@@ -593,7 +593,7 @@ def absorbed_bmm_concat_cast_q_fp8(
             f"(SGLANG_OPT_Q8KV8_QPREP_VARIANT); valid: {_valid}"
         )
     if variant == "cuda":
-        from sglang.jit_kernel.qprep_bf16_fp8_sm90 import q8kv8_qprep_fwd
+        from sglang.kernels.ops.attention.qprep_bf16_fp8_sm90 import q8kv8_qprep_fwd
 
         q8kv8_qprep_fwd(q_fp8_pad, q_nope, w_kc, q_rope, num_heads)
         return

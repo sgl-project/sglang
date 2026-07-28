@@ -50,7 +50,7 @@ def _make_inputs(T: int, H: int, K: int, seed: int = 1234, magnitude: float = 1.
 )
 @pytest.mark.parametrize("pad_heads_extra", [0, 2])
 def test_qprep_vs_triton_two_dot(T, h_k, pad_heads_extra):
-    from sglang.jit_kernel.qprep_bf16_fp8_sm90 import q8kv8_qprep_fwd
+    from sglang.kernels.ops.attention.qprep_bf16_fp8_sm90 import q8kv8_qprep_fwd
     from sglang.kernels.ops.kvcache.cache_ops import (
         absorbed_bmm_concat_cast_q_fp8,
     )
@@ -88,7 +88,7 @@ def test_qprep_vs_triton_two_dot(T, h_k, pad_heads_extra):
     "h_k", [(64, 192), (128, 128)], ids=["glm_h64_k192", "ds_h128_k128"]
 )
 def test_qprep_fp64_reference_parity(h_k):
-    from sglang.jit_kernel.qprep_bf16_fp8_sm90 import q8kv8_qprep_fwd
+    from sglang.kernels.ops.attention.qprep_bf16_fp8_sm90 import q8kv8_qprep_fwd
     from sglang.kernels.ops.kvcache.cache_ops import (
         absorbed_bmm_concat_cast_q_fp8,
     )

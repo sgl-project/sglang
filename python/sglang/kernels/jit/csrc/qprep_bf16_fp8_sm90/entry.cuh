@@ -26,7 +26,7 @@ limitations under the License.
 namespace {
 
 // All strides are in elements; validation of dtypes/shapes/alignment happens
-// in the Python wrapper (sglang/jit_kernel/qprep_bf16_fp8_sm90.py).
+// in the Python wrapper (sglang/kernels/ops/attention/qprep_bf16_fp8_sm90.py).
 void qprep_bf16_fp8_dispatch(
     tvm::ffi::TensorView q_nope,
     tvm::ffi::TensorView w_kc,

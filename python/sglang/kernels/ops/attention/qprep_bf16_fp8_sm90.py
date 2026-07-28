@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit, override_jit_cuda_arch
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.jit.utils import cache_once, load_jit, override_jit_cuda_arch
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module

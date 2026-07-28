@@ -210,7 +210,7 @@ def test_sparse_mla_q8kv8_prefill_corner_cases(
 def test_sparse_mla_q8kv8_prefill_topk_length_only(
     d_qk: int, s_q: int, topk: int, s_kv: int
 ):
-    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
 
