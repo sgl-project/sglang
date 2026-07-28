@@ -10,13 +10,11 @@ if sys.platform == "darwin" and platform.machine() == "arm64":
 else:
     import torch
     from sgl_kernel.debug_utils import maybe_wrap_debug_kernel
-    from sgl_kernel.load_utils import (
-        _load_architecture_specific_ops,
-        _preload_cuda_library,
-    )
+    from sgl_kernel.load_utils import _preload_cuda_library, load_common_ops
 
-    # Initialize the ops library based on current GPU
-    common_ops = _load_architecture_specific_ops()
+    # Initialize the ops library based on current GPU. Returns None (with a warning)
+    # instead of raising when SGLANG_KERNEL_ALLOW_MISSING_OPS is set; see load_common_ops.
+    common_ops = load_common_ops()
 
     # Preload the CUDA library to avoid the issue of libcudart.so.12 not found
     if torch.version.cuda is not None:
