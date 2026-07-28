@@ -1,6 +1,8 @@
 #pragma once
 
-#if defined(__AVX512F__) && defined(__AVX512BF16__) && defined(__AMX_BF16__)
+// AMX support is dispatched at runtime via OneDNN brgemm;
+// only AVX512F + AVX512BF16 are needed at compile time here.
+#if defined(__AVX512F__) && defined(__AVX512BF16__)
 #define CPU_CAPABILITY_AVX512
 #endif
 
