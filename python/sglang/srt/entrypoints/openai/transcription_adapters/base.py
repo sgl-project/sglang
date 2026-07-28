@@ -107,6 +107,19 @@ class TranscriptionAdapter(ABC):
         """
         return {}
 
+    @property
+    def realtime_slicing_config(self) -> dict:
+        """Slicing-path tuning knobs, off by default -- an adapter opts in by
+        overriding with ``enabled=True`` and model-tuned values.
+        ``left_overlap_ms`` is the audio kept across the sliced boundary for
+        dedupe context; ``min_audio_sec`` is the floor below which slicing stays
+        off. ``left_overlap_ms`` must stay below ``unfixed_chunk_num *
+        chunk_size_sec * 1000`` from ``chunked_streaming_config``; otherwise the
+        session logs a warning and falls back to cumulative inference. Negative
+        values likewise disable slicing with a warning.
+        """
+        return {"enabled": False, "left_overlap_ms": 0, "min_audio_sec": 0.0}
+
     def postprocess_text(self, text: str) -> str:
         """Strip model-specific markers from raw decoded text.
 
