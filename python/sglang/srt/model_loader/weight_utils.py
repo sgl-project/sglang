@@ -686,6 +686,16 @@ def filter_duplicate_safetensors_files(
     weight_files_in_index = set()
     for weight_name in weight_map:
         weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
+    # Fail fast if the index references shard files that are not on disk (e.g. an
+    # incomplete or interrupted download). Otherwise those shards are silently
+    # dropped and the model loads with uninitialized weights.
+    missing_files = sorted(f for f in weight_files_in_index if not os.path.isfile(f))
+    if missing_files:
+        raise RuntimeError(
+            f"{index_file} references {len(missing_files)} shard file(s) missing "
+            f"from {hf_folder} (incomplete download?): "
+            f"{[os.path.basename(f) for f in missing_files]}"
+        )
     # Filter out any fields that are not found in the index file.
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
