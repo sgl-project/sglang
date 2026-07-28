@@ -712,9 +712,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 )
                 logger.error(error)
                 for remaining_item in items[index:]:
-                    self._return_item_result(
-                        remaining_item, OutputBatch(error=error)
-                    )
+                    self._return_item_result(remaining_item, OutputBatch(error=error))
                 return
             except Exception as e:
                 logger.error(
@@ -724,9 +722,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 )
                 error = f"Incremental native grouped execution failed: {e}"
                 for remaining_item in items[index:]:
-                    self._return_item_result(
-                        remaining_item, OutputBatch(error=error)
-                    )
+                    self._return_item_result(remaining_item, OutputBatch(error=error))
                 return
 
             self._return_item_result(item, output_batch)
@@ -1162,9 +1158,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
             if isinstance(handler_result, _IncrementalOutputs):
                 try:
-                    self._return_incremental_results(
-                        items, handler_result.outputs
-                    )
+                    self._return_incremental_results(items, handler_result.outputs)
                 except zmq.ZMQError as e:
                     logger.error(f"ZMQ error sending incremental reply: {e}")
                 continue
@@ -1192,9 +1186,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
             # 3. return results
             try:
-                for item, output_batch in zip(
-                    items, output_batches, strict=True
-                ):
+                for item, output_batch in zip(items, output_batches, strict=True):
                     self._return_item_result(item, output_batch)
             except zmq.ZMQError as e:
                 # Reply failed; log and keep loop alive to accept future requests

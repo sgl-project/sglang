@@ -289,9 +289,7 @@ class GlmImageAR(PipelineStage):
             )
 
         prior_token_ids_d32 = torch.tensor(
-            generated_ids[
-                large_image_offset : large_image_offset + token_h * token_w
-            ],
+            generated_ids[large_image_offset : large_image_offset + token_h * token_w],
             device=device,
         )
         return self._upsample_token_ids(prior_token_ids_d32, token_h, token_w)
