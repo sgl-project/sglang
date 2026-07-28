@@ -86,6 +86,12 @@ class CausalConvCache:
         self._store[key] = value
 
     def advance_chunk(self) -> None:
+        # Moving past the first chunk with retain=False means the caller lied:
+        # the second chunk would read an empty cache, treat itself as the first
+        # one, and silently drop the temporal stride.
+        assert (
+            self.retain or self.chunk_index == 0
+        ), "retain=False promised there would be only one chunk"
         self.chunk_index += 1
 
     def is_first_chunk(self) -> bool:
@@ -198,7 +204,13 @@ def causal_cache_frames(
 
 
 def interleave_time(x: torch.Tensor) -> torch.Tensor:
-    """``(b, 2c, t, h, w) -> (b, c, 2t, h, w)``, interleaving the halves in time."""
+    """``(b, 2c, t, h, w) -> (b, c, 2t, h, w)``, interleaving the halves in time.
+
+    Only ever called with t <= 2, because the decoder streams one latent frame
+    at a time. The permute-copy this does loses to an explicit stack once t grows
+    past roughly 8, so a VAE that decodes in temporal blocks would want to
+    measure before reusing this.
+    """
     return rearrange(x, "b (r c) t h w -> b c (t r) h w", r=2)
 
 
@@ -281,11 +293,17 @@ class CausalConv3d(nn.Conv3d):
             x = F.pad(x, (0, 0, 0, 0, time_pad, 0))
         if not current_platform.is_amp_supported():
             x = x.to(self.weight.dtype)
-        x = match_conv3d_input_format(x, self.weight)
         return self._conv_impl(x)
 
     def _conv_impl(self, x: torch.Tensor) -> torch.Tensor:
-        """The convolution itself; ROCm patches this rather than ``forward``."""
+        """The convolution itself; ROCm patches this rather than ``forward``.
+
+        The layout match belongs here, not in ``_conv``: a backend that replaces
+        this method wants the input in whatever layout suits it. ROCm's unfolded
+        Conv2D, for one, immediately gathers into a standard-contiguous buffer,
+        so converting to channels_last_3d first is pure loss.
+        """
+        x = match_conv3d_input_format(x, self.weight)
         return F.conv3d(
             x,
             self.weight,

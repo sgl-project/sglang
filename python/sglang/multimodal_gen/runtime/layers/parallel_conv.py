@@ -556,7 +556,9 @@ class SpatialParallelCausalConv3d(CausalConv3d):
             x,
             self._conv_impl,
             height_pad_mode="zeros",
-            match_conv3d_format=True,
+            # `_conv_impl` matches the layout itself, so a backend that replaces
+            # it can opt out of the conversion entirely.
+            match_conv3d_format=False,
         )
 
 
