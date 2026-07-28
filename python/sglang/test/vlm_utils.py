@@ -34,18 +34,6 @@ class TestOpenAIMLLMServerBase(CustomTestCase):
     fixed_args: list = ["--trust-remote-code", "--enable-multimodal"]
     trust_remote_code: bool = True
 
-    # Multimodal asset URLs/paths. Defaults point to the remote sgl-test-files
-    # mirror; NPU/other backends may override these class attributes to local
-    # paths to avoid network downloads in CI.
-    image_man_ironing_url: str = IMAGE_MAN_IRONING_URL
-    image_sgl_logo_url: str = IMAGE_SGL_LOGO_URL
-    video_jobs_url: str = VIDEO_JOBS_URL
-    audio_trump_speech_url: str = AUDIO_TRUMP_SPEECH_URL
-    audio_bird_song_url: str = AUDIO_BIRD_SONG_URL
-
-    # Number of frames sampled by `prepare_video_images_messages`.
-    video_max_frames_num: int = 10
-
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -81,17 +69,9 @@ class TestOpenAIMLLMServerBase(CustomTestCase):
         return {}
 
     def get_or_download_file(self, url: str) -> str:
+        cache_dir = os.path.expanduser("~/.cache")
         if url is None:
             raise ValueError()
-
-        # Local absolute path: use as-is if it exists, otherwise fail fast
-        # instead of falling through to the HTTP download branch.
-        if os.path.isabs(url):
-            if os.path.exists(url):
-                return url
-            raise FileNotFoundError(f"Local file does not exist: {url}")
-
-        cache_dir = os.path.expanduser("~/.cache")
         file_name = url.split("/")[-1]
         file_path = os.path.join(cache_dir, file_name)
         os.makedirs(cache_dir, exist_ok=True)
@@ -172,7 +152,7 @@ class AudioOpenAITestMixin(TestOpenAIMLLMServerBase):
     def test_audio_speech_completion(self):
         # a fragment of Trump's speech
         audio_response = self.get_audio_response(
-            self.audio_trump_speech_url,
+            AUDIO_TRUMP_SPEECH_URL,
             "Listen to this audio and write down the audio transcription in English.",
             category="speech",
         )
@@ -181,7 +161,7 @@ class AudioOpenAITestMixin(TestOpenAIMLLMServerBase):
     def test_audio_ambient_completion(self):
         # bird song
         audio_response = self.get_audio_response(
-            self.audio_bird_song_url,
+            AUDIO_BIRD_SONG_URL,
             "Please listen to the audio snippet carefully and transcribe the content in English.",
             "ambient",
         )
@@ -197,14 +177,14 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": self.image_man_ironing_url},
+                    "image_url": {"url": IMAGE_MAN_IRONING_URL},
                 }
             )
         elif image_id == 1:
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": self.image_sgl_logo_url},
+                    "image_url": {"url": IMAGE_SGL_LOGO_URL},
                 }
             )
         else:
@@ -272,7 +252,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {"url": self.image_man_ironing_url},
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
                         },
                         {
                             "type": "text",
@@ -302,7 +282,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {"url": self.image_man_ironing_url},
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
                         },
                         {
                             "type": "text",
@@ -353,12 +333,12 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {"url": self.image_man_ironing_url},
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
                             "modalities": "multi-images",
                         },
                         {
                             "type": "image_url",
-                            "image_url": {"url": self.image_sgl_logo_url},
+                            "image_url": {"url": IMAGE_SGL_LOGO_URL},
                             "modalities": "multi-images",
                         },
                         {
@@ -400,7 +380,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
 
         from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
-        max_frames_num = self.video_max_frames_num
+        max_frames_num = 10
         decoder = VideoDecoderWrapper(video_path)
         total_frame_num = len(decoder)
         uniform_sampled_frames = np.linspace(
@@ -436,7 +416,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
         return messages
 
     def test_video_images_chat_completion(self):
-        url = self.video_jobs_url
+        url = VIDEO_JOBS_URL
         file_path = self.get_or_download_file(url)
 
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -514,7 +494,7 @@ class VideoOpenAITestMixin(TestOpenAIMLLMServerBase):
         return messages
 
     def test_video_chat_completion(self):
-        url = self.video_jobs_url
+        url = VIDEO_JOBS_URL
         file_path = self.get_or_download_file(url)
 
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -575,11 +555,11 @@ class OmniOpenAITestMixin(
                 "content": [
                     {
                         "type": "image_url",
-                        "image_url": {"url": self.image_man_ironing_url},
+                        "image_url": {"url": IMAGE_MAN_IRONING_URL},
                     },
                     {
                         "type": "audio_url",
-                        "audio_url": {"url": self.audio_trump_speech_url},
+                        "audio_url": {"url": AUDIO_TRUMP_SPEECH_URL},
                     },
                     {
                         "type": "text",
