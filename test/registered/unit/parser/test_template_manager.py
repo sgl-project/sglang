@@ -115,6 +115,62 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
                 )
                 self.assertEqual(parser, "poolside_v1")
 
+    def test_poolside_v1_laguna_s21_shaped_template(self):
+        # Laguna-S-2.1's real template defaults enable_thinking on and lacks
+        # the XS-style prose describing the tool-call format; only the tool
+        # preamble and the <arg_key>/<arg_value> markup identify the family.
+        template = (
+            "{%- set enable_thinking = enable_thinking | default(true) -%}\n"
+            "You may call functions to assist with the user query.\n"
+            "All available function signatures are listed below:\n"
+            "{{- '<tool_call>' + function_data.name -}}\n"
+            '{{- "<arg_key>" ~ k ~ "</arg_key>" -}}'
+            '{{- "<arg_value>" ~ v ~ "</arg_value>" -}}\n'
+            "{{- '</tool_call>' -}}"
+        )
+        _, config, parser = self._detect(template, ["<tool_call>"])
+        self.assertEqual(
+            config,
+            ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=True),
+        )
+        self.assertEqual(parser, "poolside_v1")
+
+    def test_enable_thinking_default_filter_variants(self):
+        cases = [
+            # Jinja's documented alias for the default filter.
+            ("{%- set enable_thinking = enable_thinking | d(true) -%}", True),
+            # No whitespace around the pipe.
+            ("{% set enable_thinking = enable_thinking|default(false) %}", False),
+            # A commented-out assignment must not shadow the live one.
+            (
+                "{# {%- set enable_thinking = enable_thinking | default(false) -%} #}\n"
+                "{%- set enable_thinking = enable_thinking | default(true) -%}",
+                True,
+            ),
+        ]
+        for template, expected in cases:
+            with self.subTest(template=template):
+                _, config, _ = self._detect(template, [])
+                self.assertEqual(
+                    config,
+                    ReasoningToggleConfig(
+                        toggle_param="enable_thinking", default_enabled=expected
+                    ),
+                )
+
+    def test_enable_thinking_boolean_mode_default_not_a_toggle(self):
+        # default(x, true) / default(x, boolean=true) replace any falsy value,
+        # so an explicit enable_thinking=false still renders as the default;
+        # the assignment is not a working toggle and must stay undetected.
+        for template in (
+            "{%- set enable_thinking = enable_thinking | default(true, true) -%}",
+            "{%- set enable_thinking = enable_thinking"
+            " | default(true, boolean=true) -%}",
+        ):
+            with self.subTest(template=template):
+                _, config, _ = self._detect(template, [])
+                self.assertIsNone(config)
+
     def test_nemotron_detects_uppercase_true_assignment(self):
         template = """
         {% set enable_thinking = enable_thinking if enable_thinking is defined else True %}
@@ -403,6 +459,20 @@ class TestToolCallParserDetection(unittest.TestCase):
         rp = detect_reasoning_parser(template, tok, config, force)
         tcp = detect_tool_call_parser(template, tok, config, force)
         return rp, tcp
+
+    def test_poolside_s21_shape_resolves_poolside_tool_call_parser(self):
+        # Regression: with default(true) the S-2.1 shape must not fall through
+        # to the qwen tool-call parser, which cannot read Poolside's XML-KV
+        # tool format.
+        template = (
+            "{%- set enable_thinking = enable_thinking | default(true) -%}\n"
+            "All available function signatures are listed below:\n"
+            "<tool_call>{{ name }}<arg_key>{{ k }}</arg_key>"
+            "<arg_value>{{ v }}</arg_value></tool_call>"
+        )
+        force, config = detect_reasoning_pattern(template)
+        result = detect_tool_call_parser(template, _DummyTokenizer([]), config, force)
+        self.assertEqual(result, "poolside_v1")
 
     def test_qwen3_detects_qwen_tool_call_parser(self):
         rp, tcp = self._detect_all("Qwen/Qwen3-0.6B")

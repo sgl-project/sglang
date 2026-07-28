@@ -71,6 +71,31 @@ class ReasoningToggleConfig:
         return self.special_case == "always"
 
 
+_JINJA_COMMENT_RE = re.compile(r"{#.*?#}", re.DOTALL)
+
+
+def _has_toggle_default_assignment(
+    ctx: TemplateDetectionContext, param: str, default: bool
+) -> bool:
+    """True if the template defaults ``param`` via Jinja's ``default`` filter,
+    e.g. ``{%- set enable_thinking = enable_thinking | default(false) -%}``
+    (Laguna-XS-2.1) or ``default(true)`` (Laguna-S-2.1).
+
+    Accepts Jinja's documented ``d`` alias for ``default``. Two-argument forms
+    (``default(x, true)`` / ``default(x, boolean=true)``) are deliberately not
+    matched: in boolean mode an explicit ``param=false`` is itself replaced by
+    the default, so the assignment is not a working toggle. Jinja comments are
+    stripped first so a commented-out assignment cannot shadow the live one.
+    """
+    literal = "true|True" if default else "false|False"
+    pattern = (
+        rf"set\s+{param}\s*=\s*{param}\s*\|\s*"
+        rf"(?:default|d)\s*\(\s*(?:{literal})\s*\)"
+    )
+    template = _JINJA_COMMENT_RE.sub("", ctx.template)
+    return re.search(pattern, template) is not None
+
+
 # ---------------------------------------------------------------------------
 # Reasoning mode rules (detect toggle config from template)
 # ---------------------------------------------------------------------------
@@ -104,10 +129,7 @@ REASONING_MODE_RULES = (
             r"{%\s*set\s+enable_thinking\s*=\s*(?:false|False)\s*%}",
             re.DOTALL,
         )
-        or ctx.has_pattern(
-            r"set\s+enable_thinking\s*=\s*enable_thinking\s*\|\s*"
-            r"default\(\s*(?:false|False)\s*\)"
-        ),
+        or _has_toggle_default_assignment(ctx, "enable_thinking", False),
     ),
     DetectionRule(
         name="nemotron_3_super_low_effort",
@@ -139,10 +161,7 @@ REASONING_MODE_RULES = (
             r"enable_thinking\s+is\s+not\s+defined\s+or\s+enable_thinking"
         )
         or ctx.has_pattern(r"namespace\([^)]*enable_thinking\s*=\s*true")
-        or ctx.has_pattern(
-            r"set\s+enable_thinking\s*=\s*enable_thinking\s*\|\s*"
-            r"default\(\s*(?:true|True)\s*\)"
-        ),
+        or _has_toggle_default_assignment(ctx, "enable_thinking", True),
     ),
     DetectionRule(
         name="explicit_thinking_default_false",
@@ -151,7 +170,8 @@ REASONING_MODE_RULES = (
             r"{%\s*if\s+not\s+thinking\s+is\s+defined\s*%}.*?"
             r"{%\s*set\s+thinking\s*=\s*(?:false|False)\s*%}",
             re.DOTALL,
-        ),
+        )
+        or _has_toggle_default_assignment(ctx, "thinking", False),
     ),
     DetectionRule(
         name="thinking_default_true",
@@ -168,7 +188,8 @@ REASONING_MODE_RULES = (
             r"thinking\s+is\s+defined\s+and\s+(?:thinking\s+is\s+false|not\s+thinking)"
         )
         or ctx.has_pattern(r"thinking\s+is\s+not\s+defined\s+or\s+thinking")
-        or ctx.has_pattern(r"namespace\([^)]*thinking\s*=\s*true"),
+        or ctx.has_pattern(r"namespace\([^)]*thinking\s*=\s*true")
+        or _has_toggle_default_assignment(ctx, "thinking", True),
     ),
 )
 
@@ -277,10 +298,16 @@ def _is_hunyuan(ctx):
 
 def _is_poolside_v1(ctx):
     has_poolside_tool_format = (
-        ctx.has_text("unescaped XML-like object")
-        and ctx.has_text("<tool_call>function-name")
-        and ctx.has_text("<arg_key>")
+        ctx.has_text("<arg_key>")
         and ctx.has_text("<arg_value>")
+        and (
+            # Laguna-XS.2 spells out the tool-call format in prose;
+            # Laguna-S-2.1 does not, so also key on the tool preamble both
+            # template families share. The Poolside identity must not depend
+            # on the enable_thinking default, which differs between families.
+            ctx.has_text("unescaped XML-like object")
+            or ctx.has_text("All available function signatures are listed below")
+        )
     )
     return has_poolside_tool_format or (
         ctx.reasoning_config
