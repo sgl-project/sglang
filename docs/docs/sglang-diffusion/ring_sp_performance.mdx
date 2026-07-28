@@ -10,6 +10,7 @@ Sequence parallelism splits long image or video latent sequences across GPUs. In
 - `--sp-degree`: total sequence parallel degree
 - `--ulysses-degree`: Ulysses parallel degree
 - `--ring-degree`: ring parallel degree
+- `--sp-attention-mode`: attention exchange used inside each SP group
 
 The degrees must satisfy:
 
@@ -17,11 +18,101 @@ The degrees must satisfy:
 sp_degree = ulysses_degree * ring_degree
 ```
 
+The default `--sp-attention-mode ulysses` uses all-to-all to redistribute
+sequence shards over attention heads. `--sp-attention-mode kv_gather` keeps
+queries sequence-sharded and all-gathers keys and values, then computes each
+rank's local output directly. The K/V-gather mode currently supports
+non-causal attention with `--ring-degree 1`.
+
 Use SP when sequence length or video shape makes the DiT forward pass the bottleneck and the model supports sequence sharding. For latency-oriented multi-GPU Qwen/Wan deployments, also compare against CFG parallelism and FSDP; SP is not automatically the best multi-GPU setting for every model.
+
+## Choosing The Attention Exchange
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "20%"}} />
+    <col style={{width: "30%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Communication</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Memory</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Constraints</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>ulysses</code></td>
+      <td style={{padding: "9px 12px"}}>All-to-all before and after attention</td>
+      <td style={{padding: "9px 12px"}}>Full sequence with a shard of the attention heads during attention</td>
+      <td style={{padding: "9px 12px"}}>Attention head divisibility must match the Ulysses degree</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>kv_gather</code></td>
+      <td style={{padding: "9px 12px"}}>All-gather K and V; Q and output remain sequence-sharded</td>
+      <td style={{padding: "9px 12px"}}>Replicates full K and V within the SP group</td>
+      <td style={{padding: "9px 12px"}}>Non-causal attention and <code>ring_degree=1</code></td>
+    </tr>
+  </tbody>
+</table>
+
+Neither exchange is universally faster. K/V gather avoids the reverse
+all-to-all and can help when its local attention shape or collective is more
+efficient, while Ulysses can use less attention activation memory. Benchmark
+both on the target model, resolution, accelerator, and interconnect.
 
 ## Recommended Commands
 
-### Two-GPU Sequence Parallelism
+### Ulysses Sequence Parallelism
+
+The default mode needs only the total SP degree when ring parallelism is not
+used:
+
+```bash
+sglang serve \
+  --model-path Qwen/Qwen-Image \
+  --num-gpus 4 \
+  --sp-degree 4 \
+  --port 8898
+```
+
+### K/V-Gather Sequence Parallelism
+
+Use the same SP process-group layout and select the alternative attention
+exchange explicitly:
+
+```bash
+sglang serve \
+  --model-path Qwen/Qwen-Image \
+  --num-gpus 4 \
+  --sp-degree 4 \
+  --sp-attention-mode kv_gather \
+  --port 8898
+```
+
+### Tensor Plus Sequence Parallelism
+
+TP and SP use independent dimensions. With DP and CFG parallelism disabled,
+the required GPU count is `tp_size * sp_degree`. This example creates two TP
+groups across a two-rank SP dimension:
+
+```bash
+sglang serve \
+  --model-path Qwen/Qwen-Image \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --sp-degree 2 \
+  --sp-attention-mode kv_gather \
+  --port 8898
+```
+
+Omit `--sp-attention-mode kv_gather` to use TP plus Ulysses with the same
+`tp=2, sp=2` topology.
+
+### Ring Sequence Parallelism
 
 This example uses two GPUs with `sp=2`, `ulysses=1`, and `ring=2`.
 

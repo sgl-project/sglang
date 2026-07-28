@@ -1833,6 +1833,60 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(server_args.ltx2_two_stage_device_mode, "original")
 
 
+class TestSPAttentionMode(unittest.TestCase):
+    def test_ulysses_is_the_default(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.sp_attention_mode, "ulysses")
+
+    def test_kv_gather_supports_tp_and_sp(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 4,
+                "tp_size": 2,
+                "sp_degree": 2,
+                "ulysses_degree": 2,
+                "ring_degree": 1,
+                "sp_attention_mode": "kv_gather",
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.tp_size, 2)
+        self.assertEqual(args.sp_degree, 2)
+        self.assertEqual(args.sp_attention_mode, "kv_gather")
+
+    def test_kv_gather_rejects_ring_parallelism(self):
+        with self.assertRaisesRegex(ValueError, "requires --ring-degree 1"):
+            _from_dict_without_model_resolution(
+                {
+                    "model_path": "/fake",
+                    "num_gpus": 2,
+                    "sp_degree": 2,
+                    "ulysses_degree": 1,
+                    "ring_degree": 2,
+                    "sp_attention_mode": "kv_gather",
+                    "performance_mode": "manual",
+                }
+            )
+
+    def test_unknown_sp_attention_mode_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "sp_attention_mode must be one of"):
+            _from_dict_without_model_resolution(
+                {
+                    "model_path": "/fake",
+                    "sp_attention_mode": "unknown",
+                    "performance_mode": "manual",
+                }
+            )
+
+
 class TestFSDPShardConditions(unittest.TestCase):
     def test_helpers_match_only_direct_block_entries(self):
         self.assertTrue(

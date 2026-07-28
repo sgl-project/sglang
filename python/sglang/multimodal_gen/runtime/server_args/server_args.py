@@ -71,6 +71,7 @@ LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 LORA_MERGE_MODES = ("auto", "merge", "dynamic")
+SP_ATTENTION_MODES = ("ulysses", "kv_gather")
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -218,6 +219,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # sequence parallelism
     ulysses_degree: Optional[int] = None
     ring_degree: Optional[int] = None
+    sp_attention_mode: Literal["ulysses", "kv_gather"] = "ulysses"
     # data parallelism
     # number of data parallelism groups
     dp_size: int = 1
@@ -1101,7 +1103,9 @@ class ServerArgs(DisaggServerArgsMixin):
         ):
             self.ulysses_degree = self.sp_degree
             logger.info(
-                f"Automatically set ulysses_degree=sp_degree={self.ulysses_degree} for best performance"
+                "Automatically set ulysses_degree=sp_degree=%d for the "
+                "sequence-parallel process-group layout",
+                self.ulysses_degree,
             )
 
         if self.ulysses_degree is None:
@@ -1498,6 +1502,18 @@ class ServerArgs(DisaggServerArgsMixin):
                 "encoder weights; `dp` never folds and splits the batch across "
                 "ranks (best batched throughput; requires TP=1 and DP=1); "
                 "`replicate` disables both. The default is `auto`."
+            ),
+        )
+        parser.add_argument(
+            "--sp-attention-mode",
+            type=str,
+            choices=SP_ATTENTION_MODES,
+            default=ServerArgs.sp_attention_mode,
+            help=(
+                "Sequence-parallel attention exchange: 'ulysses' redistributes "
+                "sequence shards over attention heads with all-to-all; "
+                "'kv_gather' keeps local queries and all-gathers keys/values. "
+                "kv_gather supports non-causal attention with ring_degree=1."
             ),
         )
         parser.add_argument(
@@ -2453,6 +2469,13 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
 
     def _validate_parallelism(self):
+        if self.sp_attention_mode not in SP_ATTENTION_MODES:
+            raise ValueError(
+                f"sp_attention_mode must be one of: {', '.join(SP_ATTENTION_MODES)}"
+            )
+        if self.sp_attention_mode == "kv_gather" and self.ring_degree != 1:
+            raise ValueError("--sp-attention-mode kv_gather requires --ring-degree 1")
+
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) must be >= and divisible by sp_degree ({self.sp_degree})"
