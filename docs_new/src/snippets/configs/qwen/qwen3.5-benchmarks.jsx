@@ -757,6 +757,16 @@ export const benchmarks = [
     ],
   },
   {
+    match: { hw: "h200", variant: "397b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 148, tpot_ms: 6.44, tokens_per_sec_per_gpu: 166 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 198, tpot_ms: 42.05, tokens_per_sec_per_gpu: 2578 },
+    ],
+  },
+  {
     match: { hw: "h200", variant: "397b", quant: "fp8", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.16",
     speed: [
