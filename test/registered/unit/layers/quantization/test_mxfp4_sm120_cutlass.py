@@ -291,8 +291,10 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch):
         generator=generator,
     )
     layer = SimpleNamespace(
-        w13_weight=torch.nn.Parameter(w13.clone(), requires_grad=False),
-        w2_weight=torch.nn.Parameter(w2.clone(), requires_grad=False),
+        w13_weight=torch.nn.Parameter(
+            w13.view(torch.uint8).clone(), requires_grad=False
+        ),
+        w2_weight=torch.nn.Parameter(w2.view(torch.uint8).clone(), requires_grad=False),
         w13_weight_scale=torch.nn.Parameter(
             w13_scale.view(torch.uint8).clone(), requires_grad=False
         ),

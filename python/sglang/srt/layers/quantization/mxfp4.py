@@ -1045,11 +1045,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             out[:, N_pad : N_pad + N_un, :last_un] = gate_rows
             return out
 
-        w13_padded = _stack_up_gate_w13(
-            layer.w13_weight.data.view(torch.uint8), K_pad // 2, K_un // 2
-        )
+        w13_padded = _stack_up_gate_w13(layer.w13_weight.data, K_pad // 2, K_un // 2)
         w13_scale_padded = _stack_up_gate_w13(
-            layer.w13_weight_scale.data.view(torch.uint8),
+            layer.w13_weight_scale.data,
             K_pad // sf_block_size,
             K_un // sf_block_size,
         )
@@ -1064,11 +1062,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             out[:, :K_un, :last_un] = unpadded[:, :K_un, :]
             return out
 
-        w2_padded = _pad_w2_3d(
-            layer.w2_weight.data.view(torch.uint8), N_pad // 2, N_un // 2
-        )
+        w2_padded = _pad_w2_3d(layer.w2_weight.data, N_pad // 2, N_un // 2)
         w2_scale_padded = _pad_w2_3d(
-            layer.w2_weight_scale.data.view(torch.uint8),
+            layer.w2_weight_scale.data,
             N_pad // sf_block_size,
             N_un // sf_block_size,
         )
