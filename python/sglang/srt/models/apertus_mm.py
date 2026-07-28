@@ -26,7 +26,6 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
-    MultimodalInputFormat,
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -169,16 +168,13 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
         items: List[MultimodalDataItem],
         encode_item,
     ) -> torch.Tensor:
-        """Embed raw items and pass through precomputed items in source order."""
+        """Embed raw image or audio items in source order."""
         embeddings = []
         for item in items:
-            if item.format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
-                embeddings.append(item.feature.reshape(-1, item.feature.shape[-1]))
-            else:
-                ids_per_item = [
-                    encode_item(feature) for feature in self._item_features([item])
-                ]
-                embeddings.append(self._embed_code_ids(ids_per_item))
+            ids_per_item = [
+                encode_item(feature) for feature in self._item_features([item])
+            ]
+            embeddings.append(self._embed_code_ids(ids_per_item))
         return torch.cat(embeddings, dim=0)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
