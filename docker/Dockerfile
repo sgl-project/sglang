@@ -630,8 +630,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                 *) echo "ERROR: no X.Y.Z.devYYYYMMDD nightly found in the index (format may have changed)"; exit 1 ;; \
             esac; \
         fi; \
-        echo "Installing ai-dynamo==${DYNAMO_VERSION}"; \
-        python3 -m pip install --extra-index-url https://pypi.nvidia.com "ai-dynamo==${DYNAMO_VERSION}"; \
+        runtime_wheel="ai_dynamo_runtime-${DYNAMO_VERSION}-cp310-abi3-manylinux_2_28_$(uname -m).whl"; \
+        if curl -fsSI "https://pypi.nvidia.com/ai-dynamo-runtime/${runtime_wheel}" >/dev/null; then \
+            echo "Installing ai-dynamo==${DYNAMO_VERSION}"; \
+            python3 -m pip install --extra-index-url https://pypi.nvidia.com "ai-dynamo==${DYNAMO_VERSION}"; \
+        else \
+            echo "WARNING: skipping ai-dynamo==${DYNAMO_VERSION}; ${runtime_wheel} is unavailable"; \
+        fi; \
     fi
 
 # Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
