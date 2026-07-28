@@ -16,6 +16,7 @@ the GPU runs both steps back-to-back with no idle gap.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -85,6 +86,11 @@ class MlxPendingJob:
 class SchedulerMlxOverlapMixin:
     """Mixin that adds MLX overlap scheduling to :class:`Scheduler`."""
 
+    @staticmethod
+    def _record_mlx_launch(batch: ScheduleBatch) -> None:
+        """Record the start time for an MLX overlap forward step."""
+        batch.launch_ts = time.monotonic()
+
     def _finalize_mlx_pending_job(self: Scheduler, pending: MlxPendingJob):
         # Account for this completed forward step. The standard scheduler does
         # this inside run_batch(), but the MLX overlap loop bypasses run_batch,
@@ -153,6 +159,7 @@ class SchedulerMlxOverlapMixin:
         pending_next: Optional[MlxPendingJob] = None
 
         def _launch_fresh(batch: ScheduleBatch) -> MlxPendingJob:
+            self._record_mlx_launch(batch)
             # Materialize batch.input_ids from CPU staging (prefill) or the
             # FutureMap relay (decode) before the forward. With deferred input
             # materialization, get_next_batch_to_run leaves input_ids unset; the
@@ -182,13 +189,16 @@ class SchedulerMlxOverlapMixin:
             # Composition is identical to prev: reuse a fresh batch copy
             # of the same underlying ScheduleBatch so process_batch_result
             # updates the same req objects with the new token.
+
+            batch_copy = prev.batch_copy.copy()
+            self._record_mlx_launch(batch_copy)
             return MlxPendingJob(
                 lazy_tokens=lazy_tokens,
                 prefills=prefills,
                 extends=extends,
                 decode=decode,
                 mode=mode,
-                batch_copy=prev.batch_copy.copy(),
+                batch_copy=batch_copy,
                 schedule_batch=prev.schedule_batch,
                 reqs=prev.reqs,
             )
