@@ -7961,6 +7961,13 @@ class ServerArgs:
             help="Deprecated alias for --mamba-radix-cache-strategy.",
         )
         parser.add_argument(
+            "--enable-gdn-replayssm-spec",
+            action=DeprecatedStoreTrueAction,
+            dest="enable_linear_replayssm_spec",
+            new_flag="--enable-linear-replayssm-spec",
+            help="[Deprecated] Use --enable-linear-replayssm-spec instead.",
+        )
+        parser.add_argument(
             "--cuda-graph-max-bs",
             type=int,
             action=DeprecatedAliasStoreAction,
