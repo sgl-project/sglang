@@ -317,7 +317,9 @@ class DeepseekMLAForwardMixin:
                                 transpose_scale=False,
                             )
                             if _use_aiter_bpreshuffle_gfx95:
-                                q_quanted = materialize_bpreshuffle_fp8_scale_tuple(q_quanted)
+                                q_quanted = materialize_bpreshuffle_fp8_scale_tuple(
+                                    q_quanted
+                                )
                             q = q_quanted
                         else:
                             q, _, k_nope, _ = fused_rms_fp8_group_quant(
@@ -744,7 +746,10 @@ class DeepseekMLAForwardMixin:
                         topk_indices=topk_indices,
                     )
                     attn_output = fusion_plan.attn_output_buf
-                elif forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled:
+                elif (
+                    forward_batch.forward_mode.is_decode()
+                    and get_parallel().dcp_enabled
+                ):
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -928,7 +933,9 @@ class DeepseekMLAForwardMixin:
                         transpose_scale=False,
                     )
                     if _use_aiter_bpreshuffle_gfx95:
-                        attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(attn_bmm_output)
+                        attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
+                            attn_bmm_output
+                        )
                 else:
                     attn_bmm_output = _bmm_buf.flatten(1, 2)
             elif self.o_proj.weight.dtype == torch.uint8:
@@ -943,7 +950,9 @@ class DeepseekMLAForwardMixin:
                     transpose_scale=False,
                 )
                 if _use_aiter_bpreshuffle_gfx95:
-                    attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(attn_bmm_output)
+                    attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
+                        attn_bmm_output
+                    )
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
