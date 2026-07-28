@@ -4,7 +4,7 @@
 #
 # Produces the SYCL-built libccl.so.1 that SGLang's PyXcclCommunicator loads
 # (via SGLANG_PYXCCL_SO_PATH) to call Intel oneCCL directly for XPU tensor-
-# parallel collectives. See docs/platforms/xpu.pyxccl.md.
+# parallel collectives. See docs_new/docs/hardware-platforms/xpu.pyxccl.md.
 #
 # USAGE
 #   ./build_oneccl_xpu.sh [OPTIONS]

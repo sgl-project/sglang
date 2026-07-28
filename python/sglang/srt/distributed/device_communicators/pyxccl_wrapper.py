@@ -195,6 +195,22 @@ class ONECCLLibrary:
                 xpuStream_t,
             ],
         ),
+        # onecclResult_t onecclAllToAll(
+        #   const void *sendbuff, void *recvbuff, size_t count,
+        #   onecclDataType_t datatype, onecclComm_t comm, void *stream);
+        # NOTE: `count` is the per-rank element count (not the total).
+        Function(
+            "onecclAllToAll",
+            onecclResult_t,
+            [
+                buffer_type,
+                buffer_type,
+                ctypes.c_size_t,
+                onecclDataType_t,
+                onecclComm_t,
+                xpuStream_t,
+            ],
+        ),
         # onecclResult_t onecclReduceScatter(
         #   const void *sendbuff, void *recvbuff, size_t recvcount,
         #   onecclDataType_t datatype, onecclRedOp_t redop,
@@ -381,6 +397,22 @@ class ONECCLLibrary:
         self.ONECCL_CHECK(
             self._funcs["onecclReduceScatter"](
                 sendbuff, recvbuff, count, datatype, op, comm, stream
+            )
+        )
+
+    def onecclAllToAll(
+        self,
+        sendbuff: buffer_type,
+        recvbuff: buffer_type,
+        count: int,
+        datatype: int,
+        comm: onecclComm_t,
+        stream: xpuStream_t,
+    ) -> None:
+        """`count` is the per-rank element count, not the buffer total."""
+        self.ONECCL_CHECK(
+            self._funcs["onecclAllToAll"](
+                sendbuff, recvbuff, count, datatype, comm, stream
             )
         )
 

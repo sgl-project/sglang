@@ -129,7 +129,7 @@ class PyXcclCommunicator:
                 "oneCCL communicator initialization failed: %s. This is often "
                 "caused by missing transport configuration; check that "
                 "CCL_ATL_TRANSPORT=ofi and FI_PROVIDER_PATH are set correctly "
-                "(see docs/platforms/xpu.pyxccl.md).",
+                "(see docs_new/docs/hardware-platforms/xpu.pyxccl.md).",
                 exc,
             )
             self.available = False
@@ -221,6 +221,35 @@ class PyXcclCommunicator:
             buffer_type(input_tensor.data_ptr()),
             buffer_type(output_tensor.data_ptr()),
             input_tensor.numel(),
+            onecclDataTypeEnum.from_torch(input_tensor.dtype),
+            self.comm,
+            self._stream(),
+        )
+
+    def all_to_all_single(
+        self, output_tensor: torch.Tensor, input_tensor: torch.Tensor
+    ):
+        """Even-split all-to-all: each rank sends an equal chunk to every rank.
+
+        Mirrors ``torch.distributed.all_to_all_single`` without split lists;
+        oneCCL takes the *per-rank* element count.
+        """
+        if self.disabled:
+            return
+        assert input_tensor.device == self.device, (
+            f"this pyxccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {input_tensor.device}"
+        )
+        assert input_tensor.numel() % self.world_size == 0, (
+            f"all_to_all_single requires an even split, but numel "
+            f"({input_tensor.numel()}) is not divisible by world_size "
+            f"({self.world_size})"
+        )
+        self._debug_log("AllToAll", input_tensor)
+        self.oneccl.onecclAllToAll(
+            buffer_type(input_tensor.data_ptr()),
+            buffer_type(output_tensor.data_ptr()),
+            input_tensor.numel() // self.world_size,
             onecclDataTypeEnum.from_torch(input_tensor.dtype),
             self.comm,
             self._stream(),

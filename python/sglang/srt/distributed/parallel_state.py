@@ -420,7 +420,7 @@ class GroupCoordinator:
                     "SGLANG_ENABLE_PYXCCL=1 was set but PyXcclCommunicator "
                     "failed to initialize, so XPU tensor parallelism (tp>1) "
                     "cannot run. Set up pyxccl + oneCCL correctly (see "
-                    "docs/platforms/xpu.pyxccl.md), point SGLANG_PYXCCL_SO_PATH "
+                    "docs_new/docs/hardware-platforms/xpu.pyxccl.md), point SGLANG_PYXCCL_SO_PATH "
                     "at a SYCL-built libccl.so.1, and ensure the required OFI "
                     "environment variables (CCL_ATL_TRANSPORT=ofi, "
                     "FI_PROVIDER_PATH) are set. To use torch.distributed "
@@ -944,6 +944,10 @@ class GroupCoordinator:
         return True
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
+        pyxccl_comm = self.pyxccl_comm
+        if pyxccl_comm is not None and not pyxccl_comm.disabled:
+            pyxccl_comm.all_to_all_single(output, input)
+            return
         torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
     def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
@@ -1253,6 +1257,25 @@ class GroupCoordinator:
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
+        pyxccl_comm = self.pyxccl_comm
+        if pyxccl_comm is not None and not pyxccl_comm.disabled:
+            # oneCCL has no gather primitive, so emulate it exactly as
+            # XpuCommunicator.gather does (all-gather, then keep the result on
+            # `dst` only) -- but over oneCCL, so it works without an XPU
+            # torch.distributed backend.
+            input_size = input_.size()
+            output_tensor = torch.empty(
+                (world_size,) + input_size, dtype=input_.dtype, device=input_.device
+            )
+            pyxccl_comm.all_gather(output_tensor, input_)
+            if self.rank_in_group != dst:
+                return None
+            output_tensor = output_tensor.movedim(0, dim)
+            return output_tensor.reshape(
+                input_size[:dim]
+                + (world_size * input_size[dim],)
+                + input_size[dim + 1 :]
+            )
         if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
             return self.xpu_communicator.gather(input_, self.rank_in_group, dst, dim)
         # Allocate output tensor.
@@ -1898,6 +1921,17 @@ def set_torch_symm_mem_all_reduce(enable: bool):
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
 
 
+def xccl_is_available() -> bool:
+    """Whether this torch build has the XCCL backend compiled in.
+
+    Not every XPU torch build ships XCCL; when it is missing,
+    ``init_process_group(backend="xccl")`` raises "Distributed package doesn't
+    have XCCL built in". No environment variable can change that -- it is a
+    compile-time property of the wheel.
+    """
+    return torch.distributed.is_xccl_available()
+
+
 # TODO: refactor in-tree platforms to get rid of this wrapper
 def get_default_distributed_backend(device: str) -> str:
     # We deliberately go through ``platforms.current_platform`` (rather than
@@ -1905,8 +1939,33 @@ def get_default_distributed_backend(device: str) -> str:
     # platforms package's lazy ``__getattr__`` and picks up runtime overrides
     # of ``_current_platform`` (e.g. in tests).
     if device == platforms.current_platform.device_type:
-        return platforms.current_platform.get_torch_distributed_backend_str()
-    return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
+        backend = platforms.current_platform.get_torch_distributed_backend_str()
+    else:
+        backend = _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
+
+    # pyxccl replaces the XPU *collectives*, but the process group itself is
+    # still bootstrapped by torch.distributed, and on a build without XCCL that
+    # bootstrap raises before pyxccl is ever constructed. Bootstrap over gloo
+    # instead: pyxccl owns the XPU data plane, exactly as pynccl owns it on CUDA
+    # (pynccl likewise rendezvouses over the gloo ``cpu_group``). gloo registers
+    # itself for the CPU device only, so the XPU device slot stays empty and any
+    # XPU collective pyxccl does *not* implement raises "No backend type
+    # associated with device type xpu" instead of silently degrading to a CPU
+    # round-trip. See docs_new/docs/hardware-platforms/xpu.pyxccl.md.
+    if (
+        backend == "xccl"
+        and envs.SGLANG_ENABLE_PYXCCL.get()
+        and not xccl_is_available()
+    ):
+        logger.warning(
+            "This torch build has no XCCL backend; bootstrapping the process "
+            "group over gloo so SGLANG_ENABLE_PYXCCL=1 can drive XPU "
+            "collectives on oneCCL directly. Collectives pyxccl does not "
+            "implement (group gather, MoE all-to-all) are unsupported here and "
+            "will raise rather than fall back."
+        )
+        return "gloo"
+    return backend
 
 
 def _create_global_tcp_store(rank: int, world_size: int) -> None:
@@ -2014,6 +2073,19 @@ def init_distributed_environment(
             pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
         else:
             pg_options = get_torch_distributed_pg_options()
+
+        if backend == "xccl" and not xccl_is_available():
+            # torch would raise a bare "Distributed package doesn't have XCCL
+            # built in" here, which gives no hint about the way out.
+            raise RuntimeError(
+                "This PyTorch build does not have the XCCL backend compiled in "
+                "(torch.distributed.is_xccl_available() is False), so XPU "
+                "distributed cannot be initialized with backend='xccl'. Either "
+                "install a torch XPU build that includes XCCL, or set "
+                "SGLANG_ENABLE_PYXCCL=1 to run XPU collectives directly on "
+                "Intel oneCCL (which bootstraps over gloo instead). See "
+                "docs_new/docs/hardware-platforms/xpu.pyxccl.md."
+            )
 
         # this backend is used for WORLD
         torch.distributed.init_process_group(

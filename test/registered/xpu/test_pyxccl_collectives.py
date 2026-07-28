@@ -149,7 +149,9 @@ def sglang_tp_collectives_fn(rank: int, world_size: int):
     )
 
     torch.xpu.set_device(rank)
-    backend = get_default_distributed_backend("xpu")  # -> "xccl"
+    # -> "xccl", or "gloo" when this torch build has no XCCL compiled in (pyxccl
+    # then owns the XPU collectives; see get_default_distributed_backend).
+    backend = get_default_distributed_backend("xpu")
     init_distributed_environment(
         backend=backend,
         world_size=world_size,

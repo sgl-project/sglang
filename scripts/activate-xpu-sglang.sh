@@ -7,7 +7,7 @@
 #       --model-path facebook/opt-125m --device xpu --tp 2 \
 #       --attention-backend intel_xpu
 #
-# See docs/platforms/xpu.pyxccl.md for the full setup guide.
+# See docs_new/docs/hardware-platforms/xpu.pyxccl.md for the full setup guide.
 
 # ---------------------------------------------------------------------------
 # 1. Intel oneAPI compiler & SYCL runtime

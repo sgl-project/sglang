@@ -17,6 +17,13 @@ cannot initialize, SGLang raises at startup for `tp>1` rather than silently
 falling back — since you opted in precisely because torch.distributed may be
 unavailable.
 
+pyxccl replaces the *collectives*; the process group itself is still bootstrapped
+by `torch.distributed`. On a torch build that does have XCCL, that bootstrap uses
+`xccl` as before. On a build without it, `SGLANG_ENABLE_PYXCCL=1` makes SGLang
+bootstrap over `gloo` instead, so the missing backend is not fatal — see
+[torch built without the XCCL backend](#torch-built-without-the-xccl-backend)
+for the caveats.
+
 ---
 
 ## Quick Checklist
@@ -243,6 +250,46 @@ Failed to load oneCCL library from libccl.so.1
 
 **Fix**: Build the oneCCL runtime (Step 2) and set `SGLANG_PYXCCL_SO_PATH` to a
 valid `libccl.so.1` (or put its directory on `LD_LIBRARY_PATH`).
+
+### torch built without the XCCL backend
+
+```text
+RuntimeError: Distributed package doesn't have XCCL built in
+  ... in _create_xccl_process_group
+```
+
+pyxccl replaces the XPU *collectives*, but the process group is still
+bootstrapped by `torch.distributed`. Whether XCCL exists is a compile-time
+property of the torch wheel — no environment variable changes it. Check with:
+
+```bash
+python -c "import torch.distributed as d; print(d.is_xccl_available())"
+```
+
+**Fix**: Set `SGLANG_ENABLE_PYXCCL=1`. SGLang then bootstraps the process group
+over `gloo` — which registers itself for the CPU device only, leaving the XPU
+device slot empty — and runs the XPU collectives on oneCCL directly. This mirrors
+CUDA, where pynccl owns the data plane and rendezvouses over the gloo
+`cpu_group`. Alternatively, install a torch XPU build that includes XCCL.
+
+Because no XPU backend is registered, any XPU collective pyxccl does *not*
+implement raises `No backend type associated with device type xpu` rather than
+silently degrading to a CPU round-trip. Covered by pyxccl: `all_reduce`,
+`all_gather`, `reduce_scatter`, `broadcast`, `send`, `recv`, `all_to_all_single`,
+and `gather` (emulated via all-gather). Not covered: `reduce_scatter` with a
+tensor *list*, `all_gatherv`/`reduce_scatterv`, and object-based collectives
+(which use the CPU group and are unaffected).
+
+### CPU-only oneCCL plugin
+
+```text
+|WARN| [onecclSetDevice:732] Plugin does not implement onecclSetDevice (INIT_DEVICE)
+oneCCL communicator initialization failed: oneCCL error: Not implemented.
+```
+
+The loaded `libccl.so` is a CPU-only build (common for the `oneccl` conda/pip
+package). **Fix**: Point `SGLANG_PYXCCL_SO_PATH` at a SYCL-built oneCCL v2
+library from Step 2.
 
 ---
 
