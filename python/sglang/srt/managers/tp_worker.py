@@ -184,9 +184,7 @@ class BaseTpWorker(ABC):
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         success, message = self.model_runner.weight_updater.update_weights_from_tensor(
-            named_tensors=self._deserialize_own_rank(
-                recv_req.serialized_named_tensors
-            ),
+            named_tensors=self._deserialize_own_rank(recv_req.serialized_named_tensors),
             load_format=recv_req.load_format,
         )
         return success, message
