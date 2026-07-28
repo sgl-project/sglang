@@ -83,10 +83,8 @@ class EagerRunner(BaseRunner):
                     ),
                 )
             else:
-                num_tokens_per_req = (
-                    mr.spec_algorithm.get_num_tokens_per_req_for_target_verify(
-                        num_draft_tokens, mr.is_draft_worker
-                    )
+                num_tokens_per_req = mr.decode_num_tokens_per_req(
+                    num_draft_tokens=num_draft_tokens
                 )
         else:
             dllm_config = DllmConfig.from_server_args(sa)
@@ -104,7 +102,7 @@ class EagerRunner(BaseRunner):
             max_bs *= sa.speculative_eagle_topk
         # Mirror prepare_mlp_sync_batch padding so the registry holds what load_batch copies.
         if require_mlp_sync(sa):
-            from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 
             max_bs = ceil_align(max_bs, self.attn_tp_size)
             max_bs = ceil_align(max_bs, get_cp_padding_align_size())
@@ -150,11 +148,7 @@ class EagerRunner(BaseRunner):
         mr = self.model_runner
         num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
-            num_tokens_per_req = (
-                mr.spec_algorithm.get_num_tokens_per_req_for_target_verify(
-                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
-                )
-            )
+            num_tokens_per_req = mr.decode_num_tokens_per_req()
         return (
             self._alloc_dummy_decode_buffers(
                 self._eager_max_bs, num_tokens_per_req=num_tokens_per_req
@@ -291,21 +285,7 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         cp_v2_active = is_cp_v2_active(forward_batch)
-        forward_positions = forward_batch.positions
-        if cp_v2_active:
-            prepare_cp_forward(forward_batch)
-            complete_hidden_states = kwargs.get("input_embeds")
-            if complete_hidden_states is None:
-                embed_layer = model_runner.model.get_input_embeddings()
-                complete_hidden_states = embed_layer(forward_batch.input_ids)
-            sharded_hidden_states, sharded_positions = cp_split_before_forward(
-                complete_hidden_states,
-                forward_batch.positions,
-                forward_batch,
-            )
-            kwargs["input_embeds"] = sharded_hidden_states
-            forward_positions = sharded_positions
-        else:
+        if not cp_v2_active:
             forward_batch.attn_cp_metadata = None
 
         category = (
@@ -337,54 +317,71 @@ class EagerRunner(BaseRunner):
                         model_runner.moe_layers,
                         model_runner.moe_fusions,
                         dsa_indexers=model_runner.dsa_indexers,
+                        mha_companion_layers=model_runner.mha_companion_layers,
                     ),
                 ):
                     ret = model_runner.model.forward(
                         forward_batch.input_ids,
-                        forward_positions,
+                        forward_batch.positions,
                         forward_batch,
                         **kwargs,
                     )
             elif cp_v2_active:
-                # CP-V2: drive .model directly to gather across CP ranks before logits.
-                hidden_states = model_runner.model.model(
-                    forward_batch.input_ids,
-                    forward_positions,
-                    forward_batch,
-                    input_embeds=kwargs.get("input_embeds"),
-                    pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
-                )
-                aux_hidden_states = None
-                capture_aux_hidden_states = getattr(
-                    model_runner.model, "capture_aux_hidden_states", False
-                )
-                if capture_aux_hidden_states:
-                    hidden_states, aux_hidden_states = hidden_states
-                if model_runner.model.pp_group.is_last_rank:
-                    hidden_states = cp_gather_after_forward(
-                        hidden_states,
-                        forward_batch,
-                        torch.cuda.current_stream(),
-                    )
-                    ret = model_runner.model.logits_processor(
-                        forward_batch.input_ids,
-                        hidden_states,
-                        model_runner.model.lm_head,
-                        forward_batch,
-                        aux_hidden_states,
-                    )
-                elif capture_aux_hidden_states:
-                    ret = hidden_states, aux_hidden_states
-                else:
-                    ret = hidden_states
+                ret = self._execute_extend_cp_v2(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(
                     forward_batch.input_ids,
-                    forward_positions,
+                    forward_batch.positions,
                     forward_batch,
                     **kwargs,
                 )
         return ret
+
+    def _execute_extend_cp_v2(
+        self, forward_batch: ForwardBatch, kwargs: dict
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        """CP-v2 extend: shard inputs at the model boundary, run the body on the
+        rank-local slice, then gather hidden states before the logits step.
+        """
+        model = self.model_runner.model
+
+        prepare_cp_forward(forward_batch)
+        input_embeds = kwargs.get("input_embeds")
+        if input_embeds is None:
+            input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+        input_embeds, positions = cp_split_before_forward(
+            input_embeds, forward_batch.positions, forward_batch
+        )
+
+        hidden_states = model.model(
+            forward_batch.input_ids,
+            positions,
+            forward_batch,
+            input_embeds=input_embeds,
+            pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
+        )
+        capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
+        aux_hidden_states = None
+        if capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+        if not model.pp_group.is_last_rank:
+            return (
+                (hidden_states, aux_hidden_states)
+                if capture_aux_hidden_states
+                else hidden_states
+            )
+
+        hidden_states = cp_gather_after_forward(
+            hidden_states, forward_batch, torch.cuda.current_stream()
+        )
+        return model.logits_processor(
+            forward_batch.input_ids,
+            hidden_states,
+            model.lm_head,
+            forward_batch,
+            aux_hidden_states,
+        )
 
     def _execute_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None

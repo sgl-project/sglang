@@ -75,16 +75,49 @@ def test_remove_imported_name_asserts_when_absent(tmp_path: Path) -> None:
 # --- add_import ----------------------------------------------------------------
 
 
-def test_remove_imported_name_collapses_a_multiline_import_to_one_line(
+def test_remove_imported_name_preserves_the_multiline_form(
     tmp_path: Path,
 ) -> None:
-    """Pruning a name from a parenthesized import rebuilds it as a single sorted-later line."""
+    """Pruning a name from an exploded import deletes only that line, so the parens and the
+    magic trailing comma survive and the formatter keeps it multi-line (a flat rebuild would
+    collapse an import the target left multi-line)."""
     (tmp_path / "m.py").write_text(
         "from pkg import (\n    a,\n    moved,\n    b,\n)\n\nx = a + b\n"
     )
     r = Repro("b", "t").remove_imported_name("m.py", module="pkg", name="moved")
     _apply(r, tmp_path)
-    assert (tmp_path / "m.py").read_text() == "from pkg import a, b\n\nx = a + b\n"
+    assert (
+        tmp_path / "m.py"
+    ).read_text() == "from pkg import (\n    a,\n    b,\n)\n\nx = a + b\n"
+
+
+def test_remove_imported_name_multiline_down_to_one_collapses(
+    tmp_path: Path,
+) -> None:
+    """Pruning an exploded import down to a single surviving name collapses it to one line:
+    the formatter does not keep a lone name exploded, so a preserved-multiline form would
+    not match the target."""
+    (tmp_path / "m.py").write_text(
+        "from pkg import (\n    moved,\n    a,\n)\n\nx = a\n"
+    )
+    r = Repro("b", "t").remove_imported_name("m.py", module="pkg", name="moved")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "from pkg import a\n\nx = a\n"
+
+
+def test_remove_imported_name_down_to_one_with_a_comment_stays_exploded(
+    tmp_path: Path,
+) -> None:
+    """A lone survivor that carries a comment stays exploded (a rebuild would drop the
+    comment); only its own line is deleted."""
+    (tmp_path / "m.py").write_text(
+        "from pkg import (\n    moved,\n    a,  # keep me\n)\n\nx = a\n"
+    )
+    r = Repro("b", "t").remove_imported_name("m.py", module="pkg", name="moved")
+    _apply(r, tmp_path)
+    assert (
+        tmp_path / "m.py"
+    ).read_text() == "from pkg import (\n    a,  # keep me\n)\n\nx = a\n"
 
 
 def test_remove_imported_name_matches_a_relative_module(tmp_path: Path) -> None:
@@ -111,3 +144,20 @@ def test_remove_imported_name_preserves_comments_in_a_multiline_import(
     r = Repro("b", "t").remove_imported_name("m.py", module="pkg", name="moved")
     _apply(r, tmp_path)
     assert "# used by frobnicator" in (tmp_path / "m.py").read_text()
+
+
+def test_remove_imported_name_keep_exploded_holds_a_lone_survivor_multiline(
+    tmp_path: Path,
+) -> None:
+    """With keep_exploded, pruning down to a single survivor deletes only the removed line,
+    so the survivor keeps its magic trailing comma and the import stays multi-line (the
+    author's choice, which the source cannot reveal). A regenerating impl would collapse.
+    """
+    (tmp_path / "m.py").write_text(
+        "from pkg import (\n    moved,\n    a,\n)\n\nx = a\n"
+    )
+    r = Repro("b", "t").remove_imported_name(
+        "m.py", module="pkg", name="moved", keep_exploded=True
+    )
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "from pkg import (\n    a,\n)\n\nx = a\n"

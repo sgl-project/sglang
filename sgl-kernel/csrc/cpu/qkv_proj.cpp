@@ -240,9 +240,7 @@ inline float reduce(const scalar_t* __restrict__ x, int64_t size) {
 // no remainder
 #pragma GCC unroll 4
   for (int64_t d = 0; d < size; d += bVec::size()) {
-    bVec x_bvec = bVec::loadu(x + d);
-    fVec x_fvec0, x_fvec1;
-    std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+    auto [x_fvec0, x_fvec1] = load_float_vec2(x + d);
     sum_fvec += x_fvec0 * x_fvec0;
     sum_fvec += x_fvec1 * x_fvec1;
   }
@@ -259,12 +257,8 @@ inline void map2(scalar_t* y, const scalar_t* x, const scalar_t* __restrict__ w,
 // no remainder
 #pragma GCC unroll 4
   for (int64_t d = 0; d < size; d += bVec::size()) {
-    bVec x_bvec = bVec::loadu(x + d);
-    fVec x_fvec0, x_fvec1;
-    std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
-    bVec w_bvec = bVec::loadu(w + d);
-    fVec w_fvec0, w_fvec1;
-    std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
+    auto [x_fvec0, x_fvec1] = load_float_vec2(x + d);
+    auto [w_fvec0, w_fvec1] = load_float_vec2(w + d);
     x_fvec0 = x_fvec0 * scale_fvec * w_fvec0;
     x_fvec1 = x_fvec1 * scale_fvec * w_fvec1;
     bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
