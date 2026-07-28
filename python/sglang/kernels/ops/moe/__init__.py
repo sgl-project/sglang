@@ -34,13 +34,13 @@ register_kernel(
     KernelSpec(
         op="moe.moe_align_block_size",
         backend=KernelBackend.JIT,
-        target="sglang.jit_kernel.moe_align:moe_align_block_size",
+        target="sglang.kernels.ops.moe.moe_align:moe_align_block_size",
         capabilities=_CUDA,
         format_signature=FormatSignature(
             in_place=True,
             description="MoE align-block-size (JIT variant, AOT signature)",
         ),
-        description="MoE align-block-size (sglang.jit_kernel).",
+        description="MoE align-block-size (sglang.kernels.jit).",
     )
 )
 register_kernel(
