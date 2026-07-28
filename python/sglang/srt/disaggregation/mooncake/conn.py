@@ -171,11 +171,11 @@ class RoomTransferLifetime:
             return self._claimed
 
     def is_reclaimable(self) -> bool:
-        """Whether forgetting this room can no longer affect a live transfer.
+        """Whether this room has no active local transfer ownership.
 
-        Safe in both cases: a quiesced room admits no work and has none running,
-        and an unclaimed room has no sender, so it can never take a lease (only
-        ``add_transfer_request`` enqueues work, and only a sender calls it).
+        A quiesced room admits no work and has none running. An unclaimed room
+        has no sender *yet*, so callers must additionally preserve it for the
+        bootstrap grace period in which a metadata-late sender may still arrive.
         """
         with self._cond:
             return (not self._open and self._leases == 0) or not self._claimed
@@ -478,23 +478,26 @@ class MooncakeKVManager(CommonKVManager):
         """Bounded reclaim when the periodic sweep is not keeping up.
 
         Scans at most ``MAX_EMERGENCY_SCAN`` of the oldest entries so an insert
-        can never degrade to O(tracked rooms); the sweep does the rest.
+        can never degrade to O(tracked rooms); the sweep does the rest. The
+        normal bootstrap grace period still applies: the cap is soft when every
+        candidate may still be waiting for its local sender.
         """
         # islice over the live view keeps this O(MAX_EMERGENCY_SCAN); the keys are
         # copied out first because the dict cannot be mutated while iterating.
+        cutoff = time.monotonic() - self._room_sweep_ttl
         candidates = [
             room
             for room, lifetime in itertools.islice(
                 self._room_lifetimes.items(), MAX_EMERGENCY_SCAN
             )
-            if lifetime.is_reclaimable()
+            if lifetime.created_at <= cutoff and lifetime.is_reclaimable()
         ]
         self._retire_rooms_locked(candidates)
         if not candidates:
             logger.warning_once(
-                "Tracking more than %d Mooncake bootstrap rooms with none "
-                "reclaimable; KV metadata may be arriving for rooms this rank "
-                "never serves.",
+                "Tracking more than %d Mooncake bootstrap rooms with none old "
+                "enough and reclaimable; allowing the soft cap to grow while "
+                "metadata-first rooms remain inside their bootstrap window.",
                 MAX_TRACKED_ROOMS,
             )
 
@@ -2679,20 +2682,43 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self._peer_lacks_barrier = False
         self._last_abort_send = float("-inf")
         self._abort_lock = threading.Lock()
-        super().__init__(mgr, bootstrap_addr, bootstrap_room)
         # Per-room state (ABORT_ACK routing, staging teardown) may only be
         # touched by the receiver that owns the room. A second live receiver for
         # the same bootstrap_room means the room numbers collided upstream:
-        # everything keyed by room is then ambiguous, so say so loudly rather
-        # than corrupt the owner's state. Abort nonces are per receiver, so this
-        # one still terminates -- via its quiescence deadline.
+        # everything keyed by room is then ambiguous. Claim before the common
+        # initializer writes any room-keyed state so the loser cannot change the
+        # owner's status or address tracking.
+        self.bootstrap_room = bootstrap_room
+        self.bootstrap_addr = bootstrap_addr
+        self.kv_mgr = mgr
         self._owns_room = mgr.register_receiver(self)
         if not self._owns_room:
-            logger.error(
-                "bootstrap_room %s is already in use by an unfinished KV transfer; "
-                "colliding bootstrap rooms make per-room state ambiguous",
-                self.bootstrap_room,
+            self.conclude_state = KVPoll.Failed
+            self.require_staging = False
+            self.init_time = None
+            self.abort_notified = False
+            self._room_collision_error = (
+                f"bootstrap_room {self.bootstrap_room} is already in use by an "
+                "unfinished KV transfer"
             )
+            logger.error(
+                "%s; rejecting the colliding receiver before it can touch "
+                "room-keyed state",
+                self._room_collision_error,
+            )
+            return
+        try:
+            super().__init__(mgr, bootstrap_addr, bootstrap_room)
+        except Exception:
+            # Do not strand the room registration if construction fails before
+            # the receiver becomes operational.
+            mgr.unregister_receiver(self)
+            raise
+
+    def init(self, prefill_dp_rank: int):
+        if not self._owns_room:
+            return
+        super().init(prefill_dp_rank)
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
@@ -2781,6 +2807,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
     ):
+        if not self._owns_room:
+            # The owner is the only receiver allowed to publish destinations for
+            # a room. Sending the loser's addresses would redirect the owner's
+            # transfer into unrelated pages.
+            return
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
@@ -2857,6 +2888,12 @@ class MooncakeKVReceiver(CommonKVReceiver):
     # ------------------------------------------------------------------
 
     def abort(self):
+        if not self._owns_room:
+            # CommonKVReceiver.abort() writes failure state keyed only by room,
+            # which belongs to the winning receiver.
+            self.conclude_state = KVPoll.Failed
+            self._close_barrier()
+            return
         super().abort()
         # Stop admitting staging work now rather than on the next poll.
         self._close_barrier()
@@ -3022,6 +3059,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
             self.conclude_state = KVPoll.Failed
 
         self.clear()
+
+        if not self._owns_room:
+            raise KVTransferError(
+                self.bootstrap_room,
+                self._room_collision_error,
+                is_from_another_rank=False,
+            )
 
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
