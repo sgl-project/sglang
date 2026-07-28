@@ -31,7 +31,9 @@ def get_kernel_version_from_source() -> str:
 
     version = data.get("project", {}).get("version")
     if not version:
-        print("Error: Could not find version in python/sglang/kernels/aot/pyproject.toml")
+        print(
+            "Error: Could not find version in python/sglang/kernels/aot/pyproject.toml"
+        )
         sys.exit(1)
 
     return version
@@ -103,7 +105,9 @@ def main():
     engine_version = get_kernel_version_from_engine()
     dockerfile_version = get_kernel_version_from_dockerfile()
 
-    print(f"Kernel version in python/sglang/kernels/aot/pyproject.toml: {kernel_version}")
+    print(
+        f"Kernel version in python/sglang/kernels/aot/pyproject.toml: {kernel_version}"
+    )
     print(
         f"SGLang kernel dependency version in python/pyproject.toml: {pyproject_version}"
     )

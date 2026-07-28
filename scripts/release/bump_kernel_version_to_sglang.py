@@ -30,7 +30,9 @@ def get_kernel_version_from_source() -> str:
 
     version = data.get("project", {}).get("version")
     if not version:
-        print("Error: Could not find version in python/sglang/kernels/aot/pyproject.toml")
+        print(
+            "Error: Could not find version in python/sglang/kernels/aot/pyproject.toml"
+        )
         sys.exit(1)
 
     return version
