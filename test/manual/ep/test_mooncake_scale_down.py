@@ -1163,42 +1163,52 @@ class TestMooncakeScaleDown4To5To4(_MooncakeShrinkEndToEndBase):
                 pass
 
 
-@unittest.skip(
-    "MC13 exercises scale-up-v1 append + subsequent shrink retiring a "
-    "mix of launch-cohort and ex-append-joiner slots. Blocked at the "
-    "Mooncake C++ layer: sub-group Process Groups (``cpu_group`` / "
-    "``device_group``) are sized at PG construction to the launch "
-    "cohort width, and their ``P2PProxy`` peer arrays cannot grow to "
-    "host the appended rank. When the appended rank's socket resets "
-    "at retirement, the sub-group ``ConnectionPoller`` cascades into "
-    "``resetPeerState(peer)`` on a size-N array with peer=N and trips "
-    "the internal ``TORCH_CHECK`` with ``resetPeerState: peer_rank "
-    "out of range: N size: N``. Not fixable at the Python layer; the "
-    "operator-facing workaround is to launch at ``max_ep_size`` and "
-    "pre-shrink so every sub-group P2PProxy is sized to the widest "
-    "cohort at construction time, then only shrink or recover-grow "
-    "within that width. Kept in-tree as a regression trigger: any "
-    "future Mooncake release with a resizable ``P2PProxy`` (or a "
-    "bounds-check in ``ConnectionPoller::pollPeer``) will flip this "
-    "class to PASS."
+@unittest.skipUnless(
+    os.environ.get("SGLANG_MC13_FORCE_RUN") == "1",
+    # MC13 exercises scale-up-v1 append + subsequent shrink retiring a
+    # mix of launch-cohort and ex-append-joiner slots. Blocked at the
+    # Mooncake C++ layer on the Jun 23 container image (mooncake-
+    # transfer-engine-cuda13 0.3.11.post1): sub-group Process Groups
+    # (``cpu_group`` / ``device_group``) are sized at PG construction
+    # to the launch cohort width, and their ``P2PProxy`` peer arrays
+    # cannot grow to host the appended rank. When the appended rank's
+    # socket resets at retirement, the sub-group ``ConnectionPoller``
+    # cascades into ``resetPeerState(peer)`` on a size-N array with
+    # peer=N and trips the internal ``TORCH_CHECK`` with
+    # ``resetPeerState: peer_rank out of range: N size: N``. The
+    # kvcache-ai/Mooncake PR #2623 (merged 2026-06-26, shipped in
+    # 0.3.12) sizes ``P2PProxy`` to ``max_size`` at construction, so
+    # this class becomes runnable once that wheel is loaded into the
+    # container. Export ``SGLANG_MC13_FORCE_RUN=1`` to bypass this
+    # skip after the fresh wheel has been reinstalled by the sweep
+    # harness (see scripts/_in_container_elastic_scale_up.sh).
+    "MC13 requires kvcache-ai/Mooncake PR #2623 (>=0.3.12); "
+    "set SGLANG_MC13_FORCE_RUN=1 to run after upgrading the wheel."
 )
 class TestMooncakeScaleDown4To5To3(_MooncakeShrinkEndToEndBase):
     """MC13: ``4 -> 5 -> 3`` scale-up-v1 append, then shrink retiring
     a mix of launch-cohort and ex-append-joiner slots.
 
-    **Currently skipped** -- see the ``@unittest.skip`` decorator
-    above for the Mooncake C++ ``P2PProxy`` fixed-width-peer-array
-    limitation on ``cpu_group`` / ``device_group``.
+    **Env-gated** -- runs only when ``SGLANG_MC13_FORCE_RUN=1`` is
+    exported, because the class exercises a shape that is blocked
+    at the Mooncake C++ layer on any wheel older than 0.3.12
+    (mooncake-transfer-engine-cuda13). The Jun 23 container nightly
+    ships 0.3.11.post1, which sizes each sub-group ``P2PProxy`` peer
+    array to the launch cohort width; retiring the appended rank
+    trips ``resetPeerState: peer_rank out of range: N size: N`` on
+    ``cpu_group`` / ``device_group``. kvcache-ai/Mooncake PR #2623
+    (shipped in 0.3.12, 2026-07-24) resizes ``P2PProxy`` to
+    ``max_size`` at construction and clears that invariant, so the
+    class passes end-to-end when the sweep harness reinstalls the
+    fresh wheel (see ``scripts/_in_container_elastic_scale_up.sh``
+    and ``SGLANG_ELASTIC_MOONCAKE_WHEEL`` in ``sweep_env.sh``).
 
-    Kept in-tree for two reasons:
-
-      * Diagnostic value. Any future Mooncake release that ships a
-        resizable ``P2PProxy`` (or a bounds-check in
-        ``ConnectionPoller::pollPeer``) will make this class flip to
-        PASS immediately.
-      * Test-matrix documentation. The retire-source table below
-        makes explicit which retiree-provenance combinations are
-        exercised by the baseline versus intentionally excluded:
+    Kept env-gated (not always-on) because the shipped container
+    image still bakes in 0.3.11.post1. Flipping the gate to always-
+    on requires either bumping the container's baked wheel or
+    always running through the reinstall harness. The retire-source
+    table below makes explicit which retiree-provenance combinations
+    are exercised by the baseline:
 
     +--------------------------+-------------------+
     | Retiree provenance       | Test class        |
@@ -1212,7 +1222,7 @@ class TestMooncakeScaleDown4To5To3(_MooncakeShrinkEndToEndBase):
     | Mixed launch + ex-joiner | **MC13 (this)**   |
     +--------------------------+-------------------+
 
-    Sequence (attempted; blocked at step 3 today):
+    Sequence (executed end-to-end on mooncake >= 0.3.12):
       1. Launch primary with ``LAUNCH_EP = 4``, ``MAX_EP = 5``.
          Cohort is ranks 0-3; slot 4 is born retired.
       2. Spawn a joiner subprocess with ``join_tp=1, rank_offset=4,
@@ -1221,23 +1231,24 @@ class TestMooncakeScaleDown4To5To3(_MooncakeShrinkEndToEndBase):
          :class:`TestMooncakeScaleDown4To5To4` and
          :class:`TestMooncakeScaleUpFreshGrow` (MC02B).
       3. Post ``/scale_elastic_ep {new_ep_size:3}``. Retires slots 3
-         (launch cohort) and 4 (ex-append-joiner). When rank 4's
-         socket resets, the survivor's Mooncake C++
-         ``ConnectionPoller`` on ``cpu_group`` / ``device_group``
-         (sized to 4 at PG construction, valid peer indices
-         ``[0, 4)``) tries ``resetPeerState(4)`` and aborts.
-      4. (Never reached) Verify ``/generate`` survives on the
-         3-rank cohort.
+         (launch cohort) and 4 (ex-append-joiner). On mooncake <=
+         0.3.11.post1 this aborts inside ``ConnectionPoller`` on
+         ``cpu_group`` / ``device_group`` because their ``P2PProxy``
+         was allocated with size 4 at PG construction, so
+         ``resetPeerState(4)`` is an out-of-range access. On
+         mooncake >= 0.3.12 the array is pre-sized to
+         ``max_size == 5`` at construction, ``resetPeerState(4)`` is
+         in-range, the retire completes cleanly, and step 4 proceeds.
+      4. Verify ``/generate`` survives on the 3-rank cohort.
 
-    Why this cannot be fixed at the Python layer: the ``P2PProxy``
-    array is allocated inside Mooncake C++ at PG construction time
-    from ``this_pg->size()`` and never resizes. The
-    launch-at-``max_ep_size`` + pre-shrink pattern sidesteps this by
-    making every sub-group P2PProxy pre-size to the widest cohort
-    the deployment will ever need, so long as that ceiling is
-    established before the first live scale event.
+    The launch-at-``max_ep_size`` + pre-shrink pattern is still
+    the operator-facing workaround for deployments pinned to
+    mooncake <= 0.3.11.post1: it makes every sub-group P2PProxy
+    pre-size to the widest cohort the deployment will ever need,
+    so long as that ceiling is established before the first live
+    scale event.
 
-    Single-node topology (once/if unskipped): needs 5 visible GPUs
+    Single-node topology (when SGLANG_MC13_FORCE_RUN=1): needs 5 visible GPUs
     (4 for the primary cohort + 1 for the joiner subprocess).
     """
 
