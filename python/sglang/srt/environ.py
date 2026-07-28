@@ -770,6 +770,9 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # Debug-only: instantiate only the first N Kimi-K3 text layers and skip
+    # loading later layer weights. 0/unset keeps the full checkpoint.
+    SGLANG_KIMI_K3_KEEP_NUM_LAYERS = EnvInt(0)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
