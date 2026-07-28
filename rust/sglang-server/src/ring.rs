@@ -138,6 +138,24 @@ impl EgressProducer {
     pub fn push(&self, msg: Bytes) -> bool {
         self.tx.send(msg).is_ok()
     }
+
+    /// Non-blocking push, so the pyo3 boundary can try to hand the frame over
+    /// while still holding the GIL and detach only when it would actually park.
+    /// Releasing the GIL is not free: reacquiring it waits out the interpreter's
+    /// switch interval (5 ms by default), which dwarfs the sub-microsecond push
+    /// it was protecting.
+    ///
+    /// Hands the frame BACK on a full ring (`Err(Some(msg))`) so the caller can
+    /// retry it under [`push`](Self::push) without rebuilding it. `Err(None)` is
+    /// the consumer being gone (shutdown), where the frame is unavoidably lost.
+    #[inline]
+    pub fn try_push(&self, msg: Bytes) -> Result<(), Option<Bytes>> {
+        match self.tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(flume::TrySendError::Full(msg)) => Err(Some(msg)),
+            Err(flume::TrySendError::Disconnected(_)) => Err(None),
+        }
+    }
 }
 
 impl EgressConsumer {
