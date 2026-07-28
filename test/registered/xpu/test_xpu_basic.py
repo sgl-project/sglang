@@ -33,7 +33,6 @@ class TestXPUBasic(CustomTestCase):
             "0.6",
             "--batch-size",
             "1",
-            "--disable-decode-cuda-graph",
         ]
         if is_in_ci():
             args += ["--input", "64", "--output", "4"]

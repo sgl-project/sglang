@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import types
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,11 +10,15 @@ import torch
 
 
 def _load_precision_module():
-    stub_names = (
+    package_names = (
         "sglang",
         "sglang.multimodal_gen",
         "sglang.multimodal_gen.runtime",
         "sglang.multimodal_gen.runtime.utils",
+    )
+    stub_names = (
+        *package_names,
+        "sglang.multimodal_gen.runtime.platforms",
         "sglang.multimodal_gen.utils",
     )
     missing = object()
@@ -26,10 +31,17 @@ def _load_precision_module():
             "bf16": torch.bfloat16,
             "fp32": torch.float32,
         }
-        for package_name in stub_names[:-1]:
+        platforms_module = types.ModuleType("sglang.multimodal_gen.runtime.platforms")
+        platforms_module.current_platform = SimpleNamespace(
+            device_type="cpu",
+            is_mps=lambda: False,
+            is_amp_supported=lambda: True,
+        )
+        for package_name in package_names:
             package = types.ModuleType(package_name)
             package.__path__ = []
             sys.modules[package_name] = package
+        sys.modules["sglang.multimodal_gen.runtime.platforms"] = platforms_module
         sys.modules["sglang.multimodal_gen.utils"] = utils_module
 
         precision_path = (
@@ -53,6 +65,7 @@ def _load_precision_module():
 
 precision = _load_precision_module()
 align_tensor_to_module_dtype = precision.align_tensor_to_module_dtype
+autocast_context = precision.autocast_context
 autocast_enabled = precision.autocast_enabled
 get_module_dtype = precision.get_module_dtype
 precision_to_dtype = precision.precision_to_dtype
@@ -72,6 +85,19 @@ class _ParameterDtypeWinsModule(torch.nn.Module):
         super().__init__()
         self.dtype = torch.float32
         self.weight = torch.nn.Parameter(torch.ones(1, dtype=torch.float16))
+
+
+class _FakePlatform:
+    def __init__(self, device_type: str, *, is_mps: bool, amp_supported: bool):
+        self.device_type = device_type
+        self._is_mps = is_mps
+        self._amp_supported = amp_supported
+
+    def is_mps(self):
+        return self._is_mps
+
+    def is_amp_supported(self):
+        return self._amp_supported
 
 
 class TestDiffusionPrecisionConsistency(unittest.TestCase):
@@ -155,6 +181,27 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
         tokens = torch.ones(2, dtype=torch.long)
         aligned_tokens = align_tensor_to_module_dtype(tokens, module_without_parameters)
         self.assertEqual(aligned_tokens.dtype, torch.long)
+
+    def test_autocast_context_honors_explicit_override(self):
+        original_platform = precision.current_platform
+        try:
+            precision.current_platform = _FakePlatform(
+                "cpu", is_mps=False, amp_supported=True
+            )
+            disabled_context = autocast_context(
+                torch.bfloat16, disable_autocast=False, enabled=False
+            )
+            self.assertNotIsInstance(disabled_context, nullcontext)
+
+            precision.current_platform = _FakePlatform(
+                "mps", is_mps=True, amp_supported=False
+            )
+            mps_disabled_context = autocast_context(
+                torch.bfloat16, disable_autocast=False, enabled=False
+            )
+            self.assertIsInstance(mps_disabled_context, nullcontext)
+        finally:
+            precision.current_platform = original_platform
 
     def test_temporary_module_dtype(self):
         module = torch.nn.Linear(2, 2).to(dtype=torch.float32)

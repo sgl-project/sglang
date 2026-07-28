@@ -22,7 +22,6 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import register_xpu_device_properties_for_dynamo
 
 logger = logging.getLogger(__name__)
@@ -144,9 +143,6 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
         assert (
             not self.require_gathered_buffer
         ), "XPUGraphRunner does not support gathered buffer yet."
-        assert (
-            model_runner.spec_algorithm == SpeculativeAlgorithm.NONE
-        ), "XPUGraphRunner does not support speculative inference yet."
 
     def _init_profile_context_and_memory_record(self):
         profile_context = profile(

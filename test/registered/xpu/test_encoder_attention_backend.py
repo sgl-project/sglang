@@ -39,7 +39,6 @@ class TestEncoderAttention(CustomTestCase):
             "xpu",
             "--mm-attention-backend",
             "xpu_attn",
-            "--disable-decode-cuda-graph",
         ]
         os.environ["SGLANG_USE_SGL_XPU"] = "1"
         cls.process = popen_launch_server(
@@ -128,7 +127,6 @@ class TestEncoderAttention_Triton(TestEncoderAttention):
             "xpu",
             "--mm-attention-backend",
             "triton_attn",
-            "--disable-decode-cuda-graph",
         ]
         os.environ["SGLANG_USE_SGL_XPU"] = "0"
         cls.process = popen_launch_server(
