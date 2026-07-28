@@ -20,9 +20,7 @@ class _StridedFp16Module(torch.nn.Module):
             torch.arange(6, device=device, dtype=torch.float16).reshape(2, 3).t()
         )
         self.bias = torch.nn.Parameter(
-            (torch.arange(6, device=device, dtype=torch.float16) + 10)
-            .reshape(2, 3)
-            .t()
+            (torch.arange(6, device=device, dtype=torch.float16) + 10).reshape(2, 3).t()
         )
         self.register_buffer(
             "offset",
