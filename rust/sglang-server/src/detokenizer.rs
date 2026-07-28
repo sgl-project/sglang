@@ -23,6 +23,7 @@ use crate::ids::RidHash;
 use crate::message::DetokMsg;
 use crate::message::{ChunkEvent, EgressItem, EgressSink, Matched, SinkError, TokenIds};
 use crate::runtime::Runnable;
+use crate::tokenizer_manager::AbortSource;
 
 /// Default for `skip_special_tokens` (SGLang's SamplingParams default). The
 /// per-request value isn't available on the egress side yet; see the note in
@@ -135,7 +136,7 @@ pub struct DetokenizerWorker {
     backend: DetokenizerBackend,
     /// Unbounded abort lane, used to abort a request the shard had to drop
     /// (client backpressure) so the scheduler stops generating for it.
-    abort: flume::Sender<String>,
+    abort: flume::Sender<AbortSource>,
 }
 
 impl DetokenizerWorker {
@@ -143,7 +144,7 @@ impl DetokenizerWorker {
         shard: usize,
         rx: flume::Receiver<DetokMsg>,
         backend: DetokenizerBackend,
-        abort: flume::Sender<String>,
+        abort: flume::Sender<AbortSource>,
     ) -> Self {
         Self {
             shard,
@@ -226,12 +227,12 @@ fn handle_fail(
     table: &mut HashMap<RidHash, DetokState>,
     id: RidHash,
     message: String,
-    abort: &flume::Sender<String>,
+    abort: &flume::Sender<AbortSource>,
 ) {
     if let Some(mut st) = table.remove(&id) {
         // Abort first: `try_send` on the sink can release the handler, which frees
         // the rid for reuse (same ordering hazard as the disconnect path).
-        let _ = abort.send(st.rid.clone());
+        let _ = abort.send(AbortSource::Detok(st.rid.clone()));
         let _ = st
             .sink
             .try_send(EgressItem::Error(Error::Internal(message)));
@@ -243,7 +244,7 @@ fn handle_chunk(
     table: &mut HashMap<RidHash, DetokState>,
     mut ev: ChunkEvent,
     backend: &DetokenizerBackend,
-    abort: &flume::Sender<String>,
+    abort: &flume::Sender<AbortSource>,
 ) {
     let id = RidHash(ev.rid_hash); // raw u64 from the wire — no parse
 
@@ -285,7 +286,7 @@ fn handle_chunk(
                 // scheduler keeps generating for a connection that is already gone
                 // — the other two terminal paths (disconnect, fail) both abort.
                 let _ = st.fsm.apply(Event::Error(e.clone()));
-                let _ = abort.send(st.rid.clone());
+                let _ = abort.send(AbortSource::Detok(st.rid.clone()));
                 let _ = st.sink.try_send(EgressItem::Error(e));
                 table.remove(&id);
                 return;
@@ -358,7 +359,7 @@ fn handle_chunk(
             // exists to prevent, reached through the one abort producer that
             // bypasses the guard's ordering.
             if matches!(e, SinkError::Full) {
-                let _ = abort.send(st.rid.clone());
+                let _ = abort.send(AbortSource::Detok(st.rid.clone()));
             }
             table.remove(&id);
         }
@@ -416,7 +417,7 @@ mod tests {
             },
         );
 
-        let (tm_tx, tm_rx) = flume::unbounded::<String>();
+        let (tm_tx, tm_rx) = flume::unbounded::<AbortSource>();
         let ev = ChunkEvent {
             rid_hash: 1,
             token_ids: vec![5],
@@ -429,7 +430,7 @@ mod tests {
         // ...and the scheduler was told to abort it.
         assert!(matches!(
             tm_rx.try_recv(),
-            Ok(rid) if rid == "1"
+            Ok(AbortSource::Detok(rid)) if rid == "1"
         ));
     }
 
@@ -481,7 +482,7 @@ mod tests {
                 fsm: RequestState::Queued,
             },
         );
-        let (tm_tx, _tm_rx) = flume::unbounded::<String>();
+        let (tm_tx, _tm_rx) = flume::unbounded::<AbortSource>();
         let ev = ChunkEvent {
             rid_hash: 1,
             token_ids: ids,
