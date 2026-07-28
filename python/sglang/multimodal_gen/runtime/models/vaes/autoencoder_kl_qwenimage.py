@@ -750,6 +750,11 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         )
 
         assign_causal_cache_keys(self)
+        # Handed to causal_cache_scope so the convs read a plain attribute
+        # instead of the contextvar, which torch.compile cannot trace.
+        self._cache_consumers = [
+            m for m in self.modules() if isinstance(m, CausalConv3d)
+        ]
 
     def enable_tiling(
         self,
@@ -811,7 +816,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
 
         iter_ = 1 + (num_frame - 1) // 4
         cache = CausalConvCache(CausalCacheMode.STREAMING, retain=iter_ > 1)
-        with causal_cache_scope(cache):
+        with causal_cache_scope(cache, self._cache_consumers):
             for i in range(iter_):
                 if i == 0:
                     out = self.encoder(x[:, :, :1, :, :])
@@ -888,7 +893,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         # changes the height a cached tail would have.
         cache = CausalConvCache(CausalCacheMode.STREAMING, retain=num_frame > 1)
         decoded = []
-        with causal_cache_scope(cache):
+        with causal_cache_scope(cache, self._cache_consumers):
             for i in range(num_frame):
                 decoded.append(self.decoder(x[:, :, i : i + 1, :, :]))
                 cache.advance_chunk()
@@ -985,7 +990,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
                 cache = CausalConvCache(
                     CausalCacheMode.STREAMING, retain=frame_range > 1
                 )
-                with causal_cache_scope(cache):
+                with causal_cache_scope(cache, self._cache_consumers):
                     for k in range(frame_range):
                         if k == 0:
                             tile = x[:, :, :1, i: i + self.tile_sample_min_height, j: j + self.tile_sample_min_width]
@@ -1057,7 +1062,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
                 cache = CausalConvCache(
                     CausalCacheMode.STREAMING, retain=num_frames > 1
                 )
-                with causal_cache_scope(cache):
+                with causal_cache_scope(cache, self._cache_consumers):
                     for k in range(num_frames):
                         tile = z[:, :, k: k + 1, i: i + tile_latent_min_height, j: j + tile_latent_min_width]
                         tile = self.post_quant_conv(tile)

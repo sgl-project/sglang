@@ -198,10 +198,16 @@ class WanUpsample(nn.Upsample):
     Perform upsampling while ensuring the output tensor has the same data type as the input.
     """
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Fixed for the process. Asked per call it would break the compiled
+        # graph at every upsample, which is most of the decoder's breaks.
+        self.needs_float_upcast = not current_platform.is_amp_supported()
+
     def forward(self, x):
-        if current_platform.is_amp_supported():
-            return super().forward(x)
-        return super().forward(x.float()).type_as(x)
+        if self.needs_float_upcast:
+            return super().forward(x.float()).type_as(x)
+        return super().forward(x)
 
 
 def attention_block_forward(self, x):
@@ -1168,6 +1174,11 @@ class AutoencoderKLWan(ParallelTiledVAE):
         self.use_feature_cache = config.use_feature_cache
         self._causal_session_cache: CausalConvCache | None = None
         assign_causal_cache_keys(self)
+        # Handed to causal_cache_scope so the convs read a plain attribute
+        # instead of the contextvar, which torch.compile cannot trace.
+        self._cache_consumers = [
+            m for m in self.modules() if isinstance(m, CausalConv3d)
+        ]
 
     def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
         return should_run_spatial_shard_parallel_decode(self.config, z)
@@ -1197,7 +1208,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
             if self._should_use_spatial_parallel_decode(z)
             else disable_spatial_parallel_decode()
         )
-        with spatial_context, causal_cache_scope(cache):
+        with spatial_context, causal_cache_scope(cache, self._cache_consumers):
             for i in range(iter_):
                 outs.append(self.decoder(x[:, :, i : i + 1, :, :]))
                 cache.advance_chunk()
@@ -1217,7 +1228,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
             t = x.shape[2]
             iter_ = 1 + (t - 1) // 4
             cache = CausalConvCache(CausalCacheMode.STREAMING, retain=iter_ > 1)
-            with causal_cache_scope(cache):
+            with causal_cache_scope(cache, self._cache_consumers):
                 for i in range(iter_):
                     if i == 0:
                         out = self.encoder(x[:, :, :1, :, :])
@@ -1236,7 +1247,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
     def _encode(self, x: torch.Tensor, first_frame=False) -> torch.Tensor:
         mode = CausalCacheMode.FIRST_FRAME if first_frame else CausalCacheMode.STATELESS
-        with causal_cache_scope(CausalConvCache(mode)):
+        with causal_cache_scope(CausalConvCache(mode), self._cache_consumers):
             out = self.encoder(x)
         enc = self.quant_conv(out)
         mu, logvar = enc[:, : self.z_dim, :, :, :], enc[:, self.z_dim :, :, :, :]
@@ -1271,7 +1282,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
                 else disable_spatial_parallel_decode()
             )
             cache = CausalConvCache(CausalCacheMode.STREAMING, retain=iter_ > 1)
-            with spatial_context, causal_cache_scope(cache):
+            with spatial_context, causal_cache_scope(cache, self._cache_consumers):
                 out_chunks = []
                 for i in range(iter_):
                     out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
@@ -1298,7 +1309,9 @@ class AutoencoderKLWan(ParallelTiledVAE):
         mode = CausalCacheMode.FIRST_FRAME if first_frame else CausalCacheMode.STATELESS
         # The cache scope lives inside the spatial context: switching the shard
         # on or off changes the height a cached tail would have.
-        with spatial_context, causal_cache_scope(CausalConvCache(mode)):
+        with spatial_context, causal_cache_scope(
+            CausalConvCache(mode), self._cache_consumers
+        ):
             out = self.decoder(x)
 
         out = torch.clamp(out, min=-1.0, max=1.0)

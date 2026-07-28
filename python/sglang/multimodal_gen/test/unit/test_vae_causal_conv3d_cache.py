@@ -116,7 +116,7 @@ def _run_managed(conv, chunks, mode=CausalCacheMode.STREAMING):
     """Drive a cache-managed conv chunk by chunk inside one cache scope."""
     cache = CausalConvCache(mode)
     outs = []
-    with causal_cache_scope(cache):
+    with causal_cache_scope(cache, [conv]):
         for chunk in chunks:
             outs.append(conv(chunk))
             cache.advance_chunk()
@@ -193,7 +193,7 @@ class TestCausalConv3dCache(unittest.TestCase):
         x = torch.randn((1, 4, 3, 5, 7), dtype=torch.float64, generator=self.generator)
         expected = F.conv3d(x, conv.weight, conv.bias)
         cache = CausalConvCache(CausalCacheMode.STREAMING)
-        with causal_cache_scope(cache):
+        with causal_cache_scope(cache, [conv]):
             torch.testing.assert_close(conv(x), expected, rtol=0, atol=0)
         self.assertFalse(cache.contains("pointwise"))
 
@@ -333,15 +333,34 @@ class TestCausalConv3dCache(unittest.TestCase):
         conv.cache_key = "conv"
         x = torch.randn((1, 4, 1, 5, 7), dtype=torch.float64, generator=self.generator)
         with self.assertRaises(RuntimeError):
-            with causal_cache_scope(CausalConvCache()):
+            with causal_cache_scope(CausalConvCache(), [conv]):
                 conv(x)
                 raise RuntimeError("boom")
+        self.assertIsNone(conv._active_cache)
         # A fresh scope must not observe the aborted pass.
         cache = CausalConvCache()
-        with causal_cache_scope(cache):
+        with causal_cache_scope(cache, [conv]):
             conv(x)
         self.assertEqual(cache.chunk_index, 0)
         self.assertTrue(cache.contains("conv"))
+
+    def test_nested_scope_hands_back_the_outer_cache(self):
+        """A tiled encode opens an inner scope inside an outer forward pass."""
+        conv = CausalConv3d(4, 4, 3, padding=1).double().eval()
+        conv.cache_key = "conv"
+        outer, inner = CausalConvCache(), CausalConvCache()
+        with causal_cache_scope(outer, [conv]):
+            self.assertIs(conv._active_cache, outer)
+            with causal_cache_scope(inner, [conv]):
+                self.assertIs(conv._active_cache, inner)
+            self.assertIs(conv._active_cache, outer)
+        self.assertIsNone(conv._active_cache)
+
+    def test_platform_capabilities_are_resolved_at_construction(self):
+        """Querying the platform per call breaks the compiled graph."""
+        conv = CausalConv3d(4, 4, 3, padding=1)
+        self.assertIsInstance(conv.channels_last_supported, bool)
+        self.assertIsInstance(conv.needs_dtype_cast, bool)
 
     def test_cached_tail_does_not_pin_the_activation(self):
         """The retained tail must be a copy, not a view of the whole chunk."""
@@ -349,7 +368,7 @@ class TestCausalConv3dCache(unittest.TestCase):
         conv.cache_key = "conv"
         x = torch.randn((1, 4, 8, 5, 7), dtype=torch.float64, generator=self.generator)
         cache = CausalConvCache()
-        with causal_cache_scope(cache):
+        with causal_cache_scope(cache, [conv]):
             conv(x)
         tail = cache.get("conv")
         self.assertEqual(tail.shape[2], conv.cache_frames)

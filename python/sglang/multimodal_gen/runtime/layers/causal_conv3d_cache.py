@@ -17,9 +17,14 @@ These VAEs encode and decode a video one temporal chunk at a time, so every
 convolution that is causal in time has to carry the tail of the previous chunk
 across calls. The cache lives in a :class:`CausalConvCache` installed for the
 duration of one encode/decode via :func:`causal_cache_scope`; convolutions look
-it up by their own module path. Modules therefore hold no runtime state, which
-keeps concurrent sessions independent and makes an aborted forward pass
-impossible to observe.
+their entry up by their own module path, so the layout does not depend on the
+order in which they run.
+
+The scope also hands each convolution a direct reference to the cache, because
+``ContextVar.get`` is not traceable and reading it per convolution breaks the
+compiled graph. That reference is scoped: it is restored on exit, including when
+the forward pass raises, and a nested scope gives the outer one its own back.
+The cache itself is never module state, so the modules stay reusable.
 """
 
 import contextvars
@@ -112,12 +117,26 @@ def current_causal_cache() -> CausalConvCache | None:
 
 
 @contextmanager
-def causal_cache_scope(cache: CausalConvCache | None):
-    """Install ``cache`` for the enclosed forward pass."""
+def causal_cache_scope(cache: CausalConvCache | None, consumers=()):
+    """Install ``cache`` for the enclosed forward pass.
+
+    ``consumers`` are the modules that will read it. They get a direct reference
+    as well as the contextvar: ``ContextVar.get`` is not traceable, so reading it
+    per convolution breaks the compiled graph once per call, while an attribute
+    read is free. The contextvar remains the source of truth for anything not in
+    the list.
+    """
     token = _current_cache.set(cache)
+    previous = [consumer._active_cache for consumer in consumers]
+    for consumer in consumers:
+        consumer._active_cache = cache
     try:
         yield cache
     finally:
+        # Restore rather than clear, so a nested scope hands the outer one back
+        # its own cache.
+        for consumer, prior in zip(consumers, previous, strict=True):
+            consumer._active_cache = prior
         _current_cache.reset(token)
 
 
@@ -147,6 +166,12 @@ def assign_causal_cache_keys(root: nn.Module) -> None:
 
 
 def _channels_last_3d_supported_by_platform() -> bool:
+    """Whether this build and device pair can use channels_last_3d at all.
+
+    Resolved once and cached on each conv at construction: it cannot change
+    during the process, and querying the platform from inside a traced region
+    breaks the graph (the platform helpers are not traceable Python).
+    """
     return hasattr(torch, "channels_last_3d") and (
         current_platform.is_cuda() or current_platform.is_rocm()
     )
@@ -176,7 +201,7 @@ def memory_format_of(x: torch.Tensor) -> torch.memory_format:
     """
     if (
         x.dim() == 5
-        and hasattr(torch, "channels_last_3d")
+        and _channels_last_3d_supported_by_platform()
         and x.is_contiguous(memory_format=torch.channels_last_3d)
         and not x.is_contiguous()
     ):
@@ -251,17 +276,26 @@ class CausalConv3d(nn.Conv3d):
         # padding is asymmetric. Height and width are symmetric, which is what
         # cuDNN's implicit padding does natively.
         self.padding = (0, 0, 0)
+        # Platform capabilities are fixed for the process. Reading them here
+        # rather than per call keeps them out of any traced region: the platform
+        # helpers are not traceable Python and would break the graph on every
+        # convolution.
+        # Set by causal_cache_scope; read instead of the contextvar so the
+        # compiled graph does not break once per convolution.
+        self._active_cache: CausalConvCache | None = None
+        self.channels_last_supported = _channels_last_3d_supported_by_platform()
+        self.needs_dtype_cast = not current_platform.is_amp_supported()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.cache_frames == 0:
             return self._conv(x, time_pad=0)
-        cache = current_causal_cache()
+        cache = self._active_cache
         if cache is None or cache.mode is not CausalCacheMode.STREAMING:
             return self._conv(x, time_pad=self.stateless_pad_frames)
         return self._conv(self._consume_cache(x, cache), time_pad=0)
 
     def _consume_cache(self, x: torch.Tensor, cache: CausalConvCache) -> torch.Tensor:
-        memory_format = memory_format_of(x)
+        memory_format = self._memory_format_of(x)
         prev = cache.get(self.cache_key)
         if prev is None:
             # Same result as concatenating a zero-filled cache, but in one kernel
@@ -272,6 +306,17 @@ class CausalConv3d(nn.Conv3d):
         if cache.retain:
             cache.set(self.cache_key, self._retain_tail(x, memory_format))
         return x
+
+    def _memory_format_of(self, x: torch.Tensor) -> torch.memory_format:
+        """Layout of ``x``, without querying the platform inside the trace."""
+        if (
+            self.channels_last_supported
+            and x.dim() == 5
+            and x.is_contiguous(memory_format=torch.channels_last_3d)
+            and not x.is_contiguous()
+        ):
+            return torch.channels_last_3d
+        return torch.contiguous_format
 
     def _retain_tail(
         self, x: torch.Tensor, memory_format: torch.memory_format
@@ -291,7 +336,7 @@ class CausalConv3d(nn.Conv3d):
     def _conv(self, x: torch.Tensor, *, time_pad: int) -> torch.Tensor:
         if time_pad:
             x = F.pad(x, (0, 0, 0, 0, time_pad, 0))
-        if not current_platform.is_amp_supported():
+        if self.needs_dtype_cast:
             x = x.to(self.weight.dtype)
         return self._conv_impl(x)
 
@@ -303,7 +348,12 @@ class CausalConv3d(nn.Conv3d):
         Conv2D, for one, immediately gathers into a standard-contiguous buffer,
         so converting to channels_last_3d first is pure loss.
         """
-        x = match_conv3d_input_format(x, self.weight)
+        if (
+            self.channels_last_supported
+            and x.dim() == 5
+            and self.weight.is_contiguous(memory_format=torch.channels_last_3d)
+        ):
+            x = x.contiguous(memory_format=torch.channels_last_3d)
         return F.conv3d(
             x,
             self.weight,
@@ -342,7 +392,7 @@ class TimeDownsampleCausalConv3d(CausalConv3d):
         self.stateless_pad_frames = 2
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        cache = current_causal_cache()
+        cache = self._active_cache
         if cache is None:
             return super().forward(x)
         if cache.mode is CausalCacheMode.FIRST_FRAME:
@@ -351,7 +401,9 @@ class TimeDownsampleCausalConv3d(CausalConv3d):
             self.cache_key
         ):
             if cache.retain:
-                cache.set(self.cache_key, self._retain_tail(x, memory_format_of(x)))
+                cache.set(
+                    self.cache_key, self._retain_tail(x, self._memory_format_of(x))
+                )
             return x
         return super().forward(x)
 
@@ -365,7 +417,7 @@ class TimeUpsampleCausalConv3d(CausalConv3d):
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        cache = current_causal_cache()
+        cache = self._active_cache
         if cache is None:
             return interleave_time(super().forward(x))
         if cache.mode is CausalCacheMode.FIRST_FRAME:
