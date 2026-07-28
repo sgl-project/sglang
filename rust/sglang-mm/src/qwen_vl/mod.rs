@@ -7,7 +7,7 @@
 //! copies duplicated for stills) — plus the image-only M-RoPE fast path.
 //! All parameters come from the runtime spec; nothing is hardcoded per model.
 
-use crate::common::{par, resize, token_layout};
+use crate::common::{par, resize, round_half_even, token_layout};
 use crate::pipeline::{
     DecodedMedia, Geometry, MmFamilyProcessor, PositionOutput, ProcessedItem, Tensor, TensorData,
     TokenLayout,
@@ -190,15 +190,6 @@ impl MmFamilyProcessor for QwenVlProcessor {
     }
 }
 
-/// Python-`round()` (round-half-to-even), which `round_by_factor` relies on.
-fn round_half_even(x: f64) -> f64 {
-    if (x - x.trunc()).abs() == 0.5 {
-        (x / 2.0).round() * 2.0
-    } else {
-        x.round()
-    }
-}
-
 /// The Qwen `smart_resize`: dims divisible by `factor`, total pixels within
 /// `[min_pixels, max_pixels]`, aspect ratio preserved as closely as possible.
 pub fn smart_resize(
@@ -305,8 +296,10 @@ pub fn mrope_image_only(
 
 /// The qwen scheduler-drain shape, extracted from the generic driver
 /// [`Output`](crate::driver::Output). Shared by `sglang-server`'s MM worker
-/// and the parity binding so the mapping can't drift; replaced by a generic
-/// named-tensor handoff once a second family needs a different shape.
+/// and the parity binding so the mapping can't drift. `mimo_v2` produces the
+/// same shape (f32 features + `image_grid_thw` + `[3, len]` positions), so it
+/// drains through here too; replaced by a generic named-tensor handoff once a
+/// family needs a different shape.
 pub struct QwenDrain {
     pub input_ids: Vec<i32>,
     /// All items' `pixel_values`, concatenated in prompt order.
@@ -357,7 +350,7 @@ pub fn pack_drain(output: crate::driver::Output) -> Result<QwenDrain, String> {
 // --- Python bindings (parity tests drive the exact server pipeline) ---
 
 #[cfg(feature = "python")]
-mod python {
+pub(crate) mod python {
     use numpy::{IntoPyArray, PyArray1};
     use pyo3::exceptions::PyValueError;
     use pyo3::prelude::*;
@@ -369,7 +362,7 @@ mod python {
     type PyProcessedImage<'py> = (Bound<'py, PyArray1<f32>>, (u32, u32, u32));
     /// Full native pipeline output at the scheduler boundary:
     /// `(input_ids, features, grids, hashes, offsets, mrope, mrope_delta)`.
-    type PyNativeOutput<'py> = (
+    pub(crate) type PyNativeOutput<'py> = (
         Vec<i32>,
         Bound<'py, PyArray1<f32>>,
         Vec<(u32, u32, u32)>,
@@ -438,16 +431,18 @@ mod python {
     /// One image source: a `str` (data:/base64/file/http, resolved by
     /// `common::fetch`) or raw encoded `bytes`.
     #[derive(FromPyObject)]
-    enum PyImageSource {
+    pub(crate) enum PyImageSource {
         Str(String),
         Bytes(Vec<u8>),
     }
 
-    /// Drive the same typed native Qwen request pipeline used by
-    /// `sglang-server` (whose message layer owns the wire-payload parsing).
+    /// Drive the typed native request pipeline used by `sglang-server`
+    /// (whose message layer owns the wire-payload parsing). Family-generic —
+    /// the spec's `family` field selects the processor — and re-registered in
+    /// each family module that drains through [`pack_drain`]'s shape.
     #[pyfunction]
     #[pyo3(signature = (input_ids, images, spec_json))]
-    fn process_native_mm<'py>(
+    pub(crate) fn process_native_mm<'py>(
         py: Python<'py>,
         input_ids: Option<Vec<i32>>,
         images: Vec<PyImageSource>,

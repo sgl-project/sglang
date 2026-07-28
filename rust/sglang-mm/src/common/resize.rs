@@ -212,6 +212,71 @@ pub fn resize_lanczos_rgb(src: &[u8], h: usize, w: usize, out_h: usize, out_w: u
     resize_rgb_filter(src, h, w, out_h, out_w, Filter::Lanczos)
 }
 
+/// One output coordinate's source neighbors along an axis for the torch
+/// bilinear kernel: `v = (1-lambda)*src[i0] + lambda*src[i1]`.
+struct BilinearTap {
+    i0: usize,
+    i1: usize,
+    lambda: f32,
+}
+
+/// `(scale * (out_idx + 0.5) - 0.5).max(0)` per output index — torch's
+/// `area_pixel_compute_source_index` (align_corners=False), in f32 like the
+/// CPU kernel for float inputs.
+fn bilinear_taps(in_size: usize, out_size: usize) -> Vec<BilinearTap> {
+    let scale = in_size as f32 / out_size as f32;
+    (0..out_size)
+        .map(|o| {
+            let src = (scale * (o as f32 + 0.5) - 0.5).max(0.0);
+            let i0 = (src as usize).min(in_size - 1);
+            BilinearTap {
+                i0,
+                i1: (i0 + 1).min(in_size - 1),
+                lambda: src - i0 as f32,
+            }
+        })
+        .collect()
+}
+
+/// `torch.nn.functional.interpolate(mode="bilinear", align_corners=False)`
+/// equivalent on a flat HWC u8 RGB buffer, producing f32 in the source pixel
+/// scale. Unlike the PIL kernels above this never antialiases on downscale —
+/// torch without `antialias=True` point-samples one 2x2 neighborhood per
+/// output pixel — and it never quantizes back to u8.
+pub fn resize_rgb_f32_torch_bilinear(
+    src: &[u8],
+    h: usize,
+    w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> Vec<f32> {
+    if (out_h, out_w) == (h, w) {
+        // Identity scale maps every output index onto its source index
+        // (lambda 0), so torch degenerates to the plain float cast.
+        return src.iter().map(|&v| v as f32).collect();
+    }
+    let ys = bilinear_taps(h, out_h);
+    let xs = bilinear_taps(w, out_w);
+    let mut out = vec![0.0f32; out_h * out_w * 3];
+    par::for_chunks_mut(&mut out, out_w * 3, |yy, row| {
+        let y = &ys[yy];
+        let (r0, r1) = (y.i0 * w * 3, y.i1 * w * 3);
+        for (xx, x) in xs.iter().enumerate() {
+            for c in 0..3 {
+                let v00 = src[r0 + x.i0 * 3 + c] as f32;
+                let v01 = src[r0 + x.i1 * 3 + c] as f32;
+                let v10 = src[r1 + x.i0 * 3 + c] as f32;
+                let v11 = src[r1 + x.i1 * 3 + c] as f32;
+                // Torch's accumulation order: lerp horizontally per row,
+                // then vertically, all in f32.
+                row[xx * 3 + c] = (1.0 - y.lambda) * ((1.0 - x.lambda) * v00 + x.lambda * v01)
+                    + y.lambda * ((1.0 - x.lambda) * v10 + x.lambda * v11);
+            }
+        }
+    });
+    out
+}
+
 pub fn scaled_dims(w: usize, h: usize, frac: Option<f64>, cap: Option<i64>) -> (usize, usize) {
     let Some(frac) = frac else {
         return (w, h);
@@ -231,4 +296,76 @@ pub fn scaled_dims(w: usize, h: usize, frac: Option<f64>, cap: Option<i64>) -> (
     }
     let scale = |v: usize| ((v as f64 * ratio + 0.5).floor() as i64).max(1) as usize;
     (scale(w), scale(h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Values from `torch.nn.functional.interpolate(mode="bilinear",
+    /// align_corners=False)` run offline on a 4x6 ramp image (pixel value =
+    /// flat index), down- and up-scaled. Pins the align_corners=False source
+    /// mapping and the no-antialias 2x2 sampling — an antialiased or
+    /// align_corners=True rewrite produces different values on both.
+    #[test]
+    fn torch_bilinear_matches_reference() {
+        let (h, w) = (4usize, 6usize);
+        let src: Vec<u8> = (0..(h * w * 3) as u8).collect();
+
+        let down = resize_rgb_f32_torch_bilinear(&src, h, w, 2, 4);
+        let ch = |out: &[f32], c: usize| -> Vec<f32> {
+            out.iter().skip(c).step_by(3).copied().collect()
+        };
+        assert_eq!(
+            ch(&down, 0),
+            [9.75, 14.25, 18.75, 23.25, 45.75, 50.25, 54.75, 59.25]
+        );
+        assert_eq!(
+            ch(&down, 2),
+            [11.75, 16.25, 20.75, 25.25, 47.75, 52.25, 56.75, 61.25]
+        );
+
+        let up = resize_rgb_f32_torch_bilinear(&src, h, w, 5, 7);
+        let row = |c: usize, y: usize| -> Vec<f32> {
+            up[(y * 7) * 3..(y + 1) * 7 * 3]
+                .iter()
+                .skip(c)
+                .step_by(3)
+                .copied()
+                .collect()
+        };
+        let expect_r0 = [
+            0.0,
+            2.357142925262451,
+            4.928571701049805,
+            7.5,
+            10.071428298950195,
+            12.642857551574707,
+            15.0,
+        ];
+        let expect_c1_r3 = [
+            42.39999771118164,
+            44.75714111328125,
+            47.328575134277344,
+            49.89999771118164,
+            52.4714241027832,
+            55.0428581237793,
+            57.39999771118164,
+        ];
+        for (got, want) in row(0, 0).iter().zip(expect_r0) {
+            assert!((got - want).abs() < 1e-4, "{got} != {want}");
+        }
+        for (got, want) in row(1, 3).iter().zip(expect_c1_r3) {
+            assert!((got - want).abs() < 1e-4, "{got} != {want}");
+        }
+    }
+
+    /// Identity size must be the plain float cast (torch's identity mapping),
+    /// not a resampled copy.
+    #[test]
+    fn torch_bilinear_identity_is_exact() {
+        let src: Vec<u8> = (0..48).collect();
+        let out = resize_rgb_f32_torch_bilinear(&src, 4, 4, 4, 4);
+        assert_eq!(out, src.iter().map(|&v| v as f32).collect::<Vec<_>>());
+    }
 }

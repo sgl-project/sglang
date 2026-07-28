@@ -122,6 +122,17 @@ class NativeMmHost:
         approximating it."""
         import json
 
+        spec = self._resolve_qwen_spec()
+        if spec is None:
+            spec = self._resolve_mimo_spec()
+        if spec is None:
+            return None
+        logger.info(
+            "rust server: native MM pipeline enabled (family=%s)", spec["family"]
+        )
+        return json.dumps(spec)
+
+    def _resolve_qwen_spec(self) -> Optional[Dict[str, Any]]:
         from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 
         hf_config = self.model_config.hf_config
@@ -178,8 +189,61 @@ class NativeMmHost:
             * spec["patch_size"]
             * spec["patch_size"],
         }
-        logger.info("rust server: native MM pipeline enabled (family=qwen_vl)")
-        return json.dumps(spec)
+        return spec
+
+    def _resolve_mimo_spec(self) -> Optional[Dict[str, Any]]:
+        """MiMo-V2 family (``model_type="mimo_v2"``, e.g. MiMo-V2.5): images
+        only, 1-D-rope checkpoints only. Parameters come from the resolved
+        ``MiMoProcessor`` the Python TokenizerManager would drive — the single
+        source that already merged ``processor_config``/``vision_config`` —
+        so the native pipeline cannot drift from the Python one. Pixel-limit
+        knobs in ``--mm-process-config`` are ignored on both paths (the MiMo
+        processor never reads them), so they don't disable the native
+        pipeline the way they would for Qwen."""
+        from sglang.srt.multimodal.processors.mimo_v2 import (
+            _QWEN2VL_PIXEL_MEAN,
+            _QWEN2VL_PIXEL_STD,
+            MiMoV2Processor,
+        )
+
+        hf_config = self.model_config.hf_config
+        if (
+            type(self.mm_processor) is not MiMoV2Processor
+            or getattr(hf_config, "model_type", None) != "mimo_v2"
+        ):
+            return None
+        mp = self.mm_processor.mimo_processor
+        # The native pipeline emits the rope_type="rope" position contract
+        # ([3, len] arange, delta 0). An mrope checkpoint would need the Qwen
+        # get_rope_index path instead; none exists to validate against, so
+        # refuse rather than approximate.
+        if mp.rope_type != "rope":
+            return None
+
+        spec = {
+            "family": "mimo_v2",
+            "feature_shm": self._use_feature_shm(),
+            "image_token_id": mp.image_token_id,
+            "patch_size": mp.patch_size,
+            "merge_size": mp.merge_size,
+            "temporal_patch_size": mp.temporal_patch_size,
+            "min_pixels": int(mp.default_image_processor_kwargs["min_pixels"]),
+            "max_pixels": int(mp.default_image_processor_kwargs["max_pixels"]),
+            # 0..255-scale constants: MiMo standardizes unrescaled floats.
+            "image_mean": _QWEN2VL_PIXEL_MEAN.flatten().tolist(),
+            "image_std": _QWEN2VL_PIXEL_STD.flatten().tolist(),
+        }
+        self._native = {
+            **spec,
+            "vision_start_token_id": mp.vision_start_token_id,
+            "vision_end_token_id": mp.vision_end_token_id,
+            "video_token_id": mp.video_token_id,
+            "feature_dim": 3
+            * spec["temporal_patch_size"]
+            * spec["patch_size"]
+            * spec["patch_size"],
+        }
+        return spec
 
     def _use_feature_shm(self) -> bool:
         """Park native feature buffers in POSIX shm instead of the sidecar.
@@ -229,9 +293,7 @@ class NativeMmHost:
         native = self._native
         features_arr, shm_names, grids, hashes, offsets, mrope_arr, mrope_delta = entry
         if shm_names is None:
-            features = torch.from_numpy(
-                features_arr.reshape(-1, native["feature_dim"])
-            )
+            features = torch.from_numpy(features_arr.reshape(-1, native["feature_dim"]))
         items = []
         row = 0
         for index, ((t, h, w), item_hash, offset) in enumerate(
@@ -371,8 +433,10 @@ class RustServer:
                 raise RuntimeError(
                     "SGLANG_RUST_SERVER=1: no native Rust MM pipeline for "
                     f"model_type={scheduler.model_config.hf_config.model_type!r} "
-                    f"(supported: {', '.join(sorted(NativeMmHost.NATIVE_QWEN_MODEL_TYPES))}; "
-                    "images only). Unset SGLANG_RUST_SERVER to serve this model."
+                    "(supported: "
+                    f"{', '.join(sorted(NativeMmHost.NATIVE_QWEN_MODEL_TYPES))}, "
+                    "mimo_v2; images only). Unset SGLANG_RUST_SERVER to serve "
+                    "this model."
                 )
             server.start_mm_workers(spec, mm_host.mm_workers)
 

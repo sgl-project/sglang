@@ -30,6 +30,16 @@ pub fn pool() -> &'static rayon::ThreadPool {
     })
 }
 
+/// Python-`round()` (round-half-to-even), which the `smart_resize` variants'
+/// `round_by_factor` steps rely on.
+pub fn round_half_even(x: f64) -> f64 {
+    if (x - x.trunc()).abs() == 0.5 {
+        (x / 2.0).round() * 2.0
+    } else {
+        x.round()
+    }
+}
+
 /// Content hash for cache/dedup identity: blake3 truncated to its first 8
 /// bytes, big-endian. Deliberately *not* Python's `mm_utils.data_hash` (which
 /// is SHA-256 truncated the same way) — hashes are consistent within a path,
