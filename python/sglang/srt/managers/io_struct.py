@@ -268,6 +268,9 @@ class GenerateReqInput:
     background: bool = False
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
+    # Per-request thinking budget. Requires strict thinking so the runtime can
+    # enforce the limit rather than silently treating it as metadata.
+    max_thinking_tokens: Optional[int] = None
 
     # Priority for the request
     priority: Optional[int] = None
@@ -311,12 +314,17 @@ class GenerateReqInput:
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
-    def regenerate_rid(self):
+    def regenerate_rid(self, prefix: Optional[str] = None):
         """Generate a new request ID and return it."""
+
+        def new_rid() -> str:
+            suffix = uuid.uuid4().hex
+            return f"{prefix}_{suffix}" if prefix is not None else suffix
+
         if isinstance(self.rid, list):
-            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+            self.rid = [new_rid() for _ in range(len(self.rid))]
         else:
-            self.rid = uuid.uuid4().hex
+            self.rid = new_rid()
         return self.rid
 
     def _validate_rid_uniqueness(self):
@@ -781,6 +789,8 @@ class GenerateReqInput:
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
+            require_reasoning=self.require_reasoning,
+            max_thinking_tokens=self.max_thinking_tokens,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,

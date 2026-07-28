@@ -66,12 +66,6 @@ fn sampling_params_to_map(
             if let Some(v) = p.seed {
                 map.insert("sampling_seed".into(), serde_json::json!(v));
             }
-            if let Some(max_thinking_tokens) = p.max_thinking_tokens {
-                map.insert(
-                    "custom_params".into(),
-                    serde_json::json!({"thinking_budget": max_thinking_tokens}),
-                );
-            }
             if p.guided_decoding.is_some() && (p.json_schema.is_some() || p.regex.is_some()) {
                 return Err(
                     "legacy json_schema/regex cannot be combined with guided_decoding".into(),
@@ -225,6 +219,12 @@ pub(crate) fn build_text_generate_dict(
             "require_reasoning".into(),
             serde_json::json!(params.require_reasoning.unwrap_or(false)),
         );
+        if let Some(max_thinking_tokens) = params.max_thinking_tokens {
+            d.insert(
+                "max_thinking_tokens".into(),
+                serde_json::json!(max_thinking_tokens),
+            );
+        }
     }
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
@@ -282,6 +282,12 @@ pub(crate) fn build_generate_dict(
             "require_reasoning".into(),
             serde_json::json!(params.require_reasoning.unwrap_or(false)),
         );
+        if let Some(max_thinking_tokens) = params.max_thinking_tokens {
+            d.insert(
+                "max_thinking_tokens".into(),
+                serde_json::json!(max_thinking_tokens),
+            );
+        }
     }
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
@@ -451,10 +457,7 @@ mod tests {
             mapped["sampling_params"]["sampling_seed"],
             serde_json::json!(42)
         );
-        assert_eq!(
-            mapped["sampling_params"]["custom_params"]["thinking_budget"],
-            serde_json::json!(128)
-        );
+        assert_eq!(mapped["max_thinking_tokens"], serde_json::json!(128));
     }
 
     #[test]

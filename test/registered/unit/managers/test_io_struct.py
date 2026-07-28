@@ -268,11 +268,18 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             text="Hello",
             rid="single",
             sampling_params={"n": 3},
+            require_reasoning=True,
+            max_thinking_tokens=128,
         )
         single.normalize_batch_and_arguments()
 
         self.assertEqual(single.rid, ["single"])
         self.assertEqual([single[i].rid for i in range(3)], ["single"] * 3)
+        self.assertTrue(all(single[i].require_reasoning for i in range(3)))
+        self.assertEqual(
+            [single[i].max_thinking_tokens for i in range(3)],
+            [128] * 3,
+        )
 
         batch = GenerateReqInput(
             text=["Hello", "World"],
@@ -628,6 +635,14 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         self.assertNotEqual(original_rid, new_rid)
         self.assertEqual(req.rid, new_rid)
+
+    def test_regenerate_rid_with_parent_prefix(self):
+        req = GenerateReqInput(text="Hello", rid="logical")
+        req.normalize_batch_and_arguments()
+
+        new_rid = req.regenerate_rid(prefix="logical")
+
+        self.assertTrue(new_rid.startswith("logical_"))
 
     def test_error_cases(self):
         """Test various error cases."""

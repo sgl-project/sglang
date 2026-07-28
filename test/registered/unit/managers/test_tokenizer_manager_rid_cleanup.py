@@ -131,6 +131,7 @@ def _make_tokenizer_manager() -> TokenizerManager:
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
     tm.send_to_scheduler = MagicMock()
+    tm._dispatch_to_scheduler = Mock()
     return tm
 
 
@@ -436,6 +437,7 @@ def _make_tm_for_generate() -> TokenizerManager:
     tm = _make_tokenizer_manager()
     tm.server_args.language_only = False
     tm.server_args.tokenizer_worker_num = 1
+    tm.server_args.enable_strict_thinking = False
     tm.auto_create_handle_loop = Mock()
     tm._set_default_priority = Mock()
     tm.request_logger = Mock()
@@ -456,6 +458,7 @@ def _make_generate_obj(rid, is_single):
     obj.received_time = 0.0
     obj.external_trace_header = None
     obj.bootstrap_room = None
+    obj.max_thinking_tokens = None
     obj.normalize_batch_and_arguments = Mock()
     if not is_single:
         obj.__getitem__.side_effect = lambda i: Mock()
@@ -465,8 +468,9 @@ def _make_generate_obj(rid, is_single):
 class TestDiscardPendingReqStates(CustomTestCase):
     """Direct tests for _discard_pending_req_states."""
 
-    def test_discard_single(self):
+    def test_discard_single_aborts_scheduler_before_cleanup(self):
         tm = _make_tokenizer_manager()
+        tm._dispatch_to_scheduler = Mock()
         rid = "d_single"
         tm.rid_to_state[rid] = _make_req_state(rid)
         obj = Mock(spec=GenerateReqInput)
@@ -474,6 +478,9 @@ class TestDiscardPendingReqStates(CustomTestCase):
         obj.rid = rid
         tm._discard_pending_req_states(obj)
         self.assertNotIn(rid, tm.rid_to_state)
+        abort_req = tm._dispatch_to_scheduler.call_args.args[0]
+        self.assertEqual(abort_req.rid, rid)
+        self.assertFalse(abort_req.abort_all)
 
     def test_discard_batch_removes_all(self):
         tm = _make_tokenizer_manager()
@@ -501,7 +508,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
         tm = _make_tokenizer_manager()
         tm._dispatch_to_scheduler = Mock()
         parent = _make_generate_obj("parent", is_single=True)
-        tm._init_req_state(parent)
+        lifecycle_ids = tm._init_req_state(parent)
 
         child_rids = {"prefix", "choice_0", "choice_1"}
         for child_rid in child_rids:
@@ -509,7 +516,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
             tm._init_child_req_state("parent", child)
         tm._remove_req_state("parent")
 
-        tm._discard_pending_req_states(parent, abort_active_children=True)
+        tm._discard_pending_req_states(parent, lifecycle_ids)
 
         aborted_rids = {
             call.args[0].rid for call in tm._dispatch_to_scheduler.call_args_list
@@ -521,6 +528,22 @@ class TestDiscardPendingReqStates(CustomTestCase):
 
         tm._init_req_state(_make_generate_obj("parent", is_single=True))
         self.assertIn("parent", tm.rid_to_state)
+
+    def test_stale_cleanup_does_not_remove_reused_rid(self):
+        tm = _make_tokenizer_manager()
+        tm._dispatch_to_scheduler = Mock()
+        old_obj = _make_generate_obj("reused", is_single=True)
+        old_lifecycle_ids = tm._init_req_state(old_obj)
+        tm._remove_req_state("reused")
+
+        replacement = _make_generate_obj("reused", is_single=True)
+        tm._init_req_state(replacement)
+        replacement_state = tm.rid_to_state["reused"]
+
+        tm._discard_pending_req_states(old_obj, old_lifecycle_ids)
+
+        self.assertIs(tm.rid_to_state["reused"], replacement_state)
+        tm._dispatch_to_scheduler.assert_not_called()
 
 
 class TestParallelAbortRouting(CustomTestCase):
@@ -577,6 +600,30 @@ class TestParallelStreamTaskCleanup(CustomTestCase):
             )
             with self.assertRaisesRegex(RuntimeError, "choice failed"):
                 await stream.__anext__()
+            self.assertTrue(sibling_closed.is_set())
+
+        asyncio.run(drive())
+
+    def test_failing_non_stream_choice_cancels_and_closes_sibling_waiters(self):
+        tm = _make_tokenizer_manager()
+
+        async def drive():
+            sibling_closed = asyncio.Event()
+
+            async def failing_choice():
+                await asyncio.sleep(0)
+                raise RuntimeError("choice failed")
+                yield  # pragma: no cover
+
+            async def blocked_choice():
+                try:
+                    await asyncio.Event().wait()
+                    yield  # pragma: no cover
+                finally:
+                    sibling_closed.set()
+
+            with self.assertRaisesRegex(RuntimeError, "choice failed"):
+                await tm._collect_batch_responses([failing_choice(), blocked_choice()])
             self.assertTrue(sibling_closed.is_set())
 
         asyncio.run(drive())
@@ -703,6 +750,23 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         self.assertFalse(tm.rid_to_state)
         self.assertFalse(tm.logical_rid_to_child_rids)
         self.assertFalse(tm.child_rid_to_logical_rid)
+
+    def test_thinking_budget_rejects_runtime_without_strict_thinking(self):
+        tm = _make_tm_for_generate()
+        obj = GenerateReqInput(
+            text="hello",
+            rid="thinking-budget",
+            sampling_params={},
+            max_thinking_tokens=32,
+        )
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaisesRegex(ValueError, "--enable-strict-thinking"):
+            asyncio.run(drive())
+
+        self.assertFalse(tm.rid_to_state)
 
 
 if __name__ == "__main__":
