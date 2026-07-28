@@ -42,7 +42,7 @@ __global__ void count_and_sort_expert_tokens_kernel(
   }
 }
 
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) && !defined(USE_HCU)
 __device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffffffffu) {
   int original = v;
 #pragma unroll
@@ -112,7 +112,7 @@ __global__ void moe_align_block_size_kernel(
     scan_buf[tid] = padded_count;
   }
 
-#ifndef __CUDA_ARCH__  // HIP
+#if !defined(__CUDA_ARCH__) || defined(USE_HCU)  // HIP/HCU
 
   if (tid >= num_experts && tid < scan_size) {
     scan_buf[tid] = 0;
