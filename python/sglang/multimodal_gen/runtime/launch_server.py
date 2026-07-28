@@ -840,13 +840,13 @@ def launch_disagg_role(server_args: ServerArgs):
 
 
 def validate_dag_topology(server_args: ServerArgs) -> None:
-    """Compile the DAG and check it against the pipeline, then exit.
+    """Compile the DAG topology YAML and print the plan, then exit.
 
-    Builds the stage graph in a single process so a topology typo -- an
-    unclaimed stage, a stage name that no longer exists -- surfaces here
-    rather than after a multi-GPU cluster has come up. Only the modules this
-    node claims are loaded, so validating the lightest node is the cheapest
-    way to check the whole topology.
+    This is a lightweight dry-run: it does not load model weights or construct
+    the pipeline. Plan structure (roles, edges, predicates, terminal nodes) is
+    checked at compile time. Stage names vs the live pipeline are guarded by
+    unit tests (``test/unit/test_dag_disagg.py``) and model-specific DAG E2E
+    tests.
     """
     configure_logger(server_args)
 
@@ -856,16 +856,21 @@ def validate_dag_topology(server_args: ServerArgs) -> None:
 
     print(json.dumps(plan.to_dict(), indent=2))
 
-    from sglang.multimodal_gen.runtime.pipelines_core import build_pipeline
+    from sglang.multimodal_gen.registry import get_model_info
 
-    # Stage constructors read the process-global args, which normally get set
-    # while a worker boots.
-    set_global_server_args(server_args)
+    model_info = get_model_info(
+        server_args.model_path,
+        backend=server_args.backend,
+        model_id=server_args.model_id,
+    )
+    if model_info is not None:
+        print(f"\nModel resolves to pipeline: {model_info.pipeline_cls.__name__}")
 
-    # Constructing the pipeline runs validate_dag_stage_coverage, which raises
-    # if the plan and the registered stages disagree.
-    build_pipeline(server_args)
-    print("\nDAG topology is valid.")
+    print("\nDAG topology compiled successfully.")
+    print(
+        "Stage coverage vs the live pipeline is checked in unit/E2E tests "
+        "(see test/unit/test_dag_disagg.py)."
+    )
 
 
 def dispatch_launch(server_args: ServerArgs):

@@ -164,9 +164,10 @@ class DisaggServerArgsMixin:
             action="store_true",
             default=cls.dag_validate,
             help=(
-                "Compile --disagg-dag, check every pipeline stage is owned by "
-                "exactly one node, print the plan, and exit without loading "
-                "weights."
+                "Compile --disagg-dag, print the execution plan JSON, and exit "
+                "without loading model weights. Plan structure is validated at "
+                "compile time; stage coverage vs the live pipeline is checked "
+                "in unit/E2E tests."
             ),
         )
         parser.add_argument(
