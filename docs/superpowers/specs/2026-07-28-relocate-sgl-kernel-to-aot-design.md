@@ -29,7 +29,8 @@ detection. The relocation must preserve those behaviors.
   platform scripts, ownership, labels, and developer documentation.
 - Preserve existing CI selection behavior: an AOT-only change should run AOT
   jobs without accidentally becoming a JIT or general Python-package change.
-- Ensure the main `sglang` wheel does not absorb the nested AOT project.
+- Ensure the main `sglang` wheel and source distribution do not absorb the
+  nested AOT project.
 
 ## Non-goals and Compatibility Contract
 
@@ -82,11 +83,12 @@ hazards:
 2. the main package's broad `kernels/**/*` package-data rule may copy AOT
    sources into the `sglang` wheel.
 
-The main `python/pyproject.toml` will explicitly exclude
+The main `python/pyproject.toml` and, if required by the validated setuptools
+behavior, its source-manifest configuration will explicitly exclude
 `sglang.kernels.aot*` from package discovery and exclude
 `kernels/aot/**` from `sglang` package data. The exact patterns must be
-validated against a locally built wheel, not accepted from configuration
-inspection alone.
+validated against locally built wheel and source archives, not accepted from
+configuration inspection alone.
 
 The AOT pyproject files continue to package `python/sgl_kernel` relative to the
 new AOT root. Their distribution names and versions remain unchanged. Project
@@ -163,8 +165,8 @@ Validation is layered so path coverage is checked before expensive GPU work:
 2. Scan for old path forms and manually classify remaining `sgl-kernel`
    literals.
 3. Parse and lint modified workflow, TOML, Python, shell, and CMake files.
-4. Build the main `sglang` wheel and inspect its archive to prove that no
-   `sglang/kernels/aot/` source is included.
+4. Build the main `sglang` wheel and source distribution, then inspect both
+   archives to prove that no `sglang/kernels/aot/` source is included.
 5. Build AOT package metadata and platform-independent artifacts from the new
    project root.
 6. Build the CUDA AOT wheel on an H200 environment, install it, verify
@@ -179,8 +181,9 @@ validation and rely on their existing CI runners.
 
 ## Risks and Mitigations
 
-- **Main wheel size regression:** explicit package and package-data exclusions,
-  followed by archive inspection.
+- **Main package size regression:** explicit discovery, package-data, and
+  source-manifest exclusions where needed, followed by wheel and source-archive
+  inspection.
 - **AOT CI silently skipped:** update the dedicated filter and confirm PR check
   selection.
 - **Unnecessary CI fanout:** exclude `aot/**` from broad JIT and main-package
