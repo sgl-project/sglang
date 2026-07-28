@@ -810,7 +810,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
             return self.tiled_encode(x)
 
         iter_ = 1 + (num_frame - 1) // 4
-        cache = CausalConvCache(CausalCacheMode.STREAMING)
+        cache = CausalConvCache(CausalCacheMode.STREAMING, retain=iter_ > 1)
         with causal_cache_scope(cache):
             for i in range(iter_):
                 if i == 0:
@@ -886,7 +886,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         # The cache scope opens after the tiling dispatch and inside whatever
         # spatial-shard context the caller established: toggling the shard
         # changes the height a cached tail would have.
-        cache = CausalConvCache(CausalCacheMode.STREAMING)
+        cache = CausalConvCache(CausalCacheMode.STREAMING, retain=num_frame > 1)
         decoded = []
         with causal_cache_scope(cache):
             for i in range(num_frame):
@@ -982,7 +982,9 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
                 time = []
                 frame_range = 1 + (num_frames - 1) // 4
                 # Each tile is an independent causal sequence.
-                cache = CausalConvCache(CausalCacheMode.STREAMING)
+                cache = CausalConvCache(
+                    CausalCacheMode.STREAMING, retain=frame_range > 1
+                )
                 with causal_cache_scope(cache):
                     for k in range(frame_range):
                         if k == 0:
@@ -1052,7 +1054,9 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
             for j in range(0, width, tile_latent_stride_width):
                 time = []
                 # Each tile is an independent causal sequence.
-                cache = CausalConvCache(CausalCacheMode.STREAMING)
+                cache = CausalConvCache(
+                    CausalCacheMode.STREAMING, retain=num_frames > 1
+                )
                 with causal_cache_scope(cache):
                     for k in range(num_frames):
                         tile = z[:, :, k: k + 1, i: i + tile_latent_min_height, j: j + tile_latent_min_width]

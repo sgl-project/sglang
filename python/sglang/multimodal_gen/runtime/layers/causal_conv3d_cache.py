@@ -63,8 +63,16 @@ class CausalConvCache:
     - tensor: the retained tail of the previous chunk
     """
 
-    def __init__(self, mode: CausalCacheMode = CausalCacheMode.STREAMING) -> None:
+    def __init__(
+        self,
+        mode: CausalCacheMode = CausalCacheMode.STREAMING,
+        *,
+        retain: bool = True,
+    ) -> None:
         self.mode = mode
+        # False when the caller knows no later chunk will read the cache, so the
+        # convolutions can skip retaining a tail they would only throw away.
+        self.retain = retain
         self.chunk_index = 0
         self._store: dict[str, torch.Tensor | None] = {}
 
@@ -244,11 +252,13 @@ class CausalConv3d(nn.Conv3d):
         memory_format = memory_format_of(x)
         prev = cache.get(self.cache_key)
         if prev is None:
-            prev = x.new_zeros(
-                (x.shape[0], x.shape[1], self.cache_frames, x.shape[3], x.shape[4])
-            ).contiguous(memory_format=memory_format)
-        x = torch.cat([prev, x], dim=2)
-        cache.set(self.cache_key, self._retain_tail(x, memory_format))
+            # Same result as concatenating a zero-filled cache, but in one kernel
+            # and without materialising the zeros in the wrong layout first.
+            x = F.pad(x, (0, 0, 0, 0, self.cache_frames, 0))
+        else:
+            x = torch.cat([prev, x], dim=2)
+        if cache.retain:
+            cache.set(self.cache_key, self._retain_tail(x, memory_format))
         return x
 
     def _retain_tail(
@@ -322,7 +332,8 @@ class TimeDownsampleCausalConv3d(CausalConv3d):
         if cache.mode is CausalCacheMode.STREAMING and not cache.contains(
             self.cache_key
         ):
-            cache.set(self.cache_key, self._retain_tail(x, memory_format_of(x)))
+            if cache.retain:
+                cache.set(self.cache_key, self._retain_tail(x, memory_format_of(x)))
             return x
         return super().forward(x)
 

@@ -1214,10 +1214,10 @@ class AutoencoderKLWan(ParallelTiledVAE):
         if self.use_feature_cache:
             if self.config.patch_size is not None:
                 x = patchify(x, patch_size=self.config.patch_size)
-            cache = CausalConvCache(CausalCacheMode.STREAMING)
+            t = x.shape[2]
+            iter_ = 1 + (t - 1) // 4
+            cache = CausalConvCache(CausalCacheMode.STREAMING, retain=iter_ > 1)
             with causal_cache_scope(cache):
-                t = x.shape[2]
-                iter_ = 1 + (t - 1) // 4
                 for i in range(iter_):
                     if i == 0:
                         out = self.encoder(x[:, :, :1, :, :])
@@ -1270,7 +1270,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
                 if self._should_use_spatial_parallel_decode(z)
                 else disable_spatial_parallel_decode()
             )
-            cache = CausalConvCache(CausalCacheMode.STREAMING)
+            cache = CausalConvCache(CausalCacheMode.STREAMING, retain=iter_ > 1)
             with spatial_context, causal_cache_scope(cache):
                 out_chunks = []
                 for i in range(iter_):
