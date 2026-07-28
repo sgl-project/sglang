@@ -97,6 +97,8 @@ pub struct ServerArgs {
     #[serde(default)]
     pub incremental_streaming_output: bool,
     /// PD-disaggregation role: `"null"` (unified), `"prefill"`, or `"decode"`.
+    /// (The prefill KV bootstrap registry itself — `crate::bootstrap` — is
+    /// started separately, before this blob exists; see `lib::BootstrapServer`.)
     #[serde(default = "default_disaggregation_mode")]
     pub disaggregation_mode: String,
     /// The resolved Python `ModelConfig`, attached to the blob at dump time.
@@ -141,6 +143,14 @@ pub struct ModelConfig {
     /// boot ([`ServerArgs::validate_mandatory`]).
     #[serde(default)]
     pub vocab_size: Option<u64>,
+}
+
+fn join_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}") // bare IPv6 (`::`) needs brackets to bind
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 fn default_host() -> String {
@@ -194,9 +204,9 @@ impl ServerArgs {
     }
 
     /// Bind address `host:port`. `host` is expected to be an IP — the result is
-    /// parsed as a `SocketAddr`.
+    /// parsed as a `SocketAddr`, so a bare IPv6 host gets bracketed.
     pub fn bind(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        join_host_port(&self.host, self.port)
     }
 
     /// Whether the HTTP access log is emitted, mirroring the Python server:

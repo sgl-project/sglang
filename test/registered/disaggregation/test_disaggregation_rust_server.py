@@ -4,7 +4,7 @@ Same 2-GPU layout as test_disaggregation_basic (prefill GPU 0, decode GPU 1,
 mini_lb in front), but prefill and decode run with ``SGLANG_RUST_SERVER=1`` —
 covering the Rust `/generate` bootstrap-field intake (scalar form via the gsm8k
 eval's single-prompt requests, per-item list form via the batch test), the
-positional scheduler-wire PD block, the scheduler-hosted KV bootstrap server,
+positional scheduler-wire PD block, the rust-hosted KV bootstrap server,
 the PD warmup fan-out, and the fake-bootstrap health probe.
 
 The Rust server has no OpenAI endpoints, so everything (including the gsm8k
