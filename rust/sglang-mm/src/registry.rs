@@ -82,6 +82,9 @@ pub fn pipeline_from_spec(
         "qwen_vl" => Ok(Box::new(crate::qwen_vl::QwenVlProcessor::from_spec_json(
             json,
         )?)),
+        "mimo_v2" => Ok(Box::new(crate::mimo_v2::MimoV2Processor::from_spec_json(
+            json,
+        )?)),
         other => Err(format!("unknown mm family: {other}")),
     }
 }

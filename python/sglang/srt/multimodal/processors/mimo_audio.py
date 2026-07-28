@@ -17,9 +17,11 @@ from sglang.utils import logger
 
 try:
     from torchcodec.decoders import AudioDecoder
-except ImportError:
+except Exception as e:
+    # Not just ImportError: torchcodec imports fine but raises RuntimeError
+    # from its loader when the ffmpeg shared libs are absent.
     logger.warning(
-        "torchcodec is not installed; audio inputs will fail at request time"
+        f"torchcodec unavailable ({e}); audio inputs will fail at request time"
     )
     AudioDecoder = None
 

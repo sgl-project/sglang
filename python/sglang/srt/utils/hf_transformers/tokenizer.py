@@ -31,9 +31,9 @@ from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 from ..hf_transformers_patches import _ensure_gguf_version
 from .common import (
-    resolve_local_or_cached_file,
     attach_additional_stop_token_ids,
     check_gguf_file,
+    resolve_local_or_cached_file,
     resolve_runai_obj_uri,
 )
 from .mistral_utils import (

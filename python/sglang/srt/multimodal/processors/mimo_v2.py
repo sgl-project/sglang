@@ -18,7 +18,6 @@ import torch
 import torch.nn.functional as F
 from fastapi import HTTPException
 from PIL import Image
-from torchcodec.decoders import AudioDecoder
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
@@ -41,6 +40,18 @@ from sglang.srt.multimodal.processors.mimo_audio import (
 from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
 from sglang.srt.utils import ImageData, VideoData
 from sglang.utils import logger
+
+try:
+    from torchcodec.decoders import AudioDecoder
+except Exception as e:
+    # Not just ImportError: torchcodec imports fine but raises RuntimeError
+    # from its loader when the ffmpeg shared libs are absent. Only the
+    # video/audio paths need it, so an image-only deployment (e.g. the native
+    # rust MM pipeline) must not fail to import over it.
+    logger.warning(
+        f"torchcodec unavailable ({e}); audio inputs will fail at request time"
+    )
+    AudioDecoder = None
 
 
 @dataclass
@@ -502,6 +513,13 @@ class MiMoProcessor:
             source = BytesIO(base64.b64decode(path_or_data.split(";base64,")[1]))
         else:
             source = path_or_data  # local path or file://
+        if AudioDecoder is None:
+            # Returning False would silently serve an audio-bearing video as
+            # video-only; make the missing dependency explicit instead.
+            raise RuntimeError(
+                "torchcodec is required to probe video audio tracks; "
+                "install with `pip install torchcodec`."
+            )
         try:
             AudioDecoder(source)
             return True
