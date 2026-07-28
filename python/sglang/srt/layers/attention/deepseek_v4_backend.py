@@ -60,11 +60,6 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.dspark_components.kernels.dspark_attn_metadata import (
-    BuildBlockSeqLensCausal,
-    BuildDsparkSwaPageIndices,
-    ComputeDsparkWindowGather,
-)
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     per_step_draft_out_cache_loc,
