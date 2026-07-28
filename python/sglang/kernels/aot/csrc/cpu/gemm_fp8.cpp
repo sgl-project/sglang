@@ -1178,6 +1178,62 @@ at::Tensor fp8_scaled_mm_cpu(
   return out;
 }
 
+at::Tensor fp8_per_tensor_scaled_mm_cpu(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    at::Tensor& scales2,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType out_dtype,
+    bool is_vnni) {
+  auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
+  CHECK_INPUT(mat2);
+  CHECK_INPUT(scales2);
+  TORCH_CHECK(scales2.scalar_type() == at::kFloat, "fp8_scaled_mm_cpu: expect scales2 to be float32.");
+
+  int64_t M = mat1.size(0);
+  int64_t N = mat2.size(0);
+  int64_t K = mat2.size(1);
+
+  CHECK_EQ(mat1.size(1), K);
+  CHECK_DIM(2, mat1);
+  CHECK_DIM(2, mat2);
+
+  const auto st = mat1.scalar_type();
+  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf, "fp8_per_tensor_scaled_mm_cpu: expect A to be bfloat16 or half.");
+  TORCH_CHECK(st == out_dtype, "fp8_per_tensor_scaled_mm_cpu: expect A has same dtype with out_dtype.");
+  TORCH_CHECK(mat2.scalar_type() == at::kFloat8_e4m3fn, "fp8_per_tensor_scaled_mm_cpu: expect mat2 to be fp8_e4m3.");
+  TORCH_CHECK(scales2.scalar_type() == at::kFloat, "fp8_per_tensor_scaled_mm_cpu: expect scales2 to be float32.");
+  TORCH_CHECK(scales2.numel() == 1, "fp8_per_tensor_scaled_mm_cpu: expect scales2 to have one element for per-tensor scaling.");
+  auto out = at::empty({M, N}, mat1.options().dtype(out_dtype));
+
+  auto buffer = alloc_thread_buffer(mat1.options(), K);
+  const int64_t scale_size_K = div_up(K, (int64_t)BLOCK_K);
+  auto expanded_scales2 = scales2.reshape({1}).expand({scale_size_K}).contiguous();
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(out_dtype, "fp8_per_tensor_scaled_mm_kernel_impl", [&] {
+    fp_scaled_mm_kernel_impl<scalar_t, at::Float8_e4m3fn, float>(
+        out.data_ptr<scalar_t>(),
+        mat1.data_ptr<scalar_t>(),
+        packed_w.data_ptr<at::Float8_e4m3fn>(),
+        expanded_scales2.data_ptr<float>(),
+        get_bias_data(bias, N),
+        buffer.data_ptr<scalar_t>(),
+        M,
+        N,
+        K,
+        mat1.stride(0),
+        out.stride(0),
+        /* block_size_N */ N,
+        /* block_size_K */ BLOCK_K,
+        buffer.size(-1),
+        [&](int64_t nb) { return 0; });
+  });
+
+  return out;
+}
+
 // mat1 : [M, K] bfloat16
 // mat2 : [N, K / 2] uint8, actual layout: [N / BLOCK_N, K / 2, BLOCK_N, 2]
 // scales2: [N, K / G], actual layout: [N / BLOCK_N, K / G, BLOCK_N]
