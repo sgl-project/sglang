@@ -459,6 +459,7 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        mamba_prefill_align_size: Optional[int] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -546,6 +547,7 @@ class PrefillAdder:
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
+        self.mamba_prefill_align_size = mamba_prefill_align_size
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
@@ -894,8 +896,9 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        new_len = self._align_mamba_prefill_chunk(req, new_len)
+        truncated = new_len < cand_extend_input_len
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -912,6 +915,19 @@ class PrefillAdder:
 
         # Return if chunked prefill not finished
         return req if truncated else None
+
+    def _align_mamba_prefill_chunk(self, req: Req, new_len: int) -> int:
+        """End prefill at a cache boundary before processing an unaligned tail."""
+        align_size = self.mamba_prefill_align_size
+        if align_size is None or not self.is_hybrid_ssm_cache:
+            return new_len
+
+        start = len(req.prefix_indices)
+        end = start + new_len
+        aligned_end = end // align_size * align_size
+        if start < aligned_end < end:
+            return aligned_end - start
+        return new_len
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
@@ -1165,8 +1181,15 @@ class PrefillAdder:
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
-            input_tokens = self.ceil_paged_tokens(
-                len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+            current_extend_input_len = len(req.full_untruncated_fill_ids) - len(
+                req.prefix_indices
+            )
+            input_tokens = self.ceil_paged_tokens(current_extend_input_len)
+            mamba_aligned_input_len = self._align_mamba_prefill_chunk(
+                req, current_extend_input_len
+            )
+            needs_mamba_tail_split = (
+                mamba_aligned_input_len < current_extend_input_len
             )
 
             if (
@@ -1189,7 +1212,9 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
+            elif (
+                chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit
+            ) and not needs_mamba_tail_split:
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
@@ -1209,7 +1234,12 @@ class PrefillAdder:
                 )
             else:
                 # Make sure at least one page is available
-                trunc_len = chunk_tokens_limit // self.page_size * self.page_size
+                trunc_len = (
+                    current_extend_input_len
+                    if chunk_tokens_limit is None
+                    else min(current_extend_input_len, chunk_tokens_limit)
+                )
+                trunc_len = trunc_len // self.page_size * self.page_size
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
@@ -1228,6 +1258,7 @@ class PrefillAdder:
                 now_input_len = trunc_len + len(req.prefix_indices)
                 now_input_len = now_input_len // self.page_size * self.page_size
                 trunc_len = now_input_len - len(req.prefix_indices)
+                trunc_len = self._align_mamba_prefill_chunk(req, trunc_len)
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
