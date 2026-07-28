@@ -16,7 +16,7 @@ mod ingress;
 pub use egress::{ActivityCounter, Egress};
 pub use ingress::{Ingress, Limits};
 
-use crate::ids::RidHash;
+use crate::ids::Rid;
 use crate::message::{DetokMsg, Request};
 
 /// Blocking receive that also wakes on shutdown: returns `None` when `rx` closes
@@ -41,7 +41,7 @@ pub enum TmEvent {
 /// Producer-side handles, cloned into every stage that needs to emit.
 /// Client-visible rids currently in flight. Shared by the api server (which
 /// admits a rid) and ingress (which releases it once its abort has taken effect).
-pub type LiveRids = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+pub type LiveRids = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Rid>>>;
 
 /// Who asked for an abort — which decides who releases the rid.
 ///
@@ -60,13 +60,13 @@ pub type LiveRids = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<St
 #[derive(Clone, Debug)]
 pub enum AbortSource {
     /// From an `AbortGuard` drop. Owns the release.
-    Guard(String),
+    Guard(Rid),
     /// From a detokenizer terminal path. Aborts the scheduler work; releases nothing.
-    Detok(String),
+    Detok(Rid),
 }
 
 impl AbortSource {
-    pub fn rid(&self) -> &str {
+    pub fn rid(&self) -> &Rid {
         match self {
             Self::Guard(rid) | Self::Detok(rid) => rid,
         }
@@ -96,7 +96,7 @@ pub struct Senders {
 
 impl Senders {
     #[inline]
-    pub fn detok_for(&self, id: RidHash) -> &flume::Sender<DetokMsg> {
-        &self.detok[id.shard(self.detok.len())]
+    pub fn detok_for(&self, rid: &Rid) -> &flume::Sender<DetokMsg> {
+        &self.detok[rid.shard(self.detok.len())]
     }
 }

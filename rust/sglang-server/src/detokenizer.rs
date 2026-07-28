@@ -1,8 +1,14 @@
 //! Detokenizer shards — CPU-bound, one pinned thread per shard.
 //!
-//! Each shard owns a *local* `id -> DetokState` map. There is no lock: a given
-//! `RidHash` is routed to exactly one shard (by `RidHash::shard`) for both
-//! its `Register` and all its `Chunk`s, so the map has a single accessor.
+//! Each shard owns a *local* `rid -> DetokState` map. There is no lock: a given
+//! rid is routed to exactly one shard (by `RidHash::shard`) for both its
+//! `Register` and all its `Chunk`s, so the map has a single accessor.
+//!
+//! The hash PARTITIONS, the rid IDENTIFIES. Keying the map by the hash meant two
+//! distinct rids that happened to collide became one entry: `Register` evicted the
+//! first client's sink and their tokens were then written to the second client's
+//! connection. Chunks carry the rid string (moved out of the frame header, which
+//! owns it and would otherwise drop it), so a collision now only co-locates.
 //!
 //! Real detokenization uses dynamo-tokenizers' `DecodeStream`, a stateful
 //! incremental decoder (TGI/vLLM-style: it buffers partial UTF-8 / byte-fallback
@@ -19,7 +25,7 @@ use std::collections::HashMap;
 
 use crate::error::Error;
 use crate::fsm::{Event, RequestState};
-use crate::ids::RidHash;
+use crate::ids::Rid;
 use crate::message::DetokMsg;
 use crate::message::{ChunkEvent, EgressItem, EgressSink, Matched, SinkError, TokenIds};
 use crate::runtime::Runnable;
@@ -105,8 +111,6 @@ impl DetokenizerBackend {
 }
 
 struct DetokState {
-    /// Client-visible rid string, needed to abort on the scheduler wire.
-    rid: String,
     sink: EgressSink,
     /// `return_text_in_logprobs`: whether to decode this request's logprob token
     /// ids to text (in this shard) for the `[logprob, token_id, text]` tuples.
@@ -127,9 +131,9 @@ struct DetokState {
     fsm: RequestState,
 }
 
-/// One detokenizer shard: owns a *local* `id -> DetokState` map (single
-/// accessor, no lock) and the egress backend. Spawned (pinned) per shard as a
-/// [`Runnable`]; a given `RidHash` is routed to exactly one shard.
+/// One detokenizer shard: owns a *local* `rid -> DetokState` map (single accessor,
+/// no lock) and the egress backend. Spawned (pinned) per shard as a [`Runnable`];
+/// a given rid is routed to exactly one shard.
 pub struct DetokenizerWorker {
     shard: usize,
     rx: flume::Receiver<DetokMsg>,
@@ -157,7 +161,7 @@ impl DetokenizerWorker {
 
 impl Runnable for DetokenizerWorker {
     fn run(self) {
-        let mut table: HashMap<RidHash, DetokState> = HashMap::new();
+        let mut table: HashMap<Rid, DetokState> = HashMap::new();
         tracing::debug!(shard = self.shard, "detokenizer worker started");
 
         // Plain `recv`: exits when the `DetokMsg` channel closes (every `Senders`
@@ -167,16 +171,14 @@ impl Runnable for DetokenizerWorker {
         while let Ok(msg) = self.rx.recv() {
             match msg {
                 DetokMsg::Register {
-                    rid_hash,
                     rid,
                     sink,
                     decode_logprob_text,
                     no_stop_trim,
                 } => {
                     table.insert(
-                        rid_hash,
+                        rid.clone(),
                         DetokState {
-                            rid,
                             sink,
                             decode_logprob_text,
                             no_stop_trim,
@@ -192,14 +194,12 @@ impl Runnable for DetokenizerWorker {
                         handle_chunk(&mut table, ev, &self.backend, &self.abort);
                     }
                 }
-                DetokMsg::Result { rid_hash, payload } => {
-                    handle_result(&mut table, rid_hash, payload)
+                DetokMsg::Result { rid, payload } => handle_result(&mut table, &rid, payload),
+                DetokMsg::Fail { rid, message } => {
+                    handle_fail(&mut table, &rid, message, &self.abort)
                 }
-                DetokMsg::Fail { rid_hash, message } => {
-                    handle_fail(&mut table, rid_hash, message, &self.abort)
-                }
-                DetokMsg::Deregister { rid_hash } => {
-                    table.remove(&rid_hash);
+                DetokMsg::Deregister { rid } => {
+                    table.remove(&rid);
                 }
             }
         }
@@ -208,8 +208,8 @@ impl Runnable for DetokenizerWorker {
 
 /// Control-request result: deliver the JSON payload to the sink verbatim as a
 /// single `Done` frame — no detokenization, no streaming.
-fn handle_result(table: &mut HashMap<RidHash, DetokState>, id: RidHash, payload: bytes::Bytes) {
-    if let Some(mut st) = table.remove(&id) {
+fn handle_result(table: &mut HashMap<Rid, DetokState>, rid: &Rid, payload: bytes::Bytes) {
+    if let Some(mut st) = table.remove(rid) {
         let _ = st.sink.try_send(EgressItem::Control(payload));
         // Egress FSM: a control request goes straight to Completed (no Streaming
         // / Finalizing states — single response, never streamed).
@@ -224,15 +224,15 @@ fn handle_result(table: &mut HashMap<RidHash, DetokState>, id: RidHash, payload:
 /// frame — not bad client input. Also aborts the request on the scheduler, which
 /// otherwise keeps generating tokens for a connection that will never read them.
 fn handle_fail(
-    table: &mut HashMap<RidHash, DetokState>,
-    id: RidHash,
+    table: &mut HashMap<Rid, DetokState>,
+    rid: &Rid,
     message: String,
     abort: &flume::Sender<AbortSource>,
 ) {
-    if let Some(mut st) = table.remove(&id) {
+    if let Some(mut st) = table.remove(rid) {
         // Abort first: `try_send` on the sink can release the handler, which frees
         // the rid for reuse (same ordering hazard as the disconnect path).
-        let _ = abort.send(AbortSource::Detok(st.rid.clone()));
+        let _ = abort.send(AbortSource::Detok(rid.clone()));
         let _ = st
             .sink
             .try_send(EgressItem::Error(Error::Internal(message)));
@@ -241,14 +241,16 @@ fn handle_fail(
 }
 
 fn handle_chunk(
-    table: &mut HashMap<RidHash, DetokState>,
+    table: &mut HashMap<Rid, DetokState>,
     mut ev: ChunkEvent,
     backend: &DetokenizerBackend,
     abort: &flume::Sender<AbortSource>,
 ) {
-    let id = RidHash(ev.rid_hash); // raw u64 from the wire — no parse
+    // Copied once: `ev` is moved into the sink below, but the rid is still
+    // needed to look the request up and to remove it.
+    let rid = ev.rid.clone();
 
-    let Some(st) = table.get_mut(&id) else {
+    let Some(st) = table.get_mut(&rid) else {
         // Late chunk after completion/abort — drop.
         return;
     };
@@ -286,9 +288,9 @@ fn handle_chunk(
                 // scheduler keeps generating for a connection that is already gone
                 // — the other two terminal paths (disconnect, fail) both abort.
                 let _ = st.fsm.apply(Event::Error(e.clone()));
-                let _ = abort.send(AbortSource::Detok(st.rid.clone()));
+                let _ = abort.send(AbortSource::Detok(rid.clone()));
                 let _ = st.sink.try_send(EgressItem::Error(e));
-                table.remove(&id);
+                table.remove(&rid);
                 return;
             }
         },
@@ -330,7 +332,7 @@ fn handle_chunk(
         } else {
             Event::Disconnect
         });
-        table.remove(&id);
+        table.remove(&rid);
     } else {
         // Every intermediate chunk emits its delta frame. A failed send means the
         // client can't receive it — `Closed` (gone) or `Full` (backpressure: not
@@ -342,12 +344,12 @@ fn handle_chunk(
             match e {
                 SinkError::Full => {
                     tracing::warn!(
-                        rid = id.0,
+                        rid = %rid,
                         "detok: sink full; aborting (client backpressure)"
                     )
                 }
                 SinkError::Closed => {
-                    tracing::debug!(rid = id.0, "detok: sink closed; aborting (client gone)")
+                    tracing::debug!(rid = %rid, "detok: sink closed; aborting (client gone)")
                 }
             }
             let _ = st.fsm.apply(Event::Disconnect);
@@ -359,9 +361,9 @@ fn handle_chunk(
             // exists to prevent, reached through the one abort producer that
             // bypasses the guard's ordering.
             if matches!(e, SinkError::Full) {
-                let _ = abort.send(AbortSource::Detok(st.rid.clone()));
+                let _ = abort.send(AbortSource::Detok(rid.clone()));
             }
-            table.remove(&id);
+            table.remove(&rid);
         }
     }
 }
@@ -406,9 +408,8 @@ mod tests {
 
         let mut table = HashMap::new();
         table.insert(
-            RidHash(1),
+            Rid::from("1"),
             DetokState {
-                rid: "1".to_string(),
                 sink: EgressSink::Local(tx),
                 decode_logprob_text: false,
                 no_stop_trim: false,
@@ -419,18 +420,18 @@ mod tests {
 
         let (tm_tx, tm_rx) = flume::unbounded::<AbortSource>();
         let ev = ChunkEvent {
-            rid_hash: 1,
+            rid: Rid::from("1"),
             token_ids: vec![5],
             ..Default::default() // finish_reason None → non-terminal
         };
         handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx);
 
         // Request removed (no lingering state to be mistaken for success)...
-        assert!(!table.contains_key(&RidHash(1)));
+        assert!(!table.contains_key(&Rid::from("1")));
         // ...and the scheduler was told to abort it.
         assert!(matches!(
             tm_rx.try_recv(),
-            Ok(AbortSource::Detok(rid)) if rid == "1"
+            Ok(AbortSource::Detok(rid)) if rid == Rid::from("1")
         ));
     }
 
@@ -462,6 +463,63 @@ mod tests {
         assert_eq!(t, "a STOP");
     }
 
+    /// Two requests on the SAME shard keep separate entries. This is what a
+    /// `RidHash` collision now degrades to: the hash partitions, the rid
+    /// identifies. Keying the table by the hash made colliding rids one entry, so
+    /// `Register` evicted the first client's sink and their tokens were written to
+    /// the second client's connection. A single shard forces co-location
+    /// deterministically, without needing to find a real 64-bit collision.
+    #[test]
+    fn co_located_requests_keep_their_own_sinks() {
+        let (tx_a, mut rx_a) = mpsc::channel::<EgressItem>(4);
+        let (tx_b, mut rx_b) = mpsc::channel::<EgressItem>(4);
+        let mut table = HashMap::new();
+        let state = |tx| DetokState {
+            sink: EgressSink::Local(tx),
+            decode_logprob_text: false,
+            no_stop_trim: false,
+            decoder: None,
+            fsm: RequestState::Queued,
+        };
+        table.insert(Rid::from("alice"), state(tx_a));
+        table.insert(Rid::from("bob"), state(tx_b));
+        let (tm_tx, _tm_rx) = flume::unbounded::<AbortSource>();
+
+        let chunk = |rid: &str, id: i32| ChunkEvent {
+            rid: Rid::from(rid.to_string()),
+            token_ids: vec![id],
+            ..Default::default()
+        };
+        handle_chunk(
+            &mut table,
+            chunk("alice", 11),
+            &DetokenizerBackend::Skip,
+            &tm_tx,
+        );
+        handle_chunk(
+            &mut table,
+            chunk("bob", 22),
+            &DetokenizerBackend::Skip,
+            &tm_tx,
+        );
+
+        let ids = |rx: &mut mpsc::Receiver<EgressItem>| match rx.try_recv() {
+            Ok(EgressItem::Frame(ev)) => ev.token_ids,
+            other => panic!("expected a frame, got {other:?}"),
+        };
+        assert_eq!(
+            ids(&mut rx_a),
+            vec![11],
+            "alice must not receive bob's tokens"
+        );
+        assert_eq!(
+            ids(&mut rx_b),
+            vec![22],
+            "bob must not receive alice's tokens"
+        );
+        assert_eq!(table.len(), 2, "neither registration evicted the other");
+    }
+
     /// Drive a final (`finish_reason`) chunk through `handle_chunk` in skip mode and
     /// return the emitted `Done` event.
     fn final_chunk(
@@ -472,9 +530,8 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<EgressItem>(4);
         let mut table = HashMap::new();
         table.insert(
-            RidHash(1),
+            Rid::from("1"),
             DetokState {
-                rid: "1".to_string(),
                 sink: EgressSink::Local(tx),
                 decode_logprob_text: false,
                 no_stop_trim,
@@ -484,7 +541,7 @@ mod tests {
         );
         let (tm_tx, _tm_rx) = flume::unbounded::<AbortSource>();
         let ev = ChunkEvent {
-            rid_hash: 1,
+            rid: Rid::from("1"),
             token_ids: ids,
             // Parsed from the wire map, so the trim paths are driven by the same
             // shape Python emits rather than a hand-built enum.
