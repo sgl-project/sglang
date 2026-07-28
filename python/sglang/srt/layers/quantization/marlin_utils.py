@@ -37,12 +37,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
 )
 
-try:
-    from vllm import _custom_ops as ops
-except ImportError:
-    ops = None
-
-
 _is_cuda = is_cuda()
 
 if _is_cuda:
@@ -648,6 +642,7 @@ class MarlinConfig(QuantizationConfig):
 
         # 4 Bits packed into 32 bit datatype.
         self.pack_factor = 32 // 4
+        self.quant_type = scalar_types.uint4b8
 
         # Tile size used by marlin kernels.
         self.tile_size = 16
@@ -670,6 +665,9 @@ class MarlinConfig(QuantizationConfig):
             f"MarlinConfig(group_size={self.group_size}, "
             f"lm_head_quantized={self.lm_head_quantized})"
         )
+
+    def get_scaled_act_names(self) -> list[str]:
+        return []
 
     @classmethod
     def get_name(cls) -> str:
@@ -836,13 +834,8 @@ class MarlinLinearMethod(LinearMethodBase):
                 output_dim=1, input_dim=0, **weight_scale_args
             )
 
-        # Allocate workspace (Used for internal locking mechanism)
-        max_workspace_size = (
-            output_size_per_partition // self.quant_config.min_n_threads
-        ) * self.quant_config.max_parallel
-
         workspace = BasevLLMParameter(
-            data=torch.zeros(max_workspace_size, device="cuda", dtype=torch.int),
+            data=marlin_make_workspace(qweight.device),
             weight_loader=weight_loader,
         )
 
@@ -855,6 +848,9 @@ class MarlinLinearMethod(LinearMethodBase):
         layer.B = torch.nn.Parameter(layer.B.data, requires_grad=False)
         layer.s = torch.nn.Parameter(layer.s.data, requires_grad=False)
         layer.workspace = torch.nn.Parameter(layer.workspace.data, requires_grad=False)
+        layer.zp = marlin_make_empty_zp(layer.B.device)
+        layer.g_idx = marlin_make_empty_g_idx(layer.B.device)
+        layer.g_idx_sort_indices = marlin_make_empty_g_idx(layer.B.device)
 
     def apply(
         self,
@@ -862,26 +858,20 @@ class MarlinLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qweight = layer.B
-        scales = layer.s
-        workspace = layer.workspace
-
-        x_2d = x.view(-1, x.shape[-1])
-
-        size_m = x_2d.shape[0]
-        size_k = x_2d.shape[1]
-        size_n = scales.shape[1]
-
-        output_2d = ops.marlin_gemm(
-            x_2d, qweight, scales, workspace, size_m, size_n, size_k
+        return apply_gptq_marlin_linear(
+            input=x,
+            weight=layer.B,
+            weight_scale=layer.s,
+            weight_zp=layer.zp,
+            g_idx=layer.g_idx,
+            g_idx_sort_indices=layer.g_idx_sort_indices,
+            workspace=layer.workspace,
+            wtype=self.quant_config.quant_type,
+            output_size_per_partition=layer.s.shape[1],
+            input_size_per_partition=x.shape[-1],
+            is_k_full=True,
+            bias=bias,
         )
-
-        output = output_2d.view(x.shape[:-1] + (output_2d.shape[1],))
-
-        if bias is not None:
-            output.add_(bias)  # In-place add
-
-        return output
 
 
 def fake_unified_apply_gptq_marlin_gemm(
