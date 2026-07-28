@@ -868,6 +868,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     encoded.get("token_type_ids") if is_cross_encoder else None
                 )
 
+        # vLLM's OpenAI embeddings endpoint includes special tokens for
+        # encoder models. EmbeddingGemma's restored Gemma tokenizer adds BOS
+        # but, by its checkpoint default, omits EOS. Add EOS explicitly here
+        # rather than mutating tokenizer-global post-processing state.
+        if (
+            self.model_config.is_embedding_gemma
+            and self.tokenizer.eos_token_id is not None
+        ):
+            input_ids = [
+                (
+                    ids
+                    if ids and ids[-1] == self.tokenizer.eos_token_id
+                    else [*ids, self.tokenizer.eos_token_id]
+                )
+                for ids in input_ids
+            ]
+
         # Step 4: Extract results based on input format
         return self._extract_tokenizer_results(
             input_ids, token_type_ids, input_format, original_batch_size

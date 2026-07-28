@@ -41,17 +41,10 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     ReplaceWriteThroughOnNodeSplit,
 )
-from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
-    NodeId,
-    UnifiedLRUList,
-    UnifiedTreeCore,
-    UnifiedTreeNode,
-)
 
 # UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
 # because other modules and tests import them from this module.
-from sglang.srt.mem_cache.unified_cache_components import (
+from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
@@ -60,6 +53,13 @@ from sglang.srt.mem_cache.unified_cache_components import (
     PrepareLoadBackResult,
     SWAComponent,
     TreeComponent,
+)
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
+    NodeId,
+    UnifiedLRUList,
+    UnifiedTreeCore,
+    UnifiedTreeNode,
 )
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,

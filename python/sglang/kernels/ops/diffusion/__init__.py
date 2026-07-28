@@ -114,6 +114,6 @@ register_kernel(
     KernelSpec(
         op="diffusion.sparse_linear_attn_fwd",
         backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.diffusion.sparse_linear_attn_kernels:get_block_map",
+        target="sglang.kernels.ops.diffusion.sparse_linear_attn_kernels:_attn_fwd",
     )
 )
