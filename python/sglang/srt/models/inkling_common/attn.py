@@ -883,7 +883,7 @@ class InklingAttention(nn.Module):
             if prologue_q_descale is not None:
                 extra_attn_kwargs["q_descale"] = prologue_q_descale
             else:
-                from sglang.srt.layers.quantization.mxfp8_quant import to_mxfp8
+                from sglang.kernels.ops.quantization.mxfp8_quant import to_mxfp8
 
                 q_mxfp = to_mxfp8(q.view(num_tokens, self.num_tp_heads, self.head_dim))
                 q = q_mxfp.data.view(num_tokens, -1)
