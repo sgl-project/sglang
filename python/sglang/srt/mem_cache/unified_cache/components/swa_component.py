@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverSWAWithLockedFull,
     SWARebuild,
 )
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,

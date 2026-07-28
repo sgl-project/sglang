@@ -49,6 +49,17 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     ReplaceWriteThroughOnNodeSplit,
 )
+from sglang.srt.mem_cache.unified_cache.components import (
+    _NUM_COMPONENT_TYPES,
+    BASE_COMPONENT_TYPE,
+    CacheTransferPhase,
+    ComponentData,
+    ComponentType,
+    EvictLayer,
+    LRURefreshPhase,
+    TreeComponent,
+    get_and_increase_time_counter,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
     DemoteResult,
@@ -60,17 +71,6 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     NodeId,
     RadixCacheWalkResult,
     UnifiedTreeCoreInterface,
-)
-from sglang.srt.mem_cache.unified_cache_components import (
-    _NUM_COMPONENT_TYPES,
-    BASE_COMPONENT_TYPE,
-    CacheTransferPhase,
-    ComponentData,
-    ComponentType,
-    EvictLayer,
-    LRURefreshPhase,
-    TreeComponent,
-    get_and_increase_time_counter,
 )
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
@@ -1492,6 +1492,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 and node.component_data[BASE_COMPONENT_TYPE].host_value is not None
             ):
                 result.inserted_host_node = node.id
+            return result
+
+        # Drop the refill only under write-through (a non-write-back policy).
+        if node is not self.root_node and not node.backuped and not self.is_write_back:
+            logger.info(
+                "HiCache prefetch dropped %d-token refill under un-backed-up node %d",
+                len(host_value),
+                node.id,
+            )
+            result.host_insert_dropped = True
             return result
 
         new_node = self._new_node(priority=node.priority)
