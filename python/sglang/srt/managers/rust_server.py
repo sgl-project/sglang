@@ -333,7 +333,13 @@ class RustServer:
         if dp_rank is not None:
             http_addr = f"{server_args.host}:{server_args.port + dp_rank}"
 
-        launch_cores, server_cores = cls._partition_cores()
+        launch_cores, server_cores = cls._partition_cores(
+            mm_workers=(
+                (server_args.mm_processor_worker_num or NativeMmHost.AUTO_MM_WORKERS)
+                if scheduler.model_config.is_multimodal
+                else 0
+            )
+        )
 
         server = Server(
             # None -> run unpinned; the list carries the pinning decision.
@@ -678,7 +684,9 @@ class RustServer:
         return msgspec.json.encode(server_args, enc_hook=str).decode("utf-8")
 
     @staticmethod
-    def _partition_cores() -> Tuple[Optional[List[int]], Optional[List[int]]]:
+    def _partition_cores(
+        mm_workers: int = 0,
+    ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
         """Split this rank's allowed cores into ``(launch_cores, server_cores)``.
 
         Pure computation — no affinity is changed here. Both sets are a subset
@@ -707,7 +715,19 @@ class RustServer:
         # effectively serial) and never take more than a quarter of the cores.
         reserve = min(2, len(allowed) // 4)
         launch_cores = allowed[:reserve]
-        server_cores = allowed[reserve:]
+        # Bound the pool set instead of taking the whole remainder: this
+        # rank's "allowed" cores are usually the entire NUMA node, which the
+        # *sibling* TP ranks' processes share — an unbounded mask lets MM
+        # preprocessing bursts land on (and preempt) a sibling's CUDA-launch
+        # thread, inflating every rank's forward via the TP collectives.
+        # Measured on Qwen3.5-35B TP4 with one 720p image per request: the
+        # unbounded mask cost the worst sibling ~20 ms of ViT wall time;
+        # bounding the pools removed it. The budget covers the CPU-hot
+        # threads (MM workers + tokenizer/ingress/egress/api, which are
+        # I/O-shaped and rarely all hot at once); everything else on the node
+        # is left to the scheduler ranks.
+        pool_budget = max(8, mm_workers + 4)
+        server_cores = allowed[reserve : reserve + pool_budget]
         logger.info(
             "rust server cores=%s, scheduler launch cores=%s",
             server_cores,
