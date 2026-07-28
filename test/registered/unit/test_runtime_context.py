@@ -669,6 +669,26 @@ class TestEpBufferState(_IsolatedServerArgs):
         reset_context()
         self.assertIsNone(DeepEPBuffer._state().buffer)
 
+    def test_deepep_mode_transition_before_lazy_buffer_allocation(self):
+        try:
+            from sglang.srt.layers.moe.token_dispatcher.deepep import (
+                DeepEPBuffer,
+                DeepEPDispatchMode,
+            )
+        except ImportError:
+            self.skipTest("deep_ep not installed")
+
+        reset_context()
+        DeepEPBuffer.set_dispatch_mode_as_normal()
+
+        # CUDA Graph adapters publish the phase before the dispatcher's first
+        # lazy buffer allocation. NORMAL -> LOW_LATENCY has nothing to clean.
+        DeepEPBuffer.set_dispatch_mode_as_low_latency()
+
+        state = DeepEPBuffer._state()
+        self.assertIsNone(state.buffer)
+        self.assertEqual(state.dispatch_mode, DeepEPDispatchMode.LOW_LATENCY)
+
 
 class TestForwardFlags(_IsolatedServerArgs):
     """ctx.forward: contextvar-backed per-forward flags; scoped() restores,
@@ -686,6 +706,35 @@ class TestForwardFlags(_IsolatedServerArgs):
                 self.assertFalse(fwd.multi_stream)
             self.assertTrue(fwd.multi_stream)
         self.assertFalse(fwd.multi_stream)
+
+    def test_shared_ep_route_follows_global_mode_on_idle_rank(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.runtime_context import (
+            get_forward,
+            publish_shared_ep_forward_flags,
+        )
+
+        reset_context()
+        publish_shared_ep_forward_flags(
+            SimpleNamespace(
+                forward_mode=ForwardMode.IDLE,
+                global_forward_mode=ForwardMode.DECODE,
+                shared_ep_generation=3,
+            )
+        )
+        self.assertTrue(get_forward().shared_ep_is_decode)
+        self.assertEqual(get_forward().shared_ep_generation, 3)
+
+        publish_shared_ep_forward_flags(
+            SimpleNamespace(
+                forward_mode=ForwardMode.IDLE,
+                global_forward_mode=ForwardMode.TARGET_VERIFY,
+                shared_ep_generation=0,
+            )
+        )
+        self.assertFalse(get_forward().shared_ep_is_decode)
 
     def test_scoped_restores_on_exception_and_validates_keys(self):
         from sglang.srt.runtime_context import get_forward
@@ -744,6 +793,9 @@ class TestForwardFlags(_IsolatedServerArgs):
                 x = x + 8
             if fwd.flashinfer_trtllm_bypass:
                 x = x + 16
+            if fwd.shared_ep_is_decode:
+                x = x + 32
+            x = x + fwd.shared_ep_generation * 64
             return x
 
         self.assertEqual(probe(torch.zeros(())).item(), 0)
@@ -758,6 +810,11 @@ class TestForwardFlags(_IsolatedServerArgs):
             flashinfer_trtllm_bypass=True,
         ):
             self.assertEqual(probe(torch.zeros(())).item(), 28)
+        with get_forward().scoped(
+            shared_ep_is_decode=True,
+            shared_ep_generation=2,
+        ):
+            self.assertEqual(probe(torch.zeros(())).item(), 160)
         self.assertEqual(probe(torch.zeros(())).item(), 0)
 
     def test_parallel_config_leaves_trace_under_torch_compile(self):

@@ -376,6 +376,7 @@ def fused_moe_kernel(
     per_channel_quant: tl.constexpr,
     even_Ks: tl.constexpr,
     c_sorted: tl.constexpr,
+    a_sorted: tl.constexpr,
     filter_expert: tl.constexpr,
     swap_ab: tl.constexpr,
     FUSE_ADD_TO_OUTPUT: tl.constexpr,
@@ -461,13 +462,15 @@ def fused_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+    if a_sorted:
+        offs_a = offs_token_id
+    else:
+        offs_a = offs_token // top_k
     if a_desc is not None:
         assert use_fp8_w8a8 and group_n > 0 and group_k > 0
         start_offs_m = pid_m * BLOCK_SIZE_M
     else:
-        a_ptrs = a_ptr + (
-            offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
-        )
+        a_ptrs = a_ptr + offs_a[:, None] * stride_am + offs_k[None, :] * stride_ak
 
     if b_desc is not None:
         start_offs_n = pid_n * BLOCK_SIZE_N
@@ -494,7 +497,7 @@ def fused_moe_kernel(
             if a_desc is not None:
                 a_scale_ptrs = a_scale_ptr + offs_token_id * stride_asm
             else:
-                a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+                a_scale_ptrs = a_scale_ptr + offs_a * stride_asm
             if BLOCK_SIZE_N > group_n:
                 offs_bsn = offs_bn // group_n
             else:
@@ -509,7 +512,7 @@ def fused_moe_kernel(
             )
             b_scale = tl.load(b_scale_ptrs)
             # Load per-token scale for activations
-            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            a_scale_ptrs = a_scale_ptr + offs_a * stride_asm
             a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
         # tensor-wise
         else:
@@ -745,9 +748,17 @@ def invoke_fused_moe_kernel(
     add_output_mask: Optional[torch.Tensor] = None,
     mask_output: bool = False,
     lora_preserve_base: bool = False,
+    a_is_prequantized: bool = False,
+    a_sorted: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+    if _is_hip and (a_use_tma or b_use_tma):
+        raise RuntimeError(
+            "TMA tensor descriptors are unavailable on ROCm; use "
+            "a_use_tma=False and b_use_tma=False, and set a_sorted=True "
+            "when W2 activations use route-sorted rows"
+        )
 
     if use_fp8_w8a8:
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
@@ -757,7 +768,15 @@ def invoke_fused_moe_kernel(
     padded_size = 0
     if use_fp8_w8a8:
         assert B_scale is not None
-        if block_shape is None:
+        if a_is_prequantized:
+            assert A.dtype == torch.float8_e4m3fn
+            assert A_scale is not None
+            assert block_shape is not None and len(block_shape) == 2
+            block_n, block_k = block_shape
+            assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
+            assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
+            assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
+        elif block_shape is None:
             # activation tensor-wise fp8 quantization, dynamic or static
             padded_size = padding_size
             # activations apply per-token quantization when weights apply per-channel quantization by default
@@ -782,6 +801,7 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
     elif use_int8_w8a8:
+        assert not a_is_prequantized, "prequantized A currently supports FP8 only"
         assert B_scale is not None
         if block_shape is None:
             # activation channel-wise int8 quantization
@@ -801,9 +821,11 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
     elif use_int8_w8a16 or use_int4_w4a16:
+        assert not a_is_prequantized, "prequantized A currently supports FP8 only"
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
     else:
+        assert not a_is_prequantized, "prequantized A currently supports FP8 only"
         assert A_scale is None
         assert B_scale is None
 
@@ -845,6 +867,7 @@ def invoke_fused_moe_kernel(
         and block_shape is not None
         and block_shape[1] > 0
     ):
+        assert not a_sorted, "a_sorted is not supported for GPTQ/AWQ kernels"
         assert (
             not fuse_sum_all_reduce
         ), "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
@@ -952,6 +975,7 @@ def invoke_fused_moe_kernel(
             use_int8_w8a16=use_int8_w8a16,
             per_channel_quant=per_channel_quant,
             even_Ks=even_Ks,
+            a_sorted=a_sorted,
             c_sorted=c_sorted,
             filter_expert=filter_expert,
             swap_ab=swap_ab,

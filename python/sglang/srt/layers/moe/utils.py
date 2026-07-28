@@ -13,7 +13,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.runtime_context import get_exec, get_flags, get_forward, get_parallel
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
 
@@ -37,6 +37,7 @@ class MoeA2ABackend(Enum):
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
     PPLX = "pplx"
+    SHARED_EP = "shared_ep"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -78,6 +79,9 @@ class MoeA2ABackend(Enum):
     def is_pplx(self):
         return self == MoeA2ABackend.PPLX
 
+    def is_shared_ep(self):
+        return self == MoeA2ABackend.SHARED_EP
+
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
 
@@ -88,6 +92,7 @@ class MoeA2ABackend(Enum):
             MoeA2ABackend.MOONCAKE,
             MoeA2ABackend.NIXL,
             MoeA2ABackend.MORI,
+            MoeA2ABackend.SHARED_EP,
         )
 
 
@@ -337,6 +342,12 @@ def get_moe_runner_backend() -> MoeRunnerBackend:
     return moe.runner_backend
 
 
+def get_shared_ep_prefill_backend() -> MoeRunnerBackend:
+    """Platform-native runner used by the SharedEP prefill fallback."""
+
+    return MoeRunnerBackend.AITER if is_hip() else MoeRunnerBackend.DEEP_GEMM
+
+
 def get_speculative_moe_runner_backend() -> MoeRunnerBackend:
     moe = get_flags().moe
     if moe.speculative_runner_backend is None:
@@ -388,9 +399,15 @@ def is_sbo_enabled() -> bool:
 
 
 def is_deepep_class_backend() -> bool:
-    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, Mori, or PPLX)."""
+    """Check whether the backend uses the EP-sharded model contract."""
     b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori() or b.is_pplx()
+    return (
+        b.is_deepep()
+        or b.is_mooncake()
+        or b.is_mori()
+        or b.is_pplx()
+        or b.is_shared_ep()
+    )
 
 
 def uses_per_rank_fused_shared_slots() -> bool:

@@ -522,6 +522,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         forward_batch.input_ids = seed_input_ids
         forward_batch.spec_info.hidden_states = seed_prev_hidden
+        forward_batch.shared_ep_generation = 0
         self._set_positions(forward_batch)
 
         with (
@@ -565,6 +566,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
             forward_batch.input_ids = input_ids
             forward_batch.spec_info.hidden_states = hidden_states
+            forward_batch.shared_ep_generation = i + 1
             self._set_positions(forward_batch)
 
             with (

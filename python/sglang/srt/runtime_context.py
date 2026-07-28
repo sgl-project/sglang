@@ -474,6 +474,13 @@ class ForwardFlags:
         # Sticky across forwards: every ForwardBatch construction writes it;
         # graph runners force False around capture.
         "is_extend_in_batch": False,
+        # SharedEP's graph-static route and generation-lane selector. The
+        # forward mode, not is_extend_in_batch, decides whether TARGET_VERIFY
+        # must use the materialized fallback. Speculative loops may advance the
+        # generation index explicitly; plain target decode stays on lane zero.
+        "shared_ep_is_decode": False,
+        "shared_ep_generation": 0,
+        "shared_ep_global_num_tokens": None,
         # Per-layer MLP collective control (set by decoder via scoped()
         # around the MLP / MoE / hybrid mixer call).
         # fuse_mlp_allreduce: next residual+LN absorbs the post-MLP all-reduce.
@@ -493,6 +500,9 @@ class ForwardFlags:
             "attn_input_scattered",
             "attn_inputs",
             "is_extend_in_batch",
+            "shared_ep_is_decode",
+            "shared_ep_generation",
+            "shared_ep_global_num_tokens",
             "fuse_mlp_allreduce",
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
@@ -1079,6 +1089,29 @@ def get_resources() -> Resources:
 
 def get_forward() -> ForwardFlags:
     return _CONTEXT.forward
+
+
+def publish_shared_ep_forward_flags(forward_batch: Any) -> None:
+    """Publish the rank-consistent SharedEP route and graph-static lane."""
+
+    global_mode = getattr(forward_batch, "global_forward_mode", None)
+    local_mode = forward_batch.forward_mode
+    mode = global_mode or local_mode
+    forward = get_forward()
+    forward.set("shared_ep_is_decode", mode.is_decode())
+    forward.set(
+        "shared_ep_generation",
+        int(getattr(forward_batch, "shared_ep_generation", 0)),
+    )
+    global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
+    forward.set(
+        "shared_ep_global_num_tokens",
+        (
+            tuple(int(value) for value in global_num_tokens)
+            if global_num_tokens is not None
+            else None
+        ),
+    )
 
 
 # --- Resolved config namespaces -------------------------

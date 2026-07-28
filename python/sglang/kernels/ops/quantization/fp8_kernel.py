@@ -270,12 +270,10 @@ def _per_token_group_quant_8bit_raw(
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    if _is_hip:
-        if dtype == torch.int8:
-            bit8_max = 127.0
-        else:
-            bit8_max = 224.0
-        bit8_min = -bit8_max  # TODO incorrect for int8
+    if _is_hip and dtype == torch.float8_e4m3fnuz:
+        # gfx94x uses the legacy FNUZ encoding and its established safe range.
+        bit8_max = 224.0
+        bit8_min = -bit8_max
     else:
         if dtype == torch.int8:
             info = torch.iinfo(dtype)
@@ -808,7 +806,24 @@ def sglang_per_token_quant_fp8(
         dtype=torch.float32,
     )
 
-    sgl_per_token_quant_fp8(x, x_q, x_s)
+    if _is_hip:
+        if dtype != fp8_dtype:
+            raise ValueError(
+                f"ROCm per-token FP8 quantization requires {fp8_dtype}, got {dtype}"
+            )
+        if _use_aiter:
+            dynamic_per_token_scaled_quant(x_q, x, x_s)
+        elif _has_vllm:
+            torch.ops._C.dynamic_per_token_scaled_fp8_quant(
+                x_q,
+                x,
+                x_s,
+                None,
+            )
+        else:
+            _native_dynamic_per_token_quant_fp8(x_q, x, x_s)
+    else:
+        sgl_per_token_quant_fp8(x, x_q, x_s)
 
     return x_q, x_s
 

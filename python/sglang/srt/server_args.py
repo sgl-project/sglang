@@ -275,6 +275,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "megamoe",
     "pplx",
     "ascend_tp",
+    "shared_ep",
 ]
 
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
@@ -2256,9 +2257,15 @@ class ServerArgs:
             "flashinfer",
             "megamoe",
             "pplx",
+            "ascend_tp",
+            "shared_ep",
         ],
         Arg(
-            help="Choose the backend for MoE A2A.",
+            help=(
+                "Choose the backend for MoE A2A. shared_ep is a composite "
+                "backend that uses SharedEP for decode, DeepEP + DeepGEMM "
+                "for CUDA prefill, and MoRI + AITER for ROCm prefill."
+            ),
             choices=MOE_A2A_BACKEND_CHOICES,
             resolvable=True,
         ),
@@ -6573,10 +6580,13 @@ class ServerArgs:
             _a2a_backend_overrides,
             _a2a_ep_size,
             _a2a_fusion_adjustments,
+            _shared_ep_runner_resolution,
+            resolved_view,
             run_post_process_pass,
         )
 
         run_post_process_pass(self, _a2a_backend_overrides)
+        run_post_process_pass(self, _shared_ep_runner_resolution)
         run_post_process_pass(self, _a2a_ep_size)
 
         # The a2a-driven shared-experts fusion adjustments moved to the
@@ -8625,6 +8635,12 @@ class ServerArgs:
             )
 
         # Check two batch overlap backend requirement.
+        if self.moe_a2a_backend == "shared_ep":
+            from sglang.srt.layers.moe.shared_ep.admission import (
+                validate_shared_ep_server_args,
+            )
+
+            validate_shared_ep_server_args(self)
         self._check_two_batch_overlap()
 
         # Check communications compression

@@ -9,7 +9,10 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.utils import get_moe_weight_sizes
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    get_moe_weight_sizes,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.dequantization import (
     copy_missing_attrs,
@@ -560,6 +563,37 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         layer.w2_weight = torch.nn.Parameter(qw2_weight, requires_grad=False)
 
+    @staticmethod
+    def _prepare_shared_ep_aiter_fallback(layer: torch.nn.Module) -> None:
+        """Keep canonical decode tensors and expose the temporary prefill copy."""
+
+        if not _use_aiter or not _is_shuffle_moe_mxfp4:
+            raise RuntimeError(
+                "SharedEP Quark MXFP4 prefill requires gfx950 AITER shuffling"
+            )
+
+        for name in ("w13_weight_scale", "w2_weight_scale"):
+            scale = getattr(layer, name)
+            experts, rows, _ = scale.shape
+            shuffled = e8m0_shuffle(scale.view(experts * rows, -1))
+            shuffled = shuffled.view(experts, rows, -1)
+            shuffled.is_shuffled = True
+            setattr(layer, f"_shared_ep_aiter_{name}", shuffled)
+            scale.is_shuffled = False
+
+        w13_weight = shuffle_weight(layer.w13_weight.contiguous(), (16, 16))
+        w2_weight = shuffle_weight(layer.w2_weight.contiguous(), (16, 16))
+        w13_weight.is_shuffled = True
+        w2_weight.is_shuffled = True
+        layer._shared_ep_aiter_w13_weight = w13_weight
+        layer._shared_ep_aiter_w2_weight = w2_weight
+        layer.w13_weight.is_shuffled = False
+        layer.w2_weight.is_shuffled = False
+        logger.warning_once(
+            "SharedEP MXFP4 keeps canonical decode weights/scales and currently "
+            "allocates an explicit shuffled duplicate for MoRI+AITER prefill."
+        )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if (
             not self.is_checkpoint_mxfp4_serialized
@@ -574,31 +608,56 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             assert layer.w13_weight_scale.dtype == torch.uint8
             assert layer.w2_weight_scale.dtype == torch.uint8
 
-        # Pre-shuffle weight scales
-        s0, s1, _ = layer.w13_weight_scale.shape
-        w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
-        w13_weight_scale = e8m0_shuffle(w13_weight_scale)
-        layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+        if get_moe_a2a_backend().is_shared_ep():
+            self._prepare_shared_ep_aiter_fallback(layer)
+        else:
+            # Pre-shuffle weight scales
+            s0, s1, _ = layer.w13_weight_scale.shape
+            w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
+            w13_weight_scale = e8m0_shuffle(w13_weight_scale)
+            layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
 
-        s0, s1, _ = layer.w2_weight_scale.shape
-        w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
-        w2_weight_scale = e8m0_shuffle(w2_weight_scale)
-        layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+            s0, s1, _ = layer.w2_weight_scale.shape
+            w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
+            w2_weight_scale = e8m0_shuffle(w2_weight_scale)
+            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
 
-        # Pre-shuffle weight
-        if _is_shuffle_moe_mxfp4:
-            layer.w13_weight.data = shuffle_weight(
-                layer.w13_weight.contiguous(), (16, 16)
-            )
-            layer.w2_weight.data = shuffle_weight(
-                layer.w2_weight.contiguous(), (16, 16)
-            )
-            layer.w13_weight.is_shuffled = True
-            layer.w2_weight.is_shuffled = True
+            # Pre-shuffle weight
+            if _is_shuffle_moe_mxfp4:
+                layer.w13_weight.data = shuffle_weight(
+                    layer.w13_weight.contiguous(), (16, 16)
+                )
+                layer.w2_weight.data = shuffle_weight(
+                    layer.w2_weight.contiguous(), (16, 16)
+                )
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
 
         if hasattr(layer, "dispatcher"):
             # Weights are stored as torch.uint8 but semantically MXFP4
-            layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
+            fp4_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+            quant_config = {"weight_dtype": fp4_dtype}
+            if get_moe_a2a_backend().is_shared_ep():
+                from sglang.srt.layers.moe.moe_runner.shared_ep import (
+                    SharedEpScaleLayout,
+                    SharedEpWeightLayout,
+                )
+
+                quant_config.update(
+                    shared_ep_quantization="mxfp4",
+                    shared_ep_weight_layout=SharedEpWeightLayout.CANONICAL.value,
+                    shared_ep_scale_layout=SharedEpScaleLayout.CANONICAL.value,
+                    block_shape=(1, OCP_MX_BLOCK_SIZE),
+                    weight_group_size=OCP_MX_BLOCK_SIZE,
+                    scale_format="e8m0",
+                    weight_scale_dtype=layer.w13_weight_scale.dtype,
+                    w13_shape=tuple(layer.w13_weight.shape),
+                    w2_shape=tuple(layer.w2_weight.shape),
+                    w13_scale_shape=tuple(layer.w13_weight_scale.shape),
+                    w2_scale_shape=tuple(layer.w2_weight_scale.shape),
+                    fallback_uses_duplicate_tensors=True,
+                )
+            layer.dispatcher.set_quant_config(quant_config)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -629,23 +688,76 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             AiterQuantType,
         )
 
-        if hasattr(torch, "float4_e2m1fn_x2"):
-            w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
-            w2_weight = layer.w2_weight.view(torch.float4_e2m1fn_x2)
+        is_shared_ep = get_moe_a2a_backend().is_shared_ep()
+        if is_shared_ep:
+            required = (
+                "_shared_ep_aiter_w13_weight",
+                "_shared_ep_aiter_w2_weight",
+                "_shared_ep_aiter_w13_weight_scale",
+                "_shared_ep_aiter_w2_weight_scale",
+            )
+            missing = [name for name in required if not hasattr(layer, name)]
+            if missing:
+                raise RuntimeError(
+                    "SharedEP MXFP4 prefill fallback was not materialized: "
+                    + ", ".join(missing)
+                )
+            prefill_w13 = layer._shared_ep_aiter_w13_weight
+            prefill_w2 = layer._shared_ep_aiter_w2_weight
+            prefill_s13 = layer._shared_ep_aiter_w13_weight_scale
+            prefill_s2 = layer._shared_ep_aiter_w2_weight_scale
         else:
-            w13_weight = layer.w13_weight
-            w2_weight = layer.w2_weight
+            prefill_w13 = layer.w13_weight
+            prefill_w2 = layer.w2_weight
+            prefill_s13 = layer.w13_weight_scale
+            prefill_s2 = layer.w2_weight_scale
 
-        if hasattr(layer.w13_weight, "is_shuffled"):
+        if hasattr(torch, "float4_e2m1fn_x2"):
+            w13_weight = prefill_w13.view(torch.float4_e2m1fn_x2)
+            w2_weight = prefill_w2.view(torch.float4_e2m1fn_x2)
+        else:
+            w13_weight = prefill_w13
+            w2_weight = prefill_w2
+
+        if getattr(prefill_w13, "is_shuffled", False):
             w13_weight.is_shuffled = True
             w2_weight.is_shuffled = True
 
-        quant_info = AiterMoeQuantInfo(
+        fallback_quant_info = AiterMoeQuantInfo(
             w13_weight=w13_weight,
             w2_weight=w2_weight,
             quant_type=AiterQuantType.PER_1X32,
+            w13_scale=prefill_s13,
+            w2_scale=prefill_s2,
+            expert_mask=layer.dispatcher.expert_mask_gpu,
+        )
+        if not is_shared_ep:
+            return self.runner.run(dispatch_output, fallback_quant_info)
+
+        from sglang.srt.layers.moe.moe_runner.shared_ep import (
+            SharedEpQuantCapability,
+            SharedEpQuantInfo,
+            SharedEpQuantization,
+            SharedEpScaleLayout,
+            SharedEpWeightLayout,
+        )
+
+        quant_info = SharedEpQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            expert_mask=layer.dispatcher.expert_mask_gpu,
+            block_shape=(1, OCP_MX_BLOCK_SIZE),
+            fallback_quant_info=fallback_quant_info,
+            fallback_backend=self.runner.runner_backend,
+            quantization=SharedEpQuantization.MXFP4,
+            weight_layout=SharedEpWeightLayout.CANONICAL,
+            scale_layout=SharedEpScaleLayout.CANONICAL,
+            weight_group_size=OCP_MX_BLOCK_SIZE,
+            scale_format="e8m0",
+            capabilities=frozenset({SharedEpQuantCapability.CANONICAL_MXFP4}),
+            fallback_weight_layout=SharedEpWeightLayout.AITER_SHUFFLED,
+            fallback_scale_layout=SharedEpScaleLayout.AITER_SHUFFLED,
+            fallback_uses_duplicate_tensors=True,
         )
         return self.runner.run(dispatch_output, quant_info)

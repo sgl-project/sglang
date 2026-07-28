@@ -45,6 +45,10 @@ class MoeRunnerConfig:
     num_fused_shared_experts: Optional[int] = None
     params_dtype: Optional[torch.dtype] = None
     routing_method_type: Optional[RoutingMethodType] = None
+    # Rank-identical namespace for process-lifetime SharedEP VMM lanes.
+    # Sequential target layers intentionally share "target"; NEXTN/draft
+    # models must use a distinct namespace.
+    shared_ep_model_namespace: str = "target"
 
     # Runner configuration
     activation: str = "silu"

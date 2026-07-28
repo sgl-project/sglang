@@ -736,6 +736,7 @@ class TboForwardBatchPreparer:
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
             "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches
+            "shared_ep_generation",  # generation lane is orthogonal to TBO subbatch
         ]:
             output_dict[key] = getattr(batch, key)
 

@@ -44,7 +44,11 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_parallel,
+    publish_shared_ep_forward_flags,
+)
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import (
     empty_context,
@@ -586,6 +590,7 @@ class BaseRunner(ABC):
                 global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
+            publish_shared_ep_forward_flags(forward_batch)
 
             kwargs = {}
             if (

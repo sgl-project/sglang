@@ -2,7 +2,9 @@ import logging
 import os
 import struct
 import time
-from typing import Any, List, Optional
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any, List, Optional, Protocol
 
 import torch
 import torch.distributed as dist
@@ -36,6 +38,275 @@ def check_drv(result_tuple, label):
     if err != drv.CUresult.CUDA_SUCCESS:
         raise RuntimeError(f"{label}: {err}")
     return result_tuple[1] if len(result_tuple) > 1 else None
+
+
+class VmmBackend(Protocol):
+    """Platform-neutral operations needed by SharedEP rank-major VMM."""
+
+    platform: str
+    dlpack_device_type: int
+    supports_fabric: bool
+
+    def ensure_supported(self, device_id: int) -> None: ...
+
+    def get_allocation_granularity(
+        self, device_id: int, *, allow_fabric: bool
+    ) -> int: ...
+
+    def create_allocation(self, size: int, device_id: int, *, allow_fabric: bool): ...
+
+    def release(self, handle) -> None: ...
+
+    def export_fabric(self, handle) -> bytes: ...
+
+    def export_posix_fd(self, handle) -> int: ...
+
+    def import_fabric(self, handle: bytes): ...
+
+    def import_posix_fd(self, fd: int): ...
+
+    def reserve(self, size: int, alignment: int = 0) -> int: ...
+
+    def map(self, address: int, size: int, handle) -> None: ...
+
+    def set_access(self, address: int, size: int, device_id: int) -> None: ...
+
+    def unmap(self, address: int, size: int) -> None: ...
+
+    def address_free(self, address: int, size: int) -> None: ...
+
+
+@dataclass(frozen=True)
+class VmmCapability:
+    platform: str
+    device_id: int
+    supported: bool
+    reason: Optional[str] = None
+
+
+def _make_cuda_allocation_prop(device_id: int, *, allow_fabric: bool):
+    drv = _get_cuda_driver()
+    handle_types = drv.CUmemAllocationHandleType
+    requested_handle_types = (
+        handle_types.CU_MEM_HANDLE_TYPE_FABRIC
+        | handle_types.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        if allow_fabric
+        else handle_types.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+    )
+    prop = drv.CUmemAllocationProp()
+    prop.requestedHandleTypes = requested_handle_types
+    prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location = drv.CUmemLocation()
+    prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+    prop.location.id = device_id
+    if hasattr(prop, "allocFlags") and hasattr(prop.allocFlags, "gpuDirectRDMACapable"):
+        prop.allocFlags.gpuDirectRDMACapable = 1
+    return prop
+
+
+class CudaVmmBackend:
+    """CUDA driver-backed implementation of the SharedEP VMM facade."""
+
+    platform = "cuda"
+    dlpack_device_type = 2  # kDLCUDA
+    supports_fabric = True
+
+    def ensure_supported(self, device_id: int) -> None:
+        drv = _get_cuda_driver()
+        attribute = getattr(
+            drv.CUdevice_attribute,
+            "CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED",
+            None,
+        )
+        if attribute is None:
+            # Older cuda-python bindings do not expose the query. Preserve the
+            # previous behavior and let the first VMM operation report support.
+            return
+        supported = check_drv(
+            drv.cuDeviceGetAttribute(attribute, device_id),
+            "cuDeviceGetAttribute(VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED)",
+        )
+        if not supported:
+            raise RuntimeError(
+                f"CUDA device {device_id} does not support virtual memory management"
+            )
+
+    def get_allocation_granularity(self, device_id: int, *, allow_fabric: bool) -> int:
+        drv = _get_cuda_driver()
+        prop = _make_cuda_allocation_prop(
+            device_id,
+            allow_fabric=allow_fabric,
+        )
+        return int(
+            check_drv(
+                drv.cuMemGetAllocationGranularity(
+                    prop,
+                    drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+                ),
+                "cuMemGetAllocationGranularity",
+            )
+        )
+
+    def create_allocation(self, size: int, device_id: int, *, allow_fabric: bool):
+        drv = _get_cuda_driver()
+        prop = _make_cuda_allocation_prop(
+            device_id,
+            allow_fabric=allow_fabric,
+        )
+        label = (
+            "cuMemCreate(FABRIC|POSIX_FD)" if allow_fabric else "cuMemCreate(POSIX_FD)"
+        )
+        return check_drv(drv.cuMemCreate(size, prop, 0), label)
+
+    def release(self, handle) -> None:
+        check_drv(_get_cuda_driver().cuMemRelease(handle), "cuMemRelease")
+
+    def export_fabric(self, handle) -> bytes:
+        drv = _get_cuda_driver()
+        fabric = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        exported = check_drv(
+            drv.cuMemExportToShareableHandle(handle, fabric, 0),
+            "cuMemExportToShareableHandle(FABRIC)",
+        )
+        return bytes(exported.data)
+
+    def export_posix_fd(self, handle) -> int:
+        drv = _get_cuda_driver()
+        posix = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        return int(
+            check_drv(
+                drv.cuMemExportToShareableHandle(handle, posix, 0),
+                "cuMemExportToShareableHandle(POSIX_FD)",
+            )
+        )
+
+    def import_fabric(self, handle: bytes):
+        drv = _get_cuda_driver()
+        fabric = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        return check_drv(
+            drv.cuMemImportFromShareableHandle(handle, fabric),
+            "cuMemImportFromShareableHandle(FABRIC)",
+        )
+
+    def import_posix_fd(self, fd: int):
+        drv = _get_cuda_driver()
+        posix = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        dup_fd = os.dup(fd)
+        try:
+            return check_drv(
+                drv.cuMemImportFromShareableHandle(dup_fd, posix),
+                "cuMemImportFromShareableHandle(POSIX_FD)",
+            )
+        finally:
+            os.close(dup_fd)
+
+    def reserve(self, size: int, alignment: int = 0) -> int:
+        return int(
+            check_drv(
+                _get_cuda_driver().cuMemAddressReserve(size, alignment, 0, 0),
+                "cuMemAddressReserve",
+            )
+        )
+
+    def map(self, address: int, size: int, handle) -> None:
+        check_drv(
+            _get_cuda_driver().cuMemMap(address, size, 0, handle, 0),
+            "cuMemMap",
+        )
+
+    def set_access(self, address: int, size: int, device_id: int) -> None:
+        drv = _get_cuda_driver()
+        access = make_rw_access_desc(device_id)
+        check_drv(
+            drv.cuMemSetAccess(address, size, [access], 1),
+            "cuMemSetAccess",
+        )
+
+    def unmap(self, address: int, size: int) -> None:
+        check_drv(_get_cuda_driver().cuMemUnmap(address, size), "cuMemUnmap")
+
+    def address_free(self, address: int, size: int) -> None:
+        check_drv(
+            _get_cuda_driver().cuMemAddressFree(address, size),
+            "cuMemAddressFree",
+        )
+
+
+@lru_cache(maxsize=1)
+def get_vmm_backend() -> VmmBackend:
+    """Return the VMM implementation matching the active PyTorch runtime."""
+
+    if torch.version.hip:
+        from sglang.srt.distributed.device_communicators.hip_vmm import (
+            HipVmmBackend,
+        )
+
+        return HipVmmBackend()
+    return CudaVmmBackend()
+
+
+def query_vmm_capability(
+    device: torch.device | str | None = None,
+    *,
+    backend: Optional[VmmBackend] = None,
+) -> VmmCapability:
+    """Probe whether SharedEP's complete VMM primitive set is usable."""
+
+    selected = backend or get_vmm_backend()
+    if device is None:
+        try:
+            device = torch.device("cuda", torch.cuda.current_device())
+        except BaseException as error:
+            return VmmCapability(
+                platform=selected.platform,
+                device_id=-1,
+                supported=False,
+                reason=f"no active CUDA/HIP device: {type(error).__name__}: {error}",
+            )
+    else:
+        device = torch.device(device)
+    if device.type != "cuda":
+        return VmmCapability(
+            platform=selected.platform,
+            device_id=-1,
+            supported=False,
+            reason=f"VMM storage requires a CUDA/HIP device, got {device}",
+        )
+    device_id = device.index
+    if device_id is None:
+        device_id = torch.cuda.current_device()
+    try:
+        selected.ensure_supported(device_id)
+    except BaseException as error:
+        return VmmCapability(
+            platform=selected.platform,
+            device_id=device_id,
+            supported=False,
+            reason=f"{type(error).__name__}: {error}",
+        )
+    return VmmCapability(
+        platform=selected.platform,
+        device_id=device_id,
+        supported=True,
+    )
+
+
+def require_vmm_backend(
+    device: torch.device | str,
+    *,
+    backend: Optional[VmmBackend] = None,
+    purpose: str = "SharedEP VMM",
+) -> VmmBackend:
+    """Return a supported backend or raise an actionable capability error."""
+
+    selected = backend or get_vmm_backend()
+    capability = query_vmm_capability(device, backend=selected)
+    if not capability.supported:
+        raise RuntimeError(
+            f"{purpose} is unavailable on {selected.platform} "
+            f"device {capability.device_id}: {capability.reason}"
+        )
+    return selected
 
 
 def is_vmm_pointer(ptr: int) -> bool:
@@ -114,7 +385,13 @@ def make_rw_access_desc(device_id: int):
 
 def all_ranks_ok(group: ProcessGroup, ok: bool) -> bool:
     """True iff ``ok`` holds on every rank in ``group`` (BAND all-reduce)."""
-    flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
+    backend = dist.get_backend(group)
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if backend == dist.Backend.NCCL
+        else torch.device("cpu")
+    )
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device=device)
     dist.all_reduce(flag, op=dist.ReduceOp.BAND, group=group)
     return flag.item() == 1
 
@@ -258,10 +535,9 @@ def exchange_posix_fds(
     import threading
 
     sock_kind = getattr(socket, "SOCK_SEQPACKET", socket.SOCK_STREAM)
-    sock_dir = tempfile.mkdtemp(prefix="sgl_ar_fd_")
-    sock_path = os.path.join(sock_dir, f"rank_{rank}.sock")
-    server = socket.socket(socket.AF_UNIX, sock_kind)
-    server.settimeout(_FD_SEND_TIMEOUT_S)
+    sock_dir = None
+    sock_path = None
+    server = None
     received_fds = {}
     errors = []
 
@@ -285,13 +561,37 @@ def exchange_posix_fds(
             errors.append(e)
 
     try:
-        server.bind(sock_path)
-        server.listen(world_size)
+        setup_error = None
+        try:
+            sock_dir = tempfile.mkdtemp(prefix="sgl_ar_fd_")
+            sock_path = os.path.join(sock_dir, f"rank_{rank}.sock")
+            server = socket.socket(socket.AF_UNIX, sock_kind)
+            server.settimeout(_FD_SEND_TIMEOUT_S)
+            server.bind(sock_path)
+            server.listen(world_size)
+        except BaseException as e:
+            setup_error = e
+
+        setup_errors = [None] * world_size
+        setup_error_text = (
+            None
+            if setup_error is None
+            else f"{type(setup_error).__name__}: {setup_error}"
+        )
+        dist.all_gather_object(setup_errors, setup_error_text, group=group)
+        for failed_rank, error_text in enumerate(setup_errors):
+            if error_text is not None:
+                raise RuntimeError(
+                    "POSIX fd listener setup failed on "
+                    f"rank {failed_rank}: {error_text}"
+                ) from setup_error
+
         paths = [None] * world_size
         dist.all_gather_object(paths, sock_path, group=group)
 
         thread = threading.Thread(target=recv_loop, daemon=True)
         thread.start()
+        exchange_error = None
         try:
             for peer_rank, peer_path in enumerate(paths):
                 if peer_rank == rank:
@@ -301,13 +601,33 @@ def exchange_posix_fds(
                     sock.connect(peer_path)
                     for base_idx, fd in enumerate(local_fds):
                         _send_fd(sock, fd, rank, base_idx)
+        except BaseException as e:
+            exchange_error = e
         finally:
             thread.join(_FD_SEND_TIMEOUT_S)
 
-        if thread.is_alive():
-            raise RuntimeError("timed out waiting for POSIX fd exchange")
-        if errors:
-            raise RuntimeError("POSIX fd exchange receive failed") from errors[0]
+        if exchange_error is None and thread.is_alive():
+            exchange_error = RuntimeError("timed out waiting for POSIX fd exchange")
+        if exchange_error is None and errors:
+            exchange_error = RuntimeError(
+                f"POSIX fd exchange receive failed: {errors[0]}"
+            )
+
+        exchange_errors = [None] * world_size
+        exchange_error_text = (
+            None
+            if exchange_error is None
+            else f"{type(exchange_error).__name__}: {exchange_error}"
+        )
+        dist.all_gather_object(exchange_errors, exchange_error_text, group=group)
+        for failed_rank, error_text in enumerate(exchange_errors):
+            if error_text is not None:
+                for fd in received_fds.values():
+                    os.close(fd)
+                received_fds.clear()
+                raise RuntimeError(
+                    f"POSIX fd exchange failed on rank {failed_rank}: {error_text}"
+                ) from exchange_error
 
         expected = {
             (src_rank, base_idx)
@@ -317,24 +637,39 @@ def exchange_posix_fds(
         }
         missing = expected.difference(received_fds)
         extra = set(received_fds).difference(expected)
-        if missing or extra:
-            for fd in received_fds.values():
-                os.close(fd)
-            raise RuntimeError(
-                "POSIX fd exchange mismatch: "
-                f"missing={sorted(missing)[:8]}, extra={sorted(extra)[:8]}"
-            )
+        validation_error = (
+            f"missing={sorted(missing)[:8]}, extra={sorted(extra)[:8]}"
+            if missing or extra
+            else None
+        )
+        validation_errors = [None] * world_size
+        dist.all_gather_object(
+            validation_errors,
+            validation_error,
+            group=group,
+        )
+        for failed_rank, error_text in enumerate(validation_errors):
+            if error_text is not None:
+                for fd in received_fds.values():
+                    os.close(fd)
+                received_fds.clear()
+                raise RuntimeError(
+                    f"POSIX fd validation failed on rank {failed_rank}: {error_text}"
+                )
         return received_fds
     finally:
-        server.close()
-        try:
-            os.unlink(sock_path)
-        except FileNotFoundError:
-            pass
-        try:
-            os.rmdir(sock_dir)
-        except OSError:
-            pass
+        if server is not None:
+            server.close()
+        if sock_path is not None:
+            try:
+                os.unlink(sock_path)
+            except FileNotFoundError:
+                pass
+        if sock_dir is not None:
+            try:
+                os.rmdir(sock_dir)
+            except OSError:
+                pass
 
 
 def import_peer_handle(fabric_handle, fd, *, use_fabric: bool, peer_rank: int):

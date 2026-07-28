@@ -11,8 +11,26 @@
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
 #include <cstdint>
+#ifndef USE_ROCM
 #include <cuda_fp8.h>
+#endif
 #include <type_traits>
+
+#ifdef USE_ROCM
+struct fp8_e4m3_tensor_t {};
+namespace host::details {
+template <>
+struct DLDataTypeTrait<::fp8_e4m3_tensor_t> {
+#if HIP_FP8_TYPE_FNUZ
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat8_e4m3fnuz, .bits = 8, .lanes = 1};
+#else
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat8_e4m3fn, .bits = 8, .lanes = 1};
+#endif
+};
+}  // namespace host::details
+#else
+using fp8_e4m3_tensor_t = fp8_e4m3_t;
+#endif
 
 namespace {
 
@@ -31,6 +49,11 @@ struct SiluMulQuantVarlenParams {
 };
 
 constexpr uint32_t kMaxExperts = 256;
+#ifdef USE_ROCM
+constexpr uint32_t kScanThreads = 64;
+#else
+constexpr uint32_t kScanThreads = 32;
+#endif
 
 struct alignas(16) CTAWork {
   uint32_t expert_id;
@@ -39,12 +62,22 @@ struct alignas(16) CTAWork {
 };
 
 SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
+#ifndef USE_ROCM
   static_assert(device::kWarpThreads == 32);
 #pragma unroll
   for (uint32_t offset = 1; offset < 32; offset *= 2) {
     uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
     if (lane_id >= offset) val += n;
   }
+#else
+#pragma unroll
+  for (uint32_t offset = 1; offset < kScanThreads; offset *= 2) {
+    // CDNA executes wave64. Passing width=64 prevents the upper half-wave from
+    // being accidentally treated as a second NVIDIA-style logical warp.
+    uint32_t n = __shfl_up(val, offset, kScanThreads);
+    if (lane_id >= offset) val += n;
+  }
+#endif
   return val;
 }
 
@@ -78,11 +111,12 @@ SGL_DEVICE CTAWork get_work(const SiluMulQuantVarlenParams& params) {
   // 1. blockDim.x >= params.num_experts
   // 2. params.num_experts <= kMaxExperts
   using namespace device;
-  static_assert(kWarpThreads == 32);
 
   static __shared__ uint32_t s_warp_sum[32];
   static __shared__ CTAWork result;
 
+#ifndef USE_ROCM
+  static_assert(kWarpThreads == 32);
   result.valid = false;
 
   const uint32_t tx = threadIdx.x;
@@ -100,6 +134,34 @@ SGL_DEVICE CTAWork get_work(const SiluMulQuantVarlenParams& params) {
   __syncthreads();
   const auto tmp_val = lane_id < warp_id ? s_warp_sum[lane_id] : 0u;
   const auto prefix_exclusive = warp::reduce_sum(tmp_val) + warp_exclusive;
+#else
+  const uint32_t tx = threadIdx.x;
+  const uint32_t lane_id = tx % kScanThreads;
+  const uint32_t warp_id = tx / kScanThreads;
+  if (tx == 0) result.valid = false;
+  __syncthreads();
+
+  const uint32_t val = tx < params.num_experts ? params.masked_m[tx] : 0u;
+
+  // Per-warp inclusive scan of masked_m.
+  const uint32_t warp_inclusive = warp_inclusive_sum(lane_id, val);
+  const uint32_t warp_exclusive = warp_inclusive - val;
+
+  // Write each warp total.
+  if (lane_id == kScanThreads - 1) s_warp_sum[warp_id] = warp_inclusive;
+  __syncthreads();
+  if (tx == 0) {
+    const uint32_t num_warps = blockDim.x / kScanThreads;
+    uint32_t prefix = 0;
+    for (uint32_t warp = 0; warp < num_warps; ++warp) {
+      const uint32_t total = s_warp_sum[warp];
+      s_warp_sum[warp] = prefix;
+      prefix += total;
+    }
+  }
+  __syncthreads();
+  const auto prefix_exclusive = s_warp_sum[warp_id] + warp_exclusive;
+#endif
   const auto bx = blockIdx.x;
   if (prefix_exclusive <= bx && bx < prefix_exclusive + val) {
     result = {tx, bx - prefix_exclusive, true};
@@ -264,14 +326,14 @@ struct SiluAndMulMaskedPostQuantKernel {
     auto D = SymbolicSize{"hidden_dim x 2"};
     auto N = SymbolicSize{"hidden_dim"};
     auto G = SymbolicSize{"num_groups"};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({E, T, D})  // input
         .with_dtype<bf16_t>()
         .with_device(device)
         .verify(input);
     TensorMatcher({E, T, N})  // output
-        .with_dtype<fp8_e4m3_t>()
+        .with_dtype<fp8_e4m3_tensor_t>()
         .with_device(device)
         .verify(output);
     if (!transposed) {
@@ -315,7 +377,7 @@ struct SiluAndMulMaskedPostQuantKernel {
     };
 
     const auto num_threads = hidden_dim / 8;
-    RuntimeCheck(num_threads % device::kWarpThreads == 0);
+    RuntimeCheck(num_threads % kScanThreads == 0);
     RuntimeCheck(num_threads >= num_experts);
     const auto kernel = transposed ? kernel_transposed : kernel_normal;
     LaunchKernel(num_tokens * topk, num_threads, device.unwrap())  //
@@ -334,7 +396,7 @@ struct SiluAndMulClampKernel {
     auto M = SymbolicSize{"num_tokens"};
     auto D = SymbolicSize{"gate_up_dim"};  // 2 * out_dim
     auto H = SymbolicSize{"out_dim"};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({M, D})  // input  (gate || up)
         .with_dtype<DType>()
@@ -367,6 +429,7 @@ struct SiluMulQuantContigParams {
   const bf16_t* __restrict__ input;
   fp8_e4m3_t* __restrict__ output;
   float* __restrict__ output_scale;
+  const int32_t* __restrict__ valid_rows;
   float swiglu_limit;  // only read when kApplySwigluLimit=true
   int64_t hidden_dim;
   uint32_t num_tokens;
@@ -386,6 +449,7 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
 
   const auto token_id = blockIdx.x;
+  if (params.valid_rows != nullptr && token_id >= static_cast<uint32_t>(*params.valid_rows)) return;
   const auto work_id = threadIdx.x / kWorkThreads;
 
   const auto input = params.input + token_id * params.hidden_dim * 2;
@@ -473,6 +537,27 @@ struct SiluAndMulContigPostQuantKernel {
       const tvm::ffi::TensorView output_scale,
       const bool transposed,
       const double swiglu_limit) {
+    run_impl(input, output, output_scale, nullptr, transposed, swiglu_limit);
+  }
+
+  static void run_valid(
+      const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView output_scale,
+      const tvm::ffi::TensorView valid_rows,
+      const bool transposed,
+      const double swiglu_limit) {
+    run_impl(input, output, output_scale, &valid_rows, transposed, swiglu_limit);
+  }
+
+ private:
+  static void run_impl(
+      const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView output_scale,
+      const tvm::ffi::TensorView* valid_rows,
+      const bool transposed,
+      const double swiglu_limit) {
     using namespace host;
 
     auto device = SymbolicDevice{};
@@ -480,16 +565,22 @@ struct SiluAndMulContigPostQuantKernel {
     auto D = SymbolicSize{"hidden_dim x 2"};
     auto N = SymbolicSize{"hidden_dim"};
     auto G = SymbolicSize{"num_groups"};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({M, D})  // input (gate/up, natural or gran=8 interleaved on last dim)
         .with_dtype<bf16_t>()
         .with_device(device)
         .verify(input);
     TensorMatcher({M, N})  // fp8 output
-        .with_dtype<fp8_e4m3_t>()
+        .with_dtype<fp8_e4m3_tensor_t>()
         .with_device(device)
         .verify(output);
+    if (valid_rows != nullptr) {
+      TensorMatcher({1})  //
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(*valid_rows);
+    }
 
     const auto hidden_dim = N.unwrap();
     RuntimeCheck(D.unwrap() == 2 * hidden_dim, "invalid dimension");
@@ -523,6 +614,7 @@ struct SiluAndMulContigPostQuantKernel {
         .input = static_cast<const bf16_t*>(input.data_ptr()),
         .output = static_cast<fp8_e4m3_t*>(output.data_ptr()),
         .output_scale = static_cast<float*>(output_scale.data_ptr()),
+        .valid_rows = valid_rows == nullptr ? nullptr : static_cast<const int32_t*>(valid_rows->data_ptr()),
         .swiglu_limit = static_cast<float>(swiglu_limit),
         .hidden_dim = hidden_dim,
         .num_tokens = num_tokens,
@@ -530,7 +622,11 @@ struct SiluAndMulContigPostQuantKernel {
     };
 
     const auto num_threads = hidden_dim / 8;
+#ifdef USE_ROCM
+    RuntimeCheck(num_threads % 16 == 0);
+#else
     RuntimeCheck(num_threads % device::kWarpThreads == 0);
+#endif
     const auto kernel = transposed ? kernel_transposed : kernel_normal;
     LaunchKernel(num_tokens, num_threads, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
