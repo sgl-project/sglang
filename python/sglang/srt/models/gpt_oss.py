@@ -118,6 +118,26 @@ class GptOssConfig(PretrainedConfig):
 logger = logging.getLogger(__name__)
 
 
+def _narrow_fused_moe_ep_weight(
+    loaded_weight: torch.Tensor, num_experts: int
+) -> torch.Tensor:
+    parallel = get_parallel()
+    if parallel.moe_ep_size == 1:
+        return loaded_weight
+    assert num_experts % parallel.moe_ep_size == 0
+    num_local_experts = num_experts // parallel.moe_ep_size
+    if loaded_weight.shape[0] == num_local_experts:
+        return loaded_weight
+    if loaded_weight.shape[0] != num_experts:
+        raise ValueError(
+            f"Expected {num_experts} global or {num_local_experts} local experts, "
+            f"got {loaded_weight.shape[0]}"
+        )
+    return loaded_weight.narrow(
+        0, parallel.moe_ep_rank * num_local_experts, num_local_experts
+    )
+
+
 # Aligned with HF's implementation, using sliding window inclusive with the last token
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
@@ -1253,6 +1273,9 @@ class GptOssForCausalLM(nn.Module):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
+                    loaded_weight = _narrow_fused_moe_ep_weight(
+                        loaded_weight, self.config.num_local_experts
+                    )
                     if "bias" not in name:
                         loaded_weight = loaded_weight.transpose(-2, -1)
                     if "w2_weight_bias" in name and get_parallel().moe_tp_rank != 0:
