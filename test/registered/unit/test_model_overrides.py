@@ -71,6 +71,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "ep_size",
                     "moe_dense_tp_size",
                     "attn_cp_size",
+                    "dcp_comm_backend",
+                    "dcp_replicate_q_proj",
                     "disable_overlap_schedule",
                     "uses_mamba_radix_cache",
                     "mamba_radix_cache_strategy",

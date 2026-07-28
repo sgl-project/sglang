@@ -15,6 +15,7 @@ gate; is_cuda / is_hip are patched per-test to pin the platform deterministicall
 
 import dataclasses
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.server_args import ServerArgs
@@ -43,6 +44,9 @@ class TestDCPFieldDefaults(CustomTestCase):
 
     def test_dcp_comm_backend_default(self):
         self.assertEqual(ServerArgs.dcp_comm_backend, "ag_rs")
+
+    def test_dcp_replicate_q_proj_default_is_model_resolvable(self):
+        self.assertIsNone(ServerArgs.dcp_replicate_q_proj)
 
 
 class TestDCPCommBackendValidation(CustomTestCase):
@@ -96,6 +100,86 @@ class TestDCPCommBackendValidation(CustomTestCase):
         args = self._make_args(dcp_size=8, dcp_comm_backend="ag_rs")
         args._handle_dcp_validation()  # no raise
         self.assertEqual(args.dcp_size, 8)
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_kimi_linear_dspark_tokenspeed_with_dcp_size_2_on_cuda_passes(self, *_):
+        args = self._make_args(dcp_size=2, dcp_comm_backend="ag_rs")
+        args.speculative_algorithm = "DSPARK"
+        args.speculative_attention_mode = "decode"
+        args.decode_attention_backend = "tokenspeed_mla"
+        args.attention_backend = None
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["KimiLinearForCausalLM"])
+        )
+        with patch.object(args, "get_model_config", return_value=model_config):
+            args._handle_dcp_validation()  # no raise
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_kimi_linear_dspark_cutedsl_with_dcp_size_2_on_cuda_passes(self, *_):
+        args = self._make_args(dcp_size=2, dcp_comm_backend="ag_rs")
+        args.speculative_algorithm = "DSPARK"
+        args.speculative_attention_mode = "decode"
+        args.decode_attention_backend = "cutedsl_mla"
+        args.attention_backend = None
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["KimiLinearForCausalLM"])
+        )
+        with patch.object(args, "get_model_config", return_value=model_config):
+            args._handle_dcp_validation()  # no raise
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_kimi_linear_dspark_requires_decode_attention_mode(self, *_):
+        args = self._make_args(dcp_size=2, dcp_comm_backend="ag_rs")
+        args.speculative_algorithm = "DSPARK"
+        args.speculative_attention_mode = "prefill"
+        args.decode_attention_backend = "tokenspeed_mla"
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["KimiLinearForCausalLM"])
+        )
+        with (
+            patch.object(args, "get_model_config", return_value=model_config),
+            self.assertRaisesRegex(ValueError, "speculative_attention_mode"),
+        ):
+            args._handle_dcp_validation()
+
+    @patch(
+        "sglang.srt.server_args.envs.SGLANG_RAGGED_VERIFY_MODE.get",
+        return_value="compact",
+    )
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_kimi_linear_dspark_requires_static_ragged_verify_mode(self, *_):
+        args = self._make_args(dcp_size=2, dcp_comm_backend="ag_rs")
+        args.speculative_algorithm = "DSPARK"
+        args.speculative_attention_mode = "decode"
+        args.decode_attention_backend = "tokenspeed_mla"
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["KimiLinearForCausalLM"])
+        )
+        with (
+            patch.object(args, "get_model_config", return_value=model_config),
+            self.assertRaisesRegex(ValueError, "SGLANG_RAGGED_VERIFY_MODE=static"),
+        ):
+            args._handle_dcp_validation()
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_kimi_k3_dspark_dcp_is_not_admitted_without_arggroup_port(self, *_):
+        args = self._make_args(dcp_size=2, dcp_comm_backend="ag_rs")
+        args.speculative_algorithm = "DSPARK"
+        args.speculative_attention_mode = "decode"
+        args.decode_attention_backend = "cutedsl_mla"
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])
+        )
+        with (
+            patch.object(args, "get_model_config", return_value=model_config),
+            self.assertRaisesRegex(ValueError, "supported only"),
+        ):
+            args._handle_dcp_validation()
 
 
 if __name__ == "__main__":
