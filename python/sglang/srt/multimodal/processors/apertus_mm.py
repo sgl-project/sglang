@@ -3,6 +3,7 @@
 # Copyright 2026 The SwissAI Initiative
 """Multimodal request processing for Apertus 1.5."""
 
+import copy
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -18,6 +19,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.models.apertus_mm import Apertus1p5ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
 
@@ -183,132 +185,80 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
             self.mm_tokens.get_token_id_by_modality(modality),
         )
 
-    def _build_mm_items_from_outputs(self, outputs):
-        input_ids = outputs["input_ids"].flatten()
-        mm_items = []
-
-        if "pixel_values" in outputs:
-            image_offsets = self._get_mm_item_offsets(input_ids, Modality.IMAGE)
-            if len(outputs["pixel_values"]) != len(image_offsets):
-                raise ValueError(
-                    "Apertus image features and placeholder regions must have the same length."
-                )
-            mm_items.extend(
-                MultimodalDataItem(
-                    modality=Modality.IMAGE,
-                    feature=image,
-                    offsets=offsets,
-                )
-                for image, offsets in zip(outputs["pixel_values"], image_offsets)
-            )
-
-        if "input_features" in outputs:
-            audio_offsets = self._get_mm_item_offsets(input_ids, Modality.AUDIO)
-            if len(outputs["input_features"]) != len(audio_offsets):
-                raise ValueError(
-                    "Apertus audio features and placeholder regions must have the same length."
-                )
-            mm_items.extend(
-                MultimodalDataItem(
-                    modality=Modality.AUDIO,
-                    feature=audio,
-                    offsets=offsets,
-                )
-                for audio, offsets in zip(outputs["input_features"], audio_offsets)
-            )
-
-        return mm_items, input_ids
-
-    @staticmethod
-    def _split_precomputed_embeddings(artifact: Dict) -> List[torch.Tensor]:
-        """Return one embedding tensor for each prompt media item."""
-        embedding = artifact["feature"]
-        if embedding.dim() == 2:
-            return [embedding]
-        # Batched embeddings must already be unpadded and ordered by prompt media.
-        return list(embedding.unbind(dim=0))
-
-    def _build_precomputed_mm_items(
-        self,
-        image_artifacts,
-        audio_artifacts,
-        input_ids: torch.Tensor,
-    ):
-        """Build encoder-bypassing items by consuming prompt spans in artifact order."""
-        mm_items = []
-        for modality, artifacts in (
-            (Modality.IMAGE, image_artifacts),
-            (Modality.AUDIO, audio_artifacts),
-        ):
-            if artifacts is None:
+    def _expand_mm_items_with_apertus_offsets(
+        self, mm_items: List[MultimodalDataItem], input_ids: torch.Tensor
+    ) -> None:
+        """Assign delimiter-scoped spans and expand bundled raw media items."""
+        replacements = {}
+        for modality in (Modality.IMAGE, Modality.AUDIO):
+            modality_items = [item for item in mm_items if item.modality == modality]
+            if not modality_items:
                 continue
-            expected_item_offsets = self._get_mm_item_offsets(input_ids, modality)
-            offset_index = 0
-            for artifact in artifacts:
-                for embedding in self._split_precomputed_embeddings(artifact):
-                    # Assumption: canonical input IDs already contain one
-                    # Apertus start/end-delimited region per source media item.
-                    item_offsets = expected_item_offsets[offset_index]
-                    offset_tokens = sum(end - start + 1 for start, end in item_offsets)
-                    # Assumption: each precomputed embedding is for exactly one
-                    # source media item, in the same order as prompt regions.
-                    if embedding.shape[0] != offset_tokens:
-                        raise ValueError(
-                            "Apertus precomputed embedding length does not match its "
-                            "expanded prompt media item."
-                        )
-                    mm_items.append(
-                        MultimodalDataItem(
-                            modality=modality,
-                            offsets=item_offsets,
-                            format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
-                            precomputed_embeddings=embedding,
-                        )
+            offsets_per_item = self._get_mm_item_offsets(input_ids, modality)
+
+            # The shared processor initially bundles all raw media in a modality.
+            # Retain Apertus's source-item ownership by pairing each normalized
+            # feature with its own start/end-delimited placeholder spans.
+            if (
+                len(modality_items) == 1
+                and modality_items[0].format == MultimodalInputFormat.NORMAL
+                and isinstance(modality_items[0].feature, (list, tuple))
+            ):
+                bundled_item = modality_items[0]
+                if len(bundled_item.feature) != len(offsets_per_item):
+                    raise ValueError(
+                        "Apertus raw multimodal feature count does not match the "
+                        f"number of {modality.name.lower()} prompt spans."
                     )
-                    offset_index += 1
+                expanded_items = []
+                for feature, offsets in zip(bundled_item.feature, offsets_per_item):
+                    item = copy.copy(bundled_item)
+                    item.feature = feature
+                    item.offsets = offsets
+                    item.model_specific_data = copy.copy(
+                        bundled_item.model_specific_data
+                    )
+                    item.hash = None
+                    expanded_items.append(item)
+                replacements[id(bundled_item)] = expanded_items
+                continue
 
-            if offset_index != len(expected_item_offsets):
+            if len(modality_items) != len(offsets_per_item):
                 raise ValueError(
-                    "Apertus precomputed embeddings do not cover every "
-                    f"{modality.name.lower()} prompt span."
+                    "Apertus multimodal item count does not match the number of "
+                    f"{modality.name.lower()} prompt spans."
                 )
+            for item, offsets in zip(modality_items, offsets_per_item):
+                item.offsets = offsets
 
-        return mm_items, input_ids
+        if replacements:
+            mm_items[:] = [
+                replacement
+                for item in mm_items
+                for replacement in replacements.get(id(item), [item])
+            ]
 
-    def _get_special_input_ids(self, input_text) -> torch.Tensor:
-        """Tokenize an already-expanded prompt or preserve caller-supplied IDs."""
-        if isinstance(input_text, list):
-            return self._ensure_input_ids_is_tensor(input_text)
+    def _validate_raw_media_marker_counts(
+        self,
+        input_text,
+        image_data,
+        audio_data,
+    ) -> None:
+        """Require one source marker per raw image or audio item."""
+        if not isinstance(input_text, str):
+            return
 
-        # The caller has already expanded all multimodal markers in this string.
-        # Only tokenize it here; do not call the HF multimodal processor again.
-        add_special_tokens = True
-        bos = getattr(self._tokenizer, "bos_token", None)
-        if self._tokenizer_auto_adds_specials and bos and input_text.startswith(bos):
-            add_special_tokens = False
-        return self._tokenizer(
-            input_text,
-            return_tensors="pt",
-            add_special_tokens=add_special_tokens,
-        ).input_ids.flatten()
-
-    def _validate_special_artifacts(self, modality: Modality, artifacts):
-        """Validate one modality's artifacts without using the base one-item limit."""
-        artifacts = list(artifacts or [])
-        formats = {
-            self._get_preprocessed_input_format(artifact) for artifact in artifacts
-        }
-        if None in formats:
-            raise ValueError(
-                f"[apertus] {modality.name.lower()} special input must contain only "
-                "processor_output or precomputed_embedding artifacts."
-            )
-        if len(formats) > 1:
-            raise ValueError(
-                f"[apertus] Cannot mix processor_output and precomputed_embedding "
-                f"within {modality.name.lower()} input."
-            )
-        return artifacts, next(iter(formats), None)
+        for modality, marker, media_data in (
+            (Modality.IMAGE, self.mm_tokens.image_token, image_data),
+            (Modality.AUDIO, self.mm_tokens.audio_token, audio_data),
+        ):
+            marker_count = input_text.count(marker)
+            media_count = len(media_data or [])
+            if marker_count != media_count:
+                raise ValueError(
+                    f"[apertus] Expected {marker_count} {modality.name.lower()} "
+                    f"item(s) for {marker!r} marker(s), but received {media_count}."
+                )
 
     async def _process_special_format(
         self,
@@ -316,49 +266,49 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
         audio_data,
         input_text,
     ):
-        """Build MM items from already-preprocessed, modality-scoped artifacts."""
-        input_ids = self._get_special_input_ids(input_text)
-        images, image_format = self._validate_special_artifacts(
-            Modality.IMAGE, image_data
+        """Use the shared mixed-media flow and repair Apertus-specific offsets."""
+        if isinstance(input_text, list):
+            user_input_ids = input_text
+            prompt = ""
+        else:
+            user_input_ids = None
+            prompt = input_text or ""
+
+        if not prompt and (image_data or audio_data):
+            images = [data for data in (image_data or []) if isinstance(data, dict)]
+            audios = [data for data in (audio_data or []) if isinstance(data, dict)]
+            raw_images_dropped = len(image_data or []) - len(images)
+            raw_audios_dropped = len(audio_data or []) - len(audios)
+            if raw_images_dropped > 0 or raw_audios_dropped > 0:
+                raise ValueError(
+                    "[apertus] Cannot process raw images/audio with pre-tokenized "
+                    "input_ids. Provide multimodal data in 'processor_output' or "
+                    "'precomputed_embedding' format, or use a text prompt instead. "
+                    f"(raw images dropped: {raw_images_dropped}, "
+                    f"raw audio dropped: {raw_audios_dropped})"
+                )
+            base_output = BaseMultiModalProcessorOutput(
+                input_text=prompt,
+                images=images,
+                audios=audios,
+            )
+        else:
+            base_output = await self.load_mm_data(
+                prompt=prompt,
+                image_data=image_data,
+                audio_data=audio_data,
+                multimodal_tokens=self.mm_tokens,
+                audio_sample_rate=self.audio_sample_rate,
+            )
+
+        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            base_output, self.mm_tokens
         )
-        audios, audio_format = self._validate_special_artifacts(
-            Modality.AUDIO, audio_data
-        )
-        if not images and not audios:
-            return [], input_ids
 
-        mm_items = []
-        if image_format == MultimodalInputFormat.PROCESSOR_OUTPUT:
-            # List order is ownership order for processor outputs. Apertus's
-            # start/end markers assign each image to its expanded marker fragments.
-            image_outputs = {"input_ids": input_ids}
-            image_outputs.update(self._normalize_image_outputs(images))
-            image_items, _ = self._build_mm_items_from_outputs(image_outputs)
-            mm_items.extend(image_items)
-        if audio_format == MultimodalInputFormat.PROCESSOR_OUTPUT:
-            # Audio artifacts follow the same list-order contract as images.
-            audio_outputs = {"input_ids": input_ids}
-            audio_outputs.update(self._normalize_audio_outputs(audios))
-            audio_items, _ = self._build_mm_items_from_outputs(audio_outputs)
-            mm_items.extend(audio_items)
+        if user_input_ids is not None:
+            input_ids = torch.tensor(user_input_ids, dtype=torch.long)
 
-        if image_format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
-            image_items, _ = self._build_precomputed_mm_items(images, None, input_ids)
-            mm_items.extend(image_items)
-        if audio_format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
-            audio_items, _ = self._build_precomputed_mm_items(None, audios, input_ids)
-            mm_items.extend(audio_items)
-
-        if self.use_cuda_ipc:
-            # The special path bypasses the base processor's normal collection
-            # flow, so prepare its tensor payloads for CUDA-IPC here as well.
-            for item in mm_items:
-                if isinstance(item.feature, torch.Tensor):
-                    item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
-                if isinstance(item.precomputed_embeddings, torch.Tensor):
-                    item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
-                        item.precomputed_embeddings
-                    )
+        self._expand_mm_items_with_apertus_offsets(mm_items, input_ids)
 
         return mm_items, input_ids
 
@@ -372,13 +322,15 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         if self._has_special_format(image_data, audio_data):
-            # Offline/preprocessed media already supplies processor artifacts.
             mm_items, input_ids = await self._process_special_format(
                 image_data=image_data,
                 audio_data=audio_data,
                 input_text=input_text,
             )
         else:
+            self._validate_raw_media_marker_counts(
+                input_text, image_data, audio_data
+            )
             base_output = await self.load_mm_data(
                 prompt=input_text,
                 image_data=image_data,
@@ -386,23 +338,10 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
                 multimodal_tokens=self.mm_tokens,
                 audio_sample_rate=self.audio_sample_rate,
             )
-            images = base_output.images or []
-            audios = base_output.audios or []
-            if not images and not audios:
-                # Text-only request: keep the generic tokenization path.
-                mm_items, input_ids, _ = self.process_and_combine_mm_data(
-                    base_output, self.mm_tokens
-                )
-            else:
-                # Raw media: preserve Apertus's expanded token layout. Do not use
-                # process_and_combine_mm_data here: one source image can occupy
-                # non-contiguous placeholder fragments inside its delimiters.
-                outputs = self.process_mm_data(
-                    input_text=base_output.input_text,
-                    images=base_output.images,
-                    audios=base_output.audios,
-                )
-                mm_items, input_ids = self._build_mm_items_from_outputs(outputs)
+            mm_items, input_ids, _ = self.process_and_combine_mm_data(
+                base_output, self.mm_tokens
+            )
+            self._expand_mm_items_with_apertus_offsets(mm_items, input_ids)
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),
