@@ -59,6 +59,10 @@ class ImageGenerationsRequest(BaseModel):
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
+    # Progressive resolution generation
+    progressive_mode: Optional[str] = None
+    progressive_levels: Optional[int] = None
+    progressive_delta: Optional[float] = None
 
 
 # Video API protocol models
@@ -82,6 +86,7 @@ class VideoResponse(BaseModel):
     num_outputs: Optional[int] = None
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
+    action: Optional[Dict[str, Any]] = None
 
 
 class VideoGenerationsRequest(BaseModel):
@@ -90,6 +95,8 @@ class VideoGenerationsRequest(BaseModel):
     prompt: str
     input_reference: Optional[str] = None
     reference_url: Optional[str] = None
+    video_path: Optional[str] = None
+    video_url: Optional[str] = None
     model: Optional[str] = None
     n: Optional[int] = 1
     num_outputs_per_prompt: Optional[int] = None

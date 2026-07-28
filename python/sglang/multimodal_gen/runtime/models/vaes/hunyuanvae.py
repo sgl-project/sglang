@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
+from sglang.kernels.ops.diffusion.group_norm_silu import apply_group_norm_silu
 from sglang.multimodal_gen.configs.models.vaes import HunyuanVAEConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
