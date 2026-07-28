@@ -96,6 +96,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     supports_ragged_verify_graph: bool = True
 
+    # The fused in-graph metadata kernel indexes the live req_to_token /
+    # full->SWA mapping on every replay.
+    in_graph_metadata_reads_shared_buffers: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -1301,6 +1305,9 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
     # Per-step backends build the page table on-device (sync-free); mirror that so
     # decide_needs_cpu_seq_lens sees a consistent target + draft value.
     needs_cpu_seq_lens: bool = False
+
+    # Per-step TRTLLMHAAttnBackend kernels index live shared buffers in-graph.
+    in_graph_metadata_reads_shared_buffers: bool = True
 
     def __init__(
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
