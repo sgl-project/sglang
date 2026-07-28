@@ -1,6 +1,6 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Mapping, MutableMapping, Protocol, Sequence
 
@@ -22,6 +22,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     is_image_encoder_component_name,
     is_text_encoder_component_name,
     is_vae_component_name,
+)
+from sglang.multimodal_gen.runtime.managers.post_response_tasks import (
+    PostResponseTask,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -57,6 +60,9 @@ class ComponentUse:
     # Some components are intentionally kept ready between warmup and the first
     # real request to avoid measuring a cold H2D in the user-visible request.
     keep_ready_after_warmup: bool = False
+    # finish this use after the response is sent; the scheduler waits before
+    # the next dispatch, so module mutation cannot race the next forward pass
+    finish_after_response: bool = False
 
 
 @dataclass(slots=True)
@@ -154,6 +160,7 @@ class ComponentResidencyManager:
             pipeline.component_residency_strategies
         )
         self._uses_seen: dict[str, ComponentUse] = {}
+        self._deferred_finish_uses: dict[str, tuple[ComponentUse, nn.Module]] = {}
 
     def refresh_pipeline(self, pipeline: ComponentResidencyPipeline) -> None:
         custom_strategies = dict(pipeline.component_residency_strategies)
@@ -164,6 +171,7 @@ class ComponentResidencyManager:
             self._active_use = None
             self._active_use_module = None
             self._uses_seen.clear()
+            self._deferred_finish_uses.clear()
             self._prefetched_use_keys.clear()
         elif custom_strategies != self._custom_strategies:
             self.strategy_for.cache_clear()
@@ -181,18 +189,22 @@ class ComponentResidencyManager:
     def begin_request(
         self,
         stages: Sequence[ComponentResidencyStage],
-        batch: ResidencyBatch,
+        batch: ResidencyBatch | list[ResidencyBatch],
         server_args: ServerArgs,
     ) -> None:
         """A hook called before processing an actual request"""
         self.refresh_server_args(server_args)
-        self.state = ResidencyState(stages=stages, batch_is_warmup=batch.is_warmup)
+        self.state = ResidencyState(
+            stages=stages,
+            batch_is_warmup=self._is_warmup_batch(batch),
+        )
         self._active_use = None
         self._active_use_module = None
         self._disable_active_nvtx()
         self._current_use_index = -1
         self._prefetched_use_keys.clear()
         self._uses_seen.clear()
+        self._deferred_finish_uses.clear()
         self._stage_uses_by_index = [
             tuple(stage.component_uses(server_args, self.stage_name(stage)))
             for stage in stages
@@ -426,12 +438,16 @@ class ComponentResidencyManager:
         ) or self._should_keep_after_use(use)
         if should_keep:
             return
+        if use.finish_after_response:
+            self._deferred_finish_uses[use.component_name] = (use, module)
+            return
         strategy = self.strategy_for(use.component_name, module)
         was_on_cuda = self._module_on_cuda(module)
         strategy.finish_use(module, use, self.state)
         self._empty_cache_after_large_release(use, strategy, module, was_on_cuda)
 
-    def finish_request(self) -> None:
+    def finish_request(self) -> list[PostResponseTask]:
+        post_response_tasks: list[PostResponseTask] = []
         # 1. Close the currently active sequential use.
         self.finish_active_use(prefetch_next=False)
         # 2. Pick components that should be ready for the next request.
@@ -447,14 +463,56 @@ class ComponentResidencyManager:
             if not preferred and self._should_keep_single_dit(component_name):
                 continue
             strategy = self.strategy_for(component_name, module)
-            if preferred and not self.state.batch_is_warmup:
+            if use.finish_after_response and not self.state.batch_is_warmup:
+                deferred = self._deferred_finish_uses.pop(component_name, None)
+                deferred_use, deferred_module = deferred or (use, module)
+                post_response_tasks.append(
+                    self._make_finish_request_task(
+                        component_name,
+                        deferred_use,
+                        deferred_module,
+                        strategy,
+                        preferred=False,
+                    )
+                )
+            elif preferred and not self.state.batch_is_warmup:
                 strategy.prepare_after_request(module, use, self.state)
             else:
-                was_on_cuda = self._module_on_cuda(module)
-                strategy.finish_request(module, use, self.state, preferred=preferred)
-                self._empty_cache_after_large_release(
-                    use, strategy, module, was_on_cuda
-                )
+                self._finish_request_component(module, use, strategy, preferred)
+        self._deferred_finish_uses.clear()
+        return post_response_tasks
+
+    def _make_finish_request_task(
+        self,
+        component_name: str,
+        use: ComponentUse,
+        module: nn.Module,
+        strategy: ComponentResidencyStrategy,
+        *,
+        preferred: bool,
+    ) -> PostResponseTask:
+        state = replace(self.state)
+
+        def finish_component() -> None:
+            self._finish_request_component(module, use, strategy, preferred, state)
+
+        return (
+            f"component_residency.finish_request.{component_name}",
+            finish_component,
+        )
+
+    def _finish_request_component(
+        self,
+        module: nn.Module,
+        use: ComponentUse,
+        strategy: ComponentResidencyStrategy,
+        preferred: bool,
+        state: ResidencyState | None = None,
+    ) -> None:
+        state = state or self.state
+        was_on_cuda = self._module_on_cuda(module)
+        strategy.finish_request(module, use, state, preferred=preferred)
+        self._empty_cache_after_large_release(use, strategy, module, was_on_cuda)
 
     def stage_name(self, stage: ComponentResidencyStage) -> str:
         return self._stage_names_by_id.get(id(stage), stage.__class__.__name__)
@@ -579,6 +637,12 @@ class ComponentResidencyManager:
 
     def _module_on_cuda(self, module: nn.Module | None) -> bool:
         return self._module_device(module) == "cuda"
+
+    @staticmethod
+    def _is_warmup_batch(batch: ResidencyBatch | list[ResidencyBatch]) -> bool:
+        if isinstance(batch, list):
+            return bool(batch) and all(item.is_warmup for item in batch)
+        return batch.is_warmup
 
     def _empty_cache_after_large_release(
         self,

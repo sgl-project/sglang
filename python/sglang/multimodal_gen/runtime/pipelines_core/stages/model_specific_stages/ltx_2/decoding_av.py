@@ -44,9 +44,23 @@ class LTX2AVDecodingStage(DecodingStage):
             server_args, "audio_vae", precision_attr="audio_vae_precision"
         )
         return [
-            ComponentUse(stage_name, "vae", target_dtype=vae_dtype),
-            ComponentUse(stage_name, "audio_vae", target_dtype=audio_vae_dtype),
-            ComponentUse(stage_name, "vocoder"),
+            ComponentUse(
+                stage_name,
+                "vae",
+                target_dtype=vae_dtype,
+                finish_after_response=server_args.vae_cpu_offload,
+            ),
+            ComponentUse(
+                stage_name,
+                "audio_vae",
+                target_dtype=audio_vae_dtype,
+                finish_after_response=server_args.vae_cpu_offload,
+            ),
+            ComponentUse(
+                stage_name,
+                "vocoder",
+                finish_after_response=server_args.vae_cpu_offload,
+            ),
         ]
 
     @staticmethod
