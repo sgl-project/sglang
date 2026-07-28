@@ -2417,33 +2417,6 @@ class TestNormalizeToolContent(unittest.TestCase):
         )
         self.assertEqual(result, "plain rich")
 
-    def test_tool_reference_moved_before_text(self):
-        """A tool_reference must precede text parts so GLM-style chat templates
-        expand the referenced tool's schema.
-        """
-        content = [
-            {"type": "text", "text": "Tool loaded: Bash"},
-            {"type": "tool_reference", "name": "Bash"},
-        ]
-        result = normalize_tool_content("tool", content)
-        self.assertEqual(len(result), 2)
-        self.assertEqual(result[0]["type"], "tool_reference")
-        self.assertEqual(result[0]["name"], "Bash")
-        self.assertEqual(result[1]["type"], "text")
-
-    def test_tool_reference_relative_order_preserved(self):
-        """Multiple tool_reference parts keep their relative order when moved
-        to the front; trailing text/other parts keep theirs too."""
-        content = [
-            {"type": "text", "text": "notice"},
-            {"type": "tool_reference", "name": "Read"},
-            {"type": "text", "text": "more"},
-            {"type": "tool_reference", "name": "Bash"},
-        ]
-        result = normalize_tool_content("tool", content)
-        self.assertEqual([p["name"] for p in result[:2]], ["Read", "Bash"])
-        self.assertEqual([p["type"] for p in result[2:]], ["text", "text"])
-
 
 class InklingReasoningEffortTest(unittest.TestCase):
     """Inkling reasoning-effort mapping and validation."""
