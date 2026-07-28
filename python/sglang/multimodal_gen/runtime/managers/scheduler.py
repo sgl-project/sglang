@@ -900,10 +900,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         """
         pipeline_config = self.server_args.pipeline_config
         supports_dynamic_batching = getattr(
-            pipeline_config, "supports_dynamic_batching", None
+            pipeline_config, "supports_dynamic_batching_for_server", None
         )
         if callable(supports_dynamic_batching):
-            return self._batch_admission.enabled and supports_dynamic_batching()
+            return self._batch_admission.enabled and supports_dynamic_batching(
+                self.server_args
+            )
         return self._batch_admission.enabled
 
     def get_next_batch_to_run(self) -> list[tuple[bytes | None, Any]] | None:

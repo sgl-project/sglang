@@ -51,6 +51,9 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     def supports_dynamic_batching(self):
         return True
 
+    def supports_dynamic_batching_for_server(self, server_args):
+        return server_args.srt_encoder_url is not None
+
     def supports_native_grouped_requests(self):
         return True
 

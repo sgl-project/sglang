@@ -393,6 +393,10 @@ class PipelineConfig:
         """
         return self.task_type in (ModelTaskType.T2I, ModelTaskType.T2V)
 
+    def supports_dynamic_batching_for_server(self, server_args):
+        """Return whether dynamic batching is available for this server setup."""
+        return self.supports_dynamic_batching()
+
     def supports_native_grouped_requests(self):
         """Return whether dynamic batches should run as grouped Req lists."""
         return False
