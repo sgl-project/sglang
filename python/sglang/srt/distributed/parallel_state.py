@@ -1921,7 +1921,7 @@ def set_torch_symm_mem_all_reduce(enable: bool):
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
 
 
-def xccl_is_available() -> bool:
+def is_xccl_available() -> bool:
     """Whether this torch build has the XCCL backend compiled in.
 
     Not every XPU torch build ships XCCL; when it is missing,
@@ -1955,7 +1955,7 @@ def get_default_distributed_backend(device: str) -> str:
     if (
         backend == "xccl"
         and envs.SGLANG_ENABLE_PYXCCL.get()
-        and not xccl_is_available()
+        and not is_xccl_available()
     ):
         logger.warning(
             "This torch build has no XCCL backend; bootstrapping the process "
@@ -2074,7 +2074,7 @@ def init_distributed_environment(
         else:
             pg_options = get_torch_distributed_pg_options()
 
-        if backend == "xccl" and not xccl_is_available():
+        if backend == "xccl" and not is_xccl_available():
             # torch would raise a bare "Distributed package doesn't have XCCL
             # built in" here, which gives no hint about the way out.
             raise RuntimeError(
