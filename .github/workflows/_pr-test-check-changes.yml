@@ -93,16 +93,15 @@ jobs:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/**"
               - "python/sglang/srt/observability/**"
-              - "python/sglang/jit_kernel/**"
-              - "test/registered/jit/diffusion/**"
-              - "test/registered/jit/benchmark/diffusion/**"
+              - "python/sglang/kernels/ops/diffusion/**"
+              - "test/registered/kernels/ops/diffusion/**"
+              - "test/registered/kernels/benchmark/diffusion/**"
               - "python/sglang/cli/**"
             jit_kernel:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-jit-kernel.yml"
               - "python/pyproject.toml"
-              - "python/sglang/jit_kernel/**"
-              - "test/registered/jit/**"
+              - "test/registered/kernels/**"
               # sglang.kernels is the migrated kernel namespace (RFC #29630 / #30044); the
               # base-b-kernel suites import it directly, so kernel edits must run them.
               - "python/sglang/kernels/**"

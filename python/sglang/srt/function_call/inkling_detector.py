@@ -97,7 +97,29 @@ class InklingDetector(BaseFormatDetector):
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
+        # Drain every complete call in the delta: this detector has no
+        # stream-end flush, so anything left in self._buffer is lost.
         self._buffer += new_text
+        all_calls: list[ToolCallItem] = []
+        normal_parts: list[str] = []
+        while True:
+            result, made_progress = self._parse_buffered_increment(tools)
+            if result.normal_text:
+                normal_parts.append(result.normal_text)
+            if result.calls:
+                all_calls.extend(result.calls)
+            if not made_progress:
+                break
+        return StreamingParseResult(
+            normal_text="".join(normal_parts),
+            calls=all_calls,
+        )
+
+    def _parse_buffered_increment(
+        self, tools: List[Tool]
+    ) -> tuple[StreamingParseResult, bool]:
+        # One drain step: emit a text run or one complete call; the bool is
+        # whether the buffer advanced (the caller loops while it does).
         current_text = self._buffer
 
         if self.bot_token not in current_text:
@@ -105,8 +127,11 @@ class InklingDetector(BaseFormatDetector):
             if header_start is not None:
                 safe_text = current_text[:header_start]
                 self._buffer = current_text[header_start:]
-                return StreamingParseResult(
-                    normal_text=self._clean_normal_text(safe_text)
+                return (
+                    StreamingParseResult(
+                        normal_text=self._clean_normal_text(safe_text)
+                    ),
+                    False,
                 )
             # Hold back a partial prefix of ANY token _clean_normal_text
             # strips — emitting a split control token leaks its first half as
@@ -121,7 +146,10 @@ class InklingDetector(BaseFormatDetector):
             else:
                 safe_text = current_text
                 self._buffer = ""
-            return StreamingParseResult(normal_text=self._clean_normal_text(safe_text))
+            return (
+                StreamingParseResult(normal_text=self._clean_normal_text(safe_text)),
+                False,
+            )
 
         bot_pos = current_text.find(self.bot_token)
         if bot_pos > 0:
@@ -131,7 +159,8 @@ class InklingDetector(BaseFormatDetector):
             self._buffer = current_text[bot_pos:]
             normal_text = self._clean_normal_text(normal_text)
             if normal_text:
-                return StreamingParseResult(normal_text=normal_text)
+                # prefix stripped, call now at buffer head -> keep draining
+                return StreamingParseResult(normal_text=normal_text), True
             current_text = self._buffer
 
         if not hasattr(self, "_tool_indices"):
@@ -145,9 +174,9 @@ class InklingDetector(BaseFormatDetector):
         try:
             payload, end_idx = _partial_json_loads(current_text[start_idx:], flags)
         except (MalformedJSON, json.JSONDecodeError):
-            return StreamingParseResult()
+            return StreamingParseResult(), False
         if not isinstance(payload, Mapping):
-            return StreamingParseResult()
+            return StreamingParseResult(), False
 
         calls: list[ToolCallItem] = []
         name = payload.get("name")
@@ -172,7 +201,7 @@ class InklingDetector(BaseFormatDetector):
 
         json_text = current_text[start_idx : start_idx + end_idx]
         if not _is_complete_json(json_text):
-            return StreamingParseResult(calls=calls)
+            return StreamingParseResult(calls=calls), False
 
         call = self._tool_call_item(
             payload,
@@ -181,9 +210,12 @@ class InklingDetector(BaseFormatDetector):
             header_name=self._current_header_name,
         )
         if call is None:
+            # Drop only the rejected call's span, not the whole buffer, or a
+            # trailing valid call dies; clear the header so it can't leak.
             self._abandon_current_tool()
-            self._buffer = ""
-            return StreamingParseResult(calls=calls)
+            self._buffer = self._remaining_after_call(current_text, start_idx + end_idx)
+            self._current_header_name = None
+            return StreamingParseResult(calls=calls), True
 
         if self.current_tool_id == -1:
             self._ensure_current_tool()
@@ -209,7 +241,7 @@ class InklingDetector(BaseFormatDetector):
         self.current_tool_id += 1
         self.current_tool_name_sent = False
         self._current_header_name = None
-        return StreamingParseResult(calls=calls)
+        return StreamingParseResult(calls=calls), True
 
     def structure_info(self) -> _GetInfoFunc:
         def info(name: str) -> StructureInfo:

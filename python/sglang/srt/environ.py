@@ -210,6 +210,22 @@ class ToolStrictLevel(IntEnum):
     PARAMETER = 2
 
 
+class InvariantCheckLevel(IntEnum):
+    """Signal level for value/index validity checks (see invariants.py).
+
+    OFF: data layer only (sanitize/containment); no detection, no signal.
+    WARN: detect + throttled log/count; degrade, never crash (prod on-demand).
+    STRICT: detect + crash on GUARD/FATAL violations (CI default).
+
+    The data layer is unconditional and independent of this level; only the
+    detection + signal layer is gated here.
+    """
+
+    OFF = 0
+    WARN = 1
+    STRICT = 2
+
+
 class Envs:
 
     # Raise on bare server_args field assignments after resolution; mutation
@@ -229,6 +245,7 @@ class Envs:
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
+    SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
 
     # HTTP server
     # Decompress request bodies tagged with `x-body-compressed`.
@@ -314,6 +331,9 @@ class Envs:
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
+    # Allocator-history buffer for /start_profile activities=["MEM"]; the
+    # default truncates long windows (each entry is one alloc/free event).
+    SGLANG_MEM_PROFILE_MAX_ENTRIES = EnvInt(100000)
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
@@ -372,6 +392,7 @@ class Envs:
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
+    SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
@@ -476,7 +497,6 @@ class Envs:
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
-    SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
@@ -763,7 +783,6 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # Spec Config
-    SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
@@ -787,6 +806,12 @@ class Envs:
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
     SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
+    # Signal level for value/index validity checks (nan/inf/oob/...); see
+    # invariants.py. OFF (prod default) runs only the free data layer, WARN
+    # adds throttled logging, STRICT (CI default) crashes on violations.
+    # Supersedes SGLANG_ENABLE_ASYNC_ASSERT, which is bridged as STRICT until
+    # every callsite migrates.
+    SGLANG_INVARIANT_CHECK = EnvInt(InvariantCheckLevel.OFF)
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
@@ -822,6 +847,8 @@ class Envs:
 
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
+    # Registered TreeCore backend serving the unified radix cache.
+    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
 
     # CUDA Graph
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
@@ -834,9 +861,13 @@ class Envs:
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
 
-    # Logits processor
-    SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(True)
-    SGLANG_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(2048)
+    # Logprob processor
+    SGLANG_ENABLE_LOGPROB_CHUNK = EnvBoolWithAlias(
+        True, deprecated_name="SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK"
+    )
+    SGLANG_LOGPROB_CHUNK_SIZE = EnvIntWithAlias(
+        2048, deprecated_name="SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
+    )
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
@@ -993,6 +1024,9 @@ class Envs:
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
+    # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
+    SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
 
     # CUDA kernels
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
@@ -1052,9 +1086,6 @@ class Envs:
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
-    # Reroutes the generic fp8 per-token-group quant (every model, not just MiniMax)
-    # to the V1 JIT kernel. Off by default; V1 is byte-identical to V2.
-    SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT = EnvBool(False)
     SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
@@ -1119,6 +1150,8 @@ class Envs:
     # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
+    # Seconds before permanently dropping an unhealthy encoder (0 = keep probing).
+    SGLANG_ENCODER_BOOTSTRAP_EVICTED_TTL = EnvFloat(600.0)
     # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
@@ -1189,6 +1222,9 @@ def _convert_SGL_to_SGLANG():
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
     )
     _print_deprecated_env("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
+    # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
+    _print_deprecated_env("SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT")
+    _print_deprecated_env("SGLANG_MASKED_GEMM_FAST_ACT")
     _print_deprecated_env("SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN")
     # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
     _print_deprecated_env("SGLANG_OPT_USE_CUDA_SCONV")
