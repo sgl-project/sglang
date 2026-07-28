@@ -941,6 +941,97 @@ mod tests {
         assert!(events[1].extras.is_none());
     }
 
+    /// An inactive extras family may arrive as EMPTY columns or as `batch_size`
+    /// zeros, and both must decode to exactly the same events.
+    ///
+    /// This is the contract the Python producer's per-family gating relies on. It
+    /// used to run all seven families whenever any one of them was active, so an
+    /// inactive family shipped 4096 zeros per column; it now skips `accept`, which
+    /// leaves those columns empty. `per_req_ok` admits either and `lens_i` reads 0
+    /// past the end — but nothing pinned that, so a later tightening of the column
+    /// validation (say, requiring every column to be `batch_size` long) would
+    /// silently start rejecting whole frames, hanging every request in them.
+    #[test]
+    fn empty_and_zero_filled_inactive_families_decode_alike() {
+        use rmpv::Value;
+        let f = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let i = |xs: &[i32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
+
+        // Only `out_lp` is active; the other six families are inactive. `zeros`
+        // picks how they are spelled: the old producer's per-request zeros, or the
+        // gated producer's empty column.
+        let build = |zeros: bool| {
+            // Inactive: the old producer ran `accept` anyway and appended a 0 per
+            // request; the gated producer skips it and leaves the column empty.
+            let reqlens = if zeros { arr_u(&[0, 0]) } else { arr_u(&[]) };
+            let header_arr = Value::Array(vec![
+                Value::Array(vec![Value::from("1"), Value::from("2")]), // rids
+                Value::Array(vec![Value::Nil, Value::Nil]),             // finish
+                arr_u(&[3, 4]),                                         // prompt
+                arr_u(&[1, 1]),                                         // tok_lens
+                arr_u(&[2, 0]),                                         // out_lp_lens (ACTIVE)
+                reqlens.clone(),                                        // in_lp_lens
+                reqlens.clone(),                                        // out_top_reqlens
+                arr_u(&[]),                                             // out_top_poslens
+                reqlens.clone(),                                        // in_top_reqlens
+                arr_u(&[]),                                             // in_top_poslens
+                reqlens.clone(),                                        // out_tid_reqlens
+                arr_u(&[]),                                             // out_tid_poslens
+                reqlens.clone(),                                        // in_tid_reqlens
+                arr_u(&[]),                                             // in_tid_poslens
+                reqlens,                                                // hidden_reqlens
+                arr_u(&[]),                                             // hidden_poslens
+            ]);
+            let mut header = Vec::new();
+            rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+            let mut data = Vec::new();
+            data.extend(i(&[10, 20])); // token_ids
+            data.extend(f(&[-0.5, -0.6])); // out_lp_val (req0)
+            data.extend(i(&[10, 99])); // out_lp_idx
+            let framed = frame_egress_batch_cols(&header, &[&data]);
+            let mut events = Vec::new();
+            assert!(
+                for_each_chunk(&framed[1..], |ev| events.push(ev)).ok,
+                "frame rejected (zeros={zeros})"
+            );
+            events
+        };
+
+        let old = build(true);
+        let new = build(false);
+        assert_eq!(old.len(), 2);
+        assert_eq!(old.len(), new.len());
+        for (o, n) in old.iter().zip(&new) {
+            assert_eq!(o.rid, n.rid);
+            assert_eq!(o.token_ids, n.token_ids);
+            match (o.extras.as_deref(), n.extras.as_deref()) {
+                (Some(a), Some(b)) => {
+                    assert_eq!(a.out_lp_val, b.out_lp_val);
+                    assert_eq!(a.out_lp_idx, b.out_lp_idx);
+                    // Every inactive family stays empty in BOTH spellings.
+                    assert!(a.in_lp_val.is_empty() && b.in_lp_val.is_empty());
+                    assert!(a.out_top_lens.is_empty() && b.out_top_lens.is_empty());
+                    assert!(a.in_top_lens.is_empty() && b.in_top_lens.is_empty());
+                    assert!(a.out_tid_lens.is_empty() && b.out_tid_lens.is_empty());
+                    assert!(a.in_tid_lens.is_empty() && b.in_tid_lens.is_empty());
+                    assert!(a.hidden_lens.is_empty() && b.hidden_lens.is_empty());
+                }
+                (None, None) => {}
+                _ => panic!("extras presence differs between the two spellings"),
+            }
+        }
+        // req0 really did carry its active family through both spellings.
+        assert_eq!(
+            new[0]
+                .extras
+                .as_deref()
+                .expect("req0 has out_lp")
+                .out_lp_val,
+            vec![-0.5, -0.6]
+        );
+    }
+
     /// All SEVEN extras families in one frame, each with a distinct length AND
     /// distinct values. The existing extras test exercises only `out_lp` /
     /// `out_top` / `hidden`, so transposing a header pair — `in_top_*` with
