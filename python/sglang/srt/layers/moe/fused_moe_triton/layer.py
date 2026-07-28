@@ -93,25 +93,27 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
-def _make_loaded_weight_compact(loaded_weight: torch.Tensor) -> torch.Tensor:
-    """Materialize a CPU tensor view into independent contiguous storage."""
+def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
+    """Copy a CPU tensor view into independent contiguous storage."""
     if loaded_weight.device.type != "cpu":
         return loaded_weight
     tensor_bytes = loaded_weight.numel() * loaded_weight.element_size()
-    is_compact = (
+    needs_copy = not (
         loaded_weight.is_contiguous()
         and loaded_weight.storage_offset() == 0
         and loaded_weight.untyped_storage().nbytes() == tensor_bytes
     )
-    if is_compact:
+    if not needs_copy:
         return loaded_weight
     return loaded_weight.clone(memory_format=torch.contiguous_format)
 
 
-def _maybe_compact_loaded_weight(loaded_weight: torch.Tensor) -> torch.Tensor:
-    if not envs.SGLANG_MOE_COMPACT_WEIGHT_LOAD.get():
+def _maybe_copy_weight_view_before_h2d(
+    loaded_weight: torch.Tensor,
+) -> torch.Tensor:
+    if not envs.SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D.get():
         return loaded_weight
-    return _make_loaded_weight_compact(loaded_weight)
+    return _copy_weight_view_before_h2d(loaded_weight)
 
 
 def _get_deepep_comm_group(a2a_backend):
@@ -579,7 +581,7 @@ class FusedMoE(torch.nn.Module):
     ):
         # for per channel weight quantization
         if shard_id == "w2":
-            loaded_weight = _maybe_compact_loaded_weight(loaded_weight)
+            loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
             expert_data.copy_(loaded_weight)
         elif shard_id in ("w1", "w3"):
             self._load_w13(
@@ -652,7 +654,7 @@ class FusedMoE(torch.nn.Module):
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
-        loaded_weight = _maybe_compact_loaded_weight(loaded_weight)
+        loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
@@ -723,7 +725,7 @@ class FusedMoE(torch.nn.Module):
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
-        loaded_weight = _maybe_compact_loaded_weight(loaded_weight)
+        loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
         expert_data.copy_(loaded_weight)
 
     def _maybe_load_fp8_shared_expert_as_fp4(
