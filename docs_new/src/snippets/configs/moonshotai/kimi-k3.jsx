@@ -658,13 +658,7 @@ export const config = {
       verified: false,
       verificationStatus: "in-progress",
       env: [],
-      // Neither --enable-symm-mem nor --disable-custom-all-reduce: the fused
-      // all-reduce auto-probe skips itself whenever symmetric memory is on
-      // (k3_ar_fusion.py -- the symm-pool allocation contract does not hold
-      // under the pynccl allocator context), so setting it here silently opts
-      // this cell out of the fused path that the other two B300 cells get.
-      // Disabling the custom all-reduce made no measurable difference at TP8
-      // bs=1 either way.
+      // No --enable-symm-mem: it makes the fused all-reduce auto-probe skip.
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
