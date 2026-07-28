@@ -1,23 +1,31 @@
 [package]
 name = "sglang-mm"
-version = "0.1.0"
-edition = "2024"
 description = "Rust-accelerated multimodal preprocessing for SGLang"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Consumed by python/setup.py: registers this crate as a PyO3 extension module
+# of the main sglang wheel at the given import path. debug = false keeps
+# editable installs on release builds (image preprocessing is perf-sensitive).
+[package.metadata.sglang]
+python-module = "sglang.srt.multimodal._core"
+debug = false
 
 [lib]
-name = "_core"
+# Unique per-crate artifact name (the shared workspace target/ dir cannot hold
+# two `lib_core` cdylibs). The importable Python module is still `_core`: the
+# name comes from the `#[pymodule]` entry point and the setuptools-rust
+# `target` in python/pyproject.toml, which renames the built artifact.
+name = "sglang_mm_core"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module"] }
-numpy = "0.23"
-rayon = "1.10"
+pyo3 = { workspace = true }
+
+base64 = "0.22"
+blake3 = "1"
 half = "2.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-blake3 = "1"
-base64 = "0.22"
-
-[profile.release]
-lto = true
-codegen-units = 1
+numpy = "0.29"
+rayon = "1.10"
