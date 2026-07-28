@@ -120,6 +120,7 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
             FlashInferTrtllmBf16MoeQuantInfo,
         )
 
+        is_gated = base_layer.moe_runner_config.is_gated
         layer._lora_runner = None
         layer._quant_info = FlashInferTrtllmBf16MoeQuantInfo(
             gemm1_weights=base_layer.w13_weight.data,
@@ -127,6 +128,35 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
             global_num_experts=int(base_layer.num_experts),
             local_expert_offset=int(base_layer.moe_ep_rank)
             * int(base_layer.num_local_experts),
+            kernel_hidden_size=(
+                getattr(
+                    quant_method,
+                    "_flashinfer_kernel_hidden_size",
+                    base_layer.hidden_size,
+                )
+                if is_gated
+                else base_layer.hidden_size
+            ),
+            input_pad_value=(
+                getattr(quant_method, "_flashinfer_input_pad_value", 0.0)
+                if is_gated
+                else 0.0
+            ),
+            gemm1_alpha=(
+                getattr(quant_method, "_flashinfer_gemm1_alpha", None)
+                if is_gated
+                else None
+            ),
+            gemm1_beta=(
+                getattr(quant_method, "_flashinfer_gemm1_beta", None)
+                if is_gated
+                else None
+            ),
+            gemm1_clamp_limit=(
+                getattr(quant_method, "_flashinfer_gemm1_clamp_limit", None)
+                if is_gated
+                else None
+            ),
         )
         # Expose w13_weight/w2_weight on the bf16 quant-info so the backend-agnostic
         # cuda-graph MoE buffer init (BaseLoRABackend.init_cuda_graph_moe_buffers) reads

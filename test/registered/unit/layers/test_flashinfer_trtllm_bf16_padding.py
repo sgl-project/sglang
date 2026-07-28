@@ -14,6 +14,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     _prepare_flashinfer_trtllm_bf16_weights,
 )
+from sglang.srt.lora.trtllm_lora_temp import lora_layer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -523,6 +524,47 @@ class TestFlashInferTrtllmBf16Padding(CustomTestCase):
                 method.forward_cuda(layer, dispatch_output)
                 quant_info = method.runner.quant_info
 
+                self.assertEqual(
+                    quant_info.kernel_hidden_size, 2944 if is_gated else 2880
+                )
+                self.assertEqual(quant_info.input_pad_value, 1.0 if is_gated else 0.0)
+                self.assertIs(quant_info.gemm1_alpha, alpha if is_gated else None)
+                self.assertIs(quant_info.gemm1_beta, beta if is_gated else None)
+                self.assertIs(
+                    quant_info.gemm1_clamp_limit, clamp_limit if is_gated else None
+                )
+
+    def test_bf16_lora_payload_uses_prepared_values_or_non_gated_fallback(self):
+        """BF16 LoRA construction must satisfy the padded runner payload contract."""
+        alpha = torch.tensor([1.702])
+        beta = torch.tensor([1.0])
+        clamp_limit = torch.tensor([7.0])
+
+        for is_gated in (True, False):
+            with self.subTest(is_gated=is_gated):
+                quant_method = SimpleNamespace(quant_config=None, block_quant=False)
+                if is_gated:
+                    quant_method._flashinfer_kernel_hidden_size = 2944
+                    quant_method._flashinfer_input_pad_value = 1.0
+                    quant_method._flashinfer_gemm1_alpha = alpha
+                    quant_method._flashinfer_gemm1_beta = beta
+                    quant_method._flashinfer_gemm1_clamp_limit = clamp_limit
+                base_layer = SimpleNamespace(
+                    quant_method=quant_method,
+                    w13_weight=Parameter(torch.empty(1, 2, 2, 2)),
+                    w2_weight=Parameter(torch.empty(1, 2, 2, 2)),
+                    num_experts=4,
+                    moe_ep_rank=1,
+                    num_local_experts=2,
+                    hidden_size=2880,
+                    moe_runner_config=SimpleNamespace(is_gated=is_gated),
+                )
+                layer = SimpleNamespace()
+
+                with patch.object(lora_layer, "_warm_sgl_trtllm_moe_module"):
+                    lora_layer.init_experimental_sgl_trtllm_lora(layer, base_layer)
+
+                quant_info = layer._quant_info
                 self.assertEqual(
                     quant_info.kernel_hidden_size, 2944 if is_gated else 2880
                 )
