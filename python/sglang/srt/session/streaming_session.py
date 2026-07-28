@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
@@ -243,7 +243,7 @@ class StreamingSession(BasePrefixCache):
         # [NPU] When aligned context < page_size, release the slot's KV and
         # fall back to radix cache (full prefill). Once context >= page_size,
         # streaming session kicks in with page-aligned KV reuse.
-        if self.page_size > 1:
+        if is_npu() and self.page_size > 1:
             expected_prefix_len = min(slot.kv_committed_len, len(params.key))
             aligned_prefix_len = (
                 expected_prefix_len // self.page_size
@@ -269,7 +269,7 @@ class StreamingSession(BasePrefixCache):
         )
 
         # Floor-align prefix_len to page boundary (NPU workaround).
-        if self.page_size > 1:
+        if is_npu() and self.page_size > 1:
             prefix_len = (prefix_len // self.page_size) * self.page_size
             req.kv_committed_len = min(req.kv_committed_len, prefix_len)
             slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
