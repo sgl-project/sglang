@@ -3,7 +3,7 @@ name: AMD AITER Scout
 on:
   schedule:
     - cron: '0 20 * * 1'   # Monday 20:00 UTC
-    - cron: '0 20 * * 4'   # Thursday 20:00 UTC
+    # - cron: '0 20 * * 4'   # Thursday 20:00 UTC (temporarily disabled)
   workflow_dispatch:
     inputs:
       aiter_ref:

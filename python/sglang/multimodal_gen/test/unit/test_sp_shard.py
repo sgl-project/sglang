@@ -1,5 +1,7 @@
 """Unit tests for the unified SP shard helpers (pure logic, no distributed)."""
 
+import sys
+
 import pytest
 import torch
 
@@ -210,4 +212,4 @@ def test_gather_seq_trims(monkeypatch):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-q"])
+    sys.exit(pytest.main([__file__, "-q"]))
