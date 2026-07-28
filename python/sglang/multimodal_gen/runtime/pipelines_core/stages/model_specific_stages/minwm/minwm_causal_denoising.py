@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 MINWM_ACTION_HISTORY_CACHE = "minwm_action_history"
 MINWM_INITIAL_NOISE_CACHE = "minwm_initial_noise"
 MINWM_INITIAL_NOISE_CURSOR_CACHE = "minwm_initial_noise_cursor"
+MINWM_T2V_FIRST_LATENT_CACHE = "minwm_t2v_first_latent"
 
 
 def _parity_dump(name: str, value) -> None:
@@ -676,9 +677,55 @@ class MinWMCausalVaeDecodingStage(CausalVaeDecodingStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs):
         generated_latents = batch.latents
+        original_block_idx = batch.block_idx
+        causal_state = (
+            get_realtime_causal_dit_state(batch.session)
+            if batch.session is not None
+            else None
+        )
+        if batch.block_idx == 0 and causal_state is not None:
+            causal_state.runtime_cache.pop(MINWM_T2V_FIRST_LATENT_CACHE, None)
+
         if batch.block_idx == 0 and batch.image_latent is not None:
             batch.latents = torch.cat([batch.image_latent, generated_latents], dim=2)
+        elif (
+            batch.block_idx == 0
+            and batch.image_latent is None
+            and causal_state is not None
+        ):
+            # Wan2.2's residual decoder cannot continue from a one-latent first
+            # call: on the next call one upsample branch produces two temporal
+            # values while its shortcut produces four. Preserve T2V's immediate
+            # first-frame response, then use this latent to reseed the decoder
+            # together with the first regular block below.
+            causal_state.runtime_cache[MINWM_T2V_FIRST_LATENT_CACHE] = (
+                generated_latents.detach().clone()
+            )
+        elif (
+            batch.block_idx == 1
+            and batch.image_latent is None
+            and causal_state is not None
+        ):
+            first_latent = causal_state.runtime_cache.pop(
+                MINWM_T2V_FIRST_LATENT_CACHE, None
+            )
+            if first_latent is not None:
+                batch.latents = torch.cat([first_latent, generated_latents], dim=2)
+                # Make the base stage reset and seed the VAE as a fresh causal
+                # decode. The leading pixel frame was already emitted by block
+                # zero and is removed from this block's output below.
+                batch.block_idx = 0
         try:
-            return super().forward(batch, server_args)
+            result = super().forward(batch, server_args)
+            if (
+                original_block_idx == 1
+                and batch.latents.shape[2] > generated_latents.shape[2]
+            ):
+                if isinstance(result.output, torch.Tensor):
+                    result.output = result.output[:, :, 1:]
+                elif result.output is not None:
+                    result.output = [sample[:, 1:] for sample in result.output]
+            return result
         finally:
+            batch.block_idx = original_block_idx
             batch.latents = generated_latents

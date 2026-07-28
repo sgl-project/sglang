@@ -53,6 +53,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.vae import (
     CausalVaeDecodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
 from sglang.multimodal_gen.tools.convert_minwm_checkpoint import (
     DEFAULT_SOURCE_URI,
@@ -499,6 +500,51 @@ def test_minwm_t2v_decoder_does_not_prepend_a_reference(monkeypatch):
     assert seen[1].shape[2] == 2
     assert t2v_batch.latents is generated
     assert i2v_batch.latents is generated
+
+
+def test_minwm_t2v_decoder_reseeds_one_latent_first_block(monkeypatch):
+    seen = []
+
+    def fake_forward(_self, batch, _server_args):
+        seen.append((batch.block_idx, batch.latents.clone()))
+        pixel_frames = 1 + 4 * (batch.latents.shape[2] - 1)
+        return OutputBatch(
+            output=torch.arange(pixel_frames).reshape(1, 1, pixel_frames, 1, 1)
+        )
+
+    monkeypatch.setattr(CausalVaeDecodingStage, "forward", fake_forward)
+    stage = MinWMCausalVaeDecodingStage.__new__(MinWMCausalVaeDecodingStage)
+    session = RealtimeSession()
+    first_latent = torch.full((1, 2, 1, 1, 1), 1.0)
+    regular_latents = torch.full((1, 2, 4, 1, 1), 2.0)
+    first_batch = SimpleNamespace(
+        block_idx=0,
+        image_latent=None,
+        latents=first_latent,
+        session=session,
+    )
+    regular_batch = SimpleNamespace(
+        block_idx=1,
+        image_latent=None,
+        latents=regular_latents,
+        session=session,
+    )
+
+    first_output = stage.forward(first_batch, SimpleNamespace())
+    regular_output = stage.forward(regular_batch, SimpleNamespace())
+
+    assert seen[0][0] == 0
+    assert seen[0][1].shape[2] == 1
+    assert seen[1][0] == 0
+    assert seen[1][1].shape[2] == 5
+    torch.testing.assert_close(seen[1][1][:, :, :1], first_latent)
+    assert first_output.output.shape[2] == 1
+    assert regular_output.output.shape[2] == 16
+    assert regular_output.output.flatten()[0].item() == 1
+    assert first_batch.block_idx == 0
+    assert regular_batch.block_idx == 1
+    assert first_batch.latents is first_latent
+    assert regular_batch.latents is regular_latents
 
 
 def test_minwm_unbounded_kv_policy_reaches_cache_allocation():
