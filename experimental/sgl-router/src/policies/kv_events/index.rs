@@ -29,6 +29,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
@@ -39,7 +40,7 @@ use tracing::{debug, info, warn};
 use super::block_size_oracle::BlockSizeOracle;
 use super::bootstrap::{
     fetch_snapshot, BootstrapState, BootstrapTracker, PeerRegistry, PeerSnapshot, RankOutcome,
-    SnapshotOutcome, VettedSnapshot, WireWorker, PRODUCER_CACHE_TTL, SNAPSHOT_FORMAT,
+    SnapshotOutcome, VettedSnapshot, WireWorker, SNAPSHOT_FORMAT,
 };
 use super::discovery::{fetch_event_config, EventConfig};
 use super::subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
@@ -68,6 +69,13 @@ const PENDING_BATCH_LIMIT: usize = 1024;
 /// Short relative to the bootstrap deadline that bounds the whole sweep, so a
 /// peer becoming available is picked up promptly.
 const PEER_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Depth of the obligation queue feeding the coordinator.
+///
+/// Sized well past the per-fleet worker count so `add_worker` never blocks on
+/// the coordinator; the fallback for a full queue is a sweep of its own, which is
+/// correct but re-downloads a body the in-flight sweep is already fetching.
+const BOOTSTRAP_QUEUE_DEPTH: usize = 1024;
 
 /// Passes to skip a peer after a retriable failure.
 ///
@@ -237,8 +245,8 @@ pub struct KvEventIndex {
     ctrl_tx: mpsc::Sender<PumpControl>,
     /// Most recently built snapshot and when it was built. Async mutex because
     /// it gates the build, and a waiter must yield its worker — see
-    /// [`KvEventIndex::peer_snapshot`].
-    snapshot_cache: AsyncMutex<Option<(Instant, Arc<PeerSnapshot>)>>,
+    /// [`KvEventIndex::peer_snapshot_body`].
+    snapshot_cache: AsyncMutex<Option<CachedSnapshot>>,
     /// Separate client for snapshot fetches.
     ///
     /// WHY not `http`: that client carries a 2s TOTAL-request timeout, which is
@@ -248,6 +256,329 @@ pub struct KvEventIndex {
     /// failure as `unreachable`. Total sweep time stays bounded by the bootstrap
     /// deadline, so a generous per-request timeout costs nothing.
     snapshot_http: reqwest::Client,
+    /// Obligations waiting for the coordinator to fold them into the sweep that
+    /// is in flight, or to start one. See [`bootstrap_coordinator`].
+    bootstrap_tx: mpsc::Sender<ObligationBatch>,
+}
+
+/// A built snapshot together with its already-encoded JSON body.
+///
+/// WHY the body is cached and not just the struct: the producer serves this to
+/// every booting sibling, and `serde_json` on a multi-megabyte tree costs about
+/// as much as the tree walk that produced it. Caching only the struct amortises
+/// the walk across the TTL but re-encodes per request, so a boot herd pays the
+/// encode N times for one identical document.
+struct CachedSnapshot {
+    /// When this snapshot's CONTENTS were sampled — the instant before the
+    /// cursors were read — not when the build finished.
+    ///
+    /// The whole freshness contract hangs on this being the earlier of the two.
+    /// A consumer asking for "no older than N" is asking what the snapshot
+    /// covers, and it covers the publisher's stream as of the cursor read; a
+    /// walk plus encode of a multi-megabyte tree takes long enough that stamping
+    /// completion would claim coverage the document does not have, which is
+    /// exactly the gap this parameter exists to close.
+    ///
+    /// One residual, unavoidable at this layer: a cursor reflects what this
+    /// replica had APPLIED, so the stamp still overstates by the producer's own
+    /// receive-to-apply latency. That is sub-millisecond against a window that
+    /// used to be seconds.
+    exported_at: Instant,
+    snap: Arc<PeerSnapshot>,
+    /// `Bytes` so handing it to a response body is a refcount bump rather than
+    /// a copy of the whole tree.
+    body: Bytes,
+}
+
+/// One batch of obligations handed to the coordinator.
+///
+/// Carries `holding_since` because the coordinator cannot otherwise know how
+/// fresh a snapshot these ranks need: see [`PendingSweep::freshness_floor`].
+struct ObligationBatch {
+    obligations: Vec<(KvWorkerId, u64)>,
+    /// When these ranks began holding batches — i.e. the instant after which a
+    /// peer's export must have been taken for the graft to splice.
+    holding_since: Instant,
+    late_join: LateJoin,
+}
+
+/// What a batch accepts when it arrives while a sweep is already in flight.
+///
+/// The sweep asked for freshness on behalf of the ranks it started with, so a
+/// batch that arrives afterwards may be delivered against an export predating
+/// its own `holding_since` — which the pump then resolves [`RankOutcome::Gap`].
+/// Whether that is acceptable depends on what the batch has left to spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LateJoin {
+    /// Ride the in-flight sweep's snapshot regardless.
+    ///
+    /// For discovery this is the right trade and the reason the coordinator
+    /// exists: a fleet's worth of workers lands DURING the first fetch by
+    /// design, and making them wait for a sweep of their own would cost a second
+    /// fleet-wide fetch on every boot. A rank that gaps this way still has its
+    /// one retry.
+    Permitted,
+    /// Wait for a sweep that asks on this batch's behalf.
+    ///
+    /// For a gap retry, which is the only [`Refused`](LateJoin::Refused) caller,
+    /// riding along is equivalent to dropping it: the retry exists because the
+    /// last export did not splice, `gap_retried` caps it at one, and a snapshot
+    /// taken before the rank resumed holding re-gaps by construction. Deferring
+    /// costs one loop iteration, since the coordinator re-enters `take_pending`
+    /// as soon as it has delivered.
+    Refused,
+}
+
+/// Obligations taken off the queue for one sweep, with the freshness every one
+/// of them requires.
+struct PendingSweep {
+    obligations: Vec<(KvWorkerId, u64)>,
+    /// The NEWEST `holding_since` among the absorbed batches, because the
+    /// sweep's one snapshot has to satisfy every rank in it: a rank that began
+    /// holding at T needs an export after T, so the strictest requirement wins.
+    ///
+    /// An `Instant` rather than a max-age duration on purpose. The sweep retries
+    /// for as long as the deadline allows, and each attempt re-derives
+    /// `elapsed()` from this — so the age it asks for grows while the condition
+    /// it encodes (`exported_at > floor`) stays exactly the same.
+    freshness_floor: Instant,
+    /// Batches that arrived too late for this sweep to have asked on their
+    /// behalf and refused to ride along. Handed back for the next one.
+    deferred: Vec<ObligationBatch>,
+}
+
+impl PendingSweep {
+    /// Fold a batch in before the sweep starts, tightening the floor it will ask
+    /// with.
+    fn absorb(&mut self, batch: ObligationBatch) {
+        self.freshness_floor = self.freshness_floor.max(batch.holding_since);
+        self.obligations.extend(batch.obligations);
+    }
+
+    /// Fold a batch in after the floor has been frozen — i.e. once the sweep is
+    /// running and its request has already stated what it wants.
+    ///
+    /// Deliberately does NOT tighten the floor: the fetch has already gone out
+    /// under the old one, so raising it here would describe a guarantee this
+    /// sweep never asked for.
+    fn admit_late(&mut self, batch: ObligationBatch) {
+        if batch.late_join == LateJoin::Refused && batch.holding_since > self.freshness_floor {
+            self.deferred.push(batch);
+        } else {
+            self.obligations.extend(batch.obligations);
+        }
+    }
+}
+
+impl From<ObligationBatch> for PendingSweep {
+    fn from(batch: ObligationBatch) -> Self {
+        Self {
+            obligations: batch.obligations,
+            freshness_floor: batch.holding_since,
+            deferred: Vec::new(),
+        }
+    }
+}
+
+/// Serialise bootstrap into one sweep at a time, and let every rank pending when
+/// that sweep lands share its snapshot.
+///
+/// # Why this exists
+///
+/// A peer snapshot is fleet-wide: one body carries the whole worker table, every
+/// cursor, and the whole tree, so a single fetch already contains everything
+/// every pending rank needs. `add_worker` fires once per discovered engine, so
+/// sweeping from there re-downloads that same document once per engine. The
+/// document grows with the fleet while the fetch count grows with it too — on a
+/// 168-engine fleet that measured as ~144 fetches of a 35 MB body per booting
+/// replica, most of which timed out and left their ranks cold.
+///
+/// # Why the fetch is not delayed to collect a batch first
+///
+/// It does not need to be: the sweep is the collection window. The fetch of a
+/// multi-megabyte body takes far longer than an EndpointSlice watch event takes
+/// to deliver a fleet, so ranks discovered while it is in flight are merged into
+/// the same delivery and ride the same snapshot — at no latency cost.
+///
+/// # Why that is safe
+///
+/// The invariant is a SEQUENCE condition, not a wall-clock one: a graft is sound
+/// when the rank's live stream resumes at `peer_cursor + 1`. Vetting happens
+/// after the body arrives, against the live-worker set at that moment, so a
+/// worker discovered during the fetch is already live and already covered by the
+/// snapshot. And the watermark check adjudicates every rank independently, so a
+/// rank whose publisher did advance in between is discarded to
+/// [`RankOutcome::Gap`] and runs cold — never spliced over a hole.
+///
+/// One narrow window remains by construction: a rank whose obligation arrives
+/// after vetting but before the merge is delivered against a snapshot that
+/// dropped it as unknown, which the pump reports as
+/// [`RankOutcome::Uncovered`]. Also safe, also cold, and bounded by the gap
+/// between those two instants.
+///
+/// # Freshness, and who a sweep speaks for
+///
+/// Sharing one snapshot only helps if that snapshot is fresh enough for the
+/// ranks sharing it, and the ranks in a batch began holding at different
+/// moments. [`PendingSweep::freshness_floor`] keeps the strictest of them and
+/// every fetch attempt states it, so a peer serving from cache rebuilds rather
+/// than handing back an export older than some rank in the batch.
+///
+/// That guarantee covers the ranks the sweep STARTED with. A rank merged in
+/// afterwards was not represented in the request, so it may still be delivered
+/// against an export predating it — safe (the watermark check discards it to
+/// [`RankOutcome::Gap`]) but wasted. Discovery accepts that trade;
+/// [`LateJoin::Refused`] batches do not and are deferred to the next sweep.
+async fn bootstrap_coordinator(
+    mut rx: mpsc::Receiver<ObligationBatch>,
+    index: std::sync::Weak<KvEventIndex>,
+    cancel: CancellationToken,
+) {
+    // Ranks already given a second sweep. A rank no peer covers must not buy a
+    // fresh fleet-wide fetch on every pass — that is the amplification this
+    // coordinator exists to remove — so each gets at most one retry.
+    let mut requeued: HashSet<KvWorkerId> = HashSet::new();
+    loop {
+        // Block for the first obligation, then take whatever else is already
+        // queued. No waiting: the fetch itself is the batching window.
+        let Some(mut pending) = take_pending(&mut rx, &cancel).await else {
+            return;
+        };
+
+        // Obligations already taken from the channel are dropped without a
+        // `PumpControl` if this fails, which would normally strand their ranks in
+        // `Pending`. Only reachable once the last `Arc<KvEventIndex>` is gone —
+        // i.e. teardown, where the pump that would have received the message is
+        // gone too and nothing is left to keep ready.
+        let deps = {
+            let Some(index) = index.upgrade() else { return };
+            index.bootstrap_deps()
+        };
+        let deadline = deps.deadline();
+        let ranks: Vec<KvWorkerId> = pending.obligations.iter().map(|(r, _)| r.clone()).collect();
+
+        // ONE sweep, awaited here rather than spawned — that is what makes this
+        // single-flight. Obligations discovered while it runs pile up in the
+        // channel and are merged below, so they ride this same snapshot.
+        let started = Instant::now();
+        let result = sweep_until_deadline(&deps, &ranks, deadline, pending.freshness_floor).await;
+        let joined = drain_ready(&mut rx, &mut pending);
+        if joined > 0 || !pending.deferred.is_empty() {
+            debug!(
+                joined,
+                deferred = pending.deferred.len(),
+                total = pending.obligations.len(),
+                sweep_ms = started.elapsed().as_millis(),
+                "kv-bootstrap: ranks arriving during the sweep joined its snapshot, \
+                 minus any that need a fresher one",
+            );
+        }
+
+        // The sweep's coverage check (`covers_any`) only spoke for the ranks it
+        // was given, so a rank merged afterwards may be absent from the accepted
+        // peer's tree — the peer can itself be partially discovered and know one
+        // of our workers but not another. Delivering such a rank into this
+        // snapshot resolves it `Uncovered`, which is TERMINAL; before this
+        // coordinator existed its own sweep would have kept looking for a peer
+        // that did cover it. Give it that second look instead.
+        if let SweepResult::Found(ref vetted) = result {
+            let mut retry = Vec::new();
+            let mut deliver = Vec::with_capacity(pending.obligations.len());
+            for ob in pending.obligations.drain(..) {
+                let covered = vetted.covers_any(std::slice::from_ref(&ob.0));
+                if covered || !requeued.insert(ob.0.clone()) {
+                    deliver.push(ob);
+                } else {
+                    retry.push(ob);
+                }
+            }
+            pending.obligations = deliver;
+            if !retry.is_empty() {
+                // Carry the floor forward rather than re-stamping to now: these
+                // ranks have been holding since it, so demanding an export newer
+                // than they need would force the peer into avoidable rebuilds.
+                pending.deferred.push(ObligationBatch {
+                    obligations: retry,
+                    holding_since: pending.freshness_floor,
+                    late_join: LateJoin::Permitted,
+                });
+            }
+        }
+
+        for batch in std::mem::take(&mut pending.deferred) {
+            // Re-queue via the index rather than a sender this task owns: a
+            // long-lived clone here would hold the channel open forever and kill
+            // the all-senders-dropped exit.
+            match index.upgrade() {
+                // A full queue must not drop the batch — an obligation nothing
+                // owns strands its ranks in `Pending`, which holds `/readyz` and
+                // eventually overflows the pump's hold-back. Sweeping un-batched
+                // costs a fetch and keeps the freshness these ranks asked for,
+                // where folding them into this delivery would spend it.
+                Some(idx) => {
+                    if let Err(e) = idx.bootstrap_tx.try_send(batch) {
+                        warn!("kv-bootstrap: batch queue unavailable ({e}); sweeping un-batched");
+                        idx.spawn_bootstrap(e.into_inner());
+                    }
+                }
+                // Teardown: nothing is left to run another sweep, so deliver them
+                // here rather than stranding them.
+                None => pending.obligations.extend(batch.obligations),
+            }
+        }
+
+        deliver_bootstrap(&deps, pending.obligations, result, deadline).await;
+    }
+}
+
+/// Block for the first obligation, then take everything already queued behind it
+/// without waiting.
+///
+/// `None` means stop — cancelled, or every sender dropped with nothing pending.
+async fn take_pending(
+    rx: &mut mpsc::Receiver<ObligationBatch>,
+    cancel: &CancellationToken,
+) -> Option<PendingSweep> {
+    // Block until there is something to do, so an idle fleet costs nothing.
+    let first = tokio::select! {
+        _ = cancel.cancelled() => return None,
+        first = rx.recv() => first?,
+    };
+    let mut pending = PendingSweep::from(first);
+    // Pre-sweep, so these tighten the floor the sweep will ask with rather than
+    // arriving after it has already asked.
+    while let Ok(more) = rx.try_recv() {
+        pending.absorb(more);
+    }
+    Some(pending)
+}
+
+/// Move every immediately-available obligation into `into`, returning how many
+/// ranks were added. Never waits.
+///
+/// Called once the sweep has run, so batches are admitted under the frozen floor
+/// — see [`PendingSweep::admit_late`]. Ranks it defers are not counted as joined.
+fn drain_ready(rx: &mut mpsc::Receiver<ObligationBatch>, into: &mut PendingSweep) -> usize {
+    let before = into.obligations.len();
+    while let Ok(more) = rx.try_recv() {
+        into.admit_late(more);
+    }
+    into.obligations.len() - before
+}
+
+/// Encode a snapshot for the wire.
+///
+/// `PeerSnapshot` is a plain `Serialize` struct with no non-string map keys, so
+/// this cannot actually fail; an empty body on the impossible branch keeps the
+/// caller total, and a consumer reads it as an unusable peer and moves on.
+fn encode_snapshot(snap: &PeerSnapshot) -> Bytes {
+    match serde_json::to_vec(snap) {
+        Ok(v) => Bytes::from(v),
+        Err(e) => {
+            warn!(error = %e, "kv-bootstrap: snapshot serialisation failed");
+            Bytes::new()
+        }
+    }
 }
 
 impl std::fmt::Debug for KvEventIndex {
@@ -330,6 +661,7 @@ impl KvEventIndex {
         let live_workers: Arc<Mutex<HashSet<KvWorkerId>>> = Arc::new(Mutex::new(HashSet::new()));
         let pump_cancel = CancellationToken::new();
         let peers = Arc::new(PeerRegistry::new());
+        let (bootstrap_tx, bootstrap_rx) = mpsc::channel(BOOTSTRAP_QUEUE_DEPTH);
         let pump = tokio::spawn(pump_loop(
             PumpDeps {
                 tree: tree.clone(),
@@ -339,19 +671,20 @@ impl KvEventIndex {
                 bootstrap: bootstrap.clone(),
                 peers: Arc::clone(&peers),
                 snapshot_http: snapshot_http.clone(),
+                bootstrap_tx: bootstrap_tx.clone(),
                 ctrl_tx: ctrl_tx.clone(),
             },
             pump_cancel.clone(),
             rx,
             ctrl_rx,
         ));
-        Arc::new(Self {
+        let index = Arc::new(Self {
             tree,
             subscribers,
             load_subscribers,
             engine_load,
             pump: Mutex::new(Some(pump)),
-            pump_cancel,
+            pump_cancel: pump_cancel.clone(),
             workers: Mutex::new(HashMap::new()),
             http,
             live_workers,
@@ -362,18 +695,41 @@ impl KvEventIndex {
             ctrl_tx,
             snapshot_cache: AsyncMutex::new(None),
             snapshot_http,
-        })
+            bootstrap_tx,
+        });
+        // Gated on the SAME predicate as registration (`peer_bootstrap_enabled`),
+        // not on `settled()`. If the two ever disagree, obligations get queued
+        // with nothing draining them: their ranks stay `Pending` and hold batches
+        // until the pump's per-rank cap overflows. An enabled tracker that is
+        // already settled at construction — a zero timeout — is exactly that case.
+        if index.bootstrap.enabled() {
+            tokio::spawn(bootstrap_coordinator(
+                bootstrap_rx,
+                Arc::downgrade(&index),
+                pump_cancel,
+            ));
+        }
+        index
     }
 
     /// Build (or reuse) this replica's snapshot for a peer to bootstrap from.
+    ///
+    /// # The caller states how fresh it needs
+    ///
+    /// `max_age` is the oldest export this requester can use — see
+    /// [`PRODUCER_CACHE_TTL`] for why a fixed TTL cannot answer this and the
+    /// consumer can. A cached entry is reused only if it meets the requirement.
     ///
     /// # Single-flight, without spending threads on it
     ///
     /// The cache lock is held across the build on purpose: a simultaneous
     /// scale-up has every new replica asking at once, and serialising the
-    /// builders means the fleet pays one walk per [`PRODUCER_CACHE_TTL`] rather
-    /// than one per requester. Waiters re-check the TTL after acquiring and
-    /// return the freshly built snapshot.
+    /// builders means the fleet pays one walk per generation of requesters
+    /// rather than one per requester. Waiters re-check against their OWN
+    /// `max_age` after acquiring, so a build that started after a waiter began
+    /// holding satisfies it and it returns without a second walk; one that
+    /// started before does not, and that waiter builds. The herd therefore costs
+    /// a walk per build-duration of arrival spread, not a walk per member.
     ///
     /// Both halves of that serialisation must yield, because this runs on the
     /// runtime that also proxies requests, and the requesters are a boot herd
@@ -387,13 +743,44 @@ impl KvEventIndex {
     ///
     /// Shard read locks are taken one at a time inside the walk, so routing can
     /// still match against the other shards throughout.
-    pub async fn peer_snapshot(&self) -> Arc<PeerSnapshot> {
+    /// Returns the snapshot already encoded, which is the only form anything
+    /// needs: the HTTP route is the sole consumer.
+    ///
+    /// There is deliberately no struct-returning twin. `snapshot_entry` encodes
+    /// as part of filling the cache, so an accessor that handed back only the
+    /// `Arc<PeerSnapshot>` would still pay a multi-megabyte `serde_json` pass and
+    /// a blocking-pool round trip, then discard the result — a trap for the next
+    /// caller who just wants to read a field.
+    pub async fn peer_snapshot_body(&self, max_age: Duration) -> Bytes {
+        self.snapshot_entry(max_age).await.1
+    }
+
+    /// A snapshot that declares itself useless, for the paths that must answer
+    /// without a tree. Consumers skip a `producer_ready: false` peer and retry.
+    fn not_ready_snapshot(&self) -> PeerSnapshot {
+        PeerSnapshot {
+            format: SNAPSHOT_FORMAT,
+            block_size: self.block_size_oracle.get().unwrap_or(0),
+            is_bigram: self.block_size_oracle.is_bigram(),
+            producer_ready: false,
+            workers: Vec::new(),
+            cursors: Vec::new(),
+            nodes: Vec::new(),
+        }
+    }
+
+    async fn snapshot_entry(&self, max_age: Duration) -> (Arc<PeerSnapshot>, Bytes) {
         let mut cache = self.snapshot_cache.lock().await;
-        if let Some((built_at, snap)) = cache.as_ref() {
-            if built_at.elapsed() < PRODUCER_CACHE_TTL {
-                return Arc::clone(snap);
+        if let Some(c) = cache.as_ref() {
+            if c.exported_at.elapsed() < max_age {
+                return (Arc::clone(&c.snap), c.body.clone());
             }
         }
+
+        // Stamped BEFORE the cursors are read, so the entry never claims to
+        // cover more of the publisher's stream than it does. See
+        // `CachedSnapshot::exported_at`.
+        let exported_at = Instant::now();
 
         // Read the cursors BEFORE walking the tree, never after.
         //
@@ -422,15 +809,13 @@ impl KvEventIndex {
                 // tree, and do NOT cache it: the consumer skips a
                 // `producer_ready: false` peer, so it retries elsewhere.
                 warn!(error = %e, "kv-bootstrap: snapshot walk failed; reporting not-ready to peers");
-                return Arc::new(PeerSnapshot {
-                    format: SNAPSHOT_FORMAT,
-                    block_size: self.block_size_oracle.get().unwrap_or(0),
-                    is_bigram: self.block_size_oracle.is_bigram(),
-                    producer_ready: false,
-                    workers: Vec::new(),
-                    cursors: Vec::new(),
-                    nodes: Vec::new(),
-                });
+                let snap = Arc::new(self.not_ready_snapshot());
+                // Deliberately NOT cached, same as before: a consumer skips a
+                // `producer_ready: false` peer, so the next request should get a
+                // real attempt rather than a cached refusal. Encoding inline is
+                // fine — this body is a handful of bytes.
+                let body = encode_snapshot(&snap);
+                return (snap, body);
             }
         };
         let index_of: HashMap<&KvWorkerId, u32> = worker_table
@@ -466,8 +851,25 @@ impl KvEventIndex {
             cursors,
             nodes,
         });
-        *cache = Some((Instant::now(), Arc::clone(&snap)));
-        snap
+        // Encode on the blocking pool for the same reason the walk goes there:
+        // serialising a multi-megabyte tree is CPU-bound with no await point,
+        // and this runs on the runtime that is also proxying requests.
+        let to_encode = Arc::clone(&snap);
+        let body = match tokio::task::spawn_blocking(move || encode_snapshot(&to_encode)).await {
+            Ok(b) => b,
+            Err(e) => {
+                // Runtime shutting down or the encode panicked. Answer this
+                // caller without caching, so a later request retries.
+                warn!(error = %e, "kv-bootstrap: snapshot encode failed");
+                return (snap, Bytes::new());
+            }
+        };
+        *cache = Some(CachedSnapshot {
+            exported_at,
+            snap: Arc::clone(&snap),
+            body: body.clone(),
+        });
+        (snap, body)
     }
 
     /// Shared handle to the bootstrap tracker. `/readyz` reads it to decide
@@ -612,7 +1014,28 @@ impl KvEventIndex {
         );
         self.subscribers.add_worker(worker_url, &cfg).await;
         if !bootstrap_obligations.is_empty() {
-            self.spawn_bootstrap(bootstrap_obligations);
+            // Stamped HERE, after `subscribers.add_worker` — not at `register`.
+            // It is the instant the subscriber went live that a peer's export has
+            // to beat, and anything earlier would let the sweep accept a snapshot
+            // taken during the subscribe window, which is precisely the hole the
+            // watermark check would then reject as `Gap`.
+            let batch = ObligationBatch {
+                obligations: bootstrap_obligations,
+                holding_since: Instant::now(),
+                late_join: LateJoin::Permitted,
+            };
+            // Hand off rather than sweeping here, so 168 discovered workers
+            // share one fleet-wide fetch instead of pulling the same body 168
+            // times. This rank's subscriber is already live (above), so whichever
+            // sweep picks the obligation up exports strictly after it.
+            if let Err(e) = self.bootstrap_tx.try_send(batch) {
+                // Queue full or coordinator gone. Fall back to sweeping
+                // directly: an obligation that nothing owns would leave its rank
+                // `Pending` with batches held until the queue overflows, so
+                // dropping it is not an option.
+                warn!("kv-bootstrap: batch queue unavailable ({e}); sweeping un-batched");
+                self.spawn_bootstrap(e.into_inner());
+            }
         }
         // Load subscribers (one per rank on the dedicated load port). A no-op
         // when the worker advertises no load port (older engine). Workers that
@@ -626,8 +1049,14 @@ impl KvEventIndex {
 
     /// Whether this worker's ranks should enter the bootstrap state machine.
     ///
-    /// A settled tracker means peer bootstrap is disabled (or already finished),
-    /// so batches are applied directly and nothing is held back.
+    /// Keyed on whether peer bootstrap is CONFIGURED, deliberately not on whether
+    /// it has settled. Those answer different questions, and conflating them cost
+    /// real warm coverage: a worker discovered after the first graft resolved
+    /// every pending rank found the tracker latched, was denied an obligation, and
+    /// so never got its subtree — the replica served a tree short by that
+    /// worker's blocks, with no `bootstrap_state` entry to say so. Readiness is
+    /// safe either way, because `settled()` short-circuits on `latched` and a rank
+    /// registered afterwards cannot drag `/readyz` back to 503.
     ///
     /// WHY this deliberately does NOT check for an empty peer set: registering is
     /// what arms the bootstrap deadline. Skipping registration because nobody is
@@ -639,7 +1068,7 @@ impl KvEventIndex {
     /// no-peer case is resolved by `spawn_bootstrap`, which waits for discovery
     /// to confirm there are no siblings and only then abandons.
     fn peer_bootstrap_enabled(&self) -> bool {
-        !self.bootstrap.settled()
+        self.bootstrap.enabled()
     }
 
     /// Fetch a snapshot for `ranks` from the warmest peer that answers, and
@@ -649,91 +1078,32 @@ impl KvEventIndex {
     /// so a slow peer delays readiness only up to the bootstrap deadline. Every
     /// exit path sends exactly one [`PumpControl`] message, which is what
     /// guarantees the held-back batches are eventually released.
-    fn spawn_bootstrap(&self, obligations: Vec<(KvWorkerId, u64)>) {
-        let ranks: Vec<KvWorkerId> = obligations.iter().map(|(r, _)| r.clone()).collect();
-        let http = self.snapshot_http.clone();
-        let peers = Arc::clone(&self.peers);
-        let bootstrap = Arc::clone(&self.bootstrap);
-        let live_workers = Arc::clone(&self.live_workers);
-        let oracle = Arc::clone(&self.block_size_oracle);
-        let ctrl_tx = self.ctrl_tx.clone();
-        let deadline = bootstrap.time_remaining().unwrap_or(bootstrap.timeout());
-
+    fn spawn_bootstrap(&self, batch: ObligationBatch) {
+        let deps = self.bootstrap_deps();
         tokio::spawn(async move {
-            // Retry rather than sweeping once.
-            //
-            // WHY: worker discovery regularly completes before the peer watch has
-            // delivered its first EndpointSlice list, so a single sweep sees zero
-            // candidates and abandons — the joining replica then boots cold even
-            // though warm siblings existed. The same loop also covers a rolling
-            // update whose only visible candidates are surge pods still finishing
-            // their own bootstrap. The whole loop is bounded by the bootstrap
-            // deadline, and it exits immediately once discovery confirms there is
-            // genuinely nobody to ask.
-            let ctx = SweepCtx {
-                http: &http,
-                peers: &peers,
-                bootstrap: &bootstrap,
-                live_workers: &live_workers,
-                oracle: &oracle,
-            };
-            // Shared so the terminal log can name the last concrete reason
-            // rather than only "no usable snapshot".
-            let last_reason: Mutex<Option<String>> = Mutex::new(None);
-            let attempt = async {
-                let mut permanently_rejected: HashSet<String> = HashSet::new();
-                let mut cooldown: HashMap<String, u32> = HashMap::new();
-                loop {
-                    if let Some(vetted) = sweep_peers(
-                        &ctx,
-                        &ranks,
-                        &mut permanently_rejected,
-                        &mut cooldown,
-                        &last_reason,
-                    )
-                    .await
-                    {
-                        return Some(vetted);
-                    }
-                    if peers.known_to_have_no_peers() {
-                        debug!("kv-bootstrap: discovery confirmed no sibling replicas");
-                        return None;
-                    }
-                    tokio::time::sleep(PEER_RETRY_INTERVAL).await;
-                }
-            };
-
-            // The deadline bounds the whole peer sweep, not each request, so a
-            // fleet of slow peers cannot outlast the readiness gate.
-            let outcome = tokio::time::timeout(deadline, attempt).await;
-            let msg = match outcome {
-                Ok(Some(vetted)) => PumpControl::ApplySnapshot {
-                    obligations,
-                    vetted: Box::new(vetted),
-                },
-                Ok(None) => {
-                    info!(
-                        ranks = ranks.len(),
-                        "kv-bootstrap: no sibling replicas to bootstrap from; ranks will run cold",
-                    );
-                    PumpControl::AbandonBootstrap { obligations }
-                }
-                Err(_) => {
-                    warn!(
-                        ranks = ranks.len(),
-                        timeout_ms = deadline.as_millis(),
-                        peers_tried = peers.len(),
-                        last_reason = last_reason.lock().as_deref().unwrap_or("none recorded"),
-                        "kv-bootstrap: no peer supplied a usable snapshot within the deadline; \
-                         ranks will run cold",
-                    );
-                    PumpControl::AbandonBootstrap { obligations }
-                }
-            };
-            if ctrl_tx.send(msg).await.is_err() {
-                warn!("kv-bootstrap: pump is gone; bootstrap result discarded");
-            }
+            let ObligationBatch {
+                obligations,
+                holding_since,
+                late_join: _,
+            } = batch;
+            let ranks: Vec<KvWorkerId> = obligations.iter().map(|(r, _)| r.clone()).collect();
+            let deadline = deps.deadline();
+            let result = sweep_until_deadline(&deps, &ranks, deadline, holding_since).await;
+            deliver_bootstrap(&deps, obligations, result, deadline).await;
         });
+    }
+
+    /// Clone the handles a sweep needs, so it can run detached (or be awaited by
+    /// the coordinator) without borrowing `self`.
+    fn bootstrap_deps(&self) -> BootstrapDeps {
+        BootstrapDeps {
+            http: self.snapshot_http.clone(),
+            peers: Arc::clone(&self.peers),
+            bootstrap: Arc::clone(&self.bootstrap),
+            live_workers: Arc::clone(&self.live_workers),
+            oracle: Arc::clone(&self.block_size_oracle),
+            ctrl_tx: self.ctrl_tx.clone(),
+        }
     }
 
     /// Tear down a worker's subscribers and clear it from the tree.
@@ -829,16 +1199,174 @@ impl KvEventIndex {
     }
 }
 
+/// The handles a bounded peer sweep needs, cloned out of [`KvEventIndex`] so the
+/// sweep can run detached — or be awaited by the coordinator — without borrowing
+/// `self`.
+#[derive(Clone)]
+struct BootstrapDeps {
+    http: reqwest::Client,
+    peers: Arc<PeerRegistry>,
+    bootstrap: Arc<BootstrapTracker>,
+    live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
+    oracle: Arc<BlockSizeOracle>,
+    ctrl_tx: mpsc::Sender<PumpControl>,
+}
+
+impl BootstrapDeps {
+    /// Budget for one sweep.
+    ///
+    /// While readiness is still gated, this is whatever is LEFT of the tracker's
+    /// single window — never a fresh one. That window is the `/readyz` gate, armed
+    /// once at first worker discovery, and `--kv-bootstrap-timeout-ms` is
+    /// documented as how long readiness may hold; re-arming per sweep would hold
+    /// it for an unbounded multiple of the configured value, the same bug
+    /// `BootstrapTracker::rearmed` exists to prevent for flapping workers.
+    ///
+    /// Once settled that constraint is gone, so a worker discovered afterwards
+    /// gets a full window instead of the remainder — which is zero, because
+    /// `time_remaining` saturates at the deadline. Without this, allowing late
+    /// ranks to register would be pointless: every one of them would time out
+    /// instantly and run cold, warming nothing.
+    fn deadline(&self) -> Duration {
+        if self.bootstrap.settled() {
+            return self.bootstrap.timeout();
+        }
+        self.bootstrap
+            .time_remaining()
+            .unwrap_or(self.bootstrap.timeout())
+    }
+}
+
+/// Outcome of one bounded peer sweep.
+enum SweepResult {
+    Found(VettedSnapshot),
+    /// Discovery confirmed there are no siblings, so waiting cannot help.
+    NoPeers,
+    TimedOut {
+        peers_tried: usize,
+        last_reason: Option<String>,
+    },
+}
+
+/// Sweep peers until one yields a usable snapshot, discovery proves there are
+/// none, or the budget runs out.
+///
+/// Retries rather than sweeping once: worker discovery regularly completes before
+/// the peer watch has delivered its first EndpointSlice list, so a single sweep
+/// sees zero candidates and abandons — the joining replica then boots cold even
+/// though warm siblings existed. The same loop covers a rolling update whose only
+/// visible candidates are surge pods still finishing their own bootstrap.
+///
+/// `freshness_floor` is the instant every fetch demands the peer's export beat:
+/// re-derived per attempt, so a sweep that runs for minutes keeps asking for the
+/// same coverage rather than drifting into accepting older state.
+async fn sweep_until_deadline(
+    deps: &BootstrapDeps,
+    ranks: &[KvWorkerId],
+    deadline: Duration,
+    freshness_floor: Instant,
+) -> SweepResult {
+    let ctx = SweepCtx {
+        http: &deps.http,
+        peers: &deps.peers,
+        bootstrap: &deps.bootstrap,
+        live_workers: &deps.live_workers,
+        oracle: &deps.oracle,
+        freshness_floor,
+    };
+    // Shared so the terminal log can name the last concrete reason rather than
+    // only "no usable snapshot".
+    let last_reason: Mutex<Option<String>> = Mutex::new(None);
+    let attempt = async {
+        let mut permanently_rejected: HashSet<String> = HashSet::new();
+        let mut cooldown: HashMap<String, u32> = HashMap::new();
+        loop {
+            if let Some(vetted) = sweep_peers(
+                &ctx,
+                ranks,
+                &mut permanently_rejected,
+                &mut cooldown,
+                &last_reason,
+            )
+            .await
+            {
+                return Some(vetted);
+            }
+            if deps.peers.known_to_have_no_peers() {
+                debug!("kv-bootstrap: discovery confirmed no sibling replicas");
+                return None;
+            }
+            tokio::time::sleep(PEER_RETRY_INTERVAL).await;
+        }
+    };
+
+    // The deadline bounds the whole sweep, not each request, so a fleet of slow
+    // peers cannot outlast the readiness gate.
+    match tokio::time::timeout(deadline, attempt).await {
+        Ok(Some(vetted)) => SweepResult::Found(vetted),
+        Ok(None) => SweepResult::NoPeers,
+        Err(_) => SweepResult::TimedOut {
+            peers_tried: deps.peers.len(),
+            last_reason: last_reason.lock().clone(),
+        },
+    }
+}
+
+/// Turn a sweep result into the single [`PumpControl`] message its obligations
+/// are owed. Every exit path sends exactly one, which is what releases the ranks
+/// from `Pending`.
+async fn deliver_bootstrap(
+    deps: &BootstrapDeps,
+    obligations: Vec<(KvWorkerId, u64)>,
+    result: SweepResult,
+    deadline: Duration,
+) {
+    let n = obligations.len();
+    let msg = match result {
+        SweepResult::Found(vetted) => PumpControl::ApplySnapshot {
+            obligations,
+            vetted: Box::new(vetted),
+        },
+        SweepResult::NoPeers => {
+            info!(
+                ranks = n,
+                "kv-bootstrap: no sibling replicas to bootstrap from; ranks will run cold",
+            );
+            PumpControl::AbandonBootstrap { obligations }
+        }
+        SweepResult::TimedOut {
+            peers_tried,
+            last_reason,
+        } => {
+            warn!(
+                ranks = n,
+                timeout_ms = deadline.as_millis(),
+                peers_tried,
+                last_reason = last_reason.as_deref().unwrap_or("none recorded"),
+                "kv-bootstrap: no peer supplied a usable snapshot within the deadline; \
+                 ranks will run cold",
+            );
+            PumpControl::AbandonBootstrap { obligations }
+        }
+    };
+    if deps.ctrl_tx.send(msg).await.is_err() {
+        warn!("kv-bootstrap: pump is gone; bootstrap result discarded");
+    }
+}
+
 /// One pass over the candidate peers, returning the first snapshot that vets.
 ///
-/// Kept separate from `spawn_bootstrap`'s retry loop so "which peer do we take?"
-/// and "how long do we keep looking?" stay independently readable.
+/// Kept separate from [`sweep_until_deadline`]'s retry loop so "which peer do we
+/// take?" and "how long do we keep looking?" stay independently readable.
 struct SweepCtx<'a> {
     http: &'a reqwest::Client,
     peers: &'a PeerRegistry,
     bootstrap: &'a BootstrapTracker,
     live_workers: &'a Mutex<HashSet<KvWorkerId>>,
     oracle: &'a BlockSizeOracle,
+    /// See [`sweep_until_deadline`]. Held as the instant, converted to an age at
+    /// each fetch.
+    freshness_floor: Instant,
 }
 
 async fn sweep_peers(
@@ -854,6 +1382,7 @@ async fn sweep_peers(
         bootstrap,
         live_workers,
         oracle,
+        freshness_floor,
     } = ctx;
     for peer in peers.candidates() {
         // A format / block-size / bigram mismatch is a stable property of that
@@ -870,7 +1399,11 @@ async fn sweep_peers(
                 continue;
             }
         }
-        let snap = match fetch_snapshot(http, &peer).await {
+        // Ask for an export that beats the floor. Derived per attempt, not once:
+        // the condition is "newer than the floor", and only the age it
+        // corresponds to moves as the sweep retries.
+        let max_age = freshness_floor.elapsed();
+        let snap = match fetch_snapshot(http, &peer, Some(max_age)).await {
             Ok(Some(s)) => s,
             Ok(None) => {
                 bootstrap.record_peer_outcome(SnapshotOutcome::Unreachable, &peer, None);
@@ -951,6 +1484,9 @@ struct PumpDeps {
     /// question, about state it already grafted.
     peers: Arc<PeerRegistry>,
     snapshot_http: reqwest::Client,
+    /// Obligation queue, so a gap-discarded rank can be handed back for another
+    /// sweep instead of staying cold with budget unspent.
+    bootstrap_tx: mpsc::Sender<ObligationBatch>,
     /// Loopback into this pump's own control channel, so a probe answer arrives
     /// on the single writer like every other tree mutation.
     ctrl_tx: mpsc::Sender<PumpControl>,
@@ -978,12 +1514,14 @@ async fn pump_loop(
         bootstrap,
         peers,
         snapshot_http,
+        bootstrap_tx,
         ctrl_tx,
     } = deps;
     let pump_state = PumpState {
         tree: &tree,
         cursors: &cursors,
         bootstrap: &bootstrap,
+        bootstrap_tx: &bootstrap_tx,
         live_workers: &live_workers,
     };
 
@@ -1079,6 +1617,7 @@ async fn pump_loop(
                             SpliceVerdict::Advanced => {
                                 awaiting_splice_proof.remove(&rank);
                                 demote_unproven_rank(&pump_state, &rank, RankOutcome::Gap);
+                                requeue_gapped_rank(&bootstrap, &bootstrap_tx, &rank);
                             }
                             SpliceVerdict::NoAdvance => {
                                 awaiting_splice_proof.remove(&rank);
@@ -1253,6 +1792,7 @@ async fn pump_loop(
                         bootstrap.set(&worker, BootstrapState::Failed);
                         tree.clear_worker(&worker);
                         cursors.lock().remove(&worker);
+                        requeue_gapped_rank(&bootstrap, &bootstrap_tx, &worker);
                     } else {
                         // The deferred check passed: this rank's grafted state is
                         // now proven continuous with its live stream, which is the
@@ -1278,6 +1818,9 @@ struct PumpState<'a> {
     cursors: &'a Mutex<HashMap<KvWorkerId, i64>>,
     bootstrap: &'a BootstrapTracker,
     live_workers: &'a Mutex<HashSet<KvWorkerId>>,
+    /// Obligation queue, so the graft path can hand a gapped rank back for
+    /// another sweep. See [`requeue_gapped_rank`].
+    bootstrap_tx: &'a mpsc::Sender<ObligationBatch>,
 }
 
 fn apply_batch(
@@ -1366,6 +1909,12 @@ fn fail_rank(
 /// and we missed the reset event, a renumbered stream can report a cursor below
 /// the old watermark, reading as `NoAdvance`. The `PublisherReset` arm handles
 /// the case where the event does arrive.
+///
+/// Asks for no particular freshness, unlike a bootstrap fetch. A cursor read
+/// from the peer's cached export is still positive evidence that the publisher
+/// moved — the question is whether it EVER passed the watermark, not whether it
+/// has by this instant — so forcing a rebuild here would buy a fleet-wide tree
+/// walk per unproven rank and answer no better.
 fn spawn_splice_probe(
     http: reqwest::Client,
     peers: Arc<PeerRegistry>,
@@ -1378,7 +1927,7 @@ fn spawn_splice_probe(
         let mut answered = false;
         let mut verdict = SpliceVerdict::Unknown;
         for peer in peers.candidates() {
-            match fetch_snapshot(&http, &peer).await {
+            match fetch_snapshot(&http, &peer, None).await {
                 Ok(Some(snap)) => {
                     answered = true;
                     if let Some(seq) = snap.wire_cursor_for(&rank.url, rank.dp_rank) {
@@ -1425,6 +1974,44 @@ fn spawn_splice_probe(
 /// [`BootstrapState::Pending`], and this rank is `Recovered` — it was grafted,
 /// it is serving, and the wait for evidence has run out. There is no held queue
 /// to replay either, because reaching the deferred path required an empty one.
+/// Hand a gap-discarded rank back for one more sweep.
+///
+/// A gap is the costliest failure: a snapshot was fetched, grafted, then thrown
+/// away because the live stream did not join its watermark. A fresher snapshot
+/// usually splices, and on a large fleet these were the ONLY remaining loss once
+/// amplification and timeouts were fixed — 199 of 1512 ranks in a measured
+/// rollout. The tracker caps this at one retry per rank.
+///
+/// Stamped with NOW and marked [`LateJoin::Refused`], which together are what
+/// stop the retry being spent on state that cannot splice: the rank resumed
+/// holding at this instant, so the sweep that takes it must ask for an export
+/// beating that, and it will not be folded into a sweep already in flight whose
+/// request predates it. Without both, a retry landing mid-sweep is adjudicated
+/// against a snapshot taken before the gap, re-gaps by construction, and burns
+/// the one attempt `gap_retried` allows.
+fn requeue_gapped_rank(
+    bootstrap: &BootstrapTracker,
+    tx: &mpsc::Sender<ObligationBatch>,
+    rank: &KvWorkerId,
+) {
+    let Some(obligation) = bootstrap.retry_after_gap(rank) else {
+        return;
+    };
+    let batch = ObligationBatch {
+        obligations: vec![obligation],
+        holding_since: Instant::now(),
+        late_join: LateJoin::Refused,
+    };
+    if let Err(e) = tx.try_send(batch) {
+        // The rank is `Pending` now and nobody owns it, which would hold its
+        // batches until the per-rank cap overflows. Put it back.
+        warn!("kv-bootstrap: could not re-queue gapped rank ({e}); leaving it cold");
+        bootstrap.set(rank, BootstrapState::Failed);
+        return;
+    }
+    debug!(worker = ?rank, "kv-bootstrap: gapped rank re-queued for another sweep");
+}
+
 fn demote_unproven_rank(st: &PumpState<'_>, rank: &KvWorkerId, outcome: RankOutcome) {
     // A rank that has since been forgotten or re-registered is not ours to
     // demote; `Recovered` is the only state this can legitimately act on.
@@ -1531,6 +2118,7 @@ fn apply_snapshot(
                 // Put the queue back so `fail_rank` replays it after clearing.
                 held.insert(rank.clone(), queue);
                 fail_rank(st, held, &rank, false, RankOutcome::Gap);
+                requeue_gapped_rank(st.bootstrap, st.bootstrap_tx, &rank);
                 continue;
             }
             Some(_) => proven = true,
@@ -1588,6 +2176,332 @@ mod tests {
         }
     }
 
+    // ---- bootstrap fan-in (take_pending / drain_ready) ----
+
+    fn obligation(n: u32) -> ObligationBatch {
+        discovery_batch(n, Instant::now())
+    }
+
+    fn discovery_batch(n: u32, holding_since: Instant) -> ObligationBatch {
+        ObligationBatch {
+            obligations: vec![(worker_id(&format!("http://w{n}:30000"), 0), n as u64)],
+            holding_since,
+            late_join: LateJoin::Permitted,
+        }
+    }
+
+    /// A discovery burst is taken in one go, so one fleet-wide snapshot serves
+    /// every rank instead of one fetch per worker.
+    #[tokio::test]
+    async fn take_pending_takes_the_whole_queued_burst() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        for n in 0..8 {
+            tx.send(obligation(n)).await.unwrap();
+        }
+        let got = take_pending(&mut rx, &cancel).await.expect("obligations");
+        assert_eq!(got.obligations.len(), 8, "all eight are taken together");
+    }
+
+    /// Absorbing a burst must adopt the STRICTEST freshness in it: the sweep
+    /// fetches once for all of them, so a snapshot older than the last rank to
+    /// start holding cannot splice for that rank.
+    #[tokio::test]
+    async fn take_pending_adopts_the_newest_holding_instant() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let base = Instant::now();
+        let newest = base + Duration::from_millis(300);
+        tx.send(discovery_batch(0, base)).await.unwrap();
+        tx.send(discovery_batch(1, newest)).await.unwrap();
+        tx.send(discovery_batch(2, base + Duration::from_millis(100)))
+            .await
+            .unwrap();
+
+        let got = take_pending(&mut rx, &cancel).await.expect("obligations");
+        assert_eq!(got.obligations.len(), 3);
+        assert_eq!(
+            got.freshness_floor, newest,
+            "the floor must be the newest holding instant, not the first seen",
+        );
+    }
+
+    /// And it must not wait for a quiet period to do it — the sweep is the
+    /// batching window, so adding latency here would be pure cost.
+    #[tokio::test]
+    async fn take_pending_does_not_wait() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        tx.send(obligation(1)).await.unwrap();
+        let started = Instant::now();
+        let got = take_pending(&mut rx, &cancel).await.expect("obligations");
+        let elapsed = started.elapsed();
+        assert_eq!(got.obligations.len(), 1);
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "returned in {elapsed:?}; must not debounce",
+        );
+    }
+
+    /// The load-bearing behaviour: ranks discovered WHILE a sweep is in flight
+    /// are merged into that sweep's delivery, so they ride its snapshot rather
+    /// than waiting for a second fetch.
+    #[tokio::test]
+    async fn drain_ready_merges_arrivals_from_during_the_sweep() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        tx.send(obligation(0)).await.unwrap();
+        let mut pending = take_pending(&mut rx, &cancel).await.expect("obligations");
+        assert_eq!(pending.obligations.len(), 1);
+
+        // Stand in for the fetch: more workers show up while it is running.
+        for n in 1..6 {
+            tx.send(obligation(n)).await.unwrap();
+        }
+        let joined = drain_ready(&mut rx, &mut pending);
+        assert_eq!(joined, 5, "late arrivals are reported");
+        assert_eq!(
+            pending.obligations.len(),
+            6,
+            "and merged into the same delivery",
+        );
+        assert!(
+            pending.deferred.is_empty(),
+            "discovery rides along rather than waiting for a sweep of its own",
+        );
+    }
+
+    /// A mid-sweep merge must NOT retroactively tighten the floor: the request
+    /// has already gone out under the old one, so claiming otherwise would
+    /// describe a guarantee this sweep never asked for.
+    #[tokio::test]
+    async fn drain_ready_does_not_move_the_floor_the_sweep_asked_with() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let base = Instant::now();
+        tx.send(discovery_batch(0, base)).await.unwrap();
+        let mut pending = take_pending(&mut rx, &cancel).await.expect("obligations");
+
+        tx.send(discovery_batch(1, base + Duration::from_secs(5)))
+            .await
+            .unwrap();
+        drain_ready(&mut rx, &mut pending);
+        assert_eq!(
+            pending.freshness_floor, base,
+            "the floor is frozen once the sweep is in flight",
+        );
+    }
+
+    /// A gap retry landing mid-sweep must not be spent on that sweep's snapshot.
+    /// It was fetched under a floor older than the retry, so it re-gaps by
+    /// construction — and `gap_retried` allows no third attempt.
+    #[tokio::test]
+    async fn drain_ready_defers_a_gap_retry_the_sweep_cannot_speak_for() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let base = Instant::now();
+        tx.send(discovery_batch(0, base)).await.unwrap();
+        let mut pending = take_pending(&mut rx, &cancel).await.expect("obligations");
+
+        let rank = worker_id("http://gapped:30000", 0);
+        tx.send(ObligationBatch {
+            obligations: vec![(rank.clone(), 7)],
+            holding_since: base + Duration::from_millis(200),
+            late_join: LateJoin::Refused,
+        })
+        .await
+        .unwrap();
+
+        let joined = drain_ready(&mut rx, &mut pending);
+        assert_eq!(joined, 0, "a deferred batch is not counted as joined");
+        assert_eq!(
+            pending.obligations.len(),
+            1,
+            "and is not delivered into this sweep",
+        );
+        assert_eq!(pending.deferred.len(), 1, "it is handed to the next one");
+        assert_eq!(pending.deferred[0].obligations[0].0, rank);
+    }
+
+    /// The refusal is about freshness, not about being a retry: a retry the
+    /// sweep's own floor already covers has nothing to gain from waiting.
+    #[tokio::test]
+    async fn drain_ready_admits_a_retry_the_floor_already_covers() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let base = Instant::now();
+        tx.send(discovery_batch(0, base)).await.unwrap();
+        let mut pending = take_pending(&mut rx, &cancel).await.expect("obligations");
+
+        tx.send(ObligationBatch {
+            obligations: vec![(worker_id("http://early:30000", 0), 7)],
+            holding_since: base - Duration::from_millis(200),
+            late_join: LateJoin::Refused,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(drain_ready(&mut rx, &mut pending), 1);
+        assert!(pending.deferred.is_empty());
+    }
+
+    /// The producer reuses its cached export only for a caller whose freshness
+    /// requirement it actually meets. This is the whole point of the parameter:
+    /// under a fixed TTL the peer happily served an export taken before the
+    /// consumer subscribed, and the graft then gapped on the watermark.
+    #[tokio::test]
+    async fn producer_reuses_its_export_only_when_it_meets_the_callers_max_age() {
+        let index = KvEventIndex::new();
+        let exported_at = || async {
+            index
+                .snapshot_cache
+                .lock()
+                .await
+                .as_ref()
+                .expect("an entry was cached")
+                .exported_at
+        };
+
+        index.peer_snapshot_body(Duration::from_secs(60)).await;
+        let first = exported_at().await;
+
+        // A caller that can live with a minute-old tree gets the same one back.
+        index.peer_snapshot_body(Duration::from_secs(60)).await;
+        assert_eq!(first, exported_at().await, "a met requirement reuses");
+
+        // A caller that began holding after that export cannot use it.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        index.peer_snapshot_body(Duration::ZERO).await;
+        assert!(
+            exported_at().await > first,
+            "an unmet requirement must rebuild, not serve the stale export",
+        );
+    }
+
+    /// The stamp has to be taken BEFORE the contents are sampled. Stamping
+    /// completion would claim coverage the document does not have — exactly the
+    /// hole the parameter closes — and the walk plus encode of a real tree is
+    /// long enough for that to matter.
+    #[tokio::test]
+    async fn producer_stamps_the_export_before_it_samples() {
+        let index = KvEventIndex::new();
+        let before = Instant::now();
+        index.peer_snapshot_body(Duration::ZERO).await;
+        let after = Instant::now();
+        let exported_at = index
+            .snapshot_cache
+            .lock()
+            .await
+            .as_ref()
+            .expect("an entry was cached")
+            .exported_at;
+        assert!(
+            exported_at >= before && exported_at <= after,
+            "the stamp must sit inside the build, at its start",
+        );
+    }
+
+    /// A worker discovered after readiness opened must still be allowed to warm.
+    /// Gating registration on `settled()` denied it silently: the replica served a
+    /// tree missing that worker's blocks with no `bootstrap_state` entry to show
+    /// for it.
+    #[test]
+    fn enabled_survives_settling_so_late_workers_still_bootstrap() {
+        let tracker = BootstrapTracker::new(Duration::from_millis(1));
+        let id = worker_id("http://w1:30000", 0);
+        tracker.register(std::slice::from_ref(&id));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(tracker.settled(), "deadline expiry settles readiness");
+        assert!(
+            tracker.enabled(),
+            "settling must NOT disable bootstrap for workers found later",
+        );
+    }
+
+    /// The disabled case must stay distinguishable from the finished case, or a
+    /// router with no `--kv-peer-selector` would start holding batches.
+    #[test]
+    fn disabled_tracker_is_not_enabled() {
+        let t = BootstrapTracker::disabled();
+        assert!(t.settled());
+        assert!(
+            !t.enabled(),
+            "no selector configured ⇒ never register ranks"
+        );
+    }
+
+    /// The premise behind `BootstrapDeps::deadline`'s settled branch: the
+    /// remaining window saturates at zero, so a late rank handed
+    /// `time_remaining()` would get no budget at all and abandon instantly.
+    #[test]
+    fn time_remaining_saturates_to_zero_once_expired() {
+        let tracker = BootstrapTracker::new(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            tracker.time_remaining(),
+            Some(Duration::ZERO),
+            "expired window must read as zero, not as None",
+        );
+        assert!(
+            tracker.timeout() > Duration::ZERO,
+            "so the settled branch has a real budget to fall back on",
+        );
+    }
+
+    /// The retry is capped at once per rank. Without the cap, a rank no peer
+    /// covers would buy a fresh fleet-wide fetch on every pass, reintroducing the
+    /// amplification the coordinator exists to remove.
+    #[test]
+    fn requeue_is_capped_at_one_retry_per_rank() {
+        let mut requeued: HashSet<KvWorkerId> = HashSet::new();
+        let rank = worker_id("http://w1:30000", 0);
+
+        // First time an uncovered rank is seen: eligible for a second sweep.
+        assert!(
+            requeued.insert(rank.clone()),
+            "first sighting must be retried",
+        );
+        // Second time: must be delivered as-is (resolving to Uncovered) rather
+        // than triggering another fetch.
+        assert!(
+            !requeued.insert(rank.clone()),
+            "second sighting must NOT buy another fetch",
+        );
+    }
+
+    /// Nothing queued means nothing added, and no spinning.
+    #[tokio::test]
+    async fn drain_ready_on_empty_queue_adds_nothing() {
+        let (_tx, mut rx) = mpsc::channel::<ObligationBatch>(4);
+        let mut pending = PendingSweep::from(obligation(0));
+        assert_eq!(drain_ready(&mut rx, &mut pending), 0);
+        assert_eq!(pending.obligations.len(), 1);
+    }
+
+    /// Cancellation while idle ends the coordinator rather than parking forever.
+    #[tokio::test]
+    async fn take_pending_stops_on_cancel() {
+        let (_tx, mut rx) = mpsc::channel::<ObligationBatch>(4);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(
+            take_pending(&mut rx, &cancel).await.is_none(),
+            "cancelled coordinator stops",
+        );
+    }
+
+    /// All senders dropped with nothing pending ends the coordinator too.
+    #[tokio::test]
+    async fn take_pending_stops_when_senders_drop() {
+        let (tx, mut rx) = mpsc::channel::<ObligationBatch>(4);
+        let cancel = CancellationToken::new();
+        drop(tx);
+        assert!(
+            take_pending(&mut rx, &cancel).await.is_none(),
+            "closed channel stops the coordinator",
+        );
+    }
+
     /// Bundle of plumbing returned by `spawn_pump` so individual tests
     /// can destructure just the bits they need.
     struct PumpHarness {
@@ -1601,6 +2515,8 @@ mod tests {
         tx: mpsc::Sender<WorkerEvent>,
         pump: JoinHandle<()>,
         ctrl_tx: mpsc::Sender<PumpControl>,
+        /// Obligations the pump handed back, e.g. a gap-driven retry.
+        bootstrap_rx: mpsc::Receiver<ObligationBatch>,
     }
 
     /// Build a tree + cursors + live-set wired through `pump_loop` with
@@ -1624,6 +2540,8 @@ mod tests {
         let cancel = CancellationToken::new();
         let (tx, rx) = mpsc::channel(4);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(4);
+        // Real queue so a gap-driven re-queue is observable rather than dropped.
+        let (bootstrap_tx, bootstrap_rx) = mpsc::channel(16);
         let pump = tokio::spawn(pump_loop(
             PumpDeps {
                 tree: tree.clone(),
@@ -1636,6 +2554,7 @@ mod tests {
                 // any network. Probe verdicts are driven directly instead.
                 peers: Arc::new(PeerRegistry::new()),
                 snapshot_http: reqwest::Client::new(),
+                bootstrap_tx: bootstrap_tx.clone(),
                 ctrl_tx: ctrl_tx.clone(),
             },
             cancel.clone(),
@@ -1651,6 +2570,7 @@ mod tests {
             tx,
             pump,
             ctrl_tx,
+            bootstrap_rx,
         }
     }
 
@@ -1859,14 +2779,73 @@ mod tests {
         drop(h.ctrl_tx);
         h.pump.await.unwrap();
 
-        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Failed));
+        // Gapped ranks are handed back for one retry, so the rank is Pending
+        // rather than terminally Failed — the discarded graft is the same either
+        // way.
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Pending));
         assert!(
             !h.tree.match_prefix(None, &[100, 200]).workers.contains(&id),
             "snapshot state must be discarded for a gapped rank",
         );
         // The live stream still applies: cold, not broken.
         assert!(h.tree.match_prefix(None, &[42]).workers.contains(&id));
-        assert!(tracker.settled());
+        // Readiness now WAITS: the gapped rank went back to Pending for its retry,
+        // so the tracker is unsettled until that resolves or the deadline expires.
+        // Warming the tree is preferred over opening `/readyz` on a cold rank.
+        assert!(!tracker.settled());
+    }
+
+    /// A gap is the costliest failure — a snapshot was fetched, grafted, then
+    /// thrown away. So the rank is handed back for one more sweep instead of
+    /// staying cold with budget unspent, and the retry is capped at one.
+    #[tokio::test]
+    async fn pump_requeues_a_gapped_rank_once() {
+        let id = worker_id("http://w1", 0);
+        let tracker = pending_tracker(std::slice::from_ref(&id));
+        let mut h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+
+        // Watermark 5, first live batch seq 9 — 6..8 lost, so this gaps.
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 9,
+            batch: batch(vec![stored(None, vec![42])]),
+        })
+        .await
+        .unwrap();
+        h.ctrl_tx
+            .send(PumpControl::ApplySnapshot {
+                obligations: obligations(&tracker, std::slice::from_ref(&id)),
+                vetted: Box::new(vetted_for(&id, 5)),
+            })
+            .await
+            .unwrap();
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+
+        let requeued = h.bootstrap_rx.try_recv().expect("gapped rank re-queued");
+        assert_eq!(requeued.obligations.len(), 1);
+        assert_eq!(
+            requeued.obligations[0].0, id,
+            "the gapped rank itself is handed back",
+        );
+        assert_eq!(
+            requeued.late_join,
+            LateJoin::Refused,
+            "a retry must not be spent on a snapshot fetched before the gap",
+        );
+        assert_eq!(
+            tracker.state_of(&id),
+            Some(BootstrapState::Pending),
+            "back to Pending so the next sweep may graft onto it",
+        );
+
+        // Capped: a second gap on the same rank must not buy another fetch.
+        tracker.set(&id, BootstrapState::Failed);
+        assert!(
+            tracker.retry_after_gap(&id).is_none(),
+            "one retry per rank, or a persistently gapping rank re-fetches forever",
+        );
     }
 
     /// Same gap, detected on the *immediate* path: the batch is already held
@@ -1900,7 +2879,7 @@ mod tests {
         drop(h.ctrl_tx);
         h.pump.await.unwrap();
 
-        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Failed));
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Pending));
         assert!(
             !h.tree.match_prefix(None, &[100, 200]).workers.contains(&id),
             "snapshot state must be discarded for a gapped rank",
@@ -2513,7 +3492,7 @@ mod tests {
         drop(h.ctrl_tx);
         h.pump.await.unwrap();
 
-        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Failed));
+        assert_eq!(tracker.state_of(&id), Some(BootstrapState::Pending));
         assert!(
             !h.tree.match_prefix(None, &[100, 200]).workers.contains(&id),
             "positive evidence of a missed batch must discard the graft",
@@ -2585,8 +3564,9 @@ mod tests {
 
         assert_eq!(
             tracker.state_of(&id),
-            Some(BootstrapState::Failed),
-            "an Unknown verdict must not consume the pending proof",
+            Some(BootstrapState::Pending),
+            "an Unknown verdict must not consume the pending proof; the later \
+             Advanced verdict then gaps, which re-queues the rank",
         );
         assert_eq!(rank_count(&tracker, "warm"), 0);
     }

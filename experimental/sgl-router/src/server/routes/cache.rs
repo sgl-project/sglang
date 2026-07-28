@@ -3,15 +3,16 @@
 
 //! Cache-management admin endpoints.
 
+use crate::policies::kv_events::bootstrap::PRODUCER_CACHE_TTL;
 use crate::server::app_context::AppContext;
 use crate::workers::worker::Worker;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Query, State};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::stream::{self, StreamExt};
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,6 +72,17 @@ impl FlushCacheResult {
     }
 }
 
+/// Query string of `GET /internal/kv_snapshot`.
+///
+/// Every field optional, so a peer that sends nothing — an older router image,
+/// or a caller with no freshness requirement — is served rather than rejected.
+#[derive(Debug, Default, Deserialize)]
+pub struct SnapshotParams {
+    /// Oldest export the caller can use, in milliseconds. Named to match
+    /// [`crate::policies::kv_events::bootstrap::MAX_AGE_PARAM`].
+    max_age_ms: Option<u64>,
+}
+
 /// `GET /internal/kv_snapshot` — serve this replica's cache-aware tree so a
 /// newly started sibling can bootstrap from it instead of routing cache-blind.
 ///
@@ -82,7 +94,13 @@ impl FlushCacheResult {
 /// The body always reports `producer_ready`, so a peer that is itself still
 /// bootstrapping is skipped by the consumer rather than propagating a cold
 /// tree. Snapshot construction is single-flighted and briefly cached; see
-/// [`crate::policies::kv_events::index::KvEventIndex::peer_snapshot`].
+/// [`crate::policies::kv_events::index::KvEventIndex::peer_snapshot_body`].
+///
+/// `?max_age_ms=N` states how stale an export the caller can use, which is a
+/// correctness input for a bootstrapping consumer rather than a preference —
+/// see [`PRODUCER_CACHE_TTL`]. Omitting it accepts whatever is cached within
+/// that default, which is what an older router image does and what a splice
+/// probe wants.
 ///
 /// # Exposure
 ///
@@ -90,11 +108,40 @@ impl FlushCacheResult {
 /// pprof endpoint — the router has no auth middleware, so reachability is
 /// already the trust boundary for its admin surface. The body is block hashes
 /// and worker URLs: no prompt text and no token ids.
-pub async fn kv_snapshot(State(ctx): State<Arc<AppContext>>) -> Response {
+pub async fn kv_snapshot(
+    State(ctx): State<Arc<AppContext>>,
+    Query(params): Query<SnapshotParams>,
+) -> Response {
     match ctx.kv_index() {
         Some(index) => {
-            let snap = index.peer_snapshot().await;
-            (StatusCode::OK, Json(&*snap)).into_response()
+            let max_age = params
+                .max_age_ms
+                .map_or(PRODUCER_CACHE_TTL, Duration::from_millis);
+            // Pre-encoded and cached by the producer, so a boot herd does not
+            // re-serialise one identical multi-megabyte tree per request. Handing
+            // `Bytes` to the body is a refcount bump, not a copy.
+            let body = index.peer_snapshot_body(max_age).await;
+            if body.is_empty() {
+                // The encode failed (see `snapshot_entry`). Must NOT be a 200: the
+                // consumer's `fetch_snapshot` would fail JSON decode, which lands
+                // in the one `sweep_peers` arm that skips the peer cooldown — so a
+                // booting sibling would re-request this same broken body every
+                // 250ms for its whole bootstrap window. A non-success status reads
+                // as "no snapshot here" and earns the cooldown.
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "snapshot could not be encoded",
+                    })),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                axum::body::Body::from(body),
+            )
+                .into_response()
         }
         None => (
             StatusCode::NOT_FOUND,
@@ -234,6 +281,63 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use tower::ServiceExt;
+
+    /// Exercise the REAL route, not a stand-in server: the body is served
+    /// pre-encoded from the producer cache rather than through `Json`, so the
+    /// content type and parseability are now this handler's responsibility.
+    #[tokio::test]
+    async fn kv_snapshot_route_serves_parseable_json() {
+        use crate::policies::kv_events::bootstrap::{PeerSnapshot, SNAPSHOT_PATH};
+        let ctx = Arc::new(AppContext::stub());
+        ctx.attach_kv_index(crate::policies::kv_events::KvEventIndex::new());
+        let app = crate::server::app::build_router(Arc::clone(&ctx));
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri(SNAPSHOT_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+        );
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<PeerSnapshot>(&body)
+            .expect("route body must deserialise as a PeerSnapshot");
+    }
+
+    /// The freshness parameter must be OPTIONAL at the extractor. A router image
+    /// that predates it sends the bare path, and rejecting that would turn every
+    /// mixed-version bootstrap into an unreachable peer.
+    #[tokio::test]
+    async fn kv_snapshot_route_accepts_a_max_age_and_survives_its_absence() {
+        use crate::policies::kv_events::bootstrap::{PeerSnapshot, MAX_AGE_PARAM, SNAPSHOT_PATH};
+        let ctx = Arc::new(AppContext::stub());
+        ctx.attach_kv_index(crate::policies::kv_events::KvEventIndex::new());
+
+        for uri in [
+            SNAPSHOT_PATH.to_string(),
+            format!("{SNAPSHOT_PATH}?{MAX_AGE_PARAM}=0"),
+            format!("{SNAPSHOT_PATH}?{MAX_AGE_PARAM}=30000"),
+        ] {
+            let app = crate::server::app::build_router(Arc::clone(&ctx));
+            let res = app
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{uri} must be served");
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<PeerSnapshot>(&body)
+                .unwrap_or_else(|e| panic!("{uri} must yield a PeerSnapshot: {e}"));
+        }
+    }
 
     /// Spawn a fake worker that answers `POST /flush_cache` with `status`.
     /// Returns its base URL and a shutdown handle (drop or send to stop).

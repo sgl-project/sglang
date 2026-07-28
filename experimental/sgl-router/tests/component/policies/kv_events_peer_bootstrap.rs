@@ -151,7 +151,7 @@ async fn new_replica_view_matches_warm_replica_over_http() {
 
     // New replica: fetch, vet against its own live worker set, graft.
     let http = reqwest::Client::new();
-    let fetched = fetch_snapshot(&http, &base_url)
+    let fetched = fetch_snapshot(&http, &base_url, None)
         .await
         .expect("fetch succeeds")
         .expect("peer serves a snapshot");
@@ -182,7 +182,10 @@ async fn cursors_survive_the_round_trip() {
     let (base_url, _server) = serve_snapshot(snapshot_of(&old_tree, &cursors)).await;
 
     let http = reqwest::Client::new();
-    let fetched = fetch_snapshot(&http, &base_url).await.unwrap().unwrap();
+    let fetched = fetch_snapshot(&http, &base_url, None)
+        .await
+        .unwrap()
+        .unwrap();
     let live: HashSet<KvWorkerId> = workers.iter().cloned().collect();
     let vetted = VettedSnapshot::from_wire(fetched, &live, Some(64), false).unwrap();
 
@@ -217,7 +220,10 @@ async fn grafting_requires_going_through_vetting() {
     let (base_url, _server) = serve_snapshot(snapshot_of(&old_tree, &[])).await;
 
     let http = reqwest::Client::new();
-    let fetched = fetch_snapshot(&http, &base_url).await.unwrap().unwrap();
+    let fetched = fetch_snapshot(&http, &base_url, None)
+        .await
+        .unwrap()
+        .unwrap();
     let live: HashSet<KvWorkerId> = workers.iter().cloned().collect();
 
     // A hostile-or-buggy peer's block size is refused here, before any tree
@@ -246,7 +252,10 @@ async fn cold_sibling_is_rejected_as_a_source() {
     let (base_url, _server) = serve_snapshot(snapshot_of(&empty, &[])).await;
 
     let http = reqwest::Client::new();
-    let fetched = fetch_snapshot(&http, &base_url).await.unwrap().unwrap();
+    let fetched = fetch_snapshot(&http, &base_url, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
         !fetched.producer_ready,
         "a replica with an empty tree must not advertise itself as a source",
@@ -269,7 +278,7 @@ async fn older_peer_without_the_endpoint_reads_as_no_snapshot() {
     });
 
     let http = reqwest::Client::new();
-    let got = fetch_snapshot(&http, &format!("http://{addr}"))
+    let got = fetch_snapshot(&http, &format!("http://{addr}"), None)
         .await
         .expect("a 404 is not a transport error");
     assert!(got.is_none(), "404 must read as 'peer has no snapshot'");
@@ -294,7 +303,10 @@ async fn unknown_workers_are_dropped_but_known_view_is_preserved() {
 
     let (base_url, _server) = serve_snapshot(snapshot_of(&old_tree, &[])).await;
     let http = reqwest::Client::new();
-    let fetched = fetch_snapshot(&http, &base_url).await.unwrap().unwrap();
+    let fetched = fetch_snapshot(&http, &base_url, None)
+        .await
+        .unwrap()
+        .unwrap();
 
     let live: HashSet<KvWorkerId> = known.iter().cloned().collect();
     let vetted = VettedSnapshot::from_wire(fetched, &live, Some(64), false).unwrap();
@@ -343,7 +355,10 @@ async fn mismatched_block_size_is_refused() {
     let (base_url, _server) = serve_snapshot(snap).await;
 
     let http = reqwest::Client::new();
-    let fetched = fetch_snapshot(&http, &base_url).await.unwrap().unwrap();
+    let fetched = fetch_snapshot(&http, &base_url, None)
+        .await
+        .unwrap()
+        .unwrap();
     let live: HashSet<KvWorkerId> = workers.iter().cloned().collect();
     let err = VettedSnapshot::from_wire(fetched, &live, Some(64), false)
         .expect_err("a block-size mismatch must be refused");

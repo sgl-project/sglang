@@ -91,11 +91,34 @@ pub const SNAPSHOT_FORMAT: u32 = 1;
 /// Path served by the producer and fetched by the consumer.
 pub const SNAPSHOT_PATH: &str = "/internal/kv_snapshot";
 
-/// How long a producer may reuse an already-built snapshot before rebuilding.
+/// Query parameter by which a consumer states how stale a cached snapshot it
+/// will accept, in milliseconds. See [`PRODUCER_CACHE_TTL`].
+pub const MAX_AGE_PARAM: &str = "max_age_ms";
+
+/// How long a producer may reuse an already-built snapshot for a request that
+/// states no freshness requirement of its own.
 ///
-/// Exists to absorb a simultaneous scale-up: N replicas booting at once share
-/// one tree walk instead of forcing N. Short enough that the cursors a
-/// consumer seeds stay close to the live stream.
+/// # Why staleness is a correctness input, not a tuning knob
+///
+/// A cached snapshot was exported some time BEFORE the consumer that receives it
+/// subscribed. Every event the publisher emitted in that window is in neither
+/// place — not in the snapshot, not in the consumer's held queue — so the live
+/// stream resumes above `cursor + 1`, the watermark reads a hole, and the graft
+/// is discarded to [`RankOutcome::Gap`]. On a fleet whose ranks publish
+/// continuously that window was the dominant remaining loss: at 168 engines a
+/// fixed 2s TTL cost 13% of ranks while abandoned and uncovered were both zero.
+///
+/// A shorter fixed TTL only makes that less likely. What removes it is letting
+/// the CONSUMER state the requirement, since only the consumer knows when its
+/// ranks began holding: [`MAX_AGE_PARAM`] carries "no older than this", the
+/// producer rebuilds when its entry does not meet it, and a bootstrap fetch asks
+/// for an export strictly after its own subscribe. Gap by staleness then cannot
+/// happen rather than merely happening less.
+///
+/// So this constant is now only the DEFAULT for callers with no such
+/// requirement — a splice probe, which wants one cursor and does not care how
+/// old it is, and an older router image that does not send the parameter. It can
+/// be generous again, which is what keeps a boot herd sharing one walk.
 pub const PRODUCER_CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// Per-rank bootstrap outcome.
@@ -719,6 +742,18 @@ pub struct BootstrapTracker {
     /// the bootstrap budget.
     deadline: Mutex<Option<Instant>>,
     timeout: Duration,
+    /// Whether peer bootstrap is configured at all (a `--kv-peer-selector` is
+    /// set), as opposed to configured-and-already-finished.
+    ///
+    /// WHY this is not derivable from `settled()`: both a
+    /// [`BootstrapTracker::disabled`] tracker and one that has completed its work
+    /// report settled, but they must be treated oppositely at `add_worker`.
+    /// Disabled means "never hold this rank's batches"; finished means "readiness
+    /// is already green, but a newly discovered worker should still be warmed".
+    /// Collapsing the two silently denies a late worker its snapshot and leaves
+    /// its subtree cold — the tree ends up short by that worker's blocks with
+    /// nothing in the metrics to say so.
+    enabled: bool,
     latched: AtomicBool,
     /// Whether the one-shot re-arm at first worker discovery has happened.
     ///
@@ -742,6 +777,14 @@ pub struct BootstrapTracker {
     /// task; the epoch has to be per rank.
     epochs: Mutex<HashMap<KvWorkerId, u64>>,
     epoch_seq: AtomicU64,
+    /// Ranks already given one post-gap retry.
+    ///
+    /// A gap means the grafted state was discarded because the live stream did not
+    /// join the snapshot's watermark — the most wasteful failure there is, since a
+    /// snapshot WAS fetched and then thrown away. A fresher snapshot usually
+    /// splices, so it is worth one more sweep. Capped at one per rank: a rank that
+    /// keeps gapping would otherwise re-fetch a fleet-wide body indefinitely.
+    gap_retried: Mutex<HashSet<KvWorkerId>>,
     /// Per-peer-attempt tallies keyed by [`SnapshotOutcome::as_label`].
     ///
     /// Kept here rather than pushed into the metrics registry because the
@@ -773,10 +816,12 @@ impl BootstrapTracker {
             // from first worker discovery rather than from process start.
             deadline: Mutex::new(Some(Instant::now() + timeout)),
             timeout,
+            enabled: true,
             latched: AtomicBool::new(false),
             rearmed: AtomicBool::new(false),
             epochs: Mutex::new(HashMap::new()),
             epoch_seq: AtomicU64::new(0),
+            gap_retried: Mutex::new(HashSet::new()),
             peer_outcomes: Mutex::new(HashMap::new()),
             rank_outcomes: Mutex::new(HashMap::new()),
         }
@@ -830,9 +875,17 @@ impl BootstrapTracker {
     /// A tracker that is settled from the start, for the paths where peer
     /// bootstrap is disabled entirely.
     pub fn disabled() -> Self {
-        let t = Self::new(Duration::ZERO);
+        let mut t = Self::new(Duration::ZERO);
+        t.enabled = false;
         t.latched.store(true, Ordering::Relaxed);
         t
+    }
+
+    /// Whether peer bootstrap is configured. Unlike [`BootstrapTracker::settled`]
+    /// this never flips: it answers "may ranks bootstrap at all?", not "is
+    /// readiness still waiting?".
+    pub fn enabled(&self) -> bool {
+        self.enabled
     }
 
     pub fn timeout(&self) -> Duration {
@@ -908,6 +961,31 @@ impl BootstrapTracker {
             states.remove(id);
             epochs.remove(id);
         }
+    }
+
+    /// Move a gap-discarded rank back to `Pending` so it can be swept again,
+    /// returning the obligation to queue.
+    ///
+    /// `None` when the retry must not happen: already retried once, the rank was
+    /// forgotten or re-registered by a new incarnation, or it is not in the
+    /// `Failed` state a gap leaves behind. The caller MUST queue a returned
+    /// obligation — a `Pending` rank nobody owns holds its batches until the
+    /// pump's per-rank cap overflows.
+    ///
+    /// Readiness is unaffected: `settled()` short-circuits on `latched`, so a rank
+    /// returning to `Pending` cannot drag `/readyz` back to 503.
+    pub fn retry_after_gap(&self, id: &KvWorkerId) -> Option<(KvWorkerId, u64)> {
+        let mut states = self.states.lock();
+        if states.get(id) != Some(&BootstrapState::Failed) {
+            return None;
+        }
+        // Same lock order as `register` (states, then epochs).
+        let epoch = *self.epochs.lock().get(id)?;
+        if !self.gap_retried.lock().insert(id.clone()) {
+            return None;
+        }
+        states.insert(id.clone(), BootstrapState::Pending);
+        Some((id.clone(), epoch))
     }
 
     pub fn state_of(&self, id: &KvWorkerId) -> Option<BootstrapState> {
@@ -1036,13 +1114,35 @@ impl PeerRegistry {
     }
 }
 
+/// The URL a snapshot fetch goes to, carrying the caller's freshness
+/// requirement when it has one.
+fn snapshot_url(peer_base_url: &str, max_age: Option<Duration>) -> String {
+    let base = format!("{}{}", peer_base_url.trim_end_matches('/'), SNAPSHOT_PATH);
+    match max_age {
+        // Saturating rather than wrapping: an absurd duration must read as "any
+        // age will do", never as a near-zero age that forces a needless rebuild.
+        Some(d) => {
+            let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+            format!("{base}?{MAX_AGE_PARAM}={ms}")
+        }
+        None => base,
+    }
+}
+
 /// Fetch one peer's snapshot. `Ok(None)` means "peer reachable but has no
 /// snapshot to give" (non-200, including an older image's 404).
+///
+/// `max_age` is the oldest export the caller can use. `None` accepts whatever
+/// the peer has cached, which is right for a splice probe reading one cursor and
+/// wrong for a bootstrap — see [`PRODUCER_CACHE_TTL`]. An older router image
+/// ignores the parameter and answers from its own cache, so a mixed-version
+/// fleet degrades to the pre-parameter behaviour rather than failing.
 pub async fn fetch_snapshot(
     http: &reqwest::Client,
     peer_base_url: &str,
+    max_age: Option<Duration>,
 ) -> Result<Option<PeerSnapshot>, reqwest::Error> {
-    let url = format!("{}{}", peer_base_url.trim_end_matches('/'), SNAPSHOT_PATH);
+    let url = snapshot_url(peer_base_url, max_age);
     let resp = http.get(&url).send().await?;
     if !resp.status().is_success() {
         debug!(
@@ -1090,6 +1190,48 @@ mod tests {
         ids.iter()
             .map(|(u, r)| KvWorkerId::new((*u).to_string(), *r))
             .collect()
+    }
+
+    /// A caller with no freshness requirement must send a bare path, so an older
+    /// router image — and this crate's own splice probe — sees the request it
+    /// has always seen.
+    #[test]
+    fn snapshot_url_omits_the_parameter_when_any_age_will_do() {
+        assert_eq!(
+            snapshot_url("http://peer:3000", None),
+            format!("http://peer:3000{SNAPSHOT_PATH}"),
+        );
+        // Trailing slash on the base must not produce a doubled separator.
+        assert_eq!(
+            snapshot_url("http://peer:3000/", None),
+            format!("http://peer:3000{SNAPSHOT_PATH}"),
+        );
+    }
+
+    #[test]
+    fn snapshot_url_states_the_requirement_in_milliseconds() {
+        assert_eq!(
+            snapshot_url("http://peer:3000", Some(Duration::from_millis(1500))),
+            format!("http://peer:3000{SNAPSHOT_PATH}?{MAX_AGE_PARAM}=1500"),
+        );
+        // Zero is the strictest request, not an absent one.
+        assert_eq!(
+            snapshot_url("http://peer:3000", Some(Duration::ZERO)),
+            format!("http://peer:3000{SNAPSHOT_PATH}?{MAX_AGE_PARAM}=0"),
+        );
+    }
+
+    /// Saturate rather than wrap. A wrapped duration would read as a near-zero
+    /// age and force the peer into a fleet-wide rebuild it was never asked for.
+    #[test]
+    fn snapshot_url_saturates_an_absurd_age() {
+        assert_eq!(
+            snapshot_url("http://peer:3000", Some(Duration::MAX)),
+            format!(
+                "http://peer:3000{SNAPSHOT_PATH}?{MAX_AGE_PARAM}={}",
+                u64::MAX
+            ),
+        );
     }
 
     /// The splice probe reads a cursor by WIRE identity, deliberately skipping
