@@ -83,6 +83,12 @@ def maybe_register_hicache_draft(
     if not enable_hierarchical_cache:
         return
 
+    # DFLASH keeps a compact sliding-window draft KV (window_size tokens per
+    # request) that is never radix-evicted, so offloading it to host buys
+    # nothing and wastes RAM. Skip host-pool creation for the draft.
+    if spec_algorithm.is_dflash():
+        return
+
     draft_kv_pool = get_draft_kv_pool(
         draft_worker=draft_worker,
         spec_algorithm=spec_algorithm,

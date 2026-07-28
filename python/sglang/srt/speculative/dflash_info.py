@@ -69,12 +69,76 @@ class DFlashVerifyInput(SpecInput):
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
-        verify_forward_batch = ForwardBatch.init_new(
-            batch,
-            target_worker.model_runner,
-            capture_hidden_mode=self.capture_hidden_mode,
-            return_hidden_states_before_norm=False,
+
+        # TARGET_VERIFY is an extend-mode forward (init_new copies
+        # batch.extend_lens / batch.prefix_lens onto the ForwardBatch). The
+        # verify block is `draft_token_num` new tokens per request on top of
+        # the committed prefix, so populate those two fields explicitly —
+        # otherwise init_new inherits stale prefill values and backends that
+        # key on extend_seq_lens (KVarN's fused verify path) read garbage.
+        # Mirrors eagle_worker_common.prepare_for_draft_extend.
+        bs = len(batch.seq_lens)
+        gpu_only = batch.seq_lens_cpu is None
+        draft_token_num = int(self.draft_token_num)
+        saved_prefix_lens = batch.prefix_lens
+        saved_extend_lens = batch.extend_lens
+        saved_seq_lens = batch.seq_lens
+        saved_seq_lens_sum = batch.seq_lens_sum
+        try:
+            if gpu_only:
+                batch.prefix_lens = batch.seq_lens.to(torch.int32)
+                batch.extend_lens = torch.full(
+                    (bs,),
+                    draft_token_num,
+                    dtype=torch.int32,
+                    device=batch.seq_lens.device,
+                )
+                # KVarN's fused verify path computes `committed = seq_lens -
+                # extend_lens`, so seq_lens must be the *post-verify* length.
+                batch.seq_lens = batch.seq_lens + draft_token_num
+                batch.seq_lens_sum = int(batch.seq_lens.sum().item())
+            else:
+                batch.prefix_lens = batch.seq_lens_cpu.tolist()
+                batch.extend_lens = [draft_token_num] * bs
+                # The caller already bumped seq_lens_cpu to committed + block;
+                # bump the GPU mirror to match for backends that read it.
+                batch.seq_lens = batch.seq_lens + draft_token_num
+                batch.seq_lens_sum = int(batch.seq_lens.sum().item())
+            verify_forward_batch = ForwardBatch.init_new(
+                batch,
+                target_worker.model_runner,
+                capture_hidden_mode=self.capture_hidden_mode,
+                return_hidden_states_before_norm=False,
+            )
+        finally:
+            batch.prefix_lens = saved_prefix_lens
+            batch.extend_lens = saved_extend_lens
+            batch.seq_lens = saved_seq_lens
+            batch.seq_lens_sum = saved_seq_lens_sum
+
+        # init_new treats TARGET_VERIFY like decode for position purposes
+        # (forward_batch_info.py: line 833 `is_target_verify()` branch) and
+        # therefore never copies batch.extend_lens -> ret.extend_seq_lens.
+        # Backends that key on extend_seq_lens (KVarN's fused verify path)
+        # see None. Populate the verify geometry explicitly: every request
+        # contributes `draft_token_num` new query tokens on top of its
+        # committed prefix, and the post-verify seq_len is committed + block.
+        device = verify_forward_batch.seq_lens.device
+        verify_extend_lens = torch.full(
+            (bs,), draft_token_num, dtype=torch.int32, device=device
         )
+        # `verify_forward_batch.seq_lens` was built from the (bumped)
+        # batch.seq_lens, so it already holds committed + draft_token_num.
+        verify_prefix_lens = (
+            verify_forward_batch.seq_lens.to(torch.int32) - verify_extend_lens
+        )
+        verify_forward_batch.extend_seq_lens = verify_extend_lens
+        verify_forward_batch.extend_prefix_lens = verify_prefix_lens
+        if not gpu_only:
+            verify_forward_batch.extend_seq_lens_cpu = [draft_token_num] * bs
+            verify_forward_batch.extend_prefix_lens_cpu = (
+                verify_prefix_lens.cpu().tolist()
+            )
 
         can_run_cuda_graph = bool(
             target_worker.model_runner.decode_cuda_graph_runner
