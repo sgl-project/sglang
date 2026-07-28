@@ -115,7 +115,7 @@ def norm_scale_shift(
     ``weight`` is the effective RMSNorm weight (K2 stores ``scale``, so callers
     pass ``scale + 1``), kept off the checkpoint so the identity load is unaffected.
     """
-    if x.is_cuda and x.shape[-1] % 256 == 0:
+    if x.is_cuda and x.shape[-1] % 256 == 0 and x.shape[-1] <= 8192:
         from sglang.kernels.ops.diffusion.cutedsl.scale_residual_norm_scale_shift import (
             fused_norm_scale_shift,
         )
