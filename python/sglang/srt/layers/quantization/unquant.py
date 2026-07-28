@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from enum import Enum
 from typing import TYPE_CHECKING, List, Optional
 
@@ -133,6 +134,128 @@ def get_bf16_gemm_backend() -> Bf16GemmBackend:
     if _BF16_GEMM_BACKEND is None:
         _BF16_GEMM_BACKEND = Bf16GemmBackend.AUTO
     return _BF16_GEMM_BACKEND
+
+
+def _prepare_flashinfer_trtllm_bf16_weights(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_bias: Optional[torch.Tensor],
+    w2_bias: Optional[torch.Tensor],
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    gemm1_alpha: Optional[float],
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Pad canonical BF16 MoE weights and fold static biases into them.
+
+    FlashInfer's TRT-LLM kernel consumes [up, gate] W13 rows and has no bias
+    arguments. The first padded hidden and intermediate channels therefore
+    provide constant-one features for the two bias terms respectively.
+    """
+    kernel_hidden_size = ((hidden_size + 127) // 128) * 128
+    kernel_intermediate_size = w2.shape[-1]
+    if kernel_intermediate_size < intermediate_size:
+        raise ValueError(
+            "FlashInfer TRT-LLM W2 has fewer columns than the logical "
+            f"intermediate size: {kernel_intermediate_size} < {intermediate_size}"
+        )
+    if w2.shape[-2] < hidden_size:
+        raise ValueError(
+            "FlashInfer TRT-LLM W2 has fewer rows than the logical hidden "
+            f"size: {w2.shape[-2]} < {hidden_size}"
+        )
+
+    num_experts = w13.shape[0]
+    if w2.shape[0] != num_experts:
+        raise ValueError("W13 and W2 must have the same number of experts")
+
+    def get_w13_halves(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        compact_rows = 2 * intermediate_size
+        padded_rows = 2 * kernel_intermediate_size
+        row_dim = -2 if tensor.dim() == 3 else -1
+        if tensor.shape[row_dim] == compact_rows:
+            gate_start = intermediate_size
+        elif tensor.shape[row_dim] == padded_rows:
+            gate_start = kernel_intermediate_size
+        else:
+            raise ValueError(
+                "W13 must have either logical or kernel-padded rows, got "
+                f"{tensor.shape[row_dim]} rows for logical={intermediate_size} and "
+                f"kernel={kernel_intermediate_size}"
+            )
+        return (
+            tensor.narrow(row_dim, 0, intermediate_size),
+            tensor.narrow(row_dim, gate_start, intermediate_size),
+        )
+
+    if w13.shape[-1] < hidden_size:
+        raise ValueError(
+            "FlashInfer TRT-LLM W13 has fewer columns than the logical hidden "
+            f"size: {w13.shape[-1]} < {hidden_size}"
+        )
+    up_weight, gate_weight = get_w13_halves(w13)
+    prepared_w13 = torch.zeros(
+        num_experts,
+        2 * kernel_intermediate_size,
+        kernel_hidden_size,
+        dtype=w13.dtype,
+        device=w13.device,
+    )
+    prepared_w13[:, :intermediate_size, :hidden_size] = up_weight[:, :, :hidden_size]
+    prepared_w13[
+        :,
+        kernel_intermediate_size : kernel_intermediate_size + intermediate_size,
+        :hidden_size,
+    ] = gate_weight[:, :, :hidden_size]
+
+    prepared_w2 = torch.zeros(
+        num_experts,
+        kernel_hidden_size,
+        kernel_intermediate_size,
+        dtype=w2.dtype,
+        device=w2.device,
+    )
+    prepared_w2[:, :hidden_size, :intermediate_size] = w2[
+        :, :hidden_size, :intermediate_size
+    ]
+
+    if w13_bias is not None:
+        if kernel_hidden_size == hidden_size:
+            raise ValueError(
+                "FlashInfer TRT-LLM W13 bias folding requires a padded hidden channel"
+            )
+        up_bias, gate_bias = get_w13_halves(w13_bias)
+        prepared_w13[:, :intermediate_size, hidden_size] = up_bias[
+            :, :intermediate_size
+        ].to(prepared_w13.dtype)
+        prepared_w13[
+            :,
+            kernel_intermediate_size : kernel_intermediate_size + intermediate_size,
+            hidden_size,
+        ] = gate_bias[:, :intermediate_size].to(prepared_w13.dtype)
+
+    if w2_bias is not None:
+        if kernel_hidden_size == hidden_size:
+            raise ValueError(
+                "FlashInfer TRT-LLM W2 bias folding requires a padded hidden channel"
+            )
+        if kernel_intermediate_size == intermediate_size:
+            raise ValueError(
+                "FlashInfer TRT-LLM W2 bias folding requires a padded intermediate channel"
+            )
+        if gemm1_alpha is None:
+            raise ValueError("FlashInfer TRT-LLM W2 bias folding requires gemm1_alpha")
+        gate = 1.0
+        up = 1.0 / (gate / (1.0 + math.exp(-gemm1_alpha * gate))) - 1.0
+        prepared_w13[:, intermediate_size, hidden_size] = up
+        prepared_w13[:, kernel_intermediate_size + intermediate_size, hidden_size] = (
+            gate
+        )
+        prepared_w2[:, :hidden_size, intermediate_size] = w2_bias[:, :hidden_size].to(
+            prepared_w2.dtype
+        )
+
+    return prepared_w13, prepared_w2, kernel_hidden_size
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -374,6 +497,57 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
+            hidden_size = layer.moe_runner_config.hidden_size
+            intermediate_size = layer.intermediate_size_per_partition_unpadded
+            prepared_w13, prepared_w2, kernel_hidden_size = (
+                _prepare_flashinfer_trtllm_bf16_weights(
+                    layer.w13_weight.data,
+                    layer.w2_weight.data,
+                    getattr(layer, "w13_weight_bias", None),
+                    getattr(layer, "w2_weight_bias", None),
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    gemm1_alpha=layer.moe_runner_config.gemm1_alpha,
+                )
+            )
+            copy_or_rebind_param(layer, "w13_weight", prepared_w13)
+            copy_or_rebind_param(layer, "w2_weight", prepared_w2)
+
+            num_local_experts = layer.num_local_experts
+            device = prepared_w13.device
+            gemm1_alpha = layer.moe_runner_config.gemm1_alpha
+            gemm1_clamp_limit = layer.moe_runner_config.gemm1_clamp_limit
+            self._flashinfer_kernel_hidden_size = kernel_hidden_size
+            self._flashinfer_input_pad_value = float(
+                getattr(layer, "w13_weight_bias", None) is not None
+                or getattr(layer, "w2_weight_bias", None) is not None
+            )
+            self._flashinfer_gemm1_alpha = (
+                torch.full(
+                    (num_local_experts,),
+                    gemm1_alpha,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                if gemm1_alpha is not None
+                else None
+            )
+            self._flashinfer_gemm1_beta = (
+                torch.ones(num_local_experts, dtype=torch.float32, device=device)
+                if gemm1_alpha is not None
+                else None
+            )
+            self._flashinfer_gemm1_clamp_limit = (
+                torch.full(
+                    (num_local_experts,),
+                    gemm1_clamp_limit,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                if gemm1_clamp_limit is not None
+                else None
+            )
+
             from flashinfer.fused_moe.core import (
                 _maybe_get_cached_w3_w1_permute_indices,
                 convert_to_block_layout,
@@ -548,8 +722,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
     @property
     def load_up_proj_weight_first(self) -> bool:
-        # FlashInfer CUTLASS kernel assumes [Up, Gate] Proj as W13
-        return self.use_flashinfer_cutlass
+        # FlashInfer kernels assume [Up, Gate] projections in W13.
+        return self.use_flashinfer_cutlass or self.use_flashinfer_trtllm_moe
 
     def apply(
         self,
