@@ -30,7 +30,6 @@ EXTRAS="dev_hip,tracing"
 if [ -n "$OPTIONAL_DEPS" ]; then
     EXTRAS="dev_hip,tracing,${OPTIONAL_DEPS}"
 fi
-echo "Installing python extras: [${EXTRAS}]"
 
 # Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
 if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
@@ -41,6 +40,14 @@ else
 fi
 
 # Install the required dependencies in CI.
+# ROCm 7.2.4 images ship torch 2.11, which srt_hip cannot satisfy (it pins
+# compressed-tensors 0.15.0, requiring torch<2.11). Select the rocm724 extras.
+IMAGE_TORCH_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.__version__)')
+if [[ "${IMAGE_TORCH_VERSION}" == 2.11.* ]]; then
+  EXTRAS="${EXTRAS/dev_hip/dev_hip_rocm724}"
+fi
+echo "Image torch ${IMAGE_TORCH_VERSION}; installing python extras: [${EXTRAS}]"
+
 # Fix permissions on pip cache, ignore errors from concurrent access or missing temp files
 docker exec ci_sglang chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
