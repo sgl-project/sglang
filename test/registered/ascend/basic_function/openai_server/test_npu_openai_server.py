@@ -21,7 +21,7 @@ from sglang.test.ascend.test_ascend_utils import (
     BGE_RERANKER_V2_M3_WEIGHTS_PATH,
     LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_npu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -30,8 +30,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=182, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
+register_npu_ci(est_time=400, suite="stage-b-test-1-npu-a2", nightly=False)
+register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
 
 
 class TestOpenAIServer(CustomTestCase):

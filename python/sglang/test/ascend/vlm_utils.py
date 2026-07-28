@@ -96,3 +96,41 @@ class TestVLMModels(CustomTestCase):
             f"Model {self.model} accuracy ({metrics['score']}) "
             f"below expected threshold ({self.mmmu_accuracy:.4f}){test_name}",
         )
+
+
+# Override remote URLs with local NPU asset paths so that the upstream
+# mixins (which reference these module-level constants) fetch files from
+# the local filesystem instead of the network in NPU CI.
+import sglang.test.vlm_utils as _upstream
+from sglang.test.ascend.test_ascend_utils import (
+    AUDIO_BIRD_SONG_PATH,
+    AUDIO_TRUMP_WEF_PATH,
+    IMAGE_MAN_IRONING_PATH,
+    IMAGE_SGL_LOGO_PATH,
+    VIDEO_JOBS_PRESENTING_IPOD_PATH,
+)
+
+_upstream.IMAGE_SGL_LOGO_URL = IMAGE_SGL_LOGO_PATH
+_upstream.IMAGE_MAN_IRONING_URL = IMAGE_MAN_IRONING_PATH
+_upstream.AUDIO_BIRD_SONG_URL = AUDIO_BIRD_SONG_PATH
+_upstream.AUDIO_TRUMP_SPEECH_URL = AUDIO_TRUMP_WEF_PATH
+_upstream.VIDEO_JOBS_URL = VIDEO_JOBS_PRESENTING_IPOD_PATH
+
+_orig_download = _upstream.TestOpenAIMLLMServerBase.get_or_download_file
+
+
+def _npu_get_or_download_file(self, url: str) -> str:
+    if url is None:
+        raise ValueError()
+
+    # Local absolute path: use as-is if it exists, otherwise fail fast
+    # instead of falling through to the HTTP download branch.
+    if os.path.isabs(url):
+        if os.path.exists(url):
+            return url
+        raise FileNotFoundError(f"Local file does not exist: {url}")
+
+
+_upstream.TestOpenAIMLLMServerBase.get_or_download_file = _npu_get_or_download_file
+
+from sglang.test.vlm_utils import *

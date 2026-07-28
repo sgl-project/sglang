@@ -415,8 +415,12 @@ IMAGES_023_PATH = os.path.join(IMAGES_DIR, "023.jpg")
 IMAGES_MAN_PATH = os.path.join(IMAGES_DIR, "man.png")
 IMAGES_LOGO_PATH = os.path.join(IMAGES_DIR, "logo.png")
 IMAGES_1_1_PATH = os.path.join(IMAGES_DIR, "1x1.png")
+IMAGE_MAN_IRONING_PATH = os.path.join(IMAGES_DIR, "man_ironing_on_back_of_suv.png")
+IMAGE_SGL_LOGO_PATH = os.path.join(IMAGES_DIR, "sgl_logo.png")
 VIDEO_JOBS_PATH = os.path.join(VIDEO_DIR, "jobs.mp4")
 AUDIO_TRUMP_WEF_PATH = os.path.join(VIDEO_DIR, "audios_Trump_WEF_2018_10s.mp3")
+VIDEO_JOBS_PRESENTING_IPOD_PATH = os.path.join(VIDEO_DIR, "jobs_presenting_ipod.mp4")
+AUDIO_BIRD_SONG_PATH = os.path.join(VIDEO_DIR, "audios_bird_song.mp3")
 INVOICE_WITH_BARCODE_LOGO_IMAGES_PATH = os.path.join(
     IMAGES_DIR, "invoice_with_barcode_logo.jpeg"
 )
