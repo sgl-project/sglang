@@ -18,7 +18,6 @@ as the attn-res prefix sum) or ``None``.
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
@@ -117,37 +116,6 @@ def enabled() -> bool:
     return _get_state() is not None
 
 
-@contextmanager
-def symm_alloc():
-    """Route tensor allocations into the torch symm-mem pool. Under capture the
-    graph's own pool is paused first (two pools at once is rejected)."""
-    import torch.distributed._symmetric_memory as torch_symm_mem
-    from torch._C import (
-        _cuda_beginAllocateCurrentThreadToPool,
-        _cuda_endAllocateToPool,
-        _cuda_releasePool,
-    )
-
-    device_index = torch.cuda.current_device()
-    pool = torch_symm_mem.get_mem_pool(torch.device("cuda", device_index))
-    in_capture = torch.cuda.is_current_stream_capturing()
-    graph_pool_id = None
-    if in_capture:
-        from sglang.srt.distributed.device_communicators import pynccl_allocator
-
-        graph_pool_id = pynccl_allocator._graph_pool_id
-        assert graph_pool_id is not None, "graph_pool_id not set under capture"
-        _cuda_endAllocateToPool(device_index, graph_pool_id)
-    _cuda_beginAllocateCurrentThreadToPool(device_index, pool.id)
-    try:
-        yield
-    finally:
-        _cuda_endAllocateToPool(device_index, pool.id)
-        _cuda_releasePool(device_index, pool.id)
-        if in_capture:
-            _cuda_beginAllocateCurrentThreadToPool(device_index, graph_pool_id)
-
-
 class _Buffer(NamedTuple):
     region: torch.Tensor  # flat [max_rows * width]
     base: int  # local VA of region[0]
@@ -170,12 +138,12 @@ def _max_buffer_rows() -> int:
     return int(server_args.max_prefill_tokens or 0)
 
 
-def _create_buffer(name: str, width: int, dtype: torch.dtype) -> _Buffer:
+def _create_buffer(
+    name: str, width: int, dtype: torch.dtype, group_name: str
+) -> _Buffer:
     """One symmetric buffer, rendezvoused once. ``empty_strided_p2p`` skips the
     caching allocator, so this is right for a persistent buffer only."""
     from torch._C._distributed_c10d import _SymmetricMemory
-
-    from sglang.srt.distributed.parallel_state import get_tp_group
 
     max_rows = _max_buffer_rows()
     # outside inference mode on purpose: created inside it the buffer would be an
@@ -187,7 +155,7 @@ def _create_buffer(name: str, width: int, dtype: torch.dtype) -> _Buffer:
             [1],
             dtype,
             torch.device("cuda", torch.cuda.current_device()),
-            get_tp_group().cpu_group.group_name,
+            group_name,
         ).view(max_rows, width)
     handle = _SymmetricMemory.rendezvous(region)
     assert handle is not None and handle.multicast_ptr != 0
@@ -210,29 +178,50 @@ def _create_buffer(name: str, width: int, dtype: torch.dtype) -> _Buffer:
     return buf
 
 
-def symm_buffer(name: str, rows: int, width: int, dtype: torch.dtype):
+def symm_buffer(
+    name: str,
+    rows: int,
+    width: int,
+    dtype: torch.dtype,
+    group_name: Optional[str] = None,
+):
     """``[rows, width]`` view of a named persistent symmetric buffer.
 
     The pull reduces in place on the input's multicast alias, so every rank must
     resolve the same ``(buffer, offset)``; a per-forward symm-pool allocation does
     not, because torch's caching allocator breaks ties on the absolute address and
     ``rendezvous`` validates sizes only.
+
+    ``group_name`` defaults to the TP group, the one the fused all-reduce reduces
+    over; a caller reducing over another group (SP-MoE's attention TP group) passes
+    its own. Each name belongs to one group, so the name alone identifies it.
     """
+    if group_name is None:
+        from sglang.srt.distributed.parallel_state import get_tp_group
+
+        group_name = get_tp_group().cpu_group.group_name
     buf: _Buffer = ctx.get_buffer(
-        f"k3_symm:{name}", lambda: _create_buffer(name, width, dtype)
+        f"k3_symm:{name}", lambda: _create_buffer(name, width, dtype, group_name)
     )
     assert 0 < rows <= buf.max_rows and width == buf.width and dtype == buf.region.dtype
     return buf.region[:rows]
 
 
-def get_mc_ptr(x: torch.Tensor) -> int:
-    """Multicast VA of ``x``, which must be a :func:`symm_buffer` slice."""
+def find_mc_ptr(x: torch.Tensor) -> Optional[int]:
+    """Multicast VA of ``x`` if it lies inside a named buffer, else None."""
     ptr = int(x.data_ptr())
     end = ptr + x.numel() * x.element_size()
     for buf in _BUFS:
         if buf.base <= ptr and end <= buf.base + buf.region.nbytes:
             return buf.mc_base + (ptr - buf.base)
-    raise AssertionError("K3 fused pull input is not a symm_buffer slice")
+    return None
+
+
+def get_mc_ptr(x: torch.Tensor) -> int:
+    """Multicast VA of ``x``, which must be a :func:`symm_buffer` slice."""
+    mc = find_mc_ptr(x)
+    assert mc is not None, "K3 fused pull input is not a symm_buffer slice"
+    return mc
 
 
 def all_reduce(

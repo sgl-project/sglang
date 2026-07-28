@@ -2028,18 +2028,15 @@ class KimiK3DecoderLayer(nn.Module):
             o_proj.reduce_results = False
             if k3_sp_collective.enabled():
                 # The table selects NVLS pull RS for larger token buckets.
-                # Allocate only those o_proj outputs in multicast symmetric
-                # memory; small push RS keeps the regular graph allocator.
+                # Only those o_proj outputs come from the persistent symmetric
+                # buffer; small push RS keeps the regular graph allocator.
                 _sp_inner_o_proj_forward = o_proj.forward
 
                 def _sp_o_proj_forward(x, *args, **kwargs):
                     output_rows = k3_sp_collective.get_o_proj_output_rows(x.shape[0])
                     if k3_sp_collective.requires_symmetric_rs(output_rows, x.device):
                         output = k3_sp_collective.get_o_proj_output_buffer(
-                            output_rows,
-                            x.dtype,
-                            x.device,
-                            o_proj.output_size,
+                            output_rows, x.dtype, o_proj.output_size
                         )
                         result = _sp_inner_o_proj_forward(
                             x, *args, output_tensor=output[: x.shape[0]], **kwargs
