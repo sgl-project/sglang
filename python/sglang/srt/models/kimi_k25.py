@@ -482,7 +482,9 @@ class MoonViT3dEncoder(nn.Module):
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
         forward_metadata = prepare_vision_attention_metadata(
-            cu_seqlens, device=hidden_states.device
+            cu_seqlens,
+            device=hidden_states.device,
+            max_seqlen=max_seqlen,
         )
 
         for block in self.blocks:

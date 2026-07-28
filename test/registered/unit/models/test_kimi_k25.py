@@ -243,7 +243,11 @@ def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
     ]
     expected = [
         F.interpolate(
-            image.unsqueeze(0), size=(16, 12), mode="bicubic", align_corners=False
+            image.unsqueeze(0),
+            size=(16, 12),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
         )
         for _, image in indexed_images
     ]
@@ -511,6 +515,9 @@ def test_dp_helper_can_lazily_load_kimi_features_on_tp1():
 
 def test_dp_helper_uses_config_hidden_size_for_empty_moonvit3d_rank():
     class _GatherGroup:
+        def broadcast(self, tensor, src):
+            tensor.fill_(1)
+
         def all_gather(self, tensor, dim):
             return torch.cat([torch.ones_like(tensor), tensor], dim=dim)
 
