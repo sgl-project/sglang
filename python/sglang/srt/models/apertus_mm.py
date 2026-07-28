@@ -24,7 +24,11 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    MultimodalDataItem,
+    MultimodalInputFormat,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -160,17 +164,28 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
             )
         return embeddings
 
+    def _embed_items(
+        self,
+        items: List[MultimodalDataItem],
+        encode_item,
+    ) -> torch.Tensor:
+        """Embed raw items and pass through precomputed items in source order."""
+        embeddings = []
+        for item in items:
+            if item.format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
+                embeddings.append(item.feature.reshape(-1, item.feature.shape[-1]))
+            else:
+                ids_per_item = [
+                    encode_item(feature) for feature in self._item_features([item])
+                ]
+                embeddings.append(self._embed_code_ids(ids_per_item))
+        return torch.cat(embeddings, dim=0)
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        ids_per_item = [
-            self._encode_image_to_llm_ids(image) for image in self._item_features(items)
-        ]
-        return self._embed_code_ids(ids_per_item)
+        return self._embed_items(items, self._encode_image_to_llm_ids)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        ids_per_item = [
-            self._encode_audio_to_llm_ids(audio) for audio in self._item_features(items)
-        ]
-        return self._embed_code_ids(ids_per_item)
+        return self._embed_items(items, self._encode_audio_to_llm_ids)
 
     def _pad_output_logits(
         self, output: LogitsProcessorOutput
