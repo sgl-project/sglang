@@ -157,9 +157,24 @@ class RMSNorm(CustomOp):
 
             x_var = x[..., : self.variance_size_override]
 
+        if x.device.type == "mps" and self.variance_size_override is None:
+            weight = self.weight.to(dtype=torch.float32)
+            x = F.rms_norm(
+                x,
+                (self.hidden_size,),
+                weight,
+                self.variance_epsilon,
+            ).to(orig_dtype)
+            if residual is None:
+                return x
+            return x, residual
+
         variance = x_var.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
-        x = (x * self.weight).to(orig_dtype)
+        weight = self.weight
+        if x.device.type == "mps" and weight.dtype != x.dtype:
+            weight = weight.to(dtype=x.dtype)
+        x = (x * weight).to(orig_dtype)
         if residual is None:
             return x
         else:
@@ -1021,6 +1036,7 @@ def apply_qk_norm_rope(
     if (
         fused_enabled
         and _is_cuda
+        and not torch.compiler.is_compiling()
         and allow_inplace
         and (q_eps == k_eps)
         and q.dtype in (torch.float16, torch.bfloat16)
