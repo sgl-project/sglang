@@ -124,6 +124,8 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     use_fp8: bool
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
+    w13_bias: Optional[torch.Tensor] = None
+    w2_bias: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
@@ -234,7 +236,32 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        if quant_info.w13_bias is not None:
+            gateup_output.add_(quant_info.w13_bias[m_indices])
+
+        if self.config.gemm1_alpha is not None:
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
+            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+                swiglu_no_interleaved_with_alpha_and_limit,
+            )
+
+            down_input = swiglu_no_interleaved_with_alpha_and_limit(
+                gateup_output,
+                self.config.gemm1_alpha,
+                self.config.gemm1_clamp_limit,
+            )
+            del gateup_output
+            down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+                down_input,
+                scale_block_size,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+            del down_input
+        elif envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
 
             down_input_fp8 = torch.empty(
@@ -317,6 +344,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a=recipe_a,
             recipe_b=recipe_b,
         )
+
+        if quant_info.w2_bias is not None:
+            down_output.add_(quant_info.w2_bias[m_indices])
 
         return down_output
 

@@ -332,6 +332,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
+        self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
         self.use_marlin = get_moe_runner_backend().is_marlin()
         self.flashinfer_mxfp4_moe_precision = (
             get_server_args().flashinfer_mxfp4_moe_precision
@@ -395,6 +396,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     intermediate_size_per_partition, 256
                 )
                 hidden_size = round_up(hidden_size, 256)
+            elif self.use_deep_gemm:
+                self._padded_intermediate = round_up(
+                    intermediate_size_per_partition, 128
+                )
+                self._padded_hidden = round_up(hidden_size, 128)
+                self.hidden_pad = self._padded_hidden - layer.hidden_size
+                self.intermediate_pad = (
+                    self._padded_intermediate
+                    - layer.intermediate_size_per_partition
+                )
             else:
                 intermediate_size_per_partition_after_pad = round_up(
                     intermediate_size_per_partition, triton_kernels_padding_alignment
@@ -436,9 +447,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition, triton_kernels_padding_alignment
             )
 
-        self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
-
-        self.hidden_size = hidden_size
+        self.intermediate_size_per_partition = (
+            self._padded_intermediate
+            if self.use_deep_gemm
+            else intermediate_size_per_partition_after_pad
+        )
+        self.hidden_size = self._padded_hidden if self.use_deep_gemm else hidden_size
+        if self.use_deep_gemm:
+            layer.moe_runner_config.hidden_size = self.hidden_size
+            layer.moe_runner_config.intermediate_size_per_partition = (
+                self.intermediate_size_per_partition
+            )
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(
@@ -508,6 +527,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        if self.use_deep_gemm:
+            self._process_weights_for_deep_gemm(layer)
+            return
+
         if self.use_marlin:
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,
@@ -881,6 +904,98 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
+    def _process_weights_for_deep_gemm(self, layer):
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        num_experts = layer.num_local_experts
+        intermediate_size = layer.w13_weight.shape[1] // 2
+        hidden_size = layer.w13_weight.shape[2] * 2
+        padded_intermediate = self.intermediate_size_per_partition
+        padded_hidden = self.hidden_size
+        device = layer.w13_weight.device
+
+        def pad_gate_up(
+            x: torch.Tensor, padded_last_dim: int, fill_value: int = 0
+        ) -> torch.Tensor:
+            out = torch.full(
+                (num_experts, 2 * padded_intermediate, padded_last_dim),
+                fill_value,
+                dtype=x.dtype,
+                device=device,
+            )
+            out[:, :intermediate_size, : x.shape[-1]] = x[:, 0::2]
+            out[
+                :,
+                padded_intermediate : padded_intermediate + intermediate_size,
+                : x.shape[-1],
+            ] = x[:, 1::2]
+            return out
+
+        w13_weight = pad_gate_up(
+            layer.w13_weight.data, padded_hidden // 2
+        ).view(torch.int8)
+        w2_weight = torch.zeros(
+            num_experts,
+            padded_hidden,
+            padded_intermediate // 2,
+            dtype=layer.w2_weight.dtype,
+            device=device,
+        )
+        w2_weight[:, :hidden_size, : layer.w2_weight.shape[-1]] = layer.w2_weight.data
+        w2_weight = w2_weight.view(torch.int8)
+
+        w13_scale_raw = pad_gate_up(
+            layer.w13_weight_scale.data, padded_hidden // 32, fill_value=127
+        )
+        w2_scale_raw = torch.full(
+            (num_experts, padded_hidden, padded_intermediate // 32),
+            127,
+            dtype=torch.uint8,
+            device=device,
+        )
+        w2_scale_raw[
+            :, :hidden_size, : layer.w2_weight_scale.shape[-1]
+        ] = layer.w2_weight_scale.data
+
+        w13_bias = pad_gate_up(layer.w13_weight_bias.data.unsqueeze(-1), 1).squeeze(
+            -1
+        )
+        w2_bias = torch.zeros(
+            num_experts,
+            padded_hidden,
+            dtype=layer.w2_weight_bias.dtype,
+            device=device,
+        )
+        w2_bias[:, :hidden_size] = layer.w2_weight_bias.data
+
+        def prepare_scale(scale: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            scale = torch.exp2(scale.float() - 127)
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                from deep_gemm import transform_sf_into_required_layout
+
+                num_experts, n, _ = scale.shape
+                scale = transform_sf_into_required_layout(
+                    scale,
+                    mn=n,
+                    k=weight.shape[2] * 2,
+                    recipe=(1, 32),
+                    num_groups=num_experts,
+                    disable_ue8m0_cast=False,
+                )
+            return scale
+
+        layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+        layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+        layer.w13_weight_scale = Parameter(
+            prepare_scale(w13_scale_raw, w13_weight), requires_grad=False
+        )
+        layer.w2_weight_scale = Parameter(
+            prepare_scale(w2_scale_raw, w2_weight), requires_grad=False
+        )
+        layer.w13_weight_bias = Parameter(w13_bias, requires_grad=False)
+        layer.w2_weight_bias = Parameter(w2_bias, requires_grad=False)
+        torch.cuda.empty_cache()
+
     def _process_weights_for_sm90_cutlass(self, layer):
         """De-interleave + pad + halving-swap + byte-interleave MXFP4 weights
         for FlashInfer's SM90 ``cutlass_fused_moe(use_w4_group_scaling=True)``
@@ -1031,6 +1146,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             moe_runner_backend.is_triton_kernels()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_marlin()
+            or moe_runner_backend.is_deep_gemm()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         elif (
@@ -1084,7 +1200,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
+        topk_output = getattr(dispatch_output, "topk_output", None)
         if _is_cpu:
             if use_intel_amx_backend(layer):
                 from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
@@ -1277,6 +1393,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
         backend = self.runner.runner_backend
+        if backend.is_deep_gemm():
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                DeepGemmMoeQuantInfo,
+            )
+
+            if x.shape[-1] != self.hidden_size:
+                x = torch.nn.functional.pad(
+                    x, (0, self.hidden_pad), mode="constant", value=0.0
+                )
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_fp8=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                w13_bias=layer.w13_weight_bias,
+                w2_bias=layer.w2_weight_bias,
+                block_shape=[1, 32],
+                is_fp4_experts=True,
+            )
+            return self.runner.run(
+                dispatch_output._replace(hidden_states=x), quant_info
+            )
         if backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
                 TritonKernelsQuantInfo,

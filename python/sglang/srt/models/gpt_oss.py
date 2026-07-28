@@ -33,6 +33,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -263,8 +264,44 @@ class GptOssSparseMoeBlock(nn.Module):
 
         if not get_moe_a2a_backend().is_deepep():
             return self.forward_normal(hidden_states)
+        return self.forward_deepep(hidden_states, forward_batch)
+
+    def forward_deepep(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if hidden_states.shape[0] > 0:
+            router_logits, _ = self.router(hidden_states)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
         else:
-            raise NotImplementedError("forward_deepep branch not implemented yet")
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        expert_hidden_size = getattr(
+            getattr(self.experts, "quant_method", None),
+            "hidden_size",
+            hidden_states.shape[-1],
+        )
+        if expert_hidden_size != hidden_states.shape[-1]:
+            expert_hidden_states = torch.nn.functional.pad(
+                hidden_states,
+                (0, expert_hidden_size - hidden_states.shape[-1]),
+            )
+        else:
+            expert_hidden_states = hidden_states
+
+        final_hidden_states = self.experts(
+            hidden_states=expert_hidden_states,
+            topk_output=topk_output,
+        )
+        return final_hidden_states[..., : hidden_states.shape[-1]].contiguous()
 
     def forward_dwdp(
         self,
