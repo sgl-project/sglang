@@ -350,6 +350,29 @@ impl RemoteRegionDescriptor {
         self.location
     }
 
+    pub(crate) fn from_authenticated_record(
+        base_address: u64,
+        length: u64,
+        location: MemoryLocation,
+    ) -> Result<Self, EngineError> {
+        if base_address == 0 || length == 0 {
+            return Err(EngineError::InvalidDescriptor {
+                field: "remote_region",
+                detail: "authenticated address and length must be non-zero".into(),
+            });
+        }
+        base_address
+            .checked_add(length)
+            .ok_or(EngineError::RangeOverflow {
+                field: "remote_region",
+            })?;
+        Ok(Self {
+            base_address,
+            length,
+            location,
+        })
+    }
+
     fn checked_address(&self, offset: u64, length: u64) -> Result<u64, EngineError> {
         let end = offset
             .checked_add(length)

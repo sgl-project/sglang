@@ -32,6 +32,7 @@ zeroize = "1"
 
 axum = { version = "0.8.9", features = ["json", "tokio"] }
 core_affinity = "0.8"
+crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
 # the dynamo-tokenizers is deps on hf-hub, should bump version together
 dynamo-tokenizers = "1.5.3"
 flume = "0.12.0"

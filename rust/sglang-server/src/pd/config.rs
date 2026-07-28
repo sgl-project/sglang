@@ -3,7 +3,8 @@ use thiserror::Error;
 
 pub const EXPECTED_PROFILE_CANONICAL_BYTES: usize = 769;
 pub const EXPECTED_PROFILE_DIGEST_HEX: &str =
-    "9a9b82e5536d19d1cc17a395c25a906b4e7185fb42612a0cfb30ed8b9ad9e881";
+    "5b5f8ff14bb542b5e848c4331fbe4872c94793dee9c9cd079a3445ba41ed863d";
+pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 524_288;
 pub const PROFILE_DOMAIN: &[u8] = b"SGLANG-PD-PROFILE-V1\0";
 
 const PROFILE_SOURCE: &[u8] = include_bytes!("../../contracts/profile-v1.json");
@@ -339,6 +340,14 @@ impl PdProfileV1 {
     }
 
     fn validate(&self) -> Result<(), ProfileError> {
+        if self.control.max_payload_bytes
+            != u32::try_from(MAX_CONTROL_PAYLOAD_BYTES).expect("payload limit fits u32")
+        {
+            return Err(ProfileError::InvalidField {
+                field: "control.max_payload_bytes",
+                detail: format!("must be {MAX_CONTROL_PAYLOAD_BYTES}"),
+            });
+        }
         validate_sorted_unique(
             "model.enabled_runtime_features",
             &self.model.enabled_runtime_features,

@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use uuid::{Variant, Version};
 
 use crate::pd::config::EXPECTED_PROFILE_DIGEST_HEX;
@@ -8,8 +10,13 @@ use crate::pd::protocol::types::{
 
 const MAX_BOOTSTRAP_ROOM: u64 = i64::MAX as u64;
 const MAX_REGION_ID: u16 = 57;
+const MAX_KV_REGION_ID: u16 = 55;
 const SLOT_CAPACITY: u16 = 32;
 const MAX_TOKEN_COUNT: u32 = 4096;
+const MAX_KV_PAGES: usize = 64;
+const MAX_KV_BLOCKS: usize = 56 * MAX_KV_PAGES;
+const KV_PAGE_BYTES: u64 = 131_072;
+const KV_ROW_BYTES: u64 = 2_048;
 
 impl ControlPayload {
     pub(crate) fn validate(&self) -> Result<(), PayloadError> {
@@ -306,19 +313,30 @@ fn validate_destination_blocks(blocks: &[DestinationBlock]) -> Result<(), Payloa
     if blocks.is_empty() {
         return invalid("destination_blocks", "must not be empty");
     }
+    if blocks.len() > MAX_KV_BLOCKS {
+        return invalid("destination_blocks", "must contain at most 3584 entries");
+    }
     if blocks.windows(2).any(|pair| pair[0] >= pair[1]) {
         return invalid(
             "destination_blocks",
             "must be strictly sorted without duplicates",
         );
     }
+    let mut destination_pages = BTreeSet::new();
     for block in blocks {
-        validate_range(
+        validate_kv_range(
             block.region_id,
             block.byte_offset,
             block.byte_length,
             "destination_blocks",
         )?;
+        destination_pages.insert(block.destination_page);
+    }
+    if destination_pages.len() > MAX_KV_PAGES {
+        return invalid(
+            "destination_blocks",
+            "must reference at most 64 destination pages",
+        );
     }
     for pair in blocks.windows(2) {
         if pair[0].region_id == pair[1].region_id
@@ -335,16 +353,29 @@ fn validate_kv_blocks(blocks: &[KvBlock]) -> Result<(), PayloadError> {
     if blocks.is_empty() {
         return invalid("kv_blocks", "must not be empty");
     }
+    if blocks.len() > MAX_KV_BLOCKS {
+        return invalid("kv_blocks", "must contain at most 3584 entries");
+    }
     if blocks.windows(2).any(|pair| pair[0] >= pair[1]) {
         return invalid("kv_blocks", "must be strictly sorted without duplicates");
     }
+    let mut source_pages = BTreeSet::new();
+    let mut destination_pages = BTreeSet::new();
     for block in blocks {
-        validate_range(
+        validate_kv_range(
             block.region_id,
             block.byte_offset,
             block.byte_length,
             "kv_blocks",
         )?;
+        source_pages.insert(block.source_page);
+        destination_pages.insert(block.destination_page);
+    }
+    if source_pages.len() > MAX_KV_PAGES || destination_pages.len() > MAX_KV_PAGES {
+        return invalid(
+            "kv_blocks",
+            "must reference at most 64 source and destination pages",
+        );
     }
     for pair in blocks.windows(2) {
         if pair[0].region_id == pair[1].region_id
@@ -356,6 +387,33 @@ fn validate_kv_blocks(blocks: &[KvBlock]) -> Result<(), PayloadError> {
         }
     }
     Ok(())
+}
+
+fn validate_kv_range(
+    region_id: u16,
+    offset: u64,
+    length: u64,
+    field: &'static str,
+) -> Result<(), PayloadError> {
+    if region_id > MAX_KV_REGION_ID {
+        return invalid(
+            "region_id",
+            "KV blocks must use the frozen KV region mapping 0..=55",
+        );
+    }
+    if !offset.is_multiple_of(KV_ROW_BYTES) || !length.is_multiple_of(KV_ROW_BYTES) {
+        return invalid(field, "KV ranges must be token-row aligned");
+    }
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| PayloadError::InvalidField {
+            field,
+            detail: "range overflows u64".into(),
+        })?;
+    if end > KV_PAGE_BYTES {
+        return invalid(field, "KV ranges must remain within one 131072-byte page");
+    }
+    validate_range(region_id, offset, length, field)
 }
 
 fn validate_range(

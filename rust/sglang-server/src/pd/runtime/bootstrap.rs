@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+use crate::pd::buffer::AuthenticatedRemoteRegionTable;
 use crate::pd::config::{PdProfileV1, ProfileError};
 use crate::pd::protocol::{
     ClientHello, ControlPayload, DecodedFrame, Direction, DirectionalSession, FixedBytes,
@@ -100,6 +101,23 @@ pub struct BootstrapRegistration {
 }
 
 impl BootstrapRegistration {
+    pub fn from_registered_table<H>(
+        table: &crate::pd::buffer::RegisteredRegionTable<H>,
+        mooncake_host: String,
+        mooncake_port: u16,
+    ) -> Result<Self, PdReason> {
+        if mooncake_host.is_empty() || mooncake_port == 0 || !table.is_registered() {
+            return Err(PdReason::ProtocolMismatch);
+        }
+        Ok(Self {
+            registration_epoch: FixedBytes::new(table.epoch().as_bytes()),
+            layout_fingerprint: table.layout_fingerprint(),
+            mooncake_host,
+            mooncake_port,
+            regions: table.authenticated_region_records(),
+        })
+    }
+
     fn into_payload(self) -> RegisterRegions {
         RegisterRegions {
             registration_epoch: self.registration_epoch,
@@ -128,11 +146,16 @@ pub struct PairConnection {
     readiness: PairReadiness,
     profile: Arc<PdProfileV1>,
     clock: Arc<dyn Clock>,
+    peer_regions: Option<AuthenticatedRemoteRegionTable>,
 }
 
 impl PairConnection {
     pub const fn readiness(&self) -> &PairReadiness {
         &self.readiness
+    }
+
+    pub const fn peer_regions(&self) -> Option<&AuthenticatedRemoteRegionTable> {
+        self.peer_regions.as_ref()
     }
 
     pub async fn send(&mut self, payload: &ControlPayload) -> Result<(), RuntimeError> {
@@ -209,6 +232,7 @@ pub async fn bootstrap_decode(
         },
         profile: Arc::clone(&identity.profile),
         clock,
+        peer_regions: None,
     };
     connection
         .send(&ControlPayload::RegisterRegions(
@@ -288,6 +312,7 @@ pub async fn bootstrap_prefill(
         },
         profile: Arc::clone(&identity.profile),
         clock,
+        peer_regions: None,
     };
     let registration = connection
         .receive_expected(MessageKind::RegisterRegions)
@@ -304,6 +329,9 @@ pub async fn bootstrap_prefill(
         return Err(RuntimeError::Compatibility);
     }
     let destination_epoch = registration.registration_epoch;
+    let authenticated_regions =
+        AuthenticatedRemoteRegionTable::from_authenticated_register(&registration)
+            .map_err(|_| RuntimeError::Compatibility)?;
     run_blocking({
         let port = Arc::clone(&port);
         let registration = registration.clone();
@@ -347,6 +375,7 @@ pub async fn bootstrap_prefill(
     connection.readiness.ready = true;
     connection.readiness.peer_registration_epoch = Some(destination_epoch);
     connection.readiness.probe_generation = probe_generation;
+    connection.peer_regions = Some(authenticated_regions);
     tracing::info!(
         role = "prefill",
         state = "pair_ready",

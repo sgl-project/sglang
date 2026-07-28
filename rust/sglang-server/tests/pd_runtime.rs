@@ -96,6 +96,15 @@ async fn authenticated_handshake_register_canary_reaches_pair_ready_on_both_side
         prefill.readiness().profile_digest
     );
     assert_eq!(decode.readiness().probe_generation, 1);
+    assert!(decode.peer_regions().is_none());
+    assert_eq!(
+        prefill
+            .peer_regions()
+            .expect("authenticated destination region table")
+            .epoch()
+            .as_bytes(),
+        decode.readiness().local_registration_epoch.into_array()
+    );
     assert!(prefill_port.event_count() >= 2);
     assert!(decode_port.event_count() >= 3);
 
@@ -203,12 +212,7 @@ async fn bad_registration_open_peer_and_canary_results_keep_readiness_false() {
             layout_fingerprint: decode_identity.layout_fingerprint,
             mooncake_host: "127.0.0.1".into(),
             mooncake_port: 19000,
-            regions: vec![RegionRecord {
-                region_id: 1,
-                remote_base_addr: 0x1000,
-                length_bytes: 131_072,
-                location: "cpu:1".into(),
-            }],
+            regions: frozen_regions(),
         };
         if failure == BootstrapFailure::WrongEpoch {
             registration.registration_epoch = FixedBytes::new(
@@ -504,6 +508,25 @@ struct TestBootstrapPort {
     registration: Option<BootstrapRegistration>,
     fail_open: bool,
     fail_verify: bool,
+}
+
+fn frozen_regions() -> Vec<RegionRecord> {
+    (0_u16..58)
+        .map(|region_id| {
+            let (length_bytes, location) = match region_id {
+                0..=55 => (131_072, "cuda:5"),
+                56 => (32 * 64, "cpu:1"),
+                57 => (32 * 192, "cpu:1"),
+                _ => unreachable!(),
+            };
+            RegionRecord {
+                region_id,
+                remote_base_addr: 0x1000_0000 + u64::from(region_id) * 0x0100_0000,
+                length_bytes,
+                location: location.into(),
+            }
+        })
+        .collect()
 }
 
 impl BootstrapPort for TestBootstrapPort {

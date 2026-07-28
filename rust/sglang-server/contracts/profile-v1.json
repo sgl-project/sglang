@@ -4,7 +4,7 @@
     "magic": "SGPD",
     "schema_major": 1,
     "schema_minor": 0,
-    "max_payload_bytes": 65536
+    "max_payload_bytes": 524288
   },
   "security": {
     "mac": "hmac-sha256",

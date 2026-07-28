@@ -42,12 +42,7 @@ impl CpuMockBootstrapPort {
                     layout_fingerprint: identity.layout_fingerprint,
                     mooncake_host: endpoint.ip().to_string(),
                     mooncake_port: endpoint.port(),
-                    regions: vec![RegionRecord {
-                        region_id,
-                        remote_base_addr: remote.base_address(),
-                        length_bytes: remote.length(),
-                        location: remote.location().as_native_str().into(),
-                    }],
+                    regions: frozen_mock_regions(region_id, remote.base_address(), remote.length()),
                 }),
                 Some(memory),
                 Some(region),
@@ -84,6 +79,36 @@ impl CpuMockBootstrapPort {
             ShutdownOutcome::NotSafe { .. } => Err(PdReason::LocalFatal),
         }
     }
+}
+
+fn frozen_mock_regions(
+    canary_region_id: u16,
+    canary_address: u64,
+    canary_length: u64,
+) -> Vec<RegionRecord> {
+    (0_u16..58)
+        .map(|region_id| {
+            let (length_bytes, location) = match region_id {
+                0..=55 => (131_072, "cuda:5"),
+                56 => (32 * 64, "cpu:1"),
+                57 => (32 * 192, "cpu:1"),
+                _ => unreachable!(),
+            };
+            RegionRecord {
+                region_id,
+                remote_base_addr: if region_id == canary_region_id
+                    && canary_address.is_multiple_of(64)
+                    && canary_length == length_bytes
+                {
+                    canary_address
+                } else {
+                    0x1000_0000 + u64::from(region_id) * 0x0100_0000
+                },
+                length_bytes,
+                location: location.into(),
+            }
+        })
+        .collect()
 }
 
 impl BootstrapPort for CpuMockBootstrapPort {

@@ -6,11 +6,11 @@ use rmpv::Value;
 use sha2::Sha256;
 use thiserror::Error;
 
+use crate::pd::config::MAX_CONTROL_PAYLOAD_BYTES;
 use crate::pd::protocol::types::{ControlPayload, Direction, MessageKind, PayloadError};
 
 pub const HEADER_BYTES: usize = 32;
 pub const TAG_BYTES: usize = 32;
-pub const MAX_PAYLOAD_BYTES: usize = 65_536;
 
 const MAGIC: &[u8; 4] = b"SGPD";
 const SCHEMA_MAJOR: u16 = 1;
@@ -56,7 +56,7 @@ impl FrameCodec {
         }
 
         let payload_bytes = encode_payload(payload)?;
-        if payload_bytes.len() > MAX_PAYLOAD_BYTES {
+        if payload_bytes.len() > MAX_CONTROL_PAYLOAD_BYTES {
             return Err(FrameError::PayloadTooLarge);
         }
         let payload_len =
@@ -100,7 +100,7 @@ impl FrameCodec {
             return Err(FrameError::Flags);
         }
         let payload_len = read_u32(frame, 12)?;
-        if payload_len as usize > MAX_PAYLOAD_BYTES {
+        if payload_len as usize > MAX_CONTROL_PAYLOAD_BYTES {
             return Err(FrameError::PayloadTooLarge);
         }
         let sequence = read_u64(frame, 16)?;
@@ -443,7 +443,7 @@ pub enum FrameError {
     Version,
     #[error("PD control frame flags must be zero")]
     Flags,
-    #[error("PD control payload exceeds 65536 bytes")]
+    #[error("PD control payload exceeds 524288 bytes")]
     PayloadTooLarge,
     #[error("PD control frame length does not match its header")]
     Length,

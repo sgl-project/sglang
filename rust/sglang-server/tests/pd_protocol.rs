@@ -7,8 +7,9 @@ use rmpv::Value as MessagePackValue;
 use serde::Deserialize;
 use serde_json::Value;
 use sglang_server::pd::protocol::{
-    AuthKind, ControlPayload, Direction, FixedBytes, FrameCodec, MessageKind, Psk,
-    derive_session_keys, frame_hash, transcript_hash,
+    AuthKind, ControlPayload, Direction, FixedBytes, FrameCodec, FrameError, KvBlock, MessageKind,
+    PrepareAccepted, Psk, RoomFields, SessionError, derive_session_keys, frame_hash,
+    read_raw_frame, transcript_hash,
 };
 use sha2::Sha256;
 
@@ -510,6 +511,63 @@ fn direction_matrix_accepts_only_frozen_directions() {
 }
 
 #[test]
+fn maximum_fragmented_transfer_plan_fits_the_frozen_control_payload() {
+    const KV_REGION_COUNT: u16 = 56;
+    const KV_PAGES_PER_ROOM: u32 = 64;
+    const KV_PAGE_BYTES: u64 = 131_072;
+    const CONTROL_FRAME_OVERHEAD: usize = 64;
+    const MAX_CONTROL_PAYLOAD_BYTES: usize = 524_288;
+
+    let kv_blocks = (0..KV_REGION_COUNT)
+        .flat_map(|region_id| {
+            (0..KV_PAGES_PER_ROOM).map(move |page| KvBlock {
+                region_id,
+                source_page: page,
+                destination_page: (page * 37) % KV_PAGES_PER_ROOM,
+                byte_offset: 0,
+                byte_length: KV_PAGE_BYTES,
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(kv_blocks.len(), 3_584);
+
+    let payload = ControlPayload::PrepareAccepted(PrepareAccepted {
+        room: RoomFields {
+            decode_process_epoch: fixed("11111111111141118111111111111111"),
+            bootstrap_room: 0,
+            attempt_id: fixed("33333333333343338333333333333333"),
+            generation: 1,
+            request_contract_digest: FixedBytes::new([0x55; 32]),
+        },
+        source_registration_epoch: fixed("aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa"),
+        destination_registration_epoch: fixed("bbbbbbbbbbbb4bbb8bbbbbbbbbbbbbbb"),
+        kv_blocks,
+        source_aux_slot: 1,
+        destination_aux_slot: 1,
+        source_completion_slot: 1,
+        destination_completion_slot: 1,
+        valid_token_count: 4_096,
+        chunk_sequence: 0,
+        chunk_count: 1,
+        is_last_chunk: true,
+        transfer_plan_digest: FixedBytes::new([0x66; 32]),
+    });
+
+    let frame = FrameCodec::encode(
+        MessageKind::PrepareAccepted,
+        Direction::PrefillToDecode,
+        1,
+        1_700_000_030_000,
+        &payload,
+        &[0x77; 32],
+    )
+    .expect("the frozen 4096-token fragmented plan must encode");
+    let payload_bytes = frame.len() - CONTROL_FRAME_OVERHEAD;
+    assert_eq!(payload_bytes, 262_107);
+    assert!(payload_bytes <= MAX_CONTROL_PAYLOAD_BYTES);
+}
+
+#[test]
 fn decoder_rejects_wrong_key_and_oversized_authenticated_payload() {
     let (golden, _psk, keys) = golden_material();
     let fixture = &golden.frames[17];
@@ -525,7 +583,7 @@ fn decoder_rejects_wrong_key_and_oversized_authenticated_payload() {
         .is_err()
     );
 
-    let oversized = vec![0_u8; 65_537];
+    let oversized = vec![0_u8; 524_289];
     let frame = raw_authenticated_frame(
         fixture.kind,
         fixture.sequence,
@@ -533,16 +591,36 @@ fn decoder_rejects_wrong_key_and_oversized_authenticated_payload() {
         &oversized,
         &keys.decode_to_prefill,
     );
-    assert!(
+    assert!(matches!(
         FrameCodec::decode(
             &frame,
             fixture.direction,
             fixture.sequence,
             golden.clock.now_unix_ms,
             &keys.decode_to_prefill,
-        )
-        .is_err()
-    );
+        ),
+        Err(FrameError::PayloadTooLarge)
+    ));
+}
+
+#[tokio::test]
+async fn bounded_reader_rejects_524289_byte_header_before_reading_the_payload() {
+    let (mut writer, mut reader) = tokio::io::duplex(64);
+    let mut header = [0_u8; 32];
+    header[..4].copy_from_slice(b"SGPD");
+    header[4..6].copy_from_slice(&1_u16.to_be_bytes());
+    header[8..10].copy_from_slice(&(MessageKind::Ping as u16).to_be_bytes());
+    header[12..16].copy_from_slice(&524_289_u32.to_be_bytes());
+    header[16..24].copy_from_slice(&1_u64.to_be_bytes());
+    header[24..32].copy_from_slice(&1_700_000_030_000_u64.to_be_bytes());
+    tokio::io::AsyncWriteExt::write_all(&mut writer, &header)
+        .await
+        .expect("write oversized header");
+
+    assert!(matches!(
+        read_raw_frame(&mut reader).await,
+        Err(SessionError::PayloadTooLarge)
+    ));
 }
 
 fn raw_authenticated_frame(

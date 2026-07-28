@@ -1,7 +1,8 @@
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroize;
 
-use crate::pd::protocol::codec::{HEADER_BYTES, MAX_PAYLOAD_BYTES, TAG_BYTES};
+use crate::pd::config::MAX_CONTROL_PAYLOAD_BYTES;
+use crate::pd::protocol::codec::{HEADER_BYTES, TAG_BYTES};
 use crate::pd::protocol::{
     ControlPayload, DecodedFrame, Direction, FrameCodec, FrameError, SessionKeys,
 };
@@ -101,7 +102,7 @@ where
             .try_into()
             .map_err(|_| SessionError::Header)?,
     ) as usize;
-    if payload_len > MAX_PAYLOAD_BYTES {
+    if payload_len > MAX_CONTROL_PAYLOAD_BYTES {
         return Err(SessionError::PayloadTooLarge);
     }
     let tail_len = payload_len
@@ -136,6 +137,6 @@ pub enum SessionError {
     Write,
     #[error("PD control frame header is malformed")]
     Header,
-    #[error("PD control payload exceeds 65536 bytes")]
+    #[error("PD control payload exceeds 524288 bytes")]
     PayloadTooLarge,
 }
