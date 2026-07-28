@@ -12,6 +12,7 @@ use serde::Deserialize;
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::{OneOrMany, OneOrManyItem, SamplingParams, SamplingParamsInput, TokenIds};
 use crate::error::Error;
+use crate::ids::Rid;
 
 /// Hard cap on prompts per `/generate` body. Every column below is allocated per
 /// item, so this bounds the work a single request can ask for.
@@ -207,12 +208,12 @@ impl GenerateBody {
         // rid: absent → mint one uuid per item here, so every request carries its
         // final rid from this point on; a single string fans out as `{rid}_{i}`
         // for a batch (Python `_normalize_batch`); a list is per-item.
-        let rids: Vec<String> = match rid {
-            None => (0..n).map(|_| crate::ids::new_rid()).collect(),
-            Some(OneOrMany::One(r)) if !is_batch => vec![r],
+        let rids: Vec<Rid> = match rid {
+            None => (0..n).map(|_| Rid::default()).collect(),
+            Some(OneOrMany::One(r)) if !is_batch => vec![r.into()],
             Some(OneOrMany::One(r)) => {
                 check_broadcast_budget(r.len(), n, "rid")?;
-                (0..n).map(|i| format!("{r}_{i}")).collect()
+                (0..n).map(|i| format!("{r}_{i}").into()).collect()
             }
             Some(OneOrMany::Many(v)) => {
                 if !is_batch || v.len() != n {
@@ -232,7 +233,7 @@ impl GenerateBody {
                         )));
                     }
                 }
-                v
+                v.into_iter().map(Into::into).collect()
             }
         };
 
@@ -313,7 +314,9 @@ pub enum RequestKind {
 #[derive(Debug, Default)]
 pub struct GenerateRequest {
     /// This item's final rid: the client's (normalized per item by `into_requests`) or a
-    /// uuid minted there when none was sent.
+    /// uuid minted there when none was sent. A [`Rid`], not a `String`: the wire
+    /// forms stay textual (`GenerateBody` on the way in, `TokenizedGenerateReqInput`
+    /// on the way out) but every in-process carrier names the type.
     ///
     /// Duplicates *within* one request are rejected by `into_requests` (Python
     /// `_validate_rid_uniqueness`). A collision with a *concurrent* request's rid
@@ -321,7 +324,7 @@ pub struct GenerateRequest {
     /// as Python's `TokenizerManager` does ("Duplicate request ID detected"). It
     /// used to overwrite the earlier request's `RidHash` slot, and this comment
     /// used to call that parity with Python; both were wrong.
-    pub rid: String,
+    pub rid: Rid,
     pub text: Option<String>,
     /// Client-supplied token ids, or filled by the Tokenizer stage.
     pub input_ids: Option<TokenIds>,
@@ -544,15 +547,15 @@ mod tests {
     #[test]
     fn split_rid_matches_python_normalize() {
         let (ps, _) = requests(r#"{"text": "a", "rid": "r"}"#).unwrap();
-        assert_eq!(ps[0].rid, "r");
+        assert_eq!(ps[0].rid, Rid::from("r"));
 
         let (ps, _) = requests(r#"{"text": ["a", "b"], "rid": "base"}"#).unwrap();
-        assert_eq!(ps[0].rid, "base_0");
-        assert_eq!(ps[1].rid, "base_1");
+        assert_eq!(ps[0].rid, Rid::from("base_0"));
+        assert_eq!(ps[1].rid, Rid::from("base_1"));
 
         let (ps, _) = requests(r#"{"text": ["a", "b"], "rid": ["x", "y"]}"#).unwrap();
-        assert_eq!(ps[0].rid, "x");
-        assert_eq!(ps[1].rid, "y");
+        assert_eq!(ps[0].rid, Rid::from("x"));
+        assert_eq!(ps[1].rid, Rid::from("y"));
 
         let (ps, _) = requests(r#"{"text": ["a", "b"]}"#).unwrap();
         // Absent → `into_requests` mints one uuid per item, all distinct.
@@ -726,7 +729,7 @@ mod tests {
 
         assert!(requests(r#"{"text": ["a", "b"], "rid": ["x", "y"]}"#).is_ok());
         let (ps, _) = requests(r#"{"text": ["a", "b"], "rid": "x"}"#).unwrap();
-        assert_eq!(ps[0].rid, "x_0");
-        assert_eq!(ps[1].rid, "x_1");
+        assert_eq!(ps[0].rid, Rid::from("x_0"));
+        assert_eq!(ps[1].rid, Rid::from("x_1"));
     }
 }

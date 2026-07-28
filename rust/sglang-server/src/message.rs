@@ -29,17 +29,15 @@ pub(crate) use types::{OneOrMany, OneOrManyItem, TokenIds};
 use bytes::Bytes;
 
 use crate::fsm::RequestState;
-use crate::ids::RidHash;
+use crate::ids::Rid;
 
 /// The owned request as it travels ingress stages (single owner, so `state` is
 /// mutated lock-free). Common fields here; variant data in [`RequestKind`].
 #[derive(Debug)]
 pub struct Request {
-    /// Routing key: `RidHash::from_rid(&rid)`.
-    pub rid_hash: RidHash,
     /// Client-visible request id (uuid hex) — what the scheduler wire and
     /// `meta_info.id` carry.
-    pub rid: String,
+    pub rid: Rid,
     pub state: RequestState,
     /// Back-channel to the client connection for egress frames.
     pub sink: EgressSink,
@@ -56,13 +54,15 @@ pub struct IngressMsg {
 }
 
 /// Messages to a Detokenizer shard. `Register` carries the per-request sink for
-/// the shard's local `rid_hash -> sink` map; everything routes by `RidHash::shard`.
+/// the shard's local `rid -> sink` map. The rid STRING is the identity: `RidHash`
+/// picks the shard (collisions there merely co-locate, which is harmless), but two
+/// distinct rids that hash alike must not be the same map entry — that evicted one
+/// client's sink and delivered their tokens to the other's connection.
 pub enum DetokMsg {
     Register {
-        rid_hash: RidHash,
         /// Client-visible rid string — kept in `DetokState` so the shard can
         /// emit `TmEvent::Abort(rid)` (the wire needs the string, not the hash).
-        rid: String,
+        rid: Rid,
         sink: EgressSink,
         /// Decode logprob token ids to text here (CPU-bound) not on the api threads.
         decode_logprob_text: bool,
@@ -73,14 +73,11 @@ pub enum DetokMsg {
     /// per send, so one message per request cost ~1.3 µs × batch (5.1x at 4096).
     Chunks(Vec<ChunkEvent>),
     /// Control result: one already-serialized payload delivered to the sink verbatim.
-    Result {
-        rid_hash: RidHash,
-        payload: bytes::Bytes,
-    },
+    Result { rid: Rid, payload: bytes::Bytes },
     /// Terminal per-request failure → an `Error` to the sink (a 400, not a crash).
-    Fail { rid_hash: RidHash, message: String },
-    /// Drop the `rid_hash -> sink` entry for a request rejected before the scheduler
+    Fail { rid: Rid, message: String },
+    /// Drop the `rid -> sink` entry for a request rejected before the scheduler
     /// (the rejecting stage already answered the client); else `Register` leaks one
     /// entry.
-    Deregister { rid_hash: RidHash },
+    Deregister { rid: Rid },
 }

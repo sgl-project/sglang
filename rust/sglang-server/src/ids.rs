@@ -2,67 +2,112 @@
 
 use std::{
     collections::hash_map::RandomState,
-    fmt::{Debug, Display, Formatter, Result},
-    hash::BuildHasher,
+    fmt,
+    hash::{BuildHasher, Hash},
+    ops::Deref,
     sync::OnceLock,
 };
 
 use uuid::Uuid;
-
-/// Process-local request key, derived by hashing the client-visible rid string
-/// (`from_rid`). Cheap to copy, used as the routing key on the egress side
-/// (detok shard selection) and to correlate scheduler output chunks back to the
-/// originating connection. NOT the identity the client sees — that is the rid
-/// string; this is its stable 64-bit digest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RidHash(pub u64);
-
-impl RidHash {
-    /// Derive the routing key from a rid string. Every stage (ingress push, egress
-    /// decode, abort) hashes with the same per-process seed, so they agree without
-    /// a shared map.
-    ///
-    /// The seed is RANDOM, not fixed. `Register` is an insert-overwrite, so two
-    /// rids colliding delivers one client's tokens to another's connection — and
-    /// rids are routinely client-supplied. With the fixed `DefaultHasher` keys
-    /// (SipHash with (0, 0)) that is an offline ~2^32 birthday search anyone can
-    /// run, not a 2^-64 accident. The digest never crosses the wire (Python knows
-    /// only the rid string), so reseeding costs nothing.
-    pub fn from_rid(rid: &str) -> Self {
-        static SEED: OnceLock<RandomState> = OnceLock::new();
-        RidHash(SEED.get_or_init(RandomState::new).hash_one(rid))
-    }
-
-    /// Shard index for `n` detokenizer shards. Pure function of the id so the
-    /// ingress and egress sides agree without any shared map.
-    #[inline]
-    pub fn shard(self, n: usize) -> usize {
-        debug_assert!(n > 0);
-        (self.0 as usize) % n
-    }
-}
-
-impl Display for RidHash {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        write!(f, "req-{}", self.0)
-    }
-}
-
-/// Mint a fresh client-visible request id — uuid4 hex, matching the Python
-/// server's `uuid.uuid4().hex`.
-pub fn new_rid() -> String {
-    Uuid::new_v4().simple().to_string()
-}
 
 /// Health-probe rid prefix — MUST match the Python server's
 /// `sglang.srt.constants.HEALTH_CHECK_RID_PREFIX`, so scheduler logs / crash
 /// dumps and any prefix-gated logic recognize probes from either server.
 pub const HEALTH_CHECK_RID_PREFIX: &str = "HEALTH_CHECK";
 
-/// Mint a health-probe rid: `HEALTH_CHECK_<uuid4 hex>`, the Python server's
-/// `f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"` format.
-pub fn new_health_check_rid() -> String {
-    format!("{HEALTH_CHECK_RID_PREFIX}_{}", new_rid())
+#[derive(Clone, Debug)]
+pub struct Rid {
+    id: String,
+    /// Partition key, derived from `id`. Never part of identity — see the `Eq` /
+    /// `Hash` impls below.
+    hash: u64,
+}
+
+// Identity is the ID, not the digest. Deriving these would fold `hash` into both,
+// which is redundant while the seed is stable and silently wrong if it ever isn't.
+impl PartialEq for Rid {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for Rid {}
+impl Hash for Rid {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl Rid {
+    /// Borrow the underlying id — the form the msgpack wire and the HTTP body use.
+    pub fn as_str(&self) -> &str {
+        &self.id
+    }
+
+    pub fn new() -> Self {
+        let id = Uuid::new_v4().simple().to_string();
+        Rid::from(id)
+    }
+
+    pub fn new_health_check() -> Self {
+        let id = format!("{HEALTH_CHECK_RID_PREFIX}_{}", Uuid::new_v4().simple());
+        Rid::from(id)
+    }
+
+    /// Shard index for `n` detokenizer shards. Pure function of the id so the
+    /// ingress and egress sides agree without any shared map.
+    #[inline]
+    pub fn shard(&self, n: usize) -> usize {
+        debug_assert!(n > 0);
+        (self.hash as usize) % n
+    }
+}
+
+impl From<String> for Rid {
+    fn from(id: String) -> Self {
+        // ONE seed per process, not one per conversion. Ingress and egress each
+        // build a `Rid` from the same string and must agree on the shard without a
+        // shared map — a fresh `RandomState` here would hash the same rid two
+        // different ways, so chunks would arrive at a shard that never registered
+        // the request and be dropped.
+        //
+        // The seed is random rather than fixed because rids are client-supplied:
+        // with public keys, colliding rids are an offline ~2^32 search. Collisions
+        // are only a shard co-location now (identity is the string), but a keyed
+        // hash also stops an attacker from stacking every request onto one shard.
+        static SEED: OnceLock<RandomState> = OnceLock::new();
+        let hash = SEED.get_or_init(RandomState::new).hash_one(&id);
+        Rid { id, hash }
+    }
+}
+
+impl From<&str> for Rid {
+    fn from(id: &str) -> Self {
+        Rid::from(id.to_string())
+    }
+}
+
+impl Deref for Rid {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.id
+    }
+}
+
+impl Default for Rid {
+    fn default() -> Self {
+        Rid::new()
+    }
+}
+
+impl fmt::Display for Rid {
+    /// The BARE rid, with no decoration. It is formatted into client-facing error
+    /// messages and into wire values (`AbortReq`), so a prefix here would surface
+    /// as a corrupted id rather than a nicety. `Debug` still shows `Rid("…")` if a
+    /// log wants the type visible.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.id)
+    }
 }
 
 #[cfg(test)]
@@ -75,7 +120,7 @@ mod tests {
     /// hyphenated) would silently break the parity.
     #[test]
     fn rid_matches_python_uuid4_hex_format() {
-        let rid = new_rid();
+        let rid = Rid::new();
         assert_eq!(rid.len(), 32);
         assert!(
             rid.chars()
@@ -90,7 +135,7 @@ mod tests {
     #[test]
     fn health_rid_matches_python_convention() {
         assert_eq!(HEALTH_CHECK_RID_PREFIX, "HEALTH_CHECK");
-        let rid = new_health_check_rid();
+        let rid = Rid::new_health_check();
         // "HEALTH_CHECK_" + 32 hex chars
         assert!(rid.starts_with("HEALTH_CHECK_"));
         assert_eq!(rid.len(), "HEALTH_CHECK_".len() + 32);
