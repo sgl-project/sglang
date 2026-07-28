@@ -838,11 +838,23 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 FlashInferTrtllmBf16MoeQuantInfo,
             )
 
+            is_gated = layer.moe_runner_config.is_gated
             quant_info = FlashInferTrtllmBf16MoeQuantInfo(
                 gemm1_weights=layer.w13_weight,
                 gemm2_weights=layer.w2_weight,
                 global_num_experts=layer.num_experts,
                 local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                kernel_hidden_size=(
+                    self._flashinfer_kernel_hidden_size
+                    if is_gated
+                    else layer.hidden_size
+                ),
+                input_pad_value=(self._flashinfer_input_pad_value if is_gated else 0.0),
+                gemm1_alpha=self._flashinfer_gemm1_alpha if is_gated else None,
+                gemm1_beta=self._flashinfer_gemm1_beta if is_gated else None,
+                gemm1_clamp_limit=(
+                    self._flashinfer_gemm1_clamp_limit if is_gated else None
+                ),
             )
             return self.runner.run(dispatch_output, quant_info)
         else:

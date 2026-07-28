@@ -1,6 +1,7 @@
 """CPU coverage for biased BF16 FlashInfer TRT-LLM MoE weight preparation."""
 
 import unittest
+from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
@@ -15,6 +16,15 @@ from sglang.srt.layers.quantization.unquant import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+# The runner imports quantization registry state, so initialize unquant first.
+# isort: off
+from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import BypassedTopKOutput, PackedTopKOutput, TopKConfig
+
+# isort: on
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -342,6 +352,186 @@ class TestFlashInferTrtllmBf16Padding(CustomTestCase):
             calls,
             ["w13_permute", "w2_permute", "block_layout", "block_layout"],
         )
+
+    def test_bf16_runner_pads_inputs_and_restores_logical_width(self):
+        """Both BF16 kernels receive padded inputs and return logical outputs."""
+        tokens, hidden_size, kernel_hidden_size = 3, 2880, 2944
+        input_pad_value = 1.0
+        alpha = torch.tensor([1.702])
+        beta = torch.tensor([1.0])
+        clamp_limit = torch.tensor([7.0])
+        quant_info = flashinfer_trtllm.FlashInferTrtllmBf16MoeQuantInfo(
+            gemm1_weights=torch.empty(1),
+            gemm2_weights=torch.empty(1),
+            global_num_experts=1,
+            local_expert_offset=0,
+            kernel_hidden_size=kernel_hidden_size,
+            input_pad_value=input_pad_value,
+            gemm1_alpha=alpha,
+            gemm1_beta=beta,
+            gemm1_clamp_limit=clamp_limit,
+        )
+        runner_config = MoeRunnerConfig(
+            activation="silu",
+            is_gated=True,
+            num_fused_shared_experts=0,
+            num_local_experts=1,
+            intermediate_size_per_partition=128,
+            top_k=1,
+        )
+        hidden_states = torch.randn(tokens, hidden_size, dtype=torch.bfloat16)
+        kernel_result = torch.randn(kernel_hidden_size, tokens).transpose(0, 1)
+
+        flashinfer = ModuleType("flashinfer")
+        flashinfer.__path__ = []
+        fused_moe = ModuleType("flashinfer.fused_moe")
+        fused_moe.__path__ = []
+        core = ModuleType("flashinfer.fused_moe.core")
+        core.ActivationType = SimpleNamespace(
+            Swiglu=SimpleNamespace(value=1),
+            Geglu=SimpleNamespace(value=2),
+        )
+
+        for use_routed_topk in (False, True):
+            with self.subTest(use_routed_topk=use_routed_topk):
+                kernel_calls = []
+
+                def mock_kernel(**kwargs):
+                    kernel_calls.append(kwargs)
+                    return kernel_result
+
+                if use_routed_topk:
+                    fused_moe.trtllm_bf16_routed_moe = mock_kernel
+                    topk_output = PackedTopKOutput(
+                        packed_topk_ids=torch.zeros(tokens, 1, dtype=torch.int32),
+                        router_logits=torch.empty(tokens, 1),
+                    )
+                else:
+                    fused_moe.trtllm_bf16_moe = mock_kernel
+                    topk_output = BypassedTopKOutput(
+                        hidden_states=hidden_states,
+                        router_logits=torch.empty(tokens, 1),
+                        topk_config=TopKConfig(top_k=1),
+                    )
+
+                dispatch_output = StandardDispatchOutput(
+                    hidden_states=hidden_states,
+                    hidden_states_scale=None,
+                    topk_output=topk_output,
+                )
+                with (
+                    patch.dict(
+                        "sys.modules",
+                        {
+                            "flashinfer": flashinfer,
+                            "flashinfer.fused_moe": fused_moe,
+                            "flashinfer.fused_moe.core": core,
+                        },
+                    ),
+                    patch.object(flashinfer_trtllm, "get_tp_group", return_value=None),
+                    patch.object(
+                        flashinfer_trtllm,
+                        "use_symmetric_memory",
+                        return_value=nullcontext(),
+                    ),
+                    patch.object(
+                        flashinfer_trtllm, "is_allocation_symmetric", return_value=False
+                    ),
+                ):
+                    output = (
+                        flashinfer_trtllm.fused_experts_none_to_flashinfer_trtllm_bf16(
+                            dispatch_output,
+                            quant_info,
+                            runner_config,
+                            use_routed_topk=use_routed_topk,
+                        )
+                    )
+
+                self.assertEqual(len(kernel_calls), 1)
+                kernel_input = kernel_calls[0]["hidden_states"]
+                self.assertEqual(
+                    tuple(kernel_input.shape), (tokens, kernel_hidden_size)
+                )
+                torch.testing.assert_close(kernel_input[:, :hidden_size], hidden_states)
+                torch.testing.assert_close(
+                    kernel_input[:, hidden_size:],
+                    torch.full(
+                        (tokens, kernel_hidden_size - hidden_size),
+                        input_pad_value,
+                        dtype=hidden_states.dtype,
+                    ),
+                )
+                self.assertIs(kernel_calls[0]["gemm1_alpha"], alpha)
+                self.assertIs(kernel_calls[0]["gemm1_beta"], beta)
+                self.assertIs(kernel_calls[0]["gemm1_clamp_limit"], clamp_limit)
+                self.assertEqual(
+                    tuple(output.hidden_states.shape), (tokens, hidden_size)
+                )
+                self.assertTrue(output.hidden_states.is_contiguous())
+                torch.testing.assert_close(
+                    output.hidden_states, kernel_result[:, :hidden_size]
+                )
+
+    def test_forward_cuda_builds_bf16_padding_payload_for_gated_and_non_gated(self):
+        """Gated preparation values flow through, while non-gated uses safe defaults."""
+
+        class FakeBackend:
+            def is_triton_kernels(self):
+                return False
+
+            def is_deep_gemm(self):
+                return False
+
+        class CaptureRunner:
+            runner_backend = FakeBackend()
+
+            def run(self, dispatch_output, quant_info):
+                self.quant_info = quant_info
+                return dispatch_output
+
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=torch.empty(2, 2880, dtype=torch.bfloat16),
+            hidden_states_scale=None,
+            topk_output=SimpleNamespace(),
+        )
+        alpha = torch.tensor([1.702])
+        beta = torch.tensor([1.0])
+        clamp_limit = torch.tensor([7.0])
+
+        for is_gated in (True, False):
+            with self.subTest(is_gated=is_gated):
+                method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
+                method.use_flashinfer_cutlass = False
+                method.use_flashinfer_trtllm_moe = True
+                method.runner = CaptureRunner()
+                if is_gated:
+                    method._flashinfer_kernel_hidden_size = 2944
+                    method._flashinfer_input_pad_value = 1.0
+                    method._flashinfer_gemm1_alpha = alpha
+                    method._flashinfer_gemm1_beta = beta
+                    method._flashinfer_gemm1_clamp_limit = clamp_limit
+                layer = SimpleNamespace(
+                    w13_weight=Parameter(torch.empty(1)),
+                    w2_weight=Parameter(torch.empty(1)),
+                    num_experts=4,
+                    moe_ep_rank=1,
+                    num_local_experts=2,
+                    hidden_size=2880,
+                    moe_runner_config=SimpleNamespace(is_gated=is_gated),
+                )
+
+                method.forward_cuda(layer, dispatch_output)
+                quant_info = method.runner.quant_info
+
+                self.assertEqual(
+                    quant_info.kernel_hidden_size, 2944 if is_gated else 2880
+                )
+                self.assertEqual(quant_info.input_pad_value, 1.0 if is_gated else 0.0)
+                self.assertIs(quant_info.gemm1_alpha, alpha if is_gated else None)
+                self.assertIs(quant_info.gemm1_beta, beta if is_gated else None)
+                self.assertIs(
+                    quant_info.gemm1_clamp_limit, clamp_limit if is_gated else None
+                )
 
     def test_bias_folding_requires_spare_padded_channels(self):
         """Bias folding must reject kernel shapes with no synthetic channels."""
