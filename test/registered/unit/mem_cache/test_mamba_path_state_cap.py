@@ -14,13 +14,13 @@ import torch
 from test_unified_radix_cache_unittest import CacheConfig, UnifiedRadixCacheSuite
 
 from sglang.srt.mem_cache.unified_cache.cache_action import MambaEvictExcessPathStates
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
     MambaComponent,
 )
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     ComponentType,
 )
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase

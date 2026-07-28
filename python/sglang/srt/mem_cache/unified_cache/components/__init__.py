@@ -1,7 +1,7 @@
-from sglang.srt.mem_cache.unified_cache_components.full_component import FullComponent
-from sglang.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent
-from sglang.srt.mem_cache.unified_cache_components.swa_component import SWAComponent
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
+from sglang.srt.mem_cache.unified_cache.components.mamba_component import MambaComponent
+from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
+from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
