@@ -15,6 +15,7 @@ import torch.nn as nn
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
@@ -25,6 +26,10 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4A16LinearMethod,
+)
+from sglang.srt.layers.quantization.nvfp4_online import (
+    ModelOptNvFp4OnlineFusedMoEMethod,
+    NvFp4OnlineConfig,
 )
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
@@ -635,6 +640,58 @@ class TestParseQuantHfConfig(CustomTestCase):
         # eligible MoE experts; this test stops at quantization-method routing.
         self.assertEqual(self.model_config.quantization, "modelopt_fp4")
 
+    def test_modelopt_fp8_preserves_nvfp4_online(self):
+        self.assertIsNone(
+            ModelOptFp8Config.override_quantization_method(
+                {"quant_method": "modelopt_fp8", "quant_algo": "FP8"},
+                "nvfp4_online",
+            )
+        )
+
+    def test_nvfp4_online_uses_runtime_moe_ignore_list(self):
+        with envs.SGLANG_FP4_IGNORED_LAYERS.override("model.layers.1"):
+            config = NvFp4OnlineConfig.from_config(
+                {
+                    "quant_method": "modelopt_fp8",
+                    "ignore": ["backbone.layers.0.mixer.in_proj", "mtp*"],
+                }
+            )
+        config.apply_weight_name_mapper(
+            WeightsMapper(orig_to_new_prefix={"backbone.": "model."})
+        )
+
+        self.assertTrue(config.is_checkpoint_fp8_serialized)
+        self.assertEqual(
+            config.online_fp4_ignored_layers,
+            ["layers.1", "model.layers.1"],
+        )
+        self.assertTrue(
+            config._is_checkpoint_layer_ignored("model.layers.0.mixer.in_proj")
+        )
+        self.assertTrue(config._is_checkpoint_layer_ignored("mtp.layers.0.mixer"))
+        self.assertFalse(config._is_online_fp4_layer_ignored("mtp.layers.0.mixer"))
+        self.assertTrue(config._is_online_fp4_layer_ignored("model.layers.1.mixer"))
+
+        class FakeFusedMoE:
+            pass
+
+        online_method = object()
+        with (
+            patch(
+                "sglang.srt.layers.moe.fused_moe_triton.FusedMoE",
+                FakeFusedMoE,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.nvfp4_online."
+                "ModelOptNvFp4OnlineFusedMoEMethod",
+                return_value=online_method,
+            ),
+        ):
+            self.assertIs(
+                config.get_quant_method(FakeFusedMoE(), "mtp.layers.0.mixer"),
+                online_method,
+            )
+
 
 class TestModelOptFp4LoaderSelection(CustomTestCase):
     def test_draft_modelopt_fp4_uses_checkpoint_exclusions(self):
@@ -690,6 +747,50 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
                     LoadConfig(**{option: "/tmp/modelopt"}), model_config
                 )
                 self.assertIsInstance(loader, ModelOptModelLoader)
+
+
+class TestNvFp4OnlineWeightLoader(CustomTestCase):
+    def test_non_gated_w1_is_quantized_without_pairing(self):
+        method = object.__new__(ModelOptNvFp4OnlineFusedMoEMethod)
+        method.layer_log_name = "mtp.layers.0.mixer.experts"
+        layer = SimpleNamespace(
+            moe_runner_config=SimpleNamespace(is_gated=False),
+            w13_weight_scale=object(),
+            w13_weight_scale_2=object(),
+        )
+        param = SimpleNamespace(device=torch.device("cpu"))
+        original_weight_loader = MagicMock()
+        fp4_weight = torch.empty(2, 8, dtype=torch.uint8)
+        weight_scale = torch.empty(2, 1, dtype=torch.float8_e4m3fn)
+        weight_scale_2 = torch.ones((), dtype=torch.float32)
+
+        with patch.object(
+            method,
+            "_quantize_weight_nvfp4",
+            return_value=(fp4_weight, weight_scale, weight_scale_2),
+        ) as quantize:
+            weight_loader = method.get_online_weight_loader(
+                layer, original_weight_loader
+            )
+            weight_loader(
+                param,
+                torch.ones(2, 16, dtype=torch.bfloat16),
+                "mtp.layers.0.mixer.experts.0.up_proj.weight",
+                "w1",
+                None,
+            )
+
+        quantize.assert_called_once()
+        self.assertEqual(original_weight_loader.call_count, 3)
+        self.assertIs(original_weight_loader.call_args_list[0].args[0], param)
+        self.assertIs(
+            original_weight_loader.call_args_list[1].args[0],
+            layer.w13_weight_scale,
+        )
+        self.assertIs(
+            original_weight_loader.call_args_list[2].args[0],
+            layer.w13_weight_scale_2,
+        )
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):

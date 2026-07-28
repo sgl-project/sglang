@@ -68,21 +68,20 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         weight_block_size: Optional[List[int]] = None,
         use_mxfp8: bool = False,
     ) -> None:
-        source_ignored_layers = self._normalize_ignored_layers(exclude_modules)
-        fp4_ignored_layers = list(source_ignored_layers)
-        if ignored_layers_str := envs.SGLANG_FP4_IGNORED_LAYERS.get():
-            fp4_ignored_layers.extend(
+        checkpoint_ignored_layers = self._normalize_ignored_layers(exclude_modules)
+        online_fp4_ignored_layers = self._normalize_ignored_layers(
+            [
                 layer.strip()
-                for layer in ignored_layers_str.split(",")
+                for layer in envs.SGLANG_FP4_IGNORED_LAYERS.get().split(",")
                 if layer.strip()
-            )
-        fp4_ignored_layers = self._normalize_ignored_layers(fp4_ignored_layers)
+            ]
+        )
         super().__init__(
             kv_cache_quant_algo=None,
-            exclude_modules=source_ignored_layers,
+            exclude_modules=checkpoint_ignored_layers,
             packed_modules_mapping=packed_modules_mapping or {},
         )
-        self.fp4_ignored_layers = fp4_ignored_layers
+        self.online_fp4_ignored_layers = online_fp4_ignored_layers
         # NVFP4 weight scales are fixed at load time; FlashInfer computes one
         # FP32 activation scale per token at runtime.
         self.use_per_token_activation = self._use_per_token_activation
@@ -114,18 +113,34 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         quant_method = str(config.get("quant_method", "")).lower()
         use_mxfp8 = "mxfp8" in quant_method
         is_checkpoint_fp8_serialized = "fp8" in quant_method or use_mxfp8
-        ignored_layers = config.get("ignored_layers") or config.get(
-            "modules_to_not_convert"
+        # Checkpoint exclusions describe source storage precision. Online FP4
+        # exclusions are controlled independently by SGLANG_FP4_IGNORED_LAYERS.
+        checkpoint_ignored_layers = (
+            config.get("ignore")
+            or config.get("ignored_layers")
+            or config.get("modules_to_not_convert")
         )
-        if isinstance(ignored_layers, str):
-            ignored_layers = [ignored_layers]
+        if isinstance(checkpoint_ignored_layers, str):
+            checkpoint_ignored_layers = [checkpoint_ignored_layers]
         return cls(
-            exclude_modules=ignored_layers,
+            exclude_modules=checkpoint_ignored_layers,
             packed_modules_mapping=config.get("packed_modules_mapping"),
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=config.get("activation_scheme", "dynamic"),
             weight_block_size=config.get("weight_block_size"),
             use_mxfp8=use_mxfp8,
+        )
+
+    def _is_checkpoint_layer_ignored(self, prefix: str) -> bool:
+        return is_layer_skipped(
+            prefix, self.exclude_modules, self.packed_modules_mapping
+        ) or self.is_layer_excluded(prefix)
+
+    def _is_online_fp4_layer_ignored(self, prefix: str) -> bool:
+        return is_layer_skipped(
+            prefix,
+            self.online_fp4_ignored_layers,
+            self.packed_modules_mapping,
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
@@ -134,22 +149,17 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(
-                prefix, self.exclude_modules, self.packed_modules_mapping
-            ) or self.is_layer_excluded(prefix):
+            if self._is_checkpoint_layer_ignored(prefix):
                 return UnquantizedLinearMethod()
             if self.is_checkpoint_fp8_serialized:
                 return Fp8LinearMethod(self)
             return UnquantizedLinearMethod()
         if isinstance(layer, FusedMoE):
-            if is_layer_skipped(
-                prefix, self.exclude_modules, self.packed_modules_mapping
-            ) or self.is_layer_excluded(prefix):
-                return None
-            if is_layer_skipped(
-                prefix, self.fp4_ignored_layers, self.packed_modules_mapping
-            ):
-                if self.is_checkpoint_fp8_serialized:
+            if self._is_online_fp4_layer_ignored(prefix):
+                if (
+                    self.is_checkpoint_fp8_serialized
+                    and not self._is_checkpoint_layer_ignored(prefix)
+                ):
                     return Fp8MoEMethod(self)
                 return None
             return ModelOptNvFp4OnlineFusedMoEMethod(self, prefix)
