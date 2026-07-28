@@ -226,8 +226,8 @@ mod tests {
         assert_eq!(arr[16].as_bool(), Some(false), "return_routed_experts");
         assert_eq!(arr[17].as_u64(), Some(0), "routed_experts_start_len");
         assert_eq!(arr[18].as_bool(), Some(false), "return_indexer_topk");
-        for i in 19..=23 {
-            assert!(arr[i].is_nil(), "idx {i} must be a nil default");
+        for (i, slot) in arr.iter().enumerate().take(24).skip(19) {
+            assert!(slot.is_nil(), "idx {i} must be a nil default");
         }
         assert_eq!(arr[24].as_str(), Some("10.0.0.1"), "bootstrap_host at 24");
         assert_eq!(arr[25].as_u64(), Some(8998), "bootstrap_port at 25");

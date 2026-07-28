@@ -1215,17 +1215,11 @@ class Scheduler(
             get_disagg().disaggregation_transfer_backend
         )
 
-        # In rust-server mode there is no TokenizerManager process, so the
-        # rank-0 scheduler hosts the prefill KV bootstrap server instead
-        # (`start_disagg_service` no-ops on non-prefill roles). It must be up
-        # before the PrefillBootstrapQueue below: its KVManager registers to
-        # the bootstrap port synchronously, and a failed registration only
-        # retries ~60s then logs — leaving every PD request unroutable.
-        self.disagg_bootstrap_server = (
-            start_disagg_service(self.server_args)
-            if self._hosts_rust_server()
-            else None
-        )
+        # Must run before the PrefillBootstrapQueue below: that queue's
+        # KVManager registers to the bootstrap port synchronously, and a failed
+        # registration only retries ~60s then logs — leaving every PD request
+        # unroutable.
+        self.maybe_init_disagg_bootstrap_server()
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
         draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
@@ -1865,6 +1859,19 @@ class Scheduler(
             self.ps.pp_rank == 0
             and self.ps.attn_tp_rank == 0
             and self.ps.attn_cp_rank == 0
+        )
+
+    def maybe_init_disagg_bootstrap_server(self) -> None:
+        """Host the prefill KV bootstrap server on this scheduler in rust-server
+        mode: there is no ``TokenizerManager`` process to own it. No-op
+        otherwise, and ``start_disagg_service`` itself no-ops on non-prefill
+        roles."""
+
+        # Kept only to hold a reference — the server dies if it is collected.
+        self.disagg_bootstrap_server = (
+            start_disagg_service(self.server_args)
+            if self._hosts_rust_server()
+            else None
         )
 
     def maybe_init_rust_server(self) -> None:

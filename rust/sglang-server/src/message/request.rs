@@ -305,16 +305,21 @@ impl GenerateBody {
         // `fan_out` yields `Option<Option<T>>` for these nullable elements
         // (outer: absent, inner: an explicit `null` element) — flatten, both
         // mean "not set" downstream.
-        let bootstrap_hosts = flat(fan_out(bootstrap_host, n, "bootstrap_host")?);
-        let bootstrap_ports = flat(fan_out(bootstrap_port, n, "bootstrap_port")?);
+        let bootstrap_hosts = flatten_column(fan_out(bootstrap_host, n, "bootstrap_host")?);
+        let bootstrap_ports = flatten_column(fan_out(bootstrap_port, n, "bootstrap_port")?);
         let bootstrap_rooms = match bootstrap_room {
+            // `wrapping_add`, not `checked_`: rooms are drawn from `[0, 2^63)`,
+            // so a batch can only overflow by starting within `n` of `i64::MAX`
+            // — and distinct-but-wrapped still pairs P↔D, where saturating
+            // would collide every item onto one room.
             Some(OneOrMany::One(Some(room))) => {
                 (0..n).map(|i| Some(room.wrapping_add(i as i64))).collect()
             }
-            other => flat(fan_out(other, n, "bootstrap_room")?),
+            other => flatten_column(fan_out(other, n, "bootstrap_room")?),
         };
-        let bootstrap_pair_keys = flat(fan_out(bootstrap_pair_key, n, "bootstrap_pair_key")?);
-        let decode_tp_sizes = flat(fan_out(decode_tp_size, n, "decode_tp_size")?);
+        let bootstrap_pair_keys =
+            flatten_column(fan_out(bootstrap_pair_key, n, "bootstrap_pair_key")?);
+        let decode_tp_sizes = flatten_column(fan_out(decode_tp_size, n, "decode_tp_size")?);
 
         // Every column above is exactly `n` long, so zip them by value: each
         // request takes ownership of its cell, with no indexing or bounds checks.
@@ -522,7 +527,7 @@ impl<T: HeapBytes> HeapBytes for Option<T> {
 /// Collapse `fan_out`'s nullable-element output: outer `None` (field absent /
 /// scalar broadcast of nothing) and inner `None` (an explicit `null` list
 /// element) both mean "not set".
-fn flat<T>(column: Vec<Option<Option<T>>>) -> Vec<Option<T>> {
+fn flatten_column<T>(column: Vec<Option<Option<T>>>) -> Vec<Option<T>> {
     column.into_iter().map(Option::flatten).collect()
 }
 
