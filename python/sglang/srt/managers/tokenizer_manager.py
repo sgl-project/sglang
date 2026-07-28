@@ -631,6 +631,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        *,
+        internal_mm_processor_kwargs: Optional[Dict[str, Any]] = None,
     ):
         self.auto_create_handle_loop()
 
@@ -665,7 +667,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
-                    tokenized_obj = await self._tokenize_one_request(obj)
+                    tokenized_obj = await self._tokenize_one_request(
+                        obj,
+                        internal_mm_processor_kwargs=internal_mm_processor_kwargs,
+                    )
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
@@ -834,6 +839,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
+        *,
+        internal_mm_processor_kwargs: Optional[Dict[str, Any]] = None,
     ):
         """Tokenize one request."""
         # Tokenize
@@ -915,6 +922,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         audio_data=obj.audio_data,
                         input_text=(input_text or input_ids),
                         request_obj=obj,
+                        **(internal_mm_processor_kwargs or {}),
                         max_req_input_len=self.max_req_input_len,
                     )
             elif (
@@ -930,6 +938,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     audio_data=obj.audio_data,
                     input_text=(input_text or input_ids),
                     request_obj=obj,
+                    **(internal_mm_processor_kwargs or {}),
                     max_req_input_len=self.max_req_input_len,
                 )
 

@@ -544,6 +544,10 @@ def _acknowledge_deferred_cuda_ipc_cache_hits(
     the equivalent single acknowledgement.  This preserves the fixed-pool
     lifecycle without reintroducing an unnecessary GPU-to-GPU copy.
     """
+    # Return before touching the parallel group when nothing here is deferred.
+    if not any(isinstance(item.feature, CudaIpcTensorTransportProxy) for item in items):
+        return
+
     parallel = get_parallel()
     if parallel.attn_tp_rank != 0:
         return
@@ -654,13 +658,22 @@ def _batch_encode_per_image_misses(
 
         for _idx, item, start, end in overlapping:
             if item.hash in hash_to_embedding:
+                # In-batch duplicate: release its IPC feature like a cache hit.
+                _acknowledge_deferred_cuda_ipc_cache_hits([item])
                 continue
-            cached = embedding_cache.get_single(item.hash)
+            cached = (
+                embedding_cache.get_single(item.hash)
+                if item.use_embedding_cache
+                else None
+            )
             if cached is not None:
                 hash_to_embedding[item.hash] = cached.embedding
+                _acknowledge_deferred_cuda_ipc_cache_hits([item])
             elif item.hash not in unique_misses:
                 token_count = end - start + 1
                 unique_misses[item.hash] = (item, token_count)
+            else:
+                _acknowledge_deferred_cuda_ipc_cache_hits([item])
 
     # Phase 1b: single ViT call for all unique cache misses
     if unique_misses:
@@ -677,7 +690,8 @@ def _batch_encode_per_image_misses(
 
         split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
         for h, emb in zip(ordered_hashes, split_embeddings):
-            embedding_cache.set(h, EmbeddingResult(embedding=emb))
+            if unique_misses[h][0].use_embedding_cache:
+                embedding_cache.set(h, EmbeddingResult(embedding=emb))
             # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
             hash_to_embedding[h] = emb
 
@@ -715,7 +729,9 @@ def _get_chunked_embedding_by_item(
     cached_embeddings = {}
     miss_items = []
     for idx, item, start, end in overlapping:
-        cached = embedding_cache.get_single(item.hash)
+        cached = (
+            embedding_cache.get_single(item.hash) if item.use_embedding_cache else None
+        )
         if cached is not None:
             cached_embeddings[idx] = cached.embedding
             _acknowledge_deferred_cuda_ipc_cache_hits([item])
@@ -749,7 +765,8 @@ def _get_chunked_embedding_by_item(
 
         for (idx, item, _, _), emb in zip(miss_items, split_embeddings):
             cached_embeddings[idx] = emb
-            embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
+            if item.use_embedding_cache:
+                embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
 
     chunk_slices = []
     for idx, _, start, end in overlapping:
@@ -1485,6 +1502,20 @@ def hash_feature(f):
             return f.precomputed_hash
         return tensor_hash([f.tensor])
     return data_hash(f)
+
+
+def hash_mm_item(feature_hash: int, modality: Modality, offsets: Optional[list]) -> int:
+    """Bind multimodal content identity to its encoder-token geometry."""
+    hasher = hashlib.sha256()
+    hasher.update(b"sglang-mm-item-v2\0")
+    hasher.update(modality.name.encode("ascii"))
+    hasher.update(feature_hash.to_bytes(8, byteorder="big", signed=False))
+    for start, end in offsets or ():
+        token_count = int(end) - int(start) + 1
+        if token_count <= 0:
+            raise ValueError(f"Invalid multimodal item offset: {(start, end)}")
+        hasher.update(token_count.to_bytes(8, byteorder="big", signed=False))
+    return int.from_bytes(hasher.digest()[:8], byteorder="big", signed=False)
 
 
 def extend_mrope_positions_for_retracted_request(

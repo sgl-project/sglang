@@ -15,7 +15,6 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-import numpy as np
 import pybase64
 from fastapi import WebSocket, WebSocketDisconnect
 from openai.types.realtime import (
@@ -52,13 +51,12 @@ from openai.types.realtime.realtime_error import RealtimeError
 from pydantic import BaseModel, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
+from sglang.srt.entrypoints.openai.realtime.asr_processor import (
+    RealtimeASRProcessor,
+)
 from sglang.srt.entrypoints.openai.realtime.audio_buffer import (
     PCM_SAMPLE_WIDTH,
-    AudioState,
-    is_near_silent_pcm,
-    pcm_to_float_samples,
     resample_to_target_rate,
-    slice_pcm_range,
 )
 from sglang.srt.entrypoints.openai.realtime.protocol import (
     DEFAULT_INPUT_SAMPLE_RATE,
@@ -69,11 +67,8 @@ from sglang.srt.entrypoints.openai.realtime.protocol import (
     TranscriptionSessionConfig,
 )
 from sglang.srt.entrypoints.openai.streaming_asr import (
-    StreamingASRState,
-    is_cjk_char,
     needs_space,
     normalize_whitespace,
-    process_asr_chunk,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
@@ -85,10 +80,6 @@ from sglang.srt.utils import random_uuid
 logger = logging.getLogger(__name__)
 
 
-_DEFERRED_SENTENCE_PUNCT = frozenset(".!?。！？")
-_CJK_SENTENCE_PUNCT = frozenset("。！？")
-
-
 _CLIENT_EVENT_TYPES: Dict[str, type] = {
     "session.update": SessionUpdateEvent,
     "input_audio_buffer.append": InputAudioBufferAppendEvent,
@@ -98,6 +89,8 @@ _CLIENT_EVENT_TYPES: Dict[str, type] = {
 
 
 def _parse_client_event(raw: Dict[str, Any]) -> Optional[BaseModel]:
+    """Parse, returning None if type is unknown. Raises ValidationError on
+    a malformed payload of a known type."""
     cls = _CLIENT_EVENT_TYPES.get(raw.get("type"))
     if cls is None:
         return None
@@ -106,6 +99,11 @@ def _parse_client_event(raw: Dict[str, Any]) -> Optional[BaseModel]:
 
 @dataclass
 class _SessionConfig:
+    """Session-level configuration negotiated via session.update: audio
+    input format, requested language, sampling params. Persists until
+    the session ends; ``configured`` gates audio-frame handling so the
+    server doesn't run inference on PCM sent before session.update."""
+
     input_sample_rate: int = DEFAULT_INPUT_SAMPLE_RATE
     language: Optional[str] = None
     client_model: Optional[str] = None
@@ -115,53 +113,21 @@ class _SessionConfig:
 
 @dataclass
 class _ItemState:
+    """Per-item conversation-item ids and the wire-formatted deltas
+    emitted so far for the current item. current_item_id is reserved at
+    __init__ and only announced to the client by
+    input_audio_buffer.committed."""
+
     current_item_id: str
     previous_item_id: Optional[str] = None
     emitted_deltas: List[str] = field(default_factory=list)
-    pending_sentence_punctuation: str = ""
-
-
-def split_trailing_sentence_punctuation(delta: str) -> tuple[str, str]:
-    end = len(delta.rstrip())
-    start = end
-    while start > 0 and delta[start - 1] in _DEFERRED_SENTENCE_PUNCT:
-        start -= 1
-    if start == end:
-        return delta, ""
-    return delta[:start].rstrip(), delta[start:end]
-
-
-def should_emit_pending_sentence_punctuation(pending: str, next_delta: str) -> bool:
-    next_delta = next_delta.lstrip()
-    if not next_delta:
-        return True
-    first = next_delta[0]
-    # CJK has no case: after a deferred CJK sentence ender, a same-script
-    # continuation means the boundary re-transcription continued the clause.
-    # A pending Latin '.' before CJK text still flushes (language switch).
-    if pending and pending[-1] in _CJK_SENTENCE_PUNCT and is_cjk_char(first):
-        return False
-    return not (first.isalpha() and first.islower())
-
-
-@dataclass
-class _ASRWindowPlan:
-    is_last: bool
-    use_slicing: bool
-    prompt: Optional[str]
-    dedupe_against: Optional[str]
-    overlap_seconds: float
-    slice_start_global: int
-    slice_end_global: int
-
-
-@dataclass
-class _ASRWindowResult:
-    delta: str
-    skipped: bool
 
 
 class RealtimeConnection:
+    """One realtime transcription session. Drives the WS receive loop,
+    dispatches typed client events to the matching _on_* handler, and
+    triggers chunked ASR inference at audio buffer thresholds."""
+
     def __init__(
         self,
         websocket: WebSocket,
@@ -170,83 +136,20 @@ class RealtimeConnection:
         server_args: ServerArgs,
     ) -> None:
         self.websocket = websocket
-        self.tokenizer_manager = tokenizer_manager
         self.adapter = adapter
         self.server_args = server_args
 
         self.session_id = f"sess_{random_uuid()}"
         self._current_client_event_id: Optional[str] = None
 
-        self.model_sample_rate = adapter.model_sample_rate
-        self.bytes_per_second = self.model_sample_rate * PCM_SAMPLE_WIDTH
-        self.max_buffer_seconds = server_args.asr_max_buffer_seconds
-
         self.config = _SessionConfig()
-
-        slicing_cfg = adapter.realtime_slicing_config
-        slicing_requested = (
-            bool(slicing_cfg.get("enabled", False))
-            and not server_args.asr_disable_input_slicing
+        self.asr_processor = RealtimeASRProcessor(
+            tokenizer_manager=tokenizer_manager,
+            adapter=adapter,
+            server_args=server_args,
         )
-        left_overlap_ms = int(slicing_cfg.get("left_overlap_ms", 0))
-        min_audio_sec = float(slicing_cfg.get("min_audio_sec", 0.0))
-
-        state = StreamingASRState(**adapter.chunked_streaming_config)
-        chunk_size_bytes = int(state.chunk_size_sec * self.bytes_per_second)
-        if chunk_size_bytes <= 0:
-            raise RuntimeError(
-                f"adapter.chunked_streaming_config produced non-positive "
-                f"chunk_size_sec; got {state.chunk_size_sec!r}"
-            )
-        if state.unfixed_chunk_num < 0 or state.unfixed_token_num < 0:
-            raise RuntimeError(
-                f"adapter.chunked_streaming_config produced negative holdback "
-                f"values; got unfixed_chunk_num={state.unfixed_chunk_num!r}, "
-                f"unfixed_token_num={state.unfixed_token_num!r}"
-            )
-
-        invalid_slicing_fields = []
-        if left_overlap_ms < 0:
-            invalid_slicing_fields.append(f"left_overlap_ms={left_overlap_ms!r}")
-        if min_audio_sec < 0:
-            invalid_slicing_fields.append(f"min_audio_sec={min_audio_sec!r}")
-        if slicing_requested and invalid_slicing_fields:
-            logger.warning(
-                "[realtime] invalid realtime_slicing_config (%s); "
-                "audio slicing disabled, falling back to cumulative inference",
-                ", ".join(invalid_slicing_fields),
-            )
-            slicing_requested = False
-        left_overlap_ms = max(left_overlap_ms, 0)
-        min_audio_sec = max(min_audio_sec, 0.0)
-
-        left_overlap_bytes = int(left_overlap_ms / 1000 * self.bytes_per_second)
-        left_overlap_bytes -= left_overlap_bytes % PCM_SAMPLE_WIDTH
-        # chunk_index counts inference windows, each consuming >= chunk_size_sec
-        # of audio, so this proxy can only delay the gate past min_audio_sec
-        # (staying cumulative longer), never fire it early.
-        slicing_min_chunk_index = (
-            math.ceil(min_audio_sec / state.chunk_size_sec) if slicing_requested else 0
-        )
-        slicing_enabled = (
-            slicing_requested
-            and left_overlap_bytes < state.unfixed_chunk_num * chunk_size_bytes
-        )
-        if slicing_requested and not slicing_enabled:
-            logger.warning(
-                "[realtime] left_overlap=%dms >= unfixed_chunks_duration=%dms; "
-                "audio slicing disabled, falling back to cumulative inference",
-                left_overlap_ms,
-                state.unfixed_chunk_num * int(state.chunk_size_sec * 1000),
-            )
-        self.audio = AudioState(
-            max_buffer_bytes=self.max_buffer_seconds * self.bytes_per_second,
-            chunk_size_bytes=chunk_size_bytes,
-            state=state,
-            left_overlap_bytes=left_overlap_bytes,
-            slicing_min_chunk_index=slicing_min_chunk_index,
-            slicing_enabled=slicing_enabled,
-        )
+        self.asr_state = self.asr_processor.create_state()
+        self.model_sample_rate = self.asr_processor.model_sample_rate
 
         self.item = _ItemState(current_item_id=f"item_{random_uuid()}")
 
@@ -271,10 +174,17 @@ class RealtimeConnection:
                     "Internal server error",
                     error_type="server_error",
                 )
-            except (WebSocketDisconnect, RuntimeError):
-                pass
+            except (WebSocketDisconnect, RuntimeError) as e:
+                logger.debug(
+                    "[realtime] failed to notify client of unexpected error: %s",
+                    e,
+                )
 
     async def _run_loop(self) -> None:
+        """Receive-and-dispatch loop. Validation errors emit an error event
+        and continue; fatal append-path errors (buffer overflow, append-time
+        inference failure) close the WebSocket and terminate the loop.
+        """
         while True:
             self._current_client_event_id = None
             message = await self.websocket.receive()
@@ -327,6 +237,7 @@ class RealtimeConnection:
                 return
 
     async def _dispatch(self, event: BaseModel) -> bool:
+        """Returns True if the session should terminate."""
         if isinstance(event, InputAudioBufferAppendEvent):
             return await self._on_input_audio_buffer_append(event)
         if isinstance(event, SessionUpdateEvent):
@@ -340,7 +251,10 @@ class RealtimeConnection:
     async def _on_session_update(self, event: SessionUpdateEvent) -> None:
         cfg = event.session
 
-        # Keep `transcription` nullable so partial updates can detect it.
+        # Normalize audio to an empty input cfg if absent so downstream
+        # `audio.X is not None` reads as a business rule, not an existence check.
+        # transcription stays nullable so partial-update can detect whether
+        # the client sent the block.
         audio = (
             cfg.audio.input if cfg.audio else None
         ) or TranscriptionSessionAudioInput()
@@ -383,10 +297,11 @@ class RealtimeConnection:
             )
             return
 
-        new_rate = self.config.input_sample_rate
+        new_rate = self.config.input_sample_rate  # default: keep current
         fmt = audio.format
         if fmt is not None:
             if not isinstance(fmt, AudioPCM):
+                # G.711 (pcmu / pcma): not implemented.
                 await self._send_error(
                     "not_supported",
                     f"audio.input.format.type must be 'audio/pcm'; "
@@ -406,10 +321,7 @@ class RealtimeConnection:
             # Changing the rate mid-item would leave already-buffered PCM
             # at the old rate mixed with new audio at the new rate, so
             # require the client to commit or clear before switching.
-            if (
-                new_rate != self.config.input_sample_rate
-                and self.audio.total_pcm_bytes_received > 0
-            ):
+            if new_rate != self.config.input_sample_rate and self.asr_state.has_audio:
                 await self._send_error(
                     "invalid_state",
                     "Cannot change audio.input.format.rate while audio is "
@@ -418,6 +330,7 @@ class RealtimeConnection:
                 )
                 return
 
+        # Mutation pass — no early returns past this point.
         self.config.input_sample_rate = new_rate
         if transcription is not None:
             self.config.client_model = transcription.model
@@ -459,6 +372,7 @@ class RealtimeConnection:
             )
             return False
 
+        # Empty audio is a no-op (heartbeat frames); skip b64decode.
         if not event.audio:
             return False
 
@@ -483,14 +397,14 @@ class RealtimeConnection:
             src_samples * self.model_sample_rate / self.config.input_sample_rate
         )
         if (
-            self.audio.total_pcm_bytes_received + target_samples * PCM_SAMPLE_WIDTH
-            > self.audio.max_buffer_bytes
+            self.asr_state.audio.received_bytes + target_samples * PCM_SAMPLE_WIDTH
+            > self.asr_processor.max_buffer_bytes
         ):
             # Close 1009 ("message too big") so clients can distinguish
             # session-resource exhaustion from a normal close.
             await self._send_error_and_close(
                 "buffer_overflow",
-                f"Accumulated audio exceeded {self.max_buffer_seconds}s; "
+                f"Accumulated audio exceeded {self.asr_processor.max_buffer_seconds}s; "
                 f"commit or clear before sending more audio",
                 close_code=1009,
             )
@@ -503,14 +417,11 @@ class RealtimeConnection:
                 self.config.input_sample_rate,
                 self.model_sample_rate,
             )
-        self.audio.append_pcm(data)
-
-        new_audio_bytes = (
-            self.audio.total_pcm_bytes_received - self.audio.last_scheduled_offset_bytes
-        )
-        if new_audio_bytes >= self.audio.chunk_size_bytes:
+        self.asr_state.audio.append_pcm(data)
+        if self.asr_processor.next_chunk_ready(self.asr_state):
             ok = await self._run_inference(is_last=False)
             if not ok:
+                # WS already closed inside _run_inference.
                 return True
         return False
 
@@ -520,18 +431,13 @@ class RealtimeConnection:
         if not self.config.configured:
             await self._send_error("invalid_state", "Send session.update before commit")
             return
-        if (
-            self.audio.total_pcm_bytes_received == 0
-            and not self.audio.state.full_transcript
-        ):
+        if not self.asr_state.has_audio and not self.asr_state.has_transcript:
             await self._send_error(
                 "invalid_state", "Cannot commit an empty audio buffer"
             )
             return
 
-        has_new_audio = (
-            self.audio.total_pcm_bytes_received > self.audio.last_inferred_offset_bytes
-        )
+        has_new_audio = self.asr_state.has_new_audio
         item_id = self.item.current_item_id
         prev_item_id = self.item.previous_item_id
 
@@ -567,23 +473,24 @@ class RealtimeConnection:
         # Capture PCM duration before `_start_next_item()` clears the absolute
         # byte counters for the next item.
         pcm_duration_seconds = (
-            self.audio.total_pcm_bytes_received / self.bytes_per_second
+            self.asr_state.audio.received_bytes / self.asr_processor.bytes_per_second
         )
 
         if has_new_audio:
             ok = await self._run_inference(is_last=True)
             if not ok:
+                # _run_inference already emitted transcription.failed and
+                # rolled the item; don't also emit completed.
                 return
-        elif self.audio.state.full_transcript:
+        elif self.asr_state.has_transcript:
             # Audio length was exactly a chunk_size_bytes multiple. Flush
             # the tail tokens update() held back.
-            tail = self.audio.state.finalize()
-            await self._emit_transcription_delta(tail)
+            await self._emit_transcription_delta_text(
+                self.asr_processor.finalize(self.asr_state)
+            )
 
-        await self._flush_pending_sentence_punctuation()
-
-        # Rebuild from emitted_deltas: both paths leave full_transcript only a
-        # partial tail, while the deltas together are the whole transcript.
+        # Transcript state may retain only the latest hypothesis or pending
+        # suffix; emitted deltas are the authoritative wire transcript.
         transcript = normalize_whitespace("".join(self.item.emitted_deltas))
 
         await self._send(
@@ -604,7 +511,11 @@ class RealtimeConnection:
     async def _on_input_audio_buffer_clear(
         self, event: InputAudioBufferClearEvent
     ) -> None:
-        # Use a fresh item id for post-clear pre-commit deltas.
+        # Reserve a fresh current_item_id so post-clear pre-commit deltas
+        # don't share an item_id with deltas the client already received
+        # for the abandoned audio. previous_item_id is NOT touched — the
+        # cleared item was never committed, so the prior-commit chain
+        # shouldn't include it.
         self._reset_inference_state()
         self.item.current_item_id = f"item_{random_uuid()}"
         await self._send(
@@ -613,150 +524,20 @@ class RealtimeConnection:
             )
         )
 
-    # Realtime ASR remains stateless at the backend request level: each append
-    # schedules either one cumulative item request or, after the adapter gate, one
-    # bounded tail-window request. Window lifecycle:
-    # 1. prepare: choose cumulative vs sliced and flush cumulative holdback before
-    #    the first sliced request.
-    # 2. execute: run the model, or defer short/silent/unsafe sliced windows
-    #    without mutating transcript state.
-    # 3. emit: publish the accepted delta.
-    # 4. commit: advance scheduling for every attempt, but advance inferred bytes
-    #    and compact PCM only after a real accepted inference.
     async def _run_inference(self, is_last: bool) -> bool:
-        """Prepare, execute, emit, then commit one ASR window.
-
-        Returns False only on inference failure, after the failure handler has
-        already emitted the error (append-time also closes the socket).
-        """
-        plan = await self._prepare_asr_window(is_last)
+        """Run ASR on the current buffer. Returns False on failure:
+        commit-time emits transcription.failed and rolls the item; append-time
+        emits a generic error envelope and closes the WebSocket."""
         try:
-            result = await self._execute_asr_window(plan)
+            delta = await self.asr_processor.process(
+                self.asr_state,
+                is_last=is_last,
+                sampling_params=self.config.sampling_params,
+            )
         except Exception:
             return await self._handle_inference_failure(is_last)
-        await self._emit_transcription_delta(
-            result.delta,
-            defer_trailing_sentence_punctuation=plan.use_slicing and not plan.is_last,
-        )
-        self._commit_asr_window(plan, result)
+        await self._emit_transcription_delta_text(delta)
         return True
-
-    async def _prepare_asr_window(self, is_last: bool) -> _ASRWindowPlan:
-        """May flush cumulative holdback before switching to a sliced window."""
-        committed_text = self.audio.state.get_prefix_text()
-        use_slicing = (
-            self.audio.slicing_enabled
-            and bool(committed_text)
-            and self.audio.state.chunk_index >= self.audio.slicing_min_chunk_index
-        )
-        if use_slicing:
-            if self.audio.state.confirmed_text != self.audio.state.full_transcript:
-                await self._emit_transcription_delta(
-                    self.audio.state.finalize(cumulative=True),
-                    defer_trailing_sentence_punctuation=True,
-                )
-                committed_text = self.audio.state.get_prefix_text()
-            prompt: Optional[str] = self.adapter.prompt_template
-            dedupe_against: Optional[str] = committed_text
-            slice_start_global = max(
-                0,
-                self.audio.last_inferred_offset_bytes - self.audio.left_overlap_bytes,
-            )
-        else:
-            prompt = None
-            dedupe_against = None
-            slice_start_global = 0
-        return _ASRWindowPlan(
-            is_last=is_last,
-            use_slicing=use_slicing,
-            prompt=prompt,
-            dedupe_against=dedupe_against,
-            overlap_seconds=(
-                self.audio.left_overlap_bytes / self.bytes_per_second
-                if use_slicing
-                else 0.0
-            ),
-            slice_start_global=slice_start_global,
-            slice_end_global=self.audio.total_pcm_bytes_received,
-        )
-
-    async def _execute_asr_window(self, plan: _ASRWindowPlan) -> _ASRWindowResult:
-        """Run the planned window, or defer it without consuming audio."""
-        # A sliced->cumulative flip can ask for compacted-away bytes; clamp.
-        slice_start = max(0, self.audio.global_to_local(plan.slice_start_global))
-        slice_end = self.audio.global_to_local(plan.slice_end_global)
-        pcm_slice = slice_pcm_range(self.audio.pcm_buffer, slice_start, slice_end)
-        too_short = plan.use_slicing and len(pcm_slice) < self.audio.chunk_size_bytes
-        near_silent = (
-            plan.use_slicing and not too_short and is_near_silent_pcm(pcm_slice)
-        )
-
-        if (too_short or near_silent) and not plan.is_last:
-            return _ASRWindowResult(delta="", skipped=True)
-
-        if (too_short or near_silent) and plan.is_last:
-            # Commit must not drop a short/quiet tail: widen to the full buffer.
-            full_slice = slice_pcm_range(self.audio.pcm_buffer, 0, slice_end)
-            if not full_slice or is_near_silent_pcm(full_slice):
-                return _ASRWindowResult(delta="", skipped=False)
-            audio_samples = await asyncio.to_thread(pcm_to_float_samples, full_slice)
-            delta = await self._run_asr_on_samples(
-                plan, audio_samples, overlap_seconds=0.0
-            )
-            return _ASRWindowResult(delta=delta, skipped=False)
-
-        audio_samples = await asyncio.to_thread(pcm_to_float_samples, pcm_slice)
-        verified_out: Dict[str, Any] = {}
-        delta = await self._run_asr_on_samples(
-            plan,
-            audio_samples,
-            overlap_seconds=plan.overlap_seconds,
-            defer_if_unverified=plan.use_slicing and not plan.is_last,
-            verified_out=verified_out,
-        )
-        if (
-            plan.use_slicing
-            and not plan.is_last
-            and not verified_out.get("verified", True)
-        ):
-            # Unsafe overlap hypothesis: don't ingest; keep audio recoverable.
-            return _ASRWindowResult(delta="", skipped=True)
-        return _ASRWindowResult(delta=delta, skipped=False)
-
-    async def _run_asr_on_samples(
-        self,
-        plan: _ASRWindowPlan,
-        audio_samples: np.ndarray,
-        *,
-        overlap_seconds: float,
-        defer_if_unverified: bool = False,
-        verified_out: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        """Shared model call; fills the per-connection args from self and plan."""
-        return await process_asr_chunk(
-            tokenizer_manager=self.tokenizer_manager,
-            adapter=self.adapter,
-            state=self.audio.state,
-            audio_data=audio_samples,
-            sampling_params=self.config.sampling_params,
-            is_last=plan.is_last,
-            prompt=plan.prompt,
-            dedupe_against=plan.dedupe_against,
-            sample_rate=self.model_sample_rate,
-            overlap_seconds=overlap_seconds,
-            defer_if_unverified=defer_if_unverified,
-            verified_out=verified_out,
-        )
-
-    def _commit_asr_window(
-        self, plan: _ASRWindowPlan, result: _ASRWindowResult
-    ) -> None:
-        """Advance scheduling for every attempt, consumption only after inference."""
-        self.audio.last_scheduled_offset_bytes = plan.slice_end_global
-        if not result.skipped:
-            self.audio.last_inferred_offset_bytes = plan.slice_end_global
-            if plan.use_slicing and not plan.is_last:
-                self.audio.compact_after_sliced_inference()
 
     async def _handle_inference_failure(self, is_last: bool) -> bool:
         """Send the correct failure signal for append-time vs commit-time errors."""
@@ -764,9 +545,10 @@ class RealtimeConnection:
             "[realtime] inference failed: session=%s item=%s buffer_bytes=%d",
             self.session_id,
             self.item.current_item_id,
-            len(self.audio.pcm_buffer),
+            len(self.asr_state.audio.data),
         )
         if is_last:
+            # Already client-visible: transcription.failed can reference the item.
             await self._send(
                 ConversationItemInputAudioTranscriptionFailedEvent(
                     event_id=f"event_{random_uuid()}",
@@ -782,6 +564,7 @@ class RealtimeConnection:
             )
             self._start_next_item()
         else:
+            # The item is not announced yet; close instead of referencing a ghost id.
             await self._send_error_and_close(
                 "inference_failed",
                 "Transcription failed",
@@ -789,36 +572,10 @@ class RealtimeConnection:
             )
         return False
 
-    async def _flush_pending_sentence_punctuation(self) -> None:
-        if not self.item.pending_sentence_punctuation:
-            return
-        punctuation = self.item.pending_sentence_punctuation
-        self.item.pending_sentence_punctuation = ""
-        await self._emit_transcription_delta_text(punctuation)
-
-    async def _emit_transcription_delta(
-        self,
-        delta: str,
-        *,
-        defer_trailing_sentence_punctuation: bool = False,
-    ) -> None:
-        if not delta:
-            return
-        if self.item.pending_sentence_punctuation:
-            punctuation = self.item.pending_sentence_punctuation
-            self.item.pending_sentence_punctuation = ""
-            # A lowercase (or same-script CJK) continuation means the deferred
-            # punctuation was a false sentence end at a slice boundary; drop it.
-            if should_emit_pending_sentence_punctuation(punctuation, delta):
-                await self._emit_transcription_delta_text(punctuation)
-        if defer_trailing_sentence_punctuation:
-            delta, punctuation = split_trailing_sentence_punctuation(delta)
-            self.item.pending_sentence_punctuation = punctuation
-            if not delta:
-                return
-        await self._emit_transcription_delta_text(delta)
-
     async def _emit_transcription_delta_text(self, delta: str) -> None:
+        """emitted_deltas stores wire-formatted text (with leading
+        boundary spaces baked in), so "".join(...) reconstructs the
+        cumulative transcript verbatim."""
         for word in delta.split(" "):
             if not word:
                 continue
@@ -841,10 +598,8 @@ class RealtimeConnection:
         self._reset_inference_state()
 
     def _reset_inference_state(self) -> None:
-        self.audio.state = StreamingASRState(**self.adapter.chunked_streaming_config)
-        self.audio.reset_pcm_offsets()
+        self.asr_state = self.asr_processor.create_state()
         self.item.emitted_deltas.clear()
-        self.item.pending_sentence_punctuation = ""
 
     def _build_session_info(self) -> TranscriptionSessionConfig:
         # id / object aren't SDK fields; round-trip via extra='allow' so

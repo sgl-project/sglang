@@ -11,6 +11,8 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
 )
 from sglang.srt.multimodal.processors.qwen3_asr import DEFAULT_ASR_PROMPT
 
+_LONG_AUDIO_GATE_SEC = 60.0
+
 
 @register_transcription_adapter("Qwen3ASR")
 class Qwen3ASRAdapter(TranscriptionAdapter):
@@ -36,10 +38,18 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
         return DEFAULT_ASR_PROMPT
 
     @property
-    def realtime_slicing_config(self) -> dict:
-        # Keep short/mid utterances cumulative; slice only long sessions where
-        # bounded prefill/memory is worth the boundary risk.
-        return {"enabled": True, "left_overlap_ms": 2000, "min_audio_sec": 45.0}
+    def realtime_long_audio_config(self) -> dict:
+        # Windowed mode engages only past min_audio_sec (the default 60s cap
+        # stays cumulative); window geometry comes from the mm processor.
+        return {
+            "min_audio_sec": _LONG_AUDIO_GATE_SEC,
+            # 64s of acoustic context; older audio is carried by the prefix.
+            "max_audio_context_windows": 8,
+            # Recent-text anchor; A/B showed no accuracy cost vs 512.
+            "decoder_prefix_max_tokens": 192,
+            # Hold one agreed word back to avoid premature sentence ends.
+            "decoder_prefix_holdback_words": 1,
+        }
 
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         temperature = request.temperature
