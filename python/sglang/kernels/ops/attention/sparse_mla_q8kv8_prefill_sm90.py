@@ -284,20 +284,60 @@ def sparse_mla_q8kv8_prefill_fwd(
     """Run Q8KV8 (FP8) sparse prefill attention on SM90.
 
     The kernel writes into three output tensors. By default fresh tensors
-    are allocated and returned; callers that want to reuse buffers (e.g.
-    for CUDA graph capture) may pass pre-allocated ``out`` / ``max_logits``
-    / ``lse`` tensors of the expected shape/dtype/device. The three output
-    tensors must not alias each other.
+    are allocated and returned; callers that want to reuse buffers may pass
+    pre-allocated ``out`` / ``max_logits`` / ``lse`` tensors of the expected
+    shape/dtype/device. The three output tensors must not alias each other.
 
     Returns:
-        out:        [s_q, h_q, d_v], bfloat16
-        max_logits: [s_q, h_q], float32
-        lse:        [s_q, h_q], float32
+        out:         [s_q, h_q, d_v], bfloat16
+        max_logits:  [s_q, h_q], float32
+        lse:         [s_q, h_q], float32
     """
     s_q, h_q, d_qk = q.shape
     s_kv = kv.shape[0]
     h_kv = kv.shape[1]
     topk = indices.shape[2]
+
+    # The CUDA implementation uses B_H=64 and launches h_q / B_H CTAs.
+    # Reject unpadded TP-local head counts instead of launching zero CTAs and
+    # returning uninitialized outputs, which can appear to callers as a hang or
+    # a later collective failure.
+    if h_q == 0 or h_q % 64 != 0:
+        raise ValueError(
+            "sparse_mla_q8kv8_prefill_fwd requires h_q padded to a positive "
+            f"multiple of 64, got {h_q}"
+        )
+
+    if h_kv != 1:
+        raise ValueError(
+            f"sparse_mla_q8kv8_prefill_fwd requires h_kv=1, got {h_kv}"
+        )
+
+    if d_qk not in (512, 576):
+        raise ValueError(
+            f"sparse_mla_q8kv8_prefill_fwd supports d_qk=512/576, got {d_qk}"
+        )
+
+    if indices.ndim != 3 or indices.shape[:2] != (s_q, h_kv):
+        raise ValueError(
+            "indices must have shape "
+            f"({s_q}, {h_kv}, topk), got {tuple(indices.shape)}"
+        )
+
+    if indices.dtype != torch.int32:
+        raise ValueError(f"indices must be int32, got {indices.dtype}")
+
+    if topk == 0 or topk % 64 != 0:
+        raise ValueError(
+            f"Q8KV8 sparse-prefill topk width must be a positive multiple of 64, got {topk}"
+        )
+
+    if topk_length is not None:
+        if topk_length.shape != (s_q,) or topk_length.dtype != torch.int32:
+            raise ValueError(
+                f"topk_length must be int32 with shape ({s_q},), got "
+                f"{tuple(topk_length.shape)}/{topk_length.dtype}"
+            )
 
     if d_v != 512:
         raise ValueError(
@@ -307,15 +347,25 @@ def sparse_mla_q8kv8_prefill_fwd(
     if attn_sink is not None and topk_length is None:
         raise ValueError("attn_sink requires topk_length to be provided as well")
 
+    if attn_sink is not None:
+        if attn_sink.shape != (h_q,) or attn_sink.dtype != torch.float32:
+            raise ValueError(
+                f"attn_sink must be float32 with shape ({h_q},), got "
+                f"{tuple(attn_sink.shape)}/{attn_sink.dtype}"
+            )
+
     device = q.device
+
     if out is None:
         out = torch.empty(s_q, h_q, d_v, dtype=torch.bfloat16, device=device)
     else:
         _check_out_buffer(out, "out", (s_q, h_q, d_v), torch.bfloat16, device)
+
     if max_logits is None:
         max_logits = torch.empty(s_q, h_q, dtype=torch.float32, device=device)
     else:
         _check_out_buffer(max_logits, "max_logits", (s_q, h_q), torch.float32, device)
+
     if lse is None:
         lse = torch.empty(s_q, h_q, dtype=torch.float32, device=device)
     else:

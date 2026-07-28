@@ -76,20 +76,21 @@ class TestDeepSeekV4Q8KV8KVAdapter(CustomTestCase):
 
     def test_cast_q_fp8_for_q8kv8_prefill_returns_kernel_inputs(self):
         q = (
-            torch.randn(5, 64, 512, dtype=torch.bfloat16, device=self.device) * 0.05
+            torch.randn(5, 16, 512, dtype=torch.bfloat16, device=self.device) * 0.05
         )
 
         q_fp8, q_scale = cast_q_fp8_for_q8kv8_prefill(q)
 
-        self.assertEqual(q_fp8.shape, q.shape)
+        self.assertEqual(q_fp8.shape, (5, 64, 512))
         self.assertEqual(q_fp8.dtype, fp8_dtype)
         self.assertTrue(q_fp8.is_contiguous())
+        self.assertTrue(torch.count_nonzero(q_fp8[:, 16:]).item() == 0)
         self.assertEqual(q_scale.shape, torch.Size([]))
         self.assertEqual(q_scale.dtype, torch.float32)
         self.assertEqual(q_scale.device, q.device)
         self.assertEqual(q_scale.item(), 1.0)
         torch.testing.assert_close(
-            q_fp8.to(torch.bfloat16).float(),
+            q_fp8[:, :16].to(torch.bfloat16).float(),
             q.float(),
             atol=3e-2,
             rtol=2e-1,
