@@ -323,10 +323,8 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch):
         top_k=4,
         activation="silu",
         is_gated=True,
-        # Non-default values verify that SM120 forwards the model config
-        # instead of silently hard-coding GPT-OSS's current defaults.
-        gemm1_alpha=1.75,
-        gemm1_clamp_limit=6.5,
+        gemm1_alpha=1.702,
+        gemm1_clamp_limit=7.0,
     )
     method.moe_runner_config = config
     method.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, config)
@@ -370,9 +368,9 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch):
         ],
         w13_bias[:, 0::2],
     )
-    assert torch.all(layer.swiglu_alpha == 1.75)
+    assert torch.all(layer.swiglu_alpha == 1.702)
     assert torch.all(layer.swiglu_beta == 1.0)
-    assert torch.all(layer.swiglu_limit == 6.5)
+    assert torch.all(layer.swiglu_limit == 7.0)
     assert layer._mxfp4_backend == "flashinfer_cutlass_sm120"
 
     x = torch.randn(

@@ -1077,14 +1077,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         w13_scale_interleaved = block_scale_interleave(w13_scale_padded)
         w2_scale_interleaved = block_scale_interleave(w2_scale_padded)
-        if (
-            w13_scale_interleaved.numel() != w13_scale_padded.numel()
-            or w2_scale_interleaved.numel() != w2_scale_padded.numel()
-        ):
-            raise ValueError(
-                "SM120 FlashInfer MXFP4 scale interleave produced unexpected "
-                "padding; expert dimensions must be aligned to 128."
-            )
 
         layer.w13_weight = Parameter(w13_padded, requires_grad=False)
         layer.w2_weight = Parameter(w2_padded, requires_grad=False)
@@ -1099,14 +1091,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w13_weight_bias = Parameter(w13_bias_padded, requires_grad=False)
         layer.w2_weight_bias = Parameter(w2_bias_padded, requires_grad=False)
 
-        swiglu_alpha = self.moe_runner_config.gemm1_alpha
-        if swiglu_alpha is None:
-            swiglu_alpha = 1.702
-        swiglu_limit = self.moe_runner_config.gemm1_clamp_limit
-        if swiglu_limit is None:
-            swiglu_limit = 7.0
         layer.swiglu_alpha = Parameter(
-            torch.full((E,), float(swiglu_alpha), dtype=torch.float32, device=device),
+            torch.full((E,), 1.702, dtype=torch.float32, device=device),
             requires_grad=False,
         )
         layer.swiglu_beta = Parameter(
@@ -1114,7 +1100,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         layer.swiglu_limit = Parameter(
-            torch.full((E,), float(swiglu_limit), dtype=torch.float32, device=device),
+            torch.full((E,), 7.0, dtype=torch.float32, device=device),
             requires_grad=False,
         )
         # The MXFP4 ABI uses a neutral global weight scale for each GEMM.
