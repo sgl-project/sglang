@@ -15,7 +15,7 @@
 
 namespace device::distributed {
 
-inline constexpr uint32_t kMaxWorldSize = 8;
+inline constexpr uint32_t kMaxWorldSize = 16;
 
 struct Counter {
  public:
