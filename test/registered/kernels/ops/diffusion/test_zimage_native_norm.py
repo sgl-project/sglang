@@ -76,3 +76,9 @@ def test_zimage_native_norm_rejects_hidden_size_above_limit():
 
     assert zimage_rmsnorm_scale(x, weight, modulation, EPS) is None
     assert zimage_rmsnorm_tanh_residual(x, modulation, residual, weight, EPS) is None
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
