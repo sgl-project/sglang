@@ -110,6 +110,11 @@ class SessionRadixCacheMixin:
                 parent = node.parent
                 self.token_to_kv_pool_allocator.free(node.value)
                 self._delete_leaf(node)
+                # Emit a BlockRemoved event for the freed node, mirroring the
+                # regular eviction path (see RadixCache.evict). Without this,
+                # KV-aware routers consuming the event queue would keep stale
+                # entries for blocks that a session release has already freed.
+                self._record_remove_event(node)
                 freed += 1
                 node = parent
         logger.info(
