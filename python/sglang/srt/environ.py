@@ -210,6 +210,23 @@ class ToolStrictLevel(IntEnum):
     PARAMETER = 2
 
 
+class TransferBarrierLevel(IntEnum):
+    """How strictly KV pages are withheld from reuse while a transfer may run.
+
+    OFF: no barrier; a failed request releases its pages immediately (legacy).
+    WARN: wait for proof that transfer work stopped, but release anyway after
+        SGLANG_DISAGGREGATION_QUIESCE_TIMEOUT, logging an error and counting it.
+        A peer too old to prove quiescence is also released, once, loudly.
+    STRICT: never release without proof. A request that cannot get it stays
+        non-terminal, and the worker fails once too many accumulate, so the
+        restart releases the pages safely rather than corrupting a peer.
+    """
+
+    OFF = 0
+    WARN = 1
+    STRICT = 2
+
+
 class InvariantCheckLevel(IntEnum):
     """Signal level for value/index validity checks (see invariants.py).
 
@@ -396,6 +413,18 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # Whether a failed KV transfer may hand its KV pages back to the allocator
+    # before the transfer is known to have stopped. See TransferBarrierLevel.
+    SGLANG_DISAGGREGATION_TRANSFER_BARRIER = EnvInt(TransferBarrierLevel.WARN)
+    # WARN only: upper bound, in seconds, on how long a failed transfer holds its
+    # pages before they are released anyway. Keep this above the manager socket's
+    # 30s ZMQ send timeout, because a transfer holds its room while notifying the
+    # peer; a shorter value reports spurious timeouts whenever a decode stops
+    # reading. STRICT ignores it.
+    SGLANG_DISAGGREGATION_QUIESCE_TIMEOUT = EnvFloat(60.0)
+    # STRICT only: how many requests may be stuck waiting for proof before the
+    # worker gives up and fails, so that a restart releases the pages safely.
+    SGLANG_DISAGGREGATION_MAX_UNQUIESCED = EnvInt(256)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)

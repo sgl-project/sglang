@@ -15,6 +15,7 @@ import threading
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+import zmq
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,11 @@ class DecodeStagingHandler:
         # before unregister runs, but release_room still needs it.
         self._room_to_receiver: dict = {}
         self._wm_subscribers: dict = {}
+        # Subscriber keys whose last watermark send hit backpressure. Watermarks
+        # are cumulative, so resending the current value later is always correct
+        # -- but it has to actually happen, or a prefill waiting on staging space
+        # never learns the ring advanced.
+        self._wm_retry: set = set()
 
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
         """Register a prefill's bootstrap connection for watermark broadcasts."""
@@ -419,22 +425,50 @@ class DecodeStagingHandler:
     ) -> None:
         """Free a staging allocation and broadcast watermark to all prefills."""
         self.staging_allocator.free(alloc_id)
-        post_wm = self.staging_allocator.get_watermark()
-        room = decode_req.req.bootstrap_room
+        self._broadcast_watermark(self.staging_allocator.get_watermark())
+
+    def retry_pending_watermarks(self) -> None:
+        """Resend the current watermark to subscribers that were backpressured.
+
+        Driven from the scheduler loop next to advance_scatter, so a dropped
+        watermark costs one poll of latency instead of stalling a prefill that is
+        waiting for staging space which is already free.
+        """
+        if not self._wm_retry:
+            return
+        self._broadcast_watermark(self.staging_allocator.get_watermark(), retry=True)
+
+    def _broadcast_watermark(self, post_wm, retry: bool = False) -> None:
         wm_round, wm_tail = post_wm
         wm_round_b = str(wm_round).encode("ascii")
         wm_tail_b = str(wm_tail).encode("ascii")
-        for _key, (receiver, session_id) in list(self._wm_subscribers.items()):
+        if retry:
+            targets = [
+                (key, entry)
+                for key, entry in list(self._wm_subscribers.items())
+                if key in self._wm_retry
+            ]
+        else:
+            targets = list(self._wm_subscribers.items())
+        self._wm_retry.difference_update(key for key, _entry in targets)
+
+        for key, (receiver, session_id) in targets:
             sid_b = session_id.encode("ascii")
             for bootstrap_info in receiver.bootstrap_infos:
+                # Reached from the scheduler loop (advance_scatter, and
+                # release_room on every teardown) over sockets that set no ZMQ
+                # send timeout, so it must never wait for a peer.
                 try:
                     sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
                     with lock:
                         sock.send_multipart(
-                            [b"WATERMARK", wm_round_b, wm_tail_b, sid_b]
+                            [b"WATERMARK", wm_round_b, wm_tail_b, sid_b], zmq.NOBLOCK
                         )
                 except Exception:
-                    pass
+                    # Retry the current value later rather than dropping it: this
+                    # may be the last release, with no later broadcast to
+                    # supersede it.
+                    self._wm_retry.add(key)
 
 
 def is_watermark_ready(

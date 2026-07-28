@@ -166,6 +166,14 @@ class HiCacheRestoreGatedKVReceiver:
             return KVPoll.Transferring
         return poll
 
+    # The transfer ownership barrier belongs to the wrapped receiver, which owns
+    # the KV pages; this wrapper only gates Success on HiCache restore.
+    def advance_failure_quiescence(self) -> bool:
+        return self.decode_req.kv_receiver.advance_failure_quiescence()
+
+    def is_failure_quiescing(self) -> bool:
+        return self.decode_req.kv_receiver.is_failure_quiescing()
+
 
 class DecodeHiCacheTransferMixin:
     """HiCache hooks for ``DecodeTransferQueue``: drive restore state machine."""
