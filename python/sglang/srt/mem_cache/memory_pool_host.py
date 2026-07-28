@@ -84,10 +84,6 @@ def _warn_ascend_hicache_mamba_fallback_once(reason: str) -> None:
     )
 
 
-def _ascend_hicache_mamba_transfer_debug_enabled() -> bool:
-    return os.getenv("SGLANG_HICACHE_TRANSFER_DEBUG", "0") == "1"
-
-
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -323,17 +319,9 @@ class MambaPoolHost(HostKVCache):
             device_states, _ = self._state_components(self.device_pool)
             logger.info(
                 "Ascend HiCache Mamba state transfer mode: native async "
-                "(requested=%s, components=%d, device_layouts=%s).",
+                "(requested=%s, components=%d).",
                 self.ascend_mamba_io_mode,
                 len(device_states),
-                [
-                    {
-                        "shape": tuple(state.shape),
-                        "stride": tuple(state.stride()),
-                        "contiguous": state.is_contiguous(),
-                    }
-                    for state in device_states
-                ],
             )
             return
 
@@ -354,21 +342,6 @@ class MambaPoolHost(HostKVCache):
         layer_count: int,
     ) -> None:
         device_states, host_states = self._state_components(device_pool)
-        if _ascend_hicache_mamba_transfer_debug_enabled():
-            bytes_per_slot = sum(
-                int(state[0, 0].numel() * state.element_size())
-                for state in device_states
-            )
-            logger.warning(
-                "Ascend HiCache Mamba async enqueue: direction=%s, slots=%d, "
-                "components=%d, layer_begin=%d, layer_count=%d, bytes=%d",
-                direction.name,
-                int(device_indices.numel()),
-                len(device_states),
-                layer_begin,
-                layer_count,
-                bytes_per_slot * int(device_indices.numel()) * layer_count,
-            )
         transfer_op = transfer_state_dim_exchange
         if transfer_op is None:
             raise RuntimeError(
