@@ -313,6 +313,16 @@ sglang serve \
 - Leave `--mm-attention-backend` unset — auto-selected, with a correctness fallback.
 - Don't add `--mm-enable-dp-encoder`; K3 already shards images across TP ranks.
 
+#### VLM compatibility
+
+| Feature | K3 behavior |
+|---|---|
+| PD | Supported. Image processing and ViT run on prefill; the PD transfer then moves both paged MLA KV and KDA recurrent state as described in [PD disaggregation](#pd-disaggregation). |
+| EPD | Supported on the public `kimi-k3` branch. Use an `--encoder-only` vision role and a `--language-only` prefill role; add the normal decode role for full EPD. See the [EPD guide](../../../docs/advanced_features/epd_disaggregation). |
+| MM encoder DP | Built in. K3 shards complete images across TP ranks, so leave `--mm-enable-dp-encoder` unset in unified, PD-prefill, and encoder-only roles. |
+| CUDA IPC | Compatible with the local processor-to-scheduler path on a single-node unified or PD-prefill role. It does not replace `--encoder-transfer-backend` for EPD or the PD KV/KDA transfer, and its bounded pool consumes HBM. |
+| ViT BCG | Compatible with unified and encoder-only roles, but recommended only for repeated encoder shapes after measuring the HBM trade-off below. |
+
 #### Should ViT BCG be enabled?
 
 Keep ViT BCG **off** for general serving; enable `SGLANG_VIT_ENABLE_CUDA_GRAPH=1` only for ViT-only / EPD encoder workloads with recurring image shapes and spare HBM.
