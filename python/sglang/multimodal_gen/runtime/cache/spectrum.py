@@ -329,9 +329,7 @@ class SpectrumMixin:
             return self.spectrum_forecaster_negative
         return self.spectrum_forecaster
 
-    def _set_spectrum_forecaster(
-        self, forecaster: Optional[SpectrumForecaster]
-    ) -> None:
+    def _set_spectrum_forecaster(self, forecaster: SpectrumForecaster) -> None:
         """Set forecaster for current branch (cond or uncond)."""
         if self.spectrum_is_cfg_negative and self._spectrum_supports_cfg_cache:
             self.spectrum_forecaster_negative = forecaster
@@ -495,7 +493,6 @@ class SpectrumMixin:
             cnt = 0
             consecutive = 0
             curr_ws = params.window_size
-            self._set_spectrum_forecaster(None)
 
         self._set_spectrum_branch_state(cnt, consecutive, curr_ws)
         return actual_forward
