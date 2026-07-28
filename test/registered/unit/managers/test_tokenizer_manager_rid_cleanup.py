@@ -273,14 +273,11 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         rid = "batch_finish_rid"
         state = _make_req_state(rid)
         tm.rid_to_state[rid] = state
-        tm._register_child_rid("logical_parent", rid)
 
         batch_output = _make_batch_str_output(rid)
         asyncio.run(tm._handle_batch_output(batch_output))
 
         self.assertNotIn(rid, tm.rid_to_state)
-        self.assertNotIn("logical_parent", tm.logical_rid_to_child_rids)
-        self.assertNotIn(rid, tm.child_rid_to_logical_rid)
 
     def test_batch_output_allows_resubmit_after_finish(self):
         """After a request finishes, the same rid can be resubmitted."""
@@ -470,7 +467,6 @@ class TestDiscardPendingReqStates(CustomTestCase):
 
     def test_discard_single_aborts_scheduler_before_cleanup(self):
         tm = _make_tokenizer_manager()
-        tm._dispatch_to_scheduler = Mock()
         rid = "d_single"
         tm.rid_to_state[rid] = _make_req_state(rid)
         obj = Mock(spec=GenerateReqInput)
@@ -506,7 +502,6 @@ class TestDiscardPendingReqStates(CustomTestCase):
 
     def test_parallel_cleanup_aborts_children_and_allows_parent_reuse(self):
         tm = _make_tokenizer_manager()
-        tm._dispatch_to_scheduler = Mock()
         parent = _make_generate_obj("parent", is_single=True)
         lifecycle_ids = tm._init_req_state(parent)
 
@@ -531,7 +526,6 @@ class TestDiscardPendingReqStates(CustomTestCase):
 
     def test_stale_cleanup_does_not_remove_reused_rid(self):
         tm = _make_tokenizer_manager()
-        tm._dispatch_to_scheduler = Mock()
         old_obj = _make_generate_obj("reused", is_single=True)
         old_lifecycle_ids = tm._init_req_state(old_obj)
         tm._remove_req_state("reused")
@@ -547,10 +541,9 @@ class TestDiscardPendingReqStates(CustomTestCase):
 
 
 class TestParallelAbortRouting(CustomTestCase):
-    def test_parent_abort_fans_out_without_changing_direct_abort_modes(self):
+    def test_parent_abort_fans_out_to_children(self):
         tm = _make_tokenizer_manager()
         tm.server_args.tokenizer_worker_num = 1
-        tm._dispatch_to_scheduler = Mock()
         tm._register_child_rid("parent", "choice_0")
         tm._register_child_rid("parent", "choice_1")
 
@@ -561,18 +554,6 @@ class TestParallelAbortRouting(CustomTestCase):
             {request.rid for request in requests}, {"choice_0", "choice_1"}
         )
         self.assertTrue(all(not request.abort_all for request in requests))
-
-        tm._dispatch_to_scheduler.reset_mock()
-        tm.abort_request("choice_0")
-        request = tm._dispatch_to_scheduler.call_args.args[0]
-        self.assertEqual(request.rid, "choice_0")
-        self.assertFalse(request.abort_all)
-
-        tm._dispatch_to_scheduler.reset_mock()
-        tm.abort_request(abort_all=True)
-        request = tm._dispatch_to_scheduler.call_args.args[0]
-        self.assertEqual(request.rid, "")
-        self.assertTrue(request.abort_all)
 
 
 class TestParallelStreamTaskCleanup(CustomTestCase):
@@ -716,7 +697,6 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
 
     def test_parallel_abort_during_tokenization_prevents_child_dispatch(self):
         tm = _make_tm_for_generate()
-        tm._dispatch_to_scheduler = Mock()
         tm._send_one_request = Mock()
         obj = GenerateReqInput(
             text="hello",

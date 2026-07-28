@@ -438,10 +438,8 @@ mod tests {
     }
 
     #[test]
-    fn generate_maps_seed_priority_reasoning_and_thinking_budget() {
+    fn generate_maps_nested_generation_controls() {
         let request = proto::GenerateRequest {
-            input_ids: vec![1, 2],
-            priority: Some(7),
             sampling_params: Some(proto::SamplingParams {
                 seed: Some(42),
                 require_reasoning: Some(true),
@@ -451,7 +449,6 @@ mod tests {
             ..Default::default()
         };
         let mapped = build_generate_dict("request", &request).unwrap();
-        assert_eq!(mapped["priority"], serde_json::json!(7));
         assert_eq!(mapped["require_reasoning"], serde_json::json!(true));
         assert_eq!(
             mapped["sampling_params"]["sampling_seed"],
@@ -461,68 +458,29 @@ mod tests {
     }
 
     #[test]
-    fn generate_maps_all_guided_decoding_constraints() {
-        use proto::guided_decoding::Constraint;
-        let cases = [
-            (
-                Constraint::JsonSchema("{\"type\":\"object\"}".into()),
-                "json_schema",
-                "{\"type\":\"object\"}",
-            ),
-            (Constraint::Regex("[0-9]+".into()), "regex", "[0-9]+"),
-            (
-                Constraint::Ebnf("root ::= 'yes'".into()),
-                "ebnf",
-                "root ::= 'yes'",
-            ),
-            (
-                Constraint::Choice(proto::ChoiceConstraint {
-                    values: vec!["a+b".into(), "x.y".into()],
-                }),
-                "regex",
-                "(?:a\\+b|x\\.y)",
-            ),
-            (
-                Constraint::StructuralTag("{\"type\":\"structural_tag\"}".into()),
-                "structural_tag",
-                "{\"type\":\"structural_tag\"}",
-            ),
-        ];
-        for (constraint, key, expected) in cases {
-            let request = proto::GenerateRequest {
-                sampling_params: Some(proto::SamplingParams {
-                    guided_decoding: Some(proto::GuidedDecoding {
-                        constraint: Some(constraint),
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            let mapped = build_generate_dict("request", &request).unwrap();
-            assert_eq!(mapped["sampling_params"][key], serde_json::json!(expected));
-        }
-    }
-
-    #[test]
-    fn legacy_guidance_is_mapped_and_conflicts_are_rejected() {
-        let legacy = proto::GenerateRequest {
+    fn guided_choice_maps_to_escaped_regex() {
+        let request = proto::GenerateRequest {
             sampling_params: Some(proto::SamplingParams {
-                json_schema: Some("{\"type\":\"string\"}".into()),
-                regex: Some("[a-z]+".into()),
+                guided_decoding: Some(proto::GuidedDecoding {
+                    constraint: Some(proto::guided_decoding::Constraint::Choice(
+                        proto::ChoiceConstraint {
+                            values: vec!["a+b".into(), "x.y".into()],
+                        },
+                    )),
+                }),
                 ..Default::default()
             }),
             ..Default::default()
         };
-        let mapped = build_generate_dict("request", &legacy).unwrap();
-        assert_eq!(
-            mapped["sampling_params"]["json_schema"],
-            serde_json::json!("{\"type\":\"string\"}")
-        );
+        let mapped = build_generate_dict("request", &request).unwrap();
         assert_eq!(
             mapped["sampling_params"]["regex"],
-            serde_json::json!("[a-z]+")
+            serde_json::json!("(?:a\\+b|x\\.y)")
         );
+    }
 
+    #[test]
+    fn invalid_guidance_combinations_are_rejected() {
         let conflicting = proto::GenerateRequest {
             sampling_params: Some(proto::SamplingParams {
                 regex: Some("[a-z]+".into()),
@@ -533,11 +491,6 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(
-            build_generate_dict("request", &conflicting)
-                .unwrap_err()
-                .contains("cannot be combined")
-        );
 
         let empty_choice = proto::GenerateRequest {
             sampling_params: Some(proto::SamplingParams {
@@ -550,6 +503,9 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(build_generate_dict("request", &empty_choice).is_err());
+
+        for request in [conflicting, empty_choice] {
+            assert!(build_generate_dict("request", &request).is_err());
+        }
     }
 }

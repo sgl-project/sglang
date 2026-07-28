@@ -264,6 +264,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req.modalities, ["image", "image", "image"])
 
     def test_parallel_sampling_keeps_one_logical_rid_per_prompt(self):
+        """Test logical RID and reasoning control preservation across parallel samples."""
         single = GenerateReqInput(
             text="Hello",
             rid="single",
@@ -637,6 +638,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req.rid, new_rid)
 
     def test_regenerate_rid_with_parent_prefix(self):
+        """Test RID regeneration with a logical parent prefix."""
         req = GenerateReqInput(text="Hello", rid="logical")
         req.normalize_batch_and_arguments()
 
