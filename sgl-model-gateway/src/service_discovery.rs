@@ -342,15 +342,28 @@ pub async fn start_service_discovery(
         // cadence, independent of watch health. `time::interval` fires
         // immediately, so the first reconcile also seeds the worker set at
         // startup.
+        //
+        // Both this timer and the watch-restart path below drive reconciles,
+        // so they share a lock (taken inside `reconcile_from_list`) to keep
+        // the passes from interleaving.
+        let reconcile_lock = Arc::new(tokio::sync::Mutex::new(()));
         {
             let pods_resync = pods.clone();
             let config_resync = Arc::clone(&config_arc);
             let tracked_resync = Arc::clone(&tracked_pods);
             let app_context_resync = Arc::clone(&app_context);
+            let lock_resync = Arc::clone(&reconcile_lock);
             // Clamp to >= 1s: time::interval panics on a zero period.
             let resync_period = config_arc.resync_interval.max(Duration::from_secs(1));
             tokio::spawn(async move {
                 let mut ticker = time::interval(resync_period);
+                // Delay, not the default Burst: if a LIST ever takes longer
+                // than the period, Burst fires every missed tick with no gap,
+                // so a slow API server would be answered with back-to-back
+                // cluster-wide LISTs — a feedback loop that cannot recover on
+                // its own. Delay keeps consecutive reconciles at least
+                // `resync_period` apart no matter how slow the LIST is.
+                ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
                 loop {
                     ticker.tick().await;
                     reconcile_from_list(
@@ -359,6 +372,7 @@ pub async fn start_service_discovery(
                         Arc::clone(&tracked_resync),
                         Arc::clone(&app_context_resync),
                         config_resync.port,
+                        &lock_resync,
                     )
                     .await;
                 }
@@ -378,6 +392,7 @@ pub async fn start_service_discovery(
                 Arc::clone(&tracked_pods),
                 Arc::clone(&app_context),
                 port,
+                &reconcile_lock,
             )
             .await;
 
@@ -683,7 +698,28 @@ async fn reconcile_from_list(
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
     app_context: Arc<AppContext>,
     port: u16,
+    reconcile_lock: &tokio::sync::Mutex<()>,
 ) {
+    // One reconcile at a time. The periodic timer and the watch-restart path
+    // both call this, and letting two passes interleave lets the one holding
+    // the older LIST snapshot delete a pod the newer one has just added.
+    let _guard = reconcile_lock.lock().await;
+
+    // Snapshot the tracked set BEFORE issuing the LIST; only pods that were
+    // already tracked at that instant are eligible for removal below. The
+    // watch runs concurrently, so a pod it registers while the LIST is in
+    // flight is legitimately missing from the response through no fault of
+    // its own. Removing it would open exactly the zero-worker window this
+    // reconcile exists to close, and the watch would not re-emit an Apply to
+    // repair it — the pod would stay unregistered until the next resync.
+    let tracked_before: HashSet<PodInfo> = match tracked_pods.lock() {
+        Ok(tracker) => tracker.clone(),
+        Err(e) => {
+            error!("SD resync: failed to lock tracked_pods: {}", e);
+            return;
+        }
+    };
+
     // Same client-side filtering as the watch (Config::default() => no server
     // label filter); we match via should_include below.
     let list = match pods.list(&ListParams::default()).await {
@@ -729,17 +765,12 @@ async fn reconcile_from_list(
         }
     }
 
-    // Remove-absent: any tracked pod whose name is no longer in the API.
-    // Iterate the STORED PodInfo values so handle_pod_deletion's exact-struct
-    // `tracked.remove(pod_info)` always matches.
-    let stale: Vec<PodInfo> = match tracked_pods.lock() {
-        Ok(tracker) => stale_tracked_pods(&tracker, &present),
-        Err(e) => {
-            error!("SD resync: failed to lock tracked_pods: {}", e);
-            return;
-        }
-    };
-    for pod_info in stale {
+    // Remove-absent: any pod tracked before the LIST whose name is no longer
+    // in the API. Iterate the STORED PodInfo values so handle_pod_deletion's
+    // exact-struct `tracked.remove(pod_info)` always matches; that call also
+    // re-checks membership under the lock, so a pod the watch removed in the
+    // meantime is a no-op rather than a duplicate deregistration.
+    for pod_info in stale_tracked_pods(&tracked_before, &present) {
         handle_pod_deletion(
             &pod_info,
             Arc::clone(&tracked_pods),
