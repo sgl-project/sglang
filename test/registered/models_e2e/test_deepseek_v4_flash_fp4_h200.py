@@ -99,11 +99,13 @@ class TestDSV4FlashFP4H200FlashInferCutlass(
     GSM8KMixin,
     CustomTestCase,
 ):
-    """FlashInfer SM90 mixed-input cutlass MXFP4 backend (this PR): TP=4 + EAGLE.
+    """FlashInfer MXFP4 with EAGLE and mixed DP/TP attention on eight H200s.
 
     Mirrors :class:`TestDSV4FlashFP4H200` but swaps `--moe-runner-backend marlin`
     for `flashinfer_mxfp4`, exercising the SM90 cutlass path from FlashInfer PR
-    #3084 end-to-end on a real DSv4-Flash checkpoint.
+    #3084 end-to-end on a real DSv4-Flash checkpoint. TP8/DP4 gives attention
+    TP2, covering replicated post-attention gathers in both the base model and
+    the EAGLE NextN path.
     """
 
     gsm8k_accuracy_thres = 0.93
@@ -121,7 +123,11 @@ class TestDSV4FlashFP4H200FlashInferCutlass(
             other_args=[
                 "--trust-remote-code",
                 "--tp",
+                "8",
+                "--dp",
                 "4",
+                "--enable-dp-attention",
+                "--enable-dp-lm-head",
                 "--moe-runner-backend",
                 "flashinfer_mxfp4",
                 "--speculative-algorithm",

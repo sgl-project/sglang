@@ -14,7 +14,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.dp_attention import (
-    dp_gather_partial,
+    dp_gather_replicate,
     get_global_dp_buffer_len,
     is_dp_attention_enabled,
 )
@@ -162,7 +162,11 @@ class DeepseekV4ModelNextN(nn.Module):
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
-            dp_gather_partial(input_ids_global, input_ids[:, None], forward_batch)
+            # Input ids are replicated across attention TP ranks. Clone the view
+            # because the MAX_LEN gather may clear its local input in place.
+            dp_gather_replicate(
+                input_ids_global, input_ids[:, None].clone(), forward_batch
+            )
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = input_ids
