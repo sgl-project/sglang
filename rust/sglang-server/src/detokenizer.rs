@@ -1,7 +1,7 @@
 //! Detokenizer shards — CPU-bound, one pinned thread per shard.
 //!
 //! Each shard owns a *local* `rid -> DetokState` map. There is no lock: a given
-//! rid is routed to exactly one shard (by `RidHash::shard`) for both its
+//! rid is routed to exactly one shard (by `Rid::shard`) for both its
 //! `Register` and all its `Chunk`s, so the map has a single accessor.
 //!
 //! The hash PARTITIONS, the rid IDENTIFIES. Keying the map by the hash meant two
@@ -464,7 +464,7 @@ mod tests {
     }
 
     /// Two requests on the SAME shard keep separate entries. This is what a
-    /// `RidHash` collision now degrades to: the hash partitions, the rid
+    /// A shard-hash collision now degrades to: the hash partitions, the rid
     /// identifies. Keying the table by the hash made colliding rids one entry, so
     /// `Register` evicted the first client's sink and their tokens were written to
     /// the second client's connection. A single shard forces co-location

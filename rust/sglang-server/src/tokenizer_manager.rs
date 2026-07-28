@@ -39,29 +39,20 @@ pub enum TmEvent {
 }
 
 /// Producer-side handles, cloned into every stage that needs to emit.
-/// Client-visible rids currently in flight. Shared by the api server (which
-/// admits a rid) and ingress (which releases it once its abort has taken effect).
-pub type LiveRids = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Rid>>>;
-
-/// Who asked for an abort — which decides who releases the rid.
+/// Who asked for an abort. Both variants do the same work in
+/// [`Ingress::on_abort`](crate::tokenizer_manager::ingress::Ingress) — deregister
+/// the detok entry, tell the scheduler to stop — and the source is kept for
+/// diagnostics.
 ///
-/// The registry entry must have exactly ONE owner. `AbortGuard` is that owner: it
-/// releases a rid directly when the request finished naturally, and delegates to
-/// [`Ingress::on_abort`](crate::tokenizer_manager::ingress::Ingress) for a rid it
-/// aborted, so the release lands after the deregister and the ring push rather
-/// than after the mere enqueue.
-///
-/// The detokenizer also issues aborts (a failed request, a decoder error, a full
-/// sink), and those must NOT release: the handler's guard is still armed and still
-/// owns the entry. Releasing there admitted a retry while the original guard was
-/// live, and the guard's later abort — or its later release — then tore the retry
-/// down or opened a second admission slot for a third request that overwrote its
-/// detok sink.
+/// There is no in-flight rid registry to keep consistent, and so no release
+/// ordering to get wrong: [`Rid::from_client`] makes every client-supplied rid
+/// internally unique, so a resubmit of the "same" rid is a different `Rid` and
+/// cannot be tangled up with an abort still in flight for the original.
 #[derive(Clone, Debug)]
 pub enum AbortSource {
     /// From an `AbortGuard` drop. Owns the release.
     Guard(Rid),
-    /// From a detokenizer terminal path. Aborts the scheduler work; releases nothing.
+    /// From a detokenizer terminal path. Aborts the scheduler work.
     Detok(Rid),
 }
 
@@ -90,7 +81,7 @@ pub struct Senders {
     pub abort: flume::Sender<AbortSource>,
     /// → Tokenizer pool (CPU-bound, pinned threads).
     pub tok: flume::Sender<Request>,
-    /// → Detokenizer shards, indexed by `RidHash::shard(detok.len())`.
+    /// → Detokenizer shards, indexed by `Rid::shard(detok.len())`.
     pub detok: Vec<flume::Sender<DetokMsg>>,
 }
 

@@ -101,7 +101,7 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
         };
     // Deregister on drop (never disarmed): a busy-skipped probe has no terminal
     // frame, so without this abort it leaks one detok entry per call.
-    let _abort_guard = AbortGuard::new(state.senders.clone(), state.live_rids.clone(), rid);
+    let _abort_guard = AbortGuard::new(state.senders.clone(), rid);
 
     // Watch the heartbeat advance (timeout frozen at router build, default 20s).
     let deadline = tokio::time::Instant::now() + timeout;
@@ -197,11 +197,7 @@ async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -
     // Abort on client disconnect: the guard fires when dropped before the request
     // finishes (axum drops the handler/SSE stream). Disarmed on a natural terminal.
     // `rid_str` is the response `meta_info.id`, reused for every frame.
-    let mut guard = AbortGuard::new(
-        state.senders.clone(),
-        state.live_rids.clone(),
-        rid_str.clone(),
-    );
+    let mut guard = AbortGuard::new(state.senders.clone(), rid_str.clone());
     // Cumulative frames (SGLang default) vs per-step deltas.
     let incremental = state.server_args.incremental_streaming_output;
 
@@ -215,7 +211,7 @@ async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -
     } else {
         // Unary: fold to the terminal, respond once. Disarm only on a real terminal
         // (a truncation leaves the guard armed so the scheduler work is aborted).
-        let (status, value, terminal) = drain_unary(&mut rx, &rid_str).await;
+        let (status, value, terminal) = drain_unary(&mut rx, rid_str.client_facing()).await;
         if terminal {
             guard.disarm(&rid_str);
         }
@@ -280,22 +276,10 @@ async fn generate_batch(
     requests: Vec<GenerateRequest>,
     stream: bool,
 ) -> Response {
-    // Reject the WHOLE batch before dispatching any of it. `submit` checks one rid
-    // at a time, so a collision at item k left items 0..k already handed to the
-    // scheduler — the client sees a 400 while that prefix keeps generating, and
-    // (until the abort lane landed) could leak their rids too. Python validates
-    // every request before it creates any.
-    {
-        let live = state.live_rids.lock().expect("live_rids poisoned");
-        if let Some(dup) = requests.iter().find(|r| live.contains(&r.rid)) {
-            return pre_submit_error(
-                StatusCode::BAD_REQUEST,
-                &format!("Duplicate request ID detected: {}", dup.rid),
-                stream,
-            );
-        }
-    }
-    let mut guard = AbortGuard::new_empty(state.senders.clone(), state.live_rids.clone());
+    // No cross-item rid collision to worry about: `into_requests` rejected duplicate
+    // rids within this batch, and `Rid::from_client` made each one unique against
+    // every other in-flight request.
+    let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut receivers = Vec::with_capacity(requests.len());
     for req in requests {
         match submit(state, RequestKind::Generate(Box::new(req)), stream).await {
@@ -319,7 +303,7 @@ async fn generate_batch(
         // Unary: drain each in order (already all submitted, so they run together).
         let mut results = Vec::with_capacity(receivers.len());
         for (rid_str, mut rx) in receivers {
-            let (_status, value, terminal) = drain_unary(&mut rx, &rid_str).await;
+            let (_status, value, terminal) = drain_unary(&mut rx, rid_str.client_facing()).await;
             if terminal {
                 guard.disarm(&rid_str);
             }
@@ -393,7 +377,7 @@ fn generation_event_stream(
                     EgressItem::Frame(out) => {
                         accs[i].fold(&out);
                         if incremental {
-                            yield stream_frame_string(out, &accs[i], true, &rid_strs[i], idx(i));
+                            yield stream_frame_string(out, &accs[i], true, rid_strs[i].client_facing(), idx(i));
                         } else {
                             coalesced = true;
                         }
@@ -415,12 +399,12 @@ fn generation_event_stream(
                 // carries the full cumulative state, so any coalesced ones are moot.
                 yield match out.finish_reason.as_ref().and_then(|f| f.abort_status()) {
                     Some((code, message)) => tag_value(error_value(code, message), idx(i)),
-                    None => stream_frame_string(out, &accs[i], incremental, &rid_strs[i], idx(i)),
+                    None => stream_frame_string(out, &accs[i], incremental, rid_strs[i].client_facing(), idx(i)),
                 };
                 guard.disarm(&rid_strs[i]); // terminal → not re-pushed
             } else {
                 if coalesced {
-                    yield cumulative_frame_string(&accs[i], &rid_strs[i], idx(i));
+                    yield cumulative_frame_string(&accs[i], rid_strs[i].client_facing(), idx(i));
                 }
                 futs.push(recv_indexed(i, rx)); // keep this item flowing
             }
@@ -477,12 +461,8 @@ mod tests {
         let (tx0, rx0) = mpsc::channel(8);
         let (tx1, rx1) = mpsc::channel(8);
         let receivers = vec![("10".into(), rx0), ("11".into(), rx1)];
-        let stream = generation_event_stream(
-            receivers,
-            AbortGuard::new_empty(senders(), Default::default()),
-            false,
-            true,
-        );
+        let stream =
+            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
         futures::pin_mut!(stream);
 
         // Drive deterministically: exactly one channel has data before each poll.
@@ -518,12 +498,8 @@ mod tests {
         let (tx0, rx0) = mpsc::channel(8);
         let (tx1, rx1) = mpsc::channel(8);
         let receivers = vec![("10".into(), rx0), ("11".into(), rx1)];
-        let stream = generation_event_stream(
-            receivers,
-            AbortGuard::new_empty(senders(), Default::default()),
-            false,
-            true,
-        );
+        let stream =
+            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
         futures::pin_mut!(stream);
 
         tx0.send(EgressItem::Error(crate::error::Error::Validation(
@@ -548,12 +524,8 @@ mod tests {
     async fn incremental_emits_deltas_with_cumulative_count() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![("10".into(), rx)];
-        let stream = generation_event_stream(
-            receivers,
-            AbortGuard::new_empty(senders(), Default::default()),
-            true,
-            true,
-        );
+        let stream =
+            generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, true);
         futures::pin_mut!(stream);
 
         tx.send(frame(10, "Hello")).await.unwrap();
@@ -584,12 +556,8 @@ mod tests {
     async fn single_shape_omits_index() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![("10".into(), rx)];
-        let stream = generation_event_stream(
-            receivers,
-            AbortGuard::new_empty(senders(), Default::default()),
-            false,
-            false,
-        );
+        let stream =
+            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
         futures::pin_mut!(stream);
 
         tx.send(done(10, "hi")).await.unwrap();
@@ -608,12 +576,8 @@ mod tests {
     async fn cumulative_backlog_coalesces_to_latest() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![("10".into(), rx)];
-        let stream = generation_event_stream(
-            receivers,
-            AbortGuard::new_empty(senders(), Default::default()),
-            false,
-            false,
-        );
+        let stream =
+            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
         futures::pin_mut!(stream);
 
         // Three chunks queued before the stream is ever polled (a client falling behind).
@@ -639,12 +603,8 @@ mod tests {
     async fn incremental_backlog_emits_every_delta() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![("10".into(), rx)];
-        let stream = generation_event_stream(
-            receivers,
-            AbortGuard::new_empty(senders(), Default::default()),
-            true,
-            false,
-        );
+        let stream =
+            generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, false);
         futures::pin_mut!(stream);
 
         tx.send(frame(10, "a")).await.unwrap();

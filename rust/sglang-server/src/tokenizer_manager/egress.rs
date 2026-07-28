@@ -1,6 +1,6 @@
 //! TokenizerManager egress thread — drains the egress ring (scheduler output
 //! pushed from Python) and routes each message to the detok shard that owns its
-//! `RidHash`. Routing is a pure function of the rid, so it matches the shard
+//! `Rid::shard`. Routing is a pure function of the rid, so it matches the shard
 //! the request registered with on ingress — no shared map, no lock.
 //!
 //! The ring carries a 1-byte frame tag: `BATCH` (a whole decode batch, fanned

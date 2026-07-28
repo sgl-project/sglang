@@ -119,7 +119,7 @@ pub fn frame_egress_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
 pub struct BatchHeader {
     /// Request ids, as the same strings Python holds (`Req.rid`, uuid hex) —
     /// hashed back to the internal routing key in `decode_one`
-    /// (`RidHash::from_rid`), mirroring the control path. The wire has no
+    /// (`Rid::shard`), mirroring the control path. The wire has no
     /// rid-shape coupling; any string is a valid rid.
     pub rids: Vec<String>,
     pub finish_reasons: Vec<Option<FinishReason>>,
@@ -519,7 +519,7 @@ pub fn frame_egress_error(rid: &str, message: &str) -> Bytes {
 pub struct ChunkEvent {
     /// Client-visible rid — the request's IDENTITY. Moved out of the frame header
     /// (which owns it and drops it), so carrying it costs no allocation. The shard
-    /// is still chosen by `RidHash::from_rid`, but a hash collision there now only
+    /// is still chosen by `Rid::shard`, but a hash collision there now only
     /// co-locates two requests instead of merging them.
     pub rid: Rid,
     /// New token ids for this step. Empty allowed (e.g. metadata-only frames).
@@ -1021,7 +1021,7 @@ mod tests {
     }
 
     /// Two DISTINCT rids that hash to the same shard must stay separate requests.
-    /// Identity is the rid string now, so a `RidHash` collision can only co-locate
+    /// Identity is the rid string now, so a shard-hash collision can only co-locate
     /// them — it can no longer merge their `DetokState`, which used to evict one
     /// client's sink and deliver their tokens to the other's connection.
     #[test]
