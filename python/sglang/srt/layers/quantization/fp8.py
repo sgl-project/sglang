@@ -1971,12 +1971,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # kernel consumes gate/up-interleaved pre-shuffled weights + correspondingly
         # shuffled 1x32 scales, and (with MoeRunner passing ActivationType.Swiglu +
         # swiglu_limit) computes the clamped SwiGLU. Shuffle here for the aiter runner;
-        # other runners (triton/cutlass/deepgemm) keep the canonical layout.
+        # other runners (triton/cutlass/deepgemm) keep the canonical layout. Gate on
+        # use_mxfp8 so non-MXFP8 experts (e.g. block-fp8) that select the aiter runner
+        # keep the canonical layout instead of this per-1x32 gate/up shuffle.
         _moe_runner_is_aiter = (
             getattr(self, "runner", None) is not None
             and self.runner.runner_backend.is_aiter()
         )
-        if _use_aiter and _moe_runner_is_aiter:
+        if _use_aiter and _moe_runner_is_aiter and self.use_mxfp8:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
             for _sn, _is_w13 in (
                 ("w13_weight_scale_inv", True),
