@@ -9,6 +9,185 @@ keywords:
 mode: wide
 ---
 
+<div className="not-prose">
+  <div
+    style={{
+      position: "relative",
+      overflow: "hidden",
+      marginBottom: "1.5rem",
+      padding: "clamp(1.5rem, 4vw, 2.5rem)",
+      border: "1px solid rgba(251, 146, 60, 0.35)",
+      borderRadius: "1rem",
+      background:
+        "linear-gradient(135deg, #111827 0%, #31202f 58%, #9a3412 100%)",
+      boxShadow: "0 20px 45px rgba(17, 24, 39, 0.18)",
+      color: "#ffffff",
+    }}
+  >
+    <div
+      aria-hidden="true"
+      style={{
+        position: "absolute",
+        top: "-7rem",
+        right: "-5rem",
+        width: "18rem",
+        height: "18rem",
+        borderRadius: "999px",
+        background: "rgba(251, 146, 60, 0.18)",
+        filter: "blur(2px)",
+      }}
+    />
+    <div
+      style={{
+        position: "relative",
+        zIndex: 1,
+        display: "flex",
+        flexWrap: "wrap",
+        alignItems: "center",
+        gap: "clamp(1.25rem, 3vw, 2rem)",
+      }}
+    >
+      <div style={{ flex: "1 1 24rem", minWidth: 0 }}>
+        <div
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "0.45rem",
+            marginBottom: "0.9rem",
+            padding: "0.35rem 0.7rem",
+            border: "1px solid rgba(255, 255, 255, 0.28)",
+            borderRadius: "999px",
+            background: "rgba(255, 255, 255, 0.1)",
+            fontSize: "0.72rem",
+            fontWeight: 750,
+            letterSpacing: "0.08em",
+            textTransform: "uppercase",
+          }}
+        >
+          <span aria-hidden="true">✦</span>
+          Featured model · New
+        </div>
+        <a
+          href="/cookbook/autoregressive/Moonshotai/Kimi-K3"
+          style={{
+            display: "block",
+            margin: 0,
+            color: "#ffffff",
+            fontSize: "clamp(1.75rem, 4vw, 2.65rem)",
+            fontWeight: 750,
+            lineHeight: 1.08,
+            letterSpacing: "-0.035em",
+            textDecoration: "none",
+          }}
+        >
+          Meet Kimi-K3 on SGLang
+        </a>
+        <p
+          style={{
+            maxWidth: "48rem",
+            margin: "1rem 0 0",
+            color: "rgba(255, 255, 255, 0.82)",
+            fontSize: "1rem",
+            lineHeight: 1.65,
+          }}
+        >
+          SGLang natively implements and deeply optimizes K3's new architecture
+          with fused KDA decode kernels, DP attention, MTP, PD disaggregation,
+          and KDA-aware prefix caching. Kimi-K3 is supported on both NVIDIA and
+          AMD GPUs.
+        </p>
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "0.5rem",
+            marginTop: "1.15rem",
+          }}
+        >
+          {[
+            "2.8T parameters",
+            "Fused KDA decode",
+            "NVIDIA + AMD",
+          ].map((item) => (
+            <span
+              key={item}
+              style={{
+                padding: "0.35rem 0.65rem",
+                borderRadius: "999px",
+                background: "rgba(255, 255, 255, 0.1)",
+                color: "rgba(255, 255, 255, 0.9)",
+                fontSize: "0.78rem",
+                fontWeight: 650,
+              }}
+            >
+              {item}
+            </span>
+          ))}
+        </div>
+        <a
+          href="/cookbook/autoregressive/Moonshotai/Kimi-K3"
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            marginTop: "1.35rem",
+            padding: "0.7rem 1rem",
+            borderRadius: "0.55rem",
+            background: "#ffffff",
+            color: "#7c2d12",
+            fontSize: "0.88rem",
+            fontWeight: 750,
+            textDecoration: "none",
+          }}
+        >
+          Open the Kimi-K3 cookbook&nbsp;→
+        </a>
+      </div>
+      <a
+        href="/cookbook/autoregressive/Moonshotai/Kimi-K3"
+        aria-label="Open the Kimi-K3 cookbook"
+        style={{
+          flex: "0 1 12rem",
+          minWidth: "10rem",
+          padding: "0.8rem",
+          border: "1px solid rgba(255, 255, 255, 0.22)",
+          borderRadius: "0.9rem",
+          background: "rgba(255, 255, 255, 0.96)",
+          boxShadow: "0 16px 35px rgba(0, 0, 0, 0.22)",
+          textDecoration: "none",
+        }}
+      >
+        <div
+          role="img"
+          aria-label="Moonshot AI"
+          style={{
+            width: "100%",
+            aspectRatio: "16 / 9",
+            borderRadius: "0.45rem",
+            backgroundColor: "#ffffff",
+            backgroundImage: "url('/cards/logos/moonshotai.png')",
+            backgroundPosition: "center",
+            backgroundRepeat: "no-repeat",
+            backgroundSize: "cover",
+          }}
+        />
+        <div
+          style={{
+            padding: "0.65rem 0.35rem 0.2rem",
+            color: "#111827",
+            textAlign: "center",
+            fontSize: "0.78rem",
+            fontWeight: 750,
+            letterSpacing: "0.06em",
+            textTransform: "uppercase",
+          }}
+        >
+          Kimi-K3 deployment guide
+        </div>
+      </a>
+    </div>
+  </div>
+</div>
+
 <a
   class="github-button"
   href="https://github.com/sgl-project/sglang"
@@ -82,6 +261,116 @@ It is designed to deliver low-latency and high-throughput inference across a wid
       alignItems: "stretch",
     }}
   >
+    <a
+      href="https://lmsys.org/blog/2026-07-27-kimi-k3-day0-support/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/kimi-k3-day0-support/cover-kimi-k3.png"
+          alt="SGLang and Miles Add Day-0 Support for Kimi K3"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"SGLang and Miles Add Day-0 Support for Kimi K3"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"July 27, 2026"}
+        </p>
+      </div>
+    </a>
+    <a
+      href="https://lmsys.org/blog/2026-07-18-opd-support-in-miles/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/opd-support-in-miles/figure-1.png"
+          alt="OPD Support in Miles"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"OPD Support in Miles"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"July 18, 2026"}
+        </p>
+      </div>
+    </a>
     <a
       href="https://lmsys.org/blog/2026-07-15-inkling-day0-support/"
       target="_blank"
@@ -299,116 +588,6 @@ It is designed to deliver low-latency and high-throughput inference across a wid
           }}
         >
           {"July 6, 2026"}
-        </p>
-      </div>
-    </a>
-    <a
-      href="https://lmsys.org/blog/2026-07-02-agent-assisted-sglang-development/"
-      target="_blank"
-      rel="noopener noreferrer"
-      style={{
-        display: "block",
-        border: "1px solid rgba(128, 128, 128, 0.3)",
-        borderRadius: "0.75rem",
-        overflow: "hidden",
-        textDecoration: "none",
-        color: "inherit",
-        height: "100%",
-      }}
-    >
-      <div
-        style={{
-          aspectRatio: "16 / 9",
-          overflow: "hidden",
-          background: "rgba(128, 128, 128, 0.15)",
-        }}
-      >
-        <img
-          src="https://lmsys.org/images/blog/agent-assisted-sglang-development/sglang-agent-cover.png"
-          alt="Agent-Assisted SGLang Development: An Initial Exploration"
-          style={{
-            width: "100%",
-            height: "100%",
-            objectFit: "cover",
-            objectPosition: "center",
-            display: "block",
-          }}
-        />
-      </div>
-      <div style={{ padding: "0.9rem 1rem 1rem" }}>
-        <p
-          style={{
-            margin: 0,
-            fontWeight: 600,
-            lineHeight: 1.35,
-            fontSize: "0.98rem",
-          }}
-        >
-          {"Agent-Assisted SGLang Development: An Initial Exploration"}
-        </p>
-        <p
-          style={{
-            margin: "0.55rem 0 0",
-            fontSize: "0.85rem",
-            opacity: 0.75,
-          }}
-        >
-          {"July 2, 2026"}
-        </p>
-      </div>
-    </a>
-    <a
-      href="https://lmsys.org/blog/2026-06-27-netpreme-xmem/"
-      target="_blank"
-      rel="noopener noreferrer"
-      style={{
-        display: "block",
-        border: "1px solid rgba(128, 128, 128, 0.3)",
-        borderRadius: "0.75rem",
-        overflow: "hidden",
-        textDecoration: "none",
-        color: "inherit",
-        height: "100%",
-      }}
-    >
-      <div
-        style={{
-          aspectRatio: "16 / 9",
-          overflow: "hidden",
-          background: "rgba(128, 128, 128, 0.15)",
-        }}
-      >
-        <img
-          src="https://lmsys.org/images/blog/netpreme-xmem/figure1.png"
-          alt="Accelerating SGLang HiCache with Netpreme X-Mem\u2122 MPU"
-          style={{
-            width: "100%",
-            height: "100%",
-            objectFit: "cover",
-            objectPosition: "center",
-            display: "block",
-          }}
-        />
-      </div>
-      <div style={{ padding: "0.9rem 1rem 1rem" }}>
-        <p
-          style={{
-            margin: 0,
-            fontWeight: 600,
-            lineHeight: 1.35,
-            fontSize: "0.98rem",
-          }}
-        >
-          {"Accelerating SGLang HiCache with Netpreme X-Mem\u2122 MPU"}
-        </p>
-        <p
-          style={{
-            margin: "0.55rem 0 0",
-            fontSize: "0.85rem",
-            opacity: 0.75,
-          }}
-        >
-          {"July 8, 2026"}
         </p>
       </div>
     </a>
