@@ -28,7 +28,7 @@ use v0.5.13 or a later version.
 | Data Parallelism              | `--dp-size 8`                                                                                 |
 | Expert Parallelism            | `--ep-size 16 \`<br/>`--moe-a2a-backend deepep \`<br/>`--deepep-mode auto`                     |
 | Quantization                  | `--quantization modelslim`                                                                    |
-| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs`; e.g. `--cuda-graph-bs 2 4 6 8 10 12 14 16 18 20` |
+| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs 2 4 6 8 10 12 14 16 18 20` |
 | Speculative Decoding          | `--speculative-algorithm NEXTN \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
@@ -45,23 +45,40 @@ see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_opti
 
 ## Prerequisites
 
+### Environment
+
+Before following this tutorial, complete the environment setup in the documents below:
+
+- [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start) — the fastest way to get started.
+  It walks you through launching the official container image, starting the SGLang server, and sending a test request.
+  Recommended if you are new to SGLang on Ascend.
+- [SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/ascend_npu) — the full installation guide.
+  It covers the component version mapping (CANN, TorchNPU, Triton, kernels, etc.), building from source or from a
+  Dockerfile, and recommended system settings (CPU power scheme, NUMA, swap). Use it when you need to install or customize
+  the environment instead of using the official image.
+
 ### Model weights
 
-<Warning>
-If you need to download model weights, check the model size before downloading to reserve enough space.
-</Warning>
+Before downloading model weights, check the model size to reserve enough disk space.
+For multi-node deployment, download the weights to a shared directory accessible to all nodes.
 
-- [Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp](https://www.modelscope.cn/models/Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp) (W4A8 quantized version with MTP)
+- [Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp](https://www.modelscope.cn/models/Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp) (W4A8 quantized version with MTP, 235.88GB)
 
-Ensure the available device memory exceeds the model weight size before deployment. For optimal throughput and latency,
-refer to the [best practice configurations](#best-practices) which may require additional nodes or cards.
+<Info>
+The W4A8 variant (235.88GB) can be deployed on 8 × 64GB of device memory (`--tp-size 8`), which corresponds to one full A2
+node or 8 dies on A3 (4 cards).
+</Info>
 
-It is recommended to download the model weights to a shared directory across multiple nodes.
+This is the minimum recommended configuration. For optimized configurations,
+see [Best practices](#best-practices), which may require additional cards or nodes.
+
+For the hardware specifications (memory per die, dies per card, and the difference between A2 and A3),
+see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware).
 
 ## Installation
 
 <Warning>
-Ensure sufficient disk space before pulling images. The Docker image requires at least **30 GB** of free space.
+Ensure sufficient disk space before pulling images. The Docker image requires at least **30GB** of free space.
 </Warning>
 
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
@@ -148,7 +165,7 @@ quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
 with limited hardware resources. This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see
-[Qwen3.5-397B Best Practice — PD Mixed On A3](/docs/hardware-platforms/ascend-npus/best_practice/qwen3_5_397b#single-node).
+[Qwen3.5-397B Best Practice — PD Mixed On A3](/docs/hardware-platforms/ascend-npus/best_practice/qwen3_5_397b#single-node-pd-mixed).
 
 ## Functional verification
 
@@ -173,6 +190,33 @@ curl http://${HOST}:${PORT}/generate \
 ```
 
 Expected result: an HTTP 200 response with the generated text containing "Paris".
+
+For multimodal requests (text + image):
+
+```shell
+# ============================================================
+# Before running, update the following variables:
+#   HOST: the server host address (e.g., localhost)
+#   PORT: the server port number (e.g., 6688)
+# ============================================================
+
+curl http://${HOST}:${PORT}/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "Qwen3.5-397B-A17B-w4a8-mtp",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"}},
+                    {"type": "text", "text": "Describe this image."}
+                ]
+            }
+        ]
+    }'
+```
+
+Expected result: an HTTP 200 response with a description of the image.
 
 Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For more
 testing examples (Health Check, Generate, Chat Completions, and port usage guidance),
@@ -201,4 +245,3 @@ guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/
 ## FAQ
 
 For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq).
-This section only covers model-specific issues.

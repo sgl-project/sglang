@@ -56,6 +56,23 @@ void int8_scaled_mm_impl<at::BFloat16>(
 
 }  // anonymous namespace
 
+std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& /*A*/) {
+  TORCH_CHECK(false, "not implemented yet");
+  return {at::Tensor(), at::Tensor()};
+}
+
+at::Tensor int8_scaled_mm_cpu(
+    at::Tensor& /*mat1*/,
+    at::Tensor& /*mat2*/,
+    at::Tensor& /*scales1*/,
+    at::Tensor& /*scales2*/,
+    const std::optional<at::Tensor>& /*bias*/,
+    at::ScalarType /*out_dtype*/,
+    bool /*is_vnni*/) {
+  TORCH_CHECK(false, "not implemented yet");
+  return at::Tensor();
+}
+
 // weight     :  static, per-channel, symmetric
 // activation : dynamic,   per-token, symmetric
 //

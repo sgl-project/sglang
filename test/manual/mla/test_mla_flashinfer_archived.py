@@ -31,7 +31,7 @@ class TestFlashinferMLA(CustomTestCase):
             other_args.extend(
                 [
                     "--enable-torch-compile",
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "4",
                     "--attention-backend",
                     "flashinfer",

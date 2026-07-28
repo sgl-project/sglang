@@ -98,7 +98,7 @@ export const MiniCPMV46Deployment = () => {
       cmd += ` \\\n  --tool-call-parser qwen3_coder`;
     }
     if (mambaCache === 'v2') {
-      cmd += ` \\\n  --mamba-scheduler-strategy extra_buffer`;
+      cmd += ` \\\n  --mamba-radix-cache-strategy extra_buffer`;
     }
     cmd += ` \\\n  --host 0.0.0.0 --port 30000`;
 

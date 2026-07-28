@@ -112,7 +112,7 @@ class TestRegressionBasic(ScriptedTestCase):
         "dbdcdde245 mamba_pool_idx cleanup-skip is mamba-architecture-specific. "
         "The shared test fixture does not configure a mamba model; running this "
         "regression against the default transformer model would not exercise the "
-        "mamba NO_TOKEN cleanup path, so the body would be a pure smoke test "
+        "mamba NO_TOKEN cleanup path, so the body would be a check "
         "with no real protection. Re-enable when a mamba fixture is wired in."
     )
     def test_mamba_chunked_resume_no_token(self):

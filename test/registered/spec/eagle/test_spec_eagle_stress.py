@@ -48,7 +48,7 @@ class TestEagle3Topk16V2Retract(Eagle3Base, SpecAccuracyKit, SpecFeatureKit):
     spec_topk = 16
     spec_tokens = 64
     disable_overlap = False
-    cuda_graph_max_bs = 5
+    cuda_graph_max_bs_decode = 5
     max_running_requests = 64
     gsm8k_accept_len_thres = 2.4
     extra_args = ("--max-total-tokens", 4500)  # small KV to trigger retract

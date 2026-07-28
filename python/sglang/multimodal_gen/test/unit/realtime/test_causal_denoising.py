@@ -399,6 +399,24 @@ def test_causal_kv_cache_allocation_sets_shapes_and_optional_int_indices():
     assert cache[0].allow_growth is False
 
 
+def test_causal_kv_cache_can_direct_current_attention():
+    cache = CausalSelfAttentionKVCache(
+        k=torch.zeros(1, 3, 1, 1),
+        v=torch.zeros(1, 3, 1, 1),
+        global_end_index=torch.zeros(1, dtype=torch.long),
+        local_end_index=torch.zeros(1, dtype=torch.long),
+        cache_size=3,
+        sink_tokens=0,
+        attention_window_size=3,
+    )
+
+    assert cache.can_direct_current_attention(3)
+    assert not cache.can_direct_current_attention(2)
+
+    cache.sink_tokens = 1
+    assert not cache.can_direct_current_attention(3)
+
+
 def test_causal_kv_cache_update_handles_append_roll_and_recompute():
     cache = CausalSelfAttentionKVCache(
         k=torch.zeros(1, 4, 1, 1),
