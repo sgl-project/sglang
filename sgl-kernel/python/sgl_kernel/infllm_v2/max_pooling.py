@@ -37,9 +37,9 @@ def max_pooling_1d_varlen(
     padding = 1
 
     num_heads = input.shape[0]
-    total_q = input.shape[1]
+    total_q = total_q if total_q > 0 else input.shape[1]
 
-    output = torch.zeros(
+    output = torch.empty(
         num_heads, total_q, out_len, device=input.device, dtype=input.dtype
     )
     torch.ops.sgl_kernel.infllm_v2_max_pooling_1d_varlen.default(
