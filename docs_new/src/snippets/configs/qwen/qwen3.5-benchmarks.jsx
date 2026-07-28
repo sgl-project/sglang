@@ -17,6 +17,26 @@ export const benchmarks = [
     notes: "GSM8K via benchmark/gsm8k/bench_sglang.py (200 questions); MMMU via benchmark/mmmu/bench_sglang.py (91-sample val subset).",
   },
   {
+    match: { hw: "b200", variant: "0.8b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 40, tpot_ms: 1.18, tokens_per_sec_per_gpu: 6722 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 98, tpot_ms: 9.04, tokens_per_sec_per_gpu: 95696 },
+    ],
+  },
+  {
+    match: { hw: "b200", variant: "0.8b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 47, tpot_ms: 0.7, tokens_per_sec_per_gpu: 10233 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 2406, tpot_ms: 4.1, tokens_per_sec_per_gpu: 101088 },
+    ],
+  },
+  {
     match: { hw: "b200", variant: "2b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
@@ -257,6 +277,26 @@ export const benchmarks = [
     ],
   },
   {
+    match: { hw: "b300", variant: "0.8b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 88, tpot_ms: 1.17, tokens_per_sec_per_gpu: 6248 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 160, tpot_ms: 16.15, tokens_per_sec_per_gpu: 54868 },
+    ],
+  },
+  {
+    match: { hw: "b300", variant: "0.8b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 92, tpot_ms: 0.56, tokens_per_sec_per_gpu: 10624 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 183, tpot_ms: 11.78, tokens_per_sec_per_gpu: 72748 },
+    ],
+  },
+  {
     match: { hw: "b300", variant: "2b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
@@ -494,6 +534,236 @@ export const benchmarks = [
         ttft_ms: 157, tpot_ms: 2.61, tokens_per_sec_per_gpu: 1452 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
         ttft_ms: 37580, tpot_ms: 9.17, tokens_per_sec_per_gpu: 5358 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "0.8b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 118, tpot_ms: 1.47, tokens_per_sec_per_gpu: 4872 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 226, tpot_ms: 19.58, tokens_per_sec_per_gpu: 45499 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "0.8b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 124, tpot_ms: 1.08, tokens_per_sec_per_gpu: 6088 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 5828, tpot_ms: 9.77, tokens_per_sec_per_gpu: 42348 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "2b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 51, tpot_ms: 1.89, tokens_per_sec_per_gpu: 4318 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 123, tpot_ms: 14.58, tokens_per_sec_per_gpu: 60178 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "2b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 55, tpot_ms: 1.07, tokens_per_sec_per_gpu: 6701 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 4792, tpot_ms: 8.1, tokens_per_sec_per_gpu: 50186 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 91, tpot_ms: 3.41, tokens_per_sec_per_gpu: 2480 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 139, tpot_ms: 26.17, tokens_per_sec_per_gpu: 33292 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "4b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 96, tpot_ms: 1.4, tokens_per_sec_per_gpu: 5001 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 6776, tpot_ms: 11.2, tokens_per_sec_per_gpu: 35742 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "9b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 140, tpot_ms: 5.16, tokens_per_sec_per_gpu: 1642 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 202, tpot_ms: 35.48, tokens_per_sec_per_gpu: 24499 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "9b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 145, tpot_ms: 2.02, tokens_per_sec_per_gpu: 3649 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 9353, tpot_ms: 15.47, tokens_per_sec_per_gpu: 26094 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "27b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 458, tpot_ms: 14.87, tokens_per_sec_per_gpu: 566 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 42735, tpot_ms: 52.37, tokens_per_sec_per_gpu: 6542 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "27b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 466, tpot_ms: 5.8, tokens_per_sec_per_gpu: 1292 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 48669, tpot_ms: 22.21, tokens_per_sec_per_gpu: 7569 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "27b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 326, tpot_ms: 10.25, tokens_per_sec_per_gpu: 818 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 22163, tpot_ms: 49.9, tokens_per_sec_per_gpu: 9501 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "27b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 341, tpot_ms: 4.52, tokens_per_sec_per_gpu: 1661 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 33234, tpot_ms: 23.75, tokens_per_sec_per_gpu: 9995 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "35b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 126, tpot_ms: 4.16, tokens_per_sec_per_gpu: 1991 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 7037, tpot_ms: 35.09, tokens_per_sec_per_gpu: 18004 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "35b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 124, tpot_ms: 2.15, tokens_per_sec_per_gpu: 3549 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 14134, tpot_ms: 15.53, tokens_per_sec_per_gpu: 20462 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "35b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 114, tpot_ms: 3.6, tokens_per_sec_per_gpu: 2307 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 169, tpot_ms: 36.14, tokens_per_sec_per_gpu: 24387 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "35b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 122, tpot_ms: 2.15, tokens_per_sec_per_gpu: 3704 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 317, tpot_ms: 27.81, tokens_per_sec_per_gpu: 30073 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "122b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 202, tpot_ms: 4.73, tokens_per_sec_per_gpu: 426 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 267, tpot_ms: 55.94, tokens_per_sec_per_gpu: 3985 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "122b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 212, tpot_ms: 1.87, tokens_per_sec_per_gpu: 825 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 13792, tpot_ms: 22.52, tokens_per_sec_per_gpu: 4441 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "122b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 147, tpot_ms: 4.97, tokens_per_sec_per_gpu: 837 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 269, tpot_ms: 55.47, tokens_per_sec_per_gpu: 7963 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "122b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 226, tpot_ms: 1.92, tokens_per_sec_per_gpu: 1798 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 8115, tpot_ms: 25.16, tokens_per_sec_per_gpu: 11043 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "397b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 273, tpot_ms: 5.78, tokens_per_sec_per_gpu: 164 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 10284, tpot_ms: 55.5, tokens_per_sec_per_gpu: 1476 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "397b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 176, tpot_ms: 2.25, tokens_per_sec_per_gpu: 387 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 17496, tpot_ms: 15.52, tokens_per_sec_per_gpu: 2192 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "397b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 234, tpot_ms: 5.07, tokens_per_sec_per_gpu: 197 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 100 },
+        ttft_ms: 389, tpot_ms: 49.43, tokens_per_sec_per_gpu: 2198 },
     ],
   },
 ];
