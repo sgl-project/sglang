@@ -701,12 +701,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.config = config
         self.layer_id = layer_id
 
-        # Pass quant_config through unchanged. ModelOptFp4Config.is_layer_excluded()
-        # already decides per-prefix whether a layer is quantized or kept in BF16,
-        # so forcing this to None here would break checkpoints that DO quantize
-        # linear attention (uniform W4A4). NVIDIA's MoE-only NVFP4 checkpoints list
-        # attention modules in exclude_modules, so is_layer_excluded() returns
-        # UnquantizedLinearMethod for them and behavior is unchanged for those.
         self.linear_attn = Qwen3_5GatedDeltaNet(
             config, layer_id, quant_config, alt_stream, prefix
         )
@@ -888,13 +882,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        # Pass quant_config through unchanged. ModelOptFp4Config.is_layer_excluded()
-        # already decides per-prefix whether a layer is quantized or kept in BF16,
-        # so forcing this to None here would break checkpoints that DO quantize
-        # full attention (uniform W4A4). NVIDIA's MoE-only NVFP4 checkpoints list
-        # attention modules in exclude_modules, so is_layer_excluded() returns
-        # UnquantizedLinearMethod for them and behavior is unchanged for those.
-
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
@@ -918,9 +905,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # Also pass quant_config to RadixAttention so a FP8-KV quant method (if
-        # any) registers k_scale/v_scale params here; otherwise baked KV scales
-        # from the checkpoint have nowhere to load into and default to 1.0.
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -1243,15 +1227,10 @@ ALL_DECODER_LAYER_TYPES = {
     "linear_attention": Qwen3_5LinearDecoderLayer,
 }
 
-# ModelOpt FP4 checkpoints that quantize attention bake the per-layer KV-cache
-# scales under the HF attention projections ("...self_attn.k_proj.k_scale"); in
-# the sglang module tree they live on RadixAttention ("...attn.k_scale"). Must
-# be applied to the weight stream before load_weights() strips ".self_attn",
-# otherwise the stacked-params qkv_proj matching consumes the name and silently
-# drops the scale. Applied per-load_weights rather than exposed as a
-# hf_to_sglang_mapper class attribute: the loader feeds that attribute into
-# quant_config.apply_weight_name_mapper(), which rewrites exclude_modules --
-# a side effect the VL classes deliberately disable (hf_to_sglang_mapper=None).
+# ModelOpt FP4 checkpoints bake the per-layer KV-cache scales under the HF
+# attention projections; in sglang they live on RadixAttention. Apply this to the
+# weight stream at the top of load_weights(), before ".self_attn" is stripped and
+# before the stacked qkv_proj matching would consume the name.
 QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
     orig_to_new_substr={
         ".self_attn.k_proj.k_scale": ".attn.k_scale",
