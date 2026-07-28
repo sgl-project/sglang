@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
         "--thresholds", default=Path(__file__).with_name("thresholds.json")
     )
     parser.add_argument("--profile", default="bitwise")
+    parser.add_argument("--case", action="append", dest="selected_cases")
     return parser.parse_args()
 
 
@@ -149,6 +150,13 @@ def main() -> None:
         profile = threshold_manifest["profiles"][args.profile]
     except KeyError as exc:
         raise ValueError(f"unknown threshold profile: {args.profile}") from exc
+    selected = set(args.selected_cases or [])
+    cases = [
+        case for case in manifest["cases"] if not selected or case["id"] in selected
+    ]
+    unknown = selected - {case["id"] for case in manifest["cases"]}
+    if unknown:
+        raise ValueError(f"unknown case ids: {sorted(unknown)}")
 
     results = Path(args.results).resolve()
     baseline_by_case = {
@@ -156,10 +164,10 @@ def main() -> None:
             results / "cases" / case["id"] / "baseline.npy",
             allow_pickle=False,
         )
-        for case in manifest["cases"]
+        for case in cases
     }
     records = []
-    for case in manifest["cases"]:
+    for case in cases:
         case_contract = resolve_case_contract(case, manifest["contract"])
         reference_frames = int(case_contract["reference_pixel_frames"])
         case_dir = results / "cases" / case["id"]
@@ -306,7 +314,12 @@ def main() -> None:
     }
     # Preserve the exact evaluated manifest beside the report. This avoids a
     # later source-tree edit changing the apparent inputs of an archived run.
-    write_json(results / "manifest.resolved.json", manifest)
+    resolved_manifest = {
+        **manifest,
+        "contract": {**manifest["contract"], "case_count": len(cases)},
+        "cases": cases,
+    }
+    write_json(results / "manifest.resolved.json", resolved_manifest)
     write_json(results / "report.json", report)
     markdown = [
         "# MinWM realtime parity report",
