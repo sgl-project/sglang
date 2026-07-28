@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.layers.causal_conv3d_cache import CausalConv3d
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -589,7 +590,15 @@ class SpatialParallelConv2d(nn.Conv2d):
         )
 
 
-class SpatialParallelCausalConv3d(nn.Conv3d):
+class SpatialParallelCausalConv3d(CausalConv3d):
+    """Causal Conv3d whose height dimension is sharded across the decode group.
+
+    The temporal cache stays rank-local: the height split happens before any
+    convolution runs, so each rank only ever caches its own slice. Height
+    padding comes from the halo exchange while the shard is active, and from
+    plain padding once :func:`disable_spatial_parallel_decode` turns it off.
+    """
+
     def __init__(
         self,
         in_channels: int,
@@ -605,60 +614,29 @@ class SpatialParallelCausalConv3d(nn.Conv3d):
             stride=stride,
             padding=padding,
         )
-
-        self.height_pad_top = self.padding[1]
-        self.height_pad_bottom = self.padding[1]
+        self.height_pad_top = self.height_padding
+        self.height_pad_bottom = self.height_padding
         self.height_halo_size = (self.kernel_size[-2] - 1) // 2
-
-        self.padding: tuple[int, int, int]
-        if self.height_halo_size > 0:
-            self._padding = (
-                self.padding[2],
-                self.padding[2],
-                0,
-                0,
-                2 * self.padding[0],
-                0,
-            )
-        else:
-            self._padding = (
-                self.padding[2],
-                self.padding[2],
-                self.padding[1],
-                self.padding[1],
-                2 * self.padding[0],
-                0,
-            )
-        self.padding = (0, 0, 0)
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
         self.rank = get_decode_parallel_rank()
         self.world_size = get_decode_parallel_world_size()
 
-    def forward(self, x, cache_x=None):
-        padding = list(self._padding)
+    def _conv(self, x: torch.Tensor, *, time_pad: int) -> torch.Tensor:
         if spatial_parallel_decode_disabled():
-            padding[2] = self.height_pad_top
-            padding[3] = self.height_pad_bottom
-        x = causal_conv3d_cat_pad(x, cache_x, padding)
-        x = x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
+            return super()._conv(x, time_pad=time_pad)
 
-        if spatial_parallel_decode_disabled():
-            x = _match_conv3d_input_format(x, self.weight)
-            return F.conv3d(
-                x,
-                self.weight,
-                self.bias,
-                self.stride,
-                (0, 0, 0),
-                self.dilation,
-                self.groups,
-            )
-
+        # Height padding is supplied by the halo exchange, so it must not be
+        # padded here as well.
+        pad = (self.width_padding, self.width_padding, 0, 0, time_pad, 0)
+        if any(pad):
+            x = F.pad(x, pad)
+        if not current_platform.is_amp_supported():
+            x = x.to(self.weight.dtype)
         return _spatial_parallel_conv_forward(
             self,
             x,
-            super().forward,
+            self._conv_impl,
             height_pad_mode="zeros",
             match_conv3d_format=True,
         )

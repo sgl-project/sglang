@@ -1,13 +1,11 @@
-"""Equivalence oracle for the Wan/QwenImage VAE temporal causal cache.
+"""Regression tests for the Wan/QwenImage VAE temporal causal cache.
 
 The reference implementation below restates the cache protocol independently of
 the production code: it re-derives the causal padding from an explicit geometry
-spec and drives the cache with a plain ``list`` + integer cursor. Only weights
-and the stateless sub-layers (norms, activations, spatial resample) are shared
-with the module under test.
-
-Keeping the oracle independent lets it stay a valid reference across the whole
-refactor, including after the spatial padding is handed back to cuDNN.
+spec and drives the cache with a plain ``list`` + integer cursor, the way the
+VAEs did before the cache moved into a manager. Only weights are shared with the
+module under test, so the reference stays a valid oracle even after the spatial
+padding is handed back to cuDNN.
 """
 
 import unittest
@@ -16,6 +14,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.configs.models.vaes.wanvae import (
+    WanVAEArchConfig,
+    WanVAEConfig,
+)
 from sglang.multimodal_gen.runtime.layers.causal_conv3d_cache import (
     CausalCacheMode,
     CausalConv3d,
@@ -26,7 +28,7 @@ from sglang.multimodal_gen.runtime.layers.causal_conv3d_cache import (
     causal_cache_scope,
     interleave_time,
 )
-from sglang.multimodal_gen.runtime.models.vaes import wanvae
+from sglang.multimodal_gen.runtime.models.vaes.wanvae import AutoencoderKLWan
 
 CACHE_T = 2
 
@@ -38,16 +40,9 @@ class _RefCausalConv3d:
     the time dimension is padded causally (``2 * padding[0]`` on the left).
     """
 
-    def __init__(self, conv: torch.nn.Conv3d, padding: tuple[int, int, int]):
+    def __init__(self, conv: nn.Conv3d, padding: tuple[int, int, int]):
         self.conv = conv
-        self.pad = (
-            padding[2],
-            padding[2],
-            padding[1],
-            padding[1],
-            2 * padding[0],
-            0,
-        )
+        self.pad = (padding[2], padding[2], padding[1], padding[1], 2 * padding[0], 0)
 
     def __call__(self, x: torch.Tensor, cache_x: torch.Tensor | None = None):
         pad = list(self.pad)
@@ -63,177 +58,22 @@ def _ref_grow_cache(x: torch.Tensor, prev) -> torch.Tensor:
     """Reproduce the short-chunk fixup: borrow the last frame of the previous cache."""
     cache_x = x[:, :, -CACHE_T:, :, :].clone()
     if cache_x.shape[2] < 2 and prev is not None:
-        cache_x = torch.cat(
-            [prev[:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2
-        )
+        cache_x = torch.cat([prev[:, :, -1, :, :].unsqueeze(2), cache_x], dim=2)
     return cache_x
 
 
-def _ref_residual_block(block, x, feat_cache, feat_idx):
-    conv1 = _RefCausalConv3d(block.conv1, padding=(1, 1, 1))
-    conv2 = _RefCausalConv3d(block.conv2, padding=(1, 1, 1))
-
-    if isinstance(block.conv_shortcut, torch.nn.Identity):
-        h = x
-    else:
-        h = _RefCausalConv3d(block.conv_shortcut, padding=(0, 0, 0))(x)
-
-    x = block.nonlinearity(block.norm1(x))
-    idx = feat_idx[0]
-    cache_x = _ref_grow_cache(x, feat_cache[idx])
-    x = conv1(x, feat_cache[idx])
-    feat_cache[idx] = cache_x
-    feat_idx[0] += 1
-
-    x = block.nonlinearity(block.norm2(x))
-    x = block.dropout(x)
-    idx = feat_idx[0]
-    cache_x = _ref_grow_cache(x, feat_cache[idx])
-    x = conv2(x, feat_cache[idx])
-    feat_cache[idx] = cache_x
-    feat_idx[0] += 1
-
-    return x + h
-
-
-def _ref_resample(resample, x, feat_cache, feat_idx):
-    b, c, t, h, w = x.size()
-
-    if resample.mode == "upsample3d":
-        time_conv = _RefCausalConv3d(resample.time_conv, padding=(1, 0, 0))
-        idx = feat_idx[0]
-        if feat_cache[idx] is None:
-            feat_cache[idx] = "Rep"
-            feat_idx[0] += 1
-        else:
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and feat_cache[idx] != "Rep":
-                cache_x = torch.cat(
-                    [feat_cache[idx][:, :, -1, :, :].unsqueeze(2), cache_x], dim=2
-                )
-            if cache_x.shape[2] < 2 and feat_cache[idx] == "Rep":
-                cache_x = torch.cat([torch.zeros_like(cache_x), cache_x], dim=2)
-            if feat_cache[idx] == "Rep":
-                x = time_conv(x)
-            else:
-                x = time_conv(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
-            feat_idx[0] += 1
-
-            x = x.reshape(b, 2, c, t, h, w)
-            x = torch.stack((x[:, 0], x[:, 1]), 3)
-            x = x.reshape(b, c, t * 2, h, w)
-
-    t = x.shape[2]
-    x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
-    x = resample.resample(x)
-    x = x.view(b, t, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
-
-    if resample.mode == "downsample3d":
-        time_conv = _RefCausalConv3d(resample.time_conv, padding=(0, 0, 0))
-        idx = feat_idx[0]
-        if feat_cache[idx] is None:
-            feat_cache[idx] = x.clone()
-            feat_idx[0] += 1
-        else:
-            cache_x = x[:, :, -1:, :, :].clone()
-            x = time_conv(torch.cat([feat_cache[idx][:, :, -1:, :, :], x], 2))
-            feat_cache[idx] = cache_x
-            feat_idx[0] += 1
-
-    return x
-
-
-def _run_production(module, chunks, num_slots):
-    """Drive the production module chunk by chunk through its contextvar protocol."""
-    feat_map = [None] * num_slots
-    outs = []
-    with wanvae.forward_context(feat_cache_arg=feat_map, feat_idx_arg=0):
-        for chunk in chunks:
-            wanvae.feat_idx.set(0)
-            outs.append(module(chunk))
+def _ref_plain_stream(conv, chunks):
+    """The old per-call protocol for a symmetrically padded causal conv."""
+    ref = _RefCausalConv3d(conv, padding=(1, 1, 1))
+    outs, cache = [], None
+    for x in chunks:
+        outs.append(ref(x, cache))
+        cache = _ref_grow_cache(x, cache)
     return outs
-
-
-def _run_reference(ref_fn, module, chunks, num_slots):
-    feat_map = [None] * num_slots
-    outs = []
-    for chunk in chunks:
-        feat_idx = [0]
-        outs.append(ref_fn(module, chunk, feat_map, feat_idx))
-    return outs
-
-
-def _make_chunks(shape, num_chunks, *, generator):
-    return [
-        torch.randn(shape, dtype=torch.float64, generator=generator)
-        for _ in range(num_chunks)
-    ]
-
-
-class TestCausalCacheOracle(unittest.TestCase):
-    """Pin the current cache protocol so the refactor can be checked against it."""
-
-    def setUp(self):
-        torch.manual_seed(0)
-        self.generator = torch.Generator().manual_seed(1234)
-
-    def _assert_chunks_equal(self, produced, expected):
-        self.assertEqual(len(produced), len(expected))
-        for i, (got, want) in enumerate(zip(produced, expected, strict=True)):
-            self.assertEqual(got.shape, want.shape, msg=f"chunk {i} shape mismatch")
-            torch.testing.assert_close(got, want, rtol=0, atol=0, msg=f"chunk {i}")
-
-    def test_causal_conv3d_streaming(self):
-        conv = wanvae.WanCausalConv3d(4, 6, 3, padding=1).double().eval()
-        ref = _RefCausalConv3d(conv, padding=(1, 1, 1))
-        chunks = _make_chunks((1, 4, 1, 5, 7), 4, generator=self.generator)
-
-        prod_out, prod_cache = [], None
-        ref_out, ref_cache = [], None
-        for chunk in chunks:
-            prod_out.append(conv(chunk, prod_cache))
-            prod_cache = _ref_grow_cache(chunk, prod_cache)
-            ref_out.append(ref(chunk, ref_cache))
-            ref_cache = _ref_grow_cache(chunk, ref_cache)
-        self._assert_chunks_equal(prod_out, ref_out)
-
-    def test_residual_block_streaming(self):
-        block = wanvae.WanResidualBlock(4, 6).double().eval()
-        chunks = _make_chunks((1, 4, 1, 5, 7), 5, generator=self.generator)
-        produced = _run_production(block, chunks, num_slots=2)
-        expected = _run_reference(_ref_residual_block, block, chunks, num_slots=2)
-        self._assert_chunks_equal(produced, expected)
-
-    def test_residual_block_streaming_multi_frame_chunks(self):
-        block = wanvae.WanResidualBlock(4, 4).double().eval()
-        chunks = _make_chunks((1, 4, 4, 5, 7), 3, generator=self.generator)
-        produced = _run_production(block, chunks, num_slots=2)
-        expected = _run_reference(_ref_residual_block, block, chunks, num_slots=2)
-        self._assert_chunks_equal(produced, expected)
-
-    def test_upsample3d_resample_streaming(self):
-        resample = wanvae.WanResample(4, mode="upsample3d").double().eval()
-        chunks = _make_chunks((1, 4, 1, 5, 7), 4, generator=self.generator)
-        produced = _run_production(resample, chunks, num_slots=1)
-        expected = _run_reference(_ref_resample, resample, chunks, num_slots=1)
-        self._assert_chunks_equal(produced, expected)
-
-    def test_downsample3d_resample_streaming(self):
-        resample = wanvae.WanResample(4, mode="downsample3d").double().eval()
-        # Encoder feeds 1 frame for the first chunk, then 4 frames per chunk.
-        chunks = [
-            torch.randn((1, 4, 1, 8, 8), dtype=torch.float64, generator=self.generator),
-            torch.randn((1, 4, 4, 8, 8), dtype=torch.float64, generator=self.generator),
-            torch.randn((1, 4, 4, 8, 8), dtype=torch.float64, generator=self.generator),
-        ]
-        produced = _run_production(resample, chunks, num_slots=1)
-        expected = _run_reference(_ref_resample, resample, chunks, num_slots=1)
-        self._assert_chunks_equal(produced, expected)
 
 
 def _ref_time_upsample_stream(conv, chunks):
-    """Temporal branch of ``resample_forward`` for ``upsample3d``, spatial part removed."""
+    """Temporal branch of the old ``resample_forward`` for ``upsample3d``."""
     ref = _RefCausalConv3d(conv, padding=(1, 0, 0))
     slot = None
     outs = []
@@ -257,7 +97,7 @@ def _ref_time_upsample_stream(conv, chunks):
 
 
 def _ref_time_downsample_stream(conv, chunks):
-    """Temporal branch of ``resample_forward`` for ``downsample3d``."""
+    """Temporal branch of the old ``resample_forward`` for ``downsample3d``."""
     ref = _RefCausalConv3d(conv, padding=(0, 0, 0))
     slot = None
     outs = []
@@ -283,12 +123,41 @@ def _run_managed(conv, chunks, mode=CausalCacheMode.STREAMING):
     return outs
 
 
-def _clone_weights(dst: nn.Conv3d, src: nn.Conv3d) -> None:
-    dst.load_state_dict(src.state_dict())
+def _make_chunks(shape, num_chunks, *, generator):
+    return [
+        torch.randn(shape, dtype=torch.float64, generator=generator)
+        for _ in range(num_chunks)
+    ]
 
 
-class TestManagedCausalConv3d(unittest.TestCase):
-    """The cache-managed convs must reproduce the oracle bit for bit."""
+def _tiny_wan(*, is_residual: bool) -> AutoencoderKLWan:
+    """A few-channel Wan VAE with random weights; no checkpoint needed."""
+    arch = WanVAEArchConfig(
+        base_dim=8,
+        z_dim=4,
+        dim_mult=(1, 2, 2),
+        num_res_blocks=1,
+        temperal_downsample=(True, True) if is_residual else (False, True),
+        latents_mean=(0.0,) * 4,
+        latents_std=(1.0,) * 4,
+        is_residual=is_residual,
+        # Wan 2.2 folds a 2x2 pixel patch into the channel dim before encoding.
+        patch_size=2 if is_residual else None,
+        in_channels=12 if is_residual else 3,
+        out_channels=12 if is_residual else 3,
+        # One temporal downsample for 2.1, two for 2.2.
+        scale_factor_temporal=4 if is_residual else 2,
+        scale_factor_spatial=4,
+    )
+    config = WanVAEConfig(arch_config=arch)
+    config.use_parallel_encode = False
+    config.use_parallel_decode = False
+    torch.manual_seed(0)
+    return AutoencoderKLWan(config).double().eval()
+
+
+class TestCausalConv3dCache(unittest.TestCase):
+    """The cache-managed convs must reproduce the old protocol bit for bit."""
 
     def setUp(self):
         torch.manual_seed(0)
@@ -301,7 +170,11 @@ class TestManagedCausalConv3d(unittest.TestCase):
             torch.testing.assert_close(got, want, rtol=0, atol=0, msg=f"chunk {i}")
 
     def test_cache_frames_derivation(self):
-        """Pointwise-in-time convs must not be given a cache slot at all."""
+        """Pointwise-in-time convs must not be given a cache slot at all.
+
+        Handing them one would prepend frames and change the output length,
+        which then breaks the residual add downstream.
+        """
         self.assertEqual(CausalConv3d(4, 6, 3, padding=1).cache_frames, 2)
         self.assertEqual(CausalConv3d(4, 6, 1).cache_frames, 0)
         self.assertEqual(
@@ -315,7 +188,6 @@ class TestManagedCausalConv3d(unittest.TestCase):
         )
 
     def test_pointwise_conv_is_transparent(self):
-        """A 1x1x1 conv must behave exactly like plain Conv3d, cache or not."""
         conv = CausalConv3d(4, 6, 1).double().eval()
         conv.cache_key = "pointwise"
         x = torch.randn((1, 4, 3, 5, 7), dtype=torch.float64, generator=self.generator)
@@ -335,92 +207,75 @@ class TestManagedCausalConv3d(unittest.TestCase):
         self.assertEqual(root.encoder.conv_in.cache_key, "encoder.conv_in")
         self.assertEqual(root.decoder.conv_in.cache_key, "decoder.conv_in")
 
-    def test_streaming_matches_reference(self):
-        legacy = wanvae.WanCausalConv3d(4, 6, 3, padding=1).double().eval()
+    def test_streaming_matches_reference_single_frame_chunks(self):
         conv = CausalConv3d(4, 6, 3, padding=1).double().eval()
-        _clone_weights(conv, legacy)
         conv.cache_key = "conv"
         chunks = _make_chunks((1, 4, 1, 5, 7), 5, generator=self.generator)
+        self._assert_chunks_equal(
+            _run_managed(conv, chunks), _ref_plain_stream(conv, chunks)
+        )
 
-        ref_out, ref_cache = [], None
-        for chunk in chunks:
-            ref_out.append(
-                _RefCausalConv3d(legacy, padding=(1, 1, 1))(chunk, ref_cache)
-            )
-            ref_cache = _ref_grow_cache(chunk, ref_cache)
-        self._assert_chunks_equal(_run_managed(conv, chunks), ref_out)
-
-    def test_streaming_matches_reference_multi_frame(self):
-        legacy = wanvae.WanCausalConv3d(4, 4, 3, padding=1).double().eval()
+    def test_streaming_matches_reference_multi_frame_chunks(self):
         conv = CausalConv3d(4, 4, 3, padding=1).double().eval()
-        _clone_weights(conv, legacy)
         conv.cache_key = "conv"
         chunks = _make_chunks((1, 4, 4, 5, 7), 4, generator=self.generator)
-
-        ref_out, ref_cache = [], None
-        for chunk in chunks:
-            ref_out.append(
-                _RefCausalConv3d(legacy, padding=(1, 1, 1))(chunk, ref_cache)
-            )
-            ref_cache = _ref_grow_cache(chunk, ref_cache)
-        self._assert_chunks_equal(_run_managed(conv, chunks), ref_out)
+        self._assert_chunks_equal(
+            _run_managed(conv, chunks), _ref_plain_stream(conv, chunks)
+        )
 
     def test_stateless_pads_every_call_independently(self):
         conv = CausalConv3d(4, 6, 3, padding=1).double().eval()
         conv.cache_key = "conv"
         ref = _RefCausalConv3d(conv, padding=(1, 1, 1))
         chunks = _make_chunks((1, 4, 3, 5, 7), 3, generator=self.generator)
-        expected = [ref(chunk) for chunk in chunks]
-        produced = _run_managed(conv, chunks, mode=CausalCacheMode.STATELESS)
-        self._assert_chunks_equal(produced, expected)
+        self._assert_chunks_equal(
+            _run_managed(conv, chunks, mode=CausalCacheMode.STATELESS),
+            [ref(chunk) for chunk in chunks],
+        )
 
     def test_time_upsample_streaming_matches_reference(self):
-        legacy = (
-            wanvae.WanCausalConv3d(4, 8, (3, 1, 1), padding=(1, 0, 0)).double().eval()
-        )
         conv = (
             TimeUpsampleCausalConv3d(4, 8, (3, 1, 1), padding=(1, 0, 0)).double().eval()
         )
-        _clone_weights(conv, legacy)
         conv.cache_key = "time_conv"
         chunks = _make_chunks((1, 4, 1, 5, 7), 5, generator=self.generator)
-        expected = _ref_time_upsample_stream(legacy, chunks)
-        self._assert_chunks_equal(_run_managed(conv, chunks), expected)
+        self._assert_chunks_equal(
+            _run_managed(conv, chunks), _ref_time_upsample_stream(conv, chunks)
+        )
 
     def test_time_upsample_stateless_matches_whole_tensor_path(self):
-        legacy = (
-            wanvae.WanCausalConv3d(4, 8, (3, 1, 1), padding=(1, 0, 0)).double().eval()
-        )
         conv = (
             TimeUpsampleCausalConv3d(4, 8, (3, 1, 1), padding=(1, 0, 0)).double().eval()
         )
-        _clone_weights(conv, legacy)
         conv.cache_key = "time_conv"
         x = torch.randn((1, 4, 5, 5, 7), dtype=torch.float64, generator=self.generator)
 
         b, c, t, h, w = x.shape
-        legacy_out = legacy(x).reshape(b, 2, c, t, h, w)
-        expected = torch.stack((legacy_out[:, 0], legacy_out[:, 1]), 3).reshape(
-            b, c, t * 2, h, w
+        ref = _RefCausalConv3d(conv, padding=(1, 0, 0))(x).reshape(b, 2, c, t, h, w)
+        expected = torch.stack((ref[:, 0], ref[:, 1]), 3).reshape(b, c, t * 2, h, w)
+        self._assert_chunks_equal(
+            _run_managed(conv, [x], mode=CausalCacheMode.STATELESS), [expected]
         )
-        produced = _run_managed(conv, [x], mode=CausalCacheMode.STATELESS)
-        self._assert_chunks_equal(produced, [expected])
 
-    def test_time_upsample_first_frame_is_skipped(self):
-        conv = (
+    def test_time_conv_is_skipped_for_a_leading_single_frame(self):
+        up = (
             TimeUpsampleCausalConv3d(4, 8, (3, 1, 1), padding=(1, 0, 0)).double().eval()
         )
-        conv.cache_key = "time_conv"
-        x = torch.randn((1, 4, 1, 5, 7), dtype=torch.float64, generator=self.generator)
-        produced = _run_managed(conv, [x], mode=CausalCacheMode.FIRST_FRAME)
-        self._assert_chunks_equal(produced, [x])
-
-    def test_time_downsample_streaming_matches_reference(self):
-        legacy = (
-            wanvae.WanCausalConv3d(4, 4, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0))
+        down = (
+            TimeDownsampleCausalConv3d(
+                4, 4, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0)
+            )
             .double()
             .eval()
         )
+        up.cache_key, down.cache_key = "up", "down"
+        x = torch.randn((1, 4, 1, 5, 7), dtype=torch.float64, generator=self.generator)
+        for conv in (up, down):
+            self._assert_chunks_equal(
+                _run_managed(conv, [x], mode=CausalCacheMode.FIRST_FRAME), [x]
+            )
+
+    def test_time_downsample_streaming_matches_reference(self):
         conv = (
             TimeDownsampleCausalConv3d(
                 4, 4, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0)
@@ -428,22 +283,23 @@ class TestManagedCausalConv3d(unittest.TestCase):
             .double()
             .eval()
         )
-        _clone_weights(conv, legacy)
         conv.cache_key = "time_conv"
+        # The encoder feeds one frame for the first chunk, then four per chunk.
         chunks = [
             torch.randn((1, 4, 1, 5, 7), dtype=torch.float64, generator=self.generator),
             torch.randn((1, 4, 4, 5, 7), dtype=torch.float64, generator=self.generator),
             torch.randn((1, 4, 4, 5, 7), dtype=torch.float64, generator=self.generator),
         ]
-        expected = _ref_time_downsample_stream(legacy, chunks)
-        self._assert_chunks_equal(_run_managed(conv, chunks), expected)
+        self._assert_chunks_equal(
+            _run_managed(conv, chunks), _ref_time_downsample_stream(conv, chunks)
+        )
 
     def test_time_downsample_stateless_keeps_ceil_half_length(self):
         """The whole-tensor path pads two frames so the output stays at ceil(T/2).
 
-        This is what the old ``time_conv._padding[4] = 2`` mutation did, except
-        it silently missed Wan 2.2 where the resample hides inside a residual
-        down block.
+        That is what the old ``time_conv._padding[4] = 2`` mutation did, except
+        it scanned ``down_blocks`` for ``WanResample`` and so silently missed
+        Wan 2.2, where the resample hides inside a residual down block.
         """
         conv = (
             TimeDownsampleCausalConv3d(
@@ -480,7 +336,7 @@ class TestManagedCausalConv3d(unittest.TestCase):
             with causal_cache_scope(CausalConvCache()):
                 conv(x)
                 raise RuntimeError("boom")
-        # A fresh scope must not see the aborted pass's state.
+        # A fresh scope must not observe the aborted pass.
         cache = CausalConvCache()
         with causal_cache_scope(cache):
             conv(x)
@@ -498,6 +354,89 @@ class TestManagedCausalConv3d(unittest.TestCase):
         tail = cache.get("conv")
         self.assertEqual(tail.shape[2], conv.cache_frames)
         self.assertLess(tail.untyped_storage().nbytes(), x.numel() * x.element_size())
+
+
+class TestWanVaeCacheLifecycle(unittest.TestCase):
+    """End-to-end properties of the cache across a whole tiny Wan VAE."""
+
+    def setUp(self):
+        self.generator = torch.Generator().manual_seed(4321)
+
+    def _latents(self, vae, num_frames):
+        return torch.randn(
+            (1, vae.z_dim, num_frames, 4, 4),
+            dtype=torch.float64,
+            generator=self.generator,
+        )
+
+    def test_every_cache_key_is_assigned_and_unique(self):
+        vae = _tiny_wan(is_residual=False)
+        keys = [
+            m.cache_key
+            for m in vae.modules()
+            if isinstance(m, CausalConv3d) and m.cache_frames > 0
+        ]
+        self.assertTrue(keys)
+        self.assertTrue(all(keys), msg="every cached conv needs a key")
+        self.assertEqual(len(keys), len(set(keys)), msg="keys must be unique")
+        # The pointwise convs are deliberately left out of the cache.
+        self.assertEqual(vae.quant_conv.cache_frames, 0)
+        self.assertEqual(vae.post_quant_conv.cache_frames, 0)
+
+    def test_decode_frame_count_follows_the_temporal_ratio(self):
+        """A wrong first-chunk flag would make every chunk trim, shrinking output."""
+        for is_residual in (False, True):
+            vae = _tiny_wan(is_residual=is_residual)
+            ratio = vae.temporal_compression_ratio
+            for num_latent_frames in (1, 2, 4):
+                with torch.no_grad():
+                    out = vae.decode(self._latents(vae, num_latent_frames))
+                self.assertEqual(
+                    out.shape[2],
+                    (num_latent_frames - 1) * ratio + 1,
+                    msg=f"is_residual={is_residual} n={num_latent_frames}",
+                )
+
+    def test_causal_decode_in_chunks_matches_one_shot(self):
+        """The core streaming invariant: splitting a clip must not change it."""
+        for is_residual in (False, True):
+            vae = _tiny_wan(is_residual=is_residual)
+            latents = self._latents(vae, 4)
+            with torch.no_grad():
+                vae.reset_causal_decode_state()
+                whole = vae.causal_decode(latents)
+                vae.reset_causal_decode_state()
+                parts = [
+                    vae.causal_decode(latents[:, :, :1]),
+                    vae.causal_decode(latents[:, :, 1:3]),
+                    vae.causal_decode(latents[:, :, 3:]),
+                ]
+                vae.reset_causal_decode_state()
+            torch.testing.assert_close(torch.cat(parts, dim=2), whole, rtol=0, atol=0)
+
+    def test_modes_do_not_leak_into_each_other(self):
+        """A stateless pass in between must not perturb the streaming result."""
+        vae = _tiny_wan(is_residual=False)
+        latents = self._latents(vae, 3)
+        with torch.no_grad():
+            clean = vae.decode(latents)
+            vae._decode(latents)
+            after_stateless = vae.decode(latents)
+        torch.testing.assert_close(after_stateless, clean, rtol=0, atol=0)
+
+    def test_encode_decode_round_trip_shapes(self):
+        for is_residual in (False, True):
+            vae = _tiny_wan(is_residual=is_residual)
+            pixels = torch.randn(
+                (1, 3, 9, 16, 16), dtype=torch.float64, generator=self.generator
+            )
+            with torch.no_grad():
+                latents = vae.encode(pixels).mode()
+                out = vae.decode(latents)
+            self.assertEqual(latents.shape[1], vae.z_dim)
+            self.assertEqual(out.shape[0], 1)
+            self.assertEqual(out.shape[1], 3)
+            self.assertEqual(out.shape[2], pixels.shape[2])
 
 
 if __name__ == "__main__":

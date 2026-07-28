@@ -207,11 +207,13 @@ class CausalConv3d(nn.Conv3d):
         # `cache_frames` for symmetrically padded convs; the strided temporal
         # convs override it.
         self.stateless_pad_frames = 2 * self.padding[0]
+        self.height_padding = self.padding[1]
+        self.width_padding = self.padding[2]
         self._spatial_pad = (
-            self.padding[2],
-            self.padding[2],
-            self.padding[1],
-            self.padding[1],
+            self.width_padding,
+            self.width_padding,
+            self.height_padding,
+            self.height_padding,
         )
         self.padding = (0, 0, 0)
 
