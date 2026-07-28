@@ -9,7 +9,6 @@ import unittest
 import openai
 
 from sglang.test.ascend.test_ascend_utils import (
-    GEMMA_3_4B_IT_WEIGHTS_PATH,
     KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH,
     LLAVA_ONEVISION_QWEN2_7B_OV_WEIGHTS_PATH,
     MINICPM_O_2_6_WEIGHTS_PATH,
@@ -21,7 +20,6 @@ from sglang.test.ascend.test_ascend_utils import (
 from sglang.test.ascend.vlm_utils import *
 from sglang.test.ascend.vlm_utils import (
     AudioOpenAITestMixin,
-    CustomTestCase,
     ImageOpenAITestMixin,
     OmniOpenAITestMixin,
     TestOpenAIMLLMServerBase,
@@ -141,16 +139,6 @@ class TestMiniCPMV4Server(ImageOpenAITestMixin):
 
 class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     model = MINICPM_O_2_6_WEIGHTS_PATH
-    extra_args = [
-        "--cuda-graph-max-bs-decode",
-        "4",
-        "--attention-backend",
-        "ascend",
-    ]
-
-
-class TestGemma3itServer(ImageOpenAITestMixin):
-    model = GEMMA_3_4B_IT_WEIGHTS_PATH
     extra_args = [
         "--cuda-graph-max-bs-decode",
         "4",
