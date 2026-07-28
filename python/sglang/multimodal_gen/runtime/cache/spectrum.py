@@ -275,6 +275,7 @@ class SpectrumMixin:
 
         # Runtime branch tracking
         self.spectrum_is_cfg_negative = False
+        self._spectrum_ctx: Optional[SpectrumContext] = None
         prefix = getattr(self.config, "prefix", "").lower()
         self._spectrum_supports_cfg_cache = prefix in self._CFG_SUPPORTED_PREFIXES
 
@@ -443,6 +444,7 @@ class SpectrumMixin:
           gaps over time (paper alpha).
         """
         ctx = self._get_spectrum_context()
+        self._spectrum_ctx = ctx
         if ctx is None:
             # Spectrum disabled — always run blocks (normal DiT path).
             return True
@@ -486,9 +488,7 @@ class SpectrumMixin:
         # End-of-run wrap: after ``total_steps`` forwards on this branch, reset
         # counters so state does not leak if the same module is reused. (A fresh
         # run also resets via ``reset_spectrum_state`` at denoising timestep 0.)
-        total_steps = params.get_total_forward_steps(
-            ctx.num_inference_steps, ctx.do_cfg, self._spectrum_supports_cfg_cache
-        )
+        total_steps = ctx.total_forward_steps
         if cnt >= total_steps:
             self._emit_spectrum_summary(ctx)
             cnt = 0
@@ -501,7 +501,7 @@ class SpectrumMixin:
 
     def spectrum_record_features(self, features: torch.Tensor) -> None:
         """Append block outputs from a real forward to the branch forecaster."""
-        ctx = self._get_spectrum_context()
+        ctx = self._spectrum_ctx or self._get_spectrum_context()
         if ctx is None:
             return
 
@@ -538,15 +538,17 @@ class SpectrumMixin:
 
         # Update forecaster with actual features from this real step
         forecaster.update(step_idx, features.detach())
+        self._spectrum_ctx = None
 
     def spectrum_predict_features(self, template: torch.Tensor) -> torch.Tensor:
         """Return forecasted block outputs for a skipped step (same shape as template)."""
         forecaster = self._get_spectrum_forecaster()
         if forecaster is None or not forecaster.ready():
             return template
-        ctx = self._get_spectrum_context()
+        ctx = self._spectrum_ctx or self._get_spectrum_context()
         if ctx is None:
             return template
         step_idx = float(ctx.current_step)
         predicted = forecaster.predict(step_idx)
+        self._spectrum_ctx = None
         return predicted.to(dtype=template.dtype, device=template.device)
