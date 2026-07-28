@@ -225,27 +225,53 @@ Wan2.2 causal VAE 的 residual cache 不能把单独解码 1 latent 后留下的
 - Ruff 和 `git diff --check`：通过
 - deselected 的测试是当前容器中 diffusers UniPC timestep rounding 漂移；本任务使用
   固定 few-step DMD schedule `[1000, 750, 500, 250]`，不经过 UniPC。
-- B200 单 case `02_explorer_w30j60l60a31`：
-  - 182 个 BF16 latent bitwise 一致，`max_abs=0`；
-  - 725 个 uint8 RGB frame 尚非 bitwise；
-  - pixel `max_abs=1`、RMSE `0.0068532548`、SSIM `0.9999997259`；
-  - 只有 `0.0046967%` 的 uint8 channel values 发生变化，且变化幅度均为 1。
+- B200 单 case latent probe `02_explorer_w30j60l60a31`：182 个 BF16 latent
+  bitwise 一致，`max_abs=0`。这直接覆盖了 DiT、DMD scheduler、action 和 KV cache。
 - 14-case raw-frame parity：使用两张 B200 并行执行 native baseline 和 SGLang API，
-  Job 为 `minwm-dmd22-step1600-t2v-full14-20260728-01`。
+  Job `minwm-dmd22-step1600-t2v-full14-20260728-01` 已完成：
+  - 14/14 通过 numerical parity；
+  - 13/14 的 480×832 uint8 RGB raw frames 完全 bitwise 一致；
+  - 只有 `01_explorer_w181` 不是 pixel bitwise：`max_abs=1`、
+    RMSE `0.0068532548`、SSIM `0.9999997259`；
+  - 该 case 只有 `0.0046967%` 的 uint8 channel values 变化，且变化幅度均为 1。
 
-单 case 证明 DiT、DMD scheduler、action 和 KV cache 已经 bitwise 对齐；剩余 pixel
-差异来自两条 decode 路径的执行边界：
+latent probe 证明 DiT、DMD scheduler、action 和 KV cache 已经 bitwise 对齐；唯一
+一条 case 的 pixel 差异来自两条 decode 路径的执行边界：
 
 - baseline 把 182 latent 一次性交给 causal VAE；
 - realtime 为了低延迟按 `1/4/.../1` latent 流式解码，并在第二块重播种 cache。
 
 两者输出仅有 uint8 round-to-nearest 边界上的 ±1 差异。本次把它归类为“latent
-bitwise、pixel numerical parity”，而不是宣称 pixel bitwise。
+bitwise、全量 pixel numerical parity，其中 13/14 pixel bitwise”，而不是笼统宣称
+14 条 pixel 全部 bitwise。
+
+## B200 性能结果
+
+同一批 14 个 case 共生成 9990 帧。baseline 与 SGLang 分别独占一张 B200，并行启动
+但互不共享 GPU；计时包含每个 case 的端到端生成时间：
+
+| 统计口径 | native minWM baseline | SGLang realtime | SGLang 提升 |
+| --- | ---: | ---: | ---: |
+| 全部 14 case，加权 output FPS | 19.264 | 23.711 | 23.1% |
+| 排除首次 compile/cold-start，加权 output FPS | 19.648 | 24.450 | 24.4% |
+
+SGLang warm case 的端到端 FPS 中位数为 24.482，范围为
+24.044–24.633；TTFF 中位数为 0.507 秒，首帧之后的 steady-state FPS 中位数为
+24.926。第一个 case 包含 compile/cold-start：TTFF 13.371 秒，端到端 17.101 FPS，
+但首帧后的 steady-state 已达到 24.946 FPS。baseline warm case 的 FPS 中位数为
+19.486，范围为 19.293–20.575。
+
+这里的 output FPS 是“生成出的 pixel frames / 端到端秒数”，不是 WebUI 的 render
+FPS。它说明 warm SGLang 已略高于 24 FPS 实时线；浏览器能否稳定消费还取决于
+WebSocket payload、解码、排队和页面渲染。
 
 ## 结果阅读原则
 
-最终页面会至少提供 baseline 和 SGLang 两路同步播放。数值结论必须读取
-`report.json`：
+结果目录是
+`results/dmd22-step1600-t2v-full14-b200-numerical/`。平铺页面同时展示 14 个 case，
+每个 case 提供 baseline/SGLang 双路和 “Play both” 同步播放。用支持 HTTP Range 的
+本地服务器验证后，页面显示 14/14 PASS、14 张卡片 Ready；实际点击第一组同时播放，
+8.85 秒位置的双路时间差为 0.0054 秒。数值结论必须读取 `report.json`：
 
 - `bitwise_equal=true` 才代表解码后的 uint8 raw frame 完全相同；
 - MP4 文件 SHA 不同不一定是模型不同，编码器 metadata/码率也会改变文件字节；
