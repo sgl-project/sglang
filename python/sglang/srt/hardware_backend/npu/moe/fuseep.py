@@ -12,12 +12,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed import get_moe_ep_group
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -30,7 +30,7 @@ _PARAMS_BYTES = 2  # bf16 — Ascend's Dispatch & Combine does not support fp16
 def _get_fuseep_buffer(layer: FusedMoE):
     DeepEPBuffer.set_dispatch_mode_as_low_latency()
     return DeepEPBuffer.get_deepep_buffer(
-        get_tp_group().device_group,
+        get_moe_ep_group().device_group,
         layer.hidden_size,
         _PARAMS_BYTES,
         DeepEPMode.LOW_LATENCY,
@@ -57,7 +57,7 @@ def forward_fuseep(
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         ),
         num_experts=layer.num_experts,
-        fuse_mode=get_exec().moe.fuseep_mode,
+        fuse_mode=get_server_args().fuseep_mode,
     )
     return hidden_states
 
@@ -126,7 +126,7 @@ def process_fuseep_weights(layer: torch.nn.Module, weight_prefix: str) -> None:
 
     Invoked by ``maybe_apply_fuseep_weights`` for both ``"w13"`` and ``"w2"``.
     """
-    if get_exec().moe.fuseep_mode == 1:
+    if get_server_args().fuseep_mode == 1:
         # -- The fused MoE optimization mode "1": dispatch_gmm_combine_decode --
         if weight_prefix == "w13":
             cpu_w13 = layer.w13_weight.data.transpose(1, 2).cpu()
@@ -143,7 +143,7 @@ def process_fuseep_weights(layer: torch.nn.Module, weight_prefix: str) -> None:
             layer.w2_weight_scale = torch.nn.Parameter(
                 w2_scale.to(torch.float32), requires_grad=False
             )
-    elif get_exec().moe.fuseep_mode == 2:
+    elif get_server_args().fuseep_mode == 2:
         # -- The fused MoE optimization mode "2": dispatch_ffn_combine --
         if weight_prefix == "w13":
             w13_weight = _release_weight_cache(layer.w13_weight)

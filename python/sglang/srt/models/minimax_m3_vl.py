@@ -6,7 +6,9 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import (
+    get_pp_group,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -17,7 +19,10 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -37,7 +42,7 @@ from sglang.srt.models.minimax_vl_common import (
     load_vision_weight,
     merge_vit_qkv_weights,
 )
-from sglang.srt.runtime_context import get_mm, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -60,7 +65,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
-        self.use_data_parallel = get_mm().mm_enable_dp_encoder
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
 
         self.num_fused_shared_experts = 0
         self._determine_num_fused_shared_experts()
@@ -105,7 +110,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                 text_config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("language_model.lm_head", prefix),
-                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()

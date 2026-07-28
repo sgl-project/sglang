@@ -12,7 +12,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
@@ -76,20 +76,20 @@ def should_use_dsa_fused_topk(
 
 
 def is_dsa_enable_prefill_cp():
-    return get_parallel().enable_dsa_prefill_context_parallel
+    return get_server_args().enable_dsa_prefill_context_parallel
 
 
 def is_dsa_prefill_cp_in_seq_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_parallel().dsa_prefill_cp_mode == "in-seq-split"
+        and get_server_args().dsa_prefill_cp_mode == "in-seq-split"
     )
 
 
 def is_dsa_prefill_cp_round_robin_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_parallel().dsa_prefill_cp_mode == "round-robin-split"
+        and get_server_args().dsa_prefill_cp_mode == "round-robin-split"
     )
 
 
