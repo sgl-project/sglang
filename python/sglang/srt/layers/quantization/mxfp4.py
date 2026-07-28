@@ -1088,22 +1088,41 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_bias_padded[:, :K_un] = layer.w2_weight_bias.data
 
         # ---- Per-expert gated activation scalars ---------------------------
-        # SwiGLU uses alpha/beta/limit. Kimi-K3 SiTU reuses alpha as
-        # situ_beta and limit as situ_linear_beta.
-        _sm90_alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
-        _sm90_limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
-        layer.swiglu_alpha = Parameter(
-            torch.full((E,), _sm90_alpha, dtype=torch.float32, device=device),
-            requires_grad=False,
-        )
-        layer.swiglu_beta = Parameter(
-            torch.full((E,), 1.0, dtype=torch.float32, device=device),
-            requires_grad=False,
-        )
-        layer.swiglu_limit = Parameter(
-            torch.full((E,), _sm90_limit, dtype=torch.float32, device=device),
-            requires_grad=False,
-        )
+        # Keep SiTU separate from SwiGLU-Bias: FlashInfer selects SiTU via
+        # ActivationType.Swiglu + situ_beta/situ_linear_beta, not a new enum.
+        if layer.moe_runner_config.activation == "situ":
+            _situ_beta = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 4.0
+            _situ_linear_beta = (
+                getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 25.0
+            )
+            layer.swiglu_alpha = None
+            layer.swiglu_beta = None
+            layer.swiglu_limit = None
+            layer.situ_beta = Parameter(
+                torch.full((E,), _situ_beta, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
+            layer.situ_linear_beta = Parameter(
+                torch.full((E,), _situ_linear_beta, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
+        else:
+            _sm90_alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
+            _sm90_limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
+            layer.swiglu_alpha = Parameter(
+                torch.full((E,), _sm90_alpha, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
+            layer.swiglu_beta = Parameter(
+                torch.full((E,), 1.0, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
+            layer.swiglu_limit = Parameter(
+                torch.full((E,), _sm90_limit, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
+            layer.situ_beta = None
+            layer.situ_linear_beta = None
 
         # ---- FlashInfer SM90 byte / scale interleave -----------------------
         # The padded buffers above are contiguous by construction (allocated
@@ -1189,6 +1208,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             swiglu_alpha=layer.swiglu_alpha,
             swiglu_beta=layer.swiglu_beta,
             swiglu_limit=layer.swiglu_limit,
+            situ_beta=layer.situ_beta,
+            situ_linear_beta=layer.situ_linear_beta,
             moe_tp_size=layer.moe_tp_size,
             moe_tp_rank=layer.moe_tp_rank,
             moe_ep_size=layer.moe_ep_size,

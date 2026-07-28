@@ -84,12 +84,13 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     w2_bias: Optional[torch.Tensor] = None  # bf16 [E, K]
 
     # Optional per-expert activation overrides, fp32 [E].
-    # For ActivationType.Swiglu these are alpha/beta/limit. For
-    # ActivationType.Situ, swiglu_alpha carries situ_beta and swiglu_limit
-    # carries situ_linear_beta.
+    # SwiGLU uses swiglu_alpha/beta/limit. Kimi-K3 SiTU uses
+    # ActivationType.Swiglu with explicit situ_beta/situ_linear_beta.
     swiglu_alpha: Optional[torch.Tensor] = None
     swiglu_beta: Optional[torch.Tensor] = None
     swiglu_limit: Optional[torch.Tensor] = None
+    situ_beta: Optional[torch.Tensor] = None
+    situ_linear_beta: Optional[torch.Tensor] = None
 
     # TP/EP topology (forwarded to the FlashInfer kernel)
     moe_tp_size: int = 1
@@ -369,12 +370,11 @@ def fused_experts_none_to_flashinfer_mxfp4(
 
     activation_type = ActivationType.Swiglu
     if runner_config.activation == "situ":
-        if not hasattr(ActivationType, "Situ"):
+        if quant_info.situ_beta is None or quant_info.situ_linear_beta is None:
             raise RuntimeError(
-                "Kimi-K3 SiTU on SM90 flashinfer_mxfp4 requires a FlashInfer "
-                "build with ActivationType.Situ support."
+                "Kimi-K3 SiTU on SM90 flashinfer_mxfp4 requires "
+                "situ_beta and situ_linear_beta tensors."
             )
-        activation_type = ActivationType.Situ
     elif runner_config.activation != "silu":
         raise RuntimeError(
             "flashinfer_mxfp4 CUTLASS MXFP4 supports only silu/swiglu or "
@@ -395,6 +395,8 @@ def fused_experts_none_to_flashinfer_mxfp4(
         swiglu_alpha=quant_info.swiglu_alpha,
         swiglu_beta=quant_info.swiglu_beta,
         swiglu_limit=quant_info.swiglu_limit,
+        situ_beta=quant_info.situ_beta,
+        situ_linear_beta=quant_info.situ_linear_beta,
         tp_size=quant_info.moe_tp_size,
         tp_rank=quant_info.moe_tp_rank,
         ep_size=quant_info.moe_ep_size,
