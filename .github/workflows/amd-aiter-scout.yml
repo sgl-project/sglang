@@ -21,6 +21,11 @@ on:
         required: false
         type: boolean
         default: true
+      amd_ci_image:
+        description: 'Override AMD CI Docker image for called workflows (optional, e.g. rocm/sgl-dev:tag)'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   actions: write
@@ -96,6 +101,7 @@ jobs:
     with:
       ref: amd/aiter-ci
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      amd_ci_image: ${{ inputs.amd_ci_image }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
@@ -107,6 +113,7 @@ jobs:
     with:
       ref: amd/aiter-ci
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      amd_ci_image: ${{ inputs.amd_ci_image }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
@@ -119,6 +126,7 @@ jobs:
       ref: amd/aiter-ci
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      amd_ci_image: ${{ inputs.amd_ci_image }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   call-pr-test-amd-rocm720:
@@ -130,6 +138,7 @@ jobs:
       ref: amd/aiter-ci
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      amd_ci_image: ${{ inputs.amd_ci_image }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   check-all-jobs:

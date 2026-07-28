@@ -29,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx950-rocm7_15', 'gfx1250-rocm7_15']
+        gpu_arch: ['gfx950-rocm7_15']
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -92,7 +92,7 @@ jobs:
             exit 1
           fi
 
-          tag=v${version}-${rocm_tag}
+          tag=v${version}-${rocm_tag}-test
           echo "IMAGE_TAG=${tag}-${{ env.DATE }}" >> $GITHUB_ENV
 
           # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
