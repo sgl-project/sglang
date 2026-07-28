@@ -7,9 +7,14 @@ from typing import Tuple
 
 import torch
 
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 
 logger = logging.getLogger(__name__)
@@ -818,9 +823,15 @@ def mhc_pre(
     comb_mix = torch.empty(
         num_tokens, hc_mult2, dtype=torch.float32, device=residual.device
     )
-    layer_input = torch.empty(
-        num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
-    )
+    # layer_input is the post-norm activation fed into the MoE. Allocate it in
+    # the symmetric memory pool so the downstream all-reduce uses the low-latency
+    # NCCL symmetric path: the Triton inplace MoE runner writes the expert
+    # output back into this buffer, so a symmetric input yields a symmetric
+    # all-reduce input.
+    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+        layer_input = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
+        )
 
     if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
@@ -1476,12 +1487,16 @@ def mhc_fused_post_pre(
         dtype=torch.float32,
         device=residual.device,
     )
-    layer_input_cur = torch.empty(
-        num_tokens,
-        hidden_size,
-        dtype=torch.bfloat16,
-        device=residual.device,
-    )
+    # layer_input_cur is the post-norm activation fed into the MoE; allocate it
+    # in the symmetric memory pool so the Triton inplace MoE runner yields a
+    # symmetric all-reduce input (see _mhc_pre_impl).
+    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+        layer_input_cur = torch.empty(
+            num_tokens,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=residual.device,
+        )
 
     if norm_weight is not None:
         # Final mhc_pre stage: convert GEMM partials into post/comb/layer_input

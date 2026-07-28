@@ -59,7 +59,7 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
         model_config=SimpleNamespace(is_multimodal=False),
         max_recv_per_poll=-1,
         stream_output=lambda *args, **kwargs: None,
-        get_last_forward_mode=lambda: None,
+        get_last_batch=lambda: None,
     )
 
 

@@ -30,6 +30,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# TODO: Remove after FlashInfer fixes the mxfp8_gemm autotuning IMA.
+FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset({"mxfp8_gemm"})
+
+
+def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
+    skip_ops = set(model_runner.server_args.flashinfer_autotune_skip_ops or ())
+    skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
+    return skip_ops
+
 
 def should_run_flashinfer_autotune(
     model_runner: ModelRunner, *, for_speculative_draft: bool = False
@@ -88,15 +97,8 @@ def should_run_flashinfer_autotune(
         "modelopt_fp8",
         "modelopt_mixed",
     )
-    # Online MXFP8 (microscaling) linears dispatch to flashinfer's
-    # ``mm_mxfp8``, which the flashinfer fp8 autotune dummy run does not
-    # exercise correctly -- it triggers an illegal memory access inside the
-    # mxfp8 cutlass cubin. The mxfp8 gemm is fixed-config and needs no
-    # tuning, so skip autotune for these models.
-    model_uses_mxfp8 = "mxfp8" in (model_quantization or "")
-    fp8_gemm_needs_autotune = not model_uses_mxfp8 and (
-        get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
-        or (model_uses_modelopt_fp8 and is_sm100_supported())
+    fp8_gemm_needs_autotune = get_fp8_gemm_runner_backend().is_flashinfer_cutlass() or (
+        model_uses_modelopt_fp8 and is_sm100_supported()
     )
 
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
@@ -131,6 +133,9 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(mr.ps.moe_ep_size),
         str(mr.model_config.hf_config.__class__.__name__),
     ]
+    # A different skip policy must not reuse previously tuned tactics.
+    skip_ops = get_flashinfer_autotune_skip_ops(mr)
+    model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
     if mr.is_draft_worker:
         model_key_parts.append(f"draft_quant={mr.model_config.quantization}")
     model_key = "|".join(model_key_parts)
@@ -179,8 +184,11 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
             from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
             maybe_skip_logits = autotune_dummy_run_mode()
+        skip_ops = get_flashinfer_autotune_skip_ops(mr)
         with torch.inference_mode(), autotune(
-            True, cache=str(autotune_cache)
+            True,
+            cache=str(autotune_cache),
+            skip_ops=skip_ops,
         ), maybe_skip_logits:
             yield
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
