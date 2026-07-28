@@ -128,8 +128,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         ),
     )
 
-    # Validate --speculative-draft-window-size once, regardless of algorithm.
-    # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
+    # Validate --speculative-draft-window-size / --speculative-draft-sink-size once,
+    # regardless of algorithm. Consumed by DFLASH (compact draft KV cache), Llama
+    # EAGLE-3 (drafter attention SWA), and the built-in MTP/NEXTN + EAGLE draft-decode
+    # path on the Triton and FlashInfer draft attention backends (StreamingLLM sink +
+    # recent window).
     if cfg.speculative_draft_window_size is not None:
         window_size = int(cfg.speculative_draft_window_size)
         if window_size <= 0:
@@ -141,12 +144,29 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             "handle_speculative_decoding",
             speculative_draft_window_size=window_size,
         )
-        if cfg.speculative_algorithm not in ("EAGLE3", "DFLASH"):
+        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH"):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
-                "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
+                "speculative_algorithm=%s (honored by DFLASH, Llama EAGLE-3, and the "
+                "EAGLE/MTP/NEXTN draft-decode path on the Triton/FlashInfer draft backends).",
                 cfg.speculative_algorithm,
             )
+
+    if cfg.speculative_draft_sink_size is not None:
+        sink_size = int(cfg.speculative_draft_sink_size)
+        if sink_size < 0:
+            raise ValueError(
+                f"--speculative-draft-sink-size must be non-negative, got {sink_size}."
+            )
+        if cfg.speculative_draft_window_size is None:
+            raise ValueError(
+                "--speculative-draft-sink-size requires --speculative-draft-window-size."
+            )
+        declare_resolution(
+            server_args,
+            "handle_speculative_decoding",
+            speculative_draft_sink_size=sink_size,
+        )
 
     algo = None
     if cfg.speculative_algorithm is not None:

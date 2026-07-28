@@ -31,6 +31,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
@@ -212,6 +213,41 @@ def draft_kv_indices_used_len(
     num_steps = i + 1 (per-step slice) and speculative_num_steps (capacity assert).
     """
     return seq_lens_sum * topk + bs * num_steps
+
+
+def resolve_draft_decode_window(model_runner) -> Tuple[int, int]:
+    """Resolve (window_size, sink_size) for generate_draft_decode_kv_indices.
+
+    Returns (0, 0) -- full draft attention, the pristine read plan -- when
+    --speculative-draft-window-size is unset, and also when the draft model
+    already has a sliding window of its own: the index builder emits one KV list
+    shared by every draft layer, so it cannot express a per-layer window, and the
+    draft model's own window is authoritative -- whether it comes from the
+    checkpoint or, for LlamaForCausalLMEagle3, from this same flag.
+    """
+    # Read through the resolving view: handle_speculative_decoding declares both
+    # fields rather than assigning them, so the raw field holds the unvalidated input.
+    cfg = resolving_view(model_runner.server_args)
+    window_size = int(cfg.speculative_draft_window_size or 0)
+    if window_size <= 0:
+        return 0, 0
+    # The runner's resolved window, not the raw config field: config keys
+    # (sliding_window / window_size) are overloaded across model families, while
+    # this is the same value the attention backends key their own SWA paths on.
+    native_window = getattr(model_runner, "sliding_window_size", None)
+    if native_window is not None and native_window > 0:
+        # An equal window is the one that was asked for, applied per layer instead
+        # of here (LlamaForCausalLMEagle3 routes this flag into its own window).
+        if native_window != window_size:
+            logger.warning(
+                "Ignoring --speculative-draft-window-size=%d: this draft model has a "
+                "sliding window of %d, which the attention backend applies per layer. "
+                "Draft-decode windowing stays off.",
+                window_size,
+                native_window,
+            )
+        return 0, 0
+    return window_size, int(cfg.speculative_draft_sink_size or 0)
 
 
 def record_stream_each(tensors, stream):
