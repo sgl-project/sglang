@@ -354,6 +354,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         assert self.pipeline is not None
         self._validate_group_forward_reqs(batch)
         results = iter(self.pipeline.forward_batch_iter(batch, self.server_args))
+        group_start_time = time.monotonic()
 
         for req in batch:
             output_batch = self._execute_forward_common(
@@ -365,6 +366,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     req, output_batch
                 ),
                 error_context=f"grouped request {req.request_id}",
+                execution_start_time=group_start_time,
             )
             assert isinstance(output_batch, OutputBatch)
             yield output_batch
@@ -394,6 +396,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return_req: bool,
         save_output_paths: Callable[[OutputBatch], None],
         error_context: str,
+        execution_start_time: float | None = None,
     ) -> OutputBatch | Req:
         """
         Args:
@@ -404,7 +407,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if self.rank == 0 and not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
 
-            start_time = time.monotonic()
+            start_time = (
+                execution_start_time
+                if execution_start_time is not None
+                else time.monotonic()
+            )
             self._realtime_sessions.attach(req)
 
             # capture memory baseline for each req in grouped forward on rank-0

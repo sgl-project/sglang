@@ -277,7 +277,19 @@ class PipelineExecutor(ABC):
 
         remaining_stages = stages[grouped_stage_count:]
         for batch in batches:
-            yield self.execute(remaining_stages, batch, server_args)
+            try:
+                yield self.execute(remaining_stages, batch, server_args)
+            except Exception as e:
+                logger.error(
+                    "Independent grouped tail failed for request %s: %s",
+                    batch.request_id,
+                    e,
+                    exc_info=True,
+                )
+                yield OutputBatch(
+                    error=f"Error executing grouped request {batch.request_id}: {e}",
+                    metrics=batch.metrics,
+                )
 
     @contextlib.contextmanager
     def profile_execution(self, batch: Req, dump_rank: int = 0):
