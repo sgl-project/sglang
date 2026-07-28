@@ -1034,6 +1034,13 @@ class Envs:
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
 
+    SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
+
+    # Issue the FP8 MoE activation quant on the model's alt stream so it
+    # overlaps the router gate GEMM instead of sitting serially between the
+    # gate reduce and the routing kernel (trtllm path; fail-closed: the
+    # runner ignores the pre-quant unless block/layout match).
+    SGLANG_MOE_ALT_STREAM_PREQUANT = EnvBool(False)
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
