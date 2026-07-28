@@ -390,7 +390,7 @@ class Runtime:
         for port in range(self.server_args.port, 40000):
             if is_port_available(port):
                 break
-        self.server_args.port = port
+        self.server_args.override("runtime_endpoint.port_alloc", port=port)
 
         self.url = self.server_args.url()
         self.generate_url = self.url + "/generate"

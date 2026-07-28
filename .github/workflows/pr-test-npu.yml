@@ -60,10 +60,11 @@ jobs:
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
               - "test/registered/ascend/**"
+              - "test/registered/unit/npu/**"
               - ".github/workflows/pr-test-npu.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
-              - "python/sglang/jit_kernel/diffusion/triton/npu_fallback.py"
+              - "python/sglang/kernels/ops/diffusion/triton/npu_fallback.py"
               - "python/sglang/srt/**"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
@@ -88,6 +89,46 @@ jobs:
         run: |
           echo "CANN_image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
           echo "CANN_image_910b=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
+
+  stage-a-unit-test-npu:
+    needs: [check-changes, pr-gate, set-image-config]
+    if: needs.check-changes.outputs.main_package == 'true'
+    runs-on: linux-aarch64-a2-1
+    container:
+      image: ${{ needs.set-image-config.outputs.CANN_image_910b }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Mark repository safe
+        run: |
+          git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
+      - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local:8082"
+        run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host "${CACHING_URL}"
+
+          bash scripts/ci/npu/npu_ci_install_dependency.sh 910b
+
+      - name: Run test
+        timeout-minutes: 15
+        env:
+          SGLANG_IS_IN_CI: true
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite stage-a-unit-test-npu
 
   stage-b-test-1-npu-a2:
     needs: [check-changes, pr-gate, set-image-config]
@@ -408,11 +449,38 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  pr-single-node-tests:
+    name: single-node-poc
+    needs: [check-changes, pr-gate, set-image-config]
+    if: needs.check-changes.outputs.main_package == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        test_config:
+          # qwen3_6_27b performance tests
+          - name: qwen3_6_27b_w8a8_1p_in64k_out1k_50ms
+            runner: linux-aarch64-a3-2
+            test_case: test/registered/ascend/performance/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_1p_in64k_out1k_50ms.py
+            test_type: 'perf'
+    uses: ./.github/workflows/nightly-test-npu-e2e-single-node.yml
+    with:
+      runner: ${{ matrix.test_config.runner }}
+      test_type: ${{ matrix.test_config.test_type }}
+      test_config_name: ${{ matrix.test_config.name }}
+      test_case: ${{ matrix.test_config.test_case }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+      install_sglang_from_source: false
+      install_sglang_deps: true
+      device_type_for_deps: 'a3'
+      transformers_version: ''
+
   pr-test-npu-finish:
     needs:
       [
         check-changes,
 
+        stage-a-unit-test-npu,
         stage-b-test-1-npu-a2,
         stage-b-test-2-npu-a2,
         stage-b-test-4-npu-a3,
@@ -420,6 +488,8 @@ jobs:
 
         multimodal-gen-test-1-npu-a3,
         multimodal-gen-test-2-npu-a3,
+
+        pr-single-node-tests,
       ]
     if: always()
     runs-on: ubuntu-latest

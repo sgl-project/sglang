@@ -21,7 +21,7 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.sample.ideogram import IDEOGRAM4_PRESETS
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
-    refresh_context_on_transformer,
+    refresh_context_on_dual_transformer,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import build_varlen_mask_meta
@@ -153,9 +153,10 @@ class Ideogram4ProgressiveDenoisingStage(
     """Progressive-resolution denoising stage for Ideogram 4.
 
     Inherits the progressive loop from ProgressiveDenoisingStage and the
-    Ideogram-specific dual-transformer forward pass from Ideogram4DenoisingStage
-    via MRO.  __init__ calls DenoisingStage directly to avoid cooperative-init
-    incompatibility between the two parent signatures.
+    Ideogram-specific forward pass from Ideogram4DenoisingStage via MRO. The
+    base checkpoint uses two transformers, while distilled checkpoints pass no
+    unconditional transformer. __init__ calls DenoisingStage directly to avoid
+    cooperative-init incompatibility between the two parent signatures.
 
     MRO for method resolution:
       Ideogram4ProgressiveDenoisingStage
@@ -179,6 +180,7 @@ class Ideogram4ProgressiveDenoisingStage(
         DenoisingStage.__init__(
             self,
             transformer=transformer,
+            transformer_2=unconditional_transformer,
             scheduler=Ideogram4Scheduler(),
             pipeline=pipeline,
         )
@@ -186,8 +188,7 @@ class Ideogram4ProgressiveDenoisingStage(
         self._spectrum_A = IDEOGRAM_SPECTRUM_A
         self._spectrum_beta = IDEOGRAM_SPECTRUM_BETA
         # Ideogram4DenoisingStage extra transformer
-        self.unconditional_transformer = unconditional_transformer
-        self._maybe_torch_compile(self.unconditional_transformer)
+        self.unconditional_transformer = self.transformer_2
 
     # ------------------------------------------------------------------
     # Latent scale factor
@@ -454,9 +455,17 @@ class Ideogram4ProgressiveDenoisingStage(
         self, n_remaining: int, scm_preset: str | None
     ) -> None:
         """Refresh both conditional and unconditional transformers."""
-        refresh_context_on_transformer(
-            self.transformer, n_remaining, scm_preset=scm_preset
+        # Recompute the full SCM config here so custom compute/cache bins stay
+        # active after a progressive-resolution stage transition.
+        _, scm_policy, steps_computation_mask, steps_computation_mask_2 = (
+            self._cache_dit_scm_masks(n_remaining, n_remaining)
         )
-        refresh_context_on_transformer(
-            self.unconditional_transformer, n_remaining, scm_preset=scm_preset
+        refresh_context_on_dual_transformer(
+            self.transformer,
+            self.unconditional_transformer,
+            n_remaining,
+            n_remaining,
+            steps_computation_mask=steps_computation_mask,
+            steps_computation_mask_2=steps_computation_mask_2,
+            steps_computation_policy=scm_policy,
         )
