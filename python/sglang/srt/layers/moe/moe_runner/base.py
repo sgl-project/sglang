@@ -60,6 +60,8 @@ class MoeRunnerConfig:
     # silu+is_gated swiglu path consumes it (interleaved -> swiglu_gpt_oss_*,
     # otherwise chunk gate/up then apply alpha/limit).
     gate_up_interleaved: bool = True
+    layer: Optional[torch.nn.Module] = None
+    use_tp_all_gather_activation: bool = False
 
 
 @dataclass
