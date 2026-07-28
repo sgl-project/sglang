@@ -8273,15 +8273,22 @@ class ServerArgs:
         return max(candidate_steps) + 1
 
     @property
+    def mamba_state_chunk_size(self) -> int:
+        """Chunk size used by the linear-attention kernel's intermediate states."""
+        if not hasattr(self, "_mamba_state_chunk_size"):
+            hf_config = self.get_model_config().hf_config
+            self._mamba_state_chunk_size = getattr(
+                hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE
+            )
+        return self._mamba_state_chunk_size
+
+    @property
     def mamba_cache_chunk_size(self) -> int:
-        # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE
-        # (or mamba_chunk_size if it is defined in the model's config) and page_size.
-        # It is used to determine the caching point in a sequence during prefill.
+        # Cache checkpoints must align to both the kernel state chunks and pages.
         if not hasattr(self, "_mamba_cache_chunk_size"):
             from sglang.srt.arg_groups.overrides import resolved_view
 
-            hf_config = self.get_model_config().hf_config
-            chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
+            chunk_size = self.mamba_state_chunk_size
             page_size = resolved_view(self).page_size
             assert (
                 max(chunk_size, page_size) % min(chunk_size, page_size) == 0
