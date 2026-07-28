@@ -35,6 +35,12 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
     def prompt_template(self) -> str:
         return DEFAULT_ASR_PROMPT
 
+    @property
+    def realtime_slicing_config(self) -> dict:
+        # Keep short/mid utterances cumulative; slice only long sessions where
+        # bounded prefill/memory is worth the boundary risk.
+        return {"enabled": True, "left_overlap_ms": 2000, "min_audio_sec": 45.0}
+
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         temperature = request.temperature
         if temperature == 0.0:

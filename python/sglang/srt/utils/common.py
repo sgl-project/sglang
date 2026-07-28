@@ -1543,7 +1543,9 @@ CLIENT_MEDIA_EXCEPTIONS = (
 
 
 def load_audio(
-    audio_file: str, sr: Optional[int] = None, mono: bool = True
+    audio_file: Union[str, bytes, np.ndarray],
+    sr: Optional[int] = None,
+    mono: bool = True,
 ) -> np.ndarray:
     if sr is None:
         sr = 16000
