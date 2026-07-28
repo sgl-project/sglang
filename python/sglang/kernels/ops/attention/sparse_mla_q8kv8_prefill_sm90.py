@@ -289,9 +289,9 @@ def sparse_mla_q8kv8_prefill_fwd(
     shape/dtype/device. The three output tensors must not alias each other.
 
     Returns:
-        out:         [s_q, h_q, d_v], bfloat16
-        max_logits:  [s_q, h_q], float32
-        lse:         [s_q, h_q], float32
+        out:        [s_q, h_q, d_v], bfloat16
+        max_logits: [s_q, h_q], float32
+        lse:        [s_q, h_q], float32
     """
     s_q, h_q, d_qk = q.shape
     s_kv = kv.shape[0]
