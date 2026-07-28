@@ -18,7 +18,7 @@ from typing import Literal, Optional
 import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_server_args
 
 
 @dataclass
@@ -34,7 +34,7 @@ class ExpertLocationDispatchInfo:
 
     @classmethod
     def init_new(cls, layer_id: int):
-        ep_dispatch_algorithm = get_exec().moe.ep_dispatch_algorithm
+        ep_dispatch_algorithm = get_server_args().ep_dispatch_algorithm
         expert_location_metadata = get_global_expert_location_metadata()
         assert expert_location_metadata is not None
 
@@ -138,7 +138,7 @@ def _topk_ids_logical_to_physical_probability(
         raise RuntimeError(
             "LP dispatch requires CUDA tensors; got topk_ids on " f"{topk_ids.device}."
         )
-    from sglang.jit_kernel.lplb import cuda_solver
+    from sglang.kernels.ops.lplb import cuda_solver
 
     return cuda_solver.dispatch_probability(
         topk_ids, log2phy_prob, info.partial_logical_to_all_physical_map

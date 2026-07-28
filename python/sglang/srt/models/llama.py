@@ -25,7 +25,10 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.distributed import get_pp_group, get_pp_indices
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_pp_indices,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -50,7 +53,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
 from sglang.utils import get_exception_traceback
 
@@ -527,7 +530,7 @@ class LlamaForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
