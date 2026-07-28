@@ -83,14 +83,17 @@ For detailed instructions, refer to [test/README.md](https://github.com/sgl-proj
 If you need to use model which is not in `python/sglang/test/ascend/test_ascend_utils.py` list. Follow these steps:
 
 1. Register account and upload your model to [modelscope](https://modelscope.cn/models).
-2. Make sure your model is pre-cached on the CI server and is on the way "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}".
-If this is not the case, use following command on CI server:
-  ```bash
-  modelscope download \
-    --model {your_model_repo}/{your_model} \
-    --local_dir /data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}
-  ```
+2. Make sure your model is pre-cached on the CI server and is at the path "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}".
+  If this is not the case, use following command on CI server:
+
+    ```bash
+    modelscope download \
+      --model {your_model_repo}/{your_model} \
+      --local_dir /data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}
+    ```
+
   > Note: If you don’t have access to CI server, please ask maintainers (zl19940307@163.com) to download your model.
+
 3. Add model to `python/sglang/test/ascend/test_ascend_utils.py` (use docker `"/root/.cache/modelscope/hub/models/{your_model_repo}/{your_model}"` path).
 
 ## Write documentation
@@ -99,6 +102,7 @@ We recommend new contributors start by writing documentation, which helps you qu
 For more details, please refer to [docs/README.md](https://github.com/sgl-project/sglang/tree/main/docs/README.md).
 
 ## Test the accuracy
+
 If your code changes the model output, please run the accuracy tests. A quick sanity check is the few-shot GSM8K.
 
 ```bash
@@ -121,9 +125,11 @@ You can find additional accuracy eval examples in:
 - [test_gpt_oss_1gpu.py](https://github.com/sgl-project/sglang/blob/main/test/manual/core/test_gpt_oss_1gpu.py)
 
 ## Benchmark the speed
+
 Refer to [Benchmark and Profiling](../../developer_guide/benchmark_and_profiling).
 
 ## Requesting a review for merge
+
 You can follow the pull request merge process described in [MAINTAINER.md](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md).
 You will need to work with the Merge Oncall, Codeowner, and other reviewers to get their approvals.
 Then your PR can be merged.
@@ -168,6 +174,7 @@ cool-down-minutes:
 Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json) may have a per-user cooldown interval. In practice, we use the minimum of the workflow’s default window and the user-specific interval.
 
 ## Code style guidance
+
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
 - Minimize device synchronization. Reduce expensive CPU-NPU synchronization operations, such as `tensor.item()` or `tensor.cpu()`, whenever possible. Use vectorized code.
 - Prioritize extreme efficiency. SGLang is a runtime, and most of your code runs on the critical path for every request. Optimize all minor overheads as much as possible, especially in the model forward code.
@@ -177,7 +184,7 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
 - In a file, put core data structures at the top of the file. Put utility functions at the bottom of the file.
 - Keep tests run fast.
   - If a single test file run longer than 500 seconds, split it into multiple smaller files (e.g., `test_eagle_infer_a.py`, `test_eagle_infer_b.py`).
-  - If a single job in a github workflow runs longer than 30 mins, split it into smaller jobs/steps.
+  - If a single job in a github workflow runs longer than 30 min, split it into smaller jobs/steps.
   - Reuse server launches in your unit tests to make tests run faster.
 - Never use `pickle.loads()`, `pickle.load()`, or `recv_pyobj()` to deserialize untrusted or network-received data. Python’s [pickle module is not secure](https://docs.python.org/3/library/pickle.html) — it can execute arbitrary code during deserialization. Use safe serialization formats such as [msgpack](https://github.com/jcrist/msgspec) or JSON instead.
 - When supporting new hardware or features, follow these guidelines:

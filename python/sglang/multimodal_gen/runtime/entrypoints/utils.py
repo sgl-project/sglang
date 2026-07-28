@@ -8,6 +8,7 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -117,6 +118,7 @@ class GenerationResult:
     samples: Any = None
     frames: Any = None
     audio: Any = None
+    action: Any = None  # [T, raw_action_dim] predicted action (policy/inverse_dynamics)
     prompt: str | None = None
     size: tuple | None = None  # (height, width, num_frames)
     generation_time: float = 0.0
@@ -444,11 +446,13 @@ def prepare_request(
     if not isinstance(req.prompt, str):
         raise TypeError(f"`prompt` must be a string, but got {type(req.prompt)}")
 
-    if (req.width is not None and req.width <= 0) or (
-        req.height is not None and req.height <= 0
+    req_width = getattr(req, "width", None)
+    req_height = getattr(req, "height", None)
+    if (req_width is not None and req_width <= 0) or (
+        req_height is not None and req_height <= 0
     ):
         raise ValueError(
-            f"Height and width must be positive, got height={req.height}, width={req.width}"
+            f"Height and width must be positive, got height={req_height}, width={req_width}"
         )
 
     if server_args.enable_trace:
@@ -582,7 +586,7 @@ def save_materialized_output(
     if not save_output:
         return
     if not save_file_path:
-        logger.info(f"No output path provided, output not saved")
+        logger.info("No output path provided, output not saved")
         return
 
     os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
@@ -660,6 +664,21 @@ def save_outputs(
     output_paths: list[str] = []
     for idx, sample in enumerate(outputs):
         save_file_path = build_output_path(idx)
+        if data_type == DataType.ACTION:
+            if samples_out is not None:
+                samples_out.append(sample)
+            if audios_out is not None:
+                audios_out.append(None)
+            if frames_out is not None:
+                frames_out.append([])
+            if save_output and save_file_path:
+                os.makedirs(os.path.dirname(save_file_path) or ".", exist_ok=True)
+                with open(save_file_path, "w", encoding="utf-8") as f:
+                    json.dump(sample, f, ensure_ascii=False)
+                logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
+            output_paths.append(save_file_path)
+            continue
+
         if data_type == DataType.VIDEO:
             sample = attach_audio_to_video_sample(sample, audio, idx)
 
@@ -710,6 +729,9 @@ def post_process_sample(
     upscaling_scale: int = 4,
 ) -> list[Any]:
     """materialize frames and save outputs (optional)"""
+    if data_type == DataType.ACTION:
+        return []
+
     materialized = materialize_output_sample(
         sample,
         data_type,

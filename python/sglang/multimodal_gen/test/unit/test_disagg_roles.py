@@ -70,6 +70,7 @@ class _GlobalStageArgsMixin:
         server_args = SimpleNamespace(
             comfyui_mode=False,
             enable_torch_compile=False,
+            enable_breakable_cuda_graph=False,
             enable_cfg_parallel=False,
             attention_backend=None,
             **kwargs,

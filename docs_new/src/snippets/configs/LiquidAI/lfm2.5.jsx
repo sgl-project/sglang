@@ -11,6 +11,9 @@
 export const config = {
   modelName: "LFM2.5",
 
+  // TTFT/TPOT were recorded as Mean (no percentile restated in the source runs).
+  latencyPercentile: "Mean",
+
   supportedHardware: ["h100", "h200", "b200"],
 
   variants: [

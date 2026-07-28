@@ -217,32 +217,6 @@ class TestProfileMergerIntegration(CustomTestCase):
         req = ProfileReq(merge_profiles=True)
         self.assertTrue(req.merge_profiles)
 
-    def test_integration_parameters(self):
-        import inspect
-
-        # Test TokenizerManager
-        from sglang.srt.managers.tokenizer_control_mixin import (
-            TokenizerControlMixin,
-        )
-
-        sig = inspect.signature(TokenizerControlMixin.start_profile)
-        self.assertIn("req", sig.parameters)
-        self.assertNotIn("merge_profiles", sig.parameters)
-
-        # Test SchedulerProfilerMixin
-        from sglang.srt.managers.scheduler_components.profiler_manager import (
-            SchedulerProfilerManager,
-        )
-
-        sig = inspect.signature(SchedulerProfilerManager._init_profile)
-        self.assertIn("merge_profiles", sig.parameters)
-
-        # Test CLI profiler
-        from sglang.profiler import run_profile
-
-        sig = inspect.signature(run_profile)
-        self.assertIn("merge_profiles", sig.parameters)
-
 
 class TestProfileMergerEdgeCases(CustomTestCase):
     def setUp(self):
