@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 import triton
 import triton.language as tl
+
+
+class GDNDecodeProjection(NamedTuple):
+    projected_qkvz: torch.Tensor
+    projected_ba: torch.Tensor
+    mixed_qkv: torch.Tensor
+    z: torch.Tensor
+
 
 # =============================================================================
 # Fused kernel — reads INTERLEAVED input format
@@ -308,6 +318,142 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         num_stages=3,
     )
     return mixed_qkv, z, b, a
+
+
+@triton.jit
+def fused_qkvz_split_conv1d_update_contiguous_kernel(
+    projected_qkvz,
+    projected_ba,
+    mixed_qkv,
+    z,
+    b,
+    a,
+    conv_state,
+    weight,
+    cache_indices,
+    stride_projected_token: tl.constexpr,
+    stride_projected_ba_token: tl.constexpr,
+    stride_mixed_token: tl.constexpr,
+    stride_z_token: tl.constexpr,
+    stride_b_token: tl.constexpr,
+    stride_a_token: tl.constexpr,
+    stride_state_sequence: tl.constexpr,
+    stride_state_feature: tl.constexpr,
+    stride_state_token: tl.constexpr,
+    stride_weight_feature: tl.constexpr,
+    stride_weight_width: tl.constexpr,
+    stride_cache_indices: tl.constexpr,
+    QKV_DIM: tl.constexpr,
+    Z_DIM: tl.constexpr,
+    PAD_SLOT_ID: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    feature_offsets = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    qkv_mask = feature_offsets < QKV_DIM
+    projected_base = projected_qkvz + token_idx * stride_projected_token
+    values = tl.load(projected_base + feature_offsets, mask=qkv_mask)
+
+    z_mask = feature_offsets < Z_DIM
+    z_values = tl.load(
+        projected_base + QKV_DIM + feature_offsets,
+        mask=z_mask,
+    )
+    tl.store(z + token_idx * stride_z_token + feature_offsets, z_values, mask=z_mask)
+
+    if tl.program_id(1) == 0:
+        ba_offsets = tl.arange(0, 16)
+        projected_ba_base = projected_ba + token_idx * stride_projected_ba_token
+        tl.store(
+            b + token_idx * stride_b_token + ba_offsets,
+            tl.load(projected_ba_base + ba_offsets),
+        )
+        tl.store(
+            a + token_idx * stride_a_token + ba_offsets,
+            tl.load(projected_ba_base + 16 + ba_offsets),
+        )
+
+    state_idx = tl.load(cache_indices + token_idx * stride_cache_indices)
+    if state_idx == PAD_SLOT_ID:
+        return
+
+    state_base = (
+        conv_state
+        + state_idx * stride_state_sequence
+        + feature_offsets * stride_state_feature
+    )
+    state_0 = tl.load(state_base, mask=qkv_mask)
+    state_1 = tl.load(state_base + stride_state_token, mask=qkv_mask)
+    state_2 = tl.load(state_base + 2 * stride_state_token, mask=qkv_mask)
+
+    weight_base = weight + feature_offsets * stride_weight_feature
+    weight_0 = tl.load(weight_base, mask=qkv_mask)
+    weight_1 = tl.load(weight_base + stride_weight_width, mask=qkv_mask)
+    weight_2 = tl.load(weight_base + 2 * stride_weight_width, mask=qkv_mask)
+    weight_3 = tl.load(weight_base + 3 * stride_weight_width, mask=qkv_mask)
+
+    tl.debug_barrier()
+    tl.store(state_base, state_1, mask=qkv_mask)
+    tl.store(state_base + stride_state_token, state_2, mask=qkv_mask)
+    tl.store(state_base + 2 * stride_state_token, values, mask=qkv_mask)
+
+    output = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    output += state_0 * weight_0
+    output += state_1 * weight_1
+    output += state_2 * weight_2
+    output += values * weight_3
+    output = output / (1 + tl.exp(-output))
+    tl.store(
+        mixed_qkv + token_idx * stride_mixed_token + feature_offsets,
+        output,
+        mask=qkv_mask,
+    )
+
+
+def fused_qkvz_split_conv1d_update_contiguous(
+    projected_qkvz: torch.Tensor,
+    projected_ba: torch.Tensor,
+    mixed_qkv: torch.Tensor,
+    z: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    cache_indices: torch.Tensor,
+    pad_slot_id: int,
+) -> None:
+    qkv_dim = mixed_qkv.shape[1]
+    z_dim = z.shape[1] * z.shape[2]
+    grid = (projected_qkvz.shape[0], triton.cdiv(qkv_dim, 256))
+    fused_qkvz_split_conv1d_update_contiguous_kernel[grid](
+        projected_qkvz,
+        projected_ba,
+        mixed_qkv,
+        z,
+        b,
+        a,
+        conv_state,
+        weight,
+        cache_indices,
+        projected_qkvz.stride(0),
+        projected_ba.stride(0),
+        mixed_qkv.stride(0),
+        z.stride(0),
+        b.stride(0),
+        a.stride(0),
+        conv_state.stride(0),
+        conv_state.stride(1),
+        conv_state.stride(2),
+        weight.stride(0),
+        weight.stride(1),
+        cache_indices.stride(0),
+        qkv_dim,
+        z_dim,
+        pad_slot_id,
+        BLOCK_N=256,
+        num_warps=1,
+        num_stages=3,
+    )
 
 
 @triton.jit
