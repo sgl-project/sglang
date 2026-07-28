@@ -85,6 +85,8 @@ on:
           # 8-GPU GLM-5.1 (MI30x + MI35x)
           - nightly-8-gpu-glm51-rocm720
           - nightly-8-gpu-mi35x-glm51-rocm720
+          # 8-GPU GLM-5.2-FP8 (MI35x only - guards the gfx950 block-FP8 path)
+          - nightly-8-gpu-mi35x-glm52-fp8-rocm720
           # 8-GPU GLM-5-MXFP4 (MI35x only)
           - nightly-8-gpu-mi35x-glm5-mxfp4-rocm720
           # 4-GPU MiniMax-M2.5 (MI35x)
@@ -1520,10 +1522,15 @@ jobs:
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
-      - name: Setup docker (ROCm 7.2)
+      # K3 needs the Day-0 image, not the generic rocm720-mi35x nightly one.
+      # The nightly image's AITER has no aiter.ops.triton.conv.conv2d, so
+      # sglang.srt.models.kimi_k3 fails to import, the architecture is never
+      # registered, and the server cannot launch.
+      - name: Setup docker (ROCm 7.2, Kimi-K3 Day-0 image)
         run: |
           touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          bash scripts/ci/amd/amd_ci_start_container.sh \
+            --custom-image lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1534,7 +1541,7 @@ jobs:
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      # The 2.8T MXFP4 checkpoint is ~1.5 TB, so weight download and load
+      # The 2.8T MXFP4 checkpoint is ~1.56 TB, so weight download and load
       # dominate wall time well before the eval itself starts.
       - name: Accuracy Test MI35x ROCm 7.2 (8-GPU Kimi-K3)
         timeout-minutes: 300
@@ -1845,6 +1852,47 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
+  # 8-GPU GLM-5.2-FP8 (MI35x only - guards the gfx950 block-FP8 path)
+  # ==============================================================================
+
+  nightly-8-gpu-mi35x-glm52-fp8-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm52-fp8-rocm720,'))
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      # The ~700 GB FP8 checkpoint means weight download and load dominate wall
+      # time well before the eval itself starts.
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU GLM-5.2-FP8 DSA)
+        timeout-minutes: 180
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm52-fp8 --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ==============================================================================
   # 8-GPU GLM-5-MXFP4 (MI35x only)
   # ==============================================================================
 
@@ -2087,6 +2135,8 @@ jobs:
       # 8-GPU GLM-5.1 (MI30x + MI35x)
       - nightly-8-gpu-glm51-rocm720
       - nightly-8-gpu-mi35x-glm51-rocm720
+      # 8-GPU GLM-5.2-FP8 (MI35x only - guards the gfx950 block-FP8 path)
+      - nightly-8-gpu-mi35x-glm52-fp8-rocm720
       # 8-GPU GLM-5-MXFP4 (MI35x only)
       - nightly-8-gpu-mi35x-glm5-mxfp4-rocm720
       # 4-GPU MiniMax-M2.5 (MI35x)
