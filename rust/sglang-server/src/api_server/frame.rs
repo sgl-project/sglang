@@ -304,7 +304,7 @@ impl OutputAccumulator {
         }
 
         let o = &mut self.out;
-        o.rid_hash = d.rid_hash; // constant across the request; keeps the accumulated view coherent
+        o.rid.clone_from(&d.rid); // constant across the request; keeps the accumulated view coherent
         o.text.push_str(&d.text);
         o.token_ids.extend_from_slice(&d.token_ids); // token_ids doubles as output_ids
         o.completion_tokens += d.completion_tokens;
@@ -502,7 +502,7 @@ mod tests {
     fn cumulative_frame_json_matches_serde() {
         let deltas = [
             ChunkEvent {
-                rid_hash: 7,
+                rid: "7".into(),
                 text: String::new(),
                 token_ids: vec![],
                 completion_tokens: 0,
@@ -510,7 +510,7 @@ mod tests {
                 ..Default::default()
             },
             ChunkEvent {
-                rid_hash: 7,
+                rid: "7".into(),
                 text: "He\"llo\n\t".into(),
                 token_ids: vec![1000],
                 completion_tokens: 1,
@@ -518,7 +518,7 @@ mod tests {
                 ..Default::default()
             },
             ChunkEvent {
-                rid_hash: 7,
+                rid: "7".into(),
                 text: " 世界 🌍 \\".into(),
                 token_ids: vec![-2, 3],
                 completion_tokens: 2,
@@ -526,7 +526,7 @@ mod tests {
                 ..Default::default()
             },
             ChunkEvent {
-                rid_hash: 7,
+                rid: "7".into(),
                 text: "!".into(),
                 token_ids: vec![9],
                 completion_tokens: 1,
@@ -556,7 +556,7 @@ mod tests {
     fn cumulative_frame_json_defers_on_extras() {
         let mut acc = OutputAccumulator::default();
         acc.fold(&ChunkEvent {
-            rid_hash: 1,
+            rid: "1".into(),
             token_ids: vec![5],
             text: "x".into(),
             extras: Some(Box::new(ChunkExtras {

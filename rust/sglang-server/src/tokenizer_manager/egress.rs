@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
-use crate::ids::RidHash;
+use crate::ids::Rid;
 use crate::message::DetokMsg;
 use crate::message::{
     ChunkEvent, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, for_each_chunk,
@@ -71,7 +71,9 @@ impl Runnable for Egress {
                         b.clear();
                     }
                     let decoded = for_each_chunk(body, |ev| {
-                        buckets[RidHash(ev.rid_hash).shard(shards)].push(ev);
+                        // The rid picks the shard; a hash collision only co-locates two
+                        // requests now, it no longer merges them.
+                        buckets[ev.rid.shard(shards)].push(ev);
                     });
                     // Routing only fills the buckets; nothing is delivered until the
                     // sends below. So dropping them here makes rejection atomic for
@@ -107,11 +109,12 @@ impl Runnable for Egress {
                         for b in buckets.iter_mut() {
                             b.clear();
                         }
-                        for id in decoded.rids {
+                        for rid in decoded.rids {
                             // 500, not 400: the client's request was fine — the
                             // scheduler's own output frame was not.
-                            let _ = self.senders.detok[id.shard(shards)].send(DetokMsg::Fail {
-                                rid_hash: id,
+                            let shard = rid.shard(shards);
+                            let _ = self.senders.detok[shard].send(DetokMsg::Fail {
+                                rid,
                                 message: "internal error: malformed scheduler output frame".into(),
                             });
                         }
@@ -131,12 +134,12 @@ impl Runnable for Egress {
                 }
                 EGRESS_TAG_RESULT => {
                     if let Some((rid, msg)) = decode_result(body) {
-                        self.route(rid, msg);
+                        self.route(&rid, msg);
                     }
                 }
                 EGRESS_TAG_ERROR => {
                     if let Some((rid, msg)) = decode_error(body) {
-                        self.route(rid, msg);
+                        self.route(&rid, msg);
                     }
                 }
                 other => tracing::warn!(tag = other, "egress: unknown frame tag"),
@@ -149,7 +152,7 @@ impl Egress {
     /// Route one message to the shard owning `rid`. HOL ceiling: a slow shard stalls
     /// this thread; the fix is a per-shard egress ring (see `threads::TM_CORES`).
     #[inline]
-    fn route(&self, rid: RidHash, msg: DetokMsg) {
+    fn route(&self, rid: &Rid, msg: DetokMsg) {
         if self.senders.detok_for(rid).send(msg).is_err() {
             tracing::error!("egress: detok shard closed");
         }
@@ -157,47 +160,35 @@ impl Egress {
 }
 
 /// Control result: `[rid, payload]` → single non-streamed delivery to the sink.
-fn decode_result(body: &[u8]) -> Option<(RidHash, DetokMsg)> {
+fn decode_result(body: &[u8]) -> Option<(Rid, DetokMsg)> {
     let val = rmpv::decode::read_value(&mut &body[..]).ok()?;
     let rmpv::Value::Array(arr) = val else {
         return None;
     };
     let mut items = arr.into_iter();
-    let rid = RidHash::from_rid(items.next()?.as_str()?);
+    let rid = Rid::from(items.next()?.as_str()?);
     // The decode already owns the payload buffer — move it out.
     let payload = match items.next()? {
         rmpv::Value::Binary(b) => Bytes::from(b),
         rmpv::Value::String(s) => Bytes::from(s.into_bytes()),
         _ => return None,
     };
-    Some((
-        rid,
-        DetokMsg::Result {
-            rid_hash: rid,
-            payload,
-        },
-    ))
+    Some((rid.clone(), DetokMsg::Result { rid, payload }))
 }
 
 /// Per-request failure: `[rid, message]` → terminal `Error` to the sink (→ 400).
-fn decode_error(body: &[u8]) -> Option<(RidHash, DetokMsg)> {
+fn decode_error(body: &[u8]) -> Option<(Rid, DetokMsg)> {
     let val = rmpv::decode::read_value(&mut &body[..]).ok()?;
     let rmpv::Value::Array(arr) = val else {
         return None;
     };
     let mut items = arr.into_iter();
-    let rid = RidHash::from_rid(items.next()?.as_str()?);
+    let rid = Rid::from(items.next()?.as_str()?);
     let message = match items.next()? {
         rmpv::Value::String(s) => s.into_str()?,
         _ => return None,
     };
-    Some((
-        rid,
-        DetokMsg::Fail {
-            rid_hash: rid,
-            message,
-        },
-    ))
+    Some((rid.clone(), DetokMsg::Fail { rid, message }))
 }
 
 #[cfg(test)]
@@ -213,14 +204,11 @@ mod tests {
         let framed = frame_egress_error("42", "invalid request: bad field");
         assert_eq!(framed[0], EGRESS_TAG_ERROR);
         let (rid, msg) = decode_error(&framed[1..]).expect("decodes");
-        let want = RidHash::from_rid("42");
+        let want = Rid::from("42");
         assert_eq!(rid, want);
         match msg {
-            DetokMsg::Fail {
-                rid_hash: id,
-                message,
-            } => {
-                assert_eq!(id, want);
+            DetokMsg::Fail { rid, message } => {
+                assert_eq!(rid.clone(), want);
                 assert_eq!(message, "invalid request: bad field");
             }
             _ => panic!("expected Fail"),

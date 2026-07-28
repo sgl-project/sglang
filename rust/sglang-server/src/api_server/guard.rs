@@ -3,7 +3,7 @@
 //! drops the guard, which aborts whatever wasn't disarmed (mirrors Python's
 //! `is_disconnected` abort).
 
-use crate::ids::RidHash;
+use crate::ids::Rid;
 use crate::tokenizer_manager::{AbortSource, Senders};
 
 /// Aborts still-in-flight rids on drop. Each rid is disarmed on natural finish;
@@ -13,25 +13,19 @@ pub(super) struct AbortGuard {
     /// Registry to release on drop, plus every rid this guard ever covered —
     /// including disarmed ones, which are finished and must not stay "in flight".
     live_rids: super::LiveRids,
-    owned: Vec<String>,
-    /// `(routing key, rid string)` — the string is what `AbortReq` needs on the
-    /// scheduler wire (unrecoverable from the hashed key), the key is what
-    /// callers disarm by.
-    rids: Vec<(RidHash, String)>,
+    owned: Vec<Rid>,
+    /// Rids still in flight. `Rid` carries its own partition key, so there is no
+    /// separate routing value to keep alongside it.
+    rids: Vec<Rid>,
 }
 
 impl AbortGuard {
-    pub(super) fn new(
-        senders: Senders,
-        live_rids: super::LiveRids,
-        id: RidHash,
-        rid: String,
-    ) -> Self {
+    pub(super) fn new(senders: Senders, live_rids: super::LiveRids, rid: Rid) -> Self {
         Self {
             senders,
             live_rids,
             owned: vec![rid.clone()],
-            rids: vec![(id, rid)],
+            rids: vec![rid],
         }
     }
 
@@ -47,14 +41,14 @@ impl AbortGuard {
     }
 
     /// Track a request for abort-on-drop.
-    pub(super) fn arm(&mut self, id: RidHash, rid: String) {
+    pub(super) fn arm(&mut self, rid: Rid) {
         self.owned.push(rid.clone());
-        self.rids.push((id, rid));
+        self.rids.push(rid);
     }
 
     /// Request finished naturally — don't abort it on drop.
-    pub(super) fn disarm(&mut self, id: RidHash) {
-        self.rids.retain(|(r, _)| *r != id);
+    pub(super) fn disarm(&mut self, rid: &Rid) {
+        self.rids.retain(|r| r != rid);
     }
 }
 
@@ -77,7 +71,7 @@ impl Drop for AbortGuard {
         // and the ring push actually happen. Releasing them here would order the
         // send rather than the effect, and a retry could then register ahead of the
         // stale abort.
-        let aborted: Vec<String> = self.rids.drain(..).map(|(_, rid)| rid).collect();
+        let aborted: Vec<Rid> = self.rids.drain(..).collect();
         for rid in &aborted {
             let _ = self.senders.abort.send(AbortSource::Guard(rid.clone()));
         }
@@ -121,30 +115,27 @@ mod tests {
     #[test]
     fn guard_releases_only_the_rids_it_did_not_abort() {
         let live: crate::tokenizer_manager::LiveRids = Default::default();
-        live.lock().unwrap().insert("done".to_string());
-        live.lock().unwrap().insert("aborted".to_string());
+        live.lock().unwrap().insert("done".into());
+        live.lock().unwrap().insert("aborted".into());
         let (abort_tx, abort_rx) = flume::unbounded();
-        let done = RidHash::from_rid("done");
-        let mut guard = AbortGuard::new(
-            senders_with_abort(abort_tx),
-            live.clone(),
-            done,
-            "done".into(),
-        );
-        guard.arm(RidHash::from_rid("aborted"), "aborted".to_string());
-        guard.disarm(done); // finished naturally
+        let done: Rid = "done".into();
+        let mut guard = AbortGuard::new(senders_with_abort(abort_tx), live.clone(), "done".into());
+        guard.arm("aborted".into());
+        guard.disarm(&done); // finished naturally
         drop(guard);
 
         let held = live.lock().unwrap();
         assert!(
-            !held.contains("done"),
+            !held.contains(&Rid::from("done")),
             "a finished rid must be released here"
         );
         assert!(
-            held.contains("aborted"),
+            held.contains(&Rid::from("aborted")),
             "an aborted rid stays held until on_abort has issued the deregister"
         );
-        assert!(matches!(abort_rx.try_recv().unwrap(), AbortSource::Guard(r) if r == "aborted"));
+        assert!(
+            matches!(abort_rx.try_recv().unwrap(), AbortSource::Guard(r) if r.as_str() == "aborted")
+        );
     }
 
     #[test]
@@ -153,11 +144,10 @@ mod tests {
         drop(AbortGuard::new(
             senders_with_abort(tm_tx),
             Default::default(),
-            RidHash::from_rid("r7"),
-            "r7".to_string(),
+            "r7".into(),
         ));
         assert!(
-            matches!(tm_rx.try_recv(), Ok(AbortSource::Guard(rid)) if rid == "r7"),
+            matches!(tm_rx.try_recv(), Ok(AbortSource::Guard(rid)) if rid.as_str() == "r7"),
             "armed guard must abort its rid on drop",
         );
         assert!(tm_rx.try_recv().is_err(), "exactly one abort");
@@ -167,14 +157,9 @@ mod tests {
     #[test]
     fn disarmed_guard_does_not_abort() {
         let (tm_tx, tm_rx) = flume::unbounded();
-        let id = RidHash::from_rid("r9");
-        let mut guard = AbortGuard::new(
-            senders_with_abort(tm_tx),
-            Default::default(),
-            id,
-            "r9".to_string(),
-        );
-        guard.disarm(id);
+        let id = Rid::from("r9");
+        let mut guard = AbortGuard::new(senders_with_abort(tm_tx), Default::default(), "r9".into());
+        guard.disarm(&id);
         drop(guard);
         assert!(tm_rx.try_recv().is_err(), "disarmed rid must not abort");
     }

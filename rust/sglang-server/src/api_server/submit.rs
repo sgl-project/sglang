@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use super::AppState;
 use crate::fsm::RequestState;
-use crate::ids::RidHash;
+use crate::ids::Rid;
 use crate::message::{EgressItem, EgressSink, Request, RequestKind};
 use crate::tokenizer_manager::TmEvent;
 
@@ -22,12 +22,12 @@ pub(super) async fn submit(
     // error frame rather than a 4xx — same rule `pre_submit_error` applies
     // everywhere else.
     stream: bool,
-) -> Result<(RidHash, String, mpsc::Receiver<EgressItem>), Response> {
+) -> Result<(Rid, mpsc::Receiver<EgressItem>), Response> {
     let rid = match &kind {
         // Generate rids are already final: `GenerateBody::into_requests` normalized the
         // client's, or minted one. Control requests have no client-facing rid.
         RequestKind::Generate(g) => g.rid.clone(),
-        RequestKind::Control(c) => c.rid().to_string(),
+        RequestKind::Control(c) => c.rid().into(),
     };
     // Generate rids can be client-supplied, so two in-flight requests may share
     // one. Detok `Register` is an insert-overwrite: the second would evict the
@@ -59,12 +59,10 @@ pub(super) async fn submit(
             rid: Some(rid.clone()),
         });
     }
-    let id = RidHash::from_rid(&rid);
     // Async-aware send so a full TM inbox yields (backpressure) instead of parking
     // a thread; Err only when the inbox is closed (shutdown).
     let (tx, rx) = mpsc::channel::<EgressItem>(state.egress_buf);
     let request = Request {
-        rid_hash: id,
         rid: rid.clone(),
         state: RequestState::Received,
         sink: EgressSink::Local(tx),
@@ -76,7 +74,7 @@ pub(super) async fn submit(
             if let Some(lease) = lease.as_mut() {
                 lease.disarm();
             }
-            Ok((id, rid, rx))
+            Ok((rid, rx))
         }
         // `SendError` has a single meaning — the channel is disconnected.
         Err(_) => {
@@ -101,7 +99,7 @@ struct RidLease {
     /// send `rid: ""`, which is a real (if odd) rid — with a "cleared" sentinel it
     /// was indistinguishable from a disarmed lease, so the 503 and cancellation
     /// paths left `""` in the set forever and every later `rid: ""` got a 400.
-    rid: Option<String>,
+    rid: Option<Rid>,
 }
 
 impl RidLease {
@@ -151,7 +149,7 @@ mod tests {
 
     fn generate(rid: &str) -> RequestKind {
         RequestKind::Generate(Box::new(GenerateRequest {
-            rid: rid.to_string(),
+            rid: rid.into(),
             input_ids: Some(vec![1, 2, 3]),
             ..Default::default()
         }))
@@ -176,14 +174,14 @@ mod tests {
         submit(&state, generate("dup"), false)
             .await
             .expect("first submit succeeds");
-        assert!(live.lock().unwrap().contains("dup"));
+        assert!(live.lock().unwrap().contains(&Rid::from("dup")));
 
         let Err(err) = submit(&state, generate("dup"), false).await else {
             panic!("second submit with the same rid must be rejected");
         };
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert!(
-            live.lock().unwrap().contains("dup"),
+            live.lock().unwrap().contains(&Rid::from("dup")),
             "the rejected duplicate must not release the holder's entry"
         );
         // Exactly one request reached the scheduler.
@@ -229,7 +227,6 @@ mod tests {
         tm_tx
             .try_send(TmEvent::Ingress(match generate("filler") {
                 RequestKind::Generate(g) => Request {
-                    rid_hash: RidHash::from_rid("filler"),
                     rid: "filler".into(),
                     state: RequestState::Received,
                     sink: EgressSink::Local(mpsc::channel(1).0),
@@ -252,7 +249,7 @@ mod tests {
             "the full inbox must make submit pend"
         );
         assert!(
-            live.lock().unwrap().contains(""),
+            live.lock().unwrap().contains(&Rid::from("")),
             "the rid must already be reserved when submit parks on the send — \
              reserving after it leaves a window where a duplicate is admitted"
         );
