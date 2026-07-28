@@ -1066,6 +1066,11 @@ class Envs:
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
+    # Issue the FP8 MoE activation quant on the model's alt stream so it
+    # overlaps the router gate GEMM instead of sitting serially between the
+    # gate reduce and the routing kernel (trtllm bypassed path only;
+    # fail-closed: the runner ignores the pre-quant unless block/layout match).
+    SGLANG_MOE_ALT_STREAM_PREQUANT = EnvBool(False)
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
     # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
     # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,

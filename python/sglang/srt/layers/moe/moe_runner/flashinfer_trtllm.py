@@ -743,9 +743,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             # [num_tokens, hidden_size // 32] (no transpose).
             a_sf_t = a_sf.view(torch.uint8).reshape(hidden_states.shape[0], -1)
         else:
-            a_q, a_sf = per_token_group_quant_fp8(
-                hidden_states, quant_info.weight_block_k, column_major_scales=True
-            )
+            prequant = getattr(hidden_states, "_sglang_prequant_fp8", None)
+            if prequant is not None and quant_info.weight_block_k == 128:
+                a_q, a_sf = prequant
+            else:
+                a_q, a_sf = per_token_group_quant_fp8(
+                    hidden_states, quant_info.weight_block_k, column_major_scales=True
+                )
             a_sf_t = a_sf.t()
 
         if defer_finalize:
