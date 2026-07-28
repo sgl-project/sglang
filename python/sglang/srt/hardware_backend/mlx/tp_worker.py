@@ -83,7 +83,16 @@ class MlxTpModelWorker(TpModelWorker):
         # an in-flight overlap pending job.  Actually released by
         # _cleanup_stale_rids on the next scheduler-built forward, by which
         # point every pending job containing them has been finalized.
-        self._mlx_released_rids: set[str] = set()
+        # Bind each release marker to the concrete scheduler request object,
+        # not only its client-provided rid.  The tokenizer manager permits an
+        # immediate resubmit with the same rid after finish; object identity
+        # lets _cleanup_stale_rids distinguish that new incarnation from an
+        # overlap-chained forward that still contains the old request.
+        self._mlx_released_rids: dict[str, object] = {}
+        # OOM retraction can run while the overlap loop has already launched a
+        # chained decode.  Invalidate row ownership immediately, but defer the
+        # physical cache removal until that pending job has finalized.
+        self._mlx_retracted_rids: set[str] = set()
         self._mlx_pool_initialized = False
 
     def get_pad_input_ids_func(self):
@@ -121,7 +130,7 @@ class MlxTpModelWorker(TpModelWorker):
             capture_hidden_mode=capture_hidden_mode,
         )
 
-    def _cleanup_stale_rids(self, forward_mode, current_rids: set[str]) -> None:
+    def _cleanup_stale_rids(self, forward_mode, current_reqs) -> None:
         """Remove MLX state for requests that dropped out of the batch.
 
         Decode batches drop every request not in the current composition.
@@ -135,18 +144,37 @@ class MlxTpModelWorker(TpModelWorker):
         previously launched overlap pending job has been finalized, so no
         in-flight chained decode can still reference the removed state.
         """
+        current_by_rid = {req.rid: req for req in current_reqs}
+        current_rids = set(current_by_rid)
+
+        # A released request may legitimately appear once more in an already
+        # launched overlap-chained batch.  Keep it only when this forward holds
+        # the exact same Req object.  Absence, or a new request incarnation with
+        # the same rid, makes the old state safe to retire before routing.
+        releasable = set(self._mlx_retracted_rids)
+        releasable.update(
+            {
+                rid
+                for rid, released_req in self._mlx_released_rids.items()
+                if current_by_rid.get(rid) is not released_req
+            }
+        )
+        for rid in releasable:
+            self._mlx_runner.remove_request(rid)
+            self._mlx_active_rids.discard(rid)
+            self._mlx_released_rids.pop(rid, None)
+            self._mlx_retracted_rids.discard(rid)
+
         if forward_mode.is_decode():
             stale_rids = self._mlx_active_rids - current_rids
             for rid in stale_rids:
                 self._mlx_runner.remove_request(rid)
             self._mlx_active_rids = current_rids
-            self._mlx_released_rids -= stale_rids
+            for rid in stale_rids:
+                self._mlx_released_rids.pop(rid, None)
+                self._mlx_retracted_rids.discard(rid)
         else:
-            releasable = self._mlx_released_rids - current_rids
-            for rid in releasable:
-                self._mlx_runner.remove_request(rid)
-            self._mlx_released_rids -= releasable
-            self._mlx_active_rids = (self._mlx_active_rids | current_rids) - releasable
+            self._mlx_active_rids |= current_rids
 
     def prepare_for_kv_cache_release(self, req) -> None:
         """Snapshot MLX auxiliary state at the scheduler's radix insert point.
@@ -168,7 +196,7 @@ class MlxTpModelWorker(TpModelWorker):
             # here would break overlap: a chained pending job launched before
             # this request was known to be finished may still reference its
             # per-request caches and token list.
-            self._mlx_released_rids.add(req.rid)
+            self._mlx_released_rids[req.rid] = req
 
     def prepare_for_retraction(self, req) -> None:
         """Drop MLX runner state when the scheduler retracts (or OOM-aborts) a request.
@@ -189,6 +217,21 @@ class MlxTpModelWorker(TpModelWorker):
         because the retracted request's KV slots are already freed.
         """
         self._mlx_runner.remove_request(req.rid)
+        self._mlx_active_rids.discard(req.rid)
+        self._mlx_released_rids.pop(req.rid, None)
+        self._mlx_retracted_rids.discard(req.rid)
+
+    def defer_retraction(self, req) -> None:
+        """Invalidate a retracted request while an overlap job may still use it.
+
+        The scheduler row and shared KV slots are about to be freed, so routing
+        and pool flushes must stop immediately.  The private cache/token list
+        stay alive until the next scheduler-built forward, after the already
+        launched chained decode has finalized.
+        """
+        self._mlx_runner.invalidate_request(req.rid)
+        self._mlx_released_rids.pop(req.rid, None)
+        self._mlx_retracted_rids.add(req.rid)
 
     def _gather_prefill_prefix_slots(self, reqs) -> set[int]:
         """Union of prefix slot IDs for reqs that will start a fresh prefill.
@@ -241,7 +284,7 @@ class MlxTpModelWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
 
-        self._cleanup_stale_rids(forward_mode, {req.rid for req in reqs})
+        self._cleanup_stale_rids(forward_mode, reqs)
 
         next_token_ids_list: list[int] = []
 
@@ -367,7 +410,7 @@ class MlxTpModelWorker(TpModelWorker):
         if forward_mode.is_idle():
             return None, [], [], None, "idle"
 
-        self._cleanup_stale_rids(forward_mode, {req.rid for req in reqs})
+        self._cleanup_stale_rids(forward_mode, reqs)
 
         if forward_mode.is_decode():
             req_ids = [req.rid for req in reqs]

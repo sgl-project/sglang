@@ -171,6 +171,10 @@ class MlxModelRunner:
 
         self._req_caches: dict[str, list[Any]] = {}
         self._req_token_ids: dict[str, list[int]] = {}
+        # Invalidated requests retain their private arrays only long enough for
+        # an already-launched overlap graph to finalize.  They are invisible to
+        # routing and shared-pool flushes, then removed at the next safe forward.
+        self._req_invalidated: set[str] = set()
         self._cache_pool: list[list[Any]] = []  # reusable full-attention caches
 
         self._attention_kv_pool: MlxAttentionKVPool | None = None
@@ -749,6 +753,8 @@ class MlxModelRunner:
         read them will flush them then.
         """
         if self._attention_kv_pool is None or self._req_to_token_pool is None:
+            return
+        if req_id in getattr(self, "_req_invalidated", ()):
             return
         cache = self._req_caches.get(req_id)
         if cache is None:
@@ -1358,7 +1364,16 @@ class MlxModelRunner:
 
     def has_request(self, req_id: str) -> bool:
         """Check if a request has active state."""
-        return req_id in self._req_caches
+        return req_id in self._req_caches and req_id not in getattr(
+            self, "_req_invalidated", ()
+        )
+
+    def invalidate_request(self, req_id: str) -> None:
+        """Hide stale row ownership while an overlap graph still uses the cache."""
+        if req_id in self._req_caches:
+            if not hasattr(self, "_req_invalidated"):
+                self._req_invalidated = set()
+            self._req_invalidated.add(req_id)
 
     def remove_request(self, req_id: str):
         """Discard request state.
@@ -1371,6 +1386,7 @@ class MlxModelRunner:
         flush because their slots are freed.
         """
         self._req_token_ids.pop(req_id, None)
+        getattr(self, "_req_invalidated", set()).discard(req_id)
         cache = self._req_caches.pop(req_id, None)
         if cache is not None:
             self._release_cache(cache)
@@ -1382,6 +1398,7 @@ class MlxModelRunner:
     def clear(self):
         """Clear all request states."""
         self._req_token_ids.clear()
+        getattr(self, "_req_invalidated", set()).clear()
         for cache in self._req_caches.values():
             self._release_cache(cache)
         self._req_caches.clear()

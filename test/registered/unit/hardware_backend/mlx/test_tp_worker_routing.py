@@ -171,7 +171,8 @@ class TestMlxExtendRouting(unittest.TestCase):
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = _FakeRunner(known_rids)
         worker._mlx_active_rids = set()
-        worker._mlx_released_rids = set()
+        worker._mlx_released_rids = {}
+        worker._mlx_retracted_rids = set()
         return worker
 
     # ---------- the shared decision helper ----------

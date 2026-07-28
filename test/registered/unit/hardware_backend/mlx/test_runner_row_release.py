@@ -155,6 +155,9 @@ class TestMlxRunnerRowRelease(CustomTestCase):
 
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = runner
+        worker._mlx_active_rids = set(runner._req_caches)
+        worker._mlx_released_rids = {}
+        worker._mlx_retracted_rids = set()
         return worker
 
     def test_pre_release_flushes_only_committed_positions(self):
@@ -296,6 +299,30 @@ class TestMlxRunnerRowRelease(CustomTestCase):
             worker._gather_prefill_prefix_slots([rescheduled]),
             set(prefix_slots.tolist()),
         )
+
+    def test_invalidated_request_can_finalize_pending_decode_before_removal(self):
+        """Deferred OOM retraction keeps token state for a launched next step."""
+        req_pool, kv = self._pools(rows=1, kv=8)
+        runner, _writes = self._runner(req_pool)
+        _req, row, _slots = self._alloc(req_pool, kv, 2)
+        self._activate(runner, "A", row=row, offset=2, synced=2, committed=2)
+        runner._req_token_ids["A"] = [101]
+        runner._decode_step_ct = 0
+        runner._clear_steps = 0
+
+        runner.invalidate_request("A")
+        self.assertFalse(runner.has_request("A"))
+
+        tokens = runner.decode_batch_finalize(
+            SimpleNamespace(
+                lazy_tokens=SimpleNamespace(tolist=lambda: [102]), req_ids=["A"]
+            )
+        )
+
+        self.assertEqual(tokens, [102])
+        self.assertEqual(runner._req_token_ids["A"], [101, 102])
+        runner.remove_request("A")
+        self.assertNotIn("A", runner._req_token_ids)
 
     def test_finish_then_reuse_then_flush_leaves_c_intact(self):
         """End-to-end finish path: A can never write into C's reused slots."""
