@@ -269,7 +269,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             tokenizer, self.stop_strs, self.stop_regex_strs, self.min_new_tokens
         )
 
-        # Clear API input aliases so omit_defaults=True drops them from the wire.
+        # Clear API input aliases after normalizing them into internal fields.
         self.stop = None
         self.stop_regex = None
         self.is_normalized = True
