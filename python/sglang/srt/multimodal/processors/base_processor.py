@@ -567,9 +567,6 @@ class BaseMultimodalProcessor(ABC):
                 return load_audio(data, audio_sample_rate)
 
         except CLIENT_MEDIA_EXCEPTIONS as e:
-            # Bad input (e.g. invalid base64, a media URL that cannot be
-            # fetched, or media bytes that cannot be parsed) is a client
-            # error -> 400, not 500.
             data_str = str(data)
             if len(data_str) > 100:
                 data_str = data_str[:100] + "..."

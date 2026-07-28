@@ -626,8 +626,7 @@ class MMEncoder:
                 return load_audio(data, self.model_audio_sr)
 
         except CLIENT_MEDIA_EXCEPTIONS as e:
-            # Bad input -> 400. BadRequestError carries `.code`, which the DP
-            # envelope reads; a bare ValueError would be stamped 500 there.
+            # Not ValueError: the DP envelope classifies by `.code`, which only MMError carries.
             raise BadRequestError(f"Error while loading data {data}: {e}") from e
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")

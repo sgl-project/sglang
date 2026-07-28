@@ -1,10 +1,7 @@
 """Unit tests for bad-input classification in ``BaseMultimodalProcessor._load_single_item``.
 
-Client-supplied media that cannot be fetched or decoded is a bad payload, so it must
-surface as ``ValueError`` (mapped to 400 by ``serving_base.handle_request``) rather than
-``RuntimeError`` (500). Genuine server faults must still reach the caller as 500.
-
-No server, no model loading -- pure CPU.
+Media the client supplied but that cannot be fetched or decoded must raise
+``ValueError``; anything else must stay a ``RuntimeError``.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -79,17 +76,12 @@ class TestBadInputIsClientError(CustomTestCase):
 
 
 class TestServerFaultStaysServerError(CustomTestCase):
-    """Guards against over-catching: a server fault must not be downgraded to 400.
-
-    ``load_video`` catches the decoder broadly (torchcodec and decord raise
-    different types), so these two exclusions are the ones worth pinning.
-    """
+    """``load_video`` catches the decoder broadly; these are the exclusions."""
 
     def _assert_server_error(self, side_effect):
         with patch(
             "sglang.srt.utils.common.VideoDecoderWrapper", side_effect=side_effect
         ):
-            # RuntimeError is _load_single_item's 500 fallback; ValueError would be 400.
             with self.assertRaises(RuntimeError):
                 _StubProcessor._load_single_item(b"payload", Modality.VIDEO)
 

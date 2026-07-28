@@ -1508,9 +1508,7 @@ def get_mm_http_session() -> requests.Session:
 
 
 # Raised by the loaders below when client-supplied media cannot be fetched or
-# decoded: a bad payload, not a server fault. Callers map these to a 4xx.
-# RequestException covers HTTPError/ConnectionError/Timeout from the loaders'
-# get_mm_http_session() fetches; ValueError covers invalid base64.
+# decoded. ValueError is in the set because invalid base64 raises binascii.Error.
 CLIENT_MEDIA_EXCEPTIONS = (
     ValueError,
     UnidentifiedImageError,
@@ -1574,7 +1572,6 @@ def load_audio(
         else:
             audio, original_sr = sf.read(source)
     except sf.LibsndfileError as e:
-        # Undecodable client-supplied audio: bad payload, not a server fault.
         raise ValueError(f"Could not decode audio: {e}") from e
 
     if mono and len(audio.shape) > 1:
@@ -1764,10 +1761,9 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
     try:
         return VideoDecoderWrapper(source, device=device)
     except (ImportError, MemoryError):
-        raise  # missing backend / OOM is a server problem, not a bad payload
+        raise  # missing backend / OOM is not a bad payload
     except Exception as e:
-        # Undecodable client-supplied video. Caught broadly on purpose: torchcodec
-        # raises RuntimeError here, decord its own error type.
+        # Broad on purpose: torchcodec raises RuntimeError, decord its own type.
         raise ValueError(f"Could not decode video: {e}") from e
 
 
