@@ -27,6 +27,7 @@ import copy
 import dataclasses
 import logging
 import math
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
@@ -37,7 +38,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
@@ -48,6 +48,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
     set_kv_buffer_prefix_valid_tiled,
     store_cache_4d,
 )
+from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -92,6 +93,12 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# Debug-only invariant in the Mamba slot-donation path calls tensor.item(), which
+# forces a per-request cudaStreamSynchronize on the scheduler thread and can stall
+# the scheduler under load. Off by default; set SGLANG_MAMBA_DEBUG_ASSERTS=1 to
+# re-enable for debugging.
+_MAMBA_DEBUG_ASSERTS = os.environ.get("SGLANG_MAMBA_DEBUG_ASSERTS", "0") == "1"
 
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
@@ -374,6 +381,34 @@ class MambaPool:
         intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
 
+    def _detect_conv_window_axis(
+        self, conv_state_shape: List[Tuple[int, int]], win_len: int
+    ) -> int:
+        """Prefer GDN's trailing axis when both match; mixed layer layouts cannot
+        share one overlapping conv-window buffer.
+        """
+        axis = None
+        for conv_shape in conv_state_shape:
+            if conv_shape[-1] == win_len:
+                shape_axis = len(conv_shape) - 1
+            elif conv_shape[0] == win_len:
+                shape_axis = 0
+            else:
+                raise ValueError(
+                    f"conv_state shape {conv_shape} has no axis of length "
+                    f"conv_kernel-1={win_len}; cannot build the deduplicated "
+                    "sliding-window conv-intermediate view."
+                )
+            if axis is None:
+                axis = shape_axis
+            elif axis != shape_axis:
+                raise ValueError(
+                    "inconsistent conv-window axis across conv shapes "
+                    f"{conv_state_shape}; a single conv_window_axis cannot serve "
+                    "mixed layouts."
+                )
+        return axis
+
     def _allocate_deduplicated_conv_window(
         self,
         *,
@@ -438,6 +473,7 @@ class MambaPool:
             enable=enable_memory_saver
         )
         num_mamba_layers = len(mamba_layer_ids)
+        self.mamba_layer_ids = list(mamba_layer_ids)
 
         self.size = size
         self.device = device
@@ -669,6 +705,10 @@ class MambaPool:
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
+                    win_len = cache_params.shape.conv_kernel - 1
+                    self.conv_window_axis = self._detect_conv_window_axis(
+                        conv_state_shape, win_len
+                    )
                     intermediate_conv_window_cache = []
                     for conv_shape in conv_state_shape:
                         phys, view = self._allocate_deduplicated_conv_window(
@@ -804,6 +844,7 @@ class MambaPool:
         # Full (unsharded) conv sub-block dims for PD transfer across different
         # attn_tp_size (GDN: [key_dim, key_dim, value_dim]); None otherwise.
         self.conv_shard_groups = getattr(cache_params.shape, "conv_shard_groups", None)
+        self.conv_slice_axis = getattr(cache_params.shape, "conv_slice_axis", 0)
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
@@ -834,6 +875,7 @@ class MambaPool:
         return (
             not _is_npu
             and len(convs) > 0
+            and convs[0].shape[0] > 0
             and convs[0].is_cuda
             and all(c.dtype == torch.bfloat16 and c.is_contiguous() for c in convs)
         )
@@ -977,39 +1019,34 @@ class MambaPool:
             )
         current_platform.synchronize()
 
+    _NON_TRANSFER_STATE_FIELDS = frozenset(
+        {
+            "intermediate_ssm",
+            "intermediate_conv_window",
+            "replayssm_d",
+            "replayssm_k",
+            "replayssm_g",
+            "replayssm_rawv",
+            "replayssm_rawk",
+            "replayssm_beta",
+        }
+    )
+
+    def _iter_transfer_state_tensors(self):
+        """Yield transferable state tensors with their per-slot slice axis."""
+        for field, value in vars(self.mamba_cache).items():
+            if field in self._NON_TRANSFER_STATE_FIELDS or value is None:
+                continue
+            tensors = value if isinstance(value, list) else [value]
+            slice_axis = self.conv_slice_axis if field == "conv" else 0
+            for state_tensor in tensors:
+                yield field, state_tensor, slice_axis
+
     def get_contiguous_buf_infos(self):
-        """
-        Get buffer info for RDMA registration.
-        Only returns conv and temporal state buffers, excluding intermediate buffers
-        used for speculative decoding (intermediate_ssm, intermediate_conv_window).
-        """
-        state_tensors = []
-        for field in vars(self.mamba_cache):
-            # Skip intermediate buffers used only for speculative decoding
-            # These buffers have different size (spec_state_size + 1) and should not be transferred
-            if field in ("intermediate_ssm", "intermediate_conv_window"):
-                continue
-            # Skip GDN ReplaySSM ring buffers: they are derived/transient decode
-            # scratch, not part of the persistent transferable state.
-            if field in (
-                "replayssm_d",
-                "replayssm_k",
-                "replayssm_g",
-                "replayssm_rawv",
-                "replayssm_rawk",
-                "replayssm_beta",
-            ):
-                continue
-            value = getattr(self.mamba_cache, field)
-            if value is None:
-                continue
-            if isinstance(value, list):
-                state_tensors.extend(value)
-            else:
-                state_tensors.append(value)
+        """Get transferable state buffer information for RDMA registration."""
         data_ptrs, data_lens, item_lens = [], [], []
 
-        for _, state_tensor in enumerate(state_tensors):
+        for _, state_tensor, _ in self._iter_transfer_state_tensors():
             data_ptrs += [
                 state_tensor[i].data_ptr() for i in range(self.num_mamba_layers)
             ]
@@ -1022,44 +1059,36 @@ class MambaPool:
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each state tensor.
 
-        For mamba state, the layout is:
-        - conv_state: [num_layers, size+1, conv_dim/tp, conv_kernel-1]
-        - temporal_state: [num_layers, size+1, num_heads/tp, head_dim, state_size]
-
-        The 3rd dimension (index 2) is the one that gets sliced by TP.
-        Returns the size of this dimension for each tensor (repeated for each layer).
+        The slice axis is tensor-specific: normally the first per-slot axis,
+        while Kimi conv state uses the second per-slot axis.
         """
-        state_tensors = []
-        for field in vars(self.mamba_cache):
-            # Mirror the exclusions in get_contiguous_buf_infos so the returned
-            # dims line up element-wise with the RDMA buffer list.
-            if field in (
-                "intermediate_ssm",
-                "intermediate_conv_window",
-                "replayssm_d",
-                "replayssm_k",
-                "replayssm_g",
-                "replayssm_rawv",
-                "replayssm_rawk",
-                "replayssm_beta",
-            ):
-                continue
-            value = getattr(self.mamba_cache, field)
-            if value is None:
-                continue
-            if isinstance(value, list):
-                state_tensors.extend(value)
-            else:
-                state_tensors.append(value)
-
         dim_per_tensor = []
-        for state_tensor in state_tensors:
+        for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
             # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
-            # The sliceable dimension is at index 2 (after num_layers and size)
-            sliceable_dim = state_tensor.shape[2]
+            # Kimi conv state transposes the two per-slot axes to [K-1, dim].
+            axis = 2 + slice_axis
+            sliceable_dim = state_tensor.shape[axis]
             # Repeat for each layer since we have per-layer data_ptrs
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
+
+    def get_state_layer_ids(self):
+        """Global model-layer id for each RDMA state entry.
+
+        Aligned element-wise with get_contiguous_buf_infos(), which flattens
+        the state list tensor-major x layer. Lets PD transfer match entries
+        by layer id when prefill (PP stage) holds a subset of the mamba layers.
+        """
+        state_tensor_count = sum(1 for _ in self._iter_transfer_state_tensors())
+        return list(self.mamba_layer_ids) * state_tensor_count
+
+    def get_state_slice_outer_counts(self):
+        """Get the number of rows preceding each tensor's TP slice axis."""
+        outer_counts = []
+        for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
+            outer_count = math.prod(state_tensor.shape[2 : 2 + slice_axis])
+            outer_counts += [outer_count] * self.num_mamba_layers
+        return outer_counts
 
     def get_state_conv_shard_groups(self):
         """Per-tensor conv sub-block dims, aligned element-wise with
@@ -1073,29 +1102,14 @@ class MambaPool:
         those tensors keep the single contiguous slice.
         """
         subdims_per_tensor = []
-        for field in vars(self.mamba_cache):
-            # Mirror the exclusions in get_state_dim_per_tensor so the returned
-            # sub-dims line up element-wise with the RDMA buffer list.
-            if field in (
-                "intermediate_ssm",
-                "intermediate_conv_window",
-                "replayssm_d",
-                "replayssm_k",
-                "replayssm_g",
-            ):
-                continue
-            value = getattr(self.mamba_cache, field)
-            if value is None:
-                continue
-            tensors = value if isinstance(value, list) else [value]
-            for _ in tensors:
-                # Only conv_state carries a q/k/v decomposition.
-                subdims = (
-                    list(self.conv_shard_groups)
-                    if field == "conv" and self.conv_shard_groups is not None
-                    else None
-                )
-                subdims_per_tensor += [subdims] * self.num_mamba_layers
+        for field, _, _ in self._iter_transfer_state_tensors():
+            # Only conv_state carries a q/k/v decomposition.
+            subdims = (
+                list(self.conv_shard_groups)
+                if field == "conv" and self.conv_shard_groups is not None
+                else None
+            )
+            subdims_per_tensor += [subdims] * self.num_mamba_layers
         return subdims_per_tensor
 
 
@@ -1333,6 +1347,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_state_dim_per_tensor(self):
         return self.mamba_pool.get_state_dim_per_tensor()
 
+    def get_state_slice_outer_counts(self):
+        return self.mamba_pool.get_state_slice_outer_counts()
+
     def get_state_conv_shard_groups(self):
         return self.mamba_pool.get_state_conv_shard_groups()
 
@@ -1404,12 +1421,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_value_donated = (
             req.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
         )
-        assert mamba_value_donated.item() != -1, (
-            f"Donated mamba slot is -1: donate_idx={donate_idx}, "
-            f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
-            f"next_track_idx={req.mamba_next_track_idx}, "
-            f"rid={req.rid}"
-        )
+        if _MAMBA_DEBUG_ASSERTS:
+            # .item() forces a cudaStreamSynchronize; only pay it when debugging.
+            assert mamba_value_donated.item() != -1, (
+                f"Donated mamba slot is -1: donate_idx={donate_idx}, "
+                f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
+                f"next_track_idx={req.mamba_next_track_idx}, "
+                f"rid={req.rid}"
+            )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
 
@@ -3352,7 +3371,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             # payload and the interleaved UE8M0 scales.
             if not self.mxfp8_sf_interleaved or cache_k.dtype == self.store_dtype:
                 raise ValueError("MXFP8 KV cache requires K and V scale tensors.")
-            from sglang.srt.layers.quantization.mxfp8_quant import quant_store_kv_mxfp8
+            from sglang.kernels.ops.quantization.mxfp8_quant import quant_store_kv_mxfp8
 
             quant_store_kv_mxfp8(
                 cache_k,
@@ -3385,7 +3404,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         """Write per-token UE8M0 K/V scales — interleaved into the FA4
         BlockScaledBasicChunk layout for page_size==128, flat otherwise."""
         if self.mxfp8_sf_interleaved:
-            from sglang.srt.layers.quantization.mxfp8_interleave_sf import (
+            from sglang.kernels.ops.quantization.mxfp8_interleave_sf import (
                 store_sf_interleaved,
             )
 
@@ -3427,7 +3446,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         # scale rows must travel with their fp8 payload or dequant reads
         # mismatched exponents.
         if self.mxfp8_sf_interleaved:
-            from sglang.srt.layers.quantization.mxfp8_interleave_sf import (
+            from sglang.kernels.ops.quantization.mxfp8_interleave_sf import (
                 store_sf_interleaved,
             )
 
@@ -3618,6 +3637,11 @@ class HybridLinearKVPool(KVCache):
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
 
+    def get_kv_layer_ids(self):
+        """Global layer ids aligned with the full-attention KV buffers."""
+        layer_ids = list(self.full_attention_layer_id_mapping)
+        return layer_ids if self.use_mla else layer_ids * 2
+
     def get_state_buf_infos(self):
         mamba_data_ptrs, mamba_data_lens, mamba_item_lens = (
             self.mamba_pool.get_contiguous_buf_infos()
@@ -3627,6 +3651,14 @@ class HybridLinearKVPool(KVCache):
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each mamba state tensor."""
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_layer_ids(self):
+        """Global layer id per mamba state entry, aligned with get_state_buf_infos()."""
+        return self.mamba_pool.get_state_layer_ids()
+
+    def get_state_slice_outer_counts(self):
+        """Get the row count preceding each mamba state slice axis."""
+        return self.mamba_pool.get_state_slice_outer_counts()
 
     def get_state_conv_shard_groups(self):
         """Per-tensor conv sub-block dims (GDN) aligned with the state list."""
@@ -4893,7 +4925,7 @@ class MiniMaxSparseKVPool(KVCache):
         if index_pool is not None and self._can_fuse_kv_index_store(
             index_pool, cache_k, cache_idx_k
         ):
-            from sglang.jit_kernel.minimax_store_kv_index import store_kv_index
+            from sglang.kernels.ops.kvcache.minimax_store_kv_index import store_kv_index
 
             main = self.main_pool
             head_bytes = main.head_dim * main.dtype.itemsize
