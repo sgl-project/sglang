@@ -339,10 +339,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self, reqs: List[Req]
     ) -> List[OutputBatch] | _IncrementalOutputs:
         batch_size = len(reqs)
-        if self.server_args.pipeline_config.supports_incremental_grouped_outputs():
-            return _IncrementalOutputs(
-                self._iter_incremental_grouped_outputs(reqs, batch_size)
-            )
+        if self.server_args.pipeline_config.incremental_grouped_stage_count():
+            return _IncrementalOutputs(self._iter_incremental_grouped_outputs(reqs))
 
         try:
             output_batch = self.worker.execute_forward(reqs)
@@ -385,13 +383,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             )
 
     def _iter_incremental_grouped_outputs(
-        self, reqs: List[Req], batch_size: int
+        self, reqs: List[Req]
     ) -> Iterator[OutputBatch]:
         yield from self.worker.execute_forward_incremental(reqs)
         logger.info(
             "Processed incremental native grouped batch of %d/%d request(s) "
             "with max_delay=%.2fms",
-            batch_size,
+            len(reqs),
             self._batching_max_size,
             self._batching_delay_s * 1000.0,
         )

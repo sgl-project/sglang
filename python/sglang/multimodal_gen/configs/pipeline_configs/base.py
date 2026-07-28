@@ -401,12 +401,8 @@ class PipelineConfig:
         """Return whether dynamic batches should run as grouped Req lists."""
         return False
 
-    def supports_incremental_grouped_outputs(self):
-        """Return whether grouped outputs can be returned as each one completes."""
-        return False
-
     def incremental_grouped_stage_count(self):
-        """Return the number of leading stages shared by an incremental group."""
+        """Return the shared prefix length; zero disables incremental outputs."""
         return 0
 
     def estimate_request_cost(self, batch) -> float:

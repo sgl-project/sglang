@@ -57,9 +57,6 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     def supports_native_grouped_requests(self):
         return True
 
-    def supports_incremental_grouped_outputs(self):
-        return True
-
     def incremental_grouped_stage_count(self):
         return 1
 
