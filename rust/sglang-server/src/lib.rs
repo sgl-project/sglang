@@ -118,13 +118,19 @@ impl Server {
 
     /// Non-blocking drain of the ingress ring, returned **columnar** as an
     /// [`IngressBatch`] so the large `input_ids` tensor never goes through
-    /// msgpack (see the field docs for the layout). The GIL is released for the
-    /// drain + columnar split; only the `PyBytes` marshaling needs it. The `ids`
-    /// cells are copied **directly into the result `bytes`** (one copy, no
-    /// intermediate buffer).
+    /// msgpack (see the field docs for the layout). The `ids` cells are copied
+    /// **directly into the result `bytes`** (one copy, no intermediate buffer).
+    ///
+    /// Runs entirely GIL-held, deliberately. `drain` is a `try_recv` loop plus an
+    /// uncontended stash lock (the Python thread is the only consumer), so it
+    /// cannot block — there is nothing for a detach to overlap with. And detaching
+    /// is far from free: reacquiring the GIL waits out the interpreter's switch
+    /// interval, so a `py.detach` here cost up to 5 ms whenever another Python
+    /// thread was runnable, to cover ~0.2 µs of work. Held, the whole call is a
+    /// fraction of a microsecond on an empty ring.
     #[pyo3(signature = (max = 256))]
     fn recv_requests(&self, py: Python<'_>, max: usize) -> PyResult<IngressBatch> {
-        let cols = py.detach(|| self.rt.ingress.drain(max));
+        let cols = self.rt.ingress.drain(max);
         let headers = cols
             .headers
             .iter()
@@ -165,39 +171,55 @@ impl Server {
     /// Push a whole decode batch as ONE frame: a columnar msgpack `header` plus
     /// the raw `data_cols` (per-column `bytes`), concatenated here. Blocks for
     /// backpressure; `False` only on shutdown.
+    ///
+    /// Framed and pushed with the GIL HELD, detaching only if the ring is full.
+    /// This runs on the scheduler's CUDA-launch thread every decode step, where the
+    /// unconditional detach was the single worst boundary cost: framing is
+    /// ~0.1–0.2 µs, but reacquiring the GIL waits out the interpreter's switch
+    /// interval (5 ms by default) whenever another Python thread is runnable —
+    /// 17–50% of a 10–30 ms decode step, landing nondeterministically. Held, the
+    /// whole boundary is ~1.3 µs per step.
+    ///
+    /// The slow path keeps its detach because a full ring genuinely parks: the
+    /// scheduler must feel backpressure rather than drop output it has already
+    /// committed to. It essentially never fires — measured headroom is ~100×.
     fn push_batch(&self, py: Python<'_>, header: &[u8], data_cols: Vec<PyBackedBytes>) -> bool {
         let cols: Vec<&[u8]> = data_cols.iter().map(|d| d.as_ref()).collect();
-        py.detach(|| {
-            let bytes = crate::message::frame_egress_batch_cols(header, &cols);
-            self.rt.egress.push(bytes)
-        })
+        self.push_frame(py, crate::message::frame_egress_batch_cols(header, &cols))
     }
 
     /// Push a control-request result. Blocks for backpressure; `False` only on
-    /// shutdown. Frames inside `detach` like `push_batch` — the payload is small
-    /// here so the copy is cheap either way, but kept uniform so no push holds the
-    /// GIL across framing.
+    /// shutdown.
     fn push_result(&self, py: Python<'_>, rid: &str, payload: &[u8]) -> bool {
-        py.detach(|| {
-            self.rt
-                .egress
-                .push(crate::message::frame_egress_result(rid, payload))
-        })
+        self.push_frame(py, crate::message::frame_egress_result(rid, payload))
     }
 
     /// Route a terminal failure back to request `rid`. Blocks for backpressure;
     /// `False` only on shutdown.
     fn push_error(&self, py: Python<'_>, rid: &str, message: &str) -> bool {
-        py.detach(|| {
-            self.rt
-                .egress
-                .push(crate::message::frame_egress_error(rid, message))
-        })
+        self.push_frame(py, crate::message::frame_egress_error(rid, message))
     }
 
     /// Signal all threads to stop (best effort).
     fn shutdown(&self) {
         self.rt.request_shutdown();
+    }
+}
+
+impl Server {
+    /// Hand one already-framed egress message to the ring: GIL-held when it fits,
+    /// detaching only to park on a full ring. Shared by every push path — they
+    /// differ solely in how the frame is built. `false` only on shutdown.
+    #[inline]
+    fn push_frame(&self, py: Python<'_>, frame: bytes::Bytes) -> bool {
+        match self.rt.egress.try_push(frame) {
+            Ok(()) => true,
+            // Consumer gone (shutdown): the frame is unavoidably lost.
+            Err(None) => false,
+            // Full: the scheduler must block here so backpressure reaches it, and
+            // blocking is exactly when releasing the GIL pays for itself.
+            Err(Some(frame)) => py.detach(|| self.rt.egress.push(frame)),
+        }
     }
 }
 
