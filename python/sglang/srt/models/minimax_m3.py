@@ -209,19 +209,9 @@ class _FusedQKVIndexProj(nn.Module):
 
 
 def build_minimax_fused_qkv_index(model: nn.Module) -> None:
-    n_built = n_block = 0
     for module in model.modules():
         if isinstance(module, MiniMaxM3Attention):
             module.maybe_build_fused_qkv_index()
-            if module._fused_qkv_index is not None:
-                n_built += 1
-                if getattr(module._fused_qkv_index._qm, "weight_block_size", None):
-                    n_block += 1
-    log_info_on_rank0(
-        logger,
-        f"[fused-qkv-index] built {n_built} fused QKV+index projections "
-        f"({n_block} block-fp8).",
-    )
 
 
 class MiniMaxM3MLP(nn.Module):
