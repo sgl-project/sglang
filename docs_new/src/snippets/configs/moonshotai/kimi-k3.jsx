@@ -658,12 +658,11 @@ export const config = {
       verified: false,
       verificationStatus: "in-progress",
       env: [],
+      // No --enable-symm-mem: it makes the fused all-reduce auto-probe skip.
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
-        "--disable-custom-all-reduce",
-        "--enable-symm-mem",
         "--mem-fraction-static 0.85",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
