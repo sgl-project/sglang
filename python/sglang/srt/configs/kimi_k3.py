@@ -19,10 +19,10 @@ def _apply_keep_num_experts_override(text_config: KimiLinearConfig) -> None:
 
     original_num_experts = int(text_config.num_experts or 0)
     if original_num_experts <= 0:
-        raise ValueError(
-            "SGLANG_KIMI_K3_KEEP_NUM_EXPERTS requires a MoE config with "
-            f"num_experts > 0, got {text_config.num_experts!r}."
-        )
+        # Transformers builds a default config instance during __repr__ /
+        # to_diff_dict(). That default text config is dense (num_experts=None),
+        # so the debug-only expert truncation must not make config logging fail.
+        return
     if keep_num_experts > original_num_experts:
         raise ValueError(
             "SGLANG_KIMI_K3_KEEP_NUM_EXPERTS cannot exceed the checkpoint "
