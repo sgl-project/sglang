@@ -265,6 +265,15 @@ class OpenAIServingResponses(OpenAIServingChat):
             return self.create_error_response(
                 "logprobs are not supported in streaming mode", param="logprobs"
             )
+        # harmony output opens with <|channel|>analysis<|message|>, so a whole-output
+        # json_schema forces "{" at the first token and the harmony parse then fails.
+        if self.use_harmony and ResponsesRequest._json_schema_from_text_format(
+            request.text
+        ):
+            return self.create_error_response(
+                "structured output (text.format) is not supported with gpt-oss models",
+                param="text",
+            )
         if (
             self.use_harmony
             and self._has_response_tool(request, "web_search", "web_search_preview")
@@ -2283,132 +2292,149 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else:
                     normal_text, tool_calls = delta, []
 
-                # drain tool calls before normal_text: on a tool boundary the closing
-                # "}" lands in calls and the separator in text, so text-first truncates args.
-                if tool_calls:
-                    if reasoning_state["open"]:
-                        for ev in _close_reasoning_item():
-                            yield ev
-                    if message_state["open"]:
-                        for ev in _close_message_item():
-                            yield ev
+                def _emit_tool_calls():
+                    nonlocal current_output_index
+                    if tool_calls:
+                        if reasoning_state["open"]:
+                            for ev in _close_reasoning_item():
+                                yield ev
+                        if message_state["open"]:
+                            for ev in _close_message_item():
+                                yield ev
 
-                for call in tool_calls:
-                    tool_index = call.tool_index
-                    state = tool_call_states.get(tool_index)
-                    if state is None or state.get("done"):
-                        # finalize other open tool calls first so their output_item.done lands
-                        # before the next output_item.added; else they stay open till end-of-stream.
-                        for other_index in list(tool_call_states):
-                            if other_index != tool_index and not tool_call_states[
-                                other_index
-                            ].get("done"):
-                                for ev in _close_tool_call_state(other_index):
-                                    yield ev
-                        current_output_index += 1
-                        item_id = f"fc_{random_uuid()[:8]}"
-                        call_id = f"call_{random_uuid()[:24]}"
-                        state = {
-                            "item_id": item_id,
-                            "call_id": call_id,
-                            "output_index": current_output_index,
-                            "name": call.name or "",
-                            "arguments": "",
-                            "added": False,
-                            "done": False,
-                        }
-                        tool_call_states[tool_index] = state
-                    if not state["added"]:
-                        state["added"] = True
-                        # Capture ``call.name`` before the ``added`` event so
-                        # the name is set on the first emitted item.
-                        if call.name and not state["name"]:
-                            state["name"] = call.name
-                        yield _send_event(
-                            openai_responses_types.ResponseOutputItemAddedEvent(
-                                type="response.output_item.added",
-                                sequence_number=-1,
-                                output_index=state["output_index"],
-                                item=ResponseFunctionToolCall(
-                                    arguments="",
-                                    call_id=state["call_id"],
-                                    name=state["name"],
-                                    type="function_call",
-                                    id=state["item_id"],
-                                    status="in_progress",
-                                ),
+                    for call in tool_calls:
+                        tool_index = call.tool_index
+                        state = tool_call_states.get(tool_index)
+                        if state is None or state.get("done"):
+                            # finalize other open tool calls first so their output_item.done lands
+                            # before the next output_item.added; else they stay open till end-of-stream.
+                            for other_index in list(tool_call_states):
+                                # _close_tool_call_state is a no-op on already-done state.
+                                if other_index != tool_index:
+                                    for ev in _close_tool_call_state(other_index):
+                                        yield ev
+                            current_output_index += 1
+                            item_id = f"fc_{random_uuid()[:8]}"
+                            call_id = f"call_{random_uuid()[:24]}"
+                            state = {
+                                "item_id": item_id,
+                                "call_id": call_id,
+                                "output_index": current_output_index,
+                                "name": call.name or "",
+                                "arguments": "",
+                                "added": False,
+                                "done": False,
+                            }
+                            tool_call_states[tool_index] = state
+                        if not state["added"]:
+                            state["added"] = True
+                            # Capture ``call.name`` before the ``added`` event so
+                            # the name is set on the first emitted item.
+                            if call.name and not state["name"]:
+                                state["name"] = call.name
+                            yield _send_event(
+                                openai_responses_types.ResponseOutputItemAddedEvent(
+                                    type="response.output_item.added",
+                                    sequence_number=-1,
+                                    output_index=state["output_index"],
+                                    item=ResponseFunctionToolCall(
+                                        arguments="",
+                                        call_id=state["call_id"],
+                                        name=state["name"],
+                                        type="function_call",
+                                        id=state["item_id"],
+                                        status="in_progress",
+                                    ),
+                                )
                             )
-                        )
-                    if call.parameters:
-                        state["arguments"] += call.parameters
-                        yield _send_event(
-                            openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
-                                type="response.function_call_arguments.delta",
-                                sequence_number=-1,
-                                item_id=state["item_id"],
-                                output_index=state["output_index"],
-                                delta=call.parameters,
+                        if call.parameters:
+                            state["arguments"] += call.parameters
+                            yield _send_event(
+                                openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
+                                    type="response.function_call_arguments.delta",
+                                    sequence_number=-1,
+                                    item_id=state["item_id"],
+                                    output_index=state["output_index"],
+                                    delta=call.parameters,
+                                )
                             )
-                        )
 
-                # whitespace-only text while a tool call is open is a separator
-                # between tool blocks, not content. (the `normal_text and` short-
-                # circuits the tool-state scan on the common empty deltas.)
-                if normal_text and _should_emit_normal_text_as_message(
-                    normal_text,
-                    any_tool_call_in_progress=any(
-                        not s.get("done") for s in tool_call_states.values()
-                    ),
-                ):
-                    if reasoning_state["open"]:
-                        for ev in _close_reasoning_item():
-                            yield ev
-                    for tool_index in list(tool_call_states):
-                        for ev in _close_tool_call_state(tool_index):
-                            yield ev
-                    if not message_state["open"]:
-                        item_id = _open_message_item()
-                        yield _send_event(
-                            openai_responses_types.ResponseOutputItemAddedEvent(
-                                type="response.output_item.added",
-                                sequence_number=-1,
-                                output_index=message_state["output_index"],
-                                item=ResponseOutputMessage(
-                                    id=item_id,
-                                    type="message",
-                                    role="assistant",
-                                    content=[],
-                                    status="in_progress",
-                                ),
+                def _emit_normal_text():
+                    # whitespace-only text while a tool call is open is a separator
+                    # between tool blocks, not content. (the `normal_text and` short-
+                    # circuits the tool-state scan on the common empty deltas.)
+                    if normal_text and _should_emit_normal_text_as_message(
+                        normal_text,
+                        any_tool_call_in_progress=any(
+                            not s.get("done") for s in tool_call_states.values()
+                        ),
+                    ):
+                        if reasoning_state["open"]:
+                            for ev in _close_reasoning_item():
+                                yield ev
+                        for tool_index in list(tool_call_states):
+                            for ev in _close_tool_call_state(tool_index):
+                                yield ev
+                        if not message_state["open"]:
+                            item_id = _open_message_item()
+                            yield _send_event(
+                                openai_responses_types.ResponseOutputItemAddedEvent(
+                                    type="response.output_item.added",
+                                    sequence_number=-1,
+                                    output_index=message_state["output_index"],
+                                    item=ResponseOutputMessage(
+                                        id=item_id,
+                                        type="message",
+                                        role="assistant",
+                                        content=[],
+                                        status="in_progress",
+                                    ),
+                                )
                             )
-                        )
+                            yield _send_event(
+                                openai_responses_types.ResponseContentPartAddedEvent(
+                                    type="response.content_part.added",
+                                    sequence_number=-1,
+                                    output_index=message_state["output_index"],
+                                    item_id=message_state["item_id"],
+                                    content_index=0,
+                                    part=openai_responses_types.ResponseOutputText(
+                                        type="output_text",
+                                        text="",
+                                        annotations=[],
+                                        logprobs=None,
+                                    ),
+                                )
+                            )
+                        message_state["text"] += normal_text
                         yield _send_event(
-                            openai_responses_types.ResponseContentPartAddedEvent(
-                                type="response.content_part.added",
+                            openai_responses_types.ResponseTextDeltaEvent(
+                                type="response.output_text.delta",
                                 sequence_number=-1,
+                                content_index=0,
                                 output_index=message_state["output_index"],
                                 item_id=message_state["item_id"],
-                                content_index=0,
-                                part=openai_responses_types.ResponseOutputText(
-                                    type="output_text",
-                                    text="",
-                                    annotations=[],
-                                    logprobs=None,
-                                ),
+                                delta=normal_text,
+                                logprobs=[],
                             )
                         )
-                    message_state["text"] += normal_text
-                    yield _send_event(
-                        openai_responses_types.ResponseTextDeltaEvent(
-                            type="response.output_text.delta",
-                            sequence_number=-1,
-                            content_index=0,
-                            output_index=message_state["output_index"],
-                            item_id=message_state["item_id"],
-                            delta=normal_text,
-                            logprobs=[],
-                        )
-                    )
+
+                # A single delta can carry both text and calls, and the tuple
+                # loses their relative position. Recover it from the calls: a
+                # call that supplies a name is opening a new block, so the text
+                # in this delta preceded it and the message must land first.
+                # Otherwise the calls are only continuing / closing arguments,
+                # whose trailing text is a separator that would truncate the
+                # args if it were emitted first.
+                opens_new_call = any(call.name for call in tool_calls)
+                emitters = (
+                    (_emit_normal_text, _emit_tool_calls)
+                    if opens_new_call
+                    else (_emit_tool_calls, _emit_normal_text)
+                )
+                for emitter in emitters:
+                    for ev in emitter():
+                        yield ev
         except Exception:
             logger.exception("Error while streaming /v1/responses")
             failed = _sanitize_response_dict(

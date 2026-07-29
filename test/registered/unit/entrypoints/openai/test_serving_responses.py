@@ -708,6 +708,76 @@ class MultiToolCallStreamingOrderTestCase(unittest.TestCase):
         names = sorted(item["name"] for item in fc_done_items)
         self.assertEqual(names, ["get_time", "get_weather"])
 
+    def test_prose_before_tool_call_keeps_message_first(self):
+        """A delta carrying both prose and the start of a tool call must emit the
+        message item first: the parser returns them as an unordered tuple, and the
+        prose textually preceded the call."""
+        from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+
+        serving = make_serving()
+        serving.tool_call_parser = "qwen3_coder"
+        serving.reasoning_parser = None
+
+        det = Qwen3CoderDetector()
+        s, e = det.tool_call_start_token, det.tool_call_end_token
+        fp, fe = det.tool_call_prefix, det.function_end_token
+        pp, pe = det.parameter_prefix, det.parameter_end_token
+        prose = "Let me check."
+        tool = f"{s}{fp}get_weather>{pp}city>Beijing{pe}{fe}{e}"
+
+        async def fake_gen():
+            # One delta spanning prose + the whole call, as spec decoding or
+            # --stream-interval > 1 produces.
+            yield {"text": prose + tool, "meta_info": {}}
+            yield {
+                "text": prose + tool,
+                "meta_info": {
+                    "finish_reason": {"type": "stop"},
+                    "prompt_tokens": 5,
+                    "completion_tokens": 10,
+                },
+            }
+
+        request = ResponsesRequest(
+            model="x",
+            input="weather",
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        )
+
+        async def run():
+            stream = serving.responses_stream_generator_non_harmony(
+                request,
+                {},
+                fake_gen(),
+                "x",
+                Mock(),
+                RequestResponseMetadata(request_id="r"),
+            )
+            return await collect_stream_events(stream)
+
+        events = asyncio.run(run())
+        seq = list(zip(event_types(events), event_payloads(events)))
+
+        added = [
+            (p["output_index"], p["item"].get("type"))
+            for t, p in seq
+            if t == "response.output_item.added"
+        ]
+        message_index = next(i for i, kind in added if kind == "message")
+        call_index = next(i for i, kind in added if kind == "function_call")
+        self.assertLess(message_index, call_index)
+
+        # The call must not be split across two items by the reordering.
+        fc_added = [kind for _, kind in added if kind == "function_call"]
+        self.assertEqual(len(fc_added), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
