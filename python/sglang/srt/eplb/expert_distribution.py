@@ -872,9 +872,10 @@ class _DequeCollection:
 class _BufferedDetailAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._lock = threading.Lock()
-        self._record_batches = self._init_record_batches()
-        self._current_idx = 0
+        num_batches, batch_size = self._get_collection_layout(
+            self._server_args.expert_distribution_recorder_buffer_size
+        )
+        self._record_collection = _RecordCollection.init_new(num_batches, batch_size)
 
     # ------------------------------------------------------------------
     # Accumulator API
@@ -898,40 +899,24 @@ class _BufferedDetailAccumulator(_UtilizationRateAccumulatorMixin):
         outputs: Dict[str, Any],
     ):
         super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
-
-        record = dict(
-            forward_pass_id=forward_pass_id,
-            rank=self._rank,
-            gatherer_key=gatherer_key,
-            **single_pass_data,
+        self._record_collection.append(
+            dict(
+                forward_pass_id=forward_pass_id,
+                rank=self._rank,
+                gatherer_key=gatherer_key,
+                **single_pass_data,
+            )
         )
-
-        with self._lock:
-            num = len(self._record_batches)
-            # Advance past full batches and evict as we go
-            while not self._record_batches[self._current_idx].append(record):
-                self._current_idx = (self._current_idx + 1) % num
-                self._record_batches[self._current_idx].reset()
 
     def reset(self):
         super().reset()
-        with self._lock:
-            for batch in self._record_batches:
-                batch.reset()
+        self._record_collection.reset()
 
     def dump(self, output_mode: _OutputMode):
         assert output_mode == "file"
 
-        with self._lock:
-            num = len(self._record_batches)
-            records = []
-            # Walk ring from oldest (idx+1) to newest (idx)
-            for offset in range(1, num + 1):
-                batch = self._record_batches[(self._current_idx + offset) % num]
-                records.extend(batch.get_records())
-
         output = dict(
-            records=records,
+            records=self._record_collection.get_records(),
             # NOTE: This may change during recording, so here we say it is the "last" one
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
@@ -939,39 +924,31 @@ class _BufferedDetailAccumulator(_UtilizationRateAccumulatorMixin):
             f"expert_distribution_recorder_{time.time()}_{self._rank}.pt", output
         )
 
-    def _get_batch_layout(self, num_records):
-        MAX_RECORDS_PER_BATCH = 16  # cap for bounded async-D2H batch latency
-        MIN_BATCHES = 4             # ring buffer needs ≥4 for meaningful rotation
-        MIN_RECORDS_PER_BATCH = 2   # each batch must hold ≥2 for progress
-
-        # Primary constraint: records per batch; then derive batch count
-        records_per_batch = max(
-            MIN_RECORDS_PER_BATCH,
-            min(MAX_RECORDS_PER_BATCH, math.ceil(num_records / MIN_BATCHES)),
-        )
-        num_batches = max(MIN_BATCHES, math.ceil(num_records / records_per_batch))
-
-        # Per-record byte estimate (matches _BufferedDetailSinglePassGatherer tensors):
-        L = self._expert_location_metadata.num_layers
-        E = self._expert_location_metadata.num_physical_experts
-        N = self._server_args.chunked_prefill_size * 8  # max tokens per forward pass
-        topk_bytes = L * N * 8 * 4          # topk_ids_of_layer (int32)
-        meta_bytes = N * (4 + 8)            # input_ids (int32) + positions (int64)
-        gpc_bytes = L * E * 4               # global_physical_count (int32)
-        bytes_per_record = topk_bytes + meta_bytes + gpc_bytes
-
-        return num_batches, (records_per_batch * bytes_per_record)
-
-    def _init_record_batches(self) -> List[_RecordBatch]:
-        num_records = self._server_args.expert_distribution_recorder_buffer_size
-        num_batches, batch_size = self._get_batch_layout(
-            self._server_args.expert_distribution_recorder_buffer_size
-        )
-
+    def _get_collection_layout(self, num_records):
         if num_records >= 0:
-            return [_RecordBatch(batch_size) for _ in range(num_batches)]
+            MAX_RECORDS_PER_BATCH = 16  # cap for bounded async-D2H batch latency
+            MIN_BATCHES = 4  # ring buffer needs ≥4 for meaningful rotation
+            MIN_RECORDS_PER_BATCH = 2  # each batch must hold ≥2 for progress
+
+            # Primary constraint: records per batch; then derive batch count
+            records_per_batch = max(
+                MIN_RECORDS_PER_BATCH,
+                min(MAX_RECORDS_PER_BATCH, math.ceil(num_records / MIN_BATCHES)),
+            )
+            num_batches = max(MIN_BATCHES, math.ceil(num_records / records_per_batch))
+
+            # Per-record byte estimate (matches _BufferedDetailSinglePassGatherer tensors):
+            L = self._expert_location_metadata.num_layers
+            E = self._expert_location_metadata.num_physical_experts
+            N = self._server_args.chunked_prefill_size * 8  # max tokens per forward pass
+            topk_bytes = L * N * 8 * 4  # topk_ids_of_layer (int32)
+            meta_bytes = N * (4 + 8)  # input_ids (int32) + positions (int64)
+            gpc_bytes = L * E * 4  # global_physical_count (int32)
+            bytes_per_record = topk_bytes + meta_bytes + gpc_bytes
+
+            return num_batches, (records_per_batch * bytes_per_record)
         else:
-            return [_RecordBatch(batch_size)]   # infinite batch
+            return 1, -1 # infinite batch
 
 
 class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
@@ -1129,91 +1106,173 @@ def _dump_to_file(name, data):
     torch.save(data, str(path_output))
 
 
-@dataclass
-class _RecordLoc:
-    segment: torch.Tensor
-    offset: int
-    length: int
+class _RecordCollection:
+    @staticmethod
+    def init_new(num_batches: int, batch_size: int):
+        if batch_size > 0:
+            return _StagingRecordCollection(num_batches, batch_size)
+        else:
+            return _InfiniteRecordCollection()
 
-    def get(self) -> torch.Tensor:
-        return self.segment[self.offset : self.offset + self.length]
+    def append(self, record: Dict[str, Any]):
+        raise NotImplementedError
 
+    def get_records(self):
+        raise NotImplementedError
 
-@dataclass
-class _Record:
-    loc: _RecordLoc
-    shape: tuple
-    dtype: torch.dtype
-
-    def __reduce_ex__(self, protocol: int):
-        t = self.loc.get().view(self.dtype).reshape(self.shape).clone()
-        return t.__reduce_ex__(protocol)
+    def reset(self):
+        raise NotImplementedError
 
 
-class _RecordBatch:
-    def __init__(self, size_bytes: int):
-        self._segment_size = size_bytes
-        self._segment_head = 0
-        self._segment = torch.as_tensor(
-            torch.UntypedStorage(size_bytes, device=torch.device("cpu")),
-            dtype=torch.uint8,
-        ).pin_memory()
-
-        self._stream = torch.cuda.Stream()
-        self._event = torch.cuda.Event()
+class _InfiniteRecordCollection(_RecordCollection):
+    def __init__(self):
         self._records: List[Dict[str, Any]] = []
 
     def append(self, record: Dict[str, Any]) -> bool:
-        record_size = self._get_record_size(record)
-        if self._segment_head + record_size >= self._segment_size:
-            return False
+        def _process_object(obj):
+            if isinstance(obj, torch.Tensor):
+                return obj.cpu().clone()
+            return obj
 
-        processed: Dict[str, Any] = {}
-        for k, v in record.items():
-            if not isinstance(v, torch.Tensor):
-                processed[k] = v
-            else:
-                t = (
-                    v.clone(memory_format=torch.contiguous_format)
-                    .view(-1)
-                    .view(torch.uint8)
-                )
-
-                loc = _RecordLoc(
-                    segment=self._segment,
-                    offset=self._segment_head,
-                    length=t.numel()
-                )
-
-                t.record_stream(self._stream)
-                self._event.record()
-                with torch.cuda.stream(self._stream):
-                    self._event.wait(self._stream)
-                    self._segment[loc.offset : loc.offset + loc.length].copy_(
-                        t, non_blocking=True
-                    )
-
-                self._segment_head += loc.length
-                processed[k] = _Record(loc, tuple(v.shape), v.dtype)
-
-        self._records.append(processed)
+        self._records.append({k: _process_object(v) for k, v in record.items()})
         return True
 
     def get_records(self):
+        return self._records
+
+    def reset(self):
+        self._records.clear()
+
+
+@dataclass
+class _StagedTensor:
+    tensor: torch.Tensor
+    offset: int
+    length: int
+    shape: tuple
+    dtype: torch.dtype
+
+    def get_tensor(self) -> torch.Tensor:
+        t = self.tensor[self.offset : self.offset + self.length]
+        return t.view(self.dtype).reshape(self.shape).clone()
+
+    def __reduce_ex__(self, protocol: int):
+        return self.get_tensor().__reduce_ex__(protocol)
+
+
+class _RecordBatch:
+    def __init__(self, batch_size: int):
+        self._buffer = _StagingBuffer(batch_size, torch.device("cpu"))
+        self._records: List[Dict[str, Any]] = []
+        self._stream = torch.cuda.Stream()
+        self._event = torch.cuda.Event()
+
+    def fits(self, size_bytes: int):
+        return self._buffer.available() >= size_bytes
+
+    def append(
+        self, record: Dict[str, Any], staged_tensors: List[_StagedTensor]
+    ):
+        for t in staged_tensors:
+            t.tensor.record_stream(self._stream)
+            self._event.record()
+            with torch.cuda.stream(self._stream):
+                self._event.wait(self._stream)
+                t.tensor = self._buffer.get_all()
+                t.offset, t.length = self._buffer.append(t)
+        self._records.append(record)
+
+    def get(self) -> List[Dict[str, Any]]:
         if len(self._records) > 0:
             self._stream.synchronize()
         return self._records
 
     def reset(self):
         self._records.clear()
-        self._segment_head = 0
+        self._buffer.reset()
 
-    def _get_record_size(self, record: Dict[str, Any]):
-        total_bytes = 0
-        for v in record.values():
-            if isinstance(v, torch.Tensor) and v.numel() > 0:
-                total_bytes += v.numel() * v.element_size()
-        return total_bytes
+
+class _StagingRecordCollection(_RecordCollection):
+    def __init__(self, num_batches: int, batch_size: int):
+        self._ring = [_RecordBatch(batch_size) for _ in range(num_batches)]
+        self._current_batch = self._ring[0]
+
+    def append(self, record: Dict[str, Any]) -> bool:
+        # TODO: check ring buffer status
+        processed, record_staged_tensors, record_tensor_size = (
+            self._prepare_record(record)
+        )
+
+        if not self._current_batch.fits(record_tensor_size):
+            return False    # TODO: find next empty batch
+
+        self._current_batch.append(processed, record_staged_tensors)
+        return True
+
+    def get_records(self):
+        # TODO: collect from all batches, start from current batch
+        # TODO: block new records
+        return self._current_batch.get()
+
+    def reset(self):
+        # TODO: unblock new records
+        for batch in self._ring:
+            batch.reset()
+
+    def _prepare_record(self, record: Dict[str, Any]):
+        processed: Dict[str, Any] = {}
+        staged_tensors: List[_StagedTensor] = []
+        tensor_size: int = 0
+        for k, v in record.items():
+            if isinstance(v, torch.Tensor) and v.device != torch.device("cpu"):
+                if v.numel() > 0:
+                    t = (
+                        v.clone(memory_format=torch.contiguous_format)
+                        .view(-1)
+                        .view(torch.uint8)
+                    )
+                    # dummy staged tensor
+                    s = _StagedTensor(
+                        tensor=t,
+                        offset=0,
+                        length=t.numel(),
+                        shape=tuple(v.shape),
+                        dtype=v.dtype,
+                    )
+                    processed[k] = s
+                    staged_tensors.append(s)
+                    tensor_size += s.length
+                else:
+                    processed[k] = torch.empty(0, device=torch.device("cpu"))
+            else:
+                processed[k] = v
+        return processed, staged_tensors, tensor_size
+
+
+class _StagingBuffer:
+    def __init__(self, buffer_size, device):
+        self._buffer = torch.empty(
+            buffer_size, dtype=torch.uint8, device=device, pin_memory=True
+        )
+        self._capacity = buffer_size
+        self._offset = 0
+
+    def append(self, value: torch.Tensor) -> int:
+        assert value.dim() == 1, "Only 1D tensors are supported for staging buffer"
+        offset = self._offset
+        length = min(value.numel(), self._capacity - self._offset)
+        self._buffer[offset : offset + length].copy_(value[:length], non_blocking=True)
+        self._offset += length
+        return offset, length
+
+    def get_all(self) -> torch.Tensor:
+        return self._buffer
+
+    def available(self):
+        return self._capacity - self._offset
+
+    def reset(self):
+        self._offset = 0
 
 
 class _Buffer:
