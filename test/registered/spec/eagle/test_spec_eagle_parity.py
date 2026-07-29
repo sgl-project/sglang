@@ -13,7 +13,7 @@ from sglang.test.kits.spec_server_kits import SpecParityKit
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
 register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-large")
-register_xpu_ci(est_time=360, stage="stage-b", runner_config="1-gpu-xpu")
+register_xpu_ci(est_time=360, suite="nightly-xpu-1-gpu", nightly=True)
 
 _is_xpu = is_xpu()
 
@@ -41,9 +41,6 @@ class TestEagle3ParityCUDA(SpecParityKit, _Eagle3ParityBase):
 class TestEagle3ParityXPU(SpecParityKit, _Eagle3ParityBase):
     """EAGLE3 parity on XPU (triton, no overlap, deterministic)."""
 
-    # 8B target OOMs the 11.9GiB B580; use the matched Llama-3.2-1B EAGLE3 pair.
-    model = "meta-llama/Llama-3.2-1B-Instruct"
-    draft_model = "rescommons/SpecForge-EAGLE3-Llama-3.2-1B-Instruct"
     disable_overlap = False
     attention_backend = "triton"
     # Decode full-graph was active by default when this test was added
