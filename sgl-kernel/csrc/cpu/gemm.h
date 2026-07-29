@@ -67,11 +67,18 @@ inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
 }
 
-enum class CPUActMethod : int {
-  silu_and_mul = 0,
-  swiglu = 1,
-  gelu_and_mul = 2,
-};
+enum class CPUActMethod : int { silu_and_mul = 0, swiglu = 1, clamped_silu_and_mul = 2, gelu_and_mul = 3 };
+
+// Select activation based on which clamp/scale parameters the caller provided:
+//   limit + alpha ⇒ gpt-oss swiglu.
+//   limit only    ⇒ DSV4-2604B clamped silu_and_mul.
+//   neither       ⇒ plain silu_and_mul.
+inline CPUActMethod select_act_func(const std::optional<double>& alpha, const std::optional<double>& limit) {
+  if (!limit.has_value()) {
+    return CPUActMethod::silu_and_mul;
+  }
+  return alpha.has_value() ? CPUActMethod::swiglu : CPUActMethod::clamped_silu_and_mul;
+}
 
 enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3, MXFP4 = 4 };
 
@@ -225,25 +232,29 @@ void fused_experts_int4_w4a8_kernel_impl(
     int64_t topk,
     int64_t num_tokens_post_pad);
 
-template <typename scalar_t>
-void shared_expert_fp8_kernel_impl(
+// moe implementations for fp8 w8a16 and mxfp4
+template <typename scalar_t, typename packed_t, typename param_t, bool is_mxfp4>
+void shared_expert_fp_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic0,
     scalar_t* __restrict__ ic1,
     scalar_t* __restrict__ B_tmp,
     float* __restrict__ C_tmp,
     const scalar_t* __restrict__ input,
-    const at::Float8_e4m3fn* __restrict__ packed_w1,
-    const at::Float8_e4m3fn* __restrict__ packed_w2,
-    const float* __restrict__ w1s,
-    const float* __restrict__ w2s,
+    const packed_t* __restrict__ packed_w1,
+    const packed_t* __restrict__ packed_w2,
+    const param_t* __restrict__ w1s,
+    const param_t* __restrict__ w2s,
     int64_t block_size_N,
     int64_t block_size_K,
     const scalar_t* __restrict__ fused_experts_out,
     float routed_scaling_factor,
     int64_t M,
     int64_t N,
-    int64_t K);
+    int64_t K,
+    float alpha,
+    float limit,
+    CPUActMethod act_func);
 
 // tinygemm interface
 template <typename scalar_t>

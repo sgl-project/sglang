@@ -283,6 +283,28 @@ class TestGemm(CustomTestCase):
         atol = rtol = precision[ref_res.dtype]
         torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)
 
+    @parametrize(M=[1, 101], N=[16, 32 * 13], K=[32 * 16], has_bias=[False, True])
+    def test_bf16_fp32_gemm(self, M, N, K, has_bias):
+        mat1 = torch.randn(M, K, dtype=torch.bfloat16)
+        mat2 = torch.randn(N, K, dtype=torch.bfloat16)
+        bias = torch.randn(N, dtype=torch.float32) if has_bias else None
+
+        ref = torch.nn.functional.linear(mat1.float(), mat2.float(), bias)
+
+        out = torch.ops.sgl_kernel.weight_packed_linear(
+            mat1, mat2, bias, False, torch.float32
+        )
+        self.assertEqual(out.dtype, torch.float32)
+        atol = rtol = precision[torch.float32]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
+        packed_mat2 = torch.ops.sgl_kernel.convert_weight_packed(mat2)
+        out2 = torch.ops.sgl_kernel.weight_packed_linear(
+            mat1, packed_mat2, bias, True, torch.float32
+        )
+        self.assertEqual(out2.dtype, torch.float32)
+        torch.testing.assert_close(ref, out2, atol=atol, rtol=rtol)
+
 
 if __name__ == "__main__":
     unittest.main()

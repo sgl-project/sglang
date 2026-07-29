@@ -337,6 +337,7 @@ def run_a_suite(args):
         )
         if not f.endswith("/conftest.py")
         and not f.endswith("/__init__.py")
+        and not f.endswith("/cpu/quant_utils.py")
         and not f.endswith("/cpu/utils.py")
         and not f.endswith("/run_tests.py")
     ]
