@@ -31,6 +31,8 @@ class TestE2ETensorParallel(CustomTestCase):
                 "4",
                 "--mem-fraction-static",
                 "0.88",
+                "--attention-backend",
+                "triton",
             ],
             num_prompts=2,
             random_input_len=32,
