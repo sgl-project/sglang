@@ -112,6 +112,7 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
     "triton",
     "ascend",
     "trtllm_mha",
+    "intel_xpu",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
