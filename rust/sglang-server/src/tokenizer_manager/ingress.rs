@@ -27,7 +27,7 @@ use crate::message::{
     RequestKind,
 };
 use crate::ring::IngressProducer;
-use crate::runtime::Runnable;
+use crate::runtime::{Runnable, ServerArgs};
 use crate::tokenizer_manager::{AbortSource, Senders, TmEvent};
 
 /// Ingress FSM dispatcher stage. Owns its inbox + downstream handles, so the
@@ -50,18 +50,24 @@ const MAX_RID_LEN: usize = 128;
 
 /// What ingress admits, resolved once at boot from the scheduler's `server_args`.
 /// A struct rather than more positional `new` arguments — these grew from two to
-/// six, and every one of them is an `Option<u64>`/`bool` that would be trivial to
-/// swap at a call site.
-#[derive(Clone, Debug, Default)]
+/// six, and every one of them is a `u64`/`bool` that would be trivial to swap at
+/// a call site.
+///
+/// NOT `Default`-able on purpose. `vocab_size` and `context_len` are mandatory,
+/// and their zero value is the most restrictive setting there is — a derived
+/// `Default` would silently build limits that reject every request rather than
+/// failing loudly. Tests construct these explicitly (see `test_limits`).
+#[derive(Clone, Debug)]
 pub struct Limits {
     /// Token-ids-in mode: a generate request must arrive already tokenized.
     pub skip_tokenizer_init: bool,
-    /// `model_config.vocab_size`; bounds client-supplied token ids
-    /// (`None` → unknown, checks skipped).
-    pub vocab_size: Option<u64>,
-    /// `model_config.context_len`, the ceiling for input + `max_new_tokens`
-    /// (`None` → unknown, check skipped).
-    pub context_len: Option<u64>,
+    /// `model_config.vocab_size`; bounds client-supplied token ids. Mandatory —
+    /// [`ServerArgs::validate_mandatory`](crate::runtime::ServerArgs) rejects a
+    /// boot without it, so ingress can check unconditionally.
+    pub vocab_size: u64,
+    /// `model_config.context_len`, the ceiling for input + `max_new_tokens`.
+    /// Mandatory, as above.
+    pub context_len: u64,
     /// Output slots reserved on top of the input (eagle draft tokens).
     pub num_reserved_tokens: u64,
     /// Clamp `max_new_tokens` to what fits instead of rejecting the request.
@@ -70,16 +76,24 @@ pub struct Limits {
     pub enable_return_hidden_states: bool,
 }
 
-impl Limits {
-    pub fn from_server_args(sa: &crate::runtime::ServerArgs) -> Self {
-        Self {
+impl TryFrom<&ServerArgs> for Limits {
+    type Error = Error;
+
+    fn try_from(sa: &ServerArgs) -> Result<Self, Self::Error> {
+        Ok(Self {
             skip_tokenizer_init: sa.skip_tokenizer_init,
-            vocab_size: sa.model_config.vocab_size,
-            context_len: sa.model_config.context_len,
+            vocab_size: sa
+                .model_config
+                .vocab_size
+                .ok_or_else(|| Error::Validation("vocab_size missing".into()))?,
+            context_len: sa
+                .model_config
+                .context_len
+                .ok_or_else(|| Error::Validation("context_len missing".into()))?,
             num_reserved_tokens: sa.num_reserved_tokens,
             allow_auto_truncate: sa.allow_auto_truncate,
             enable_return_hidden_states: sa.enable_return_hidden_states,
-        }
+        })
     }
 }
 
@@ -448,23 +462,23 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
     // Client-supplied token ids must be in-vocabulary: an out-of-range id
     // reaches the embedding lookup and kills the scheduler process, so 400
     // here instead — mirroring the Python `TokenizerManager` validation.
-    if let (Some(vs), RequestKind::Generate(g)) = (vocab_size, &req.kind) {
+    if let RequestKind::Generate(g) = &req.kind {
         if let Some(ids) = &g.input_ids {
             for &id in ids {
-                if id < 0 || id as u64 >= vs {
+                if id < 0 || id as u64 >= vocab_size {
                     return Err(Error::Validation(format!(
                         "input_ids contains out-of-vocabulary token id {id}; \
-                         valid range is [0, {vs})"
+                         valid range is [0, {vocab_size})"
                     )));
                 }
             }
         }
         if let Some(ids) = &g.token_ids_logprob {
             for &id in ids {
-                if id < 0 || id as u64 >= vs {
+                if id < 0 || id as u64 >= vocab_size {
                     return Err(Error::Validation(format!(
                         "token_ids_logprob contains out-of-vocabulary token id \
-                         {id}; valid range is [0, {vs})"
+                         {id}; valid range is [0, {vocab_size})"
                     )));
                 }
             }
@@ -496,9 +510,7 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
 /// Under `allow_auto_truncate` both clamp instead of rejecting — the launch flag
 /// opted into that.
 fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
-    let Some(max_req_len) = limits.context_len else {
-        return Ok(()); // context length unknown — nothing to enforce
-    };
+    let max_req_len = limits.context_len;
     // Python counts the reserved slots as part of the input, so a request can be
     // rejected for them even when the prompt alone fits.
     let input_len =
@@ -670,11 +682,25 @@ mod tests {
         }
     }
 
+    /// A context ceiling high enough that only a test which sets one on purpose
+    /// can reach it. `context_len` is mandatory now, so "no ceiling" has to be a
+    /// large number rather than `None`; kept well below `u64::MAX` so the
+    /// `as i64` in the auto-truncate clamp cannot go negative if a future test
+    /// does reach this path.
+    const NO_CONTEXT_CEILING: u64 = 1 << 40;
+
     /// The default test limits: a real tokenizer, vocab 1000, no context ceiling.
+    /// Spelled out rather than `..Default::default()` — `Limits` deliberately has
+    /// no `Default`, because a zero `vocab_size`/`context_len` would reject every
+    /// request instead of behaving like "unset".
     fn test_limits() -> Limits {
         Limits {
-            vocab_size: Some(1000),
-            ..Default::default()
+            skip_tokenizer_init: false,
+            vocab_size: 1000,
+            context_len: NO_CONTEXT_CEILING,
+            num_reserved_tokens: 0,
+            allow_auto_truncate: false,
+            enable_return_hidden_states: false,
         }
     }
 
@@ -699,7 +725,7 @@ mod tests {
     #[test]
     fn total_tokens_over_context_is_rejected() {
         let limits = Limits {
-            context_len: Some(10),
+            context_len: 10,
             ..test_limits()
         };
         let mut g = GenerateRequest {
@@ -727,7 +753,7 @@ mod tests {
     #[test]
     fn reserved_tokens_count_toward_the_limit() {
         let limits = Limits {
-            context_len: Some(10),
+            context_len: 10,
             num_reserved_tokens: 5,
             ..test_limits()
         };
@@ -757,7 +783,7 @@ mod tests {
             ..Default::default()
         };
         let truncating = Limits {
-            context_len: Some(10),
+            context_len: 10,
             allow_auto_truncate: true,
             ..test_limits()
         };
@@ -773,7 +799,7 @@ mod tests {
         // itself is still checked (see `input_length_is_checked_unconditionally`).
         g.sampling_params = sp(None);
         let roomy = Limits {
-            context_len: Some(100),
+            context_len: 100,
             ..test_limits()
         };
         assert!(check_total_tokens(&mut g, &roomy).is_ok());
@@ -787,7 +813,7 @@ mod tests {
     #[test]
     fn input_length_is_checked_unconditionally() {
         let limits = Limits {
-            context_len: Some(3),
+            context_len: 3,
             ..test_limits()
         };
         let req = |max_new_tokens| GenerateRequest {
@@ -833,7 +859,7 @@ mod tests {
     #[test]
     fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
         let limits = Limits {
-            context_len: Some(10),
+            context_len: 10,
             allow_auto_truncate: true,
             ..test_limits()
         };
@@ -893,7 +919,7 @@ mod tests {
     #[test]
     fn over_context_request_deregisters_and_never_reaches_the_ring() {
         let (ingress, detok_rx, consumer, _tm_tx) = make_ingress_with(Limits {
-            context_len: Some(4),
+            context_len: 4,
             ..test_limits()
         });
         ingress.drive(generate_req(

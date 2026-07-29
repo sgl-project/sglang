@@ -134,7 +134,8 @@ pub struct ModelConfig {
     #[serde(default)]
     pub context_len: Option<u64>,
     /// Bounds client-supplied token ids — ingress 400s out-of-vocab ids before
-    /// they crash the scheduler's embedding lookup. `None` → unvalidated.
+    /// they crash the scheduler's embedding lookup;  mandatory at
+    /// boot ([`ServerArgs::validate_mandatory`]).
     #[serde(default)]
     pub vocab_size: Option<u64>,
 }
@@ -165,6 +166,9 @@ impl ServerArgs {
         }
         if self.model_config.context_len.is_none() {
             return Err("no resolvable context length (model_config.context_len)".into());
+        }
+        if self.model_config.vocab_size.is_none() {
+            return Err("no resolvable vocab size (model_config.vocab_size)".into());
         }
         Ok(())
     }

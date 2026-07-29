@@ -306,11 +306,7 @@ impl SamplingParams {
     /// `TokenizerManager._create_tokenized_object` runs them in. `Err` is a
     /// request-local 400. `skip_tokenizer_init` stands in for Python's
     /// `tokenizer is None`; `vocab_size` bounds `logit_bias` keys.
-    pub fn normalize(
-        &mut self,
-        skip_tokenizer_init: bool,
-        vocab_size: Option<u64>,
-    ) -> Result<(), Error> {
+    pub fn normalize(&mut self, skip_tokenizer_init: bool, vocab_size: u64) -> Result<(), Error> {
         self.post_init();
         self.normalize_stops(skip_tokenizer_init)?;
         self.verify(vocab_size)
@@ -414,7 +410,7 @@ impl SamplingParams {
 
     /// Python `verify(vocab_size)` — the same ranges, messages and mutual
     /// exclusions, plus the rust-server `n == 1` restriction.
-    fn verify(&self, vocab_size: Option<u64>) -> Result<(), Error> {
+    fn verify(&self, vocab_size: u64) -> Result<(), Error> {
         if !self.temperature.is_finite() || self.temperature < 0.0 {
             return Err(bad(format!(
                 "temperature must be a non-negative finite number, got {}",
@@ -481,9 +477,7 @@ impl SamplingParams {
                 let token_id: u64 = key
                     .parse()
                     .map_err(|_| bad(format!("logit_bias keys must be token ids, got {key:?}")))?;
-                if let Some(vocab_size) = vocab_size
-                    && token_id >= vocab_size
-                {
+                if token_id >= vocab_size {
                     return Err(bad(format!(
                         "logit_bias must have keys in [0, {}], got {token_id}",
                         vocab_size - 1
@@ -532,6 +526,13 @@ fn take_one_or_many(v: Option<OneOrMany<String>>) -> Vec<String> {
 mod tests {
 
     use super::*;
+
+    /// Vocab size for tests that aren't about the vocab bound at all. It is
+    /// mandatory now (`ServerArgs::validate_mandatory` rejects a boot without
+    /// one), so there is no longer an "unknown vocab" case to pass instead —
+    /// this is just a value large enough to stay out of the way.
+    const TEST_VOCAB: u64 = 1000;
+
     /// End to end through the path `/generate` takes: a bounded `stop_regex`
     /// reaches the wire with its real length, and a malformed one is a 400.
     #[test]
@@ -545,13 +546,13 @@ mod tests {
     /// Parse client JSON exactly as `/generate` does, then run the full pipeline.
     fn norm(json: &str) -> SamplingParams {
         let mut sp: SamplingParams = serde_json::from_str(json).expect("parses");
-        sp.normalize(false, None).expect("normalizes");
+        sp.normalize(false, TEST_VOCAB).expect("normalizes");
         sp
     }
 
     fn norm_err(json: &str) -> Error {
         let mut sp: SamplingParams = serde_json::from_str(json).expect("parses");
-        sp.normalize(false, None).expect_err("must reject")
+        sp.normalize(false, TEST_VOCAB).expect_err("must reject")
     }
 
     /// The wire shape the scheduler decodes: a map of field names → values — the
@@ -809,7 +810,7 @@ mod tests {
             r#"{"n": 1}"#,
         ] {
             let mut sp: SamplingParams = serde_json::from_str(json).expect("parses");
-            sp.normalize(false, None)
+            sp.normalize(false, TEST_VOCAB)
                 .unwrap_or_else(|e| panic!("{json} is in range but was rejected: {e}"));
         }
     }
@@ -832,7 +833,7 @@ mod tests {
         ] {
             let mut sp: SamplingParams = serde_json::from_str(json).expect("parses");
             assert!(
-                sp.normalize(false, None).is_err(),
+                sp.normalize(false, TEST_VOCAB).is_err(),
                 "{json} is out of range but was accepted"
             );
         }
@@ -887,7 +888,7 @@ mod tests {
         let mut once = norm(r#"{"stop": ["END", "STOP"], "stop_regex": "\\d{3}"}"#);
         let twice = {
             let mut p = once.clone();
-            p.normalize(false, None).expect("second normalize");
+            p.normalize(false, TEST_VOCAB).expect("second normalize");
             p
         };
         assert_eq!(once, twice, "a second normalize must change nothing");
@@ -897,7 +898,7 @@ mod tests {
 
         // Greedy handling must not re-fire either: temperature is 1.0 after the
         // first pass, which is not in the greedy window.
-        once.normalize(false, None).unwrap();
+        once.normalize(false, TEST_VOCAB).unwrap();
         assert_eq!(once.top_k, twice.top_k);
     }
 
@@ -913,42 +914,46 @@ mod tests {
         ] {
             let mut sp: SamplingParams = serde_json::from_str(json).expect("parses");
             assert!(
-                sp.normalize(true, None).is_err(),
+                sp.normalize(true, TEST_VOCAB).is_err(),
                 "{json} must be rejected under skip_tokenizer_init"
             );
         }
         // The same params are fine when a tokenizer is present.
         let mut sp: SamplingParams = serde_json::from_str(r#"{"stop": "END"}"#).unwrap();
-        assert!(sp.normalize(false, None).is_ok());
+        assert!(sp.normalize(false, TEST_VOCAB).is_ok());
     }
 
     /// `logit_bias` keys index the logits row, so an out-of-vocab id is a 400
-    /// (Python `verify`'s vocab bound). Skipped when the vocab size is unknown.
+    /// (Python `verify`'s vocab bound). The bound is exclusive, and it always
+    /// applies — `vocab_size` is mandatory, so there is no "unknown vocab" path
+    /// that skips this.
     #[test]
     fn logit_bias_keys_are_vocab_bounded() {
         let mut sp: SamplingParams =
             serde_json::from_str(r#"{"logit_bias": {"1000": 1.0}}"#).unwrap();
-        assert!(sp.clone().normalize(false, Some(1000)).is_err());
-        assert!(sp.normalize(false, Some(1001)).is_ok());
+        assert!(sp.clone().normalize(false, 1000).is_err());
+        assert!(sp.normalize(false, 1001).is_ok());
 
         let mut sp: SamplingParams =
             serde_json::from_str(r#"{"logit_bias": {"999": -1.0}}"#).unwrap();
-        assert!(sp.normalize(false, Some(1000)).is_ok());
+        assert!(sp.normalize(false, 1000).is_ok());
     }
 
-    /// The key *format* check must not hang off the vocab bound: the scheduler
-    /// does `logit_bias[i, int(key)]` unconditionally, so a non-numeric (or
-    /// negative, which would index from the end of the row) key has to be a 400
-    /// even when the vocab size is unknown.
+    /// The key *format* check is separate from the vocab bound: the scheduler
+    /// does `logit_bias[i, int(key)]`, so a key that is not a parseable
+    /// non-negative integer has to be a 400 in its own right — a range check
+    /// alone would let `"abc"` or `"1.5"` through to that indexing.
     #[test]
-    fn logit_bias_keys_are_token_ids_without_vocab_size() {
+    fn logit_bias_keys_must_be_parseable_token_ids() {
         for json in [
             r#"{"logit_bias": {"abc": 1.0}}"#,
             r#"{"logit_bias": {"-1": 1.0}}"#,
             r#"{"logit_bias": {"1.5": 1.0}}"#,
             r#"{"logit_bias": {"": 1.0}}"#,
         ] {
-            let _ = norm_err(json); // norm_err passes vocab_size = None
+            // Every key here is well inside TEST_VOCAB's range (or unparsable),
+            // so only the format check can be what rejects it.
+            let _ = norm_err(json);
         }
         assert!(norm(r#"{"logit_bias": {"7": 1.0}}"#).logit_bias.is_some());
     }
@@ -970,7 +975,7 @@ mod tests {
         assert!(
             serde_json::from_str::<SamplingParams>(&json)
                 .unwrap()
-                .normalize(false, None)
+                .normalize(false, TEST_VOCAB)
                 .is_ok(),
             "the cap itself must be accepted"
         );

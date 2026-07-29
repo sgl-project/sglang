@@ -225,6 +225,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .as_ref()
             .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied())
             .map(|c| vec![c]);
+        let limits = tokenizer_manager::Limits::try_from(&*cfg.server_args)
+            .map_err(|e| format!("ingress limits: {e}"))?;
         let mut parts = Some((tm_rx, ingress_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
         spawn_pool("tm-ingress", cores, 1, &mut threads, |_| {
@@ -234,7 +236,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 abort_rx.clone(),
                 senders.clone(),
                 ingress_tx,
-                tokenizer_manager::Limits::from_server_args(&cfg.server_args),
+                limits.clone(),
                 shutdown_rx.clone(),
             )
         });
@@ -290,6 +292,16 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 mod tests {
     use super::*;
 
+    /// Minimal boot args. `skip_tokenizer_init` avoids loading a tokenizer/detok
+    /// model; `model_config` carries the two fields `Limits::from_server_args`
+    /// requires. They are mandatory at boot, so a fixture without them panics the
+    /// runtime instead of exercising what these tests are about — `start` does not
+    /// run `ServerArgs::validate_mandatory` itself, `Server::start` does.
+    const TEST_SERVER_ARGS: &str = r#"{
+        "skip_tokenizer_init": true,
+        "model_config": {"context_len": 2048, "vocab_size": 1000}
+    }"#;
+
     /// Regression: `request_shutdown` must actually stop the API server — it joins
     /// the api thread once the listener closes, so the port stops accepting.
     /// (Previously it set an unread flag and the port kept accepting.)
@@ -301,7 +313,7 @@ mod tests {
         drop(probe);
 
         // `skip_tokenizer_init` → no tokenizer/detok model load; minimal boot.
-        let server_args = ServerArgs::from_json(r#"{"skip_tokenizer_init": true}"#).unwrap();
+        let server_args = ServerArgs::from_json(TEST_SERVER_ARGS).unwrap();
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
@@ -341,7 +353,7 @@ mod tests {
         let addr = probe.local_addr().unwrap();
         drop(probe);
 
-        let server_args = ServerArgs::from_json(r#"{"skip_tokenizer_init": true}"#).unwrap();
+        let server_args = ServerArgs::from_json(TEST_SERVER_ARGS).unwrap();
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
@@ -386,7 +398,7 @@ mod tests {
         let addr = probe.local_addr().unwrap();
         drop(probe);
 
-        let server_args = ServerArgs::from_json(r#"{"skip_tokenizer_init": true}"#).unwrap();
+        let server_args = ServerArgs::from_json(TEST_SERVER_ARGS).unwrap();
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
@@ -447,7 +459,7 @@ mod tests {
         let hog = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = hog.local_addr().unwrap();
 
-        let server_args = ServerArgs::from_json(r#"{"skip_tokenizer_init": true}"#).unwrap();
+        let server_args = ServerArgs::from_json(TEST_SERVER_ARGS).unwrap();
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
@@ -461,5 +473,38 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains("bind"), "error should mention bind: {err}");
+    }
+
+    /// `server_args` missing a mandatory `model_config` field must be a startup
+    /// ERROR, not a panic.
+    ///
+    /// `Limits::try_from` is fallible and the ingress loop is built inside a
+    /// `spawn_pool` closure, so resolving it there would put the failure on a
+    /// freshly spawned worker thread — a thread `start` never inspects. The boot
+    /// would report success and the server would accept connections with no
+    /// ingress loop behind them, hanging every request instead of refusing to
+    /// start. Only `Server::start` runs `validate_mandatory`, so `start` cannot
+    /// assume these fields are present.
+    #[test]
+    fn start_fails_when_model_config_is_incomplete() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        // Boots fine in every other respect — only `model_config` is absent.
+        let server_args = ServerArgs::from_json(r#"{"skip_tokenizer_init": true}"#).unwrap();
+        let cfg = RuntimeConfig {
+            rust_server_args: RustServerServerArgs {
+                http_addr: addr,
+                api_worker_num: 1,
+                ..Default::default()
+            },
+            server_args: Arc::new(server_args),
+        };
+        let err = match start(cfg) {
+            Ok(_) => panic!("an incomplete model_config must not boot, got Ok"),
+            Err(e) => e,
+        };
+        assert!(err.contains("ingress limits"), "{err}");
     }
 }
