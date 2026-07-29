@@ -55,8 +55,11 @@ class ChebyshevForecaster(nn.Module):
         self.K = K
         self.lam = lam
         self.num_steps = num_steps
+        # Preallocated (K,) / (K, N) ring buffer, written in place by update().
         self.register_buffer("t_buf", torch.empty(0))
         self._H_buf: Optional[torch.Tensor] = None
+        self._write_idx = 0
+        self._count = 0
         self._shape: Optional[torch.Size] = feature_shape
         self._coef: Optional[torch.Tensor] = None
         self.device_ref = device
@@ -95,21 +98,43 @@ class ChebyshevForecaster(nn.Module):
         else:
             assert shape == self._shape, "Spectrum feature shape must remain constant"
 
-        if self.t_buf.numel() == 0:
-            self.t_buf = t_tensor[None]
-            self._H_buf = h_flat
-        else:
-            self.t_buf = torch.cat([self.t_buf, t_tensor[None]], dim=0)
-            self._H_buf = torch.cat([self._H_buf, h_flat], dim=0)
-            if self.t_buf.numel() > self.K:
-                self.t_buf = self.t_buf[-self.K :]
-                self._H_buf = self._H_buf[-self.K :]
+        if self._H_buf is None:
+            # Preallocate the ring buffer once the flattened feature size is known
+            self.t_buf = torch.zeros(self.K, dtype=torch.float32, device=device)
+            self._H_buf = torch.zeros(
+                self.K, h_flat.shape[1], dtype=torch.float32, device=device
+            )
+
+        self.t_buf[self._write_idx] = t_tensor
+        self._H_buf[self._write_idx] = h_flat[0]
+        self._write_idx = (self._write_idx + 1) % self.K
+        self._count = min(self._count + 1, self.K)
 
         # Invalidate cached ridge coefficients; will be refit on next predict()
         self._coef = None
 
+    def _recent(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the last `min(n, count)` valid (t, h) entries in chronological
+        order (oldest first, most recent last).
+
+        Only used by the discrete Taylor blend, which needs true temporal
+        order for its finite differences (unlike the ridge fit, see
+        `_fit_if_needed`). `n` is small (<= taylor_order + 1), so even the
+        rare wraparound `cat` below is cheap.
+        """
+        count = min(self._count, n)
+        start = (self._write_idx - count) % self.K
+        if start + count <= self.K:
+            # Contiguous window -- cheap view, no copy.
+            return self.t_buf[start : start + count], self._H_buf[start : start + count]
+        # Wraps past the end of the physical buffer -- must reorder.
+        tail = self.K - start
+        t = torch.cat([self.t_buf[start:], self.t_buf[: count - tail]])
+        h = torch.cat([self._H_buf[start:], self._H_buf[: count - tail]])
+        return t, h
+
     def ready(self) -> bool:
-        return self.t_buf.numel() >= 1
+        return self._count >= 1
 
     def _fit_if_needed(self) -> None:
         """Fit ridge regression coefficients on cached (t, h) pairs if not cached."""
@@ -118,12 +143,12 @@ class ChebyshevForecaster(nn.Module):
         assert self.ready()
         assert self._H_buf is not None
         feature_dtype = self._H_buf.dtype
-        taus = self._taus(self.t_buf)
+        t, h = self.t_buf[: self._count], self._H_buf[: self._count]
+        taus = self._taus(t)
         # Ridge solve in fp32; autocast would keep matmuls in bf16 and break
         # torch.cholesky_solve dtype requirements.
         with torch.autocast(device_type=self._H_buf.device.type, enabled=False):
             x = self._build_design(taus).to(torch.float32)
-            h = self._H_buf
             p = x.shape[1]
             lam_i = self.lam * torch.eye(p, device=x.device, dtype=x.dtype)
             xt = x.transpose(0, 1)
@@ -175,8 +200,7 @@ class SpectrumForecaster(nn.Module):
         """Predict hidden state at t_star using discrete Taylor expansion from recent real steps."""
         assert self.cheb._H_buf is not None
         assert self.cheb._shape is not None
-        h = self.cheb._H_buf
-        t = self.cheb.t_buf
+        t, h = self.cheb._recent(self.taylor_order + 1)
         h_i = h[-1]
         if t.numel() < 2:
             return _unflatten(h_i.reshape(1, -1), self.cheb._shape)
