@@ -1,3 +1,12 @@
+"""Text-side reconciliation and request helpers for streaming ASR.
+
+Shared by the HTTP streaming transcription endpoint (``process_asr_chunk``)
+and the realtime WebSocket endpoint (via ``RealtimeASRProcessor``): decoded
+model text goes in, stable transcript deltas come out. ``StreamingASRState``
+holds the two reconciliation machines; ``generate_asr_text`` runs the single
+stateless backend request both endpoints build on.
+"""
+
 import io
 import logging
 import re
@@ -37,182 +46,36 @@ class DecoderSuffixDecision(msgspec.Struct, frozen=True):
 
 @dataclass
 class StreamingASRState:
-    """Reconcile cumulative hypotheses and decoded suffixes.
+    """Reconcile decoded text into a stable stream of transcript deltas.
 
     Text state only: no audio buffer, GPU state, or scheduler state lives here.
+    Two machines share the emitted-text anchor and the trim helpers:
+
+    - Cumulative machine (below the gate, and no-whitespace CJK): every decode
+      re-transcribes all audio, so ``update()``/``finalize()`` emit only the
+      words that stopped changing between hypotheses (word/char rollback).
+    - Decoder-suffix machine (windowed mode): every decode continues from a
+      text prefix, so ``preview_decoder_suffix()`` computes a delta without
+      mutating state and ``commit_decoder_suffix()`` applies it. The one-way
+      handoff between the machines is ``prepare_decoder_suffix_transition()``.
     """
 
     chunk_size_sec: float
     unfixed_chunk_num: int
     unfixed_token_num: int
+    # Hypothesis prefix the rollback machine treats as stable; may lag emitted
+    # text after an implausible CJK jump.
     confirmed_text: str = ""
-    # Already emitted text; the cumulative prompt prefix depends on it.
+    # Text actually sent to the client; prompts and dedupe anchor on it.
     emitted_text: str = ""
+    # Latest complete hypothesis (cumulative) or emitted + pending (suffix).
     full_transcript: str = ""
+    # Decoded text awaiting cross-decode agreement before it may be emitted.
     pending_suffix: str = ""
+    # Decode counter; gates cumulative prompt-prefix injection.
     chunk_index: int = 0
 
-    def get_prefix_text(self) -> str:
-        if self.chunk_index < self.unfixed_chunk_num or not self.emitted_text:
-            return ""
-        # Word overlap is unsafe for no-whitespace CJK; keep that path cumulative.
-        if is_cjk_no_whitespace(self.emitted_text):
-            return ""
-        return self.emitted_text
-
-    def get_bounded_decoder_prefix(
-        self, tokenizer, max_tokens: int, *, include_unconfirmed: bool = False
-    ) -> str:
-        """Return recent emitted context for a suffix-only decoder request."""
-        source_text = self.emitted_text
-        if include_unconfirmed:
-            source_text = _join_words(
-                source_text, self._cumulative_unemitted_tail() or ""
-            )
-        # Only the trailing max_tokens tokens can survive the cap, so tokenize
-        # a bounded character tail instead of the whole growing transcript.
-        tail = source_text[-max_tokens * _MAX_CHARS_PER_TOKEN :]
-        token_ids = tokenizer.encode(tail, add_special_tokens=False)
-        if len(token_ids) <= max_tokens:
-            return tail
-        return tokenizer.decode(
-            token_ids[-max_tokens:],
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        ).lstrip()
-
-    def can_start_decoder_prefix(self) -> bool:
-        """Whether cumulative text can safely hand off to word-based suffix state."""
-        return not (
-            is_cjk_no_whitespace(self.emitted_text)
-            or is_cjk_no_whitespace(self.full_transcript)
-        )
-
-    def prepare_decoder_suffix_transition(self, candidate: str) -> str:
-        """Preserve the cumulative holdback while adopting a decoder prefix."""
-        return _join_words(self._cumulative_unemitted_tail() or "", candidate)
-
-    def _cumulative_unemitted_tail(self) -> Optional[str]:
-        """Return the current hypothesis tail not yet emitted by rollback."""
-        confirmed_words = self.confirmed_text.split()
-        full_words = self.full_transcript.split()
-        common_count = _norm_common_prefix_len(confirmed_words, full_words)
-        if common_count < len(confirmed_words):
-            return None
-        return " ".join(full_words[common_count:])
-
-    def _record_emit(self, delta: str) -> str:
-        if delta:
-            if self.emitted_text:
-                sep = " " if needs_space(self.emitted_text, delta) else ""
-                self.emitted_text = f"{self.emitted_text}{sep}{delta}".strip()
-            else:
-                self.emitted_text = delta
-        return delta
-
-    def _trim_cjk_emitted_overlap(self, delta: str) -> str:
-        """Drop an already-emitted leading CJK run after char/word path flips."""
-        if not delta or not self.emitted_text:
-            return delta
-        # Ignore trailing sentence enders when aligning: a chunk boundary can
-        # close a clause ("...停。") that the re-transcription then extends
-        # ("...停滞..."), mirroring the word path's edge-punctuation stripping.
-        emitted = self.emitted_text.rstrip("。！？.!?")
-        max_k = min(len(delta), len(emitted))
-        for k in range(max_k, 0, -1):
-            if emitted[-k:] != delta[:k]:
-                continue
-            if all(is_cjk_char(c) for c in delta[:k]):
-                return delta[k:].lstrip()
-        return delta
-
-    def _trim_large_prompt_echo(self, delta: str) -> str:
-        """Drop an obvious full transcript-prefix echo from chunked ASR."""
-        if not delta or not self.emitted_text:
-            return delta
-
-        delta_words = delta.split()
-        # ~16 words/sec outpaces real speech, so a delta this long that also
-        # prefix-matches emitted text is a prompt echo, not new audio content.
-        max_words_for_chunk = max(24, int(self.chunk_size_sec * 16))
-        if len(delta_words) <= max_words_for_chunk:
-            return delta
-        emitted_words = self.emitted_text.split()
-
-        while len(delta_words) > max_words_for_chunk:
-            max_match = min(len(delta_words), len(emitted_words))
-            match = 0
-            for i in range(max_match):
-                if _dedupe_norm(delta_words[i]) != _dedupe_norm(emitted_words[i]):
-                    break
-                match += 1
-
-            if match < max_words_for_chunk:
-                break
-            delta_words = delta_words[match:]
-
-        return " ".join(delta_words)
-
-    def _set_suffix_candidate(self, candidate: str) -> None:
-        """Record the latest unconfirmed suffix decoded after emitted_text."""
-        self.pending_suffix = candidate
-        self.full_transcript = _join_words(self.emitted_text, candidate)
-        self.confirmed_text = self.emitted_text
-
-    def preview_decoder_suffix(
-        self, candidate: str, *, is_last: bool = False, holdback_words: int
-    ) -> DecoderSuffixDecision:
-        """Calculate a suffix update without changing emitted transcript state."""
-        candidate = self._trim_large_prompt_echo(candidate)
-        if self.emitted_text and (not self.pending_suffix or is_last):
-            candidate, _ = _dedupe_by_word(self.emitted_text, candidate)
-        previous = self.pending_suffix
-
-        if is_last:
-            return DecoderSuffixDecision(delta=candidate or previous, pending_suffix="")
-        if not candidate:
-            return DecoderSuffixDecision(delta="", pending_suffix=None)
-        if not previous:
-            return DecoderSuffixDecision(delta="", pending_suffix=candidate)
-
-        if is_cjk_no_whitespace(previous) or is_cjk_no_whitespace(candidate):
-            emit_count = max(
-                0, _common_prefix_len(previous, candidate) - holdback_words
-            )
-            return DecoderSuffixDecision(
-                delta=candidate[:emit_count], pending_suffix=candidate[emit_count:]
-            )
-
-        previous_words = previous.split()
-        candidate_words = candidate.split()
-        # Keep the acoustic tail out of the decoder prefix. A premature
-        # sentence end there can make the next request stop before newly
-        # appended audio, while the retained audio can safely recover it.
-        emit_count = max(
-            0, _norm_common_prefix_len(previous_words, candidate_words) - holdback_words
-        )
-        return DecoderSuffixDecision(
-            delta=" ".join(candidate_words[:emit_count]),
-            pending_suffix=" ".join(candidate_words[emit_count:]),
-        )
-
-    def commit_decoder_suffix(
-        self, decision: DecoderSuffixDecision, *, is_last: bool
-    ) -> str:
-        """Apply a previewed decision; preview and commit are split so a mode
-        fallback can discard the preview without touching emitted state."""
-        self.chunk_index += 1
-        if decision.pending_suffix is None:
-            return ""
-        delta = self._record_emit(decision.delta)
-        self._set_suffix_candidate("" if is_last else decision.pending_suffix)
-        return delta
-
-    def finalize_decoder_suffix(self) -> str:
-        """Emit the pending suffix at item end: no further decode will confirm it."""
-        delta = self._record_emit(self.pending_suffix)
-        self._set_suffix_candidate("")
-        return delta
+    # --- Cumulative machine: reconcile full re-transcription hypotheses ---
 
     def apply_hypothesis(self, text: str, *, is_last: bool) -> str:
         """Reconcile one complete model hypothesis with already emitted text."""
@@ -220,17 +83,6 @@ class StreamingASRState:
             self.full_transcript = text
             return self.finalize()
         return self.update(text)
-
-    def _emit_word_delta(self, old_text: str, new_text: str) -> str:
-        """Emit the word-level tail of new_text not already covered by old_text."""
-        old_words = old_text.split()
-        new_words = new_text.split()
-        common_count = _norm_common_prefix_len(old_words, new_words)
-        delta = " ".join(new_words[common_count:])
-        if common_count == 0:
-            delta = self._trim_cjk_emitted_overlap(delta)
-        delta = self._trim_large_prompt_echo(delta)
-        return self._record_emit(delta)
 
     def update(self, new_transcript: str) -> str:
         if is_cjk_no_whitespace(new_transcript):
@@ -297,6 +149,183 @@ class StreamingASRState:
         old_confirmed = self.confirmed_text
         self.confirmed_text = self.full_transcript
         return self._emit_word_delta(old_confirmed, self.full_transcript)
+
+    def get_prefix_text(self) -> str:
+        if self.chunk_index < self.unfixed_chunk_num or not self.emitted_text:
+            return ""
+        # Word overlap is unsafe for no-whitespace CJK; keep that path cumulative.
+        if is_cjk_no_whitespace(self.emitted_text):
+            return ""
+        return self.emitted_text
+
+    def _emit_word_delta(self, old_text: str, new_text: str) -> str:
+        """Emit the word-level tail of new_text not already covered by old_text."""
+        old_words = old_text.split()
+        new_words = new_text.split()
+        common_count = _norm_common_prefix_len(old_words, new_words)
+        delta = " ".join(new_words[common_count:])
+        if common_count == 0:
+            delta = self._trim_cjk_emitted_overlap(delta)
+        delta = self._trim_large_prompt_echo(delta)
+        return self._record_emit(delta)
+
+    # --- Decoder-suffix machine: reconcile windowed continuations ---
+
+    def can_start_decoder_prefix(self) -> bool:
+        """Whether cumulative text can safely hand off to word-based suffix state."""
+        return not (
+            is_cjk_no_whitespace(self.emitted_text)
+            or is_cjk_no_whitespace(self.full_transcript)
+        )
+
+    def get_bounded_decoder_prefix(
+        self, tokenizer, max_tokens: int, *, include_unconfirmed: bool = False
+    ) -> str:
+        """Return recent emitted context for a suffix-only decoder request."""
+        source_text = self.emitted_text
+        if include_unconfirmed:
+            source_text = _join_words(
+                source_text, self._cumulative_unemitted_tail() or ""
+            )
+        # Only the trailing max_tokens tokens can survive the cap, so tokenize
+        # a bounded character tail instead of the whole growing transcript.
+        tail = source_text[-max_tokens * _MAX_CHARS_PER_TOKEN :]
+        token_ids = tokenizer.encode(tail, add_special_tokens=False)
+        if len(token_ids) <= max_tokens:
+            return tail
+        return tokenizer.decode(
+            token_ids[-max_tokens:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        ).lstrip()
+
+    def prepare_decoder_suffix_transition(self, candidate: str) -> str:
+        """Preserve the cumulative holdback while adopting a decoder prefix."""
+        return _join_words(self._cumulative_unemitted_tail() or "", candidate)
+
+    def _cumulative_unemitted_tail(self) -> Optional[str]:
+        """Return the current hypothesis tail not yet emitted by rollback."""
+        confirmed_words = self.confirmed_text.split()
+        full_words = self.full_transcript.split()
+        common_count = _norm_common_prefix_len(confirmed_words, full_words)
+        if common_count < len(confirmed_words):
+            return None
+        return " ".join(full_words[common_count:])
+
+    def preview_decoder_suffix(
+        self, candidate: str, *, is_last: bool = False, holdback_words: int
+    ) -> DecoderSuffixDecision:
+        """Calculate a suffix update without changing emitted transcript state."""
+        candidate = self._trim_large_prompt_echo(candidate)
+        if self.emitted_text and (not self.pending_suffix or is_last):
+            candidate, _ = _dedupe_by_word(self.emitted_text, candidate)
+        previous = self.pending_suffix
+
+        if is_last:
+            return DecoderSuffixDecision(delta=candidate or previous, pending_suffix="")
+        if not candidate:
+            return DecoderSuffixDecision(delta="", pending_suffix=None)
+        if not previous:
+            return DecoderSuffixDecision(delta="", pending_suffix=candidate)
+
+        if is_cjk_no_whitespace(previous) or is_cjk_no_whitespace(candidate):
+            emit_count = max(
+                0, _common_prefix_len(previous, candidate) - holdback_words
+            )
+            return DecoderSuffixDecision(
+                delta=candidate[:emit_count], pending_suffix=candidate[emit_count:]
+            )
+
+        previous_words = previous.split()
+        candidate_words = candidate.split()
+        # Keep the acoustic tail out of the decoder prefix. A premature
+        # sentence end there can make the next request stop before newly
+        # appended audio, while the retained audio can safely recover it.
+        emit_count = max(
+            0, _norm_common_prefix_len(previous_words, candidate_words) - holdback_words
+        )
+        return DecoderSuffixDecision(
+            delta=" ".join(candidate_words[:emit_count]),
+            pending_suffix=" ".join(candidate_words[emit_count:]),
+        )
+
+    def commit_decoder_suffix(
+        self, decision: DecoderSuffixDecision, *, is_last: bool
+    ) -> str:
+        """Apply a previewed decision; preview and commit are split so a mode
+        fallback can discard the preview without touching emitted state."""
+        self.chunk_index += 1
+        if decision.pending_suffix is None:
+            return ""
+        delta = self._record_emit(decision.delta)
+        self._set_suffix_candidate("" if is_last else decision.pending_suffix)
+        return delta
+
+    def finalize_decoder_suffix(self) -> str:
+        """Emit the pending suffix at item end: no further decode will confirm it."""
+        delta = self._record_emit(self.pending_suffix)
+        self._set_suffix_candidate("")
+        return delta
+
+    def _set_suffix_candidate(self, candidate: str) -> None:
+        """Record the latest unconfirmed suffix decoded after emitted_text."""
+        self.pending_suffix = candidate
+        self.full_transcript = _join_words(self.emitted_text, candidate)
+        self.confirmed_text = self.emitted_text
+
+    # --- Shared emit and trim helpers ---
+
+    def _record_emit(self, delta: str) -> str:
+        if delta:
+            if self.emitted_text:
+                sep = " " if needs_space(self.emitted_text, delta) else ""
+                self.emitted_text = f"{self.emitted_text}{sep}{delta}".strip()
+            else:
+                self.emitted_text = delta
+        return delta
+
+    def _trim_cjk_emitted_overlap(self, delta: str) -> str:
+        """Drop an already-emitted leading CJK run after char/word path flips."""
+        if not delta or not self.emitted_text:
+            return delta
+        # Ignore trailing sentence enders when aligning: a chunk boundary can
+        # close a clause ("...停。") that the re-transcription then extends
+        # ("...停滞..."), mirroring the word path's edge-punctuation stripping.
+        emitted = self.emitted_text.rstrip("。！？.!?")
+        max_k = min(len(delta), len(emitted))
+        for k in range(max_k, 0, -1):
+            if emitted[-k:] != delta[:k]:
+                continue
+            if all(is_cjk_char(c) for c in delta[:k]):
+                return delta[k:].lstrip()
+        return delta
+
+    def _trim_large_prompt_echo(self, delta: str) -> str:
+        """Drop an obvious full transcript-prefix echo from chunked ASR."""
+        if not delta or not self.emitted_text:
+            return delta
+
+        delta_words = delta.split()
+        # ~16 words/sec outpaces real speech, so a delta this long that also
+        # prefix-matches emitted text is a prompt echo, not new audio content.
+        max_words_for_chunk = max(24, int(self.chunk_size_sec * 16))
+        if len(delta_words) <= max_words_for_chunk:
+            return delta
+        emitted_words = self.emitted_text.split()
+
+        while len(delta_words) > max_words_for_chunk:
+            max_match = min(len(delta_words), len(emitted_words))
+            match = 0
+            for i in range(max_match):
+                if _dedupe_norm(delta_words[i]) != _dedupe_norm(emitted_words[i]):
+                    break
+                match += 1
+
+            if match < max_words_for_chunk:
+                break
+            delta_words = delta_words[match:]
+
+        return " ".join(delta_words)
 
 
 def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:

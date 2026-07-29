@@ -3,6 +3,21 @@
 The processor is connection-scoped but keeps no stream progress itself. Each call
 plans and executes one stateless backend request, then commits the result to the
 explicit ``RealtimeASRState`` supplied by the realtime endpoint.
+
+Per-chunk flow, driven by the endpoint::
+
+    append audio -> next_chunk_ready()? -> process()
+        _plan    pick cumulative | windowed, fix the audio range and prompt
+        _infer   run one stateless backend request, reconcile the text
+        _commit  advance attempted/accepted cursors, compact windowed PCM
+    -> transcript delta
+    commit event -> process(is_last=True), or finalize() if no new audio
+
+Mode lifecycle: every item starts cumulative (identical to the pre-existing
+behavior). Past the adapter's activation gate it switches to windowed --
+encoder-aligned audio windows reused through the embedding cache plus a
+bounded decoder prefix -- and stays there for the rest of the item.
+No-whitespace CJK disables windowed; the item stays cumulative.
 """
 
 from __future__ import annotations
@@ -46,7 +61,15 @@ _MAX_DECODER_SUFFIX_TOKENS_PER_SECOND = 16
 def decoder_suffix_token_budget(
     new_audio_bytes: int, bytes_per_second: int, pending_suffix: str
 ) -> int:
-    """Bound suffix decoding without truncating text pending confirmation."""
+    """Bound suffix decoding without truncating text pending confirmation.
+
+    A degenerate decode (e.g. looping on repetitive audio) must not spend the
+    final-commit budget, so intermediate requests are capped. The cap must
+    still cover everything a correct decode may emit: 16 tokens/s over-covers
+    real speech for the new audio, and because the pending suffix is
+    re-decoded on every request it gets ~2 tokens per word plus one per CJK
+    char (BPE upper bounds). The floor keeps tiny audio increments decodable.
+    """
     new_audio_tokens = math.ceil(
         new_audio_bytes / bytes_per_second * _MAX_DECODER_SUFFIX_TOKENS_PER_SECOND
     )
@@ -206,12 +229,6 @@ class RealtimeASRProcessor:
             ),
         )
 
-    def finalize(self, state: RealtimeASRState) -> str:
-        """Emit text still held back when the item commits without new audio."""
-        if state.windowed_started:
-            return state.transcript.finalize_decoder_suffix()
-        return state.transcript.finalize()
-
     async def process(
         self,
         state: RealtimeASRState,
@@ -245,20 +262,11 @@ class RealtimeASRProcessor:
         self._commit(state, plan, result)
         return result.delta
 
-    def _windowed_text_needs_fallback(
-        self,
-        state: RealtimeASRState,
-        plan: _InferencePlan,
-        result: _InferenceResult,
-    ) -> bool:
-        # Decoder-prefix reconciliation is word based; the first windowed
-        # decode may reveal a no-whitespace transcript that cannot use it.
-        return (
-            plan.windowed
-            and not state.windowed_started
-            and result.decoder_decision is not None
-            and is_cjk_no_whitespace(result.decoder_decision.pending_suffix or "")
-        )
+    def finalize(self, state: RealtimeASRState) -> str:
+        """Emit text still held back when the item commits without new audio."""
+        if state.windowed_started:
+            return state.transcript.finalize_decoder_suffix()
+        return state.transcript.finalize()
 
     def _plan(
         self,
@@ -466,3 +474,18 @@ class RealtimeASRProcessor:
             return
         if plan.windowed:
             audio.discard_before(plan.start_offset_bytes)
+
+    def _windowed_text_needs_fallback(
+        self,
+        state: RealtimeASRState,
+        plan: _InferencePlan,
+        result: _InferenceResult,
+    ) -> bool:
+        # Decoder-prefix reconciliation is word based; the first windowed
+        # decode may reveal a no-whitespace transcript that cannot use it.
+        return (
+            plan.windowed
+            and not state.windowed_started
+            and result.decoder_decision is not None
+            and is_cjk_no_whitespace(result.decoder_decision.pending_suffix or "")
+        )

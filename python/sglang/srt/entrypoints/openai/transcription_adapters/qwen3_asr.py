@@ -11,8 +11,6 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
 )
 from sglang.srt.multimodal.processors.qwen3_asr import DEFAULT_ASR_PROMPT
 
-_LONG_AUDIO_GATE_SEC = 60.0
-
 
 @register_transcription_adapter("Qwen3ASR")
 class Qwen3ASRAdapter(TranscriptionAdapter):
@@ -39,11 +37,13 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
 
     @property
     def realtime_long_audio_config(self) -> dict:
-        # Windowed mode engages only past min_audio_sec (the default 60s cap
-        # stays cumulative); window geometry comes from the mm processor.
+        # Window geometry itself comes from the mm processor.
         return {
-            "min_audio_sec": _LONG_AUDIO_GATE_SEC,
-            # 64s of acoustic context; older audio is carried by the prefix.
+            # Activation threshold: equals the default --asr-max-buffer-seconds,
+            # so windowed mode stays dormant until an operator raises the cap.
+            "min_audio_sec": 60.0,
+            # Rolling context once active: 8 encoder-native 8s windows (64s of
+            # audio) per request; older history is carried by the prefix.
             "max_audio_context_windows": 8,
             # Recent-text anchor; A/B showed no accuracy cost vs 512.
             "decoder_prefix_max_tokens": 192,
