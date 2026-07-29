@@ -87,6 +87,33 @@ COSMOS3_ACTION_FLOW_SHIFT = 10.0
 COSMOS3_EDGE_VIDEO_FLOW_SHIFT = 3.0
 
 
+def _inject_caption_metadata(
+    prompt: str, num_frames: int, fps: float, height: int, width: int
+) -> str | None:
+    """Add the generation metadata that Cosmos3's structured captions carry.
+
+    Training captions always ship ``resolution``, plus ``duration``/``fps`` for
+    video, so a JSON caption without them is out of distribution. Returns
+    ``None`` when the prompt is not a JSON object; those prompts carry the same
+    metadata as trailing prose via the duration template instead.
+    """
+    try:
+        caption = json.loads(prompt)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(caption, dict):
+        return None
+
+    caption["resolution"] = {"H": int(height), "W": int(width)}
+    if num_frames > 1:
+        caption["duration"] = f"{int(num_frames / fps) if fps > 0 else 0}s"
+        caption["fps"] = float(fps)
+    else:
+        caption.pop("duration", None)
+        caption.pop("fps", None)
+    return json.dumps(caption)
+
+
 def _resize_crop_pil(
     image: PIL.Image.Image, target_w: int, target_h: int
 ) -> PIL.Image.Image:
@@ -333,6 +360,15 @@ class Cosmos3TokenizationStage(PipelineStage):
             use_system_prompt = False
             use_duration_template = False
             self.log_info(f"Action prompt: {prompt}")
+        else:
+            structured_caption = _inject_caption_metadata(
+                prompt, num_frames, fps, batch.height, batch.width
+            )
+            if structured_caption is not None:
+                # The metadata is already in the caption; appending the prose
+                # template too would state the duration twice.
+                prompt = structured_caption
+                use_duration_template = False
 
         # Apply duration template if enabled (no temporal concept for T2I).
         if use_duration_template and not is_image_gen and num_frames > 1:

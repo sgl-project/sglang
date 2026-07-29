@@ -2,6 +2,7 @@
 """Unit tests for Cosmos3 config, weight mapping, and sampling params."""
 
 import importlib.util
+import json
 import types
 import unittest
 from unittest import mock
@@ -47,6 +48,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     Cosmos3ImagePreprocessStage,
     Cosmos3LatentPreparationStage,
     Cosmos3TimestepPreparationStage,
+    Cosmos3TokenizationStage,
+    _inject_caption_metadata,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
     EMBODIMENT_TO_DOMAIN_ID,
@@ -879,6 +882,131 @@ class TestCosmos3ModalitySamplingParams(unittest.TestCase):
             "action",
         ):
             self.assertIsNone(getattr(sp, field))
+
+
+class TestCosmos3CaptionMetadata(unittest.TestCase):
+    """Structured captions get generation metadata; prose prompts opt out."""
+
+    def test_video_caption_gets_resolution_duration_and_fps(self):
+        prompt = json.dumps({"temporal_caption": "a cone melts"})
+        caption = json.loads(
+            _inject_caption_metadata(
+                prompt, num_frames=189, fps=24.0, height=480, width=832
+            )
+        )
+        self.assertEqual(caption["resolution"], {"H": 480, "W": 832})
+        # Whole seconds, matching the caption format the model was trained on.
+        self.assertEqual(caption["duration"], "7s")
+        self.assertEqual(caption["fps"], 24.0)
+        self.assertEqual(caption["temporal_caption"], "a cone melts")
+
+    def test_image_caption_drops_temporal_fields(self):
+        prompt = json.dumps({"subjects": ["hands"], "duration": "5s", "fps": 24.0})
+        caption = json.loads(
+            _inject_caption_metadata(
+                prompt, num_frames=1, fps=24.0, height=768, width=768
+            )
+        )
+        self.assertEqual(caption["resolution"], {"H": 768, "W": 768})
+        self.assertNotIn("duration", caption)
+        self.assertNotIn("fps", caption)
+        self.assertEqual(caption["subjects"], ["hands"])
+
+    def test_request_resolution_overrides_caption(self):
+        prompt = json.dumps({"resolution": {"H": 111, "W": 222}})
+        caption = json.loads(
+            _inject_caption_metadata(
+                prompt, num_frames=1, fps=24.0, height=640, width=640
+            )
+        )
+        self.assertEqual(caption["resolution"], {"H": 640, "W": 640})
+
+    def test_unrelated_caption_fields_are_preserved(self):
+        prompt = json.dumps({"aspect_ratio": "1,1", "subjects": ["a vase"]})
+        caption = json.loads(
+            _inject_caption_metadata(
+                prompt, num_frames=1, fps=24.0, height=640, width=640
+            )
+        )
+        self.assertEqual(caption["aspect_ratio"], "1,1")
+        self.assertEqual(caption["subjects"], ["a vase"])
+
+    def test_zero_fps_does_not_divide_by_zero(self):
+        prompt = json.dumps({"temporal_caption": "a cone melts"})
+        caption = json.loads(
+            _inject_caption_metadata(
+                prompt, num_frames=81, fps=0.0, height=480, width=832
+            )
+        )
+        self.assertEqual(caption["duration"], "0s")
+
+    def test_non_structured_prompts_are_declined(self):
+        for prompt in (
+            "A curious raccoon in a field of sunflowers.",
+            json.dumps(["not", "an", "object"]),
+            json.dumps("a bare string"),
+            "",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertIsNone(
+                    _inject_caption_metadata(
+                        prompt, num_frames=81, fps=24.0, height=480, width=832
+                    )
+                )
+
+
+class TestCosmos3DurationTemplateSuppression(unittest.TestCase):
+    """A structured caption must not also get the prose duration suffix."""
+
+    def _run_prompt_stage(self, prompt: str, use_duration_template: bool) -> str:
+        """Drive Cosmos3TokenizationStage.forward far enough to see the prompt."""
+        seen = {}
+
+        def fake_tokenize(prompt_text, *args, **kwargs):
+            seen.setdefault("prompt", prompt_text)
+            return (
+                torch.zeros(1, 4, dtype=torch.long),
+                torch.ones(1, 4, dtype=torch.long),
+                4,
+            )
+
+        stage = Cosmos3TokenizationStage.__new__(Cosmos3TokenizationStage)
+        batch = types.SimpleNamespace(
+            prompt=prompt,
+            negative_prompt="bad",
+            max_sequence_length=512,
+            use_duration_template=use_duration_template,
+            use_system_prompt=False,
+            fps=24.0,
+            num_frames=189,
+            height=480,
+            width=832,
+            data_type=DataType.VIDEO,
+            sampling_params=types.SimpleNamespace(action_mode=None),
+            extra={},
+        )
+        server_args = types.SimpleNamespace(
+            pipeline_config=types.SimpleNamespace(
+                use_duration_template=True, use_system_prompt=False
+            )
+        )
+        with (
+            mock.patch.object(stage, "_tokenize_prompt", fake_tokenize),
+            mock.patch.object(stage, "log_info"),
+        ):
+            stage.forward(batch, server_args)
+        return seen["prompt"]
+
+    def test_structured_caption_stays_valid_json(self):
+        prompt = json.dumps({"temporal_caption": "a cone melts"})
+        final = self._run_prompt_stage(prompt, use_duration_template=True)
+        caption = json.loads(final)  # would raise if the suffix were appended
+        self.assertEqual(caption["duration"], "7s")
+        self.assertNotIn("seconds long", final)
+
+    def test_prose_prompt_still_gets_the_duration_suffix(self):
+        final = self._run_prompt_stage("A curious raccoon.", use_duration_template=True)
+        self.assertIn("seconds long", final)
 
 
 if __name__ == "__main__":
