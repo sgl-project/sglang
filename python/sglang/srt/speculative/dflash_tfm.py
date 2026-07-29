@@ -2603,6 +2603,9 @@ class DFlashTfmWorker(DFlashWorkerV2):
             )
             frontier_active.scatter_(1, frontier_index, False)
 
+            if slot_stop > node_budget:
+                break
+
             parent_ancestors = gather_parent_ancestors(parent)
             token_flat = token.reshape(bs * width)
             node_score_flat = node_score.reshape(bs * width)
