@@ -39,6 +39,7 @@ class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin)
     gsm8k_accuracy_thres = 0.93
     gsm8k_num_questions = 200
     gsm8k_num_shots = 20
+    extra_server_args = []
 
     @classmethod
     def setUpClass(cls):
@@ -80,7 +81,7 @@ class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin)
             "--watchdog-timeout",
             "900",
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.extra_server_args + cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -122,7 +123,7 @@ class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin)
             "--watchdog-timeout",
             "900",
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.extra_server_args + cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,

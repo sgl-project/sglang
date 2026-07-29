@@ -4979,9 +4979,11 @@ class ServerArgs:
         ]:
             from sglang.srt.arg_groups.deepseek_v4_hook import (
                 apply_deepseek_v4_defaults,
+                validate_deepseek_v4_index_cache,
             )
 
             apply_deepseek_v4_defaults(self, model_arch)
+            validate_deepseek_v4_index_cache(self, hf_config)
 
         if model_arch in [
             "DeepseekV3ForCausalLM",

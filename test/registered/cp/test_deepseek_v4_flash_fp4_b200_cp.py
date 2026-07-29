@@ -158,6 +158,7 @@ class TestDSV4FlashFP4B200Balanced_CP_NonDeepEP(
     gsm8k_accuracy_thres = 0.93
     accept_length_thres = 1.8
     bs_1_speed_thres = 100
+    extra_server_args = []
 
     @classmethod
     def setUpClass(cls):
@@ -186,7 +187,8 @@ class TestDSV4FlashFP4B200Balanced_CP_NonDeepEP(
                 "round-robin-split",
                 "--moe-runner-backend",  # for fp4 checkpoint
                 "flashinfer_mxfp4",
-            ],
+            ]
+            + cls.extra_server_args,
         )
 
     @classmethod

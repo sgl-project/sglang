@@ -79,6 +79,8 @@ class KVArgs:
     # the connection layer to slice the buffer-type-organized flat list in a
     # PP-aware manner.
     mla_compression_ratios: Optional[List[int]]
+    dsv4_index_cache_layout_signature: Optional[str]
+    dsv4_index_cache_producer_layer_ids: Optional[List[int]]
     # Only used of npu, for kv buf groups
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
