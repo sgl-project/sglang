@@ -140,6 +140,13 @@ def test_strategy_shard_when_legal(monkeypatch):
     assert sps.plan_text_strategy(16) == "shard"
 
 
+def test_strategy_replicates_when_shorter_than_sp_degree(monkeypatch):
+    _fake_sp(monkeypatch, 8)
+    assert sps.plan_text_strategy(1) == "replicate"
+    assert sps.plan_text_strategy(7) == "replicate"
+    assert sps.plan_text_strategy(8) == "shard"
+
+
 def test_strategy_ring_blocks_padded_shard(monkeypatch):
     _fake_sp(monkeypatch, 2, ring=2)
     assert sps.plan_text_strategy(15) == "replicate"  # padded shard needs mask
