@@ -877,7 +877,7 @@ class LogitsProcessor(nn.Module):
         """Exchange only the row block owned by each destination DP rank."""
         logits = logits.contiguous()
         all_to_all_output = torch.empty_like(logits)
-        get_tp_group().all_to_all_single(all_to_all_output, logits)
+        get_tp_group().all_to_all_single(all_to_all_output.view(-1), logits.view(-1))
         return _reassemble_tp_lm_head_all_to_all_output(
             all_to_all_output, get_parallel().tp_size
         )
