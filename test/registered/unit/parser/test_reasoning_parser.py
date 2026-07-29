@@ -297,8 +297,6 @@ class TestKimiK2Detector(CustomTestCase):
 
 
 class TestKimiK3Detector(CustomTestCase):
-    """Test cases for the Kimi K3 XTML think channel detector."""
-
     TOOLS = (
         '<|open|>tools<|sep|><|open|>call tool="get_weather" index="1"<|sep|>'
         '<|open|>argument key="city" type="string"<|sep|>San Francisco'
@@ -320,24 +318,17 @@ class TestKimiK3Detector(CustomTestCase):
         )
 
     def test_unsealed_think_close_keeps_response_out_of_reasoning(self):
-        """Guard the /v1/responses regression where the think channel closed as
-        ``<|close|>think`` with no trailing ``<|sep|>``: the detector found no
-        think_end_token, so the whole response channel plus its raw markers were
-        emitted as reasoning_text and the assistant message vanished."""
         result = KimiK3Detector().detect_and_parse(self._unsealed())
         self.assertEqual(result.reasoning_text, self.THINK)
         self.assertEqual(result.normal_text, self.RESPONSE + self.TOOLS)
 
     def test_sealed_and_unsealed_agree(self):
-        """A well-formed close marker must parse identically to the degraded one."""
         sealed = KimiK3Detector().detect_and_parse(self._sealed())
         unsealed = KimiK3Detector().detect_and_parse(self._unsealed())
         self.assertEqual(sealed.reasoning_text, unsealed.reasoning_text)
         self.assertEqual(sealed.normal_text, unsealed.normal_text)
 
     def test_streaming_matches_non_streaming(self):
-        """Marker-straddling chunks must not leak a dangling ``<|close|>think``
-        into the streamed reasoning deltas."""
         for text in (self._sealed(), self._unsealed()):
             expected = KimiK3Detector().detect_and_parse(text)
             for chunk_size in (1, 7, 13):

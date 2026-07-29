@@ -18,6 +18,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -206,6 +207,70 @@ class ChatToolForwardingTestCase(unittest.TestCase):
         self.assertEqual(getattr(result, "status_code", None), 400)
 
 
+class ReasoningRequestForwardingTestCase(unittest.TestCase):
+    def test_create_responses_uses_processed_reasoning_state(self):
+        serving = make_serving()
+        serving.reasoning_parser = "deepseek-r1"
+        serving.default_chat_template_kwargs = {"thinking": False}
+        serving.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="thinking", default_enabled=True
+        )
+        rendered = MessageProcessingResult(
+            prompt="prompt",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+        captured = {}
+
+        async def fake_generate(
+            request_id,
+            request_prompt,
+            adapted_request,
+            sampling_params,
+            context,
+            **kwargs,
+        ):
+            captured["adapted_request"] = adapted_request
+            context.append_output(
+                {
+                    "text": "done",
+                    "meta_info": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                    },
+                }
+            )
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        request = ResponsesRequest(
+            model="x",
+            input="answer",
+            request_id="resp_reasoning",
+            store=False,
+        )
+
+        with (
+            patch.object(
+                serving, "_apply_conversation_template", return_value=rendered
+            ),
+            patch(
+                "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
+            ) as parser_cls,
+        ):
+            parser_cls.return_value.parse_non_stream.return_value = (None, "done")
+            response = asyncio.run(serving.create_responses(request))
+
+        self.assertEqual(response.status, "completed")
+        self.assertFalse(captured["adapted_request"].require_reasoning)
+        self.assertFalse(parser_cls.call_args.kwargs["force_reasoning"])
+
+
 class InputItemNormalizationTestCase(unittest.TestCase):
     def test_function_call_becomes_assistant_tool_call(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(
@@ -293,6 +358,7 @@ class FullResponseUsageTestCase(unittest.TestCase):
                 tokenizer=serving.tokenizer_manager.tokenizer,
                 request_metadata=metadata,
                 created_time=123,
+                require_reasoning=False,
             )
         )
 
@@ -405,6 +471,7 @@ class OutputItemsTestCase(unittest.TestCase):
                 self._function_tool_request(),
                 "raw model output with <tool_call>",
                 tokenizer=Mock(),
+                require_reasoning=False,
             )
 
         tool_calls = [
@@ -437,7 +504,10 @@ class OutputItemsTestCase(unittest.TestCase):
                 [fake_call],
             )
             output_items = serving._make_response_output_items(
-                self._function_tool_request(), "raw model output", tokenizer=Mock()
+                self._function_tool_request(),
+                "raw model output",
+                tokenizer=Mock(),
+                require_reasoning=False,
             )
 
         types = [type(item).__name__ for item in output_items]
@@ -462,7 +532,7 @@ class OutputItemsTestCase(unittest.TestCase):
         raw = '[{"name": "get_weather", "parameters": {"city": "Beijing"}}]'
 
         output_items = serving._make_response_output_items(
-            request, raw, tokenizer=Mock()
+            request, raw, tokenizer=Mock(), require_reasoning=False
         )
 
         tool_calls = [
@@ -497,7 +567,10 @@ class OutputItemsTestCase(unittest.TestCase):
             "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser"
         ) as parser_cls:
             output_items = serving._make_response_output_items(
-                request, "just a plain answer", tokenizer=Mock()
+                request,
+                "just a plain answer",
+                tokenizer=Mock(),
+                require_reasoning=False,
             )
             parser_cls.assert_not_called()
 

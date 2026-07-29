@@ -334,11 +334,39 @@ class ServingChatTestCase(unittest.TestCase):
                 [],
                 [],
                 None,
+                require_reasoning=True,
             )
 
             adapted, _ = self.chat._convert_to_internal_request(req)
 
         self.assertTrue(adapted.require_reasoning)
+
+    def test_process_messages_records_template_reasoning_state(self):
+        self.chat.default_chat_template_kwargs = {"thinking": True}
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="thinking", default_enabled=False
+        )
+        self.chat.reasoning_parser = "deepseek-v3"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+        rendered = MessageProcessingResult(
+            prompt="prompt",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+
+        with patch.object(
+            self.chat, "_apply_conversation_template", return_value=rendered
+        ):
+            processed = self.chat._process_messages(request, is_multimodal=False)
+
+        self.assertTrue(processed.require_reasoning)
 
     def test_kimi_tool_call_respects_explicit_reasoning_disable(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
