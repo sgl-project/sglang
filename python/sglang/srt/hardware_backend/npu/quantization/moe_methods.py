@@ -20,13 +20,11 @@ from sglang.srt.hardware_backend.npu.moe.matmul import (
 )
 from sglang.srt.hardware_backend.npu.moe.quant import HiddenStatesDynamicQuant
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+    _get_float4_e2m1fn_x2_dtype,
     _get_float8_e8m0fnu_dtype,
 )
 
 logger = logging.getLogger(__name__)
-
-
-MXFP4_W4A8_BLOCK_SIZE = 32
 
 
 _E8M0_DTYPE = None
@@ -65,21 +63,6 @@ def _require_e8m0_dtype():
                 "with a torch_npu build exposing float8_e8m0fnu (torch_npu >= 2.9)."
             )
     return _E8M0_DTYPE
-
-
-def _get_float4_e2m1fn_x2_dtype():
-    # Recent torch_npu builds require the NPU dtype enum instead of the torch
-    # dtype object for FP4 op arguments. Resolve it lazily so this module stays
-    # importable on non-NPU platforms.
-    from sglang.srt.utils import is_npu
-
-    if is_npu():
-        import torch_npu
-
-        npu_dtype = getattr(torch_npu, "float4_e2m1fn_x2", None)
-        if npu_dtype is not None:
-            return npu_dtype
-    return getattr(torch, "float4_e2m1fn_x2", None)
 
 
 # DEPRECATED METHOD
@@ -261,11 +244,9 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         group_list_type: int,
     ) -> torch.Tensor:
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-        e8m0_dtype = _get_float8_e8m0fnu_dtype()
-        if fp4_dtype is None or e8m0_dtype is None:
-            raise RuntimeError(
-                "NPU W4A8 MXFP MoE requires float4 and float8 E8M0 support."
-            )
+        if fp4_dtype is None:
+            raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
+        e8m0_dtype = _require_e8m0_dtype()
 
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
