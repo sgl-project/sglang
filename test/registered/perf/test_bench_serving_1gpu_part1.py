@@ -5,6 +5,7 @@ Works on 5090 (32GB).
 
 import asyncio
 import itertools
+import os
 import unittest
 
 import requests
@@ -150,7 +151,10 @@ class TestBenchServing1GPUPart1(CustomTestCase):
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
                 f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
             )
-            self.assertLess(res["median_e2e_latency_ms"], 2400)
+            e2e_latency_limit_ms = (
+                3320 if os.getenv("SGLANG_AMD_GPU_FAMILY") == "mi300" else 2400
+            )
+            self.assertLess(res["median_e2e_latency_ms"], e2e_latency_limit_ms)
             # relax for mi300x (LoRA TTFT ~2x slower than mi325)
             if is_in_amd_ci():
                 self.assertLess(res["median_ttft_ms"], 100)
