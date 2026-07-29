@@ -297,13 +297,6 @@ async fn chat_completions_inner(
     // derivation, so the two can never disagree.
     let derived_request_id = derive_request_id(probe.rid.as_deref(), &headers);
 
-    // Best-effort tee of the ingress-computed ids to the theoretical cache-sim.
-    // Fires only when we already tokenized (so it adds no latency), and is
-    // fire-and-forget — never blocks or fails the request. No-op unless
-    // `--cache-sim-url` is set.
-    if let (Some(tee), Some(t)) = (ctx.cache_sim_tee.as_ref(), request_tokens.as_ref()) {
-        tee.offer(&model_str, &t.ids, &derived_request_id);
-    }
     // Arm the response-completion extend tee (see `cache_sim_extend`): when the
     // response finishes, the assistant reply's rendered turn is appended to
     // this request's token sequence and teed insert-only, so the NEXT round's
@@ -400,6 +393,19 @@ async fn chat_completions_inner(
         .admission
         .acquire(&workers, policy.as_ref(), &selection_ctx, &model_str)
         .await?;
+    // Best-effort tee of the ingress-computed ids to the theoretical cache-sim.
+    // Fire-and-forget — never blocks or fails the request. No-op unless
+    // `--cache-sim-url` is set.
+    //
+    // Deliberately AFTER admission, not next to the tokenization it reuses. A
+    // shed request never reaches an engine, so counting it would both inflate
+    // the oracle's denominator with traffic that was never served and leave an
+    // ingest record whose extend can never arrive — indistinguishable
+    // downstream from a response that generated nothing. The bias would grow
+    // exactly when the fleet is shedding, i.e. anti-correlated with health.
+    if let (Some(tee), Some(t)) = (ctx.cache_sim_tee.as_ref(), request_tokens.as_ref()) {
+        tee.offer(&model_str, &t.ids, &derived_request_id);
+    }
     if let Some(p) = &phase {
         p.set(RequestPhase::Dispatch);
     }
@@ -1741,6 +1747,10 @@ fn lax_number(v: &serde_json::Value) -> Option<f64> {
 /// on the id the tee sends) all pointing at the same request. A fresh UUID
 /// here would leave three disjoint identifiers for one request.
 ///
+/// One exception: in PD-disagg mode no rid is forwarded (see `request_id`'s
+/// `decode_peer` gate), so the engine leg of that correlation does not exist
+/// and the engine mints its own. The gateway and oracle legs still line up.
+///
 /// SGLang keeps a provided `rid` and only generates one when absent, and it
 /// aborts every rid that *starts with* the one we send — covering `n>1`
 /// expansions.
@@ -1749,10 +1759,18 @@ fn lax_number(v: &serde_json::Value) -> Option<f64> {
 /// the engine-facing rid: two call sites would each mint their own UUID on the
 /// no-header path, and the tee's id would then not match the engine's.
 fn derive_request_id(client_rid: Option<&str>, headers: &HeaderMap) -> String {
-    if let Some(rid) = client_rid {
+    // Empty is rejected at both sources, the way the sticky-routing key in this
+    // same handler already does. An empty `rid` or a bare `x-request-id:`
+    // header would otherwise collapse every affected request onto the single
+    // key "" / "router-", turning any downstream join into a cross product.
+    if let Some(rid) = client_rid.filter(|s| !s.is_empty()) {
         return rid.to_owned();
     }
-    match headers.get("x-request-id").and_then(|v| v.to_str().ok()) {
+    match headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    {
         Some(id) => format!("router-{id}"),
         None => format!("router-{}", uuid::Uuid::new_v4().simple()),
     }
@@ -2370,6 +2388,58 @@ mod tests {
     fn offload_failed_false_for_non_messages_request() {
         let value = serde_json::json!({"prompt":"hi"});
         assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
+    }
+
+    #[test]
+    /// The id must be derived EXACTLY ONCE per request.
+    ///
+    /// A second `derive_request_id(...)` at dispatch mints a fresh UUID on the
+    /// no-client-rid, no-`x-request-id` path, so the id the tee sent and the id
+    /// the engine logged diverge — silently, for exactly the direct-to-router
+    /// traffic where correlation is already hardest. Mutation testing showed
+    /// that regression surviving the entire 773-test suite, because the
+    /// behavioral path needs a live worker to drive.
+    ///
+    /// This is a structural guard, not a behavioral one: it counts call sites
+    /// in the source. Crude, but it encodes the invariant the doc comment
+    /// states, costs nothing, and fails loudly on the exact reintroduction.
+    #[test]
+    fn request_id_is_derived_exactly_once_in_the_handler() {
+        // Count real call sites only: production code (everything before the
+        // test module), with comment lines stripped so prose mentioning the
+        // function does not inflate the count.
+        let src = include_str!("chat.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap();
+        let hits = production
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+            .map(|l| l.matches("derive_request_id(").count())
+            .sum::<usize>();
+        // One definition + exactly one call.
+        assert_eq!(
+            hits, 2,
+            "expected the definition plus exactly ONE call to derive_request_id \
+             in production code; found {hits} occurrences. Reuse the existing \
+             `derived_request_id` binding instead of deriving again — a second \
+             derivation hands one request two identities, silently, on the \
+             no-x-request-id path."
+        );
+    }
+
+    #[test]
+    fn derive_request_id_rejects_empty_ids_that_would_collapse_the_key() {
+        // An empty client rid or a bare `x-request-id:` header would put every
+        // affected request under one key, turning a downstream join into a
+        // cross product.
+        let mut h = HeaderMap::new();
+        h.insert("x-request-id", "".parse().unwrap());
+        let id = derive_request_id(Some(""), &h);
+        assert!(id.starts_with("router-"), "got {id}");
+        assert!(
+            id.len() > "router-".len(),
+            "must not be the bare prefix: {id}"
+        );
     }
 
     #[test]

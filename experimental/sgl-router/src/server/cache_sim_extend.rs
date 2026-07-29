@@ -141,6 +141,13 @@ pub(crate) fn spawn_extend_tee(
             ReplySource::Json(body) => assistant_messages_from_response_json(body),
             ReplySource::Sse(bytes) => assistant_messages_from_sse(bytes),
         };
+        // The engine's own count, when it reported one. Preferred over
+        // `len(ids) - prompt_len`, which measures the RE-RENDERED history turn
+        // and so drifts from what was generated — see `IngestIdsBody`.
+        let output_tokens = match &source {
+            ReplySource::Json(body) => completion_tokens_from_response_json(body),
+            ReplySource::Sse(bytes) => completion_tokens_from_sse(bytes),
+        };
         if replies.is_empty() {
             tracing::debug!(model = %model, "cache-sim extend: no assistant reply reconstructed; skipping");
             return;
@@ -152,7 +159,8 @@ pub(crate) fn spawn_extend_tee(
         let mut fallback_request: Option<Value> = None;
         // One extension per choice (`n > 1` yields alternative continuations —
         // whichever the client continues with should count as cached).
-        for reply in replies {
+        let choice_count = replies.len();
+        for (choice_index, reply) in replies.into_iter().enumerate() {
             // Which path produced the ids decides whether a prompt/output
             // boundary exists at all, so the two are kept distinguishable
             // rather than collapsed with `or_else`. Incremental output is
@@ -176,7 +184,29 @@ pub(crate) fn spawn_extend_tee(
                 .map(|ids| (ids, None)),
             };
             if let (Some(tee), Some((ids, prompt_len))) = (ctx.cache_sim_tee.as_ref(), produced) {
-                tee.offer_extend(&model, &ids, &request_id, prompt_len);
+                // Only tag a genuine fan-out. A single-choice response is the
+                // common case and needs no discriminator; N>1 must have one or
+                // the N records collapse onto one join key.
+                let choice = (choice_count > 1).then_some(crate::server::cache_sim_tee::Choice {
+                    index: choice_index,
+                    count: choice_count,
+                });
+                // The engine reports usage for the response as a whole, so it
+                // describes a fan-out's total, not any one alternative.
+                // Attributing it to every choice would multiply it by N.
+                let per_choice_output = if choice_count > 1 {
+                    None
+                } else {
+                    output_tokens
+                };
+                tee.offer_extend(
+                    &model,
+                    &ids,
+                    &request_id,
+                    prompt_len,
+                    choice,
+                    per_choice_output,
+                );
             } else {
                 tracing::debug!(model = %model, "cache-sim extend: tokenize failed; skipping");
             }
@@ -212,6 +242,43 @@ fn full_reencode_extension(
         messages.pop();
     }
     tokens.map(|t| t.ids)
+}
+
+/// `usage.completion_tokens` from a buffered chat response, when present.
+pub(crate) fn completion_tokens_from_response_json(body: &[u8]) -> Option<u64> {
+    serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get("usage")?
+        .get("completion_tokens")?
+        .as_u64()
+}
+
+/// `usage.completion_tokens` from a captured SSE stream.
+///
+/// Only present when the client asked for it (`stream_options.include_usage`);
+/// otherwise the engine emits no usage chunk and this is `None`. Scans from
+/// the end because the usage chunk is the last data event before `[DONE]`.
+pub(crate) fn completion_tokens_from_sse(bytes: &[u8]) -> Option<u64> {
+    let text = String::from_utf8_lossy(bytes);
+    for line in text.split('\n').rev() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let Some(payload) = line.strip_prefix("data:").map(str::trim_start) else {
+            continue;
+        };
+        if payload == "[DONE]" {
+            continue;
+        }
+        if let Some(n) = serde_json::from_str::<Value>(payload)
+            .ok()
+            .as_ref()
+            .and_then(|v| v.get("usage"))
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(Value::as_u64)
+        {
+            return Some(n);
+        }
+    }
+    None
 }
 
 /// Pull the assistant message(s) out of a buffered (non-streaming) chat
@@ -494,5 +561,46 @@ mod tests {
         let msgs = assistant_messages_from_sse(&bytes);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["content"], "ok");
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn completion_tokens_read_from_a_buffered_response() {
+        let body = br#"{"choices":[{"message":{"content":"hi"}}],
+                        "usage":{"prompt_tokens":10,"completion_tokens":7}}"#;
+        assert_eq!(completion_tokens_from_response_json(body), Some(7));
+        // No usage block: absent, NOT zero. Zero would read downstream as a
+        // real measurement of "generated nothing".
+        assert_eq!(
+            completion_tokens_from_response_json(br#"{"choices":[]}"#),
+            None
+        );
+        assert_eq!(completion_tokens_from_response_json(b"not json"), None);
+    }
+
+    #[test]
+    fn completion_tokens_read_from_the_streaming_usage_chunk() {
+        // The usage chunk is the last data event before [DONE], and it carries
+        // a null `choices` — so the scan must not stop at the content chunks.
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"completion_tokens\":11}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        assert_eq!(completion_tokens_from_sse(sse.as_bytes()), Some(11));
+    }
+
+    #[test]
+    fn no_usage_chunk_means_absent_not_zero() {
+        // The common case: the client did not set stream_options.include_usage.
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        assert_eq!(completion_tokens_from_sse(sse.as_bytes()), None);
     }
 }

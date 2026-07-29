@@ -52,8 +52,26 @@ struct TeeMsg {
     kind: TeeKind,
     model: String,
     input_ids: Vec<u32>,
+    output_tokens: Option<u64>,
     request_id: String,
     prompt_len: Option<usize>,
+    choice: Option<Choice>,
+}
+
+/// Which of an `n > 1` response's alternative continuations an extension is.
+///
+/// One request produces ONE ingest record but N extends — every choice is a
+/// separate continuation and each should seed the block store. Without a
+/// discriminator those N records share a single `request_id`, so a receiver
+/// joining on that key fans out N:1 and sums N times the real output; and N
+/// rows under one key is also exactly what a duplicate-delivery bug looks
+/// like, so the consumer cannot even detect the condition. `count` lets a
+/// receiver verify it got them all; `index` lets it pick one for accounting
+/// while still ingesting all of them for simulation.
+#[derive(Clone, Copy, Serialize)]
+pub struct Choice {
+    pub index: usize,
+    pub count: usize,
 }
 
 /// Wire body of `POST /ingest_ids` and `POST /extend_ids` (same shape).
@@ -80,6 +98,20 @@ struct IngestIdsBody<'a> {
     request_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_len: Option<usize>,
+    /// Absent on `/ingest_ids` (a request has one prompt) and on a
+    /// single-choice response; present whenever a response fanned out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    choice_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    choice_count: Option<usize>,
+    /// The engine's own completion-token count, when the response reported
+    /// one. Authoritative — unlike `input_ids.len() - prompt_len`, which
+    /// measures the RE-RENDERED history turn (template envelope, EOS,
+    /// re-serialized tool calls, reasoning the render drops) and drifts from
+    /// what was actually generated on exactly the tool-calling traffic this
+    /// oracle exists to measure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_tokens: Option<u64>,
 }
 
 /// Handle the chat/completions handler offers pre-tokenized requests to.
@@ -130,7 +162,15 @@ impl CacheSimTee {
     /// id lists are a no-op. Cheap enough to call unconditionally on the hot
     /// path.
     pub fn offer(&self, model: &str, input_ids: &[u32], request_id: &str) {
-        self.offer_kind(TeeKind::Ingest, model, input_ids, request_id, None);
+        self.offer_kind(
+            TeeKind::Ingest,
+            model,
+            input_ids,
+            request_id,
+            None,
+            None,
+            None,
+        );
     }
 
     /// Offer one completed response's FULL token sequence (prompt + generated
@@ -145,10 +185,21 @@ impl CacheSimTee {
         input_ids: &[u32],
         request_id: &str,
         prompt_len: Option<usize>,
+        choice: Option<Choice>,
+        output_tokens: Option<u64>,
     ) {
-        self.offer_kind(TeeKind::Extend, model, input_ids, request_id, prompt_len);
+        self.offer_kind(
+            TeeKind::Extend,
+            model,
+            input_ids,
+            request_id,
+            prompt_len,
+            choice,
+            output_tokens,
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn offer_kind(
         &self,
         kind: TeeKind,
@@ -156,20 +207,38 @@ impl CacheSimTee {
         input_ids: &[u32],
         request_id: &str,
         prompt_len: Option<usize>,
+        choice: Option<Choice>,
+        output_tokens: Option<u64>,
     ) {
         if input_ids.is_empty() {
             return;
         }
-        // A boundary at or past the end would make output_tokens zero or
-        // negative on the receiver. Drop the claim rather than send one that
-        // cannot be true; the extension itself is still worth teeing.
-        let prompt_len = prompt_len.filter(|n| *n < input_ids.len());
+        // A boundary must be strictly inside the sequence: 0 would claim the
+        // whole thing is output, >= len would claim none of it is. Neither can
+        // be true on the incremental path (`prompt_ids ++ non_empty_suffix`),
+        // so if one shows up the concat invariant that path rests on has
+        // broken. Drop the claim — the extension is still worth teeing — but
+        // COUNT it, because otherwise the record is indistinguishable on the
+        // wire from a legitimate full-re-encode fallback, and the one signal
+        // saying "your incremental path is producing garbage" reads as normal
+        // traffic.
+        let prompt_len = match prompt_len {
+            Some(n) if (1..input_ids.len()).contains(&n) => Some(n),
+            Some(_) => {
+                self.metrics
+                    .record_cache_sim_tee("extend_boundary_impossible");
+                None
+            }
+            None => None,
+        };
         let msg = TeeMsg {
             kind,
             model: model.to_owned(),
             input_ids: input_ids.to_vec(),
             request_id: request_id.to_owned(),
             prompt_len,
+            choice,
+            output_tokens,
         };
         match self.tx.try_send(msg) {
             Ok(()) => {}
@@ -202,6 +271,11 @@ async fn run_sender(
             input_ids: &msg.input_ids,
             request_id: &msg.request_id,
             prompt_len: msg.prompt_len,
+            // A single-choice response carries no discriminator: absent means
+            // "not a fan-out", which is the common case and the cheapest wire.
+            choice_index: msg.choice.map(|c| c.index),
+            choice_count: msg.choice.map(|c| c.count),
+            output_tokens: msg.output_tokens,
         };
         // Per-kind outcome labels so a version-skewed cache-sim (no
         // /extend_ids yet → 404) shows up as `extend_http_error` while the
@@ -335,32 +409,58 @@ mod tests {
             input_ids: &[1, 2, 3],
             request_id: "rid-1",
             prompt_len: None,
+            choice_index: None,
+            choice_count: None,
+            output_tokens: None,
         };
         let v = serde_json::to_value(&body).unwrap();
         assert!(v.get("prompt_len").is_none(), "serialized: {v}");
         assert_eq!(v["request_id"], "rid-1");
+        // Same reasoning for the fan-out and usage fields: a single-choice
+        // response and an engine that reported no usage must be ABSENT, not
+        // null or 0 — the receiver reads 0 as a real measurement.
+        for k in ["choice_index", "choice_count", "output_tokens"] {
+            assert!(v.get(k).is_none(), "{k} must be absent: {v}");
+        }
     }
 
     /// A boundary at or past the end of the sequence cannot be true: it would
-    /// make output tokens zero or negative on the receiver. Drop the claim,
-    /// keep the extension.
+    /// leave zero or negative output tokens. Drop the claim, keep the
+    /// extension.
+    ///
+    /// Asserts on what actually lands in the channel, via `unstarted()`. An
+    /// earlier version of this test re-implemented the filter in its own body
+    /// and asserted on that — which passed with the production guard deleted,
+    /// i.e. it certified an unguarded path.
     #[tokio::test]
     async fn an_impossible_boundary_is_dropped_rather_than_sent() {
         let metrics = Arc::new(MetricsRegistry::default());
-        let tee = CacheSimTee::spawn("http://127.0.0.1:1".to_string(), metrics);
-        // Equal to the length, and past it: neither leaves any output tokens.
-        for bad in [4usize, 99] {
-            let msg = TeeMsg {
-                kind: TeeKind::Extend,
-                model: "m".into(),
-                input_ids: vec![1, 2, 3, 4],
-                request_id: "rid-1".into(),
-                prompt_len: Some(bad).filter(|n| *n < 4),
-            };
-            assert!(msg.prompt_len.is_none(), "boundary {bad} should be dropped");
+        let (tee, mut rx) = unstarted(8, Arc::clone(&metrics));
+
+        // 0 claims the whole sequence is output; 4 and 99 claim none of it is.
+        for bad in [0usize, 4, 99] {
+            tee.offer_extend("m", &[1, 2, 3, 4], "rid-1", Some(bad), None, None);
+            let msg = rx
+                .try_recv()
+                .expect("the extension itself must still be teed");
+            assert!(msg.prompt_len.is_none(), "boundary {bad} must be dropped");
+            assert_eq!(msg.input_ids, vec![1, 2, 3, 4]);
         }
-        // A real boundary survives.
-        tee.offer_extend("m", &[1, 2, 3, 4], "rid-1", Some(3));
+
+        // A boundary strictly inside the sequence survives untouched.
+        tee.offer_extend("m", &[1, 2, 3, 4], "rid-1", Some(3), None, None);
+        assert_eq!(rx.try_recv().unwrap().prompt_len, Some(3));
+    }
+
+    /// The ingest leg never carries a boundary — its body IS the prompt.
+    #[tokio::test]
+    async fn ingest_never_carries_a_boundary() {
+        let metrics = Arc::new(MetricsRegistry::default());
+        let (tee, mut rx) = unstarted(4, Arc::clone(&metrics));
+        tee.offer("m", &[1, 2, 3], "rid-1");
+        let msg = rx.try_recv().unwrap();
+        assert!(msg.prompt_len.is_none());
+        assert_eq!(msg.request_id, "rid-1");
     }
 
     #[tokio::test]
@@ -386,7 +486,14 @@ mod tests {
 
         let metrics = MetricsRegistry::new();
         let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics));
-        tee.offer_extend("m", &[10, 11, 12, 13], "rid-1", Some(2));
+        tee.offer_extend(
+            "m",
+            &[10, 11, 12, 13],
+            "rid-1",
+            Some(2),
+            Some(Choice { index: 1, count: 3 }),
+            Some(42),
+        );
 
         let mut got = None;
         for _ in 0..80 {
@@ -408,6 +515,15 @@ mod tests {
         assert_eq!(
             v["prompt_len"], 2,
             "the exact prompt/output boundary must reach the wire"
+        );
+        assert_eq!(
+            v["choice_index"], 1,
+            "fan-out discriminator must reach the wire"
+        );
+        assert_eq!(v["choice_count"], 3);
+        assert_eq!(
+            v["output_tokens"], 42,
+            "the engine's own completion count must reach the wire"
         );
 
         // Metered under the extend-specific label.
