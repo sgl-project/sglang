@@ -51,8 +51,9 @@
 //                      override the page value per cell (entry → config → "P50").
 //                      Legacy "Mean" data is being re-measured to P50; drop once done
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
-//   dockerImages       optional — `docker run` image, keyed by `hw|quant`
-//                      then `hw`; falls back to `lmsysorg/sglang:dev`
+//   dockerImages       optional — `docker run` image, keyed by
+//                      `hw|quant|strategy` then `hw|quant` then `hw`;
+//                      falls back to `lmsysorg/sglang:dev`
 //   runModes           optional — command output tabs to show (`python` and/or
 //                      `docker`); defaults to both, in that order
 //   github             optional — "Submit verified cell" issue-template overrides
@@ -674,9 +675,12 @@ export const Deployment = ({ config, benchmarks }) => {
 
     let cmd;
     if (mode === "docker") {
-      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped.
+      // Image keyed by `hw|quant|strategy` (most specific), then `hw|quant`,
+      // then `hw`; `:dev` if unmapped. The strategy key covers a tier that
+      // needs its own build (e.g. a spec-decoding preview image).
       const di = config.dockerImages || {};
-      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
+      const image = di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
+        || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const vendorOf = (hwId) => {
