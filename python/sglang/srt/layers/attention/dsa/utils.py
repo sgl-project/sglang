@@ -56,6 +56,12 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
         return False
 
 
+# Tile size for the indexer FP8 K-cache preshuffle layout. Store and gather
+# kernels reorganize each page into (tile x tile) blocks so the aiter preshuffle
+# paged-MQA gather can consume the cache directly.
+INDEXER_K_CACHE_PRESHUFFLE_TILE = 16
+
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -153,7 +159,7 @@ def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
 def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
-    from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
