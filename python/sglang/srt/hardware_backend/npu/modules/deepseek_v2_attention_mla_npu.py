@@ -18,6 +18,37 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
+
+def _lazy_init_w_vc(m):
+    """Split kv_b_proj weight into w_kc and w_vc on first use.
+
+    With --load-format dummy, process_weights_after_loading may not run,
+    so w_vc/w_kc are still None. Split the weight manually.
+    """
+    return _ensure_kv_b_proj_split(m)[1]
+
+
+def _ensure_kv_b_proj_split(m):
+    """Ensure both w_kc and w_vc are split from kv_b_proj.
+
+    Returns (w_kc, w_vc).
+    """
+    if m.w_kc is not None and m.w_vc is not None:
+        return m.w_kc, m.w_vc
+
+    total_dim = m.num_local_heads * (m.qk_nope_head_dim + m.v_head_dim)
+    kc_dim = m.num_local_heads * m.qk_nope_head_dim
+    weight = m.kv_b_proj.weight  # [total_dim, kv_lora_rank]
+    if m.w_kc is None:
+        # w_kc shape: [num_heads, qk_nope_head_dim, kv_lora_rank] for bmm(q_nope, w_kc)
+        m.w_kc = weight[:kc_dim].view(m.num_local_heads, m.qk_nope_head_dim, m.kv_lora_rank).contiguous()
+    if m.w_vc is None:
+        # w_vc shape: [num_heads, kv_lora_rank, v_head_dim] for batch_matmul_transpose
+        # batch_matmul_transpose does out = a @ b^T, with b having its last dim as kv_lora_rank
+        m.w_vc = weight[kc_dim:total_dim].view(m.num_local_heads, m.v_head_dim, m.kv_lora_rank).transpose(1, 2).contiguous()
+    return m.w_kc, m.w_vc
+
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -241,11 +272,17 @@ def forward_mla_prepare_npu(
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
-        q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
+        # Lazy-init w_kc/w_vc from kv_b_proj (may be skipped with --load-format dummy)
+        _ensure_kv_b_proj_split(m)
 
-        q_nope_out = q_nope_out.transpose(0, 1)
+        if m.w_kc is not None:
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
+            q_nope_out = q_nope_out.transpose(0, 1)
+        else:
+            q_nope_out = q_nope
 
-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        if m.rotary_emb is not None:
+            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -304,7 +341,13 @@ def forward_mla_core_npu(
     )
 
     attn_output = attn_output.contiguous()
-    torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+    # Lazily init w_vc if not set (e.g. dummy weights skip process_weights_after_loading)
+    w_vc = m.w_vc
+    if w_vc is None:
+        w_vc = _lazy_init_w_vc(m)
+    if w_vc.dtype != attn_output.dtype:
+        w_vc = w_vc.to(attn_output.dtype)
+    torch.ops.npu.batch_matmul_transpose(attn_output, w_vc, attn_bmm_output)
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     output, _ = m.o_proj(attn_bmm_output)
@@ -408,16 +451,22 @@ def forward_dsa_prepare_npu(
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
-        q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
+        # Lazy-init w_kc/w_vc from kv_b_proj (may be skipped with --load-format dummy)
+        _ensure_kv_b_proj_split(m)
 
-        q_nope_out = q_nope_out.transpose(0, 1)
+        if m.w_kc is not None:
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
+            q_nope_out = q_nope_out.transpose(0, 1)
+        else:
+            q_nope_out = q_nope
 
         if m.layer_id == 0:
             m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
                 0, positions
             )
 
-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        if m.rotary_emb is not None:
+            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -485,16 +534,26 @@ def forward_dsa_core_npu(
         and not forward_batch.forward_mode.is_target_verify()
     ):
         attn_output = attn_output.transpose(0, 1)
+        w_vc = m.w_vc
+        if w_vc is None:
+            w_vc = _lazy_init_w_vc(m)
+        if w_vc.dtype != attn_output.dtype:
+            w_vc = w_vc.to(attn_output.dtype)
         torch.bmm(
             attn_output,
-            m.w_vc,
+            w_vc,
             out=attn_bmm_output.view(-1, m.num_local_heads, m.v_head_dim).transpose(
                 0, 1
             ),
         )
     else:
         attn_output = attn_output.contiguous()
-        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+        w_vc = m.w_vc
+        if w_vc is None:
+            w_vc = _lazy_init_w_vc(m)
+        if w_vc.dtype != attn_output.dtype:
+            w_vc = w_vc.to(attn_output.dtype)
+        torch.ops.npu.batch_matmul_transpose(attn_output, w_vc, attn_bmm_output)
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 
