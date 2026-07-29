@@ -761,11 +761,6 @@ class Envs:
     # kernel computes the TP-local o_proj partial and the cross-rank sum over
     # a P2P comm region, replacing the GEMM + NCCL AR pair at M <= 512.
     SGLANG_K3_GEMM_AR = EnvBool(False)
-    # Directory holding the prebuilt gemm_ar cubins (the kernels are not in
-    # this tree; only the host shim is). Files are looked up as
-    # gemm_ar_k{K}_r{R}_pdl{0,1}_sm{arch}.cubin — see
-    # kernels/ops/kimi_k3/gemm_ar.py and scripts/playground/gemm_ar_cubin.py.
-    SGLANG_K3_GEMM_AR_CUBIN = EnvStr(None)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
