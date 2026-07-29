@@ -265,6 +265,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     "cached_tokens_details", None
                 )
 
+                finish_reason = content["meta_info"].get("finish_reason", None)
+                finish_reason_type = finish_reason["type"] if finish_reason else None
+
                 is_first_chunk = index not in stream_offsets
                 offset = stream_offsets.get(index, 0)
                 # Handle echo for first chunk
@@ -275,7 +278,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
                 # Handle logprobs
                 logprobs = None
-                if request.logprobs is not None:
+                if request.logprobs is not None and finish_reason_type != "abort":
                     # The first chunk and echo is enabled.
                     if is_first_chunk and request.echo:
                         input_token_logprobs = content["meta_info"][
@@ -338,8 +341,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 else:
                     delta = text[offset:]
                 stream_offsets[index] = len(content["text"])
-                finish_reason = content["meta_info"].get("finish_reason", None)
-                finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Abort with an explicit error status_code is a system error
                 # (timeout, OOM, validation): emit a streaming error chunk.

@@ -253,6 +253,7 @@ class ServingCompletionTestCase(unittest.TestCase):
             prompt="Hello world",
             max_tokens=100,
             stream=True,
+            logprobs=5,
         )
 
         adapted_request, _ = self.sc._convert_to_internal_request(req)

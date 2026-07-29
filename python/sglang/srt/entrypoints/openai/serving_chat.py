@@ -1540,9 +1540,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 audio_tokens[index] = content["meta_info"].get("audio_tokens", 0)
                 video_tokens[index] = content["meta_info"].get("video_tokens", 0)
 
+                finish_reason = content["meta_info"].get("finish_reason", None)
+                finish_reason_type = finish_reason["type"] if finish_reason else None
+
                 # Handle logprobs
                 choice_logprobs = None
-                if request.logprobs:
+                if request.logprobs and finish_reason_type != "abort":
                     n_prev_token = n_prev_tokens.get(index, 0)
                     total_output_logprobs = content["meta_info"][
                         "output_token_logprobs_length"
@@ -1552,9 +1555,6 @@ class OpenAIServingChat(OpenAIServingBase):
                             content, n_prev_token, total_output_logprobs
                         ).model_dump()
                     n_prev_tokens[index] = total_output_logprobs
-
-                finish_reason = content["meta_info"].get("finish_reason", None)
-                finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Track finish_reason for each index
                 if finish_reason_type:
