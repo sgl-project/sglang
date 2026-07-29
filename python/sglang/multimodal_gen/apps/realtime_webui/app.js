@@ -6,24 +6,27 @@ const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
 const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v10";
 const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";
-const DEFAULT_PREVIEW_OUTPUT_QUALITY = 80;
+const DEFAULT_PREVIEW_OUTPUT_QUALITY = 55;
 const MAX_WEBP_PREVIEW_OUTPUT_QUALITY = 80;
 const SMOOTH_PREVIEW_OUTPUT_QUALITY = 70;
 const SR_PREVIEW_OUTPUT_QUALITY = 70;
 const HEAVY_PREVIEW_OUTPUT_QUALITY = 60;
-const DEFAULT_TARGET_FPS = 25;
+const DEFAULT_TARGET_FPS = 16;
+const DEFAULT_PREVIEW_MAX_WIDTH = 560;
 const DEFAULT_FRAME_INTERPOLATION_EXP = 1;
 const DEFAULT_FRAME_INTERPOLATION_SCALE = 1.0;
 const DEFAULT_UPSCALING_SCALE = 2;
 const DEFAULT_UPSCALING_MODEL =
   "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth";
-const DEFAULT_PREVIEW_SCALE = 120;
+const DEFAULT_PREVIEW_SCALE = 100;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
-const DECODE_QUEUE_SECONDS = 2.0;
-const STARTUP_DECODE_QUEUE_SECONDS = 2.5;
+const DECODE_QUEUE_SECONDS = 0.5;
+const STARTUP_DECODE_QUEUE_SECONDS = 0.75;
 const RECENT_DROP_DISPLAY_MS = 1800;
 const CONTROL_BUFFERED_AMOUNT_LIMIT = 1 << 20;
-const CONTROL_TRANSITION_FLUSH_DELAY_MS = 140;
+const CONTROL_TRANSITION_FLUSH_DELAY_MS = 50;
+const MIN_RENDER_TIMER_FPS = 30;
+const MAX_RENDER_TIMER_FPS = 60;
 const CONTROL_KEY_ACTIONS = new Map([
   ["w", "w"],
   ["a", "a"],
@@ -62,7 +65,7 @@ const reactorPresets = [
     name: "Dragon Ride",
     tone: "green",
     size: "832x480",
-    fps: 25,
+    fps: 16,
     prompt: "A locked first-person dragon-rider view matching the reference image: both tan forearms in brown leather gloves stay visible at the bottom, gripping leather reins around the green-brown scaled dragon neck; the dragon head, horns, and both wide wings frame the jungle valley, waterfalls, mist, and tall castle on the right. Smooth forward flight only, keep the same rider hands, dragon body, wing silhouette, castle placement, and humid daylight colors in every frame.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/dragon-ride.jpg`,
     source: "Reactor LingBot preset",
@@ -71,7 +74,7 @@ const reactorPresets = [
     name: "Misted Kingdom",
     tone: "green",
     size: "832x480",
-    fps: 25,
+    fps: 16,
     prompt: "A third-person over-the-shoulder fantasy view following a sword-slung rider on a brown horse through curling valley mist, wildflower meadows, ruined stone arches, cottages, and a many-spired castle under a ringed gas giant and crescent moon.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/misted-kingdom.jpg`,
     source: "Reactor LingBot preset",
@@ -80,7 +83,7 @@ const reactorPresets = [
     name: "Storm Crossing",
     tone: "blue",
     size: "832x480",
-    fps: 25,
+    fps: 16,
     prompt: "A third-person stern view of a battered grey aluminum work boat pushing through slate-black storm swells, wet wooden deck, warm cabin lamp, orange life rings, salt mist, churning wake, and a pale silver break in the dark horizon.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/storm-crossing.jpg`,
     source: "Reactor LingBot preset",
@@ -89,7 +92,7 @@ const reactorPresets = [
     name: "Citadel Approach",
     tone: "accent",
     size: "832x480",
-    fps: 25,
+    fps: 16,
     prompt: "A third-person rear view of a mud-streaked vintage Defender 4x4 driving along a cobblestone-and-sand track through a coral-lit desert canyon toward a cliff-built sandstone citadel, with cacti, red poppies, ochre dunes, and peach sunset haze.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/citadel-approach.jpg`,
     source: "Reactor LingBot preset",
@@ -98,7 +101,7 @@ const reactorPresets = [
     name: "Spring Valley",
     tone: "green",
     size: "832x480",
-    fps: 25,
+    fps: 16,
     prompt: "A third-person over-the-shoulder view following a golden retriever through a sunlit meadow with a patterned floral rug, stone bench, open book, potted seedling, cherry blossoms, rounded green oaks, soft hills, and a tender watercolor storybook atmosphere.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/spring-valley.jpg`,
     source: "Reactor LingBot preset",
@@ -107,7 +110,7 @@ const reactorPresets = [
     name: "Reef Patrol",
     tone: "blue",
     size: "832x480",
-    fps: 25,
+    fps: 16,
     prompt: "A third-person follow view trailing a large grey reef shark through clear tropical water above a sunlit coral reef, with drifting sediment, shifting sun-ray lattices, clouds of reef fish, a sardine bait ball, and deep blue open-water haze.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/reef-patrol.jpg`,
     source: "Reactor LingBot preset",
@@ -116,7 +119,7 @@ const reactorPresets = [
     name: "Alpine Run",
     tone: "blue",
     size: "832x480",
-    fps: 25,
+    fps: 16,
     prompt: "A third-person rear view of a yellow four-person whitewater raft plunging through churning rapids in an alpine canyon, red lifejackets, yellow helmets, wet paddles, dark boulders, conifer slopes, and a snow-capped mountain at the vanishing point.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/alpine-run.jpg`,
     source: "Reactor LingBot preset",
@@ -125,7 +128,7 @@ const reactorPresets = [
     name: "Ice Kayak",
     tone: "blue",
     size: "832x480",
-    fps: 25,
+    fps: 16,
     prompt: "A centered elevated third-person game camera behind a lone kayaker in a bright red kayak crossing a calm deep blue alpine lake, scattered ice blocks, mirror reflections, huge snow-covered mountain ranges, vivid sky, and crisp cold wilderness scale.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/ice-kayak.jpg`,
     source: "Reactor LingBot preset",
@@ -134,7 +137,7 @@ const reactorPresets = [
     name: "Penguin Colony",
     tone: "green",
     size: "832x480",
-    fps: 25,
+    fps: 16,
     prompt: "A third-person follow view of a single black-and-white penguin waddling across a windswept Antarctic ice shelf toward a distant colony, crystalline snow, small flippers, scattered dark boulders, rocky shoreline, and pale polar sky.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/penguin.jpg`,
     source: "Reactor LingBot preset",
@@ -143,7 +146,7 @@ const reactorPresets = [
     name: "Mars Mountain",
     tone: "accent",
     size: "832x480",
-    fps: 25,
+    fps: 16,
     prompt: "A centered third-person rear view of a six-wheeled Martian rover marked XR-7A P-3317 crossing cracked basalt toward a vast volcanic mountain, dusty rose twilight, ochre wheel plumes, weathered grey panels, and a cold alien horizon.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/mars-rover.jpg`,
     source: "Reactor LingBot preset",
@@ -152,7 +155,7 @@ const reactorPresets = [
     name: "Seaside Adventurer",
     tone: "green",
     size: "832x480",
-    fps: 25,
+    fps: 16,
     prompt: "A centered third-person anime view behind a young girl on a flower-covered coastal hillside overlooking a sparkling blue bay, rolling green hills, sailboats, dramatic cliffs, a small lighthouse, huge fluffy clouds, and warm hand-painted adventure atmosphere.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/anime3.png`,
     source: "Reactor LingBot preset",
@@ -162,7 +165,7 @@ const reactorPresets = [
     name: "Roman Chariot",
     tone: "accent",
     size: "832x480",
-    fps: 25,
+    fps: 16,
     prompt: "A centered elevated third-person game camera behind a Roman warrior riding an ancient chariot pulled by two white horses across an open grassy field, worn stone path, Roman ruins, broken columns, bright midday sky, and epic historical scale.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/chariot.png`,
     source: "Reactor LingBot preset",
@@ -172,7 +175,7 @@ const reactorPresets = [
     name: "Asylum Corridor",
     tone: "accent",
     size: "832x480",
-    fps: 25,
+    fps: 16,
     prompt: "A third-person over-the-shoulder traversal behind a man in a wet leather jacket holding a flashlight down a derelict asylum corridor, standing water, torn vinyl strips, rusted ceiling debris, bloodstains, a toppled wheelchair, and a distant cyan-grey doorway glow.",
     referenceUrl: `${REACTOR_PRESET_BASE_URL}/horror.jpg`,
     source: "Reactor LingBot preset",
@@ -180,14 +183,14 @@ const reactorPresets = [
 ];
 
 const examplePresets = [
-  { name: "Dragon Dolly", tone: "green", size: "832x480", fps: 25, prompt: "A stable first-person dolly from the same dragon-rider viewpoint, keeping the black dragon head, horns, wings, jungle canopy, and distant castle consistent; slow forward camera motion, natural parallax, no creature morphing, no scene replacement.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/00/image.jpg", source: "LingBot example 00" },
-  { name: "Stone Orbit", tone: "blue", size: "832x480", fps: 25, prompt: "A controlled look-around of the stone monument, overcast daylight, consistent geometry, subtle camera arc.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/01/image.jpg", source: "LingBot example 01" },
-  { name: "Urban Tilt", tone: "accent", size: "832x480", fps: 25, prompt: "A cinematic urban wall shot with a slow tilt and slight forward movement, warm backlight, stable architecture.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/02/image.jpg", source: "LingBot example 02" },
-  { name: "Lake Scout", tone: "green", size: "832x480", fps: 25, prompt: "A calm scouting shot across the lake, gentle camera drift, crisp mountains, stable reflections.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/03/image.jpg", source: "LingBot example 03" },
-  { name: "Ziggy Stardust", tone: "accent", size: "832x480", fps: 25, prompt: "A static night view of a narrow London alley in soft rain, wet pavement reflecting a yellow streetlamp, the blue K. West sign glowing above a doorway, cardboard boxes near the wall, a pale parked car in the distance, and a slender glam-rock figure holding a guitar under the lamp; preserve the album-cover composition, brick storefronts, muted teal and amber colors, subtle rain shimmer only.", referenceUrl: "https://upload.wikimedia.org/wikipedia/en/0/01/ZiggyStardust.jpg", source: "David Bowie Ziggy Stardust artwork", mime: "image/jpeg" },
-  { name: "Plastic Beach", tone: "blue", size: "832x480", fps: 25, prompt: "A static album-cover view matching the reference image: the Plastic Beach island stays centered above a dark midnight-blue ocean, the lighthouse remains on the left with its white reflection path, the starry navy sky stays unchanged, and the large white Plastic Beach title graphic stays in the lower foreground. Keep the original camera height, horizon, waterline, island silhouette, and deep blue color palette fixed; only tiny water shimmer, lighthouse glint, and subtle star twinkle, with no camera descent, no push-in, no orbit, and no turquoise color shift.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg", source: "Gorillaz Plastic Beach artwork", mime: "image/jpeg" },
-  { name: "Plastic Ono Band", tone: "green", size: "832x480", fps: 25, prompt: "A quiet sunlit park under a massive tree, a solitary figure resting in the grass, soft summer haze, restrained documentary camera, intimate and naturalistic.", referenceUrl: "https://upload.wikimedia.org/wikipedia/en/a/a4/JLPOBCover.jpg", source: "John Lennon/Plastic Ono Band artwork", mime: "image/jpeg" },
-  { name: "Kid A", tone: "accent", size: "832x480", fps: 25, prompt: "A cold surreal mountain range with sharp icy peaks, black-red storm clouds, glacial light, slow lateral pan, abstract digital texture, uneasy atmospheric scale.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music122/v4/bd/8e/13/bd8e1358-b367-a689-cb84-cebd0b067dc4/634904078263.png/600x600bb.jpg", source: "Radiohead Kid A artwork", mime: "image/jpeg" },
+  { name: "Dragon Dolly", tone: "green", size: "832x480", fps: 16, prompt: "A stable first-person dolly from the same dragon-rider viewpoint, keeping the black dragon head, horns, wings, jungle canopy, and distant castle consistent; slow forward camera motion, natural parallax, no creature morphing, no scene replacement.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/00/image.jpg", source: "LingBot example 00" },
+  { name: "Stone Orbit", tone: "blue", size: "832x480", fps: 16, prompt: "A controlled look-around of the stone monument, overcast daylight, consistent geometry, subtle camera arc.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/01/image.jpg", source: "LingBot example 01" },
+  { name: "Urban Tilt", tone: "accent", size: "832x480", fps: 16, prompt: "A cinematic urban wall shot with a slow tilt and slight forward movement, warm backlight, stable architecture.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/02/image.jpg", source: "LingBot example 02" },
+  { name: "Lake Scout", tone: "green", size: "832x480", fps: 16, prompt: "A calm scouting shot across the lake, gentle camera drift, crisp mountains, stable reflections.", referenceUrl: "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/03/image.jpg", source: "LingBot example 03" },
+  { name: "Ziggy Stardust", tone: "accent", size: "832x480", fps: 16, prompt: "A static night view of a narrow London alley in soft rain, wet pavement reflecting a yellow streetlamp, the blue K. West sign glowing above a doorway, cardboard boxes near the wall, a pale parked car in the distance, and a slender glam-rock figure holding a guitar under the lamp; preserve the album-cover composition, brick storefronts, muted teal and amber colors, subtle rain shimmer only.", referenceUrl: "https://upload.wikimedia.org/wikipedia/en/0/01/ZiggyStardust.jpg", source: "David Bowie Ziggy Stardust artwork", mime: "image/jpeg" },
+  { name: "Plastic Beach", tone: "blue", size: "832x480", fps: 16, prompt: "A static album-cover view matching the reference image: the Plastic Beach island stays centered above a dark midnight-blue ocean, the lighthouse remains on the left with its white reflection path, the starry navy sky stays unchanged, and the large white Plastic Beach title graphic stays in the lower foreground. Keep the original camera height, horizon, waterline, island silhouette, and deep blue color palette fixed; only tiny water shimmer, lighthouse glint, and subtle star twinkle, with no camera descent, no push-in, no orbit, and no turquoise color shift.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg", source: "Gorillaz Plastic Beach artwork", mime: "image/jpeg" },
+  { name: "Plastic Ono Band", tone: "green", size: "832x480", fps: 16, prompt: "A quiet sunlit park under a massive tree, a solitary figure resting in the grass, soft summer haze, restrained documentary camera, intimate and naturalistic.", referenceUrl: "https://upload.wikimedia.org/wikipedia/en/a/a4/JLPOBCover.jpg", source: "John Lennon/Plastic Ono Band artwork", mime: "image/jpeg" },
+  { name: "Kid A", tone: "accent", size: "832x480", fps: 16, prompt: "A cold surreal mountain range with sharp icy peaks, black-red storm clouds, glacial light, slow lateral pan, abstract digital texture, uneasy atmospheric scale.", referenceUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music122/v4/bd/8e/13/bd8e1358-b367-a689-cb84-cebd0b067dc4/634904078263.png/600x600bb.jpg", source: "Radiohead Kid A artwork", mime: "image/jpeg" },
 ];
 
 const presets = [
@@ -205,6 +208,7 @@ let frames = 0;
 let bytes = 0;
 let clearQueueOnClose = false;
 let fpsSamples = [];
+let renderLoopSamples = [];
 let decodeQueue = [];
 let queuedDecodeFrames = 0;
 let decodeInProgress = false;
@@ -238,6 +242,8 @@ let recordingSaving = false;
 let recordingEncodeChain = Promise.resolve();
 const decodeRequests = new Map();
 let controlStateController = null;
+let lastSentEventId = 0;
+let lastSampledEventId = 0;
 
 const stage = document.querySelector(".stage");
 const previewFrame = document.querySelector(".preview-frame");
@@ -250,6 +256,17 @@ const recordingCtx = recordingCanvas.getContext("2d", { alpha: false });
 const playbackController = new RealtimePlaybackController({
   mode: "live",
   targetFps: DEFAULT_TARGET_FPS,
+  holdForTargetLead: true,
+  targetLeadChunkRatio: 0.34,
+  minTargetLeadMs: 220,
+  maxTargetLeadMs: 420,
+  startLeadChunkRatio: 0.28,
+  minStartLeadMs: 160,
+  resumeLeadChunkRatio: 0.3,
+  minResumeLeadMs: 140,
+  maxResumeLeadMs: 320,
+  maxDeliveryLeadBoostMs: 220,
+  deliveryStallExpectedMultiplier: 1.12,
 });
 
 function setStatus(text, kind = "") {
@@ -265,9 +282,21 @@ function setPreviewState(state) {
 
 function addHistory(text) {
   const item = document.createElement("span");
-  item.textContent = text;
+  const now = new Date();
+  const ms = String(now.getMilliseconds()).padStart(3, "0");
+  item.textContent = `${now.toLocaleTimeString("zh-CN", { hour12: false })}.${ms} ${text}`;
   $("historyList").prepend(item);
   while ($("historyList").children.length > 8) $("historyList").lastChild.remove();
+}
+
+function updateControlDebugText() {
+  const activeActions = controlStateController
+    ? Array.from(controlStateController.activeActions).sort().join("+")
+    : "";
+  const activeText = activeActions || "idle";
+  const sentText = lastSentEventId ? `sent #${lastSentEventId}` : "sent -";
+  const sampledText = lastSampledEventId ? `sampled #${lastSampledEventId}` : "sampled -";
+  $("actionStateText").textContent = `${activeText} · ${sentText} · ${sampledText}`;
 }
 
 function drawIdle() {
@@ -302,12 +331,15 @@ function resetStreamStats() {
   lastDecodeDropCount = 0;
   encodedDecodeErrors = 0;
   renderedPreviewFrames = 0;
+  lastSentEventId = 0;
+  lastSampledEventId = 0;
   controlStateController?.reset({ sendRelease: false });
   resetDecoderState();
   updateStats();
   $("renderFps").textContent = "0";
   $("latencyText").textContent = "-";
   $("stageLatencyText").textContent = "-";
+  $("actionStateText").textContent = "-";
   $("decodeText").textContent = "-";
   $("displayLagText").textContent = "-";
   $("serverSendText").textContent = "-";
@@ -1281,7 +1313,7 @@ function drawFrame(image, { close = true, markRendered = true } = {}) {
     canvas.height = sourceHeight;
   }
   ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = "high";
+  ctx.imageSmoothingQuality = "medium";
   ctx.drawImage(drawSource, 0, 0, sourceWidth, sourceHeight);
   if (markRendered) renderedPreviewFrames += 1;
   setPreviewState("live");
@@ -1289,6 +1321,8 @@ function drawFrame(image, { close = true, markRendered = true } = {}) {
 }
 
 function renderLoop(now) {
+  renderLoopSamples.push(now);
+  renderLoopSamples = renderLoopSamples.filter((t) => now - t < 1000);
   const decision = playbackController.render(now, {
     hasPendingInput: hasPendingPlaybackInput(),
   });
@@ -1308,13 +1342,44 @@ function renderLoop(now) {
   } else if (decision.action === "hold") {
     updateStats();
   }
-  requestAnimationFrame(renderLoop);
+  scheduleRenderLoop();
+}
+
+function scheduleRenderLoop() {
+  const timerFps = Math.min(
+    MAX_RENDER_TIMER_FPS,
+    Math.max(MIN_RENDER_TIMER_FPS, previewPlaybackTargetFps() * 2),
+  );
+  window.setTimeout(() => renderLoop(performance.now()), 1000 / timerFps);
 }
 
 async function readFirstFrame() {
   const file = $("firstFrame").files[0];
   if (file) return new Uint8Array(await file.arrayBuffer());
-  return selectedReferenceBytes || selectedReferenceUrl || undefined;
+  if (selectedReferenceBytes) return selectedReferenceBytes;
+  if (selectedReferenceUrl) {
+    selectedReferenceBytes = await fetchReferenceBytes(selectedReferenceUrl);
+    return selectedReferenceBytes;
+  }
+  return undefined;
+}
+
+async function fetchReferenceBytes(url) {
+  try {
+    const response = await fetch(url, { cache: "force-cache", mode: "cors" });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (!bytes.byteLength) {
+      throw new Error("empty image");
+    }
+    return bytes;
+  } catch (error) {
+    throw new Error(
+      `reference image fetch failed: ${error.message || String(error)}`
+    );
+  }
 }
 
 function drawReferencePreviewFromImageSource(src, label) {
@@ -1543,6 +1608,12 @@ function receive(data, epoch) {
       socketServerError = message.content || "unknown";
       setStatus(socketServerError, "error");
       addHistory(`server error: ${socketServerError}`);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        socketCloseExpected = true;
+        ws.close(1000, socketServerError.slice(0, 120));
+      }
+      $("connectBtn").disabled = false;
+      if (!renderedPreviewFrames) setPreviewState("idle");
       return;
     }
     if (message.type === "chunk_stats") {
@@ -1562,6 +1633,7 @@ function receive(data, epoch) {
   }
   const header = pendingHeader;
   pendingHeader = null;
+  header.__received_at = performance.now();
   enqueueDecodeBatch(header, data, epoch);
 }
 
@@ -1610,6 +1682,8 @@ function updateServerChunkStats(stats) {
   const targetFps = previewPlaybackTargetFps();
   const theoreticalFps = chunkTotal > 0 ? numFrames / chunkTotal : 0;
   const playback = playbackController.observeServerStats(stats, performance.now());
+  lastSampledEventId = Number(stats.event_id || 0);
+  updateControlDebugText();
   const realtimeRatio = targetFps > 0 ? theoreticalFps / targetFps : 0;
   const isWarmupChunk =
     chunkIndex === 0 && theoreticalFps > 0 && theoreticalFps < targetFps * 0.8;
@@ -1633,6 +1707,8 @@ function sendEvent(kind, payload, historyText = null) {
   }
   const eventId = nextEventId++;
   ws.send(pack({ type: "event", kind, payload, event_id: eventId }));
+  lastSentEventId = eventId;
+  updateControlDebugText();
   if (kind === "camera_actions" || kind === "prompt") {
     playbackController.noteInputEvent(eventId, performance.now(), {
       cutoverMode: cameraActionHasActiveMotion(payload) || kind === "prompt" ? "motion" : "settle",
@@ -1724,6 +1800,24 @@ function modelsUrlFromServerUrl(serverUrl) {
   return url.toString();
 }
 
+function realtimeServerUrlFromLocation() {
+  if (!window.location.host) return "";
+  if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
+    return "";
+  }
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/v1/realtime_video/generate`;
+}
+
+function applyDefaultServerUrl() {
+  const current = $("serverUrl").value.trim();
+  const locationServerUrl = realtimeServerUrlFromLocation();
+  if (!locationServerUrl) return;
+  if (current.includes("127.0.0.1") || current.includes("localhost")) {
+    $("serverUrl").value = locationServerUrl;
+  }
+}
+
 function firstServedModelInfo(payload) {
   if (Array.isArray(payload?.data) && payload.data.length > 0) return payload.data[0];
   if (payload && typeof payload === "object") return payload;
@@ -1796,12 +1890,15 @@ function readPreviewTransportParams() {
   if (!outputFormat) return {};
   const params = {
     realtime_output_format: outputFormat,
-    realtime_output_pacing: true,
+    realtime_output_pacing: false,
   };
   if (outputFormat === "webp" || outputFormat === "jpeg") {
     params.output_compression = outputQuality;
+    const baseSize = parseSizeValue($("size").value);
+    if (baseSize?.width && baseSize.width > DEFAULT_PREVIEW_MAX_WIDTH) {
+      params.realtime_preview_max_width = DEFAULT_PREVIEW_MAX_WIDTH;
+    }
     if ($("superResolution").checked && $("frameInterpolation").checked) {
-      const baseSize = parseSizeValue($("size").value);
       if (baseSize?.width) params.realtime_preview_max_width = baseSize.width;
     }
   }
@@ -1940,11 +2037,7 @@ async function applyQueryParams() {
   const params = new URLSearchParams(window.location.search);
   const server = params.get("server");
   if (server) $("serverUrl").value = server;
-  else if (window.location.protocol === "http:" || window.location.protocol === "https:") {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    $("serverUrl").value =
-      `${protocol}//${window.location.host}/v1/realtime_video/generate`;
-  }
+  else applyDefaultServerUrl();
   const model = params.get("model");
   if (model) $("model").value = model;
   $("transportFormat").value = params.get("transport") || DEFAULT_PREVIEW_OUTPUT_FORMAT;
@@ -2090,7 +2183,7 @@ applyQueryParams()
     applyPresetForModel: !query.model && !query.preset,
   }))
   .catch(showError);
-requestAnimationFrame(renderLoop);
+scheduleRenderLoop();
 updateRecordButton();
 $("connectBtn").onclick = connect;
 $("stopBtn").onclick = () => closeSession();
@@ -2115,6 +2208,7 @@ $("frameInterpolation").addEventListener("change", () => {
 });
 $("superResolution").addEventListener("change", tunePreviewQualityForPostprocess);
 $("previewScale").addEventListener("input", () => setPreviewScale($("previewScale").value));
+canvas.addEventListener("pointerdown", () => canvas.focus({ preventScroll: true }));
 $("serverUrl").addEventListener("change", () => {
   queryServerModelInfo({ applyPresetForModel: true }).catch(showError);
 });
@@ -2239,6 +2333,7 @@ class ControlStateController {
     CONTROL_ACTION_META_KEYS.forEach((action) => {
       setControlButtonActive(action, this.activeActions.has(action));
     });
+    updateControlDebugText();
   }
 
   sameActions(left, right) {
@@ -2254,6 +2349,7 @@ class ControlStateController {
 
 const CONTROL_ACTION_META_KEYS = Object.keys(CONTROL_ACTION_META);
 controlStateController = new ControlStateController();
+updateControlDebugText();
 
 document.addEventListener("keydown", (event) => {
   if (isTypingTarget(event.target)) return;
@@ -2280,4 +2376,33 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     controlStateController.releaseAll();
   }
+});
+
+window.__sglangRealtimeDebug = () => ({
+  activeActions: controlStateController
+    ? Array.from(controlStateController.activeActions).sort()
+    : [],
+  bytes,
+  decodeInProgress,
+  decodeQueueLength: decodeQueue.length,
+  droppedDecodeFrames,
+  frames,
+  lastDecodeMs,
+  lastDisplayLagMs,
+  lastSampledEventId,
+  lastSentEventId,
+  pendingDecodeBatches,
+  pendingHeader: Boolean(pendingHeader),
+  playback: playbackController.snapshot(),
+  renderedFps: fpsSamples.length,
+  renderedPreviewFrames,
+  renderLoopFps: renderLoopSamples.length,
+  socketBufferedAmount: ws ? ws.bufferedAmount : 0,
+  socketCloseExpected,
+  socketHadError,
+  socketReadyState: ws ? ws.readyState : null,
+  socketServerError,
+  status: $("statusText").textContent,
+  streamEpoch,
+  visibilityState: document.visibilityState,
 });

@@ -740,6 +740,7 @@ def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
     assert batch.block_idx == 0
     assert batch.return_raw_frames is True
     assert batch.realtime_event_id == 11
+    assert batch.realtime_output_format == "webp"
     assert batch.realtime_causal_sink_size == 3
     assert batch.realtime_causal_kv_cache_num_frames == 45
 
