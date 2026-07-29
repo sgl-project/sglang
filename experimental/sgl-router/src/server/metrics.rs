@@ -32,6 +32,7 @@
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
+//! | `sgl_router_kv_event_gaps_total` | Counter | `outcome` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
@@ -200,6 +201,27 @@ impl ActiveLoadKind {
     }
 }
 
+/// KV-event gap handling outcome label. Kept intentionally small and fixed:
+/// worker/rank/seq details belong in structured logs, not metric labels.
+#[derive(Debug, Clone, Copy)]
+pub enum KvEventGapOutcome {
+    Replayed,
+    NoReplayEndpoint,
+    ReplayFailed,
+    BufferMiss,
+}
+
+impl KvEventGapOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Replayed => "replayed",
+            Self::NoReplayEndpoint => "no_replay_endpoint",
+            Self::ReplayFailed => "replay_failed",
+            Self::BufferMiss => "buffer_miss",
+        }
+    }
+}
+
 /// The shared metrics registry, held on `AppContext`. Cheap to clone — all
 /// internal state is `Arc`/`Atomic`/`Mutex`-protected.
 #[derive(Debug, Default)]
@@ -224,6 +246,7 @@ pub struct MetricsRegistry {
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    kv_event_gaps_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
@@ -473,6 +496,17 @@ impl MetricsRegistry {
     /// Bump `sgl_router_sticky_total{outcome}`.
     pub fn record_sticky(&self, outcome: StickyOutcome) {
         let mut guard = self.sticky_total.lock();
+        let counter = guard
+            .entry(outcome.as_str())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_kv_event_gaps_total{outcome}`.
+    pub fn record_kv_event_gap(&self, outcome: KvEventGapOutcome) {
+        let mut guard = self.kv_event_gaps_total.lock();
         let counter = guard
             .entry(outcome.as_str())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
@@ -785,6 +819,25 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // kv_event_gaps_total
+        out.push_str(
+            "# HELP sgl_router_kv_event_gaps_total KV-event sequence gaps observed by the router-side cache index, by fixed handling outcome.\n",
+        );
+        out.push_str("# TYPE sgl_router_kv_event_gaps_total counter\n");
+        let guard = self.kv_event_gaps_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for (outcome, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_kv_event_gaps_total{{outcome=\"{}\"}} {}\n",
+                outcome, value,
+            ));
+        }
+        drop(guard);
+
         // ingress_tokenize_errors_total
         out.push_str(
             "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-encoder model whose ingress tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
@@ -870,6 +923,7 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_stale_requests_total counter"));
         assert!(out.contains("# TYPE sgl_router_decode_affinity_total counter"));
         assert!(out.contains("# TYPE sgl_router_sticky_total counter"));
+        assert!(out.contains("# TYPE sgl_router_kv_event_gaps_total counter"));
         assert!(out.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"));
         // Pool-size series exist (at 0) for all three modes even with no
         // workers, so dashboards have a stable series to graph.
@@ -1170,6 +1224,21 @@ mod tests {
         assert!(out.contains(r#"sgl_router_sticky_total{outcome="assigned"} 1"#));
         assert!(out.contains(r#"sgl_router_sticky_total{outcome="remap"} 1"#));
         assert!(out.contains(r#"sgl_router_sticky_total{outcome="no_routing_key"} 1"#));
+    }
+
+    #[test]
+    fn kv_event_gap_counter_emits_fixed_outcomes() {
+        let reg = MetricsRegistry::new();
+        reg.record_kv_event_gap(KvEventGapOutcome::Replayed);
+        reg.record_kv_event_gap(KvEventGapOutcome::Replayed);
+        reg.record_kv_event_gap(KvEventGapOutcome::NoReplayEndpoint);
+        reg.record_kv_event_gap(KvEventGapOutcome::ReplayFailed);
+        reg.record_kv_event_gap(KvEventGapOutcome::BufferMiss);
+        let out = reg.render();
+        assert!(out.contains(r#"sgl_router_kv_event_gaps_total{outcome="replayed"} 2"#));
+        assert!(out.contains(r#"sgl_router_kv_event_gaps_total{outcome="no_replay_endpoint"} 1"#));
+        assert!(out.contains(r#"sgl_router_kv_event_gaps_total{outcome="replay_failed"} 1"#));
+        assert!(out.contains(r#"sgl_router_kv_event_gaps_total{outcome="buffer_miss"} 1"#));
     }
 
     #[test]

@@ -28,7 +28,8 @@ pub struct AppContext {
     /// `/metrics`. Shared with the chat handler (requests_total),
     /// cache-aware-zmq policy (overlap_blocks), active-load registry
     /// (active_load gauge + stale_requests_total), and PD resolver
-    /// (decode_affinity_total).
+    /// (decode_affinity_total). The KV-event index is wired from `main`
+    /// after the context exists because it is constructed before policies.
     pub metrics: Arc<MetricsRegistry>,
     ready: AtomicBool,
 }

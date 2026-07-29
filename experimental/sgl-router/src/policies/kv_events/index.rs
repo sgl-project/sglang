@@ -25,7 +25,7 @@
 //! event through this set before mutating the tree.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -36,9 +36,11 @@ use tracing::{debug, info, warn};
 
 use super::block_size_oracle::BlockSizeOracle;
 use super::discovery::{fetch_event_config, EventConfig};
+use super::replay::{fetch_replay_batches, ReplayError};
 use super::subscriber::{KvEventSubscriberRegistry, WorkerEvent};
 use super::tree::{HashTree, KvWorkerId};
-use super::wire::KvCacheEvent;
+use super::wire::{KvCacheEvent, KvEventBatch};
+use crate::server::metrics::{KvEventGapOutcome, MetricsRegistry};
 
 /// Channel buffer between the subscriber registry and the pump task.
 ///
@@ -58,6 +60,13 @@ struct WorkerEntry {
     dp_ranks: Vec<u32>,
 }
 
+/// Per-rank replay socket target, derived from `EventConfig.replay`.
+#[derive(Debug, Clone)]
+struct ReplayTarget {
+    endpoint: String,
+    buffer_steps: usize,
+}
+
 /// Bundle of `HashTree` + `KvEventSubscriberRegistry` + pump task.
 ///
 /// Construct one instance per router process and hand it to the worker
@@ -75,6 +84,10 @@ pub struct KvEventIndex {
     /// queued by a subscriber that was torn down by `remove_worker` does
     /// not re-pollute the tree after `clear_worker` ran.
     live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
+    /// Optional per-rank replay endpoint. Missing means the worker can still be
+    /// subscribed live, but a sequence gap can only be logged/metriced before
+    /// falling back to legacy current-batch application.
+    replay_targets: Arc<Mutex<HashMap<KvWorkerId, ReplayTarget>>>,
     /// Per-`(worker_url, dp_rank)` last-applied sequence number. The
     /// subscriber forwards every batch with no de-dup; this map filters
     /// any batch whose `seq` is not strictly greater than the previously
@@ -88,6 +101,7 @@ pub struct KvEventIndex {
     /// rejected (logged + not subscribed). The policy reads it at routing
     /// time to size its `compute_block_hashes` call.
     block_size_oracle: Arc<BlockSizeOracle>,
+    metrics: Arc<OnceLock<Arc<MetricsRegistry>>>,
 }
 
 impl KvEventIndex {
@@ -120,11 +134,16 @@ impl KvEventIndex {
         let subscribers = Arc::new(KvEventSubscriberRegistry::new(tx));
         let cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>> = Arc::new(Mutex::new(HashMap::new()));
         let live_workers: Arc<Mutex<HashSet<KvWorkerId>>> = Arc::new(Mutex::new(HashSet::new()));
+        let replay_targets: Arc<Mutex<HashMap<KvWorkerId, ReplayTarget>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let metrics = Arc::new(OnceLock::new());
         let pump_cancel = CancellationToken::new();
         let pump = tokio::spawn(pump_loop(
             tree.clone(),
             cursors.clone(),
             live_workers.clone(),
+            replay_targets.clone(),
+            metrics.clone(),
             pump_cancel.clone(),
             rx,
         ));
@@ -136,9 +155,16 @@ impl KvEventIndex {
             workers: Mutex::new(HashMap::new()),
             http,
             live_workers,
+            replay_targets,
             cursors,
             block_size_oracle,
+            metrics,
         })
+    }
+
+    /// Attach the process metrics registry to the background pump.
+    pub fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
+        let _ = self.metrics.set(metrics);
     }
 
     /// Shared accessor for the per-process block-size oracle. The
@@ -236,11 +262,28 @@ impl KvEventIndex {
         // it queues is accepted by the pump.
         {
             let mut live = self.live_workers.lock();
+            let mut replay_targets = self.replay_targets.lock();
             for &rank in &dp_ranks {
-                live.insert(KvWorkerId {
+                let id = KvWorkerId {
                     url: worker_url.to_string(),
                     dp_rank: rank,
-                });
+                };
+                live.insert(id.clone());
+                match replay_target_for_rank(&cfg, rank) {
+                    Some(target) => {
+                        replay_targets.insert(id, target);
+                    }
+                    None => {
+                        if cfg.replay.is_some() {
+                            warn!(
+                                worker_url = %worker_url,
+                                dp_rank = rank,
+                                "kv-events: replay endpoint port overflows u16 for rank; gap recovery disabled for this rank",
+                            );
+                        }
+                        replay_targets.remove(&id);
+                    }
+                }
             }
         }
         self.workers.lock().insert(
@@ -285,9 +328,11 @@ impl KvEventIndex {
         //    the mpsc buffer at this point will be filtered by the
         //    live-set check inside the pump.
         let mut cursors = self.cursors.lock();
+        let mut replay_targets = self.replay_targets.lock();
         for id in &ids {
             self.tree.clear_worker(id);
             cursors.remove(id);
+            replay_targets.remove(id);
         }
     }
 
@@ -320,14 +365,30 @@ impl KvEventIndex {
     }
 }
 
+fn replay_target_for_rank(cfg: &EventConfig, rank: u32) -> Option<ReplayTarget> {
+    let replay = cfg.replay.as_ref()?;
+    let port = u32::from(replay.port_base) + rank;
+    if port > u32::from(u16::MAX) {
+        return None;
+    }
+    Some(ReplayTarget {
+        endpoint: format!("tcp://{}:{port}", replay.host),
+        buffer_steps: replay.buffer_steps,
+    })
+}
+
 /// Drain `WorkerEvent`s and apply each batch to the tree. Out-of-order
-/// (seq ≤ last_applied) and stale (worker not in `live_workers`) batches
-/// are skipped. `PublisherReset` events clear the cursor so a publisher
-/// restarting from seq=1 (after sending END_SEQ) is not filtered.
+/// (seq ≤ last_applied) and stale (worker not in `live_workers`) batches are
+/// skipped. A sequence gap triggers replay when the worker advertised a replay
+/// endpoint; if replay is unavailable or cannot prove a continuous prefix, the
+/// pump records/logs the gap and falls back to the original behavior of applying
+/// the current live batch.
 async fn pump_loop(
     tree: Arc<HashTree>,
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
     live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
+    replay_targets: Arc<Mutex<HashMap<KvWorkerId, ReplayTarget>>>,
+    metrics: Arc<OnceLock<Arc<MetricsRegistry>>>,
     cancel: CancellationToken,
     mut rx: mpsc::Receiver<WorkerEvent>,
 ) {
@@ -362,7 +423,8 @@ async fn pump_loop(
 
         match ev {
             WorkerEvent::PublisherReset { worker } => {
-                if cursors.lock().remove(&worker).is_some() {
+                let had_cursor = cursors.lock().remove(&worker).is_some();
+                if had_cursor {
                     info!(
                         worker = ?worker,
                         "kv-events pump: publisher reset; cursor cleared",
@@ -382,22 +444,177 @@ async fn pump_loop(
                         continue;
                     }
                 }
-                for event in &batch.events {
-                    match event {
-                        KvCacheEvent::BlockStored(b) => {
-                            tree.insert(&worker, b.parent_block_hash, &b.block_hashes);
-                        }
-                        KvCacheEvent::BlockRemoved(b) => {
-                            tree.remove(&worker, &b.block_hashes);
-                        }
-                        KvCacheEvent::AllBlocksCleared => {
-                            tree.clear_worker(&worker);
+
+                let prev = cursors.lock().get(&worker).copied();
+                if let Some(p) = prev {
+                    if seq > p.saturating_add(1) {
+                        let expected = p.saturating_add(1);
+                        let target = replay_targets.lock().get(&worker).cloned();
+                        let Some(target) = target else {
+                            record_gap_metric(&metrics, KvEventGapOutcome::NoReplayEndpoint);
+                            warn!(
+                                worker_url = %worker.url,
+                                dp_rank = worker.dp_rank,
+                                gap_start_seq = expected,
+                                live_seq = seq,
+                                "kv-events pump: sequence gap observed but worker has no replay endpoint; applying current live batch with legacy behavior",
+                            );
+                            apply_batch(&tree, &worker, &batch);
+                            cursors.lock().insert(worker, seq);
+                            continue;
+                        };
+                        match fetch_replay_batches(&target.endpoint, expected, target.buffer_steps)
+                            .await
+                        {
+                            Ok(replayed) => {
+                                match apply_replayed_batches(
+                                    &tree, &cursors, &worker, expected, seq, replayed,
+                                ) {
+                                    Ok(last_replayed) => {
+                                        record_gap_metric(&metrics, KvEventGapOutcome::Replayed);
+                                        info!(
+                                            worker_url = %worker.url,
+                                            dp_rank = worker.dp_rank,
+                                            gap_start_seq = expected,
+                                            live_seq = seq,
+                                            last_replayed_seq = last_replayed,
+                                            "kv-events pump: gap replayed successfully",
+                                        );
+                                    }
+                                    Err(err) => {
+                                        record_gap_metric(&metrics, KvEventGapOutcome::BufferMiss);
+                                        warn!(
+                                            worker_url = %worker.url,
+                                            dp_rank = worker.dp_rank,
+                                            gap_start_seq = expected,
+                                            live_seq = seq,
+                                            error = %err,
+                                            "kv-events pump: replay did not cover gap; applying current live batch with legacy behavior",
+                                        );
+                                        apply_batch(&tree, &worker, &batch);
+                                        cursors.lock().insert(worker, seq);
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                let outcome = match err {
+                                    ReplayError::BatchLimitExceeded { .. } => {
+                                        KvEventGapOutcome::BufferMiss
+                                    }
+                                    _ => KvEventGapOutcome::ReplayFailed,
+                                };
+                                record_gap_metric(&metrics, outcome);
+                                warn!(
+                                    worker_url = %worker.url,
+                                    dp_rank = worker.dp_rank,
+                                    gap_start_seq = expected,
+                                    live_seq = seq,
+                                    error = %err,
+                                    "kv-events pump: replay request failed; applying current live batch with legacy behavior",
+                                );
+                                apply_batch(&tree, &worker, &batch);
+                                cursors.lock().insert(worker, seq);
+                                continue;
+                            }
                         }
                     }
                 }
+
+                let prev = cursors.lock().get(&worker).copied();
+                if let Some(p) = prev {
+                    if seq <= p {
+                        debug!(
+                            worker = ?worker,
+                            seq,
+                            last_applied = p,
+                            "kv-events pump: live batch already covered by replay; skipping",
+                        );
+                        continue;
+                    }
+                    if seq > p.saturating_add(1) {
+                        record_gap_metric(&metrics, KvEventGapOutcome::BufferMiss);
+                        warn!(
+                            worker_url = %worker.url,
+                            dp_rank = worker.dp_rank,
+                            gap_start_seq = p.saturating_add(1),
+                            live_seq = seq,
+                            "kv-events pump: sequence gap remains after replay attempt; applying current live batch with legacy behavior",
+                        );
+                    }
+                }
+
+                apply_batch(&tree, &worker, &batch);
                 cursors.lock().insert(worker, seq);
             }
         }
+    }
+}
+
+fn apply_batch(tree: &HashTree, worker: &KvWorkerId, batch: &KvEventBatch) {
+    for event in &batch.events {
+        match event {
+            KvCacheEvent::BlockStored(b) => {
+                tree.insert(worker, b.parent_block_hash, &b.block_hashes);
+            }
+            KvCacheEvent::BlockRemoved(b) => {
+                tree.remove(worker, &b.block_hashes);
+            }
+            KvCacheEvent::AllBlocksCleared => {
+                tree.clear_worker(worker);
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ReplayContinuityError {
+    #[error("replay returned no batches")]
+    Empty,
+    #[error("replay sequence discontinuity: expected {expected}, got {got}")]
+    NonContiguous { expected: i64, got: i64 },
+    #[error("replay ended at {last:?}, needed at least {needed}")]
+    Short { last: Option<i64>, needed: i64 },
+}
+
+fn apply_replayed_batches(
+    tree: &HashTree,
+    cursors: &Mutex<HashMap<KvWorkerId, i64>>,
+    worker: &KvWorkerId,
+    start_seq: i64,
+    live_seq: i64,
+    replayed: Vec<(i64, KvEventBatch)>,
+) -> Result<i64, ReplayContinuityError> {
+    if replayed.is_empty() {
+        return Err(ReplayContinuityError::Empty);
+    }
+    let mut expected = start_seq;
+    let mut last_applied = None;
+    for (seq, batch) in replayed {
+        if seq != expected {
+            return Err(ReplayContinuityError::NonContiguous { expected, got: seq });
+        }
+        apply_batch(tree, worker, &batch);
+        cursors.lock().insert(worker.clone(), seq);
+        last_applied = Some(seq);
+        if seq >= live_seq {
+            return Ok(seq);
+        }
+        expected = seq.saturating_add(1);
+    }
+    let needed = live_seq.saturating_sub(1);
+    match last_applied {
+        Some(last) if last >= needed => Ok(last),
+        other => Err(ReplayContinuityError::Short {
+            last: other,
+            needed,
+        }),
+    }
+}
+
+fn record_gap_metric(metrics: &OnceLock<Arc<MetricsRegistry>>, outcome: KvEventGapOutcome) {
+    if let Some(registry) = metrics.get() {
+        registry.record_kv_event_gap(outcome);
     }
 }
 
@@ -405,6 +622,9 @@ async fn pump_loop(
 mod tests {
     use super::*;
     use crate::policies::kv_events::wire::{BlockRemoved, BlockStored, KvEventBatch};
+    use bytes::Bytes;
+    use rmp::encode as mp;
+    use zeromq::{Endpoint, RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
     fn worker_id(url: &str, rank: u32) -> KvWorkerId {
         KvWorkerId {
@@ -421,6 +641,81 @@ mod tests {
         }
     }
 
+    fn block_stored_batch(block_hashes: &[i64]) -> KvEventBatch {
+        batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            parent_block_hash: None,
+            block_hashes: block_hashes.to_vec(),
+            token_ids: vec![],
+            block_size: 64,
+            lora_id: None,
+            medium: None,
+        })])
+    }
+
+    fn encode_block_stored_batch(block_hashes: &[i64]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        mp::write_array_len(&mut buf, 3).unwrap();
+        mp::write_f64(&mut buf, 0.0).unwrap();
+        mp::write_array_len(&mut buf, 1).unwrap();
+        mp::write_array_len(&mut buf, 7).unwrap();
+        mp::write_str(&mut buf, "BlockStored").unwrap();
+        mp::write_array_len(&mut buf, block_hashes.len() as u32).unwrap();
+        for hash in block_hashes {
+            mp::write_sint(&mut buf, *hash).unwrap();
+        }
+        mp::write_nil(&mut buf).unwrap();
+        mp::write_array_len(&mut buf, 0).unwrap();
+        mp::write_uint(&mut buf, 64).unwrap();
+        mp::write_nil(&mut buf).unwrap();
+        mp::write_nil(&mut buf).unwrap();
+        mp::write_nil(&mut buf).unwrap();
+        buf
+    }
+
+    async fn spawn_replay_router(
+        expected_start_seq: i64,
+        replies: Vec<(i64, Vec<u8>)>,
+    ) -> (String, JoinHandle<()>) {
+        let mut router = RouterSocket::new();
+        let endpoint = router
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .expect("bind replay ROUTER");
+        let port = match endpoint {
+            Endpoint::Tcp(_, port) => port,
+            other => panic!("unexpected endpoint: {other:?}"),
+        };
+        let handle = tokio::spawn(async move {
+            let request = router.recv().await.expect("receive replay request");
+            assert_eq!(request.len(), 3);
+            let identity = request.get(0).expect("identity").clone();
+            assert!(request.get(1).expect("delimiter").is_empty());
+            assert_eq!(
+                request.get(2).expect("start seq").as_ref(),
+                &expected_start_seq.to_be_bytes()
+            );
+            for (seq, payload) in replies {
+                router
+                    .send(replay_reply(identity.clone(), seq, payload))
+                    .await
+                    .expect("send replay reply");
+            }
+            router
+                .send(replay_reply(identity, -1, Vec::new()))
+                .await
+                .expect("send replay END");
+        });
+        (format!("tcp://127.0.0.1:{port}"), handle)
+    }
+
+    fn replay_reply(identity: Bytes, seq: i64, payload: Vec<u8>) -> ZmqMessage {
+        let mut msg = ZmqMessage::from(identity);
+        msg.push_back(Bytes::new());
+        msg.push_back(Bytes::copy_from_slice(&seq.to_be_bytes()));
+        msg.push_back(Bytes::from(payload));
+        msg
+    }
+
     /// Bundle of plumbing returned by `spawn_pump` so individual tests
     /// can destructure just the bits they need.
     struct PumpHarness {
@@ -428,6 +723,8 @@ mod tests {
         cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
         #[allow(dead_code)]
         live_set: Arc<Mutex<HashSet<KvWorkerId>>>,
+        replay_targets: Arc<Mutex<HashMap<KvWorkerId, ReplayTarget>>>,
+        metrics: Arc<MetricsRegistry>,
         #[allow(dead_code)]
         cancel: CancellationToken,
         tx: mpsc::Sender<WorkerEvent>,
@@ -441,12 +738,19 @@ mod tests {
         let cursors = Arc::new(Mutex::new(HashMap::new()));
         let live_set: Arc<Mutex<HashSet<KvWorkerId>>> =
             Arc::new(Mutex::new(live.iter().cloned().collect()));
+        let replay_targets: Arc<Mutex<HashMap<KvWorkerId, ReplayTarget>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let metrics_lock = Arc::new(OnceLock::new());
+        let metrics = MetricsRegistry::new();
+        metrics_lock.set(Arc::clone(&metrics)).unwrap();
         let cancel = CancellationToken::new();
         let (tx, rx) = mpsc::channel(4);
         let pump = tokio::spawn(pump_loop(
             tree.clone(),
             cursors.clone(),
             live_set.clone(),
+            replay_targets.clone(),
+            metrics_lock,
             cancel.clone(),
             rx,
         ));
@@ -454,6 +758,8 @@ mod tests {
             tree,
             cursors,
             live_set,
+            replay_targets,
+            metrics,
             cancel,
             tx,
             pump,
@@ -539,6 +845,93 @@ mod tests {
             "out-of-order remove must not undo the prior insert",
         );
         assert_eq!(cursors.lock().get(&id).copied(), Some(5));
+    }
+
+    /// Conservative gap fallback: without a replay endpoint, the new code must
+    /// keep the original behavior of applying the current live batch.
+    #[tokio::test]
+    async fn pump_gap_without_replay_keeps_legacy_current_batch_application() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tree, cursors, metrics, tx, pump) = (h.tree, h.cursors, h.metrics, h.tx, h.pump);
+
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 1,
+            batch: block_stored_batch(&[10]),
+        })
+        .await
+        .unwrap();
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 3,
+            batch: block_stored_batch(&[30]),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        pump.await.unwrap();
+
+        assert_eq!(tree.match_prefix(None, &[10]).matched_blocks, 1);
+        assert_eq!(
+            tree.match_prefix(None, &[30]).matched_blocks,
+            1,
+            "gap fallback should still apply the current live batch like upstream/main",
+        );
+        assert_eq!(cursors.lock().get(&id).copied(), Some(3));
+        let out = metrics.render();
+        assert!(out.contains(r#"sgl_router_kv_event_gaps_total{outcome="no_replay_endpoint"} 1"#));
+    }
+
+    /// With replay metadata, a gap is filled from the ROUTER socket before the
+    /// triggering live batch is considered.
+    #[tokio::test]
+    async fn pump_replays_gap_before_current_live_batch() {
+        let id = worker_id("http://w1", 0);
+        let (endpoint, replay_server) =
+            spawn_replay_router(2, vec![(2, encode_block_stored_batch(&[20]))]).await;
+        let h = spawn_pump(std::slice::from_ref(&id));
+        h.replay_targets.lock().insert(
+            id.clone(),
+            ReplayTarget {
+                endpoint,
+                buffer_steps: 16,
+            },
+        );
+        let (tree, cursors, metrics, tx, pump) = (h.tree, h.cursors, h.metrics, h.tx, h.pump);
+
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 1,
+            batch: block_stored_batch(&[10]),
+        })
+        .await
+        .unwrap();
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 3,
+            batch: block_stored_batch(&[30]),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        pump.await.unwrap();
+        replay_server.await.unwrap();
+
+        assert_eq!(tree.match_prefix(None, &[10]).matched_blocks, 1);
+        assert_eq!(
+            tree.match_prefix(None, &[20]).matched_blocks,
+            1,
+            "replayed seq=2 batch should be applied",
+        );
+        assert_eq!(
+            tree.match_prefix(None, &[30]).matched_blocks,
+            1,
+            "triggering live seq=3 batch should still be applied",
+        );
+        assert_eq!(cursors.lock().get(&id).copied(), Some(3));
+        let out = metrics.render();
+        assert!(out.contains(r#"sgl_router_kv_event_gaps_total{outcome="replayed"} 1"#));
     }
 
     /// AllBlocksCleared wipes the worker's tree state entirely.
@@ -651,6 +1044,7 @@ mod tests {
             topic: String::new(),
             block_size: 128,
             dp_size: 1,
+            replay: None,
             is_bigram: false,
         };
         index
@@ -680,6 +1074,7 @@ mod tests {
             topic: String::new(),
             block_size: 64,
             dp_size: 0,
+            replay: None,
             is_bigram: false,
         };
         index.add_worker("http://127.0.0.1:30200", Some(cfg)).await;
@@ -701,6 +1096,7 @@ mod tests {
             topic: String::new(),
             block_size: 64,
             dp_size: 0,
+            replay: None,
             is_bigram: true,
         };
         index.add_worker("http://127.0.0.1:30300", Some(cfg)).await;

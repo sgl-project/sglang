@@ -126,6 +126,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         topic: String::new(),
         block_size,
         dp_size: 1,
+        replay: None,
         is_bigram: false,
     };
     kv_index.add_worker(url_a, Some(preresolved.clone())).await;
