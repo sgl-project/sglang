@@ -221,13 +221,13 @@ def hadamard_transform_mn_ref(x, multiple, scale=1.0):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "dim",
-    # Power-of-2 dims from sgl-kernel/tests/test_hadamard.py (old AOT test)
+    # Power-of-2 dims from python/sglang/kernels/aot/tests/test_hadamard.py (old AOT test)
     [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
 )
 def test_hadamard_transform(dim, dtype):
     device = "cuda"
 
-    # Tolerances from sgl-kernel/tests/test_hadamard.py (old AOT test)
+    # Tolerances from python/sglang/kernels/aot/tests/test_hadamard.py (old AOT test)
     if dtype == torch.float32:
         rtol, atol = 3e-4, 3e-3
     elif dtype == torch.bfloat16:
@@ -252,7 +252,7 @@ def test_hadamard_transform(dim, dtype):
 @pytest.mark.parametrize(
     "dim",
     # Non-power-of-2 dims to test the padding path
-    # (137 from sgl-kernel/tests/test_hadamard.py, 500/1000 added for coverage)
+    # (137 from python/sglang/kernels/aot/tests/test_hadamard.py, 500/1000 added for coverage)
     [137, 500, 1000],
 )
 def test_hadamard_transform_non_power_of_two(dim, dtype):

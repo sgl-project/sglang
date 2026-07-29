@@ -27,7 +27,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
-    current_platform,
 )
 from sglang.multimodal_gen.runtime.realtime.states import (
     RealtimeCausalDiTState,
@@ -35,6 +34,9 @@ from sglang.multimodal_gen.runtime.realtime.states import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context as precision_autocast_context,
+)
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled as precision_autocast_enabled,
 )
@@ -640,9 +642,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
         autocast_enabled: bool,
     ) -> torch.Tensor:
         with (
-            torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=target_dtype,
+            precision_autocast_context(
+                target_dtype,
+                disable_autocast=False,
                 enabled=autocast_enabled,
             ),
             set_forward_context(
