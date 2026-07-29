@@ -569,6 +569,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
 
+    def supports_fast_match_prefix(self) -> bool:
+        return not self.disable
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:

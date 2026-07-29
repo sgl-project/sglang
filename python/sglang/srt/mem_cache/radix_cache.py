@@ -352,6 +352,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         )
         self._record_all_cleared_event()
 
+    def supports_fast_match_prefix(self) -> bool:
+        return not self.disable
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
 
