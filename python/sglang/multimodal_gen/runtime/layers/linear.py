@@ -179,6 +179,17 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+        elif x.device.type == "mps" and (
+            x.dtype != torch.float32
+            or layer.weight.dtype != torch.float32
+            or (bias is not None and bias.dtype != torch.float32)
+        ):
+            return F.linear(
+                x.to(torch.float32),
+                layer.weight.to(torch.float32),
+                None if bias is None else bias.to(torch.float32),
+            ).to(x.dtype)
+
         output = (
             F.linear(x, layer.weight, bias)
             if IS_AMP_SUPPORTED or bias is None
@@ -504,8 +515,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         tp_group: dist.ProcessGroup = None,
     ):
         tp_group = tp_group or get_tp_group()
-        if get_group_size(tp_group) > 1:
-            self.output_sizes = output_sizes
+        # Set output_sizes BEFORE super().__init__() so ColumnParallelLinear derives
+        # per-shard output_partition_sizes.
+        self.output_sizes = output_sizes
         super().__init__(
             input_size=input_size,
             output_size=sum(output_sizes),
@@ -517,7 +529,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             prefix=prefix,
             tp_group=tp_group,
         )
-        self.output_sizes = output_sizes
         assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
 
     def weight_loader(

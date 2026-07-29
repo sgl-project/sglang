@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.unified_cache.cache_action import FreeComponentDeviceSlot
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
