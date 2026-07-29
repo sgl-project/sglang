@@ -16,11 +16,11 @@ For all install methods and hardware platforms, see the [official SGLang install
 
 <Tab title="Python (pip / uv)">
 
-Inkling support isn't in a `pip` release yet — install from the `inkling-support` branch:
+Inkling has merged to `main` but isn't in a `pip` release yet — install from source:
 
 ```bash Command
 pip install --upgrade pip
-pip install "sglang[all] @ git+https://github.com/sgl-project/sglang.git@inkling-support"
+pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 ```
 
 Then run the **Python** output of the command panel below.
