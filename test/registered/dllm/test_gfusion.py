@@ -36,6 +36,7 @@ class TestGFusion(CustomTestCase):
                 "fa3",
                 "--dllm-algorithm",
                 "EBSampling",
+                "--no-dllm-fdfo",
                 "--mem-fraction-static",
                 "0.85",
                 "--max-running-requests",

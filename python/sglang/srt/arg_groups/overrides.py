@@ -2525,30 +2525,21 @@ def _dllm_attention_backend(view: Any) -> dict:
         return {}
     model_arch = view.get_model_config().hf_config.architectures[0]
     if model_arch == "GFusionForDiffusionLM":
-        if is_npu():
-            raise ValueError("GFusion does not support the ascend attention backend.")
+        if not is_cuda() and not is_hip():
+            raise ValueError("GFusion only supports CUDA and HIP GPUs.")
         supported_backends = {"triton"} if is_hip() else {"fa3", "triton"}
-        configured_backends = {
-            backend
-            for backend in (
-                view.attention_backend,
-                view.prefill_attention_backend,
-                view.decode_attention_backend,
-            )
-            if backend is not None
-        }
-        unsupported_backends = configured_backends - supported_backends
-        if unsupported_backends:
-            raise ValueError(
-                "GFusion only supports the following attention backends: "
-                f"{sorted(supported_backends)}; got {sorted(unsupported_backends)}."
-            )
-        if not configured_backends:
+        if view.is_attention_backend_not_set():
             attention_backend = "triton" if is_hip() else "fa3"
             logger.info(
                 f"Attention backend is set to {attention_backend} for GFusion."
             )
             return {"attention_backend": attention_backend}
+        unsupported_backends = set(attention_backends_of(view)) - supported_backends
+        if unsupported_backends:
+            raise ValueError(
+                "GFusion only supports the following attention backends: "
+                f"{sorted(supported_backends)}; got {sorted(unsupported_backends)}."
+            )
         return {}
     if is_hip():
         if view.attention_backend not in ["triton", "aiter"]:
