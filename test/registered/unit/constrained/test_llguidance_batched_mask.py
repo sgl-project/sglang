@@ -1,6 +1,7 @@
 """Bitwise parity tests for llguidance's regular-decode batched mask fill."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -8,12 +9,31 @@ from llguidance import LLTokenizer, grammar_from
 
 from sglang.srt.constrained.base_grammar_backend import GrammarRow
 from sglang.srt.constrained.llguidance_backend import GuidanceBackend, GuidanceGrammar
+from sglang.srt.constrained.reasoner_grammar_backend import (
+    ReasonerGrammarBackend,
+    ReasonerGrammarObject,
+)
 from sglang.srt.runtime_context import get_resources
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 _REGEX = r"[0-9]{1,8}"
+
+
+class _ReasoningTokenizer:
+    def encode(self, text, add_special_tokens=False):
+        return {
+            "</think>": [7],
+            "<tool_call>": [3],
+            "</tool_call>": [5],
+        }.get(text, [])
+
+
+def _is_token_allowed(vocab_mask, token_id):
+    element = token_id // 32
+    bit = token_id % 32
+    return bool(int(vocab_mask[0, element].item()) & (1 << bit))
 
 
 class TestLLGuidanceBatchedMask(unittest.TestCase):
@@ -106,6 +126,52 @@ class TestLLGuidanceBatchedMask(unittest.TestCase):
             self.assertEqual(mask.data_ptr(), same_mask.data_ptr())
         finally:
             get_resources().buffers.pop(name, None)
+
+
+class TestLLGuidanceStrictThinkingMask(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.llguidance_tokenizer = LLTokenizer("byte")
+
+    def test_backend_supports_strict_thinking_without_inner_grammar(self):
+        backend = object.__new__(GuidanceBackend)
+        backend.llguidance_tokenizer = self.llguidance_tokenizer
+        parser = SimpleNamespace(
+            detector=SimpleNamespace(
+                think_end_token="</think>",
+                think_excluded_tokens=["<tool_call>", "</tool_call>"],
+            )
+        )
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            parser,
+            _ReasoningTokenizer(),
+            enable_strict_thinking=True,
+        )
+
+        grammar = reasoner.init_strict_reasoning_grammar(reasoning=True)
+
+        self.assertIsInstance(grammar, ReasonerGrammarObject)
+        self.assertIsNone(grammar.grammar)
+        self.assertTrue(grammar.enable_token_filter)
+
+        mask = grammar.allocate_vocab_mask(
+            self.llguidance_tokenizer.vocab_size, 1, "cpu"
+        )
+        grammar.fill_vocab_mask(mask, 0)
+        self.assertFalse(_is_token_allowed(mask, 3))
+        self.assertFalse(_is_token_allowed(mask, 5))
+        self.assertTrue(_is_token_allowed(mask, 7))
+        self.assertTrue(_is_token_allowed(mask, 8))
+
+        grammar.max_think_tokens = 2
+        grammar.accept_token(10)
+        grammar.accept_token(11)
+        grammar.fill_vocab_mask(mask, 0)
+        self.assertFalse(_is_token_allowed(mask, 3))
+        self.assertFalse(_is_token_allowed(mask, 5))
+        self.assertTrue(_is_token_allowed(mask, 7))
+        self.assertFalse(_is_token_allowed(mask, 8))
 
 
 if __name__ == "__main__":
