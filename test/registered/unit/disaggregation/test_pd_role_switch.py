@@ -228,9 +228,9 @@ class TestPdRoleSwitchReqSerialization(unittest.TestCase):
 class TestPdRoleSwitchStartupValidation(unittest.TestCase):
     """--enable-pd-role-switch only rebuilds the small role-specific disagg
     structures on a flip; the per-role buffers of DP attention / EP / MoE
-    all-to-all are sized at startup and not rebuilt, so a flip with those on
-    would silently deadlock. The PD arg hook must reject the combination
-    up-front instead of failing at flip time."""
+    all-to-all / pipeline parallelism are sized at startup and not rebuilt, so
+    a flip with those on would silently deadlock. The PD arg hook must reject
+    the combination up-front instead of failing at flip time."""
 
     def _sa(self, **kw):
         base = dict(
@@ -240,6 +240,7 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             enable_dp_attention=False,
             ep_size=1,
             moe_a2a_backend="none",
+            pp_size=1,
         )
         base.update(kw)
         return SimpleNamespace(**base)
@@ -269,6 +270,11 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self._run(self._sa(moe_a2a_backend="mori"))
         self.assertIn("MoE all-to-all", str(ctx.exception))
+
+    def test_reject_pipeline_parallelism(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._run(self._sa(pp_size=2))
+        self.assertIn("pipeline parallelism", str(ctx.exception))
 
     def test_no_role_switch_is_unaffected(self):
         # The same unsupported feature is fine when role switch is off.
