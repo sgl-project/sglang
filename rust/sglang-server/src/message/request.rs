@@ -308,6 +308,7 @@ impl GenerateBody {
                 // `Some` here means "these ids were requested", so an empty list
                 // collapses to None.
                 token_ids_logprob: token_ids_logprob.filter(|ids| !ids.is_empty()),
+                return_sampling_mask: false, // TODO: port Python's `return_sampling_mask`
                 return_hidden_states: return_hidden_states.unwrap_or(false),
                 return_text_in_logprobs,
             },
@@ -371,6 +372,7 @@ pub struct GenerateRequest {
     /// This request's `token_ids_logprob` ids, fanned out by `into_requests` and
     /// collapsed to `None` when empty (the scheduler branches on `is not None`).
     pub token_ids_logprob: Option<TokenIds>,
+    pub return_sampling_mask: bool,
     pub return_hidden_states: bool,
     /// Decode logprob token ids to text in each `[logprob, token_id, text]` tuple
     /// (default leaves the text slot null). Deliberately NOT in the scheduler
