@@ -530,6 +530,7 @@ fn take_one_or_many(v: Option<OneOrMany<String>>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     /// End to end through the path `/generate` takes: a bounded `stop_regex`
     /// reaches the wire with its real length, and a malformed one is a 400.

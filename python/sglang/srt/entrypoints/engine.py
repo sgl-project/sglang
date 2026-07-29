@@ -1116,28 +1116,6 @@ class Engine(EngineScoreMixin, EngineBase):
                 None,
             )
 
-        # The embedded Rust server (started inside the rank-0 scheduler) owns
-        # the API server, tokenization, and detokenization. In that mode we do
-        # not start the Python detokenizer subprocess(es) or tokenizer manager.
-        # Do not use RayEngine with the Rust server, as it is not supported.
-        if envs.SGLANG_RUST_SERVER.get():
-            scheduler_init_result.wait_for_ready()
-            # Set up subprocess liveness watchdog to detect crashes
-            processes = list(scheduler_procs or [])
-            names = [f"scheduler_{i}" for i in range(len(processes))]
-            subprocess_watchdog = SubprocessWatchdog(
-                processes=processes, process_names=names
-            )
-            subprocess_watchdog.start()
-
-            return (
-                None,
-                None,
-                port_args,
-                scheduler_init_result,
-                subprocess_watchdog,
-            )
-
         # Launch detokenizer process(es) — optionally fronted by a router when
         # detokenizer_worker_num > 1.
         detoken_procs, detoken_names = cls._launch_detokenizer_subprocesses(
