@@ -352,7 +352,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> Iterator[OutputBatch]:
         """Yield grouped results after each request finishes its terminal stage."""
         assert self.pipeline is not None
-        results = self.pipeline.forward_batch_iter(batch, self.server_args)
+        results = self.pipeline.forward_batch_sequentially(batch, self.server_args)
         group_start_time = time.monotonic()
 
         for req in batch:
