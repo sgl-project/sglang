@@ -898,7 +898,12 @@ class HiMambaRadixCache(MambaRadixCache):
             else:
                 if prev_prefix_len < total_prefix_length + prefix_len:
                     start = max(0, prev_prefix_len - total_prefix_length)
-                    self.token_to_kv_pool_allocator.free(value[start:prefix_len])
+                    # same as MambaRadixCache._insert_helper: page-exact segment
+                    # at offset total_prefix_length of the kv row
+                    self.token_to_kv_pool_allocator.free_segment(
+                        value[start:prefix_len],
+                        start_pos=total_prefix_length + start,
+                    )
                 total_prefix_length += prefix_len
                 self._inc_hit_count(node, chunked)
 

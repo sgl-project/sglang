@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -506,7 +507,7 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_format: str = "",
     ):
@@ -525,6 +526,8 @@ class LayerCommunicator:
             )
             if (
                 gathered_last_layer_output is residual
+                # An accumulator that copies on append already holds a snapshot.
+                and not getattr(captured_last_layer_outputs, "copies_on_append", False)
                 and not self._post_attn_residual_is_read_only(residual)
             ):
                 gathered_last_layer_output = residual.clone()
