@@ -27,6 +27,9 @@ from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
 from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -38,6 +41,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -45,7 +49,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer, get_spec
+from sglang.srt.runtime_context import get_buffer, get_parallel, get_spec
 from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
     resolve_ragged_verify_layout,
@@ -153,6 +157,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # MHA-specific dimensions
         self.max_context_len = model_runner.model_config.context_len
         self.hidden_size = config.hidden_size
+        self.head_dim = config.head_dim
 
         # Runtime parameters
         self.data_type = model_runner.kv_cache_dtype
@@ -160,6 +165,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.device = model_runner.device
+        parallel = get_parallel()
+        self.dcp_size = parallel.attn_dcp_size
+        self.dcp_rank = parallel.attn_dcp_rank
+        self.dcp_group = parallel.dcp_group if self.dcp_size > 1 else None
+        self.num_q_heads = config.num_attention_heads // parallel.attn_tp_size
+        self.dcp_max_context_len = (
+            self.max_context_len + self.dcp_size - 1
+        ) // self.dcp_size
 
         # Workspace allocation
         self.workspace_size = workspace_size_bytes
@@ -204,12 +217,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             self._swa_full_to_swa_mapping = None
 
+        if self.dcp_size > 1 and self._swa_kv_pool is not None:
+            raise NotImplementedError("TRTLLM MHA DCP does not support SWA KV pools")
+        if self.dcp_size > 1 and self.decode_uses_native_fp4:
+            raise NotImplementedError(
+                "TRTLLM MHA DCP does not support native FP4 KV cache"
+            )
+
         # Static page-table width (upper bound). The CUDA-graph path builds the
         # page table on-device sized to this constant, so it never reads a runtime
         # max. See _fill_page_table_device.
         self.max_num_pages = (
-            self.max_context_len + self.page_size - 1
+            self.dcp_max_context_len + self.page_size - 1
         ) // self.page_size
+        self.dcp_cuda_graph_out_buffer: Optional[torch.Tensor] = None
+        self.dcp_cuda_graph_lse_buffer: Optional[torch.Tensor] = None
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
@@ -223,6 +245,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+        if self.dcp_size > 1 and self.is_xqa_impl:
+            raise NotImplementedError(
+                "TRTLLM MHA DCP requires trtllm-gen return_lse support"
+            )
 
         # fmha_v2 prefill kernel supports SM90 and SM120
         self.use_fmha_v2 = is_sm90_supported() or is_sm120_supported()
@@ -234,8 +260,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # "Missing TRTLLM-GEN kernel" error during CUDA-graph capture.
         # XQA (SM90/SM120 decode) has native page-128 kernels; no check needed.
         if self.page_size >= 128 and not self.is_xqa_impl:
-            from sglang.srt.runtime_context import get_parallel
-
             attn_tp_size = get_parallel().attn_tp_size
             num_q_heads = config.num_attention_heads // attn_tp_size
             num_kv_heads = config.get_num_kv_heads(attn_tp_size)
@@ -352,6 +376,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             full_to_swa=(
                 self._swa_kv_pool.full_to_swa_index_mapping if has_swa else None
             ),
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
         )
 
     def _get_layer_cache_loc(
@@ -473,6 +499,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ),
             "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
         }
+        if self.dcp_size > 1:
+            self.dcp_cuda_graph_out_buffer = torch.empty(
+                max_num_tokens,
+                self.num_q_heads * self.dcp_size,
+                self.head_dim,
+                dtype=self.q_data_type,
+                device=self.device,
+            )
+            self.dcp_cuda_graph_lse_buffer = torch.empty(
+                max_num_tokens,
+                self.num_q_heads * self.dcp_size,
+                dtype=torch.float32,
+                device=self.device,
+            )
 
         # SWA write-target buffer; bound as a [:num_tokens] view in
         # _build_cuda_graph_metadata and refilled by the fused metadata kernel.
@@ -782,6 +822,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             qlens=qlens,
             q_stride=q_stride,
             q_mode=q_mode,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
         )
 
         if self._needs_encoder_only_expand(forward_mode, metadata):
@@ -810,7 +852,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ) -> bool:
         """Check if we should use the fused FP8 KV cache write path."""
         return (
-            not is_cp_v2_active(forward_batch)
+            self.dcp_size == 1
+            and not is_cp_v2_active(forward_batch)
             and save_kv_cache
             and k is not None
             and self.data_type == torch.float8_e4m3fn
@@ -950,7 +993,27 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
 
-        if forward_batch.forward_mode.is_decode_or_idle():
+        if self.dcp_size > 1:
+            if (
+                not forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.spec_info is not None
+            ):
+                raise NotImplementedError(
+                    "TRTLLM MHA DCP currently supports non-speculative decode only; "
+                    "use a separate Triton prefill backend"
+                )
+            metadata.cache_seqlens_int32 = get_dcp_lens(
+                seqlens_in_batch, self.dcp_size, self.dcp_rank
+            ).to(torch.int32)
+            metadata.cu_seqlens_q = torch.arange(
+                0, batch_size + 1, dtype=torch.int32, device=device
+            )
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
+                (1, 0),
+            )
+
+        elif forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.spec_info is not None:
                 # Draft Decode
                 # Here we only support topk = 1 for now.
@@ -1202,27 +1265,42 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             v = None
         else:
             if save_kv_cache and k is not None:
+                kv_write_kwargs = {}
+                if self.dcp_size > 1:
+                    cache_loc = cache_loc // self.dcp_size
+                    kv_write_kwargs["dcp_kv_mask"] = (
+                        forward_batch.positions % self.dcp_size == self.dcp_rank
+                    )
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                     k,
                     v,
                     *self._kv_write_scales(layer),
+                    **kv_write_kwargs,
                 )
 
         # For XQA, q_dtype should be bf16. For trtllm-gen,
         # q_dtype should be FP8 when KV is in FP8.
         q_scale = 1.0
-        if (
-            self.data_type == torch.float8_e4m3fn
-            and not self.is_xqa_impl
-            and not use_fused_qkv
-        ):
-            q = q.to(torch.float8_e4m3fn)
-        if self.is_xqa_impl:
-            q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-        else:
+        if self.dcp_size > 1:
             q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+            with use_symmetric_memory(self.dcp_group):
+                q = q.contiguous()
+            q = self.dcp_group.all_gather(q, dim=1).contiguous()
+            if self.data_type == torch.float8_e4m3fn and not use_fused_qkv:
+                q = q.to(torch.float8_e4m3fn)
+        else:
+            if (
+                self.data_type == torch.float8_e4m3fn
+                and not self.is_xqa_impl
+                and not use_fused_qkv
+            ):
+                q = q.to(torch.float8_e4m3fn)
+            if self.is_xqa_impl:
+                q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            else:
+                q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
 
         if self.is_nvfp4_kvcache:
             kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
