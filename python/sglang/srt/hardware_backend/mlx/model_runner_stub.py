@@ -148,6 +148,13 @@ class MlxModelRunnerStub(ModelRunner):
             return 1
         return MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO
 
+    def _explicit_aux_state_size_per_worker(self) -> int | None:
+        """Return the explicit auxiliary-state cap for this attention-DP owner."""
+        aux_state_size = self.server_args.max_mamba_cache_size
+        if aux_state_size is None:
+            return None
+        return aux_state_size // self.ps.attn_dp_size
+
     def _resolve_max_running_requests(self) -> int:
         """Concurrency cap handed to the scheduler.
 
@@ -174,7 +181,7 @@ class MlxModelRunnerStub(ModelRunner):
             requested_per_worker = requested // self.ps.attn_dp_size
             resolved = min(requested_per_worker, capacity_cap)
 
-        aux_state_size = self.server_args.max_mamba_cache_size
+        aux_state_size = self._explicit_aux_state_size_per_worker()
         if (
             mambaish_config(self.model_config) is not None
             and aux_state_size is not None
@@ -242,7 +249,7 @@ class MlxModelRunnerStub(ModelRunner):
 
         # Create minimal pools
         if mambaish_config(self.model_config) is not None:
-            auxiliary_state_size = self.server_args.max_mamba_cache_size
+            auxiliary_state_size = self._explicit_aux_state_size_per_worker()
             if auxiliary_state_size is None:
                 auxiliary_state_size = (
                     self.max_running_requests * self._aux_state_slots_per_request()
