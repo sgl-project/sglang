@@ -12,6 +12,7 @@ from sglang.srt.parser.reasoning_parser import (
     InklingDetector,
     KimiDetector,
     KimiK2Detector,
+    KimiK3Detector,
     Nemotron3Detector,
     Qwen3Detector,
     ReasoningParser,
@@ -293,6 +294,64 @@ class TestKimiK2Detector(CustomTestCase):
         self.assertEqual(self.detector.tool_start_token, "<|tool_calls_section_begin|>")
         self.assertFalse(self.detector._in_reasoning)
         self.assertTrue(self.detector.stream_reasoning)
+
+
+class TestKimiK3Detector(CustomTestCase):
+    """Test cases for the Kimi K3 XTML think channel detector."""
+
+    TOOLS = (
+        '<|open|>tools<|sep|><|open|>call tool="get_weather" index="1"<|sep|>'
+        '<|open|>argument key="city" type="string"<|sep|>San Francisco'
+        "<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>"
+    )
+    THINK = "The user asks about SF weather."
+    RESPONSE = "I'll check SF weather for you."
+
+    def _sealed(self):
+        return (
+            f"{self.THINK}<|close|>think<|sep|><|open|>response<|sep|>"
+            f"{self.RESPONSE}<|close|>response<|sep|>{self.TOOLS}"
+        )
+
+    def _unsealed(self):
+        return (
+            f"{self.THINK}<|close|>think<|open|>response<|sep|>"
+            f"{self.RESPONSE}<|close|>response<|sep|>{self.TOOLS}"
+        )
+
+    def test_unsealed_think_close_keeps_response_out_of_reasoning(self):
+        """Guard the /v1/responses regression where the think channel closed as
+        ``<|close|>think`` with no trailing ``<|sep|>``: the detector found no
+        think_end_token, so the whole response channel plus its raw markers were
+        emitted as reasoning_text and the assistant message vanished."""
+        result = KimiK3Detector().detect_and_parse(self._unsealed())
+        self.assertEqual(result.reasoning_text, self.THINK)
+        self.assertEqual(result.normal_text, self.RESPONSE + self.TOOLS)
+
+    def test_sealed_and_unsealed_agree(self):
+        """A well-formed close marker must parse identically to the degraded one."""
+        sealed = KimiK3Detector().detect_and_parse(self._sealed())
+        unsealed = KimiK3Detector().detect_and_parse(self._unsealed())
+        self.assertEqual(sealed.reasoning_text, unsealed.reasoning_text)
+        self.assertEqual(sealed.normal_text, unsealed.normal_text)
+
+    def test_streaming_matches_non_streaming(self):
+        """Marker-straddling chunks must not leak a dangling ``<|close|>think``
+        into the streamed reasoning deltas."""
+        for text in (self._sealed(), self._unsealed()):
+            expected = KimiK3Detector().detect_and_parse(text)
+            for chunk_size in (1, 7, 13):
+                detector = KimiK3Detector()
+                reasoning, normal = [], []
+                for start in range(0, len(text), chunk_size):
+                    result = detector.parse_streaming_increment(
+                        text[start : start + chunk_size]
+                    )
+                    reasoning.append(result.reasoning_text or "")
+                    normal.append(result.normal_text or "")
+                with self.subTest(text=text, chunk_size=chunk_size):
+                    self.assertEqual("".join(reasoning), expected.reasoning_text)
+                    self.assertEqual("".join(normal), expected.normal_text)
 
 
 class TestGlm45Detector(CustomTestCase):

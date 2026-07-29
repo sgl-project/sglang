@@ -363,6 +363,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         session_id=request.session_id,
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
+                        require_reasoning=self._is_thinking_enabled_for_request(
+                            request
+                        ),
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -2386,6 +2389,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return_text_in_logprobs=adapted_request.return_text_in_logprobs,
                 return_hidden_states=adapted_request.return_hidden_states,
                 background=adapted_request.background,
+                require_reasoning=adapted_request.require_reasoning,
             )
 
             # Update sampling params with reduced max_tokens
