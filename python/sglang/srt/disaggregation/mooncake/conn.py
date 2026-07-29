@@ -43,9 +43,11 @@ from sglang.srt.disaggregation.mooncake.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     resolve_dcp_dst_entry_indices,
+    slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -1376,10 +1378,25 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         or rc
                     )
+            elif st == StateType.DSA_TAIL:
+                rc = (
+                    self._send_slot_state(
+                        req,
+                        src_data_ptrs,
+                        src_item_lens,
+                        dst_data_ptrs,
+                        dst_item_lens,
+                        list(indices),
+                        list(dst_indices),
+                        st.value,
+                    )
+                    or rc
+                )
             elif self._is_generic_kvcache_state_type(st):
                 if (
                     target_rank_registration_info is not None
                     and not self.is_mla_backend
+                    and not self.is_hybrid_mla_backend
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
                 ):
@@ -1461,6 +1478,44 @@ class MooncakeKVManager(CommonKVManager):
                 )
         return rc
 
+    def _send_slot_state(
+        self,
+        req: TransferInfo,
+        src_ptrs: list[int],
+        src_item_lens: list[int],
+        dst_ptrs: list[int],
+        dst_item_lens: list[int],
+        src_indices: list[int],
+        dst_indices: list[int],
+        label: str,
+    ) -> int:
+        """Transfer the live slots of a request-scoped ring-row component."""
+        try:
+            dst_ptrs = slice_dsa_tail_dst_ptrs_for_pp(
+                src_ptrs,
+                dst_ptrs,
+                self.kv_args.prefill_start_layer,
+                getattr(self.kv_args, "prefill_end_layer", None),
+            )
+            dst_item_lens = slice_dsa_tail_dst_ptrs_for_pp(
+                src_ptrs,
+                dst_item_lens,
+                self.kv_args.prefill_start_layer,
+                getattr(self.kv_args, "prefill_end_layer", None),
+            )
+            transfer_blocks = build_dsa_tail_transfer_blocks(
+                src_ptrs,
+                src_item_lens,
+                dst_ptrs,
+                src_indices,
+                dst_indices,
+                dst_item_lens,
+            )
+        except ValueError as exc:
+            logger.error("%s: %s", label, exc)
+            return -1
+        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+
     def _send_mamba_state(
         self,
         req: TransferInfo,
@@ -1519,7 +1574,8 @@ class MooncakeKVManager(CommonKVManager):
         attn_tp_size, we slice the state accordingly. GDN conv_state is the
         concatenation [query | key | value] with each sub-block head-sharded
         independently, so on the scatter path it is sliced per sub-block via
-        ``src_state_conv_shard_groups`` (see compute_mamba_state_slice_blocks).
+        ``src_state_conv_shard_groups`` (see
+        compute_mamba_state_slice_byte_blocks).
         """
         logger.warning_once(
             "Using Mamba state slice transfer for different TP sizes between prefill and decode. "

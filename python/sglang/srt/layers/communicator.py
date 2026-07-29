@@ -224,12 +224,17 @@ class AttentionInputs:
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         qkv_latent_func: Callable,
+        *,
+        is_pre_gathered: bool = False,
     ):
         self.hidden_states_local = hidden_states
         self.forward_batch = forward_batch
         self.qkv_latent_func = qkv_latent_func
         self.hidden_states_ = None
         self.qkv_latent_ = None
+        # When True, hidden_states_local is already attn_tp-gathered upstream
+        # (e.g. by MHC's prepare_attn for DSA). fetch_* must NOT gather again.
+        self.is_pre_gathered = is_pre_gathered
 
     def tp_all_gather_hidden_states(self, hidden_states, forward_batch):
         total_tokens = forward_batch.input_ids.shape[0]
@@ -244,7 +249,7 @@ class AttentionInputs:
         self.qkv_latent_ = self.qkv_latent_func(
             self.hidden_states_local, self.forward_batch
         )
-        if get_attn_tp_context().input_scattered:
+        if get_attn_tp_context().input_scattered and not self.is_pre_gathered:
             self.qkv_latent_ = self.tp_all_gather_hidden_states(
                 self.qkv_latent_, self.forward_batch
             )
@@ -254,7 +259,7 @@ class AttentionInputs:
         if self.hidden_states_ is not None:
             return self.hidden_states_
         self.hidden_states_ = self.hidden_states_local
-        if get_attn_tp_context().input_scattered:
+        if get_attn_tp_context().input_scattered and not self.is_pre_gathered:
             self.hidden_states_ = self.tp_all_gather_hidden_states(
                 self.hidden_states_, self.forward_batch
             )
@@ -266,13 +271,16 @@ class AttnTpContext:
         self.allow_input_scattered = False
         self.is_dsa = False
 
-    def init_context(self, q_lora_rank, is_dsa):
+    def init_context(self, q_lora_rank, is_dsa, is_mhc=False):
+        # DSA + input_scattered requires hidden_states to be attn_tp-gathered
+        # before the attention call. Currently only MHC's prepare_attn does this
+        # pre-gather; hence is_mhc gates DSA's eligibility for input_scattered.
         self.is_dsa = is_dsa
         self.allow_input_scattered = (
             get_parallel().enable_attn_tp_input_scattered
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
-            and not is_dsa
+            and (is_mhc or not is_dsa)
             and get_parallel().tp_size > 1
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
@@ -303,6 +311,11 @@ class AttnTpContext:
 
     def set_attn_inputs(self, attn_inputs: AttentionInputs):
         get_forward().set("attn_inputs", attn_inputs)
+
+    def set_hidden_states_local(self, hidden_states: torch.Tensor) -> None:
+        attn_inputs = get_forward().attn_inputs
+        if attn_inputs is not None:
+            attn_inputs.hidden_states_local = hidden_states
 
     def fetch_qkv_latent(self):
         attn_inputs = get_forward().attn_inputs
@@ -443,6 +456,27 @@ def enable_moe_dense_fully_dp():
 
 def enable_dwdp():
     return get_parallel().dwdp_size > 1
+
+
+def tp_reduce_scatter(
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    context: "CommunicateContext",
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Reduce-scatter ``hidden_states`` over the full TP group and slice
+    ``residual`` to this rank. Module-level so variant communicators (e.g. MHC)
+    can reuse it without holding a ``LayerCommunicator`` instance."""
+    if hidden_states.shape[0] == 0:
+        return hidden_states, hidden_states
+    assert (
+        hidden_states.shape[0] % context.tp_size == 0
+    ), f"Expected total tokens {hidden_states.shape[0]} % tp_size {context.tp_size} to be 0"
+    local_tokens = hidden_states.shape[0] // context.tp_size
+    output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
+    get_tp_group().reduce_scatter_tensor(output, hidden_states)
+    if residual is not None:
+        residual = residual.tensor_split(context.tp_size)[context.tp_rank]
+    return output, residual
 
 
 class LayerCommunicator:
@@ -742,19 +776,7 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if hidden_states.shape[0] == 0:
-            return hidden_states, hidden_states
-        assert (
-            hidden_states.shape[0] % self._context.tp_size == 0
-        ), f"Expected total tokens {hidden_states.shape[0]} % tp_size {self._context.tp_size} to be 0"
-        local_tokens = hidden_states.shape[0] // self._context.tp_size
-        output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
-        get_tp_group().reduce_scatter_tensor(output, hidden_states)
-        if residual is not None:
-            residual = residual.tensor_split(self._context.tp_size)[
-                self._context.tp_rank
-            ]
-        return output, residual
+        return tp_reduce_scatter(hidden_states, residual, self._context)
 
     def prepare_mlp(
         self,
@@ -773,6 +795,13 @@ class LayerCommunicator:
             layernorm=self.post_attention_layernorm,
             context=self._context,
         )
+
+    def maybe_prefetch_next_full_attention_kv(
+        self,
+        forward_batch: ForwardBatch,
+        next_full_attention_layer_id: Optional[int],
+    ) -> None:
+        return
 
     def postprocess_layer(
         self,
@@ -1262,7 +1291,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
         if (
             moe_cp_size > 1
             and hidden_states.shape[0] > 0
-            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.forward_mode.is_context_parallel_extend(
+                include_draft_extend_v2=True
+            )
             and forward_batch.attn_cp_metadata is not None
         ):
             # Zigzag split can produce unequal token counts across CP ranks
@@ -1443,7 +1474,9 @@ class CommunicateSummableTensorPairFn:
         moe_cp_size = get_moe_cp_size()
         if (
             moe_cp_size > 1
-            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.forward_mode.is_context_parallel_extend(
+                include_draft_extend_v2=True
+            )
             and forward_batch.attn_cp_metadata is not None
         ):
             moe_cp_rank = get_moe_cp_rank()
