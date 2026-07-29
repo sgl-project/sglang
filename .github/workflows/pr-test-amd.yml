@@ -11,7 +11,7 @@ on:
       - "python/**"
       - "scripts/ci/**"
       - "test/**"
-      - "sgl-kernel/**"
+      - "python/sglang/kernels/aot/**"
       - ".github/workflows/pr-test-amd.yml"
       - "docker/rocm.Dockerfile"
   workflow_dispatch:
@@ -175,7 +175,9 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
+              - "python/sglang/kernels/!(*.md)"
+              - "python/sglang/kernels/!(aot)/**/!(*.md)"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
               - "scripts/ci/amd/*"
@@ -183,10 +185,11 @@ jobs:
               - "test/**/!(*.md)"
               - ".github/workflows/pr-test-amd.yml"
             sgl_kernel:
-              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
+              - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-amd.yml"
             jit_kernel:
-              - "python/sglang/kernels/**"
+              - "python/sglang/kernels/!(*.md)"
+              - "python/sglang/kernels/!(aot)/**"
               - "test/registered/kernels/**"
               - ".github/workflows/pr-test-amd.yml"
             multimodal_gen:
@@ -266,15 +269,15 @@ jobs:
               "$@"
             fi
           }
-          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_align.py
-          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_softmax.py
-          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests/speculative ci_sglang python3 -m pytest test_eagle_utils.py
-          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_apply_token_bitmask_inplace.py
-          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_activation.py
-          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_topk.py
-          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_kvcacheio.py
-          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_sigmoid.py
-          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
+          run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_moe_align.py
+          run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_moe_topk_softmax.py
+          run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests/speculative ci_sglang python3 -m pytest test_eagle_utils.py
+          run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_apply_token_bitmask_inplace.py
+          run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_activation.py
+          run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_topk.py
+          run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_kvcacheio.py
+          run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_moe_topk_sigmoid.py
+          run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
           exit $failures
 
   sgl-kernel-unit-test-2-gpu-amd:
@@ -681,7 +684,7 @@ jobs:
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
@@ -821,7 +824,7 @@ jobs:
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
@@ -960,7 +963,7 @@ jobs:
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 

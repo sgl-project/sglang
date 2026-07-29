@@ -1706,6 +1706,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "XLMRobertaModel" in model_architectures
         or "XLMRobertaForSequenceClassification" in model_architectures
         or "Gemma2ForSequenceClassification" in model_architectures
+        or "Lfm2BidirectionalModel" in model_architectures
     ):
         return False
     else:
