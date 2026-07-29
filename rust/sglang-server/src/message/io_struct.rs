@@ -5,7 +5,6 @@
 
 use bytes::Bytes;
 use serde::Serialize;
-use serde::ser::{SerializeMap, SerializeStruct}; // codespell:ignore ser
 
 use super::types::{Tagged, control_messages, wire_struct};
 use super::{GenerateRequest, SamplingParams, TokenIds};
@@ -22,7 +21,7 @@ wire_struct! {
         input_embeds: (),
         mm_inputs: (),
         token_type_ids: (),
-        sampling_params: SamplingParamsMap<'a>,
+        sampling_params: &'a SamplingParams,
         return_logprob: bool,
         logprob_start_len: i64,
         top_logprobs_num: i64,
@@ -51,202 +50,6 @@ control_messages! {
     GetInternalStateReq {}
 }
 
-/// `SamplingParams` in its header slot, serialized as a msgspec **map**.
-///
-/// Python's `SamplingParams` is a plain msgspec Struct (not `array_like`), so it
-/// must be a map inside the otherwise-positional header — but `rmp_serde` writes
-/// every struct positionally. Carrying that as a NEWTYPE rather than a
-/// `#[serde(serialize_with = ...)]` attribute keeps the requirement in the type,
-/// where the wire generator can see it: the macro emits the `BaseReq` preamble by
-/// hand, and a derive-only field attribute would be silently ignored there.
-///
-/// It used to route through `serde_json::Value`, whose `Serialize` emits a map.
-/// That kept the field list in one place but cost 897 ns and 22 allocations per
-/// request — 84% of the whole header encode — to build a tree walked once and
-/// dropped, and it deep-cloned `custom_params` (arbitrary client JSON) on top of
-/// the clone the batch fan-out already makes. [`StructAsMap`] gets the same result
-/// by intercepting the one call the derive makes.
-#[derive(Debug)]
-pub(super) struct SamplingParamsMap<'a>(pub(super) &'a SamplingParams);
-
-impl Serialize for SamplingParamsMap<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize(StructAsMap(serializer))
-    }
-}
-
-/// A `Serializer` that writes a struct as a MAP and forwards everything else
-/// unchanged.
-///
-/// `rmp_serde`'s struct encoding is positional, which is right for the header's
-/// outer struct and wrong for the one field that has to match a Python msgspec
-/// `Struct`. Only the top-level `serialize_struct` is ever reached — the derive
-/// hands each field VALUE to the wrapped serializer directly — so every other
-/// method delegates, and the compiler enforces that none was forgotten.
-struct StructAsMap<S>(S);
-
-impl<S: serde::Serializer> serde::Serializer for StructAsMap<S> {
-    type Ok = S::Ok;
-    type Error = S::Error;
-    type SerializeSeq = S::SerializeSeq;
-    type SerializeTuple = S::SerializeTuple;
-    type SerializeTupleStruct = S::SerializeTupleStruct;
-    type SerializeTupleVariant = S::SerializeTupleVariant;
-    type SerializeMap = S::SerializeMap;
-    /// The interception: a struct is serialized through the map writer, so the
-    /// derive's `serialize_field` calls land as `key: value` pairs.
-    type SerializeStruct = MapAsStruct<S::SerializeMap>;
-    type SerializeStructVariant = S::SerializeStructVariant;
-
-    fn serialize_struct(
-        self,
-        _name: &'static str,
-        len: usize,
-    ) -> Result<Self::SerializeStruct, Self::Error> {
-        self.0.serialize_map(Some(len)).map(MapAsStruct)
-    }
-
-    fn serialize_bool(self, v: bool) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_bool(v)
-    }
-    fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_i8(v)
-    }
-    fn serialize_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_i16(v)
-    }
-    fn serialize_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_i32(v)
-    }
-    fn serialize_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_i64(v)
-    }
-    fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_u8(v)
-    }
-    fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_u16(v)
-    }
-    fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_u32(v)
-    }
-    fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_u64(v)
-    }
-    fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_f32(v)
-    }
-    fn serialize_f64(self, v: f64) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_f64(v)
-    }
-    fn serialize_char(self, v: char) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_char(v)
-    }
-    fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_str(v)
-    }
-    fn serialize_bytes(self, v: &[u8]) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_bytes(v)
-    }
-    fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_none()
-    }
-    fn serialize_some<T: ?Sized + Serialize>(self, v: &T) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_some(v)
-    }
-    fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_unit()
-    }
-    fn serialize_unit_struct(self, n: &'static str) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_unit_struct(n)
-    }
-    fn serialize_unit_variant(
-        self,
-        n: &'static str,
-        i: u32,
-        v: &'static str,
-    ) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_unit_variant(n, i, v)
-    }
-    fn serialize_newtype_struct<T: ?Sized + Serialize>(
-        self,
-        n: &'static str,
-        v: &T,
-    ) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_newtype_struct(n, v)
-    }
-    fn serialize_newtype_variant<T: ?Sized + Serialize>(
-        self,
-        n: &'static str,
-        i: u32,
-        var: &'static str,
-        v: &T,
-    ) -> Result<Self::Ok, Self::Error> {
-        self.0.serialize_newtype_variant(n, i, var, v)
-    }
-    fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
-        self.0.serialize_seq(len)
-    }
-    fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, Self::Error> {
-        self.0.serialize_tuple(len)
-    }
-    fn serialize_tuple_struct(
-        self,
-        n: &'static str,
-        len: usize,
-    ) -> Result<Self::SerializeTupleStruct, Self::Error> {
-        self.0.serialize_tuple_struct(n, len)
-    }
-    fn serialize_tuple_variant(
-        self,
-        n: &'static str,
-        i: u32,
-        v: &'static str,
-        len: usize,
-    ) -> Result<Self::SerializeTupleVariant, Self::Error> {
-        self.0.serialize_tuple_variant(n, i, v, len)
-    }
-    fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
-        self.0.serialize_map(len)
-    }
-    fn serialize_struct_variant(
-        self,
-        n: &'static str,
-        i: u32,
-        v: &'static str,
-        len: usize,
-    ) -> Result<Self::SerializeStructVariant, Self::Error> {
-        self.0.serialize_struct_variant(n, i, v, len)
-    }
-}
-
-/// Adapts a map writer to the `SerializeStruct` interface, so the derive's
-/// `serialize_field(name, value)` becomes `serialize_entry(name, value)`.
-struct MapAsStruct<M>(M);
-
-impl<M: SerializeMap> SerializeStruct for MapAsStruct<M> {
-    type Ok = M::Ok;
-    type Error = M::Error;
-
-    fn serialize_field<T: ?Sized + Serialize>(
-        &mut self,
-        key: &'static str,
-        value: &T,
-    ) -> Result<(), Self::Error> {
-        self.0.serialize_entry(key, value)
-    }
-
-    /// `skip_serializing_if` reaches this instead of `serialize_field`; a map has
-    /// no fixed arity, so an omitted field simply is not written.
-    fn skip_field(&mut self, _key: &'static str) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        self.0.end()
-    }
-}
-
 /// Borrow a request as its wire struct, resolving `Option` scalars to the wire
 /// defaults Python's own fields carry. Borrowed, not owned: every field is a
 /// reference into `req`, so an owning `From` would return references to a
@@ -264,7 +67,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             input_embeds: (),
             mm_inputs: (),
             token_type_ids: (),
-            sampling_params: SamplingParamsMap(&req.sampling_params),
+            sampling_params: &req.sampling_params,
             return_logprob: req.return_logprob,
             logprob_start_len: req.logprob_start_len,
             top_logprobs_num: req.top_logprobs_num,
@@ -348,7 +151,9 @@ mod tests {
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
         assert!(arr[7].is_nil(), "idx 7 must be token_type_ids (nil)");
-        assert!(arr[8].is_map(), "sampling_params must land at idx 8");
+        // An ARRAY, not a map: Python's `SamplingParams` is
+        // `msgspec.Struct(array_like=True)`, so it decodes positionally.
+        assert!(arr[8].is_array(), "sampling_params must land at idx 8");
         assert_eq!(arr[9].as_bool(), Some(true), "return_logprob at idx 9");
         assert_eq!(arr[11].as_u64(), Some(3), "top_logprobs_num at idx 11");
         assert_eq!(arr[13].as_bool(), Some(true), "stream at idx 13");

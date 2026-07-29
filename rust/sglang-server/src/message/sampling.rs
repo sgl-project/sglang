@@ -100,14 +100,14 @@ pub struct SamplingParams {
     #[serde(default = "max_new_tokens_default")]
     pub max_new_tokens: Option<i64>,
     /// API input alias, copied to `stop_strs` then cleared by `normalize`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub stop: Option<OneOrMany<String>>,
     /// Python `Optional[Set[int]]`. A `null` *element* is a 400 here where Python
     /// filters it out — a typed list can't hold one, and it is malformed input.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub stop_token_ids: Option<Vec<i64>>,
     /// API input alias, copied to `stop_regex_strs` then cleared by `normalize`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub stop_regex: Option<OneOrMany<String>>,
     #[serde(
         default = "f64_one::default",
@@ -154,13 +154,13 @@ pub struct SamplingParams {
         deserialize_with = "i64_one::deserialize"
     )]
     pub n: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub json_schema: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub regex: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub ebnf: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub structural_tag: Option<String>,
     #[serde(
         default = "bool_false::default",
@@ -182,18 +182,18 @@ pub struct SamplingParams {
         deserialize_with = "bool_false::deserialize"
     )]
     pub no_stop_trim: bool,
-    /// Opaque JSON object forwarded to a custom logit processor. Python types it
-    /// as `Dict[str, JsonScalar | list | dict]`; it is never inspected here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub custom_params: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub stream_interval: Option<i64>,
     /// Token id (as a string key, matching Python) → bias. Keys are vocab-bounded
     /// by [`verify`](Self::verify).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub logit_bias: Option<BTreeMap<String, f64>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub sampling_seed: Option<i64>,
+    /// Opaque JSON object forwarded to a custom logit processor. Python types it
+    /// as `Dict[str, JsonScalar | list | dict]`; it is never inspected here.
+    #[serde(default)]
+    pub custom_params: Option<serde_json::Value>,
 
     // --- Internal fields (populated by the pipeline below, not API-facing) ---
     //
@@ -530,6 +530,7 @@ fn take_one_or_many(v: Option<OneOrMany<String>>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     /// End to end through the path `/generate` takes: a bounded `stop_regex`
     /// reaches the wire with its real length, and a malformed one is a 400.
@@ -621,9 +622,11 @@ mod tests {
         assert_eq!(get(&w, "top_k").unwrap().as_i64(), Some(TOP_K_ALL));
         assert_eq!(get(&w, "is_normalized").unwrap().as_bool(), Some(true));
         assert_eq!(get(&w, "stop_str_max_len").unwrap().as_i64(), Some(0));
-        // Unset optionals are omitted, so msgspec applies the Python defaults.
-        assert_eq!(get(&w, "regex"), None);
-        assert_eq!(get(&w, "stop"), None);
+        // Unset optionals ride as null, NOT omitted: the msgpack wire is
+        // positional (`array_like=True`), so a skipped field would shift every
+        // later one. JSON keeps the names, which is what this test is about.
+        assert!(get(&w, "regex").unwrap().is_null());
+        assert!(get(&w, "stop").unwrap().is_null());
     }
 
     /// `max_new_tokens` is the one field where absent and null differ: absent =
@@ -637,89 +640,124 @@ mod tests {
         assert_eq!(sp.min_new_tokens, 4096);
     }
 
-    /// The scheduler decodes this map with msgspec, which **silently drops**
-    /// unknown keys — so a field renamed on one side only is invisible at runtime:
-    /// the request succeeds with that sampling param quietly not applied. That is
-    /// the drift this file's header warns about, so pin the key vocabulary; a
-    /// rename or addition then has to be a deliberate edit here too.
+    /// The 30 wire slots, in Python's declaration order.
     ///
-    /// The two sets are separate because the `Option` fields are
-    /// `skip_serializing_if`: absent from a default request, present once set.
-    /// Both must stay in sync with `sampling_params.py` (30 fields there).
-    #[test]
-    fn serialized_key_set_is_pinned() {
-        /// Always on the wire: every non-`Option` field.
-        const ALWAYS: &[&str] = &[
-            "frequency_penalty",
-            "ignore_eos",
-            "is_normalized",
-            "max_new_tokens",
-            "min_new_tokens",
-            "min_p",
-            "n",
-            "no_stop_trim",
-            "presence_penalty",
-            "repetition_penalty",
-            "skip_special_tokens",
-            "spaces_between_special_tokens",
-            "stop_regex_max_len",
-            "stop_regex_strs",
-            "stop_str_max_len",
-            "stop_strs",
-            "temperature",
-            "top_k",
-            "top_p",
-        ];
-        /// Emitted only when set (`skip_serializing_if = "Option::is_none"`).
-        const OPTIONAL: &[&str] = &[
-            "custom_params",
-            "ebnf",
-            "json_schema",
-            "logit_bias",
-            "regex",
-            "sampling_seed",
-            "stop",
-            "stop_regex",
-            "stop_token_ids",
-            "stream_interval",
-            "structural_tag",
-        ];
+    /// `SamplingParams` is `msgspec.Struct(array_like=True)` on the Python side, so
+    /// the header carries an ARRAY and every field is identified by POSITION. Two
+    /// things follow, and both are asserted below: the order must match
+    /// `SamplingParams.__struct_fields__` exactly, and no field may be omitted —
+    /// a `skip_serializing_if` anywhere would shorten the array and shift every
+    /// later field onto the wrong scheduler slot.
+    ///
+    /// KEEP IN SYNC with `sampling_params.py`. This list is an external-source
+    /// literal: it is the Python declaration order, not this file's.
+    const WIRE_ORDER: &[&str] = &[
+        "max_new_tokens",
+        "stop",
+        "stop_token_ids",
+        "stop_regex",
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "repetition_penalty",
+        "min_new_tokens",
+        "n",
+        "json_schema",
+        "regex",
+        "ebnf",
+        "structural_tag",
+        "ignore_eos",
+        "skip_special_tokens",
+        "spaces_between_special_tokens",
+        "no_stop_trim",
+        "stream_interval",
+        "logit_bias",
+        "sampling_seed",
+        "custom_params",
+        "stop_strs",
+        "stop_regex_strs",
+        "stop_str_max_len",
+        "stop_regex_max_len",
+        "is_normalized",
+    ];
 
-        let keys = |sp: &SamplingParams| -> Vec<String> {
-            let v = wire(sp);
-            let mut k: Vec<String> = v.as_object().expect("a map").keys().cloned().collect();
-            k.sort();
-            k
+    /// Every field reaches the wire, at the position Python expects.
+    ///
+    /// Each slot is given a DISTINCT value so a swap of two same-typed neighbours
+    /// is caught by value, not just by arity — the failure mode a length check
+    /// alone would wave through. Regression for the map-vs-array break: this used
+    /// to serialize as a map, which `array_like=True` rejects outright
+    /// (`Expected array, got object`), so every generate request failed to decode.
+    #[test]
+    fn wire_is_positional_and_complete() {
+        let sp = SamplingParams {
+            max_new_tokens: Some(11),
+            stop_token_ids: Some(vec![12]),
+            temperature: 0.13,
+            top_p: 0.14,
+            top_k: 15,
+            min_p: 0.16,
+            frequency_penalty: 0.17,
+            presence_penalty: 0.18,
+            repetition_penalty: 0.19,
+            min_new_tokens: 20,
+            n: 1,
+            json_schema: Some("22".into()),
+            regex: Some("23".into()),
+            ebnf: Some("24".into()),
+            structural_tag: Some("25".into()),
+            ignore_eos: true,
+            skip_special_tokens: false,
+            spaces_between_special_tokens: false,
+            no_stop_trim: true,
+            stream_interval: Some(30),
+            sampling_seed: Some(31),
+            ..Default::default()
         };
+        let buf = rmp_serde::to_vec(&sp).expect("serializes");
+        let v = rmpv::decode::read_value(&mut &buf[..]).expect("decodes");
+        let arr = v
+            .as_array()
+            .expect("array_like=True means an ARRAY, not a map");
 
         assert_eq!(
-            keys(&SamplingParams::default()),
-            ALWAYS,
-            "unset key set drifted"
+            arr.len(),
+            WIRE_ORDER.len(),
+            "every field must be emitted: a shorter array shifts later fields onto \
+             the wrong scheduler slot"
         );
-
-        // Every optional populated. Parsed, not normalized: `normalize` moves the
-        // `stop`/`stop_regex` aliases into `stop_strs`/`stop_regex_strs` and clears
-        // them, so a normalized request never carries all 30 at once.
-        let full: SamplingParams = serde_json::from_str(
-            r#"{
-                "stop": "x", "stop_token_ids": [1], "stop_regex": "y",
-                "json_schema": "{}", "regex": "a", "ebnf": "b", "structural_tag": "t",
-                "custom_params": {"k": 1}, "stream_interval": 2,
-                "logit_bias": {"3": 1.0}, "sampling_seed": 4
-            }"#,
-        )
-        .expect("parses");
-        let mut expected: Vec<&str> = ALWAYS.iter().chain(OPTIONAL).copied().collect();
-        expected.sort();
-        assert_eq!(keys(&full), expected, "populated key set drifted");
-        assert_eq!(expected.len(), 30, "sampling_params.py declares 30 fields");
+        // Spot-check the positions whose neighbours share a type, where a swap
+        // would otherwise be invisible.
+        let at = |name: &str| WIRE_ORDER.iter().position(|f| *f == name).unwrap();
+        assert_eq!(arr[at("max_new_tokens")].as_i64(), Some(11));
+        assert_eq!(arr[at("temperature")].as_f64(), Some(0.13));
+        assert_eq!(arr[at("top_p")].as_f64(), Some(0.14));
+        assert_eq!(arr[at("top_k")].as_i64(), Some(15));
+        assert_eq!(arr[at("min_p")].as_f64(), Some(0.16));
+        assert_eq!(arr[at("frequency_penalty")].as_f64(), Some(0.17));
+        assert_eq!(arr[at("presence_penalty")].as_f64(), Some(0.18));
+        assert_eq!(arr[at("repetition_penalty")].as_f64(), Some(0.19));
+        assert_eq!(arr[at("json_schema")].as_str(), Some("22"));
+        assert_eq!(arr[at("regex")].as_str(), Some("23"));
+        assert_eq!(arr[at("ebnf")].as_str(), Some("24"));
+        assert_eq!(arr[at("structural_tag")].as_str(), Some("25"));
+        assert_eq!(arr[at("ignore_eos")].as_bool(), Some(true));
+        assert_eq!(arr[at("skip_special_tokens")].as_bool(), Some(false));
+        assert_eq!(arr[at("no_stop_trim")].as_bool(), Some(true));
+        assert_eq!(arr[at("stream_interval")].as_i64(), Some(30));
+        assert_eq!(arr[at("sampling_seed")].as_i64(), Some(31));
+        // Unset optionals ride as nil rather than being skipped.
+        assert!(arr[at("stop")].is_nil());
+        assert!(arr[at("logit_bias")].is_nil());
+        assert!(arr[at("custom_params")].is_nil());
+        // `normalize` outputs occupy the tail.
+        assert!(arr[at("stop_strs")].is_array());
+        assert_eq!(arr[at("is_normalized")].as_bool(), Some(false));
     }
 
-    /// Each range check rejects, and rejects for the *stated* reason — the message
-    /// must name the offending field, so a mis-ordered or copy-pasted check (e.g.
-    /// `presence_penalty` guarded by the `frequency_penalty` bound) can't pass by
-    /// merely erroring.
     #[test]
     fn verify_rejects_out_of_range() {
         for (json, want) in [
