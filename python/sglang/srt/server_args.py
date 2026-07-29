@@ -4371,9 +4371,28 @@ class ServerArgs:
             if predicate():
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
-    def _disable_breakable_cudagraph_if_incompatible(self):
-        from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
+    def _supports_breakable_prefill_cp(self) -> bool:
+        resolved = self._resolved()
+        prefill_attention_backend, _ = self._resolved_attention_backends()
+        return (
+            self.enable_prefill_cp
+            and resolved.attn_cp_size == self.tp_size
+            and self.cp_strategy == "zigzag"
+            and prefill_attention_backend == "trtllm_mha"
+            and self.get_model_config().hf_config.architectures == ["GptOssForCausalLM"]
+        )
 
+    def _supports_breakable_moe_a2a(self) -> bool:
+        resolved = self._resolved()
+        if resolved.moe_a2a_backend == "none":
+            return True
+        return (
+            resolved.moe_a2a_backend == "flashinfer"
+            and self.moe_runner_backend == "flashinfer_trtllm_routed"
+            and self._supports_breakable_prefill_cp()
+        )
+
+    def _disable_breakable_cudagraph_if_incompatible(self):
         """Breakable (segmented capture, no torch.compile). Breakable enforces
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
@@ -4392,7 +4411,8 @@ class ServerArgs:
             # CP all_gather replay size mismatch under BCG.
             (
                 "context parallel (attn_cp_size > 1)",
-                lambda: self._resolved().attn_cp_size > 1,
+                lambda: self._resolved().attn_cp_size > 1
+                and not self._supports_breakable_prefill_cp(),
             ),
             # Capture builds a dummy extend forward with attn_dcp_metadata=None.
             (
@@ -4402,7 +4422,7 @@ class ServerArgs:
             # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
             (
                 "MoE A2A backend",
-                lambda: _resolved_view(self).moe_a2a_backend != "none",
+                lambda: not self._supports_breakable_moe_a2a(),
             ),
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
