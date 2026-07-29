@@ -1024,12 +1024,6 @@ class AscendAttnBackend(AttentionBackend):
         if trim_eager_padding:
             q_nope = q_nope[:num_token_non_padded]
             q_pe = q_pe[:num_token_non_padded]
-            if topk_indices is not None:
-                assert topk_indices.shape[0] >= num_token_non_padded, (
-                    "NPU DSA topk_indices has fewer rows than the unpadded query: "
-                    f"{topk_indices.shape[0]} < {num_token_non_padded}"
-                )
-                topk_indices = topk_indices[:num_token_non_padded]
 
         if is_prefill:
             if self.forward_metadata.actual_seq_lengths_q is not None:
