@@ -29,6 +29,11 @@ if TYPE_CHECKING:
     )
 
 
+def _normalize_gpu_uuid(uuid: str) -> str:
+    # NVML prefixes uuids with "GPU-"/"MIG-"; torch device properties do not.
+    return uuid.removeprefix("MIG-").removeprefix("GPU-").lower()
+
+
 class GPUWorkerPostTrainingMixin:
     def update_weights_from_disk(
         self,
@@ -167,11 +172,11 @@ class GPUWorkerPostTrainingMixin:
             return None, "serialized_named_tensors must be a list"
         if not payloads:
             return None, "serialized_named_tensors is required"
-        if len(payloads) == 1:
-            return payloads[0], None
 
-        world_group = get_world_group()
         if payload_gpu_uuids is None:
+            if len(payloads) == 1:
+                return payloads[0], None
+            world_group = get_world_group()
             if len(payloads) != world_group.world_size:
                 return None, (
                     f"serialized_named_tensors size must be 1 or world_size "
@@ -185,10 +190,13 @@ class GPUWorkerPostTrainingMixin:
                 f"got {len(payload_gpu_uuids)} for {len(payloads)} payloads"
             )
 
-        own_gpu_uuid = current_platform.get_device_uuid(self.local_rank)
-        if own_gpu_uuid not in payload_gpu_uuids:
+        own_gpu_uuid = _normalize_gpu_uuid(
+            current_platform.get_device_uuid(self.local_rank)
+        )
+        normalized_uuids = [_normalize_gpu_uuid(uuid) for uuid in payload_gpu_uuids]
+        if own_gpu_uuid not in normalized_uuids:
             return None, (
                 f"no payload was exported from this worker's GPU {own_gpu_uuid}, "
                 f"got {payload_gpu_uuids}"
             )
-        return payloads[payload_gpu_uuids.index(own_gpu_uuid)], None
+        return payloads[normalized_uuids.index(own_gpu_uuid)], None
