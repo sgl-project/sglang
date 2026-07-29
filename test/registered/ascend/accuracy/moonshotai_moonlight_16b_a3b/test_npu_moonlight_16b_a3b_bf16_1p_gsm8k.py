@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    TestAscendAccuracyTestCaseBase,
+    TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     MOONLIGHT_16B_A3B_MODEL_PATH,
@@ -55,11 +55,11 @@ MODEL_OTHER_ARGS = [
 ]
 
 
-class TestNPUMoonlight16B_A3B_GSM8K(TestAscendAccuracyTestCaseBase):
+class TestNPUMoonlight16B_A3B_GSM8K(TestNpuAccuracyTestCaseBase):
     model = MOONLIGHT_16B_A3B_MODEL_PATH
     envs = MODEL_ENVS
     other_args = MODEL_OTHER_ARGS
-    accuracy = 0.8
+    accuracy = 0.8370
     datasets = ["gsm8k"]
     few_shot_num = 5
     generation_config = {"max_tokens": 7168, "temperature": 1.0}

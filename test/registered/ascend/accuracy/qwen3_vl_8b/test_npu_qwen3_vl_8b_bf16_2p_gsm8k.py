@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    TestAscendAccuracyTestCaseBase,
+    TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     QWEN3_VL_8B_MODEL_PATH,
@@ -63,11 +63,11 @@ QWEN3_VL_8B_OTHER_ARGS = [
 ]
 
 
-class TestNPUQwen3_VL_8B_GSM8K(TestAscendAccuracyTestCaseBase):
+class TestNPUQwen3_VL_8B_GSM8K(TestNpuAccuracyTestCaseBase):
     model = QWEN3_VL_8B_MODEL_PATH
     envs = QWEN3_VL_8B_ENVS
     other_args = QWEN3_VL_8B_OTHER_ARGS
-    accuracy = 0.77
+    accuracy = 0.9553
     datasets = ["gsm8k"]
     few_shot_num = 5
     generation_config = {

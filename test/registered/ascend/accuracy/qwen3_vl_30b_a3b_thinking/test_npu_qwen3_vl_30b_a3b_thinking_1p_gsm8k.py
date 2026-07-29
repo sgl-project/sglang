@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    TestAscendAccuracyTestCaseBase,
+    TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     QWEN3_VL_30B_A3B_THINKING_MODEL_PATH,
@@ -55,11 +55,11 @@ OTHER_ARGS = [
 ]
 
 
-class TestNPUQwen3VL_30B_A3B_Thinking_1P_GSM8K(TestAscendAccuracyTestCaseBase):
+class TestNPUQwen3VL_30B_A3B_Thinking_1P_GSM8K(TestNpuAccuracyTestCaseBase):
     model = QWEN3_VL_30B_A3B_THINKING_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS
-    accuracy = 0.84
+    accuracy = 0.9674
     datasets = ["gsm8k"]
     few_shot_num = 5
     generation_config = {"max_tokens": 65536}

@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    TestAscendAccuracyTestCaseBase,
+    TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH,
@@ -49,7 +49,7 @@ OTHER_ARGS = [
 ]
 
 
-class TestNPUGLM5_Top64_Pruned_GSM8K(TestAscendAccuracyTestCaseBase):
+class TestNPUGLM5_Top64_Pruned_GSM8K(TestNpuAccuracyTestCaseBase):
 
     model = GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH
     envs = ENVS

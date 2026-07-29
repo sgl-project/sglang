@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    TestAscendAccuracyTestCaseBase,
+    TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import GLM_4_7_FLASH_MODEL_PATH
 from sglang.test.ci.ci_register import register_npu_ci
@@ -57,12 +57,12 @@ OTHER_ARGS = [
 ]
 
 
-class TestNPUGlm4_7Flash_1P_GSM8K(TestAscendAccuracyTestCaseBase):
+class TestNPUGlm4_7Flash_1P_GSM8K(TestNpuAccuracyTestCaseBase):
 
     model = GLM_4_7_FLASH_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS
-    accuracy = 0.86
+    accuracy = 0.9560
     datasets = ["gsm8k"]
     few_shot_num = 5
     generation_config = {"max_tokens": 65536, "temperature": 1.0}
