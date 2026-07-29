@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_gfx942_supported,
+    is_hcu,
     is_xpu,
     next_power_of_2,
 )
@@ -56,6 +57,7 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_gfx942 = is_gfx942_supported()
 _is_xpu = is_xpu()
+_is_hcu = is_hcu()
 
 if _is_cuda:
     from sgl_kernel.utils import is_arch_support_pdl
@@ -987,9 +989,15 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
+        custom_mask_numel = max_num_tokens * self.max_context_len
+        if _is_hcu:
+            # EAGLE verify includes a per-request draft-token square in addition
+            # to the context mask. Keep the extra capacity HCU-only for now.
+            num_tokens_per_req = max_num_tokens // max_bs
+            custom_mask_numel += max_num_tokens * num_tokens_per_req
         if not self.skip_prefill and not self.is_draft_runner:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                custom_mask_numel,
                 dtype=torch.uint8,
                 device=self.device,
             )

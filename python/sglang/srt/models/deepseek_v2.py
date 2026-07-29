@@ -126,6 +126,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
@@ -200,6 +201,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    is_hcu,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -644,6 +646,11 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
+        self._hcu_triton_runner_applies_routed_scale = (
+            is_hcu()
+            and isinstance(self.experts.quant_method, UnquantizedFusedMoEMethod)
+            and self.experts.quant_method.runner.runner_backend.is_triton()
+        )
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
                 topk=config.num_experts_per_tok + self.num_fused_shared_experts,
@@ -981,6 +988,7 @@ class DeepseekV2MoE(nn.Module):
             not _is_cuda
             and not _is_musa
             and not _use_aiter
+            and not self._hcu_triton_runner_applies_routed_scale
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
             final_hidden_states *= self.routed_scaling_factor
@@ -1110,6 +1118,7 @@ class DeepseekV2MoE(nn.Module):
             and not _is_musa
             and not _is_xpu
             and not _use_aiter
+            and not self._hcu_triton_runner_applies_routed_scale
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
             # fused in biased_grouped_topk so we can skip here
