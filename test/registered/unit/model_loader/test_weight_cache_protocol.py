@@ -26,15 +26,18 @@ from sglang.srt.weight_cache.protocol import (
     IPC_QUANT_ALLOWLIST,
     CacheConfig,
     UnsupportedQuantForIPCError,
+    build_daemon_model_specs,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
     compute_global_rank,
     compute_local_gpu_id,
+    format_daemon_role,
     get_quant_method_name,
     get_ready_path,
     get_socket_path,
     hash_quant_config,
     is_ipc_quant_supported,
+    normalize_draft_model_idx,
     recv_msg,
     send_msg,
 )
@@ -126,6 +129,10 @@ class TestCacheConfig(CustomTestCase):
             ("revision", "v2"),
             ("device_capability", "9.0"),
             ("torch_version", "2.4.0"),
+            # A target daemon must never serve a draft worker (and vice versa),
+            # and multi-layer MTP heads must never cross-match.
+            ("is_draft_model", True),
+            ("draft_model_idx", 0),
         ):
             self.assertFalse(
                 base.matches(_make_cache_config(**{field: value})),
@@ -190,6 +197,29 @@ class TestGlobalRankAndPaths(CustomTestCase):
         self.assertTrue(get_socket_path(3).endswith("rank3.sock"))
         self.assertTrue(get_ready_path(3).endswith("rank3.ready"))
 
+    def test_draft_paths_never_collide_with_target(self):
+        # The draft daemon shares the rank with the target daemon on the same
+        # GPU, so only the "_draft{idx}" suffix keeps their sockets apart.
+        self.assertEqual(format_daemon_role(False), "")
+        self.assertEqual(format_daemon_role(True), "_draft0")
+        self.assertEqual(format_daemon_role(True, 2), "_draft2")
+        self.assertNotEqual(get_socket_path(3), get_socket_path(3, is_draft_model=True))
+        self.assertTrue(
+            get_socket_path(3, is_draft_model=True).endswith("rank3_draft0.sock")
+        )
+        self.assertTrue(
+            get_ready_path(3, is_draft_model=True, draft_model_idx=1).endswith(
+                "rank3_draft1.ready"
+            )
+        )
+
+    def test_normalize_draft_model_idx(self):
+        # None (single-draft, unfiltered weights) must stay distinguishable
+        # from head 0 of the multi-layer path.
+        self.assertEqual(normalize_draft_model_idx(None), -1)
+        self.assertEqual(normalize_draft_model_idx(0), 0)
+        self.assertEqual(normalize_draft_model_idx(3), 3)
+
     def test_compute_local_gpu_id_honors_base_and_step(self):
         # Single-node TP=4: identity mapping rank -> gpu.
         self.assertEqual(
@@ -209,6 +239,54 @@ class TestGlobalRankAndPaths(CustomTestCase):
             ),
             4,
         )
+
+
+class TestDaemonModelSpecs(CustomTestCase):
+    """The per-rank daemon set shared by the engine and the CLI launcher."""
+
+    def test_target_only_without_speculative(self):
+        specs = build_daemon_model_specs(
+            model_path="/models/demo",
+            quantization="fp8",
+            revision="v1",
+            target_dist_init_method="tcp://127.0.0.1:1000",
+        )
+        self.assertEqual(len(specs), 1)
+        self.assertFalse(specs[0].is_draft_model)
+        self.assertEqual(specs[0].role, "")
+
+    def test_speculative_adds_draft_spec_with_model_config_fallbacks(self):
+        # Draft path/revision fall back to the target's, mirroring
+        # ModelConfig.from_server_args — that equality is what makes the
+        # daemon-side fingerprint match the draft worker's.
+        specs = build_daemon_model_specs(
+            model_path="/models/demo",
+            quantization="fp8",
+            revision="v1",
+            target_dist_init_method="tcp://127.0.0.1:1000",
+            speculative_algorithm="EAGLE",
+            speculative_draft_model_quantization="fp8",
+            draft_dist_init_method="tcp://127.0.0.1:1001",
+        )
+        self.assertEqual(len(specs), 2)
+        draft = specs[1]
+        self.assertTrue(draft.is_draft_model)
+        self.assertEqual(draft.model_path, "/models/demo")
+        self.assertEqual(draft.revision, "v1")
+        self.assertEqual(draft.role, "_draft0")
+        self.assertEqual(draft.dist_init_method, "tcp://127.0.0.1:1001")
+
+    def test_speculative_requires_separate_draft_rendezvous(self):
+        # Target and draft daemons form separate process groups; sharing one
+        # init method would deadlock, so omitting the draft endpoint must raise.
+        with self.assertRaises(ValueError):
+            build_daemon_model_specs(
+                model_path="/models/demo",
+                quantization=None,
+                revision=None,
+                target_dist_init_method="tcp://127.0.0.1:1000",
+                speculative_algorithm="EAGLE",
+            )
 
 
 class TestIpcQuantAllowlist(CustomTestCase):
