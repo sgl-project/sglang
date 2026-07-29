@@ -1285,13 +1285,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 cu_seqlens_q,
                 cache_seqlens,
                 max_seqlen_q,
+                *,
                 cu_seqlens_kv,
+                use_zigzag_page_table=False,
             ):
+                block_tables = (
+                    self._get_zigzag_layer_page_table(layer)
+                    if use_zigzag_page_table
+                    else page_table
+                )
                 return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                     query=q_chunk,
                     kv_cache=kv_cache,
                     workspace_buffer=self.workspace_buffer,
-                    block_tables=page_table,
+                    block_tables=block_tables,
                     seq_lens=cache_seqlens,
                     max_q_len=max_seqlen_q,
                     max_kv_len=self.max_context_len,
