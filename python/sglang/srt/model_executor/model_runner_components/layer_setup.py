@@ -70,6 +70,7 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
             # Loop models: one RadixAttention per loop; expand for layer_id indexing.
             if isinstance(attn_layer, nn.ModuleList):
                 attention_layers.extend(attn_layer)
+                mha_companion_layers.extend([mha_companion_layer] * len(attn_layer))
                 has_loop_attn = True
             else:
                 attention_layers.append(attn_layer)
