@@ -66,9 +66,13 @@ class TestLoadBackDurationMetric(CustomTestCase):
             num_tokens=1024,
             timing_enabled=True,
         )
+        protected_host_nodes = [MagicMock()]
         stub = SimpleNamespace(
             cache_controller=SimpleNamespace(ack_load_queue=[ack]),
-            ongoing_load_back={1: object(), 2: object()},
+            ongoing_load_back={
+                1: (object(), protected_host_nodes),
+                2: (object(), []),
+            },
             dec_lock_ref=MagicMock(),
             metrics_collector=MagicMock(),
             pp_rank=0,
@@ -83,6 +87,7 @@ class TestLoadBackDurationMetric(CustomTestCase):
         stub.metrics_collector.observe_load_back_duration.assert_called_once()
         (observed,), _ = stub.metrics_collector.observe_load_back_duration.call_args
         self.assertGreater(observed, 0.0)
+        protected_host_nodes[0].release_host.assert_called_once()
         self.assertEqual(stub.cache_controller.ack_load_queue, [])
 
     def test_loading_check_fallback_when_timing_unsupported(self):
@@ -102,9 +107,10 @@ class TestLoadBackDurationMetric(CustomTestCase):
             num_tokens=512,
             timing_enabled=False,
         )
+        protected_host_node = MagicMock()
         stub = SimpleNamespace(
             cache_controller=SimpleNamespace(ack_load_queue=[ack]),
-            ongoing_load_back={7: object()},
+            ongoing_load_back={7: (object(), [protected_host_node])},
             dec_lock_ref=MagicMock(),
             metrics_collector=MagicMock(),
             pp_rank=0,
@@ -117,6 +123,7 @@ class TestLoadBackDurationMetric(CustomTestCase):
             512
         )
         stub.metrics_collector.observe_load_back_duration.assert_not_called()
+        protected_host_node.release_host.assert_called_once()
         self.assertEqual(stub.cache_controller.ack_load_queue, [])
 
 
