@@ -2243,6 +2243,7 @@ class Indexer(MultiPlatformOp):
         )
         if trim_eager_padding:
             q = q[:num_token_non_padded]
+            bs = q.shape[0]
 
         if is_prefill:
             if (
@@ -2289,14 +2290,14 @@ class Indexer(MultiPlatformOp):
                     num_draft_tokens = get_attn_backend().speculative_num_draft_tokens
                     actual_seq_lengths_q = torch.arange(
                         num_draft_tokens,
-                        num_draft_tokens + q.shape[0],
+                        num_draft_tokens + bs,
                         num_draft_tokens,
                         dtype=torch.int32,
                         device=k.device,
                     )
                 else:
                     actual_seq_lengths_q = torch.tensor(
-                        [1 + i * 1 for i in range(q.shape[0])],
+                        [1 + i * 1 for i in range(bs)],
                         dtype=torch.int32,
                         device=k.device,
                     )
