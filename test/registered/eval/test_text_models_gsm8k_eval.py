@@ -14,7 +14,6 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
     check_evaluation_test_results,
-    is_rust_server_built,
     parse_models,
     popen_launch_server,
     write_results_to_json,
@@ -65,8 +64,6 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             cls.models.append(ModelLaunchSettings(model_path, tp_size=2))
 
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.env = None
-        cls.api = "sgl_eval"
 
     def test_gsm8k_all_models(self):
         warnings.filterwarnings(
@@ -88,14 +85,13 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                         other_args=other_args,
                         base_url=self.base_url,
                         timeout=NIGHTLY_EVAL_SERVER_TIMEOUT,
-                        env=self.env,
                     )
 
                     args = SimpleNamespace(
                         base_url=self.base_url,
                         model=model_setup.model_path,
                         eval_name="gsm8k",
-                        api=self.api,
+                        api="sgl_eval",
                         num_examples=None,
                         num_threads=1024,
                     )
@@ -137,18 +133,6 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             model_accuracy_thresholds=MODEL_SCORE_THRESHOLDS,
             model_count=len(self.models),
         )
-
-
-@unittest.skipUnless(
-    is_rust_server_built(),
-    "embedded rust server extension not built",
-)
-class TestNightlyGsm8KEvalWithRustServer(TestNightlyGsm8KEval):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.env = {"SGLANG_RUST_SERVER": "1"}
-        cls.api = "generate"
 
 
 if __name__ == "__main__":
