@@ -50,6 +50,7 @@ from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
+    build_local_pixel_values_for_dp_encoder,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
@@ -600,16 +601,23 @@ class Glm4vForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in GLM-V, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
+        # in GLM-V, last dim is the same. Non-local items' feature may have been
+        # dropped to None by the DP-encoder pre-H2D sharding; concat only the
+        # locally-owned shard.
+        fallback_device = next(self.visual.parameters()).device
+        pixel_values, dp_encoder_owner_ranks = build_local_pixel_values_for_dp_encoder(
+            items, dtype=self.visual.dtype, fallback_device=fallback_device
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         if self.use_data_parallel:
             return run_dp_sharded_mrope_vision_model(
-                self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
+                self.visual,
+                pixel_values,
+                image_grid_thw.tolist(),
+                rope_type="rope_3d",
+                owner_ranks=dp_encoder_owner_ranks,
             )
         else:
             image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
