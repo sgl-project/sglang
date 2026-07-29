@@ -448,7 +448,10 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # Must inject before prefill returns: the scheduler may update radix
         # afterward, invalidating out_cache_loc.
-        device = next_token_ids.device
+        # Non-last PP ranks return PPProxyTensors and do not sample tokens, so
+        # next_token_ids is None there. Positions are still needed for local
+        # draft-KV injection, and should live on this worker's device.
+        device = self.device
         ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
         draft_seq_lens = torch.tensor(
             batch.prefix_lens, dtype=torch.int32, device=device
