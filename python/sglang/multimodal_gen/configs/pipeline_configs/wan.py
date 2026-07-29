@@ -240,6 +240,7 @@ class Wan2_2_TI2V_5B_Config(WanT2V480PConfig, WanI2VCommonConfig):
     flow_shift: float | None = 5.0
     task_type: ModelTaskType = ModelTaskType.TI2V
     expand_timesteps: bool = True
+    vae_decode_precision: str = "fp32"
     # ti2v, 5B
     vae_stride = (4, 16, 16)
 
@@ -270,6 +271,7 @@ class FastWan2_2_TI2V_5B_Config(Wan2_2_TI2V_5B_Config):
 class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
     flow_shift: float | None = 12.0
     boundary_ratio: float | None = 0.875
+    vae_decode_precision: str = "fp32"
 
     def __post_init__(self) -> None:
         self.dit_config.boundary_ratio = self.boundary_ratio
@@ -280,6 +282,7 @@ class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
 class Wan2_2_I2V_A14B_Config(WanI2V720PConfig):
     flow_shift: float | None = 5.0
     boundary_ratio: float | None = 0.900
+    vae_decode_precision: str = "fp32"
 
     def __post_init__(self) -> None:
         super().__post_init__()
