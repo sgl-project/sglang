@@ -397,12 +397,16 @@ mod tests {
         };
         let rt = start(cfg).expect("start runtime");
 
-        // ~3MB of input_ids + an unknown field: deny_unknown_fields fails it
-        // fast at the JSON layer with a 400 — proving the body got past any
-        // size limit (a 413 would fire before parsing).
+        // ~3MB of input_ids plus a `text`, which is mutually exclusive with them:
+        // the body parses in full and is then rejected by `into_requests` with a
+        // 400, proving it got past any size limit (a 413 would fire before
+        // parsing). The rejection must come from OUR validation, not from serde —
+        // an unknown field used to serve here, but unknown fields are now ignored
+        // to match Python, so such a body would be accepted, dispatched to a ring
+        // nobody drains in this test, and hang the connection.
         let ids = "1,".repeat(1_500_000);
         let body = format!(
-            r#"{{"input_ids":[{}1],"bogus":1,"sampling_params":{{"max_new_tokens":1}}}}"#,
+            r#"{{"input_ids":[{}1],"text":"x","sampling_params":{{"max_new_tokens":1}}}}"#,
             ids
         );
         assert!(body.len() > 2 * 1024 * 1024, "test body must exceed 2MB");
@@ -425,8 +429,8 @@ mod tests {
             .nth(1)
             .and_then(|c| c.parse().ok())
             .unwrap_or(0);
-        // 422 (axum Json unknown-field rejection) proves the body was parsed;
-        // 413 would mean it was rejected on size before parsing.
+        // A 400 from the mutually-exclusive-inputs check proves the body was read
+        // and parsed in full; 413 would mean it was rejected on size beforehand.
         assert!(
             (400..500).contains(&code) && code != 413,
             "expected a JSON-layer 4xx (not 413), got: {status_line}"
