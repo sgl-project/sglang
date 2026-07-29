@@ -1028,7 +1028,7 @@ class ComposedPipelineBase(ABC):
         )
 
     @torch.no_grad()
-    def forward_batch_iter(
+    def forward_batch_sequentially(
         self,
         batches: list[Req],
         server_args: ServerArgs,
