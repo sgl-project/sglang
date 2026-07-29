@@ -314,7 +314,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
 
 BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "torch"]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
@@ -922,13 +922,42 @@ class ServerArgs:
             help=(
                 "The eviction policy of radix trees. 'lru' stands for Least "
                 "Recently Used, 'lfu' stands for Least Frequently Used, 'slru' "
-                "stands for Segmented Least Recently Used, and 'priority' evicts "
-                "lower-priority requests first."
+                "stands for Segmented Least Recently Used, 'priority' evicts "
+                "lower-priority requests first, and 'tlru' stands for "
+                "Tail-Optimized LRU (arXiv:2510.15152), which evicts the part of "
+                "a conversation that cannot affect tail TTFT before falling back "
+                "to LRU."
             ),
             choices=RADIX_EVICTION_POLICY_CHOICES,
         ),
         NS("memory"),
     ] = "lru"
+    tlru_threshold: A[
+        int,
+        Arg(
+            help=(
+                "Tail-latency threshold xi for --radix-eviction-policy tlru, in "
+                "tokens: a conversation only keeps enough cache to hold its next "
+                "prefill under xi uncached tokens, and the rest of its tail is "
+                "evicted first. Convert from a TTFT target by dividing it by the "
+                "measured ms per uncached token. Note the paper states xi in "
+                "blocks, so multiply its values by --page-size."
+            ),
+        ),
+        NS("memory"),
+    ] = 0
+    tlru_next_prompt_estimate: A[
+        int,
+        Arg(
+            help=(
+                "Estimated tokens the next turn of a conversation will add, in "
+                "tokens, for --radix-eviction-policy tlru; use the trace's "
+                "empirical mean. Only the difference (xi - this) affects "
+                "behaviour, and values at or above xi reduce T-LRU to plain LRU."
+            ),
+        ),
+        NS("memory"),
+    ] = 0
     prefill_only_disable_kv_cache: A[
         bool,
         "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
@@ -8145,6 +8174,22 @@ class ServerArgs:
                 "--disaggregation-decode-retraction-backup=host_pool requires "
                 "--disable-priority-preemption when priority scheduling is enabled."
             )
+
+        if self.radix_eviction_policy == "tlru":
+            # The tail bookkeeping T-LRU needs only exists on the unified tree, and
+            # the legacy tree would silently fall back to LRU ordering.
+            if not envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+                raise ValueError(
+                    "--radix-eviction-policy tlru requires the unified radix tree. "
+                    "Set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1."
+                )
+            if self.tlru_threshold <= self.tlru_next_prompt_estimate:
+                raise ValueError(
+                    "--radix-eviction-policy tlru needs --tlru-threshold greater than "
+                    f"--tlru-next-prompt-estimate, got {self.tlru_threshold} <= "
+                    f"{self.tlru_next_prompt_estimate}; otherwise no tokens are ever "
+                    "TEL-safe and T-LRU is exactly LRU."
+                )
 
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
