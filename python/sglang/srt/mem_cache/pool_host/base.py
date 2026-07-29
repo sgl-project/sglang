@@ -192,11 +192,18 @@ class HostKVCache(abc.ABC):
         return (device_pool.layer_num + shard_size - 1) // shard_size
 
     def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
+        if layer_id >= self.device_pool.layer_num:
+            return True
         start, end = self._device_owned_layer_range(device_pool)
         return start <= layer_id < end
 
     def _host_layer_index(self, layer_id: int, device_pool=None) -> int:
-        """Map a full local device layer id to its compacted host-buffer slot."""
+        """Map a CP-agnostic packed layer id to its host-buffer slot."""
+        target_device_layer_num = self.device_pool.layer_num
+        if layer_id >= target_device_layer_num:
+            draft_layer_id = layer_id - target_device_layer_num
+            return self.target_layer_num + draft_layer_id
+
         start, _ = self._device_owned_layer_range(device_pool)
         return layer_id - start
 

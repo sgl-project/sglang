@@ -2552,7 +2552,9 @@ def create_custom_parallel_group(
     local_config = sorted(list(set(group_ranks)))
     gathered_configs = [None for _ in range(world_size)]
 
-    torch.distributed.all_gather_object(gathered_configs, local_config)
+    torch.distributed.all_gather_object(
+        gathered_configs, local_config, group=get_world_group().cpu_group
+    )
 
     unique_groups = []
     seen_signatures = set()

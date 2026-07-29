@@ -520,6 +520,15 @@ class HybridCacheController(BaseHiCacheController):
                         i,
                         self.io_backend,
                     )
+                if self.has_mtp_draft and i < len(self.mtp_draft_device_pools):
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mtp_draft_device_pools[i],
+                        host_indices,
+                        device_indices,
+                        self.mtp_draft_transfer_layer_start + i,
+                        self.io_backend,
+                        pool_transfers=resolved_pool_transfers,
+                    )
                 producer_event.complete(i)
             ack_finish_event.record()
             self._record_transfer_indices_on_stream(

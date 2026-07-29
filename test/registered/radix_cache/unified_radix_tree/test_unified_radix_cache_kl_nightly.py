@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
 GLM5_MODEL = "zai-org/GLM-5.2-FP8"
 GLM5_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=900, suite="nightly-8-gpu-h200", nightly=True)
+register_cuda_ci(est_time=1200, suite="nightly-8-gpu-h200", nightly=True)
 
 
 class AccuracyTwoPassMixin:
@@ -191,6 +191,8 @@ class TestGLM5HiRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
 class TestGLM5UnifiedRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
     """GLM-5.2-FP8 + HiCache L3 (file backend), with UnifiedRadixTree."""
 
+    extra_server_args = ()
+
     @classmethod
     def setUpClass(cls):
         cls.model = GLM5_MODEL
@@ -223,6 +225,7 @@ class TestGLM5UnifiedRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
                 "page_first",
                 "--hicache-storage-backend",
                 "file",
+                *cls.extra_server_args,
             ],
             env={
                 "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
@@ -235,6 +238,71 @@ class TestGLM5UnifiedRadixCacheL3Accuracy(AccuracyTwoPassMixin, CustomTestCase):
         kill_process_tree(cls.process.pid)
         if os.path.isdir(cls.hicache_dir):
             shutil.rmtree(cls.hicache_dir, ignore_errors=True)
+
+
+class TestGLM5UnifiedRadixCacheL3SpecAccuracy(TestGLM5UnifiedRadixCacheL3Accuracy):
+    """GLM-5.2-FP8 + MTP + HiCache L3, with UnifiedRadixTree."""
+
+    min_second_to_first_accept_ratio = 0.9
+    extra_server_args = (
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+    )
+
+    @unittest.skip("The non-speculative class already covers the full GSM8K run.")
+    def test_gsm8k_two_passes(self):
+        pass
+
+    def test_l3_prefetch_full_prefix_hit_after_flush(self):
+        from sglang.test.kl_test_utils import _flush_cache, _generate
+
+        page = int(self.l3_prefetch_page_size)
+        n_tokens = page * int(self.l3_prefetch_prompt_pages)
+        max_uncached = int(
+            self.l3_prefetch_max_uncached_tokens
+            if self.l3_prefetch_max_uncached_tokens is not None
+            else page
+        )
+
+        rng = random.Random(987)
+        input_ids = [rng.randint(1, 30000) for _ in range(n_tokens)]
+
+        first = _generate(self.base_url, [input_ids], max_new_tokens=128)[0]
+        first_meta = first["meta_info"]
+        self.assertIn("spec_accept_length", first_meta)
+        first_accept_length = float(first_meta["spec_accept_length"])
+        self.assertGreater(
+            first_accept_length,
+            1.0,
+            f"Expected MTP to accept draft tokens, got {first_accept_length=:.3f}",
+        )
+
+        _flush_cache(self.base_url)
+        second = _generate(self.base_url, [input_ids], max_new_tokens=128)[0]
+        second_meta = second["meta_info"]
+        self.assertIn("spec_accept_length", second_meta)
+        second_accept_length = float(second_meta["spec_accept_length"])
+        cached = int(second_meta["cached_tokens"])
+
+        expected_min = n_tokens - max_uncached
+        self.assertGreaterEqual(
+            cached,
+            expected_min,
+            f"cached_tokens={cached} < {expected_min} "
+            f"(= input_len - {max_uncached})",
+        )
+        self.assertGreaterEqual(
+            second_accept_length,
+            first_accept_length * self.min_second_to_first_accept_ratio,
+            "Spec accept length dropped after L3 load-back: "
+            f"{first_accept_length=:.3f}, {second_accept_length=:.3f}",
+        )
 
 
 if __name__ == "__main__":

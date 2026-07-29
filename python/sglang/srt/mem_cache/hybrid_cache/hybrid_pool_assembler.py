@@ -57,6 +57,19 @@ def _make_layer_mapper(
     return mapper
 
 
+def _with_mtp_layer_mapping(
+    layer_mapping: dict[int, int],
+    *,
+    transfer_layer_start: int,
+    target_device_layer_num: int,
+    draft_layer_num: int,
+) -> dict[int, int]:
+    return layer_mapping | {
+        transfer_layer_start + depth: target_device_layer_num + depth
+        for depth in range(draft_layer_num)
+    }
+
+
 def build_kv_host_pool(
     *,
     kv_pool: Any,
@@ -65,6 +78,7 @@ def build_kv_host_pool(
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
     host_size: Optional[float] = None,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
 ):
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
@@ -72,6 +86,8 @@ def build_kv_host_pool(
     kwargs = {}
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
+    if mtp_draft_device_pools:
+        kwargs["mtp_draft_device_pools"] = mtp_draft_device_pools
     return kv_host_pool_cls(
         kv_pool,
         server_args.hicache_ratio,
@@ -147,14 +163,24 @@ def build_kv_only_stack(
         server_args=server_args,
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
+        mtp_draft_device_pools=params.mtp_draft_device_pools,
     )
+    if params.mtp_draft_device_pools:
+        full_layer_mapping = _with_mtp_layer_mapping(
+            full_layer_mapping,
+            transfer_layer_start=transfer_layer_num,
+            target_device_layer_num=kv_pool.layer_num,
+            draft_layer_num=len(params.mtp_draft_device_pools),
+        )
+
     entries = [
         build_pool_entry(
             name=PoolName.KV,
             host_pool=kv_host_pool,
             device_pool=kv_pool,
             layer_mapping=full_layer_mapping,
-            transfer_layer_num=transfer_layer_num,
+            transfer_layer_num=transfer_layer_num
+            + len(params.mtp_draft_device_pools),
             is_anchor=True,
         )
     ]
@@ -177,6 +203,12 @@ def build_kv_only_stack(
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
     )
+    if params.mtp_draft_device_pools:
+        cache_controller.set_mtp_draft_pools(
+            transfer_layer_start=transfer_layer_num,
+            device_pools=params.mtp_draft_device_pools,
+        )
+
     return host_pool_group, cache_controller
 
 
@@ -199,11 +231,20 @@ def build_hybrid_swa_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
+    # MTP draft pools follow the target SWA layout; select their SWA storage.
+    mtp_swa_device_pools = tuple(
+        pool.swa_kv_pool for pool in params.mtp_draft_device_pools
+    )
+
     kv_host_size = swa_host_size = None
     if server_args.hicache_size > 0:
-        kv_host_size, swa_host_size = _split_hicache_size(
-            server_args.hicache_size, (full_kv_pool, swa_kv_pool)
+        host_sizes = _split_hicache_size(
+            server_args.hicache_size,
+            (full_kv_pool, swa_kv_pool, *mtp_swa_device_pools),
         )
+        kv_host_size = host_sizes[0]
+        swa_host_size = sum(host_sizes[1:])
+
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
         page_size=params.page_size,
@@ -217,7 +258,16 @@ def build_hybrid_swa_stack(
         server_args=server_args,
         use_mla=use_mla,
         host_size=swa_host_size,
+        mtp_draft_device_pools=mtp_swa_device_pools,
     )
+
+    if mtp_swa_device_pools:
+        swa_layer_mapping = _with_mtp_layer_mapping(
+            swa_layer_mapping,
+            transfer_layer_start=transfer_layer_num,
+            target_device_layer_num=swa_kv_pool.layer_num,
+            draft_layer_num=len(mtp_swa_device_pools),
+        )
 
     # For SWA hybrid, the device alloc/free goes through the inner swa_attn_allocator
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
@@ -235,7 +285,7 @@ def build_hybrid_swa_stack(
             host_pool=swa_host_pool,
             device_pool=swa_kv_pool,
             layer_mapping=swa_layer_mapping,
-            transfer_layer_num=transfer_layer_num,
+            transfer_layer_num=transfer_layer_num + len(mtp_swa_device_pools),
             host_evict_fn=host_swa_evict_fn,
             device_evict_fn=device_swa_evict_fn,
             device_alloc_fn=swa_attn_allocator.alloc,
@@ -261,6 +311,11 @@ def build_hybrid_swa_stack(
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
     )
+    if mtp_swa_device_pools:
+        cache_controller.set_mtp_draft_pools(
+            transfer_layer_start=transfer_layer_num,
+            device_pools=mtp_swa_device_pools,
+        )
     return host_pool_group, cache_controller
 
 
@@ -319,6 +374,7 @@ def build_deepseek_v4_hicache_stack(
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
 
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
+    mtp_swa_device_buffers = []
     if is_unified_kv:
         # unified_kv keeps the SWA ring inside the unified pool and never offloads it,
         # so there is no separate SWA host pool to map.
@@ -333,6 +389,17 @@ def build_deepseek_v4_hicache_stack(
         swa_layer_mapping = {
             layer_id: layer_id for layer_id in range(transfer_layer_num)
         }
+        # DSV4 NextN drafts are single uncompressed SWA layers. Keep them after
+        # the target SWA layers so the existing paged host pool transfers both.
+        mtp_swa_device_buffers = [
+            pool.swa_kv_pool.kv_buffer[0] for pool in params.mtp_draft_device_pools
+        ]
+        swa_layer_mapping = _with_mtp_layer_mapping(
+            swa_layer_mapping,
+            transfer_layer_start=transfer_layer_num,
+            target_device_layer_num=transfer_layer_num,
+            draft_layer_num=len(mtp_swa_device_buffers),
+        )
 
     c4_layer_mapping = {}
     c128_layer_mapping = {}
@@ -377,7 +444,10 @@ def build_deepseek_v4_hicache_stack(
     if not is_unified_kv:
         swa_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.SWA),
-            device_buffers=kvcache.swa_kv_pool.kv_buffer,
+            device_buffers=[
+                *kvcache.swa_kv_pool.kv_buffer,
+                *mtp_swa_device_buffers,
+            ],
             item_bytes=kvcache.swa_kv_pool.bytes_per_page_padded,
             num_host_pages=swa_num_host_pages,
             slot_page_size=kvcache.swa_page_size,
@@ -391,7 +461,7 @@ def build_deepseek_v4_hicache_stack(
                 host_pool=swa_host_pool,
                 device_pool=kvcache.swa_kv_pool,
                 layer_mapping=swa_layer_mapping,
-                transfer_layer_num=transfer_layer_num,
+                transfer_layer_num=transfer_layer_num + len(mtp_swa_device_buffers),
                 host_evict_fn=host_swa_evict_fn,
                 device_evict_fn=device_swa_evict_fn,
                 device_alloc_fn=swa_attn_allocator.alloc,
@@ -529,6 +599,11 @@ def build_deepseek_v4_hicache_stack(
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
     )
+    if mtp_swa_device_buffers:
+        cache_controller.set_mtp_draft_pools(
+            transfer_layer_start=transfer_layer_num,
+            device_pools=mtp_swa_device_buffers,
+        )
     return host_pool_group, cache_controller
 
 
@@ -730,21 +805,34 @@ def build_anchor_sidecar_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
+    mtp_draft_device_pools = (
+        params.mtp_draft_device_pools if use_mla else ()
+    )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
         server_args=server_args,
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
+        mtp_draft_device_pools=mtp_draft_device_pools,
     )
     sidecar_host_pool = sidecar_host_pool_factory(kv_host_pool)
+    # Let HostPoolGroup dispatch packed MTP tail layers through the normal path.
+    if mtp_draft_device_pools:
+        full_layer_mapping = _with_mtp_layer_mapping(
+            full_layer_mapping,
+            transfer_layer_start=transfer_layer_num,
+            target_device_layer_num=kv_pool.layer_num,
+            draft_layer_num=len(mtp_draft_device_pools),
+        )
     entries = [
         build_pool_entry(
             name=PoolName.KV,
             host_pool=kv_host_pool,
             device_pool=kv_pool,
             layer_mapping=full_layer_mapping,
-            transfer_layer_num=transfer_layer_num,
+            transfer_layer_num=transfer_layer_num
+            + len(mtp_draft_device_pools),
             is_anchor=True,
         ),
         build_pool_entry(
@@ -752,7 +840,8 @@ def build_anchor_sidecar_stack(
             host_pool=sidecar_host_pool,
             device_pool=kv_pool,
             layer_mapping=full_layer_mapping,
-            transfer_layer_num=transfer_layer_num,
+            transfer_layer_num=transfer_layer_num
+            + len(mtp_draft_device_pools),
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
@@ -774,6 +863,11 @@ def build_anchor_sidecar_stack(
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
     )
+    if mtp_draft_device_pools:
+        cache_controller.set_mtp_draft_pools(
+            transfer_layer_start=transfer_layer_num,
+            device_pools=mtp_draft_device_pools,
+        )
     return host_pool_group, cache_controller
 
 

@@ -85,6 +85,23 @@ class BaseSpecWorker(ABC):
                 req_to_token_pool=req_to_token_pool,
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             )
+            target_model_runner = self.target_worker.model_runner
+            spec_algorithm = target_model_runner.spec_algorithm
+            # HiCache packs built-in MTP layers into the target host page, so
+            # expose their pools before the target cache is built.
+            if (
+                spec_algorithm.is_eagle()
+                and not spec_algorithm.is_eagle3()
+                and not spec_algorithm.is_frozen_kv_mtp()
+            ):
+                draft_runners = self.draft_worker.draft_runners
+                if all(
+                    runner.model_config.num_nextn_predict_layers
+                    for runner in draft_runners
+                ):
+                    target_model_runner.mtp_draft_device_pools = tuple(
+                        runner.token_to_kv_pool for runner in draft_runners
+                    )
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 

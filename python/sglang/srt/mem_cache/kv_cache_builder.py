@@ -83,6 +83,16 @@ def maybe_register_hicache_draft(
     if not enable_hierarchical_cache:
         return
 
+    cache_controller = tree_cache.cache_controller
+    # Packed MTP device pools already share the target host-pool page. Do not
+    # register a second draft host pool for the same device buffers.
+    if cache_controller.has_mtp_draft:
+        logger.info(
+            "Skipping separate HiCache draft pool registration because MTP "
+            "draft pools are packed into the target host pool."
+        )
+        return
+
     draft_kv_pool = get_draft_kv_pool(
         draft_worker=draft_worker,
         spec_algorithm=spec_algorithm,
@@ -105,7 +115,7 @@ def maybe_register_hicache_draft(
 
     # Create host pool for draft with the same slot count as the target host pool,
     # so that host indices stay 1-to-1 between target and draft KV caches.
-    primary = tree_cache.cache_controller.mem_pool_host
+    primary = cache_controller.mem_pool_host
     kw = dict(
         host_to_device_ratio=primary.size / pool.size,
         host_size=0,
@@ -172,6 +182,7 @@ def build_kv_cache(
         )
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
+    mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
 
     disable_radix_cache = server_args.disable_radix_cache or (
         model_config.is_multimodal and uses_transformers_backend
@@ -233,6 +244,7 @@ def build_kv_cache(
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        mtp_draft_device_pools=mtp_draft_device_pools,
     )
 
     tree_cache = create_tree_cache(

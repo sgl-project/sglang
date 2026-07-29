@@ -178,6 +178,34 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             ),
         )
 
+    def test_layer_sharded_mla_backup_includes_unsharded_mtp_layers(self):
+        target_pool = _device_pool_stub(layer_num=8)
+        target_pool.layer_shard_enabled = True
+        target_pool._owned_local_layer_range = mock.Mock(return_value=(2, 4))
+        draft_pools = (
+            _device_pool_stub(layer_num=1),
+            _device_pool_stub(layer_num=1),
+        )
+        host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        host.target_layer_num = 2
+        host.mtp_draft_device_pools = draft_pools
+        host._backup_from_device_per_layer = mock.Mock()
+
+        host.backup_from_device_all_layer(
+            target_pool,
+            _indices(0, 1),
+            _indices(1, 2),
+            io_backend="kernel",
+        )
+
+        calls = host._backup_from_device_per_layer.call_args_list
+        self.assertEqual(
+            [call.args[3] for call in calls],
+            [2, 3, 8, 9],
+        )
+        self.assertIs(calls[0].args[0], target_pool)
+        self.assertIs(calls[2].args[0], draft_pools[0])
+
     def test_mha_backup_then_load_roundtrip_uses_staged(self):
         layer_num = 2
         head_num = 1
@@ -215,9 +243,12 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         )
 
         host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host.device_pool = device_pool
         host.layout = "page_first"
         host.page_size = 1
         host.layer_num = layer_num
+        host.target_layer_num = layer_num
+        host.mtp_draft_device_pools = ()
         host.head_num = head_num
         host.head_dim = head_dim
         host.element_dim = head_num * head_dim
@@ -317,6 +348,8 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         host.layout = "page_first"
         host.page_size = 1
         host.layer_num = layer_num
+        host.target_layer_num = layer_num
+        host.mtp_draft_device_pools = ()
         host.kv_cache_dim = kv_cache_dim
         host.token_stride_size = kv_cache_dim
         host.layout_dim = host.token_stride_size * layer_num
@@ -607,6 +640,8 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         host.layout = "page_first"
         host.page_size = page_size
         host.layer_num = layer_num
+        host.target_layer_num = layer_num
+        host.mtp_draft_device_pools = ()
         host.indexer_page_stride_size = indexer_page_stride_size
         host.indexer_layout_dim = host.layer_num * host.indexer_page_stride_size
         host.index_k_device_ptrs = torch.tensor(
@@ -671,6 +706,63 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
 
         self.assertEqual(group.layout, "page_first")
         self.assertTrue(group.can_use_write_back_jit)
+
+    def test_host_pool_group_uses_controller_device_pool_override_for_mtp(self):
+        target_anchor_pool = object()
+        target_sidecar_pool = object()
+        draft_pool = object()
+        anchor_host_pool = mock.Mock()
+        sidecar_host_pool = mock.Mock()
+        group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=anchor_host_pool,
+                    device_pool=target_anchor_pool,
+                    layer_mapper=lambda layer_id: layer_id,
+                    is_primary_index_anchor=True,
+                ),
+                PoolEntry(
+                    name=PoolName.INDEXER,
+                    host_pool=sidecar_host_pool,
+                    device_pool=target_sidecar_pool,
+                    layer_mapper=lambda layer_id: layer_id,
+                ),
+            ]
+        )
+        host_indices = _indices(0, 1)
+        device_indices = _indices(1, 2)
+        pool_transfers = [
+            PoolTransfer(
+                name=PoolName.INDEXER,
+                host_indices=host_indices,
+                device_indices=device_indices,
+            )
+        ]
+
+        group.load_to_device_per_layer(
+            target_anchor_pool,
+            host_indices,
+            device_indices,
+            2,
+            "kernel",
+            pool_transfers=pool_transfers,
+        )
+        self.assertIs(anchor_host_pool.load_to_device_per_layer.call_args.args[0], target_anchor_pool)
+        self.assertIs(sidecar_host_pool.load_to_device_per_layer.call_args.args[0], target_sidecar_pool)
+
+        anchor_host_pool.reset_mock()
+        sidecar_host_pool.reset_mock()
+        group.load_to_device_per_layer(
+            draft_pool,
+            host_indices,
+            device_indices,
+            2,
+            "kernel",
+            pool_transfers=pool_transfers,
+        )
+        self.assertIs(anchor_host_pool.load_to_device_per_layer.call_args.args[0], draft_pool)
+        self.assertIs(sidecar_host_pool.load_to_device_per_layer.call_args.args[0], draft_pool)
 
     def test_write_back_jit_hybrid_write_keeps_extra_host_indices_on_cpu(self):
         captured = {}

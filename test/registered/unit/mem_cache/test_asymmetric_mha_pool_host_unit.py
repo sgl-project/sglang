@@ -6,6 +6,9 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    _with_mtp_layer_mapping,
+)
 from sglang.srt.mem_cache.pool_host.mha import (
     AsymmetricMHATokenToKVPoolHost,
     MHATokenToKVPoolHost,
@@ -26,6 +29,8 @@ def _make_host(layout: str) -> AsymmetricMHATokenToKVPoolHost:
     host.head_dim = 4
     host.v_head_dim = 6
     host.dtype = torch.float16
+    host.mtp_draft_device_pools = ()
+    host.target_layer_num = host.layer_num
 
     if layout == "page_first":
         k_dims = (8, host.layer_num, host.head_num, host.head_dim)
@@ -67,10 +72,24 @@ def _make_device_pool(host: AsymmetricMHATokenToKVPoolHost) -> SimpleNamespace:
         v_buffer=v_buffer,
         k_data_ptrs=torch.tensor([x.data_ptr() for x in k_buffer], dtype=torch.uint64),
         v_data_ptrs=torch.tensor([x.data_ptr() for x in v_buffer], dtype=torch.uint64),
+        layer_shard_enabled=False,
+        layer_num=host.layer_num,
     )
 
 
 class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
+    def test_mtp_transfer_ids_map_to_compact_host_tail(self):
+        target_mapping = {layer_id: layer_id for layer_id in range(8)}
+
+        packed_mapping = _with_mtp_layer_mapping(
+            target_mapping,
+            transfer_layer_start=10,
+            target_device_layer_num=8,
+            draft_layer_num=2,
+        )
+
+        self.assertEqual(packed_mapping, {**target_mapping, 10: 8, 11: 9})
+
     def test_factory_selects_asymmetric_pool_for_mismatched_kv_dims(self):
         symmetric_pool = SimpleNamespace(head_dim=4, v_head_dim=4)
         asymmetric_pool = SimpleNamespace(head_dim=4, v_head_dim=6)
