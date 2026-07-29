@@ -909,10 +909,25 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         server_args.moe_runner_backend == "auto"
     ):
         if is_sm100_supported() and server_args.moe_a2a_backend == "none":
-            overrides["moe_runner_backend"] = "flashinfer_trtllm"
-            logger.info(
-                f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
+            quantization_config = getattr(
+                model_config.hf_config, "quantization_config", {}
+            ) or {}
+            quantized_layers = quantization_config.get("quantized_layers", {})
+            has_mxfp8_layers = any(
+                info.get("quant_algo", "").upper() == "MXFP8"
+                for info in quantized_layers.values()
             )
+            if quantization == "modelopt_mixed" and has_mxfp8_layers:
+                overrides["moe_runner_backend"] = "marlin"
+                logger.info(
+                    "Use marlin as MoE runner backend on sm100 for "
+                    f"{model_arch} {quantization} with MXFP8 layers"
+                )
+            else:
+                overrides["moe_runner_backend"] = "flashinfer_trtllm"
+                logger.info(
+                    f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
+                )
         elif (
             (
                 model_config.quantization in ("modelopt_fp4", "modelopt_mixed")

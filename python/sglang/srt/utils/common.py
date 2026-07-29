@@ -4093,11 +4093,14 @@ def mxfp8_block_convert_required():
     lower and the gfx950 ``mfma_scale`` intrinsics are unavailable. So MXFP8
     checkpoints there are converted to block-fp8 [128,128] at load and run
     through the native block-fp8 kernels. gfx95 keeps its native MX path (this
-    returns False there).
+    returns False there). CUDA SM90 uses the same conversion because native
+    MXFP8 dense kernels require Blackwell.
     """
-    if not torch.version.hip:
-        return False
-    return is_gfx942_supported() and not is_gfx95_supported()
+    if torch.version.hip:
+        return is_gfx942_supported() and not is_gfx95_supported()
+    if is_cuda():
+        return (9, 0) <= get_device_capability() < (10, 0)
+    return False
 
 
 # LoRA-related constants and utilities

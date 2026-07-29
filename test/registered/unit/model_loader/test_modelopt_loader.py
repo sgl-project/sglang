@@ -16,12 +16,16 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
+    ModelOptFp8LinearMethod,
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4A16LinearMethod,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import get_device
@@ -636,7 +640,8 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             {
                 "quant_algo": "MIXED_PRECISION",
                 "quantized_layers": {
-                    "backbone.layers.0.mixer.in_proj": {"quant_algo": "FP8"},
+                    "backbone.layers.0.mixer.in_proj": {"quant_algo": "MXFP8"},
+                    "backbone.layers.0.mixer.out_proj": {"quant_algo": "FP8"},
                     "backbone.layers.1.mixer.experts.0.up_proj": {
                         "quant_algo": "NVFP4",
                         "group_size": 16,
@@ -656,8 +661,21 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
 
         self.assertEqual(
             quant_config._resolve_quant_algo("model.layers.0.mixer.in_proj"),
+            "MXFP8",
+        )
+        method = quant_config.get_quant_method(
+            LinearBase.__new__(LinearBase), "model.layers.0.mixer.in_proj"
+        )
+        self.assertIsInstance(method, Fp8LinearMethod)
+        self.assertTrue(method.quant_config.use_mxfp8)
+        self.assertEqual(
+            quant_config._resolve_quant_algo("model.layers.0.mixer.out_proj"),
             "FP8",
         )
+        method = quant_config.get_quant_method(
+            LinearBase.__new__(LinearBase), "model.layers.0.mixer.out_proj"
+        )
+        self.assertIsInstance(method, ModelOptFp8LinearMethod)
         self.assertEqual(
             quant_config._resolve_quant_algo("model.layers.1.mixer.experts"),
             "NVFP4",
@@ -666,6 +684,117 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             quant_config._resolve_quant_algo("model.layers.2.mixer.qkv_proj"),
             "FP8",
         )
+
+    def test_mixed_precision_qkv_resolution_infers_packed_shards(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "backbone.layers.2.mixer.q_proj": {"quant_algo": "MXFP8"},
+                    "backbone.layers.2.mixer.k_proj": {"quant_algo": "MXFP8"},
+                    "backbone.layers.2.mixer.v_proj": {"quant_algo": "MXFP8"},
+                },
+            }
+        )
+        quant_config.apply_weight_name_mapper(
+            WeightsMapper(orig_to_new_prefix={"backbone.": "model."})
+        )
+
+        self.assertEqual(
+            quant_config._resolve_quant_algo("model.layers.2.mixer.qkv_proj"),
+            "MXFP8",
+        )
+
+    def test_modelopt_mixed_auto_fp8_backend_uses_flashinfer_cutlass_on_sm100(self):
+        server_args = MagicMock()
+        server_args.fp8_gemm_runner_backend = "auto"
+        server_args.quantization = "modelopt_mixed"
+        original_backend = fp8_utils.FP8_GEMM_RUNNER_BACKEND
+
+        try:
+            with (
+                patch.object(fp8_utils, "_is_sm100_supported", True),
+                patch.object(fp8_utils, "is_flashinfer_available", return_value=True),
+                patch.object(fp8_utils, "is_sm120_supported", return_value=False),
+            ):
+                fp8_utils.initialize_fp8_gemm_config(server_args)
+
+            self.assertEqual(
+                fp8_utils.get_fp8_gemm_runner_backend(),
+                fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTLASS,
+            )
+        finally:
+            fp8_utils.FP8_GEMM_RUNNER_BACKEND = original_backend
+
+    def test_flashinfer_mxfp8_cutlass_pads_unaligned_output_shards(self):
+        captured = {}
+
+        def fake_quantize(input_2d, **_):
+            return (
+                torch.zeros_like(input_2d, dtype=torch.float8_e4m3fn),
+                torch.zeros(
+                    (input_2d.shape[0], input_2d.shape[1] // 32),
+                    device=input_2d.device,
+                    dtype=torch.uint8,
+                ),
+            )
+
+        def fake_block_scale_interleave(scale):
+            captured["scale_shape"] = tuple(scale.shape)
+            return scale
+
+        def fake_mm_mxfp8(
+            q_input,
+            weight_t,
+            _x_scale_u8,
+            weight_scale_t,
+            out_dtype,
+            **_,
+        ):
+            captured["weight_t_shape"] = tuple(weight_t.shape)
+            captured["weight_scale_shape"] = tuple(weight_scale_t.shape)
+            return torch.ones(
+                (q_input.shape[0], weight_t.shape[1]),
+                device=q_input.device,
+                dtype=out_dtype,
+            )
+
+        flashinfer_module = MagicMock()
+        flashinfer_module.block_scale_interleave.side_effect = (
+            fake_block_scale_interleave
+        )
+
+        with (
+            patch.dict("sys.modules", {"flashinfer": flashinfer_module}),
+            patch.object(
+                fp8_utils,
+                "get_fp8_gemm_runner_backend",
+                return_value=fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTLASS,
+            ),
+            patch.object(
+                fp8_utils,
+                "flashinfer_mxfp8_quantize",
+                side_effect=fake_quantize,
+                create=True,
+            ),
+            patch.object(
+                fp8_utils,
+                "flashinfer_mm_mxfp8",
+                side_effect=fake_mm_mxfp8,
+                create=True,
+            ),
+        ):
+            output = fp8_utils.flashinfer_mxfp8_blockscaled_linear(
+                input=torch.ones((1, 64), dtype=torch.bfloat16),
+                weight=torch.zeros((50, 64), dtype=torch.float8_e4m3fn),
+                weight_scale=torch.zeros((50, 2), dtype=torch.uint8),
+                weight_scale_fallback=torch.ones((50, 2), dtype=torch.uint8),
+            )
+
+        self.assertEqual(tuple(output.shape), (1, 50))
+        self.assertEqual(captured["weight_t_shape"], (64, 64))
+        self.assertEqual(captured["scale_shape"], (64, 2))
+        self.assertEqual(captured["weight_scale_shape"], (64, 2))
 
 
 if __name__ == "__main__":

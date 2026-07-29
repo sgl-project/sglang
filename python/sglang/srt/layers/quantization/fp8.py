@@ -115,8 +115,8 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
-# gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
-# block-fp8 [128,128] at load and run through the native block-fp8 kernels.
+# Some FP8-capable GPUs do not have native MX matmul HW; MXFP8 checkpoints are
+# converted to block-fp8 [128,128] at load and run through native block-fp8 kernels.
 _mxfp8_to_block_fp8_required = mxfp8_block_convert_required()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
@@ -287,6 +287,8 @@ class Fp8Config(QuantizationConfig):
         if self.use_mxfp8 and _is_hip and _is_gfx95_supported:
             return 95
         if self.use_mxfp8 and _mxfp8_to_block_fp8_required:
+            if _is_cuda:
+                return 89
             return 94
 
         return 100 if self.use_mxfp8 else 80
@@ -945,14 +947,18 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if self.use_mxfp8:
             backend = get_fp8_gemm_runner_backend()
+            extra_kwargs = {}
             if backend.is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
+                extra_kwargs["weight_scale_fallback"] = layer.weight_scale_inv
             elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
-            elif get_fp8_gemm_runner_backend().is_deep_gemm():
+                extra_kwargs["weight_scale_fallback"] = layer.weight_scale_inv
+            elif backend.is_deep_gemm():
                 weight_scale = getattr(
                     layer, "weight_scale_inv_deepgemm", layer.weight_scale_inv
                 )
+                extra_kwargs["weight_scale_fallback"] = layer.weight_scale_inv
                 if isinstance(x, tuple):
                     return self.w8a8_mxfp8_linear(
                         input=x[0],
@@ -960,7 +966,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         weight_scale=weight_scale,
                         input_scale=x[1],
                         bias=bias,
-                        weight_scale_fallback=layer.weight_scale_inv,
+                        **extra_kwargs,
                     )
                 return self.w8a8_mxfp8_linear(
                     input=x,
@@ -968,7 +974,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale=weight_scale,
                     input_scale=None,
                     bias=bias,
-                    weight_scale_fallback=layer.weight_scale_inv,
+                    **extra_kwargs,
                 )
             else:
                 weight_scale = layer.weight_scale_inv
@@ -979,6 +985,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale=weight_scale,
                     input_scale=x[1],
                     bias=bias,
+                    **extra_kwargs,
                 )
             return self.w8a8_mxfp8_linear(
                 input=x,
@@ -986,6 +993,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=weight_scale,
                 input_scale=None,
                 bias=bias,
+                **extra_kwargs,
             )
 
         if self.block_quant:

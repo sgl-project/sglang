@@ -14,7 +14,10 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.models.nemotron_h import NemotronHForCausalLM
+from sglang.srt.models.nemotron_h import (
+    NemotronHForCausalLM,
+    _maybe_remap_weight_scale_inv_name,
+)
 
 
 class _FakePPGroup:
@@ -132,6 +135,25 @@ class TestNemotronHWeightLoading(unittest.TestCase):
         )
         self.assertIsNone(
             skipped.loaded_weight, "non-MTP target weight should be skipped"
+        )
+
+    def test_mxfp8_weight_scale_name_remaps_to_scale_inv(self):
+        params_dict = {
+            "model.layers.0.mixer.in_proj.weight_scale_inv": object(),
+            "model.layers.5.mixer.qkv_proj.weight_scale_inv": object(),
+        }
+
+        self.assertEqual(
+            _maybe_remap_weight_scale_inv_name(
+                "model.layers.0.mixer.in_proj.weight_scale", params_dict
+            ),
+            "model.layers.0.mixer.in_proj.weight_scale_inv",
+        )
+        self.assertEqual(
+            _maybe_remap_weight_scale_inv_name(
+                "model.layers.5.mixer.qkv_proj.weight_scale", params_dict
+            ),
+            "model.layers.5.mixer.qkv_proj.weight_scale_inv",
         )
 
 

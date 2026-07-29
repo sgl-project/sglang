@@ -838,11 +838,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
 
-        def _hf(quant_algo="NVFP4"):
+        def _hf(quant_algo="NVFP4", quantized_layers=None):
             return SimpleNamespace(
                 architectures=["NemotronHForCausalLM"],
                 mlp_hidden_act="relu2",
-                quantization_config={"quant_algo": quant_algo},
+                quantization_config={
+                    "quant_algo": quant_algo,
+                    "quantized_layers": quantized_layers or {},
+                },
             )
 
         def _args(mc_quant, hf, **kw):
@@ -874,6 +877,23 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "quantization"
                 ],
                 "modelopt_mixed",
+            )
+            hf_mixed_mxfp8 = _hf(
+                "MIXED_PRECISION",
+                {
+                    "backbone.layers.0.mixer.in_proj": {"quant_algo": "MXFP8"},
+                    "backbone.layers.1.mixer.experts.0.up_proj": {
+                        "quant_algo": "NVFP4"
+                    },
+                },
+            )
+            self.assertEqual(
+                _nemotron_h_overrides(_args("modelopt", hf_mixed_mxfp8), hf_mixed_mxfp8),
+                {
+                    "quantization": "modelopt_mixed",
+                    "moe_runner_backend": "marlin",
+                    "attention_backend": "flashinfer",
+                },
             )
         with (
             patch.object(overrides_module, "is_sm100_supported", return_value=False),

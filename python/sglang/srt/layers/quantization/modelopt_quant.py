@@ -34,7 +34,11 @@ from sglang.srt.layers.quantization.fp4_utils import (
     fp4_quantize,
     get_fp4_gemm_runner_backend,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8 import (
+    Fp8Config,
+    Fp8LinearMethod,
+    Fp8MoEMethod,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_linear_bmm_flashinfer,
@@ -632,12 +636,14 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]],
         quantized_layers: Dict[str, Dict[str, Any]],
         fp8_config: ModelOptFp8Config,
+        mxfp8_config: Fp8Config,
         nvfp4_config: ModelOptFp4Config,
         nvfp4a16_config: ModelOptFp4Config,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
+        self.mxfp8_config = mxfp8_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
 
@@ -721,6 +727,14 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             exclude_modules=[],
             packed_modules_mapping=packed_modules_mapping,
         )
+        mxfp8_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            ignored_layers=[],
+            weight_block_size=[1, 32],
+            packed_modules_mapping=packed_modules_mapping,
+            use_mxfp8=True,
+        )
         nvfp4_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -743,12 +757,17 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             quantized_layers=quantized_layers,
             fp8_config=fp8_config,
+            mxfp8_config=mxfp8_config,
             nvfp4_config=nvfp4_config,
             nvfp4a16_config=nvfp4a16_config,
         )
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         super().apply_weight_name_mapper(hf_to_sglang_mapper)
+        self.fp8_config.apply_weight_name_mapper(hf_to_sglang_mapper)
+        self.mxfp8_config.apply_weight_name_mapper(hf_to_sglang_mapper)
+        self.nvfp4_config.apply_weight_name_mapper(hf_to_sglang_mapper)
+        self.nvfp4a16_config.apply_weight_name_mapper(hf_to_sglang_mapper)
         if self.quantized_layers:
             self.quantized_layers = hf_to_sglang_mapper.apply_dict(
                 self.quantized_layers
@@ -760,11 +779,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return self.quantized_layers[candidate]["quant_algo"].upper()
 
         proj_name = prefix.rsplit(".", 1)[-1]
-        if self.packed_modules_mapping and proj_name in self.packed_modules_mapping:
+        packed_modules_mapping = dict(self.packed_modules_mapping or {})
+        packed_modules_mapping.setdefault("qkv_proj", ["q_proj", "k_proj", "v_proj"])
+        if proj_name in packed_modules_mapping:
             algos = set()
             base = prefix.rsplit(".", 1)[0]
             for base_candidate in self._quantized_layer_prefix_candidates(base):
-                for shard_name in self.packed_modules_mapping[proj_name]:
+                for shard_name in packed_modules_mapping[proj_name]:
                     shard_prefix = f"{base_candidate}.{shard_name}"
                     if shard_prefix in self.quantized_layers:
                         algos.add(
@@ -820,6 +841,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
+            if quant_algo == "MXFP8":
+                return Fp8LinearMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
@@ -834,6 +857,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return None
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(self.fp8_config)
+            if quant_algo == "MXFP8":
+                return Fp8MoEMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":

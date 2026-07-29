@@ -108,6 +108,14 @@ if _is_cuda:
     )
 
 
+def _maybe_remap_weight_scale_inv_name(name: str, params_dict: dict) -> str:
+    if name in params_dict or not name.endswith(".weight_scale"):
+        return name
+
+    scale_inv_name = f"{name[: -len('.weight_scale')]}.weight_scale_inv"
+    return scale_inv_name if scale_inv_name in params_dict else name
+
+
 class NemotronHMLP(nn.Module):
     def __init__(
         self,
@@ -1150,6 +1158,8 @@ class NemotronHForCausalLM(nn.Module):
 
             if "scale" in name:
                 if name not in params_dict:
+                    name = _maybe_remap_weight_scale_inv_name(name, params_dict)
+                if name not in params_dict:
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:
                         continue
@@ -1177,6 +1187,7 @@ class NemotronHForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
+                name = _maybe_remap_weight_scale_inv_name(name, params_dict)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -1194,6 +1205,9 @@ class NemotronHForCausalLM(nn.Module):
                         continue
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
+                    name_mapped = _maybe_remap_weight_scale_inv_name(
+                        name_mapped, params_dict
+                    )
                     if name_mapped not in params_dict:
                         continue
                     param = params_dict[name_mapped]
@@ -1212,6 +1226,7 @@ class NemotronHForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+                    name = _maybe_remap_weight_scale_inv_name(name, params_dict)
                     if name in params_dict.keys():
                         param = params_dict[name]
                         weight_loader = getattr(

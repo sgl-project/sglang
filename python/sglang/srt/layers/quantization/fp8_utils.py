@@ -628,7 +628,7 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
 
     if (
         backend.is_auto()
-        and server_args.quantization == "mxfp8"
+        and server_args.quantization in ("mxfp8", "modelopt_mixed")
         and _is_sm100_supported
         and is_flashinfer_available()
     ):
@@ -1242,6 +1242,7 @@ def flashinfer_mxfp8_blockscaled_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
+    weight_scale_fallback: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """MXFP8 dense linear via FlashInfer mm_mxfp8."""
     input_2d = input.view(-1, input.shape[-1]).contiguous()
@@ -1285,11 +1286,48 @@ def flashinfer_mxfp8_blockscaled_linear(
             backend="trtllm",
         )
     elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
-        weight_scale_t = (
-            weight_scale.contiguous().t()
-            if weight_scale.ndim == 2
-            else weight_scale.contiguous()
-        )
+        if n % 32 != 0:
+            if weight_scale_fallback is None:
+                raise ValueError(
+                    "FlashInfer CUTLASS MXFP8 fallback requires canonical weight_scale "
+                    f"when N={n} is not divisible by 32."
+                )
+
+            from flashinfer import block_scale_interleave
+
+            padded_n = ceil_div(n, 32) * 32
+            pad_rows = padded_n - n
+            weight_t = torch.cat(
+                [
+                    weight,
+                    torch.zeros(
+                        (pad_rows, k),
+                        device=weight.device,
+                        dtype=weight.dtype,
+                    ),
+                ],
+                dim=0,
+            ).contiguous().t()
+            weight_scale_2d = weight_scale_fallback.contiguous().view(n, k // 32)
+            weight_scale_t = block_scale_interleave(
+                torch.cat(
+                    [
+                        weight_scale_2d,
+                        torch.zeros(
+                            (pad_rows, k // 32),
+                            device=weight_scale_2d.device,
+                            dtype=weight_scale_2d.dtype,
+                        ),
+                    ],
+                    dim=0,
+                ).contiguous()
+            ).contiguous()
+        else:
+            weight_scale_t = (
+                weight_scale.contiguous().t()
+                if weight_scale.ndim == 2
+                else weight_scale.contiguous()
+            )
         output = flashinfer_mm_mxfp8(
             q_input,
             weight_t,
@@ -1299,6 +1337,7 @@ def flashinfer_mxfp8_blockscaled_linear(
             use_8x4_sf_layout=False,
             backend="cutlass",
         )
+        output = output[:, :n]
 
     if bias is not None:
         output += bias
