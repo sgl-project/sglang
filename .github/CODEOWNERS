@@ -67,8 +67,8 @@
 /python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002 @Qiaolin-Yu
 /python/sglang/srt/utils/hf_transformers @JustinTong0323
 /python/sglang/srt/weight_cache @liusy58 @QiuMike @alexnails
-/sgl-kernel @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
-/sgl-kernel/csrc/musa @yeahdongcn
+/python/sglang/kernels/aot @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
+/python/sglang/kernels/aot/csrc/musa @yeahdongcn
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237
 /sgl-model-gateway/bindings/python @CatherineSue @key4ng @slin1237
