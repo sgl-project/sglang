@@ -98,9 +98,16 @@ class TritonRunnerCore(MoeRunnerCore):
             # Output hidden dim == input hidden dim for MoE; read it from
             # the input so it is independent of quant packing layout (int4
             # packs along the contract dim, not the output dim).
-            out = runner_input.hidden_states.new_empty(
-                (0, runner_input.hidden_states.shape[1])
-            )
+            hidden_size = runner_input.hidden_states.shape[1]
+            if self.config.no_combine:
+                # no_combine keeps the per-expert dimension: the kernel
+                # returns (num_tokens, topk, hidden_size), so the empty
+                # output has to carry topk too (matches AiterRunnerCore).
+                out = runner_input.hidden_states.new_empty(
+                    (0, runner_input.topk_ids.shape[-1], hidden_size)
+                )
+            else:
+                out = runner_input.hidden_states.new_empty((0, hidden_size))
             return TritonRunnerOutput(hidden_states=out)
 
         # deepep_normal/mori dispatch delivers hidden_states in a read-only
@@ -151,9 +158,18 @@ class TritonRunnerCore(MoeRunnerCore):
             or self.config.num_experts != self.config.num_local_experts
         )
         # Dense-compacted mori input (see pre_permute_deepep_normal_to_triton)
-        # carries no invalid (-1) expert ids, so force the unfiltered kernel path
-        # (identical to EP=1) rather than the filter_expert branch.
-        if running_state.get("mori_dense", False):
+        # carries no invalid (-1) expert ids, so the kernel's filter_expert
+        # guard (`off_experts == -1` -> write zeros and skip) can never fire.
+        # Forcing the unfiltered path is therefore numerically identical and
+        # just skips the per-block check.
+        #
+        # Exclude swiglu_limit models (DeepSeek-V4 style): with
+        # SGLANG_OPT_SWIGLU_CLAMP_FUSION enabled the unfiltered branch selects
+        # the fused silu_and_mul_clamp kernel, which is CUDA-only and asserts
+        # on HIP. filter_expert=True routes them to act_and_mul_triton, which
+        # applies the clamp, runs on HIP, and is equally correct here because
+        # the dense input has no invalid ids to filter.
+        if running_state.get("mori_dense", False) and self.config.swiglu_limit is None:
             filter_expert = False
 
         out = _fused_moe_kernel_sequence(
@@ -377,6 +393,20 @@ def pre_permute_deepep_normal_to_triton(
     topk_ids = dispatch_output.topk_ids
     topk_weights = dispatch_output.topk_weights
 
+    # mori can dispatch FP8/FP4-quantized activations, in which case the
+    # payload is packed and carries a separate per-block scale in
+    # hidden_states_scale (and FP4 also packs the hidden dim). That scale is
+    # not plumbed through to the triton runner, so consuming the payload here
+    # would silently compute against the wrong scale. Only BF16 dispatch
+    # feeding W4A16 experts is validated; refuse anything else loudly.
+    if getattr(dispatch_output, "hidden_states_scale", None) is not None:
+        raise NotImplementedError(
+            "deepep_normal->triton MoE permute does not support quantized "
+            "mori dispatch (hidden_states_scale is not None). Only BF16 "
+            "activation dispatch is supported on this path; disable mori "
+            "dispatch quantization for this model."
+        )
+
     # DeepEP/mori deliver hidden_states in a dispatcher-owned buffer (for mori
     # an external, RDMA-registered, read-only-mapped region). The triton runner
     # core writes MoE output in-place into hidden_states when config.inplace is
@@ -426,7 +456,16 @@ def pre_permute_deepep_normal_to_triton(
         # below builds a data-dependent shape a HIP graph cannot capture, so the
         # decode recipe sets --disable-cuda-graph. Assert the invariant instead
         # of carrying a dead static-shape branch for cuda-graph capture.
-        assert not torch.cuda.is_current_stream_capturing()
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "mori wide-EP with the triton MoE runner cannot be captured "
+                "into a CUDA/HIP graph: the dense-compaction below builds a "
+                "data-dependent shape. Launch with --disable-cuda-graph "
+                "(the wide-EP decode recipe sets it). Note that "
+                "--moe-runner-backend defaults to 'auto' and resolves to the "
+                "triton runner for W4A16/compressed-tensors experts, so this "
+                "cannot always be rejected during argument resolution."
+            )
         assert nre is not None
         valid = int(sum(nre))
         hidden_states = hidden_states[:valid]
