@@ -89,9 +89,9 @@ def create_tokenspeed_mla_backend(runner):
 def create_cutedsl_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("cutedsl_mla backend can only be used with MLA models.")
-    from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+    from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
 
-    return TRTLLMMLABackend(runner, backend="cute-dsl")
+    return CuteDslMLABackend(runner)
 
 
 @register_attention_backend("aiter")
