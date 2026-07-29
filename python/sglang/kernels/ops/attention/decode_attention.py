@@ -25,6 +25,7 @@ import logging
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -129,6 +130,11 @@ def _fwd_kernel_stage1(
     Lv: tl.constexpr,
     xai_temperature_len: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    SCORE_MOD: tl.constexpr = None,
+    Aux0=None,
+    aux0_stride_t=0,
+    aux0_stride_h=0,
+    aux0_len=0,
 ):
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
@@ -206,6 +212,20 @@ def _fwd_kernel_stage1(
             if xai_temperature_len > 0:
                 qk *= xai_temperature_reg
 
+            if SCORE_MOD is not None:
+                qk = SCORE_MOD(
+                    qk,
+                    cur_batch_seq_len - 1,
+                    offs_n,
+                    cur_batch,
+                    cur_head,
+                    offs_n < split_kv_end,
+                    Aux0,
+                    aux0_stride_t,
+                    aux0_stride_h,
+                    aux0_len,
+                )
+
             qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
 
             if PAGE_SIZE == 1:
@@ -275,6 +295,8 @@ def _decode_att_m_fwd(
     logit_cap,
     xai_temperature_len=-1,
     page_size: int = 1,
+    score_mod=None,
+    aux_tensors=None,
 ):
     BLOCK = 64
     # [TODO] work around SGPR limit on MI3xx
@@ -309,6 +331,10 @@ def _decode_att_m_fwd(
     )
     v_slot_stride, v_head_stride, v_page_stride, v_tok_stride = _extract_kv_strides(
         v_buffer, page_size
+    )
+
+    aux0, aux0_stride_t, aux0_stride_h, aux0_len = unpack_aux_tensors(
+        score_mod, aux_tensors
     )
 
     _fwd_kernel_stage1[grid](
@@ -346,6 +372,11 @@ def _decode_att_m_fwd(
         Lk=Lk,
         Lv=Lv,
         PAGE_SIZE=page_size,
+        SCORE_MOD=score_mod,
+        Aux0=aux0,
+        aux0_stride_t=aux0_stride_t,
+        aux0_stride_h=aux0_stride_h,
+        aux0_len=aux0_len,
     )
 
 
@@ -389,6 +420,11 @@ def _fwd_grouped_kernel_stage1(
     HAS_MLA: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
+    SCORE_MOD: tl.constexpr = None,
+    Aux0=None,
+    aux0_stride_t=0,
+    aux0_stride_h=0,
+    aux0_len=0,
 ):
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
@@ -500,6 +536,20 @@ def _fwd_grouped_kernel_stage1(
             if xai_temperature_len > 0:
                 qk *= xai_temperature_reg[:, None]
 
+            if SCORE_MOD is not None:
+                qk = SCORE_MOD(
+                    qk,
+                    cur_batch_seq_len - 1,
+                    offs_n[None, :],
+                    cur_batch,
+                    cur_head[:, None],
+                    mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                    Aux0,
+                    aux0_stride_t,
+                    aux0_stride_h,
+                    aux0_len,
+                )
+
             qk = tl.where(
                 mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
             )
@@ -574,6 +624,8 @@ def _decode_grouped_att_m_fwd(
     has_mla=False,
     use_pdl=False,
     page_size: int = 1,
+    score_mod=None,
+    aux_tensors=None,
 ):
     BLOCK = 32
     Lk = k_buffer.shape[-1]
@@ -623,6 +675,10 @@ def _decode_grouped_att_m_fwd(
         v_buffer, page_size
     )
 
+    aux0, aux0_stride_t, aux0_stride_h, aux0_len = unpack_aux_tensors(
+        score_mod, aux_tensors
+    )
+
     _fwd_grouped_kernel_stage1[grid](
         q,
         k_buffer,
@@ -663,6 +719,11 @@ def _decode_grouped_att_m_fwd(
         HAS_MLA=has_mla,
         USE_PDL=use_pdl,
         PAGE_SIZE=page_size,
+        SCORE_MOD=score_mod,
+        Aux0=aux0,
+        aux0_stride_t=aux0_stride_t,
+        aux0_stride_h=aux0_stride_h,
+        aux0_len=aux0_len,
         **extra_kargs,
     )
 
@@ -814,6 +875,8 @@ def decode_attention_fwd_normal(
     sinks=None,
     xai_temperature_len=-1,
     page_size: int = 1,
+    score_mod=None,
+    aux_tensors=None,
 ):
     _decode_att_m_fwd(
         q,
@@ -829,6 +892,8 @@ def decode_attention_fwd_normal(
         logit_cap,
         xai_temperature_len,
         page_size=page_size,
+        score_mod=score_mod,
+        aux_tensors=aux_tensors,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -863,6 +928,8 @@ def decode_attention_fwd_grouped(
     has_mla=False,
     use_pdl=False,
     page_size: int = 1,
+    score_mod=None,
+    aux_tensors=None,
 ):
     _decode_grouped_att_m_fwd(
         q,
@@ -880,6 +947,8 @@ def decode_attention_fwd_grouped(
         has_mla=has_mla,
         use_pdl=use_pdl,
         page_size=page_size,
+        score_mod=score_mod,
+        aux_tensors=aux_tensors,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -916,6 +985,8 @@ def decode_attention_fwd(
     has_mla=False,
     use_pdl=False,
     page_size: int = 1,
+    score_mod=None,
+    aux_tensors=None,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
@@ -944,6 +1015,8 @@ def decode_attention_fwd(
             sinks=sinks,
             xai_temperature_len=xai_temperature_len,
             page_size=page_size,
+            score_mod=score_mod,
+            aux_tensors=aux_tensors,
         )
     else:
         # GQA/MQA/MLA
@@ -966,4 +1039,6 @@ def decode_attention_fwd(
             has_mla=has_mla,
             use_pdl=use_pdl,
             page_size=page_size,
+            score_mod=score_mod,
+            aux_tensors=aux_tensors,
         )

@@ -13,6 +13,8 @@
 # ==============================================================================
 
 import logging
+import math
+import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -76,10 +78,15 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    ceil_align,
     is_non_idle_and_non_empty,
     make_layers,
 )
@@ -90,12 +97,37 @@ logger = logging.getLogger(__name__)
 
 
 def load_mimo_v2_qkv_proj_weight(
-    name, param, loaded_weight, expected_fused_tp_size: Optional[int] = None
+    name,
+    param,
+    loaded_weight,
+    expected_fused_tp_size: Optional[int] = None,
+    deferred_scale_inv: Optional[Dict[str, torch.Tensor]] = None,
 ):
-    if loaded_weight.shape == param.shape:
-        # The checkpoint already stores this rank's qkv_proj shard.
+    tp_size = get_parallel().attn_tp_size
+    tp_rank = get_parallel().attn_tp_rank
+    ckpt_tp = expected_fused_tp_size if expected_fused_tp_size is not None else tp_size
+
+    if ckpt_tp == tp_size and loaded_weight.shape == param.shape:
         default_weight_loader(param, loaded_weight)
         return
+
+    if expected_fused_tp_size is not None and expected_fused_tp_size % tp_size != 0:
+        raise ValueError(
+            f"MiMoV2 fused qkv_proj checkpoint is TP={expected_fused_tp_size}-"
+            f"interleaved; got attention tp_size={tp_size} while loading {name}."
+        )
+
+    is_scale_inv = "weight_scale_inv" in name
+
+    if is_scale_inv and ckpt_tp != tp_size:
+        if deferred_scale_inv is not None:
+            deferred_scale_inv[name] = loaded_weight.clone()
+            return
+        raise ValueError(
+            f"qkv_proj scale_inv {name}: shape mismatch "
+            f"{tuple(loaded_weight.shape)} vs {tuple(param.shape)} "
+            f"due to block quantization ceiling; pass deferred_scale_inv dict"
+        )
 
     if loaded_weight.ndim != param.ndim or loaded_weight.shape[1:] != param.shape[1:]:
         raise ValueError(
@@ -103,22 +135,155 @@ def load_mimo_v2_qkv_proj_weight(
             f"expected sharded {tuple(param.shape)}"
         )
 
+    if tp_size == ckpt_tp:
+        fused_shape = (param.shape[0] * tp_size, *param.shape[1:])
+        if tuple(loaded_weight.shape) != fused_shape:
+            raise ValueError(
+                f"qkv_proj weight {name}: unexpected shape "
+                f"{tuple(loaded_weight.shape)}; expected fused {fused_shape} "
+                f"or sharded {tuple(param.shape)}"
+            )
+        default_weight_loader(param, loaded_weight.chunk(tp_size, dim=0)[tp_rank])
+    else:
+        shards_per_rank = ckpt_tp // tp_size
+        shards = loaded_weight.chunk(ckpt_tp, dim=0)
+        merged = torch.cat(
+            shards[tp_rank * shards_per_rank : (tp_rank + 1) * shards_per_rank],
+            dim=0,
+        )
+        default_weight_loader(param, merged)
+
+
+def _get_ckpt_qkv_shard_sizes(config, layer_name, ckpt_tp):
+    m = re.search(r"layers\.(\d+)\.", layer_name)
+    if m is None:
+        return None
+    layer_id = int(m.group(1))
+
+    pattern = getattr(config, "hybrid_layer_pattern", None)
+    is_swa = pattern is not None and pattern[layer_id] == 1
+
+    if is_swa:
+        nh = config.swa_num_attention_heads
+        nkv = config.swa_num_key_value_heads
+        hd = config.swa_head_dim
+        vhd = getattr(config, "swa_v_head_dim", hd)
+    else:
+        nh = config.num_attention_heads
+        nkv = config.num_key_value_heads
+        hd = config.head_dim
+        vhd = getattr(config, "v_head_dim", hd)
+
+    q_per_shard = (nh // ckpt_tp) * hd
+    k_per_shard = max(1, nkv // ckpt_tp) * hd
+    v_per_shard = max(1, nkv // ckpt_tp) * vhd
+    return (q_per_shard, k_per_shard, v_per_shard)
+
+
+def _deinterleave_qkv_shards(shards, q_per_shard, k_per_shard, v_per_shard):
+    all_q, all_k, all_v = [], [], []
+    for s in shards:
+        all_q.append(s[:q_per_shard])
+        all_k.append(s[q_per_shard : q_per_shard + k_per_shard])
+        all_v.append(s[q_per_shard + k_per_shard :])
+    return torch.cat(all_q + all_k + all_v, dim=0)
+
+
+def _resolve_deferred_qkv_scale_inv(
+    params_dict: Dict[str, torch.nn.Parameter],
+    deferred_scale_inv: Dict[str, torch.Tensor],
+    expected_fused_tp_size: int,
+    block_size: int = 128,
+    config=None,
+):
     tp_size = get_parallel().attn_tp_size
     tp_rank = get_parallel().attn_tp_rank
-    if expected_fused_tp_size is not None and tp_size != expected_fused_tp_size:
-        raise ValueError(
-            f"MiMoV2 fused qkv_proj checkpoint is TP={expected_fused_tp_size}-"
-            f"interleaved; got attention tp_size={tp_size} while loading {name}."
+    ckpt_tp = expected_fused_tp_size
+    shards_per_rank = ckpt_tp // tp_size
+
+    for scale_name, ckpt_scale in deferred_scale_inv.items():
+        weight_name = scale_name.replace(".weight_scale_inv", ".weight")
+        if weight_name not in params_dict:
+            raise ValueError(
+                f"Cannot resolve deferred scale_inv {scale_name}: "
+                f"weight {weight_name} not found"
+            )
+
+        weight_param = params_dict[weight_name]
+        scale_param = params_dict[scale_name]
+        weight_data = weight_param.data
+
+        ckpt_scale_shards = ckpt_scale.chunk(ckpt_tp, dim=0)
+        my_scale_shards = ckpt_scale_shards[
+            tp_rank * shards_per_rank : (tp_rank + 1) * shards_per_rank
+        ]
+
+        weight_rows = weight_data.shape[0]
+        rows_per_ckpt_shard = weight_rows // shards_per_rank
+        block_k = ckpt_scale.shape[1]
+
+        device = weight_data.device
+        dequant_shards = []
+        for i, shard_scale in enumerate(my_scale_shards):
+            shard_weight = weight_data[
+                i * rows_per_ckpt_shard : (i + 1) * rows_per_ckpt_shard
+            ]
+            shard_scale_f32 = shard_scale.to(dtype=torch.float32, device=device)
+            scale_expanded = shard_scale_f32.repeat_interleave(
+                block_size, dim=0
+            ).repeat_interleave(block_size, dim=1)
+            scale_expanded = scale_expanded[
+                : shard_weight.shape[0], : shard_weight.shape[1]
+            ]
+            dequant_shards.append(
+                (shard_weight.to(torch.float32) * scale_expanded).to(torch.bfloat16)
+            )
+
+        qkv_sizes = (
+            _get_ckpt_qkv_shard_sizes(config, scale_name, ckpt_tp)
+            if config is not None
+            else None
+        )
+        if qkv_sizes is not None and shards_per_rank > 1:
+            merged_bf16 = _deinterleave_qkv_shards(dequant_shards, *qkv_sizes)
+        else:
+            merged_bf16 = torch.cat(dequant_shards, dim=0)
+
+        n, k = merged_bf16.shape
+        n_pad = ceil_align(n, block_size)
+        k_pad = ceil_align(k, block_size)
+        padded = torch.zeros(
+            n_pad, k_pad, dtype=merged_bf16.dtype, device=merged_bf16.device
+        )
+        padded[:n, :k] = merged_bf16
+        blocks = padded.view(
+            n_pad // block_size, block_size, k_pad // block_size, block_size
+        )
+        amax = blocks.abs().float().amax(dim=(1, 3), keepdim=True).clamp(min=1e-12)
+        finfo = torch.finfo(torch.float8_e4m3fn)
+        new_scale_inv = amax / finfo.max
+        new_fp8 = (
+            (blocks.float() / new_scale_inv)
+            .clamp(min=finfo.min, max=finfo.max)
+            .to(torch.float8_e4m3fn)
         )
 
-    fused_shape = (param.shape[0] * tp_size, *param.shape[1:])
-    if tuple(loaded_weight.shape) != fused_shape:
-        raise ValueError(
-            f"qkv_proj weight {name}: unexpected shape {tuple(loaded_weight.shape)}; "
-            f"expected fused {fused_shape} or sharded {tuple(param.shape)}"
+        n_scale = math.ceil(n / block_size)
+        k_scale = math.ceil(k / block_size)
+        weight_param.data.copy_(new_fp8.view(n_pad, k_pad)[:n, :k].contiguous())
+        default_weight_loader(
+            scale_param,
+            new_scale_inv.view(n_pad // block_size, k_pad // block_size)[
+                :n_scale, :k_scale
+            ].contiguous(),
         )
 
-    default_weight_loader(param, loaded_weight.chunk(tp_size, dim=0)[tp_rank])
+        logger.info(
+            f"Resolved deferred qkv scale_inv {scale_name}: "
+            f"dequant {shards_per_rank} shards -> requant "
+            f"({n_scale}, {k_scale})"
+            + (f", de-interleaved QKV {qkv_sizes}" if qkv_sizes else "")
+        )
 
 
 class MiMoV2MLP(nn.Module):
@@ -323,7 +488,6 @@ class MiMoV2MoE(nn.Module):
     ) -> torch.Tensor:
 
         if hidden_states.shape[0] > 0:
-            # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
         else:
@@ -1257,6 +1421,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
 
         params_dict = dict(self.named_parameters())
         skipped_mtp_weights = False
+        deferred_qkv_scale_inv: Dict[str, torch.Tensor] = {}
 
         for name, loaded_weight in weights:
             is_vision_weight = name.startswith(self._VISION_WEIGHT_PREFIXES)
@@ -1388,7 +1553,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                         self.config
                     )
                     load_mimo_v2_qkv_proj_weight(
-                        name, param, loaded_weight, expected_fused_tp_size
+                        name,
+                        param,
+                        loaded_weight,
+                        expected_fused_tp_size,
+                        deferred_scale_inv=deferred_qkv_scale_inv,
                     )
                 continue
 
@@ -1448,6 +1617,15 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                             weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
+        if deferred_qkv_scale_inv:
+            expected_fused_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(self.config)
+            _resolve_deferred_qkv_scale_inv(
+                params_dict,
+                deferred_qkv_scale_inv,
+                expected_fused_tp_size,
+                config=self.config,
+            )
 
     def get_embed_and_head(self):
         assert (
