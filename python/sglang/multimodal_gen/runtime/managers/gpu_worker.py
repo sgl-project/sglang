@@ -347,7 +347,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             error_context=f"request {req.request_id}",
         )
 
-    def execute_forward_incremental(self, batch: list[Req]) -> Iterator[OutputBatch]:
+    def execute_forward_sequentially(
+        self, batch: list[Req]
+    ) -> Iterator[OutputBatch]:
         """Yield grouped results after each request finishes its terminal stage."""
         assert self.pipeline is not None
         results = self.pipeline.forward_batch_iter(batch, self.server_args)

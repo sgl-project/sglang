@@ -73,7 +73,7 @@ _BATCH_METRICS_LOG_INTERVAL = 5
 
 
 @dataclasses.dataclass(frozen=True)
-class _IncrementalOutputs:
+class _SequentiallyReturnedOutputs:
     outputs: Iterator[OutputBatch]
 
 
@@ -254,7 +254,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
     def _dispatch_items(
         self, items: list[tuple[bytes | None, Any]]
-    ) -> OutputBatch | list[OutputBatch] | _IncrementalOutputs:
+    ) -> OutputBatch | list[OutputBatch] | _SequentiallyReturnedOutputs:
         """Dispatch ready queue items; several plain `Req`s form one dynamic batch."""
         reqs = [item[1] for item in items]
         if len(reqs) > 1 and all(isinstance(req, Req) for req in reqs):
@@ -337,10 +337,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
     def _execute_generation_grouped(
         self, reqs: List[Req]
-    ) -> List[OutputBatch] | _IncrementalOutputs:
+    ) -> List[OutputBatch] | _SequentiallyReturnedOutputs:
         batch_size = len(reqs)
         if self.server_args.pipeline_config.num_grouped_prefix_stages:
-            return _IncrementalOutputs(self._iter_incremental_grouped_outputs(reqs))
+            return _SequentiallyReturnedOutputs(
+                self._iter_grouped_outputs_sequentially(reqs)
+            )
 
         try:
             output_batch = self.worker.execute_forward(reqs)
@@ -382,12 +384,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 error_msg=f"Native grouped execution failed: {e}",
             )
 
-    def _iter_incremental_grouped_outputs(
+    def _iter_grouped_outputs_sequentially(
         self, reqs: List[Req]
     ) -> Iterator[OutputBatch]:
-        yield from self.worker.execute_forward_incremental(reqs)
+        yield from self.worker.execute_forward_sequentially(reqs)
         logger.info(
-            "Processed incremental native grouped batch of %d/%d request(s) "
+            "Processed native grouped batch sequentially: %d/%d request(s) "
             "with max_delay=%.2fms",
             len(reqs),
             self._batching_max_size,
@@ -696,7 +698,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         else:
             self.return_result(output_batch, identity, should_not_return=is_warmup)
 
-    def _return_incremental_results(
+    def _return_results_sequentially(
         self,
         items: list[tuple[bytes | None, Any]],
         outputs: Iterator[OutputBatch],
@@ -707,8 +709,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 output_batch = next(output_iter)
             except StopIteration:
                 error = (
-                    "Incremental grouped execution returned fewer outputs "
-                    "than requests."
+                    "Grouped execution returned fewer outputs than requests "
+                    "while processing sequentially."
                 )
                 logger.error(error)
                 for remaining_item in items[index:]:
@@ -716,11 +718,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 return
             except Exception as e:
                 logger.error(
-                    "Incremental native grouped execution failed: %s",
+                    "Failed to execute grouped requests sequentially: %s",
                     e,
                     exc_info=True,
                 )
-                error = f"Incremental native grouped execution failed: {e}"
+                error = f"Failed to execute grouped requests sequentially: {e}"
                 for remaining_item in items[index:]:
                     self._return_item_result(remaining_item, OutputBatch(error=error))
                 return
@@ -1153,11 +1155,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 )
                 handler_result = OutputBatch(error=str(e))
 
-            if isinstance(handler_result, _IncrementalOutputs):
+            if isinstance(handler_result, _SequentiallyReturnedOutputs):
                 try:
-                    self._return_incremental_results(items, handler_result.outputs)
+                    self._return_results_sequentially(items, handler_result.outputs)
                 except zmq.ZMQError as e:
-                    logger.error(f"ZMQ error sending incremental reply: {e}")
+                    logger.error(f"ZMQ error sending replies sequentially: {e}")
                 continue
 
             if isinstance(handler_result, list):
