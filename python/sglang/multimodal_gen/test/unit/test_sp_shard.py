@@ -143,7 +143,8 @@ def test_strategy_shard_when_legal(monkeypatch):
 def test_strategy_replicates_when_padding_spans_multiple_shards(monkeypatch):
     _fake_sp(monkeypatch, 8)
     assert sps.plan_text_strategy(1) == "replicate"
-    assert sps.plan_text_strategy(7) == "replicate"
+    assert sps.plan_text_strategy(6) == "replicate"
+    assert sps.plan_text_strategy(7) == "shard"
     assert sps.plan_text_strategy(9) == "replicate"
     assert sps.plan_text_strategy(13) == "replicate"
     assert sps.plan_text_strategy(14) == "shard"
