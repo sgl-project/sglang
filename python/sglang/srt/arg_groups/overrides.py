@@ -2530,9 +2530,7 @@ def _dllm_attention_backend(view: Any) -> dict:
         supported_backends = {"triton"} if is_hip() else {"fa3", "triton"}
         if view.is_attention_backend_not_set():
             attention_backend = "triton" if is_hip() else "fa3"
-            logger.info(
-                f"Attention backend is set to {attention_backend} for GFusion."
-            )
+            logger.info(f"Attention backend is set to {attention_backend} for GFusion.")
             return {"attention_backend": attention_backend}
         unsupported_backends = set(attention_backends_of(view)) - supported_backends
         if unsupported_backends:

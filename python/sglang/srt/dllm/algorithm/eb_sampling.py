@@ -45,9 +45,7 @@ class EBSampling(DllmAlgorithm):
                 curr_logits[..., self.mask_id] = torch.finfo(curr_logits.dtype).min
             x = torch.argmax(curr_logits, dim=-1)
 
-            masked_positions = torch.nonzero(
-                block_mask_index, as_tuple=False
-            ).flatten()
+            masked_positions = torch.nonzero(block_mask_index, as_tuple=False).flatten()
             masked_logits = curr_logits[masked_positions]
             masked_log_probs = F.log_softmax(masked_logits, dim=-1)
             masked_probs = masked_log_probs.exp()
