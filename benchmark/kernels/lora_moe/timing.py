@@ -344,6 +344,8 @@ _KERNEL_MODULES = (
     # unchanged — m16).
     "fused_middle_candidates.py",
     "fused_middle_cutedsl.py",
+    "finalize_candidates.py",
+    "finalize_cutedsl.py",
     "r10_joint_route.py",
     "reference.py",
     "routes.py",
