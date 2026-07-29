@@ -31,7 +31,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_lora
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -587,7 +587,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         if not envs.SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED.get():
             return
 
-        server_args = get_server_args()
         moe_runner_config = layer.moe_runner_config
         if not (
             _is_cuda
@@ -603,10 +602,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             and moe_runner_config.swiglu_limit is None
             # The LoRA MoE hooks read and write the full-width pre-activation
             # buffer in halves layout; both assumptions break here.
-            and not server_args.enable_lora
-            and not server_args.lora_paths
+            and not get_lora().enable_lora
+            and not get_lora().lora_paths
             # EPLB rearranges experts by copying checkpoint-layout weights in.
-            and not server_args.enable_eplb
+            and not get_exec().moe.enable_eplb
         ):
             return
 
@@ -619,6 +618,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         for e in range(w13.shape[0]):
             w13[e] = w13[e][idx]
         self.w13_swiglu_interleaved = True
+        logger.info_once(
+            "Interleaved w13 gate/up: the SwiGLU is applied by the MoE up-GEMM epilogue."
+        )
 
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
         self,

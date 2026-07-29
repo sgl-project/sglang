@@ -25,6 +25,41 @@ register_cuda_ci(est_time=12, stage="base-b-kernel-unit", runner_config="1-gpu-l
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _runtime_scaffolding():
+    """`fused_experts` needs global server args and a TP group.
+
+    It reads server args for the fused-sum-all-reduce switch, and allocates
+    its output under ``use_symmetric_memory(get_tp_group(), ...)`` even when
+    symmetric allocation is off. Single rank, gloo, TP=EP=PP=1.
+    """
+    import os
+
+    from sglang.srt.distributed.parallel_state import (
+        init_distributed_environment,
+        initialize_model_parallel,
+        model_parallel_is_initialized,
+    )
+    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29641")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    if not torch.distributed.is_initialized():
+        init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
+    if not model_parallel_is_initialized():
+        initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            backend="gloo",
+        )
+
+
 def _interleave_w13_rows(w13: torch.Tensor) -> torch.Tensor:
     """Reproduce the load-time permute: [gate; up] -> [gate0, up0, gate1, ...]."""
     inter = w13.shape[1] // 2
