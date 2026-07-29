@@ -447,6 +447,7 @@ jobs:
       )
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
         runner: [linux-mi300-1gpu-sglang]
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
@@ -562,6 +563,7 @@ jobs:
       )
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         runner: [linux-mi300-1gpu-sglang]
         part: [0, 1, 2]
@@ -601,6 +603,7 @@ jobs:
       )
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         runner: [linux-mi300-2gpu-sglang]
         part: [0, 1]
@@ -640,6 +643,7 @@ jobs:
       )
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         runner: [linux-mi300-1gpu-sglang]
         part: [0, 1, 2, 3]
@@ -780,6 +784,7 @@ jobs:
       )
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         runner: [linux-mi300-2gpu-sglang]
         part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (single_test_file/test_disagg_server.py)
@@ -1033,6 +1038,7 @@ jobs:
       RUNNER_LABELS: linux-mi300-8gpu-sglang
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         runner: [linux-mi300-8gpu-sglang]
         part: [0, 1, 2, 3]
