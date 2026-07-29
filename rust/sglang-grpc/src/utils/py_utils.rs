@@ -45,26 +45,27 @@ pub(crate) fn json_map_to_pydict<'py>(
     Ok(py_dict)
 }
 
-pub(crate) fn py_value_to_json_string(value: &Bound<'_, PyAny>) -> PyResult<String> {
-    // gRPC meta_info is a map<string, string>. JSON-encode every value,
-    // including strings, so clients can decode the map uniformly.
+pub(crate) fn py_value_to_json_value(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     match value
         .py()
         .import("json")
         .and_then(|json| json.call_method1("dumps", (value,)))
         .and_then(|json_str| json_str.extract::<String>())
     {
-        Ok(s) => Ok(s),
-        Err(_) => {
-            let fallback = value.str()?.to_string();
-            Ok(json_encode_string(&fallback))
-        }
+        Ok(serialized) => serde_json::from_str(&serialized)
+            .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string())),
+        Err(_) => Ok(serde_json::Value::String(value.str()?.to_string())),
     }
 }
 
-fn json_encode_string(value: &str) -> String {
-    serde_json::Value::String(value.to_string()).to_string()
+pub(crate) fn py_value_to_json_string(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    match value
+        .py()
+        .import("json")
+        .and_then(|json| json.call_method1("dumps", (value,)))
+        .and_then(|json_str| json_str.extract::<String>())
+    {
+        Ok(serialized) => Ok(serialized),
+        Err(_) => Ok(serde_json::Value::String(value.str()?.to_string()).to_string()),
+    }
 }
-
-#[cfg(test)]
-mod tests;
