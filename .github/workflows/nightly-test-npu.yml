@@ -135,11 +135,11 @@ jobs:
       max-parallel: 6
       matrix:
         test_config:
-#          # qwen3_6_35b_a3b performance tests
-#          - name: qwen3_6_35b_a3b_1p_in3k5_out1k5_50ms
-#            runner: linux-aarch64-a3-2
-#            test_case: test/registered/ascend/performance/qwen3_6_35b_a3b/test_npu_qwen3_6_35b_a3b_1p_in3k5_out1k5_50ms.py
-#            test_type: 'perf'
+          # qwen3_6_35b_a3b performance tests
+          - name: qwen3_6_35b_a3b_1p_in3k5_out1k5_50ms
+            runner: linux-aarch64-a3-2
+            test_case: test/registered/ascend/performance/qwen3_6_35b_a3b/test_npu_qwen3_6_35b_a3b_1p_in3k5_out1k5_50ms.py
+            test_type: 'perf'
 #          - name: qwen3_6_35b_a3b_1p_aime26
 #            runner: linux-aarch64-a3-2
 #            test_case: test/registered/ascend/accuracy/qwen3_6_35b_a3b/test_npu_qwen3_6_35b_a3b_1p_aime26.py
