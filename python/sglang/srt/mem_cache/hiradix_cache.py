@@ -1004,8 +1004,8 @@ class HiRadixCache(RadixCache):
 
         ready_counts = torch.tensor(
             [
-                self._count_ready_acks(cache_controller.ack_write_queue),
-                self._count_ready_acks(cache_controller.ack_load_queue),
+                HiRadixCache._count_ready_acks(cache_controller.ack_write_queue),
+                HiRadixCache._count_ready_acks(cache_controller.ack_load_queue),
                 *storage_queue_sizes,
             ],
             dtype=torch.int,
@@ -1035,7 +1035,7 @@ class HiRadixCache(RadixCache):
             # sequence and deadlocks under TP > 1. (Matches UnifiedRadixCache.)
             finish_count = 0
             if self.pp_rank == 0:
-                finish_count = self._count_ready_acks(
+                finish_count = HiRadixCache._count_ready_acks(
                     self.cache_controller.ack_write_queue
                 )
             finish_count_tensor = torch.tensor(
@@ -1057,7 +1057,7 @@ class HiRadixCache(RadixCache):
         if finish_count is None:
             finish_count = 0
             if self.pp_rank == 0:
-                finish_count = self._count_ready_acks(
+                finish_count = HiRadixCache._count_ready_acks(
                     self.cache_controller.ack_load_queue
                 )
             finish_count_tensor = torch.tensor(
