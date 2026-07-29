@@ -776,39 +776,6 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 if slots.numel() > 0:
                     allocator.free(slots.to(torch.int64))
 
-    def backup_state(self):
-        # EAGLE/NEXTN draft preprocess allocates speculative c{4,128} KV via
-        # alloc_extend(backup_state=True) and rolls it back with restore_state.
-        # The base SWATokenToKVPoolAllocator only snapshots the full + SWA pools,
-        # so without this override the draft's c{4,128} (+ state) slots are never
-        # rolled back -> they leak every draft step until the c4 pool exhausts.
-        # Snapshot the sub-allocators alongside the base pools.
-        return (
-            super().backup_state(),
-            self.c4_attn_allocator.backup_state(),
-            self.c128_attn_allocator.backup_state(),
-            (
-                self.c4_state_attn_allocator.backup_state()
-                if self.c4_state_attn_allocator is not None
-                else None
-            ),
-            (
-                self.c128_state_attn_allocator.backup_state()
-                if self.c128_state_attn_allocator is not None
-                else None
-            ),
-        )
-
-    def restore_state(self, state):
-        base, c4, c128, c4_state, c128_state = state
-        super().restore_state(base)
-        self.c4_attn_allocator.restore_state(c4)
-        self.c128_attn_allocator.restore_state(c128)
-        if self.c4_state_attn_allocator is not None and c4_state is not None:
-            self.c4_state_attn_allocator.restore_state(c4_state)
-        if self.c128_state_attn_allocator is not None and c128_state is not None:
-            self.c128_state_attn_allocator.restore_state(c128_state)
-
     def clear(self):
         super().clear()
         # super().__init__ calls clear() before our sub-allocators exist;

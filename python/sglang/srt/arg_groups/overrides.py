@@ -774,7 +774,7 @@ def _granite_moe_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     return {}
 
 
-@_register_for("Lfm2ForCausalLM")
+@_register_for("Lfm2ForCausalLM", "Lfm2MoeForCausalLM")
 def _lfm2_overrides(server_args: Any, hf_config: Any) -> dict:
     if is_sm100_supported() and server_args.attention_backend is None:
         return {"attention_backend": "flashinfer"}
@@ -1123,6 +1123,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "JetNemotronForCausalLM",
         "JetVLMForConditionalGeneration",
         "Lfm2ForCausalLM",
+        "Lfm2MoeForCausalLM",
         "ZayaForCausalLM",
     }
 )
@@ -2031,7 +2032,13 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 "--moe-runner-backend flashinfer_trtllm or "
                 "flashinfer_trtllm_routed."
             )
-    if view.quantization == "mxfp8":
+    # Ascend runs MXFP8 MoE on the Ascend runner; every backend selected below is
+    # CUDA/ROCm-only. Forcing one here would not merely pick the wrong runner:
+    # FusedMoE keys its w1/w3 shard swap ("flashinfer assumes w31") and its
+    # 128-alignment round-up off flashinfer_trtllm, so the experts would silently
+    # load with gate and up exchanged. Leave the backend at "auto" and let
+    # create_moe_runner resolve it to ASCEND.
+    if view.quantization == "mxfp8" and not is_npu():
         from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
         is_gfx95_mxfp8 = is_hip() and is_gfx95_supported()
