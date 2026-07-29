@@ -274,11 +274,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Free a contiguous token-position segment [start_pos, start_pos + n).
 
         The paged layout maps token positions [k * page_size, (k+1) * page_size)
-        of a request to one page, so the freed page ids are one representative
-        index per page, extracted by host-side stride arithmetic. Unlike free(),
-        this needs no torch.unique, whose data-dependent output shape forces a
-        device-to-host sync ('.item()' -> cudaStreamSynchronize) that blocks the
-        scheduler behind the in-flight forward.
+        of a request to one page, so one representative index per page is
+        extracted by host-side stride slicing. Unlike free(), this needs no
+        torch.unique, whose data-dependent output shape forces a device-to-host
+        sync ('.item()' -> cudaStreamSynchronize) that blocks the scheduler
+        behind the in-flight forward. The representatives stay plain views:
+        inside a free group they are batched and converted to page ids by one
+        cat + floor_divide at free_group_end, so a free launches no kernel here.
 
         Caller contract (see base): free_index is a slice of one request's kv
         row (or a page-aligned copy), and its pages are freed by no other call
@@ -290,24 +292,24 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         offset = start_pos % self.page_size
         if offset == 0:
-            page_reps = free_index[:: self.page_size]
+            pieces = (free_index[:: self.page_size],)
         else:
-            page_reps = torch.cat(
-                (free_index[:1], free_index[self.page_size - offset :: self.page_size])
-            )
-        page_ids = page_reps // self.page_size
+            rest = free_index[self.page_size - offset :: self.page_size]
+            head = free_index[:1]
+            pieces = (head, rest) if rest.numel() else (head,)
 
         if self.debug_mode:
+            page_ids = torch.cat([p // self.page_size for p in pieces])
             assert torch.equal(
                 torch.sort(page_ids)[0], torch.unique(free_index // self.page_size)
             )
 
         if self.is_not_in_free_group:
-            self._release_page_ids(page_ids)
+            self._release_page_ids(*(p // self.page_size for p in pieces))
             if self.debug_mode:
                 assert len(torch.unique(self.free_pages)) == len(self.free_pages)
         else:
-            self.free_page_ids_group.append(page_ids)
+            self.free_page_reps_group.extend(pieces)
 
     def free_segments(self, segments):
         """Free disjoint ascending segments of one request's kv row.
@@ -332,21 +334,23 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             prev_end = seg_end
             self.free_segment(free_index, start_pos=start_pos)
 
-    def _release_page_ids(self, page_ids: torch.Tensor):
+    def _release_page_ids(self, *page_ids: torch.Tensor):
         if self.need_sort:
-            self.release_pages = torch.cat((page_ids, self.release_pages))
+            self.release_pages = torch.cat((*page_ids, self.release_pages))
         else:
-            self.free_pages = torch.cat((page_ids, self.free_pages))
+            self.free_pages = torch.cat((*page_ids, self.free_pages))
 
     def free_group_begin(self):
         super().free_group_begin()
-        self.free_page_ids_group = []
+        self.free_page_reps_group = []
 
     def free_group_end(self):
         super().free_group_end()
-        if self.free_page_ids_group:
-            self._release_page_ids(torch.cat(self.free_page_ids_group))
-            self.free_page_ids_group = []
+        if self.free_page_reps_group:
+            self._release_page_ids(
+                torch.cat(self.free_page_reps_group) // self.page_size
+            )
+            self.free_page_reps_group = []
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
@@ -355,7 +359,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.is_not_in_free_group = True
         self.free_group = []
-        self.free_page_ids_group = []
+        self.free_page_reps_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
