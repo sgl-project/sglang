@@ -41,7 +41,7 @@
 /python/sglang/srt/layers/attention/mamba @yizhang2077 @hebiao064
 /python/sglang/srt/layers/attention/dsa @1am9trash @hubertlu-tw @kkHuang-amd @HaiShaw @Fridge003 @YAMY1234 @rainj-me
 /python/sglang/srt/layers/attention/vision.py @mickqian @yuan-luo @yhyang201
-/python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ @HaiShaw @b8zhong @OrangeRedeng @TamirBaydasov @Alisehen
+/python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ @HaiShaw @b8zhong @OrangeRedeng @TamirBaydasov @Alisehen @mmangkad
 /python/sglang/srt/layers/quantization/quark @kkHuang-amd @yichiche @hubertlu-tw @1am9trash @BowenBao
 /python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
@@ -54,7 +54,7 @@
 /python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_embedding_store.py @liusy58
 /python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @Fridge003 @ispobock
 /python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py @hebiao064
-/python/sglang/srt/model_loader @b8zhong
+/python/sglang/srt/model_loader @b8zhong @mmangkad
 /python/sglang/srt/models/deepseek_common @Fridge003 @ispobock @fzyzcjy @ch-wan
 /python/sglang/srt/models/deepseek_v2.py @fzyzcjy @zhyncs @ispobock @ch-wan @merrymercy @Fridge003
 /python/sglang/srt/models/transformers.py @adarshxs
@@ -65,7 +65,7 @@
 /python/sglang/srt/ray @Qiaolin-Yu @xyuzh
 /python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002 @Qiaolin-Yu
 /python/sglang/srt/utils/hf_transformers @JustinTong0323
-/python/sglang/srt/weight_cache @liusy58 @QiuMike
+/python/sglang/srt/weight_cache @liusy58 @QiuMike @alexnails
 /sgl-kernel @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /sgl-kernel/csrc/musa @yeahdongcn
 /sgl-model-gateway @slin1237 @CatherineSue
