@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
+    CPAttentionBackendKind,
     get_cp_strategy,
     get_cp_strategy_kind,
     init_cp_strategy,
@@ -586,7 +587,7 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertTrue(torch.equal(written_value, value))
         self.assertEqual((k_scale, v_scale), ("key-scale", "value-scale"))
 
-    def test_zigzag_attention_dispatch_runs_prev_then_next(self):
+    def test_zigzag_flashattention_dispatch_runs_prev_then_next(self):
         cp_size = 2
         seq_lens = [8]
         extend_seq_lens = [8]
@@ -619,6 +620,197 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertTrue(torch.equal(calls[0][0], q[:2]))
         self.assertTrue(torch.equal(calls[1][0], q[2:]))
         self.assertTrue(torch.equal(out, q + 100))
+
+    def test_zigzag_trtllm_dispatch_uses_one_combined_call(self):
+        cp_size = 2
+        metadata = self._metadata_for_rank(
+            0,
+            cp_size=cp_size,
+            seq_lens=[8],
+            extend_seq_lens=[8],
+        )
+        fb = SimpleNamespace(attn_cp_metadata=metadata)
+        q = torch.arange(4 * 2).view(4, 2)
+        calls = []
+
+        def attn_fn(
+            q_chunk,
+            cu_seqlens_q,
+            cache_seqlens,
+            max_seqlen_q,
+            *,
+            cu_seqlens_kv,
+            use_zigzag_page_table=False,
+        ):
+            calls.append(
+                (
+                    q_chunk.clone(),
+                    cu_seqlens_q.clone(),
+                    cache_seqlens.clone(),
+                    max_seqlen_q,
+                    cu_seqlens_kv.clone(),
+                    use_zigzag_page_table,
+                )
+            )
+            return q_chunk + 100
+
+        out = ZigzagCPStrategy(cp_size=cp_size).run_attention(
+            q,
+            fb,
+            device=torch.device("cpu"),
+            attn_fn=attn_fn,
+            attention_backend=CPAttentionBackendKind.TRTLLM_MHA,
+        )
+
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertTrue(torch.equal(call[0], q))
+        self.assertTrue(torch.equal(call[1], metadata.cu_seqlens_q_combined_tensor))
+        self.assertTrue(torch.equal(call[2], metadata.kv_len_combined_tensor))
+        self.assertEqual(call[3], metadata.max_seqlen_q_combined)
+        self.assertTrue(torch.equal(call[4], metadata.cu_seqlens_kv_combined_tensor))
+        self.assertTrue(call[5])
+        self.assertTrue(torch.equal(out, q + 100))
+
+    def test_zigzag_trtllm_single_call_zeroes_physical_padding(self):
+        cp_size = 2
+        metadata = self._metadata_for_rank(
+            0,
+            cp_size=cp_size,
+            seq_lens=[8],
+            extend_seq_lens=[8],
+        )
+        fb = SimpleNamespace(attn_cp_metadata=metadata)
+        logical_q = torch.arange(4 * 2).view(4, 2)
+        q = torch.cat([logical_q, torch.full((2, 2), -1)], dim=0)
+        calls = []
+
+        def attn_fn(
+            q_chunk,
+            cu_seqlens_q,
+            cache_seqlens,
+            max_seqlen_q,
+            *,
+            cu_seqlens_kv,
+            use_zigzag_page_table=False,
+        ):
+            calls.append(q_chunk.clone())
+            return q_chunk + 100
+
+        out = ZigzagCPStrategy(cp_size=cp_size).run_attention(
+            q,
+            fb,
+            device=torch.device("cpu"),
+            attn_fn=attn_fn,
+            attention_backend=CPAttentionBackendKind.TRTLLM_MHA,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(torch.equal(calls[0], logical_q))
+        self.assertTrue(torch.equal(out[:4], logical_q + 100))
+        self.assertTrue(torch.equal(out[4:], torch.zeros_like(out[4:])))
+
+    def test_zigzag_combined_attention_matches_two_half_reference(self):
+        def reference_attention(
+            q,
+            cu_seqlens_q,
+            cache_seqlens,
+            cu_seqlens_kv,
+            *,
+            sequence_offset,
+        ):
+            outputs = []
+            for seq_id in range(cache_seqlens.numel()):
+                q_start = int(cu_seqlens_q[seq_id])
+                q_end = int(cu_seqlens_q[seq_id + 1])
+                q_seq = q[q_start:q_end]
+                q_len = q_end - q_start
+                kv_len = int(cache_seqlens[seq_id])
+                self.assertEqual(
+                    int(cu_seqlens_kv[seq_id + 1] - cu_seqlens_kv[seq_id]),
+                    kv_len,
+                )
+
+                absolute_seq_id = sequence_offset + seq_id + 1
+                positions = torch.arange(kv_len, dtype=q.dtype)
+                k_seq = torch.stack(
+                    (
+                        positions / (kv_len + 1),
+                        torch.sin(positions + absolute_seq_id),
+                        torch.full_like(positions, absolute_seq_id / 10),
+                    ),
+                    dim=1,
+                )
+                v_seq = torch.stack(
+                    (
+                        torch.cos(positions + absolute_seq_id),
+                        positions / (absolute_seq_id + 1),
+                        torch.full_like(positions, absolute_seq_id),
+                    ),
+                    dim=1,
+                )
+                q_positions = kv_len - q_len + torch.arange(q_len)
+                allowed = torch.arange(kv_len)[None, :] <= q_positions[:, None]
+                scores = q_seq @ k_seq.T / q.shape[-1] ** 0.5
+                outputs.append(
+                    torch.softmax(scores.masked_fill(~allowed, -torch.inf), dim=-1)
+                    @ v_seq
+                )
+            return torch.cat(outputs, dim=0)
+
+        cp_size = 4
+        seq_lens = [19, 27]
+        extend_seq_lens = [11, 13]
+        for rank in range(cp_size):
+            with self.subTest(rank=rank):
+                metadata = self._metadata_for_rank(
+                    rank,
+                    cp_size=cp_size,
+                    seq_lens=seq_lens,
+                    extend_seq_lens=extend_seq_lens,
+                )
+                logical_tokens = (
+                    metadata.total_q_prev_tokens + metadata.total_q_next_tokens
+                )
+                q = torch.linspace(
+                    -0.75,
+                    0.75,
+                    steps=logical_tokens * 3,
+                    dtype=torch.float32,
+                ).view(logical_tokens, 3)
+                q_prev = q[: metadata.total_q_prev_tokens]
+                q_next = q[metadata.total_q_prev_tokens :]
+
+                two_half_out = torch.cat(
+                    (
+                        reference_attention(
+                            q_prev,
+                            metadata.cu_seqlens_q_prev_tensor,
+                            metadata.kv_len_prev_tensor,
+                            metadata.cu_seqlens_kv_prev_tensor,
+                            sequence_offset=0,
+                        ),
+                        reference_attention(
+                            q_next,
+                            metadata.cu_seqlens_q_next_tensor,
+                            metadata.kv_len_next_tensor,
+                            metadata.cu_seqlens_kv_next_tensor,
+                            sequence_offset=metadata.bs,
+                        ),
+                    ),
+                    dim=0,
+                )
+                combined_out = reference_attention(
+                    q,
+                    metadata.cu_seqlens_q_combined_tensor,
+                    metadata.kv_len_combined_tensor,
+                    metadata.cu_seqlens_kv_combined_tensor,
+                    sequence_offset=0,
+                )
+
+                torch.testing.assert_close(
+                    combined_out, two_half_out, atol=1e-5, rtol=1e-5
+                )
 
 
 if __name__ == "__main__":
