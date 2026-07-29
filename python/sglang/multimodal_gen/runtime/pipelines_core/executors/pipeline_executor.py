@@ -162,7 +162,7 @@ class PipelineExecutor(ABC):
         """Run a grouped prefix, then yield each request after its tail completes."""
         with self.profile_execution(batches[0], dump_rank=0):
             with current_platform.inference_mode():
-                yield from self.execute_group_iter(
+                yield from self.execute_group_sequentially(
                     stages,
                     batches,
                     server_args,
