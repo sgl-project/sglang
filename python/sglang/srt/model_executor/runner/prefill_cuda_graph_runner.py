@@ -1644,46 +1644,54 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch: ForwardBatch,
         static_forward_batch: ForwardBatch,
         static_num_tokens: int,
+        raw_num_tokens: int,
         **kwargs,
     ):
         """Replay a CP-local body and run the global gather/logits tail eagerly."""
         model = self.model_runner.model
-        local_output = self.backend.replay(
-            ShapeKey(size=static_num_tokens),
+        with self._prefill_forward_context(
             static_forward_batch,
-            **kwargs,
-        )
-        local_output = _slice_output_rows(
-            local_output,
-            self._cp_live_local_tokens,
-        )
-
-        capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
-        aux_hidden_states = None
-        if capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = local_output
-        else:
-            hidden_states = local_output
-
-        if not model.pp_group.is_last_rank:
-            return (
-                (hidden_states, aux_hidden_states)
-                if capture_aux_hidden_states
-                else hidden_states
+            num_tokens=static_num_tokens,
+            raw_num_tokens=raw_num_tokens,
+        ):
+            local_output = self.backend.replay(
+                ShapeKey(size=static_num_tokens),
+                static_forward_batch,
+                **kwargs,
+            )
+            local_output = _slice_output_rows(
+                local_output,
+                self._cp_live_local_tokens,
             )
 
-        hidden_states = cp_gather_after_forward(
-            hidden_states,
-            static_forward_batch,
-            torch.cuda.current_stream(),
-        )
-        return model.logits_processor(
-            forward_batch.input_ids,
-            hidden_states,
-            model.lm_head,
-            forward_batch,
-            aux_hidden_states,
-        )
+            capture_aux_hidden_states = getattr(
+                model, "capture_aux_hidden_states", False
+            )
+            aux_hidden_states = None
+            if capture_aux_hidden_states:
+                hidden_states, aux_hidden_states = local_output
+            else:
+                hidden_states = local_output
+
+            if not model.pp_group.is_last_rank:
+                return (
+                    (hidden_states, aux_hidden_states)
+                    if capture_aux_hidden_states
+                    else hidden_states
+                )
+
+            hidden_states = cp_gather_after_forward(
+                hidden_states,
+                static_forward_batch,
+                torch.cuda.current_stream(),
+            )
+            return model.logits_processor(
+                forward_batch.input_ids,
+                hidden_states,
+                model.lm_head,
+                forward_batch,
+                aux_hidden_states,
+            )
 
     def _execute_body_capture(
         self,
@@ -1817,6 +1825,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch,
                     static_forward_batch,
                     static_num_tokens,
+                    raw_num_tokens,
                     **kwargs,
                 )
             elif self._uses_eager_prefill_tail():

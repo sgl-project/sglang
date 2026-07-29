@@ -1,4 +1,5 @@
 import unittest
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -305,7 +306,23 @@ class TestPrefillCudaGraphCPBodyCapture(CustomTestCase):
         )
         runner.model_runner = SimpleNamespace(model=model)
         runner.backend = MagicMock()
-        runner.backend.replay.return_value = local_padded
+        context_state = {"active": False}
+
+        @contextmanager
+        def prefill_context(*args, **kwargs):
+            context_state["active"] = True
+            try:
+                yield
+            finally:
+                context_state["active"] = False
+
+        runner._prefill_forward_context = prefill_context
+
+        def replay(*args, **kwargs):
+            self.assertTrue(context_state["active"])
+            return local_padded
+
+        runner.backend.replay.side_effect = replay
         runner._cp_live_local_tokens = 3
         forward_batch = SimpleNamespace(input_ids=torch.arange(6))
         static_forward_batch = SimpleNamespace()
@@ -316,9 +333,11 @@ class TestPrefillCudaGraphCPBodyCapture(CustomTestCase):
             forward_batch,
             static_forward_batch,
             static_num_tokens=16,
+            raw_num_tokens=6,
         )
 
         self.assertIs(actual, output)
+        self.assertFalse(context_state["active"])
         runner.backend.replay.assert_called_once_with(
             ShapeKey(size=16),
             static_forward_batch,
@@ -360,6 +379,7 @@ class TestPrefillCudaGraphCPBodyCapture(CustomTestCase):
         runner.model_runner = SimpleNamespace(model=model)
         runner.backend = MagicMock()
         runner.backend.replay.return_value = (local_hidden, local_aux)
+        runner._prefill_forward_context = lambda *args, **kwargs: nullcontext()
         runner._cp_live_local_tokens = 3
         forward_batch = SimpleNamespace(input_ids=torch.arange(6))
         static_forward_batch = SimpleNamespace()
@@ -369,6 +389,7 @@ class TestPrefillCudaGraphCPBodyCapture(CustomTestCase):
             forward_batch,
             static_forward_batch,
             static_num_tokens=16,
+            raw_num_tokens=6,
         )
 
         self.assertIs(actual, output)
