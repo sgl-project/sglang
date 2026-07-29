@@ -424,7 +424,12 @@ class TextEncoderLoader(ComponentLoader):
                     to_cpu=should_offload,
                 )
             )
-
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None and hasattr(
+                    quant_method, "process_weights_after_loading"
+                ):
+                    quant_method.process_weights_after_loading(module)
             if should_offload:
                 # Disable FSDP for MPS as it's not compatible
                 if current_platform.is_mps():
