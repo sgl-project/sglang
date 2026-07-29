@@ -713,6 +713,19 @@ class ModelConfig:
     def linear_attn_registry_result(self) -> Any:
         return get_linear_attn_config(self.hf_config)
 
+    @property
+    def has_asymmetric_kv(self) -> bool:
+        """Whether K and V rows differ in width (head_dim != v_head_dim).
+
+        MiMoV2 is 192 / 128. A property rather than an ``__init__`` field
+        because the MLA special-casing below still rewrites ``v_head_dim``.
+        MLA models are asymmetric by construction, but they are dispatched
+        through the separate MLA branch, so this only gates MHA backends.
+        """
+        return (
+            self.head_dim != self.v_head_dim or self.swa_head_dim != self.swa_v_head_dim
+        )
+
     def _detect_attention_sinks(self) -> bool:
         """Check whether the model uses learned attention sinks.
 

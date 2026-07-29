@@ -321,9 +321,11 @@ export const MiMoV25Deployment = () => {
 
     if (multinode) flags.push(...multiNodeFlags(nnodes));
 
-    // MoE backend: Blackwell uses flashinfer_trtllm (hardware-driven); Hopper
-    // optionally uses DeepEP (toggle).
-    if (isPro && blackwell) {
+    // MoE backend: Blackwell uses flashinfer_trtllm for both variants
+    // (hardware-driven, not variant-specific -- leaving it on "auto" falls
+    // through to the triton fused-MoE runner, ~12% slower at bs=1 decode);
+    // Hopper optionally uses DeepEP (toggle).
+    if (blackwell) {
       flags.push("  --moe-runner-backend flashinfer_trtllm");
     } else if (useDeepep) {
       flags.push("  --moe-a2a-backend deepep");
@@ -349,7 +351,13 @@ export const MiMoV25Deployment = () => {
         flags.push(`  --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 64}'`);
       }
     } else {
-      if (blackwell) flags.push("  --mm-attention-backend fa4");
+      if (blackwell) {
+        // fa4 is required, not a tuning choice: MiMoV2 has asymmetric KV
+        // (head_dim 192 / v_head_dim 128) and the SM100 default trtllm_mha
+        // rejects it during decode cuda-graph capture.
+        flags.push("  --attention-backend fa4");
+        flags.push("  --mm-attention-backend fa4");
+      }
       flags.push("  --mem-fraction-static 0.65");
       flags.push("  --chunked-prefill-size 16384");
     }

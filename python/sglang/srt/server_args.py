@@ -5565,6 +5565,13 @@ class ServerArgs:
                     or self.speculative_eagle_topk is not None
                 )
             ):
+                # trtllm_mha's paged-KV kernel requires equal K/V row widths and
+                # fails cuda graph capture on asymmetric KV (MiMoV2 is 192 / 128)
+                # with `key_cache.size(i) == value_cache.size(i)`. fa4 carries
+                # v_head_dim through, and is the verified Blackwell backend for
+                # those models.
+                if model_config.has_asymmetric_kv:
+                    return "fa4"
                 return "trtllm_mha"
             elif is_hip():
                 return "aiter"
