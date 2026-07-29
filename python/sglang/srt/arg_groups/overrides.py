@@ -774,7 +774,7 @@ def _granite_moe_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     return {}
 
 
-@_register_for("Lfm2ForCausalLM")
+@_register_for("Lfm2ForCausalLM", "Lfm2MoeForCausalLM")
 def _lfm2_overrides(server_args: Any, hf_config: Any) -> dict:
     if is_sm100_supported() and server_args.attention_backend is None:
         return {"attention_backend": "flashinfer"}
@@ -1123,6 +1123,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "JetNemotronForCausalLM",
         "JetVLMForConditionalGeneration",
         "Lfm2ForCausalLM",
+        "Lfm2MoeForCausalLM",
         "ZayaForCausalLM",
     }
 )
@@ -1293,6 +1294,25 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
     declared: Dict[str, Any] = {}
+    model_arch = hf_config.architectures[0]
+    is_glm_sm12_fp8 = (
+        model_arch == "GlmMoeDsaForCausalLM"
+        and major == 12
+        and kv_cache_dtype == "fp8_e4m3"
+        and not is_hip()
+    )
+
+    if is_glm_sm12_fp8:
+        backend = "flashinfer_sparse_mla"
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = backend
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = backend
+        logger.warning(
+            "Set DSA backends for GLM FP8 KV Cache on SM120/SM121: "
+            f"prefill={backend}, decode={backend}."
+        )
+        return declared
 
     if view.enable_hisparse:
         from sglang.srt.arg_groups.hisparse_hook import _hisparse_default_backend
@@ -2012,7 +2032,13 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 "--moe-runner-backend flashinfer_trtllm or "
                 "flashinfer_trtllm_routed."
             )
-    if view.quantization == "mxfp8":
+    # Ascend runs MXFP8 MoE on the Ascend runner; every backend selected below is
+    # CUDA/ROCm-only. Forcing one here would not merely pick the wrong runner:
+    # FusedMoE keys its w1/w3 shard swap ("flashinfer assumes w31") and its
+    # 128-alignment round-up off flashinfer_trtllm, so the experts would silently
+    # load with gate and up exchanged. Leave the backend at "auto" and let
+    # create_moe_runner resolve it to ASCEND.
+    if view.quantization == "mxfp8" and not is_npu():
         from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
         is_gfx95_mxfp8 = is_hip() and is_gfx95_supported()
