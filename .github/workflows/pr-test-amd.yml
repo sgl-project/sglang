@@ -706,15 +706,7 @@ jobs:
 
       - name: Setup kernel caches
         run: |
-          # Keep AITER JIT output container-local so concurrent jobs cannot
-          # delete or overwrite each other's compiled kernels.
-          docker exec ci_sglang mkdir -p /tmp/aiter-kernels /sgl-data/miopen-cache /sgl-data/hf-cache/hub
-
-          # Clear pre-built AITER kernels from Docker image to avoid segfaults
-          # The image may have stale/incompatible kernels at /sgl-workspace/aiter/aiter/jit/
-          echo "Clearing pre-built AITER kernels from Docker image..."
-          docker exec ci_sglang rm -rf /sgl-workspace/aiter/aiter/jit/*.so 2>/dev/null || true
-          echo "AITER kernels cleared - will be rebuilt on first use"
+          docker exec ci_sglang mkdir -p /sgl-data/miopen-cache /sgl-data/hf-cache/hub
 
           # Create persistent cache marker if /sgl-data is a real mount (not ephemeral)
           # This tells the test cleanup code to NOT delete downloaded models
@@ -774,7 +766,6 @@ jobs:
             -e SGLANG_SKIP_CONSISTENCY=1 \
             -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
             -e SGLANG_DIFFUSION_ARTIFACT_DIR=/sglang-checkout/diffusion-failures \
-            -e AITER_JIT_DIR=/tmp/aiter-kernels \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
             -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
@@ -846,15 +837,7 @@ jobs:
 
       - name: Setup kernel caches
         run: |
-          # Keep AITER JIT output container-local so concurrent jobs cannot
-          # delete or overwrite each other's compiled kernels.
-          docker exec ci_sglang mkdir -p /tmp/aiter-kernels /sgl-data/miopen-cache /sgl-data/hf-cache/hub
-
-          # Clear pre-built AITER kernels from Docker image to avoid segfaults
-          # The image may have stale/incompatible kernels at /sgl-workspace/aiter/aiter/jit/
-          echo "Clearing pre-built AITER kernels from Docker image..."
-          docker exec ci_sglang rm -rf /sgl-workspace/aiter/aiter/jit/*.so 2>/dev/null || true
-          echo "AITER kernels cleared - will be rebuilt on first use"
+          docker exec ci_sglang mkdir -p /sgl-data/miopen-cache /sgl-data/hf-cache/hub
 
           # Create persistent cache marker if /sgl-data is a real mount (not ephemeral)
           # This tells the test cleanup code to NOT delete downloaded models
@@ -914,7 +897,6 @@ jobs:
             -e SGLANG_SKIP_CONSISTENCY=1 \
             -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
             -e SGLANG_DIFFUSION_ARTIFACT_DIR=/sglang-checkout/diffusion-failures \
-            -e AITER_JIT_DIR=/tmp/aiter-kernels \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
             -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
@@ -990,7 +972,6 @@ jobs:
           # memory-format behavior that the ROCm conv path doesn't reproduce
           # (CUDA-specific). The rest of the unit suite is portable.
           docker exec \
-            -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \

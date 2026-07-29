@@ -341,8 +341,7 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
 docker exec ci_sglang mkdir -p \
   /sgl-data/hf-cache/hub \
   /sgl-data/pip-cache \
-  /sgl-data/miopen-cache \
-  /sgl-data/aiter-kernels
+  /sgl-data/miopen-cache
 
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
