@@ -627,6 +627,33 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.attn_cp_metadata = None
         prepare_cp_forward(forward_batch)
 
+        captured_local_tokens = None
+        if not capture:
+            try:
+                captured_local_tokens = self.cp_bucket_local_tokens[static_num_tokens]
+            except KeyError as exc:
+                raise RuntimeError(
+                    "Missing CP-local capture capacity for global prefill bucket "
+                    f"{static_num_tokens}"
+                ) from exc
+
+            # Breakable graph segments retain the captured token-row geometry
+            # even when a smaller live batch reuses this bucket. Preserve the
+            # live logical lengths used to discard padding, but make every CP
+            # physical tensor and collective use the captured local capacity.
+            metadata = forward_batch.attn_cp_metadata
+            if hasattr(metadata, "per_rank_actual_token"):
+                live_physical_tokens = max(metadata.per_rank_actual_token)
+                if live_physical_tokens > captured_local_tokens:
+                    raise RuntimeError(
+                        f"Live batch needs {live_physical_tokens} local CP rows, "
+                        f"but global prefill bucket {static_num_tokens} has "
+                        f"captured capacity {captured_local_tokens}"
+                    )
+                cp_size = len(metadata.per_rank_actual_token)
+                metadata.per_rank_actual_token = [captured_local_tokens] * cp_size
+                metadata.max_rank_len = [captured_local_tokens] * cp_size
+
         raw_tokens = int(forward_batch.extend_num_tokens)
         global_input_ids = forward_batch.input_ids[:raw_tokens]
         global_positions = forward_batch.positions[:raw_tokens]
@@ -644,13 +671,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             captured_local_tokens = live_local_tokens
             self.cp_bucket_local_tokens[static_num_tokens] = captured_local_tokens
         else:
-            try:
-                captured_local_tokens = self.cp_bucket_local_tokens[static_num_tokens]
-            except KeyError as exc:
-                raise RuntimeError(
-                    "Missing CP-local capture capacity for global prefill bucket "
-                    f"{static_num_tokens}"
-                ) from exc
+            assert captured_local_tokens is not None
             if live_local_tokens > captured_local_tokens:
                 raise RuntimeError(
                     f"Live batch needs {live_local_tokens} local CP rows, but global "

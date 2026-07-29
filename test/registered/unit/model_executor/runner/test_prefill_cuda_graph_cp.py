@@ -193,6 +193,57 @@ class TestPrefillCudaGraphCPStaticInputs(CustomTestCase):
         "prepare_cp_forward",
         create=True,
     )
+    def test_replay_keeps_logical_rows_but_uses_captured_physical_rows(
+        self, mock_prepare, mock_split
+    ):
+        runner = self._runner()
+        runner.cp_bucket_local_tokens = {16: 4}
+        batch = self._batch(12)
+        metadata = SimpleNamespace(
+            per_rank_logical_token=[3, 3, 3, 3],
+            per_rank_actual_token=[3, 3, 3, 3],
+            max_rank_len=[3, 3, 3, 3],
+        )
+        mock_prepare.side_effect = lambda forward_batch: setattr(
+            forward_batch, "attn_cp_metadata", metadata
+        )
+
+        def split(_, __, forward_batch):
+            self.assertEqual(
+                forward_batch.attn_cp_metadata.per_rank_logical_token,
+                [3, 3, 3, 3],
+            )
+            self.assertEqual(
+                forward_batch.attn_cp_metadata.per_rank_actual_token,
+                [4, 4, 4, 4],
+            )
+            self.assertEqual(
+                forward_batch.attn_cp_metadata.max_rank_len,
+                [4, 4, 4, 4],
+            )
+            return torch.ones((4, 2)), torch.arange(4)
+
+        mock_split.side_effect = split
+
+        live_rows = runner._prepare_cp_static_inputs(
+            batch,
+            static_num_tokens=16,
+            capture=False,
+        )
+
+        self.assertEqual(live_rows, 4)
+        self.assertIs(batch.attn_cp_metadata, metadata)
+
+    @patch(
+        "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
+        "cp_split_before_forward",
+        create=True,
+    )
+    @patch(
+        "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
+        "prepare_cp_forward",
+        create=True,
+    )
     def test_replay_rejects_more_local_rows_than_captured(
         self, mock_prepare, mock_split
     ):
