@@ -142,6 +142,55 @@ class TestFlashInferTrtllmBf16Padding(CustomTestCase):
             w13[:, intermediate_size:],
         )
 
+    def test_preparation_deinterleaves_gpt_oss_gate_up_checkpoint_rows(self):
+        """GPT-OSS checkpoint [gate0, up0, ...] rows become FlashInfer [up, gate]."""
+        hidden_size = 3
+        intermediate_size = 5
+        kernel_intermediate_size = 128
+        gate = torch.arange(
+            intermediate_size * hidden_size, dtype=torch.float32
+        ).reshape(intermediate_size, hidden_size)
+        up = gate + 100
+        interleaved = torch.stack((gate, up), dim=1).reshape(
+            1, 2 * intermediate_size, hidden_size
+        )
+        runtime_padded = torch.zeros(
+            1,
+            2 * kernel_intermediate_size,
+            hidden_size,
+            dtype=torch.bfloat16,
+        )
+        runtime_padded[:, : 2 * intermediate_size] = interleaved.to(torch.bfloat16)
+
+        prepared_w13, _, _ = _prepare_flashinfer_trtllm_bf16_weights(
+            runtime_padded,
+            torch.zeros(
+                1,
+                hidden_size,
+                kernel_intermediate_size,
+                dtype=torch.bfloat16,
+            ),
+            None,
+            None,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            gemm1_alpha=1.702,
+            gate_up_interleaved=True,
+        )
+
+        torch.testing.assert_close(
+            prepared_w13[:, :intermediate_size, :hidden_size],
+            up.unsqueeze(0).to(torch.bfloat16),
+        )
+        torch.testing.assert_close(
+            prepared_w13[
+                :,
+                kernel_intermediate_size : kernel_intermediate_size + intermediate_size,
+                :hidden_size,
+            ],
+            gate.unsqueeze(0).to(torch.bfloat16),
+        )
+
     def test_preparation_reads_runtime_padded_w13_layout(self):
         """Only logical [up, gate] rows survive a runtime-padded W13 input."""
         hidden_size = 3
