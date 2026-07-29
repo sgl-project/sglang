@@ -1692,6 +1692,9 @@ class MooncakeKVManager(CommonKVManager):
         message: dispatch errors are logged and the loop advances.
         """
         threading.Thread(target=self._run_decode_receiver_loop).start()
+        # Exactly once per manager — keep this out of the per-message
+        # receiver/dispatch path (see the latch + rationale in
+        # CommonKVManager._start_heartbeat_checker_thread).
         self._start_heartbeat_checker_thread()
 
     def _run_decode_receiver_loop(self):
