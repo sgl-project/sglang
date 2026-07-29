@@ -19,7 +19,6 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
-    get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
@@ -367,7 +366,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             self.use_deep_gemm
             and layer.w13_weight.dtype == torch.bfloat16
             and get_moe_a2a_backend().is_deepep()
-            and get_deepep_mode().enable_low_latency()
             and not _is_npu
             and not _is_hip
             and hasattr(layer, "dispatcher")
