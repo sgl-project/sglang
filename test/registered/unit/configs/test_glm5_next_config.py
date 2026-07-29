@@ -36,7 +36,7 @@ class TestGlm5NextTextConfig(CustomTestCase):
             linear_head_dim=96,
             linear_num_heads=32,
             linear_conv_kernel_dim=3,
-            linear_lower_bound=-5.0,
+            gate_lower_bound=-5.0,
         )
 
         self.assertEqual(
@@ -47,44 +47,41 @@ class TestGlm5NextTextConfig(CustomTestCase):
                 "kda_layers": [0, 1, 3],
                 "num_heads": 32,
                 "short_conv_kernel_size": 3,
-                "lower_bound": -5.0,
-                "safe_gate": True,
+                "gate_lower_bound": -5.0,
             },
         )
         self.assertEqual(config.linear_layer_ids, [0, 1, 3])
         self.assertEqual(config.full_attention_layer_ids, [2])
 
-    def test_transformers_format_without_lower_bound_uses_non_safe_gate(self):
+    def test_transformers_format_without_lower_bound(self):
         config = Glm5NextTextConfig(
             num_hidden_layers=2,
             layer_types=["linear_attention", "deepseek_sparse_attention"],
         )
 
-        self.assertIsNone(config.linear_attn_config["lower_bound"])
-        self.assertFalse(config.linear_attn_config["safe_gate"])
+        self.assertIsNone(config.linear_attn_config["gate_lower_bound"])
 
     def test_legacy_linear_attention_config_takes_precedence(self):
-        legacy_config = {
+        linear_attn_config = {
             "full_attn_layers": [1],
             "head_dim": 64,
             "kda_layers": [0],
             "num_heads": 16,
             "short_conv_kernel_size": 2,
-            "lower_bound": -4.0,
-            "safe_gate": True,
+            "gate_lower_bound": -4.0,
         }
 
         config = Glm5NextTextConfig(
             num_hidden_layers=2,
-            linear_attn_config=legacy_config,
+            linear_attn_config=linear_attn_config,
             layer_types=["deepseek_sparse_attention", "linear_attention"],
             linear_head_dim=96,
             linear_num_heads=32,
             linear_conv_kernel_dim=3,
-            linear_lower_bound=-5.0,
+            gate_lower_bound=-5.0,
         )
 
-        self.assertIs(config.linear_attn_config, legacy_config)
+        self.assertIs(config.linear_attn_config, linear_attn_config)
 
 
 if __name__ == "__main__":

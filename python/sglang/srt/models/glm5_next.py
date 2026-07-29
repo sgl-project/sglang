@@ -317,10 +317,7 @@ class Glm5NextLinearAttention(nn.Module):
             dt_bias=self.dt_bias,
         )
 
-        if config.linear_attn_config.get("safe_gate", True):
-            # No -5.0 fallback: forcing safe-gate on ckpts that omit lower_bound
-            # switches the KDA gate formula and corrupts logits (no-EOS loops).
-            self.attn.lower_bound = config.linear_attn_config.get("lower_bound")
+        self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         if dsa_use_prefill_cp(forward_batch, self.enable_prefill_cp):

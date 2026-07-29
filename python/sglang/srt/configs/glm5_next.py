@@ -56,7 +56,7 @@ _GLM5_NEXT_TOP_LEVEL_CONFIG_KEYS = (
     "linear_head_dim",
     "linear_num_heads",
     "linear_conv_kernel_dim",
-    "linear_lower_bound",
+    "gate_lower_bound",
     "index_head_dim",
     "index_topk",
     "index_kpool",
@@ -132,7 +132,7 @@ class Glm5NextTextConfig(PretrainedConfig):
         linear_head_dim: int = 128,
         linear_num_heads: int = 64,
         linear_conv_kernel_dim: int = 4,
-        linear_lower_bound: Optional[float] = None,
+        gate_lower_bound: Optional[float] = None,
         index_head_dim: int | None = None,
         index_topk: int | None = None,
         index_n_heads: int | None = None,
@@ -199,7 +199,7 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.linear_head_dim = linear_head_dim
         self.linear_num_heads = linear_num_heads
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
-        self.linear_lower_bound = linear_lower_bound
+        self.gate_lower_bound = gate_lower_bound
         if linear_attn_config is None:
             layer_types = kwargs.get("layer_types")
             if layer_types is None:
@@ -225,8 +225,7 @@ class Glm5NextTextConfig(PretrainedConfig):
                 "kda_layers": kda_layers,
                 "num_heads": linear_num_heads,
                 "short_conv_kernel_size": linear_conv_kernel_dim,
-                "lower_bound": linear_lower_bound,
-                "safe_gate": linear_lower_bound is not None,
+                "gate_lower_bound": gate_lower_bound,
             }
         self.linear_attn_config = linear_attn_config
 
