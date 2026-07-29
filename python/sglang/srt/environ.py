@@ -1258,8 +1258,12 @@ class Envs:
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
 
-    # Sglang Rust Server
+    # ===================================================================
+    # Rust Server specific envs.
+    # ===================================================================
     SGLANG_RUST_SERVER = EnvBool(False)
+    # Most batched requests one /generate HTTP call may expand into.
+    SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 
 
 envs = Envs()
