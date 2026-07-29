@@ -404,8 +404,7 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
 
 
 def _make_random_dsv4_mxfp4(num_experts, hidden, inter, seed=0):
-    """Mirrors the fp8 base method's allocation for fp4 experts: int8-packed
-    4-bit weights, fp32 scales (containing 2**e values, not raw E8M0 bytes)."""
+    """Create native checkpoint-style packed MXFP4 weights and E8M0 scales."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     # int8 storage (signed) -- matches Fp8MoEMethod.create_weights for fp4_experts.
     w13 = torch.randint(
@@ -424,8 +423,7 @@ def _make_random_dsv4_mxfp4(num_experts, hidden, inter, seed=0):
         device="cuda",
         generator=g,
     )
-    # fp32 scales whose bit pattern after .to(float8_e8m0fnu).view(uint8) lands
-    # in a sane E8M0 band -- generate exponents around 0 (= 2**0).
+    # Native E8M0 scales with exponents around 0 (= 2**0).
     raw_e = torch.randint(
         125,
         130,
@@ -442,8 +440,8 @@ def _make_random_dsv4_mxfp4(num_experts, hidden, inter, seed=0):
         device="cuda",
         generator=g,
     )
-    w13_s = raw_e.view(torch.float8_e8m0fnu).to(torch.float32)
-    w2_s = raw_e2.view(torch.float8_e8m0fnu).to(torch.float32)
+    w13_s = raw_e.view(torch.float8_e8m0fnu)
+    w2_s = raw_e2.view(torch.float8_e8m0fnu)
     return w13, w2, w13_s, w2_s
 
 
@@ -460,12 +458,11 @@ def test_dsv4_apply_matches_flashinfer_direct(
 ):
     """End-to-end: SGLang's DSv4 ``Mxfp4FlashinferCutlassMoEMethod.apply``
     output must match a direct FlashInfer ``cutlass_fused_moe`` call with
-    the equivalent reorder + scale-cast + interleave applied manually."""
+    the equivalent native E8M0 scale/weight interleave applied manually."""
     from types import SimpleNamespace
 
     import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
     import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as ds_mod
-    from sglang.srt.layers.quantization.utils import reorder_w1w3_to_w3w1
 
     # Bypass symmetric-memory / TP-group stack in the new fused-func module
     # (where DSv4 ``apply`` now dispatches the kernel call through).
@@ -476,29 +473,31 @@ def test_dsv4_apply_matches_flashinfer_direct(
     monkeypatch.setattr(fi_cutlass_mod, "get_tp_group", lambda: None)
 
     w13, w2, w13_s, w2_s = _make_random_dsv4_mxfp4(num_experts, hidden, inter)
+    w1, w3 = w13.chunk(2, dim=1)
+    w1_s, w3_s = w13_s.chunk(2, dim=1)
+    # Simulate FusedMoE's ``load_up_proj_weight_first`` loader contract.
+    w31 = torch.cat((w3, w1), dim=1)
+    w31_s = torch.cat(
+        (w3_s.view(torch.uint8), w1_s.view(torch.uint8)),
+        dim=1,
+    ).view(torch.float8_e8m0fnu)
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
     topk_w, topk_i = _make_topk(tokens, num_experts, top_k)
 
     # ---- SGLang DSv4 path ----
-    method = ds_mod.Mxfp4FlashinferCutlassMoEMethod.__new__(
-        ds_mod.Mxfp4FlashinferCutlassMoEMethod
-    )
-    method._fp8 = SimpleNamespace(
-        process_weights_after_loading=lambda layer: None,
-    )
-    method.prefix = "test"
     # plain SiLU * up — all three SwiGLU scalars None (no clamp configured).
-    method._swiglu_alpha_tensor = None
-    method._swiglu_beta_tensor = None
-    method._swiglu_limit_tensor = None
+    method = ds_mod.Mxfp4FlashinferCutlassMoEMethod(
+        SimpleNamespace(process_weights_after_loading=lambda layer: None),
+        "test",
+    )
     # Wire the unified MoeRunner -> flashinfer_mxfp4 fused func that
     # ``apply`` now dispatches through.
     method.runner = _build_flashinfer_mxfp4_runner(num_experts, hidden, inter)
 
     layer = _MockLayer()
-    layer.w13_weight = torch.nn.Parameter(w13.clone(), requires_grad=False)
+    layer.w13_weight = torch.nn.Parameter(w31.clone(), requires_grad=False)
     layer.w2_weight = torch.nn.Parameter(w2.clone(), requires_grad=False)
-    layer.w13_weight_scale_inv = torch.nn.Parameter(w13_s.clone(), requires_grad=False)
+    layer.w13_weight_scale_inv = torch.nn.Parameter(w31_s.clone(), requires_grad=False)
     layer.w2_weight_scale_inv = torch.nn.Parameter(w2_s.clone(), requires_grad=False)
     layer.num_local_experts = num_experts
     layer.moe_tp_size = 1
@@ -513,11 +512,10 @@ def test_dsv4_apply_matches_flashinfer_direct(
     ).hidden_states
 
     # ---- Direct FlashInfer reference ----
-    w13_re, w13_s_re = reorder_w1w3_to_w3w1(w13, w13_s)
-    w13_s_u8 = w13_s_re.to(torch.float8_e8m0fnu).view(torch.uint8).contiguous()
-    w2_s_u8 = w2_s.to(torch.float8_e8m0fnu).view(torch.uint8).contiguous()
+    w13_s_u8 = w31_s.view(torch.uint8)
+    w2_s_u8 = w2_s.view(torch.uint8)
     ref_w13 = interleave_moe_weights_for_sm90_mixed_gemm(
-        w13_re.view(torch.uint8).contiguous(), "fp4"
+        w31.view(torch.uint8).contiguous(), "fp4"
     )
     ref_w2 = interleave_moe_weights_for_sm90_mixed_gemm(
         w2.view(torch.uint8).contiguous(), "fp4"

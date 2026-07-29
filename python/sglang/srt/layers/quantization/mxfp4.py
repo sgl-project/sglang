@@ -48,7 +48,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -73,7 +73,6 @@ has_triton_kernels = is_triton_kernels_available()
 
 if is_flashinfer_available():
     from flashinfer import (
-        mxfp8_quantize,
         nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
     )
@@ -334,7 +333,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
         self.flashinfer_mxfp4_moe_precision = (
-            get_global_server_args().flashinfer_mxfp4_moe_precision
+            get_server_args().flashinfer_mxfp4_moe_precision
         )
         # When `flashinfer_mxfp4` is enabled, dispatch to one of two FlashInfer
         # entry points depending on the GPU:
@@ -857,29 +856,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight_bias = Parameter(
                         layer.w2_weight_bias.float(), requires_grad=False
                     )
-                return
-            # Fallback if the TP-sharded layer cannot be AMX-packed
-            from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-
-            w13_weight = MXFP4QuantizeUtil.dequantize(
-                quantized_data=layer.w13_weight,
-                dtype=torch.bfloat16,
-                scale=layer.w13_weight_scale,
-                block_sizes=[32],
-            )
-            w2_weight = MXFP4QuantizeUtil.dequantize(
-                quantized_data=layer.w2_weight,
-                dtype=torch.bfloat16,
-                scale=layer.w2_weight_scale,
-                block_sizes=[32],
-            )
-            del layer.w13_weight
-            del layer.w2_weight
-            del layer.w13_weight_scale
-            del layer.w2_weight_scale
-            layer.w13_weight = Parameter(w13_weight, requires_grad=False)
-            layer.w2_weight = Parameter(w2_weight, requires_grad=False)
-
             return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
@@ -1191,7 +1167,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         value=0.0,
                     )
             elif self.flashinfer_mxfp4_moe_precision == "default":
-                x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    flashinfer_mxfp8_quantize,
+                )
+
+                x_quant, x_scale = flashinfer_mxfp8_quantize(
+                    x, False, alignment=self.hidden_size
+                )
                 x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
             else:
                 raise NotImplementedError()
