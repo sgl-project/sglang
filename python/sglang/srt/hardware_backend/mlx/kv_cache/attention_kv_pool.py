@@ -154,7 +154,7 @@ class MlxBlockAttentionKVPool:
         """Ensure a request owns at least ``num_blocks`` physical blocks."""
         if num_blocks < 0:
             raise ValueError(f"num_blocks must be non-negative, got {num_blocks}")
-        existing = self._req_block_tables.setdefault(req_id, [])
+        existing = self._req_block_tables.get(req_id, [])
         needed = num_blocks - len(existing)
         if needed <= 0:
             return list(existing)
@@ -162,6 +162,9 @@ class MlxBlockAttentionKVPool:
             return None
         new_blocks = self._free_blocks[:needed]
         del self._free_blocks[:needed]
+        if req_id not in self._req_block_tables:
+            existing = []
+            self._req_block_tables[req_id] = existing
         existing.extend(new_blocks)
         return list(existing)
 

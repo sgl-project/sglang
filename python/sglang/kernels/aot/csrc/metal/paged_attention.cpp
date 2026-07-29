@@ -58,13 +58,12 @@ class BlockPagedAttentionDecode : public Primitive {
         {&nk, MTL::DataType::DataTypeUInt, 2},
         {&scale, MTL::DataType::DataTypeFloat, 3},
         {&bs, MTL::DataType::DataTypeUInt, 4},
-        {&mb, MTL::DataType::DataTypeUInt, 5},
     };
 
     const std::string kname = std::string("block_paged_attention_decode_") + dtype_suffix(q.dtype());
     const std::string hash = kname + "_hd" + std::to_string(head_dim_) + "_q" + std::to_string(num_qo_heads_) + "_k" +
-                             std::to_string(num_kv_heads_) + "_bs" + std::to_string(block_size_) + "_mb" +
-                             std::to_string(mb) + "_s" + std::to_string(static_cast<int>(sm_scale_ * 1000000.0f));
+                             std::to_string(num_kv_heads_) + "_bs" + std::to_string(block_size_) + "_s" +
+                             std::to_string(static_cast<int>(sm_scale_ * 1000000.0f));
     auto* pipe = d.get_kernel(kname, g_library, hash, consts);
     if (!pipe) {
       throw std::runtime_error("block_paged_attention_decode: failed to resolve kernel");
@@ -77,6 +76,7 @@ class BlockPagedAttentionDecode : public Primitive {
     enc.set_input_array(block_tables, 3);
     enc.set_input_array(seq_lens, 4);
     enc.set_output_array(out, 5);
+    enc.set_bytes(&mb, sizeof(uint32_t), 6);
 
     const uint32_t batch = static_cast<uint32_t>(q.shape(0));
     enc.dispatch_threads(MTL::Size::Make(batch, nq, 256), MTL::Size::Make(1, 1, 256));

@@ -113,18 +113,18 @@ def rope_pool_fused(
 
 
 def block_paged_attention_decode(
-    q: "mx.array",
-    k_blocks: "mx.array",
-    v_blocks: "mx.array",
-    block_tables: "mx.array",
-    seq_lens: "mx.array",
+    q: mx.array,
+    k_blocks: mx.array,
+    v_blocks: mx.array,
+    block_tables: mx.array,
+    seq_lens: mx.array,
     *,
     num_qo_heads: int,
     num_kv_heads: int,
     head_dim: int,
     block_size: int,
     sm_scale: float,
-) -> "mx.array":
+) -> mx.array:
     """Decode attention over a block-table MLX KV layout.
 
     Args:

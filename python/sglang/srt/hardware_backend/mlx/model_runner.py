@@ -103,7 +103,8 @@ class MlxPendingDecode:
     lazy_tokens: mx.array
     req_ids: list[str]
     caches: list[list[Any]]
-    pool_synced_offsets: dict[str, int] | None = None
+    flat_pool_synced_offsets: dict[str, int] | None = None
+    block_pool_synced_offsets: dict[str, int] | None = None
 
 
 _MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
@@ -527,7 +528,7 @@ class MlxModelRunner:
             if scales is not None and scales.dtype in _MLX_KV_FLOAT_DTYPES:
                 dtype = scales.dtype
             else:
-                dtype = mx.float16
+                dtype = mx.float32
         return n_kv_heads, head_dim, dtype
 
     def _get_attn_config(self) -> tuple[int, int, mx.Dtype]:
@@ -604,10 +605,24 @@ class MlxModelRunner:
         """Create attention KV pool (+1 for padding slot 0)."""
         self._req_to_token_pool = req_to_token_pool
         n_kv_heads, head_dim, dtype = self._get_attn_config()
-        if envs.SGLANG_MLX_USE_BLOCK_PAGED_ATTENTION.get():
-            num_blocks = (
+        block_paged_attention_enabled = (
+            envs.SGLANG_MLX_USE_BLOCK_PAGED_ATTENTION.get()
+            and self._aot_kernels.block_paged_attention.enabled
+            and not self._cache_layout.has_auxiliary_state
+        )
+        if block_paged_attention_enabled:
+            req_capacity = (
+                int(req_to_token_pool.req_to_token.shape[0])
+                if req_to_token_pool is not None
+                else 0
+            )
+            token_blocks = (
                 self._pool_size + self._block_size - 1
-            ) // self._block_size + 1
+            ) // self._block_size
+            # Blocks are owned per request. Add one partial-block headroom block
+            # per request row so token-slot admission does not over-admit many
+            # short requests that each need a separate final block.
+            num_blocks = token_blocks + req_capacity + 1
             self._block_attention_kv_pool = MlxBlockAttentionKVPool(
                 num_blocks=num_blocks,
                 block_size=self._block_size,
@@ -618,9 +633,15 @@ class MlxModelRunner:
             )
             logger.info(
                 f"Block attention KV pool initialized: num_blocks={num_blocks} "
-                f"(block 0 reserved), block_size={self._block_size}, "
+                f"(block 0 reserved, token_blocks={token_blocks}, "
+                f"fragmentation_headroom={req_capacity}), block_size={self._block_size}, "
                 f"{self._cache_layout.num_attention_layers} attention layers, "
                 f"{n_kv_heads} kv_heads, {head_dim} head_dim"
+            )
+        elif envs.SGLANG_MLX_USE_BLOCK_PAGED_ATTENTION.get():
+            logger.info(
+                "Block paged attention requested but unavailable for this model; "
+                "using legacy MLX KV cache with padded SDPA fallback."
             )
         if self.disable_radix_cache:
             return
@@ -939,6 +960,10 @@ class MlxModelRunner:
         that specific lazy scalar.
         """
         next_token = int(pending.lazy_token.item())
+        if self._block_attention_kv_pool is not None:
+            self._ensure_block_request_capacity(
+                pending.req_id, self._first_attention_cache(pending.cache).offset
+            )
         self._req_token_ids[pending.req_id] = list(pending.full_token_ids) + [
             next_token
         ]
@@ -961,6 +986,10 @@ class MlxModelRunner:
         ), f"extend_start called for unknown request {req_id}"
 
         cache = self._req_caches[req_id]
+        if self._block_attention_kv_pool is not None:
+            self._ensure_block_request_capacity(
+                req_id, self._first_attention_cache(cache).offset + len(new_token_ids)
+            )
 
         input_ids = mx.array([new_token_ids], dtype=mx.int32)
         model_output = self.model(input_ids, cache=cache)
@@ -1208,7 +1237,7 @@ class MlxModelRunner:
         caches: list[list[Any]],
         batched_input: mx.array,
         req_ids: list[str],
-    ) -> tuple[mx.array, dict[str, int] | None]:
+    ) -> tuple[mx.array, dict[str, int] | None, dict[str, int] | None]:
         self._ensure_block_capacity_for_decode(req_ids, caches)
         ctx = self._build_batched_decode_context(caches, req_ids)
         seq_lens = ctx.seq_lens
@@ -1221,21 +1250,26 @@ class MlxModelRunner:
             ]
             model_output = self.model(batched_input, cache=shim_cache)
             logits = self._extract_logits(model_output)
-            pool_synced_offsets = None
+            flat_pool_synced_offsets = None
             if ctx.aot.rope is not None and ctx.aot.rope.new_token_slots is not None:
-                pool_synced_offsets = {
+                flat_pool_synced_offsets = {
                     rid: self._first_attention_cache(cache).offset
                     for rid, cache in zip(req_ids, caches)
                 }
+            block_pool_synced_offsets = None
             if (
                 ctx.aot.block_paged_attention is not None
                 and ctx.block_paged_metadata is not None
             ):
-                pool_synced_offsets = {
+                block_pool_synced_offsets = {
                     rid: self._first_attention_cache(cache).offset
                     for rid, cache in zip(req_ids, caches)
                 }
-            return mx.argmax(logits[:, -1, :], axis=-1), pool_synced_offsets
+            return (
+                mx.argmax(logits[:, -1, :], axis=-1),
+                flat_pool_synced_offsets,
+                block_pool_synced_offsets,
+            )
         finally:
             clear_context()
 
@@ -1275,17 +1309,21 @@ class MlxModelRunner:
             lazy_tokens = self._decode_with_hybrid_batching(
                 caches, batched_input, list(req_ids)
             )
-            pool_synced_offsets = None
+            flat_pool_synced_offsets = None
+            block_pool_synced_offsets = None
         else:
-            lazy_tokens, pool_synced_offsets = self._decode_with_batched_attention(
-                caches, batched_input, list(req_ids)
-            )
+            (
+                lazy_tokens,
+                flat_pool_synced_offsets,
+                block_pool_synced_offsets,
+            ) = self._decode_with_batched_attention(caches, batched_input, list(req_ids))
 
         return MlxPendingDecode(
             lazy_tokens=lazy_tokens,
             req_ids=list(req_ids),
             caches=caches,
-            pool_synced_offsets=pool_synced_offsets,
+            flat_pool_synced_offsets=flat_pool_synced_offsets,
+            block_pool_synced_offsets=block_pool_synced_offsets,
         )
 
     def decode_batch_start_chained(
@@ -1322,17 +1360,21 @@ class MlxModelRunner:
             lazy_tokens = self._decode_with_hybrid_batching(
                 caches, batched_input, prev.req_ids
             )
-            pool_synced_offsets = None
+            flat_pool_synced_offsets = None
+            block_pool_synced_offsets = None
         else:
-            lazy_tokens, pool_synced_offsets = self._decode_with_batched_attention(
-                caches, batched_input, prev.req_ids
-            )
+            (
+                lazy_tokens,
+                flat_pool_synced_offsets,
+                block_pool_synced_offsets,
+            ) = self._decode_with_batched_attention(caches, batched_input, prev.req_ids)
 
         return MlxPendingDecode(
             lazy_tokens=lazy_tokens,
             req_ids=prev.req_ids,
             caches=caches,
-            pool_synced_offsets=pool_synced_offsets,
+            flat_pool_synced_offsets=flat_pool_synced_offsets,
+            block_pool_synced_offsets=block_pool_synced_offsets,
         )
 
     def decode_batch_finalize(
@@ -1355,12 +1397,12 @@ class MlxModelRunner:
 
         for i, rid in enumerate(pending.req_ids):
             self._req_token_ids[rid].append(next_tokens[i])
-            if pending.pool_synced_offsets is not None:
-                self._req_synced_offset[rid] = pending.pool_synced_offsets[rid]
-                if self._block_attention_kv_pool is not None:
-                    self._req_block_synced_offset[rid] = pending.pool_synced_offsets[
-                        rid
-                    ]
+            if pending.flat_pool_synced_offsets is not None:
+                self._req_synced_offset[rid] = pending.flat_pool_synced_offsets[rid]
+            if pending.block_pool_synced_offsets is not None:
+                self._req_block_synced_offset[rid] = pending.block_pool_synced_offsets[
+                    rid
+                ]
 
         self._decode_step_ct += 1
         if self._clear_steps > 0 and self._decode_step_ct % self._clear_steps == 0:

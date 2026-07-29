@@ -8,7 +8,6 @@ constant uint  NUM_QO_HEADS [[function_constant(1)]];
 constant uint  NUM_KV_HEADS [[function_constant(2)]];
 constant float SM_SCALE     [[function_constant(3)]];
 constant uint  BLOCK_SIZE   [[function_constant(4)]];
-constant uint  MAX_BLOCKS   [[function_constant(5)]];
 
 constant uint PAGED_ATTN_NUM_THREADS = 256;
 constant uint PAGED_ATTN_SIMD_SIZE = 32;
@@ -44,6 +43,7 @@ inline void block_paged_attention_decode_impl(
     const device T*       v_blocks,
     const device int32_t* block_tables,
     const device int32_t* seq_lens,
+    const constant uint&  max_blocks,
     device T*             out,
     uint3 tg_pos,
     uint simd_tid,
@@ -74,7 +74,7 @@ inline void block_paged_attention_decode_impl(
          token_idx += int32_t(PAGED_ATTN_NUM_THREADS)) {
         const uint logical_block = uint(token_idx) / BLOCK_SIZE;
         const uint block_offset = uint(token_idx) - logical_block * BLOCK_SIZE;
-        const int32_t physical_block = block_tables[batch_id * MAX_BLOCKS + logical_block];
+        const int32_t physical_block = block_tables[batch_id * max_blocks + logical_block];
         if (physical_block < 0) {
             continue;
         }
@@ -174,6 +174,7 @@ inline void block_paged_attention_decode_impl(
         const device int32_t* block_tables [[buffer(3)]],                               \
         const device int32_t* seq_lens     [[buffer(4)]],                               \
         device T*             out          [[buffer(5)]],                               \
+        const constant uint&  max_blocks   [[buffer(6)]],                               \
         uint3 tg_pos [[threadgroup_position_in_grid]],                                  \
         uint simd_tid [[simdgroup_index_in_threadgroup]],                               \
         uint simd_lid [[thread_index_in_simdgroup]]) {                                  \
@@ -181,8 +182,9 @@ inline void block_paged_attention_decode_impl(
         threadgroup float warp_sums[PAGED_ATTN_NUM_WARPS];                              \
         threadgroup float warp_accs[PAGED_ATTN_NUM_WARPS * PAGED_ATTN_MAX_HEAD_DIM];    \
         block_paged_attention_decode_impl<T>(q, k_blocks, v_blocks, block_tables,       \
-                                             seq_lens, out, tg_pos, simd_tid, simd_lid, \
-                                             warp_maxes, warp_sums, warp_accs);         \
+                                             seq_lens, max_blocks, out, tg_pos,         \
+                                             simd_tid, simd_lid, warp_maxes, warp_sums, \
+                                             warp_accs);                                \
     }
 
 INSTANTIATE_BLOCK(f16,  half)
