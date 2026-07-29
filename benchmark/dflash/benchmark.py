@@ -752,6 +752,7 @@ class BenchMetrics:
     # not double-count wall time.
     decode_active_s: float
     decode_output_toks_per_s: Optional[float]
+    peak_request_decode_output_toks_per_s: Optional[float]
     # Aggregate/server definition: sum(completion_tokens) / sum(spec_verify_ct).
     spec_accept_length: Optional[float]
     # Equal-weight mean of completion_tokens / spec_verify_ct per request.
@@ -843,6 +844,9 @@ def _bench_metrics_to_payload(metrics: BenchMetrics) -> dict[str, Any]:
         "decode_output_tokens": metrics.decode_output_tokens,
         "decode_active_s": metrics.decode_active_s,
         "decode_output_toks_per_s": metrics.decode_output_toks_per_s,
+        "peak_request_decode_output_toks_per_s": (
+            metrics.peak_request_decode_output_toks_per_s
+        ),
         "spec_accept_length": metrics.spec_accept_length,
         "spec_accept_length_mean_per_request": (
             metrics.spec_accept_length_mean_per_request
@@ -865,6 +869,11 @@ def _bench_metrics_from_payload(payload: dict[str, Any]) -> BenchMetrics:
             None
             if payload["decode_output_toks_per_s"] is None
             else float(payload["decode_output_toks_per_s"])
+        ),
+        peak_request_decode_output_toks_per_s=(
+            None
+            if payload.get("peak_request_decode_output_toks_per_s") is None
+            else float(payload["peak_request_decode_output_toks_per_s"])
         ),
         spec_accept_length=payload.get("spec_accept_length"),
         spec_accept_length_mean_per_request=payload.get(
@@ -928,6 +937,7 @@ class SampleMetrics:
     output_tokens: int
     decode_output_tokens: int
     decode_intervals: tuple[tuple[float, float], ...]
+    peak_request_decode_output_toks_per_s: Optional[float]
     spec_verify_ct_sum: int
     spec_accept_lengths_per_request: tuple[float, ...]
 
@@ -1021,6 +1031,7 @@ def _run_sample(
     total_tokens = 0
     decode_output_tokens = 0
     decode_intervals: list[tuple[float, float]] = []
+    peak_request_decode_output_toks_per_s = None
     spec_verify_ct_sum = 0
     accept_lengths_per_request: list[float] = []
 
@@ -1052,6 +1063,14 @@ def _run_sample(
         decode_output_tokens += turn_decode_output_tokens
         if decode_interval is not None:
             decode_intervals.append(decode_interval)
+            decode_duration = decode_interval[1] - decode_interval[0]
+            request_decode_toks_per_s = (
+                float(turn_decode_output_tokens) / decode_duration
+            )
+            peak_request_decode_output_toks_per_s = max(
+                peak_request_decode_output_toks_per_s or 0.0,
+                request_decode_toks_per_s,
+            )
         spec_verify_ct_sum += spec_verify_ct
         if spec_verify_ct > 0:
             accept_lengths_per_request.append(
@@ -1075,6 +1094,7 @@ def _run_sample(
         output_tokens=int(total_tokens),
         decode_output_tokens=int(decode_output_tokens),
         decode_intervals=tuple(decode_intervals),
+        peak_request_decode_output_toks_per_s=peak_request_decode_output_toks_per_s,
         spec_verify_ct_sum=int(spec_verify_ct_sum),
         spec_accept_lengths_per_request=tuple(accept_lengths_per_request),
     )
@@ -1218,6 +1238,7 @@ def _run_requests(
     total_tokens = 0
     decode_output_tokens = 0
     decode_intervals: list[tuple[float, float]] = []
+    peak_request_decode_output_toks_per_s = None
     spec_verify_ct_sum = 0
     accept_lengths_per_request: list[float] = []
     generation_turn_count = 0
@@ -1239,6 +1260,11 @@ def _run_requests(
             total_tokens += sample_metrics.output_tokens
             decode_output_tokens += sample_metrics.decode_output_tokens
             decode_intervals.extend(sample_metrics.decode_intervals)
+            if sample_metrics.peak_request_decode_output_toks_per_s is not None:
+                peak_request_decode_output_toks_per_s = max(
+                    peak_request_decode_output_toks_per_s or 0.0,
+                    sample_metrics.peak_request_decode_output_toks_per_s,
+                )
             spec_verify_ct_sum += sample_metrics.spec_verify_ct_sum
             accept_lengths_per_request.extend(
                 sample_metrics.spec_accept_lengths_per_request
@@ -1281,6 +1307,7 @@ def _run_requests(
         decode_output_tokens=int(decode_output_tokens),
         decode_active_s=float(decode_active_s),
         decode_output_toks_per_s=decode_output_toks_per_s,
+        peak_request_decode_output_toks_per_s=peak_request_decode_output_toks_per_s,
         spec_accept_length=spec_accept_length,
         spec_accept_length_mean_per_request=spec_accept_length_mean_per_request,
         spec_accept_length_request_count=len(accept_lengths_per_request),
@@ -1609,11 +1636,17 @@ def _run_benchmark_job(job: BenchmarkJob) -> JobResult:
             if metrics.decode_output_toks_per_s is None
             else f"{metrics.decode_output_toks_per_s:,.2f}"
         )
+        peak_decode_toks_per_s = (
+            "N/A"
+            if metrics.peak_request_decode_output_toks_per_s is None
+            else f"{metrics.peak_request_decode_output_toks_per_s:,.2f}"
+        )
         line = (
             f"[{job.label} {job.run_label}] samples={plan.measured_sample_count:<4} "
             f"turns={plan.measured_generation_turn_count:<4} "
             f"toks/s={metrics.output_toks_per_s:,.2f} "
             f"decode_toks/s={decode_toks_per_s} "
+            f"peak_request_decode_toks/s={peak_decode_toks_per_s} "
             f"latency={metrics.latency_s:.1f}s "
             f"warmup_turns={plan.warmup_generation_turn_count}"
         )
@@ -1751,6 +1784,12 @@ def _print_summary(
                 "last_decode_finish_time]))",
             ),
             (
+                "peak_request_decode_output_tps_definition",
+                "max((completion_tokens - 1) / "
+                "(last_decode_finish_time - prefill_finished_time) "
+                "for completion_tokens > 1)",
+            ),
+            (
                 "min_generation_turns_per_config",
                 config.methodology.min_generation_turns_per_config,
             ),
@@ -1783,11 +1822,24 @@ def _print_summary(
             mode="baseline",
             field="decode_output_toks_per_s",
         )
+        baseline_peak_request_decode_output_tps = _collect_metric(
+            results=results,
+            backend=backend,
+            tp_sizes=tp_sizes,
+            concurrencies=concurrencies,
+            mode="baseline",
+            field="peak_request_decode_output_toks_per_s",
+        )
         sections: list[tuple[str, dict[tuple[int, int], Optional[float]], str]] = [
             ("Baseline output tok/s", baseline_output_tps, ",.2f"),
             (
                 "Baseline decode-only output tok/s",
                 baseline_decode_output_tps,
+                ",.2f",
+            ),
+            (
+                "Baseline peak request decode-only output tok/s",
+                baseline_peak_request_decode_output_tps,
                 ",.2f",
             ),
         ]
@@ -1809,6 +1861,14 @@ def _print_summary(
                 concurrencies=concurrencies,
                 mode=spec_mode,
                 field="decode_output_toks_per_s",
+            )
+            spec_peak_request_decode_output_tps = _collect_metric(
+                results=results,
+                backend=backend,
+                tp_sizes=tp_sizes,
+                concurrencies=concurrencies,
+                mode=spec_mode,
+                field="peak_request_decode_output_toks_per_s",
             )
             spec_accept_length = _collect_metric(
                 results=results,
@@ -1832,6 +1892,11 @@ def _print_summary(
                     (
                         f"{display_name} decode-only output tok/s",
                         spec_decode_output_tps,
+                        ",.2f",
+                    ),
+                    (
+                        f"{display_name} peak request decode-only output tok/s",
+                        spec_peak_request_decode_output_tps,
                         ",.2f",
                     ),
                     (
@@ -1894,6 +1959,7 @@ CSV_FIELDS = [
     "output_toks_per_s_std",
     "decode_output_toks_per_s",
     "decode_output_toks_per_s_std",
+    "peak_request_decode_output_toks_per_s",
     "latency_s",
     "latency_s_std",
     "decode_active_s",
@@ -1998,6 +2064,14 @@ def _aggregate_bench_metrics(metrics: list[BenchMetrics]) -> BenchMetrics:
         ),
         decode_output_toks_per_s=_mean_optional(
             [metric.decode_output_toks_per_s for metric in metrics]
+        ),
+        peak_request_decode_output_toks_per_s=max(
+            (
+                metric.peak_request_decode_output_toks_per_s
+                for metric in metrics
+                if metric.peak_request_decode_output_toks_per_s is not None
+            ),
+            default=None,
         ),
         spec_accept_length=(
             float(total_output_tokens) / float(total_spec_verify_ct)
@@ -2179,6 +2253,11 @@ def _build_csv_rows(
                         result.repeat_metrics,
                         "decode_output_toks_per_s",
                     )
+                ),
+                "peak_request_decode_output_toks_per_s": _fmt_csv_value(
+                    None
+                    if metrics is None
+                    else metrics.peak_request_decode_output_toks_per_s
                 ),
                 "latency_s": _fmt_csv_value(
                     None if metrics is None else metrics.latency_s
