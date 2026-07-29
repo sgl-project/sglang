@@ -53,7 +53,11 @@ def build_intra_turn_prefix_plan(
                 continue
 
             other_ids = fill_ids_by_req[id(other)]
-            common_len = _common_prefix_len(seed_ids, other_ids)
+            common_len = min(
+                _common_prefix_len(seed_ids, other_ids),
+                _cacheable_prefix_len(seed, seed_ids),
+                _cacheable_prefix_len(other, other_ids),
+            )
             shared_new_tokens = common_len - seed_prefix_len
             if shared_new_tokens < min_shared_new_tokens:
                 continue
@@ -64,6 +68,8 @@ def build_intra_turn_prefix_plan(
                 if (
                     req.extra_key == seed.extra_key
                     and len(req.prefix_indices) == seed_prefix_len
+                    and _cacheable_prefix_len(req, fill_ids_by_req[id(req)])
+                    >= common_len
                     and _has_prefix(fill_ids_by_req[id(req)], seed_ids, common_len)
                 )
             ]
@@ -106,6 +112,10 @@ def _is_eligible_req(req: Req) -> bool:
     if getattr(req, "skip_radix_cache_insert", False):
         return False
     return len(req.get_fill_ids()) > len(req.prefix_indices)
+
+
+def _cacheable_prefix_len(req: Req, fill_ids: array[int]) -> int:
+    return req._compute_max_prefix_len(len(fill_ids))
 
 
 def _common_prefix_len(a: array[int], b: array[int]) -> int:

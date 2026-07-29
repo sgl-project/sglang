@@ -2942,11 +2942,14 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        can_attempt_two_stage_intra_turn_prefix_cache = (
+            self._can_attempt_two_stage_intra_turn_prefix_cache()
+        )
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if (
                 req.defer_for_in_batch_prefix_cache
-                and not self.enable_two_stage_intra_turn_prefix_cache
+                and not can_attempt_two_stage_intra_turn_prefix_cache
             ):
                 continue
 
@@ -3121,6 +3124,13 @@ class Scheduler(
         )
 
     def _can_use_two_stage_intra_turn_prefix_cache(self, batch: ScheduleBatch) -> bool:
+        if not self._can_attempt_two_stage_intra_turn_prefix_cache():
+            return False
+        if batch.return_logprob or batch.return_hidden_states or batch.is_prefill_only:
+            return False
+        return True
+
+    def _can_attempt_two_stage_intra_turn_prefix_cache(self) -> bool:
         if not self.enable_two_stage_intra_turn_prefix_cache:
             return False
         if not self.is_generation:
@@ -3142,8 +3152,6 @@ class Scheduler(
         if self.model_config.is_encoder_decoder:
             return False
         if self.ngram_embedding_manager.enabled:
-            return False
-        if batch.return_logprob or batch.return_hidden_states or batch.is_prefill_only:
             return False
         if getattr(self.tree_cache, "disable", True):
             return False
@@ -3570,9 +3578,12 @@ class Scheduler(
                 stage_batch.prepare_for_extend()
                 self._run_intra_turn_prefix_stage_batch(stage_batch)
 
-            release_kv_cache(stage_req, self.tree_cache, is_insert=True)
-            stage_released = True
-            stage_locked = False
+                release_kv_cache(stage_req, self.tree_cache, is_insert=True)
+                stage_released = True
+                stage_locked = False
+            else:
+                self.tree_cache.dec_lock_ref(stage_req.last_node)
+                stage_locked = False
         finally:
             if not stage_released:
                 if stage_req.req_pool_idx is not None:
