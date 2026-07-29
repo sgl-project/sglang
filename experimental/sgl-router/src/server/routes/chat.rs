@@ -289,12 +289,20 @@ async fn chat_completions_inner(
         .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
     let at_post_tokenize = start.elapsed();
 
+    // The request id, derived HERE rather than at dispatch because both tees
+    // need it and the ingress one fires now. It is the join key that lets the
+    // oracle pair a request's prompt record with its response record; without
+    // it the two are unattributable and output tokens have nothing to attach
+    // to. Same value is reused for the engine-facing `rid` below — one
+    // derivation, so the two can never disagree.
+    let derived_request_id = derive_request_id(probe.rid.as_deref(), &headers);
+
     // Best-effort tee of the ingress-computed ids to the theoretical cache-sim.
     // Fires only when we already tokenized (so it adds no latency), and is
     // fire-and-forget — never blocks or fails the request. No-op unless
     // `--cache-sim-url` is set.
     if let (Some(tee), Some(t)) = (ctx.cache_sim_tee.as_ref(), request_tokens.as_ref()) {
-        tee.offer(&model_str, &t.ids);
+        tee.offer(&model_str, &t.ids, &derived_request_id);
     }
     // Arm the response-completion extend tee (see `cache_sim_extend`): when the
     // response finishes, the assistant reply's rendered turn is appended to
@@ -588,6 +596,7 @@ async fn chat_completions_inner(
         let model = model_str.clone();
         let request_body = body.clone();
         let prompt = extend_prompt.clone();
+        let request_id = derived_request_id.clone();
         move || -> Option<StreamCapture> {
             if !armed {
                 return None;
@@ -596,12 +605,14 @@ async fn chat_completions_inner(
             let model = model.clone();
             let request_body = request_body.clone();
             let prompt = prompt.clone();
+            let request_id = request_id.clone();
             Some(StreamCapture {
                 max_bytes: cache_sim_extend::MAX_EXTEND_CAPTURE_BYTES,
                 on_done: Box::new(move |buf| {
                     cache_sim_extend::spawn_extend_tee(
                         ctx,
                         model,
+                        request_id,
                         request_body,
                         prompt,
                         ReplySource::Sse(buf),
@@ -668,26 +679,12 @@ async fn chat_completions_inner(
     // the client passed a `rid`. Gating on it silently dropped client rids for
     // any model/policy that doesn't need ingress tokenization.
     let client_rid: Option<String> = probe.rid;
+    // Reuses `derived_request_id` (computed before the ingress tee) rather
+    // than re-deriving: a second derivation would mint a fresh UUID on the
+    // no-header path, so the id the engine sees and the id the tee sent would
+    // silently differ for exactly the traffic that bypasses the gateway.
     let request_id: Option<String> = if decode_peer.is_none() {
-        Some(match &client_rid {
-            Some(rid) => rid.clone(),
-            // No client-supplied rid: derive the minted one from the
-            // gateway/access-log `x-request-id` (already read the same way by
-            // the global access-log middleware, server/app.rs) instead of an
-            // unrelated random UUID. Without this, the router/gateway logs
-            // (keyed on x-request-id) and the engine logs (keyed on this rid)
-            // use two disjoint identifiers for the same request, making it
-            // impossible to correlate a log line found in one against the
-            // other. Falls back to a UUID only when the header itself is
-            // absent (e.g. direct-to-router traffic bypassing the gateway).
-            None => {
-                let xrid = headers.get("x-request-id").and_then(|v| v.to_str().ok());
-                match xrid {
-                    Some(id) => format!("router-{id}"),
-                    None => format!("router-{}", uuid::Uuid::new_v4().simple()),
-                }
-            }
-        })
+        Some(derived_request_id.clone())
     } else {
         None
     };
@@ -1280,6 +1277,7 @@ async fn chat_completions_inner(
                 cache_sim_extend::spawn_extend_tee(
                     Arc::clone(&ctx),
                     log_ctx.model_id.clone(),
+                    derived_request_id.clone(),
                     body.clone(),
                     extend_prompt,
                     ReplySource::Json(bytes.clone()),
@@ -1729,6 +1727,34 @@ fn lax_number(v: &serde_json::Value) -> Option<f64> {
         serde_json::Value::Number(n) => n.as_f64(),
         serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
         _ => None,
+    }
+}
+
+/// Derive this request's id: reuse a client-supplied `rid` (so an external
+/// abort-by-rid keeps working and we do not override intent), else mint one
+/// from the gateway/access-log `x-request-id` — read the same way as the
+/// global access-log middleware (`server/app.rs`) — else a UUID.
+///
+/// Deriving from `x-request-id` rather than an unrelated UUID is what keeps
+/// the router/gateway logs (keyed on that header), the engine logs (keyed on
+/// the rid we forward), and the cache-sim oracle's per-request records (keyed
+/// on the id the tee sends) all pointing at the same request. A fresh UUID
+/// here would leave three disjoint identifiers for one request.
+///
+/// SGLang keeps a provided `rid` and only generates one when absent, and it
+/// aborts every rid that *starts with* the one we send — covering `n>1`
+/// expansions.
+///
+/// Called ONCE per request, before the ingress tee, and the result reused for
+/// the engine-facing rid: two call sites would each mint their own UUID on the
+/// no-header path, and the tee's id would then not match the engine's.
+fn derive_request_id(client_rid: Option<&str>, headers: &HeaderMap) -> String {
+    if let Some(rid) = client_rid {
+        return rid.to_owned();
+    }
+    match headers.get("x-request-id").and_then(|v| v.to_str().ok()) {
+        Some(id) => format!("router-{id}"),
+        None => format!("router-{}", uuid::Uuid::new_v4().simple()),
     }
 }
 
@@ -2344,6 +2370,34 @@ mod tests {
     fn offload_failed_false_for_non_messages_request() {
         let value = serde_json::json!({"prompt":"hi"});
         assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
+    }
+
+    #[test]
+    fn derive_request_id_prefers_a_client_supplied_rid() {
+        let mut h = HeaderMap::new();
+        h.insert("x-request-id", "gw-abc".parse().unwrap());
+        assert_eq!(derive_request_id(Some("client-rid"), &h), "client-rid");
+    }
+
+    #[test]
+    fn derive_request_id_falls_back_to_the_gateway_header() {
+        // Sharing the gateway's id is what lets a cache-sim record, a router
+        // log line, and an engine log line be recognized as the same request.
+        let mut h = HeaderMap::new();
+        h.insert("x-request-id", "gw-abc".parse().unwrap());
+        assert_eq!(derive_request_id(None, &h), "router-gw-abc");
+    }
+
+    #[test]
+    fn derive_request_id_mints_a_uuid_with_no_client_rid_and_no_header() {
+        let h = HeaderMap::new();
+        let a = derive_request_id(None, &h);
+        assert!(a.starts_with("router-"));
+        // Distinct per call — which is exactly WHY the handler derives once
+        // and reuses the value: deriving separately for the tee and for the
+        // engine would hand one request two different identities, and the
+        // oracle's ingest and extend records would never pair.
+        assert_ne!(a, derive_request_id(None, &h));
     }
 
     #[test]

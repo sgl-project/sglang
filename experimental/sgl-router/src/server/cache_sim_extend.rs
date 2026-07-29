@@ -121,9 +121,14 @@ pub(crate) fn extension_can_match(request: &Value) -> bool {
 /// nearly free. The full `messages + [reply]` re-encode remains as the
 /// fallback whenever the incremental path declines (no encoder, failed
 /// per-model concat self-check, suffix render failure).
+///
+/// `request_id` is the join key shared with this request's ingress tee, so the
+/// oracle can pair the two records and report the response's output tokens
+/// against the prompt they extend.
 pub(crate) fn spawn_extend_tee(
     ctx: Arc<AppContext>,
     model: String,
+    request_id: String,
     request_body: Bytes,
     prompt: Option<IngressPrompt>,
     source: ReplySource,
@@ -148,23 +153,30 @@ pub(crate) fn spawn_extend_tee(
         // One extension per choice (`n > 1` yields alternative continuations —
         // whichever the client continues with should count as cached).
         for reply in replies {
-            let ids = prompt
-                .as_ref()
-                .and_then(|p| {
-                    ctx.tokenizers
-                        .encode_chat_extension(&model, &p.ids, &reply, p.opts)
-                })
-                .or_else(|| {
-                    full_reencode_extension(
-                        &ctx,
-                        &model_id,
-                        &request_body,
-                        &mut fallback_request,
-                        reply,
-                    )
-                });
-            if let (Some(tee), Some(ids)) = (ctx.cache_sim_tee.as_ref(), ids) {
-                tee.offer_extend(&model, &ids);
+            // Which path produced the ids decides whether a prompt/output
+            // boundary exists at all, so the two are kept distinguishable
+            // rather than collapsed with `or_else`. Incremental output is
+            // `prompt.ids ++ suffix`, so the boundary is exactly the ingress
+            // length; the fallback re-encodes the whole conversation, where no
+            // prefix is guaranteed to be the prompt.
+            let incremental = prompt.as_ref().and_then(|p| {
+                ctx.tokenizers
+                    .encode_chat_extension(&model, &p.ids, &reply, p.opts)
+                    .map(|ids| (ids, Some(p.ids.len())))
+            });
+            let produced = match incremental {
+                Some(v) => Some(v),
+                None => full_reencode_extension(
+                    &ctx,
+                    &model_id,
+                    &request_body,
+                    &mut fallback_request,
+                    reply,
+                )
+                .map(|ids| (ids, None)),
+            };
+            if let (Some(tee), Some((ids, prompt_len))) = (ctx.cache_sim_tee.as_ref(), produced) {
+                tee.offer_extend(&model, &ids, &request_id, prompt_len);
             } else {
                 tracing::debug!(model = %model, "cache-sim extend: tokenize failed; skipping");
             }
@@ -252,7 +264,7 @@ struct ToolCallAcc {
 ///
 /// The input is the FULL byte stream (the pump only delivers cleanly-completed
 /// captures), so SSE events split across network chunks reassemble here via
-/// plain line splitting. Unparseable `data:` payloads are skipped — one
+/// plain line splitting. Unparsable `data:` payloads are skipped — one
 /// malformed event costs its delta, not the reconstruction.
 pub(crate) fn assistant_messages_from_sse(bytes: &[u8]) -> Vec<Value> {
     let mut choices: std::collections::BTreeMap<u64, ChoiceAcc> = std::collections::BTreeMap::new();

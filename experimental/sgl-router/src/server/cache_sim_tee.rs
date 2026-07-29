@@ -52,16 +52,34 @@ struct TeeMsg {
     kind: TeeKind,
     model: String,
     input_ids: Vec<u32>,
+    request_id: String,
+    prompt_len: Option<usize>,
 }
 
 /// Wire body of `POST /ingest_ids` and `POST /extend_ids` (same shape).
 /// Hand-mirrored (no shared crate) by the receiver's `IdsBody` in
 /// gpu-platform-proto `sglang-router-cache-sim` (`src/server.rs`) — keep the
-/// two `{model, input_ids}` shapes in lockstep.
+/// two shapes in lockstep.
+///
+/// `request_id` is the join key: the oracle emits one record per ingest and
+/// one per extend, and without a shared id they cannot be paired, so a
+/// request's output-token count has nothing to attach to. It is additive and
+/// safe to deploy first — the receiver's `IdsBody` ignores unknown fields, so
+/// an older cache-sim simply drops it.
+///
+/// `prompt_len` is sent ONLY on `/extend_ids`, and only when the extension was
+/// built incrementally as `prompt_ids ++ suffix`, where the boundary is exact.
+/// The full-re-encode fallback re-tokenizes the whole conversation, so no
+/// prefix of its output is guaranteed to be the prompt — reporting a boundary
+/// there would silently misattribute tokens between prompt and output. Absent
+/// means "not derivable", not "zero".
 #[derive(Serialize)]
 struct IngestIdsBody<'a> {
     model: &'a str,
     input_ids: &'a [u32],
+    request_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_len: Option<usize>,
 }
 
 /// Handle the chat/completions handler offers pre-tokenized requests to.
@@ -111,26 +129,47 @@ impl CacheSimTee {
     /// dropped + counted, a closed channel (sender task gone) likewise. Empty
     /// id lists are a no-op. Cheap enough to call unconditionally on the hot
     /// path.
-    pub fn offer(&self, model: &str, input_ids: &[u32]) {
-        self.offer_kind(TeeKind::Ingest, model, input_ids);
+    pub fn offer(&self, model: &str, input_ids: &[u32], request_id: &str) {
+        self.offer_kind(TeeKind::Ingest, model, input_ids, request_id, None);
     }
 
     /// Offer one completed response's FULL token sequence (prompt + generated
     /// output, re-rendered the way the next round's request will be) to the
     /// insert-only `/extend_ids` path. Same never-blocks contract as
     /// [`Self::offer`].
-    pub fn offer_extend(&self, model: &str, input_ids: &[u32]) {
-        self.offer_kind(TeeKind::Extend, model, input_ids);
+    /// `prompt_len` is `Some` only when the extension was built incrementally
+    /// (so the prompt/output boundary is exact) — see [`IngestIdsBody`].
+    pub fn offer_extend(
+        &self,
+        model: &str,
+        input_ids: &[u32],
+        request_id: &str,
+        prompt_len: Option<usize>,
+    ) {
+        self.offer_kind(TeeKind::Extend, model, input_ids, request_id, prompt_len);
     }
 
-    fn offer_kind(&self, kind: TeeKind, model: &str, input_ids: &[u32]) {
+    fn offer_kind(
+        &self,
+        kind: TeeKind,
+        model: &str,
+        input_ids: &[u32],
+        request_id: &str,
+        prompt_len: Option<usize>,
+    ) {
         if input_ids.is_empty() {
             return;
         }
+        // A boundary at or past the end would make output_tokens zero or
+        // negative on the receiver. Drop the claim rather than send one that
+        // cannot be true; the extension itself is still worth teeing.
+        let prompt_len = prompt_len.filter(|n| *n < input_ids.len());
         let msg = TeeMsg {
             kind,
             model: model.to_owned(),
             input_ids: input_ids.to_vec(),
+            request_id: request_id.to_owned(),
+            prompt_len,
         };
         match self.tx.try_send(msg) {
             Ok(()) => {}
@@ -161,6 +200,8 @@ async fn run_sender(
         let body = IngestIdsBody {
             model: &msg.model,
             input_ids: &msg.input_ids,
+            request_id: &msg.request_id,
+            prompt_len: msg.prompt_len,
         };
         // Per-kind outcome labels so a version-skewed cache-sim (no
         // /extend_ids yet → 404) shows up as `extend_http_error` while the
@@ -244,7 +285,7 @@ mod tests {
 
         let metrics = MetricsRegistry::new();
         let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics));
-        tee.offer("m", &[10, 11, 12]);
+        tee.offer("m", &[10, 11, 12], "rid-1");
 
         // The sender POSTs asynchronously; poll until the body lands.
         let mut body = None;
@@ -259,6 +300,14 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["model"], "m");
         assert_eq!(v["input_ids"], serde_json::json!([10, 11, 12]));
+        assert_eq!(v["request_id"], "rid-1", "the join key must reach the wire");
+        // The ingest body IS the prompt, so a boundary would be redundant —
+        // and its presence on this path would mean the receiver had two
+        // disagreeing notions of where the prompt ends.
+        assert!(
+            v.get("prompt_len").is_none(),
+            "prompt_len must not be sent on /ingest_ids: {v}"
+        );
 
         // And the outcome is metered as sent.
         let mut rendered = String::new();
@@ -273,6 +322,45 @@ mod tests {
             rendered.contains(r#"sgl_router_cache_sim_tee_total{result="sent"} 1"#),
             "tee sent counter not rendered:\n{rendered}"
         );
+    }
+
+    /// The full-re-encode fallback has no valid prompt/output boundary, so it
+    /// sends none. Absent must stay absent on the wire — a `null` or a `0`
+    /// would read on the receiver as "zero output tokens", turning "cannot be
+    /// derived" into a confident wrong answer.
+    #[test]
+    fn an_omitted_boundary_is_absent_from_the_wire_not_null() {
+        let body = IngestIdsBody {
+            model: "m",
+            input_ids: &[1, 2, 3],
+            request_id: "rid-1",
+            prompt_len: None,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(v.get("prompt_len").is_none(), "serialized: {v}");
+        assert_eq!(v["request_id"], "rid-1");
+    }
+
+    /// A boundary at or past the end of the sequence cannot be true: it would
+    /// make output tokens zero or negative on the receiver. Drop the claim,
+    /// keep the extension.
+    #[tokio::test]
+    async fn an_impossible_boundary_is_dropped_rather_than_sent() {
+        let metrics = Arc::new(MetricsRegistry::default());
+        let tee = CacheSimTee::spawn("http://127.0.0.1:1".to_string(), metrics);
+        // Equal to the length, and past it: neither leaves any output tokens.
+        for bad in [4usize, 99] {
+            let msg = TeeMsg {
+                kind: TeeKind::Extend,
+                model: "m".into(),
+                input_ids: vec![1, 2, 3, 4],
+                request_id: "rid-1".into(),
+                prompt_len: Some(bad).filter(|n| *n < 4),
+            };
+            assert!(msg.prompt_len.is_none(), "boundary {bad} should be dropped");
+        }
+        // A real boundary survives.
+        tee.offer_extend("m", &[1, 2, 3, 4], "rid-1", Some(3));
     }
 
     #[tokio::test]
@@ -298,7 +386,7 @@ mod tests {
 
         let metrics = MetricsRegistry::new();
         let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics));
-        tee.offer_extend("m", &[10, 11, 12, 13]);
+        tee.offer_extend("m", &[10, 11, 12, 13], "rid-1", Some(2));
 
         let mut got = None;
         for _ in 0..80 {
@@ -313,6 +401,14 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["model"], "m");
         assert_eq!(v["input_ids"], serde_json::json!([10, 11, 12, 13]));
+        assert_eq!(
+            v["request_id"], "rid-1",
+            "extend must carry the SAME id as its ingest, or the two records cannot be paired"
+        );
+        assert_eq!(
+            v["prompt_len"], 2,
+            "the exact prompt/output boundary must reach the wire"
+        );
 
         // Metered under the extend-specific label.
         let mut rendered = String::new();
@@ -336,7 +432,7 @@ mod tests {
         // overflow and must be counted as dropped (and never block).
         let (tee, _rx) = unstarted(1, Arc::clone(&metrics));
         for _ in 0..5 {
-            tee.offer("m", &[1, 2, 3]);
+            tee.offer("m", &[1, 2, 3], "rid-1");
         }
         let rendered = metrics.render();
         assert!(
@@ -349,7 +445,7 @@ mod tests {
     async fn offer_ignores_empty_ids() {
         let metrics = MetricsRegistry::new();
         let (tee, mut rx) = unstarted(4, Arc::clone(&metrics));
-        tee.offer("m", &[]);
+        tee.offer("m", &[], "rid-1");
         // Nothing enqueued.
         assert!(rx.try_recv().is_err());
     }
@@ -368,7 +464,7 @@ mod tests {
 
         let metrics = MetricsRegistry::new();
         let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics));
-        tee.offer("m", &[1, 2, 3]);
+        tee.offer("m", &[1, 2, 3], "rid-1");
 
         let mut rendered = String::new();
         for _ in 0..80 {
@@ -395,7 +491,7 @@ mod tests {
         let metrics = MetricsRegistry::new();
         let (tee, rx) = unstarted(4, Arc::clone(&metrics));
         drop(rx); // no receiver → channel closed
-        tee.offer("m", &[1, 2, 3]);
+        tee.offer("m", &[1, 2, 3], "rid-1");
         assert!(
             metrics
                 .render()
