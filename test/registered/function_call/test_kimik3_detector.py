@@ -405,6 +405,38 @@ class TestKimiK3ReasoningDetector(unittest.TestCase):
         )
         self.assertEqual(content, "plain prose")
 
+    # truncated sep followed by a complete one, at the tail of a text block;
+    # byte-exact shapes from the deployment logs on #32567
+    def test_non_stream_double_sep_tail(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        result = detector.detect_and_parse(
+            f"{THINK_CLOSE}Let me try that.\n<|close|>think<|sep|<|sep|>"
+        )
+        self.assertEqual(result.normal_text, "Let me try that.\n")
+
+    def test_non_stream_double_sep_tail_without_middle_pipe(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        result = detector.detect_and_parse(
+            f"{THINK_CLOSE}Parallel DDG fetches.\n<|close|>think<|sep<|sep|>"
+        )
+        self.assertEqual(result.normal_text, "Parallel DDG fetches.\n")
+
+    def test_non_stream_two_double_sep_pairs(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        result = detector.detect_and_parse(
+            f"{THINK_CLOSE}first<|close|>think<|sep|<|sep|>second"
+            "<|close|>think<|sep<|sep|>"
+        )
+        self.assertEqual(result.normal_text, "firstsecond")
+
+    def test_prose_about_bare_marker_survives(self):
+        # a reply that explains the marker syntax must not be scrubbed; a bare
+        # marker with no sep is not a marker, so it stays
+        from sglang.srt.function_call.kimik3_detector import strip_section_markers
+
+        prose = "you asked about <|open|>think and what it does"
+        self.assertEqual(strip_section_markers(prose), prose)
+
     def test_tool_detector_strips_handwritten_marker(self):
         # the tool detector also owns a content channel when the reasoning
         # parser is not in the chain

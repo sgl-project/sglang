@@ -59,9 +59,11 @@ def _partial_suffix_len(text: str, markers: List[str]) -> int:
 
 # the model sometimes hand-writes a section marker out of ordinary text tokens
 # instead of emitting the atomic special token, e.g. "<|open|>think<|sep|" with no
-# closing ">", so exact-match stripping misses it and it reaches the client
+# closing ">" or a truncated sep followed by a complete one, so exact-match
+# stripping misses it and it reaches the client. at least one sep is required so
+# that prose legitimately discussing a bare "<|open|>think" survives untouched
 _SECTION_MARKER_RE = re.compile(
-    r"<\|(?:open|close)\|>(?:think|response|message|tools)(?:<\|sep(?:\|>?)?)?"
+    r"<\|(?:open|close)\|>(?:think|response|message|tools)(?:<\|sep(?:\|>?)?)+"
 )
 
 
