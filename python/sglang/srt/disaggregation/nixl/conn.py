@@ -1344,10 +1344,16 @@ class NixlKVManager(CommonKVManager):
                     # already concluded Success; don't regress the status.
                     self.update_status(room, KVPoll.Transferring)
 
-                # Drop per-room state only when every chunk landed, not on the
-                # last chunk alone: an earlier deferred chunk may still transfer.
+                # Drop per-room state only when no chunk is still outstanding and
+                # the room has concluded: Success, or a Failed *last* chunk. A
+                # non-last Failed chunk keeps the room (more chunks may follow); a
+                # late chunk for an already-Failed room is skipped at loop top.
                 if self._staging_outstanding.get(room, 0) <= 0 and (
                     self.check_status(room) == KVPoll.Success
+                    or (
+                        kv_chunk.is_last_chunk
+                        and self.check_status(room) == KVPoll.Failed
+                    )
                 ):
                     self._staging_outstanding.pop(room, None)
                     self.transfer_infos.pop(room, None)

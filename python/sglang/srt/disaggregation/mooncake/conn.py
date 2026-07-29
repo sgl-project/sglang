@@ -1740,11 +1740,18 @@ class MooncakeKVManager(CommonKVManager):
                     continue
 
                 self._staging_outstanding[kv_chunk.room] -= 1
-                # Tear down only when every chunk landed, not on the last chunk
-                # alone: an earlier deferred chunk may still need to transfer.
+                # Tear down only when no chunk is still outstanding and the room
+                # has concluded: already cleared, Success, or a Failed *last*
+                # chunk. A non-last Failed chunk keeps the room (more chunks may
+                # follow), not on the last chunk alone since an earlier deferred
+                # chunk may still need to transfer.
                 if self._staging_outstanding.get(kv_chunk.room, 0) <= 0 and (
                     kv_chunk.room not in self.request_status
                     or self.check_status(kv_chunk.room) == KVPoll.Success
+                    or (
+                        kv_chunk.is_last_chunk
+                        and self.check_status(kv_chunk.room) == KVPoll.Failed
+                    )
                 ):
                     self._staging_outstanding.pop(kv_chunk.room, None)
                     if kv_chunk.room in self.transfer_infos:
