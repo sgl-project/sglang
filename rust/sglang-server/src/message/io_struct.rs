@@ -73,7 +73,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             top_logprobs_num: req.top_logprobs_num,
             token_ids_logprob: req.token_ids_logprob.as_ref(),
             stream: req.stream,
-            return_sampling_mask: false,
+            return_sampling_mask: req.return_sampling_mask,
             return_hidden_states: req.return_hidden_states,
         }
     }
