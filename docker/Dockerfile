@@ -610,33 +610,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
-# Optional ai-dynamo nightly for Dynamo + SGLang integration testing. Gated by
-# INSTALL_DYNAMO so it lands only in the dev image (release-docker-dev.yml sets
-# it), not the version-tagged release/runtime images. Empty DYNAMO_VERSION
-# resolves the latest (highest-version) nightly, matching `pip install --pre`;
-# set it to pin an exact version for a reproducible build.
-ARG INSTALL_DYNAMO=0
+# Optional ai-dynamo nightly for Dynamo + SGLang integration testing.
+# release-docker-dev.yml resolves one version with wheels for both architectures;
+# version-tagged release/runtime images leave it empty and skip the install.
 ARG DYNAMO_VERSION=
 RUN --mount=type=cache,target=/root/.cache/pip \
-    set -eu; \
-    if [ "$INSTALL_DYNAMO" = "1" ]; then \
-        if [ -z "$DYNAMO_VERSION" ]; then \
-            index="$(curl -fsSL --retry 3 --retry-delay 2 https://pypi.nvidia.com/ai-dynamo/)" \
-                || { echo "ERROR: failed to fetch the ai-dynamo index from pypi.nvidia.com"; exit 1; }; \
-            DYNAMO_VERSION="$(printf '%s\n' "$index" \
-                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}' | sort -Vu | tail -1)"; \
-            case "$DYNAMO_VERSION" in \
-                *.*.*.dev????????) : ;; \
-                *) echo "ERROR: no X.Y.Z.devYYYYMMDD nightly found in the index (format may have changed)"; exit 1 ;; \
-            esac; \
-        fi; \
-        runtime_wheel="ai_dynamo_runtime-${DYNAMO_VERSION}-cp310-abi3-manylinux_2_28_$(uname -m).whl"; \
-        if curl -fsSI "https://pypi.nvidia.com/ai-dynamo-runtime/${runtime_wheel}" >/dev/null; then \
-            echo "Installing ai-dynamo==${DYNAMO_VERSION}"; \
-            python3 -m pip install --extra-index-url https://pypi.nvidia.com "ai-dynamo==${DYNAMO_VERSION}"; \
-        else \
-            echo "WARNING: skipping ai-dynamo==${DYNAMO_VERSION}; ${runtime_wheel} is unavailable"; \
-        fi; \
+    if [ -n "$DYNAMO_VERSION" ]; then \
+        python3 -m pip install --extra-index-url https://pypi.nvidia.com "ai-dynamo==${DYNAMO_VERSION}"; \
     fi
 
 # Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
@@ -696,7 +676,7 @@ ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
-ARG INSTALL_DYNAMO=0
+ARG DYNAMO_VERSION=
 
 WORKDIR /sgl-workspace
 
@@ -757,7 +737,7 @@ COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
 # --no-deps so it cannot re-resolve and replace Dynamo's shared dependencies.
 # Otherwise resolve the gateway's own dependencies normally.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$INSTALL_DYNAMO" = "1" ]; then \
+    if [ -n "$DYNAMO_VERSION" ]; then \
         python3 -m pip install --force-reinstall --no-deps /tmp/gateway_wheels/*.whl; \
     else \
         python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl; \
