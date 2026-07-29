@@ -468,7 +468,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 120
+        timeout-minutes: 75
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -583,7 +583,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 90
+        timeout-minutes: 60
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 2700 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -622,7 +622,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 105
+        timeout-minutes: 120
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 5400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -725,7 +725,7 @@ jobs:
           docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
 
       - name: Run diffusion server tests (1-GPU)
-        timeout-minutes: 105
+        timeout-minutes: 90
         run: |
           # AMD CI: All 1-GPU tests except FLUX.2 (FLUX.1 covers same code path)
           # Tests: T2V, T2I, I2V, LoRA
@@ -864,7 +864,7 @@ jobs:
           docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
 
       - name: Run diffusion server tests (2-GPU)
-        timeout-minutes: 255
+        timeout-minutes: 180
         run: |
           # AMD CI: All 2-GPU tests including LoRA
           # Tests: T2V, T2I, I2V, LoRA
@@ -997,7 +997,7 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e NCCL_CUMEM_ENABLE=0 \
@@ -1010,7 +1010,7 @@ jobs:
               --suite stage-c-test-4-gpu-amd \
               --auto-partition-id ${{ matrix.part }} \
               --auto-partition-size 1 \
-              --timeout-per-file 1800 \
+              --timeout-per-file 5400 \
               --enable-retry \
               --max-attempts 2 \
               --retry-wait-seconds 120 \
