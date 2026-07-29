@@ -696,7 +696,17 @@ async fn chat_completions_inner(
     };
     // Inject only a router-minted rid; a client-supplied one is already in the
     // body, and PD mode (`request_id == None`) is never injected.
-    let rid_to_inject: Option<&str> = match (request_id.as_deref(), client_rid.as_deref()) {
+    // Same empty filter `derive_request_id` applies. Without it, a client
+    // sending `"rid": ""` falls to the `_ => None` arm: nothing is injected, so
+    // the engine mints its own id while the tee and the disconnect-abort guards
+    // use `router-<uuid>` — three legs, three different ids, for exactly the
+    // input the filter was added to handle. (The abort also silently no-ops,
+    // which is strictly better than what it did before the filter existed:
+    // sending `""`, which SGLang prefix-matches against EVERY in-flight rid.)
+    let rid_to_inject: Option<&str> = match (
+        request_id.as_deref(),
+        client_rid.as_deref().filter(|s| !s.is_empty()),
+    ) {
         (Some(rid), None) => Some(rid),
         _ => None,
     };
@@ -1895,7 +1905,7 @@ mod tests {
             (
                 ApiError::StaleRequestExpired {
                     model: "m".into(),
-                    worker: reqwest::Url::parse("http://test-worker/").unwrap(),
+                    worker: Url::parse("http://test-worker/").unwrap(),
                 },
                 AbortReason::StaleRequestExpired,
             ),
@@ -2390,7 +2400,6 @@ mod tests {
         assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
     }
 
-    #[test]
     /// The id must be derived EXACTLY ONCE per request.
     ///
     /// A second `derive_request_id(...)` at dispatch mints a fresh UUID on the

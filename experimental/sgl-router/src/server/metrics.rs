@@ -363,6 +363,12 @@ pub struct MetricsRegistry {
     /// broken tee is failing while serving stays healthy — `http_error` +
     /// `error` are the two that indict it.
     cache_sim_tee_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    /// Extensions teed with a prompt/output boundary that could not be true
+    /// (0, or >= the sequence length). Deliberately NOT a `result` label on
+    /// cache_sim_tee_total: those partition delivery attempts and the message
+    /// is still delivered. Unreachable while the incremental concat invariant
+    /// holds, so any increase means that invariant broke.
+    cache_sim_boundary_impossible_total: AtomicU64,
     /// Per-reason count of `/abort_request` POSTs the router has sent to
     /// engines. Fixed-length array indexed by [`AbortReason::as_index`], so
     /// the hot path is a single `AtomicU64::fetch_add` with **zero locks and
@@ -422,6 +428,7 @@ impl Default for MetricsRegistry {
             decode_affinity_total: Default::default(),
             sticky_total: Default::default(),
             cache_sim_tee_total: Default::default(),
+            cache_sim_boundary_impossible_total: AtomicU64::new(0),
             ingress_tokenize_errors_total: Default::default(),
             backpressure_rejected_total: Default::default(),
             engine_aborts_total: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -815,6 +822,12 @@ impl MetricsRegistry {
     /// Bump `sgl_router_cache_sim_tee_total{result}`. `result` is a fixed
     /// `&'static str` ({sent, http_error, error, dropped, closed}), so label
     /// cardinality is bounded regardless of traffic.
+    /// Bump `sgl_router_cache_sim_boundary_impossible_total`.
+    pub fn record_cache_sim_boundary_impossible(&self) {
+        self.cache_sim_boundary_impossible_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_cache_sim_tee(&self, result: &'static str) {
         let mut guard = self.cache_sim_tee_total.lock();
         let counter = guard
@@ -1279,7 +1292,7 @@ impl MetricsRegistry {
 
         // cache_sim_tee_total
         out.push_str(
-            "# HELP sgl_router_cache_sim_tee_total Best-effort cache-sim tee outcomes (result=sent|http_error|error|dropped|closed for the ingress /ingest_ids tee, extend_sent|extend_http_error|extend_error for the response-completion /extend_ids tee; dropped/closed are shared queue outcomes). Observational tee to the theoretical cache-sim; a nonzero http_error (cache-sim 4xx/5xx) or error (transport) while serving is healthy means the tee is broken — extend_http_error specifically suggests a cache-sim too old to have /extend_ids.\n",
+            "# HELP sgl_router_cache_sim_tee_total Best-effort cache-sim tee outcomes (result=sent|http_error|error|dropped|closed for the ingress /ingest_ids tee, extend_sent|extend_http_error|extend_error for the response-completion /extend_ids tee; dropped/closed are shared queue outcomes, NOT split by leg). Observational tee to the theoretical cache-sim; a nonzero http_error (cache-sim 4xx/5xx) or error (transport) while serving is healthy means the tee is broken — extend_http_error specifically suggests a cache-sim too old to have /extend_ids.\n",
         );
         out.push_str("# TYPE sgl_router_cache_sim_tee_total counter\n");
         let guard = self.cache_sim_tee_total.lock();
@@ -1295,6 +1308,19 @@ impl MetricsRegistry {
             ));
         }
         drop(guard);
+
+        // cache_sim_boundary_impossible_total — rendered unconditionally (not
+        // a lazily-created label child), so a dashboard sees a 0 rather than
+        // "No data" and an alert on it can be written before it ever fires.
+        out.push_str(
+            "# HELP sgl_router_cache_sim_boundary_impossible_total Extensions teed to the cache-sim whose prompt/output boundary could not be true (0, or >= the sequence length); the boundary is dropped and the extension still sent. Unreachable while the incremental prompt_ids++suffix invariant holds, so any increase means that invariant broke and every extend's output-token split is suspect.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_sim_boundary_impossible_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_sim_boundary_impossible_total {}\n",
+            self.cache_sim_boundary_impossible_total
+                .load(Ordering::Relaxed)
+        ));
 
         // ingress_tokenize_errors_total
         out.push_str(

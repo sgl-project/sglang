@@ -225,8 +225,13 @@ impl CacheSimTee {
         let prompt_len = match prompt_len {
             Some(n) if (1..input_ids.len()).contains(&n) => Some(n),
             Some(_) => {
-                self.metrics
-                    .record_cache_sim_tee("extend_boundary_impossible");
+                // Its OWN counter, not a `result` label on the tee counter.
+                // Those labels partition delivery attempts, and this message
+                // still goes on to record `extend_sent` — sharing the counter
+                // would make one attempt bump two labels, so
+                // sum(cache_sim_tee_total) would stop being the attempt count
+                // and any sent/total ratio would skew.
+                self.metrics.record_cache_sim_boundary_impossible();
                 None
             }
             None => None,
