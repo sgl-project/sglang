@@ -9,6 +9,7 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -95,6 +96,18 @@ class TestFreeSegment(unittest.TestCase):
         with self.assertRaises(AssertionError):
             alloc.free_group_end()
 
+    def test_group_end_debug_assert_covers_release_pages(self):
+        # need_sort routes frees into release_pages; the duplicate check must
+        # not go vacuous there (PD disaggregation runs with need_sort=True).
+        alloc = _make_allocator(need_sort=True)
+        alloc.debug_mode = True
+        row = _make_kv_row(alloc, PAGE_SIZE)
+        alloc.free_group_begin()
+        alloc.free(row)
+        alloc.free_segment(row, start_pos=0)
+        with self.assertRaises(AssertionError):
+            alloc.free_group_end()
+
 
 class TestFreeSegments(unittest.TestCase):
     def _freed_by_segments(self, num_tokens, spans):
@@ -129,6 +142,43 @@ class TestFreeSegments(unittest.TestCase):
             3 * PAGE_SIZE, [(0, PAGE_SIZE), (PAGE_SIZE, 3 * PAGE_SIZE)]
         )
         self.assertTrue(torch.equal(torch.sort(freed)[0], reference))
+
+
+class _RecordingBaseAllocator(BaseTokenToKVPoolAllocator):
+    """Base-fallback allocator: free_segment inherits the default (ignore
+    start_pos, call free()), free() records what it received."""
+
+    def __init__(self):
+        super().__init__(
+            size=NUM_PAGES * PAGE_SIZE,
+            page_size=PAGE_SIZE,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        self.freed = []
+
+    def alloc(self, need_size: int):
+        raise NotImplementedError
+
+    def clear(self):
+        pass
+
+    def free(self, free_index: torch.Tensor):
+        self.freed.append(free_index)
+
+
+class TestBaseFallbackFreeSegments(unittest.TestCase):
+    def test_trim_dedups_boundary_page_before_fallback_free(self):
+        # Allocators without a free_segment override (UnifiedMamba/SWA) dedup
+        # per free() call at best, so base free_segments must hand them
+        # segments whose shared boundary page appears in exactly one call.
+        alloc = _RecordingBaseAllocator()
+        row = torch.arange(11)  # position i lives on page i // PAGE_SIZE
+        alloc.free_segments([(row[0:6], 0), (row[6:11], 6)])
+        per_call_pages = [set((t // PAGE_SIZE).tolist()) for t in alloc.freed]
+        self.assertEqual(per_call_pages, [{0, 1}, {2}])
 
 
 if __name__ == "__main__":

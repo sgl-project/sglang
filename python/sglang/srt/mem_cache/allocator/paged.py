@@ -268,7 +268,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_group.append(free_index)
 
         if self.debug_mode:
-            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+            self._debug_check_no_duplicate_pages()
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """Free a contiguous token-position segment [start_pos, start_pos + n).
@@ -306,9 +306,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.is_not_in_free_group:
             self._release_page_ids(*(p // self.page_size for p in pieces))
             if self.debug_mode:
-                assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+                self._debug_check_no_duplicate_pages()
         else:
             self.free_page_reps_group.extend(pieces)
+
+    def _debug_check_no_duplicate_pages(self):
+        # need_sort routes frees into release_pages, so the duplicate check
+        # must span both containers or it is vacuous under PD disaggregation.
+        pages = torch.cat((self.free_pages, self.release_pages))
+        assert len(torch.unique(pages)) == len(pages)
 
     def _release_page_ids(self, *page_ids: torch.Tensor):
         if self.need_sort:
@@ -330,7 +336,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             # The no-double-free contract can only be violated across the
             # calls a group aggregates; check it where they merge.
-            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+            self._debug_check_no_duplicate_pages()
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
