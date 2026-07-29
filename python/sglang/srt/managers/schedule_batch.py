@@ -907,6 +907,9 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
+        # per-component nodes this req skipped locking (e.g. mamba on the decode
+        # hold, already COW'd), so their dec releases only what it took.
+        self.skip_lock_node_ids: dict = {}
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
@@ -1249,7 +1252,9 @@ class Req(ReqDllmMixin):
                 )
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
-                match_result = zero_match_result(tree_cache, match_result)
+                match_result = zero_match_result(
+                    tree_cache, match_result, extra_key=self.extra_key
+                )
             (
                 self.prefix_indices,
                 self.last_node,
@@ -1520,6 +1525,7 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
+        self.skip_lock_node_ids = {}
         self.extend_range = None
         self.dllm_initialized = False
         self.is_retracted = True
@@ -1877,6 +1883,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
     forward_iter: Optional[int] = None
+    launch_ts: Optional[float] = None
 
     # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
     # Batched arguments to model runner
@@ -2040,6 +2047,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_dllm(self):
         return self.dllm_config is not None
+
+    def grammar_needs_sync(self) -> bool:
+        """Whether grammar forces this batch onto the synchronous path, i.e. the
+        previous batch's result is resolved before this forward."""
+        return self.has_grammar and not self.spec_algorithm.supports_grammar_overlap()
 
     def prepare_encoder_info_extend(
         self, input_ids: List[array[int]], seq_lens: List[int]
@@ -2614,6 +2626,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return total
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
+        """Reclaim evictable tree-cache entries (shortfall only), then report
+        whether the next decode step fits in the KV pool."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
@@ -2622,13 +2636,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = self._get_decode_retraction_order(
-            self.reqs,
-            server_args,
-            allow_policy_sort=(
-                self.spec_algorithm is None or self.spec_algorithm.is_none()
-            ),
-        )
+        sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
 
         retracted_reqs = []
         first_iter = True
@@ -2676,7 +2684,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     @staticmethod
     def _get_decode_retraction_order(
-        reqs: List[Req], server_args: ServerArgs, *, allow_policy_sort: bool
+        reqs: List[Req], server_args: ServerArgs
     ) -> List[int]:
         """Return indices ordered from most-preferred to least-preferred to keep.
 
@@ -2686,11 +2694,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         sorted_indices = list(range(len(reqs)))
 
         # TODO(lsyin): improve retraction policy for radix cache
-        # For spec decoding, filter_batch API can only filter requests from the
-        # back, so we can only retract from the back.
-        # TODO(sang): Clean up finish path and support better retract policy.
-        if not allow_policy_sort:
-            return sorted_indices
 
         def length_key(req: Req) -> Tuple[int, int]:
             return (len(req.output_ids), -len(req.origin_input_ids))
@@ -2991,7 +2994,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
-                has_been_filtered=False,
                 new_indices_cpu=keep_indices,
             )
 
@@ -3092,6 +3094,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
+            launch_ts=self.launch_ts,
+            extend_num_tokens=self.extend_num_tokens,
         )
 
     def maybe_evict_swa(self):
@@ -3130,7 +3134,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         and req.decode_batch_idx >= sliding_window_size
                     ):
                         self.tree_cache.dec_swa_lock_only(
-                            req.last_node, req.swa_uuid_for_lock
+                            req.last_node,
+                            req.swa_uuid_for_lock,
+                            skip_lock_node_ids=req.skip_lock_node_ids,
                         )
                         req.swa_prefix_lock_released = True
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
