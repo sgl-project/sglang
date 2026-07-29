@@ -393,6 +393,31 @@ class DFlashDraftModel(nn.Module):
             )
         return self.hidden_norm(self.fc(target_hidden))
 
+    def select_target_context_features(self, feature_indices: list[int]) -> None:
+        """Keep only a subset of trained target context features for PP-local KV injection."""
+        if not feature_indices:
+            raise ValueError("feature_indices must be non-empty.")
+        feature_indices = [int(i) for i in feature_indices]
+        if feature_indices == list(range(self.num_context_features)):
+            return
+        if min(feature_indices) < 0 or max(feature_indices) >= self.num_context_features:
+            raise ValueError(
+                "feature_indices out of range for DFLASH context projection: "
+                f"{feature_indices=} {self.num_context_features=}."
+            )
+
+        hidden_size = int(self.config.hidden_size)
+        cols = []
+        for idx in feature_indices:
+            start = idx * hidden_size
+            cols.extend(range(start, start + hidden_size))
+        index = torch.tensor(cols, dtype=torch.long, device=self.fc.weight.device)
+        self.fc.weight = nn.Parameter(
+            self.fc.weight.index_select(1, index).contiguous(),
+            requires_grad=self.fc.weight.requires_grad,
+        )
+        self.num_context_features = len(feature_indices)
+
     @torch.no_grad()
     def forward(
         self,
@@ -578,6 +603,12 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
             normed[:, i, :] = norm(slices[:, i, :])
         fused = normed.reshape(target_hidden.shape[0], -1)
         return self.hidden_norm(self.fc(fused))
+
+    def select_target_context_features(self, feature_indices: list[int]) -> None:
+        super().select_target_context_features(feature_indices)
+        self.aux_hidden_norms = nn.ModuleList(
+            [self.aux_hidden_norms[int(i)] for i in feature_indices]
+        )
 
 
 EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM]

@@ -272,11 +272,47 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+            self._select_pp_local_context_features_for_injection()
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
         return target_model.model.get_input_embeddings()
+
+    def _select_pp_local_context_features_for_injection(self) -> None:
+        if self.ps.pp_size <= 1:
+            return
+        if not hasattr(self.draft_model, "select_target_context_features"):
+            return
+
+        target_layer_ids = getattr(
+            self.model_runner.spec_aux_config, "dflash_target_layer_ids", None
+        )
+        if not target_layer_ids:
+            return
+
+        target_model = self.target_worker.model_runner.model
+        start_layer = int(getattr(target_model, "start_layer", 0))
+        end_layer = int(getattr(target_model, "end_layer", 0))
+        local_feature_indices = [
+            idx
+            for idx, layer_id in enumerate(target_layer_ids)
+            if start_layer <= int(layer_id) < end_layer
+        ]
+        if not local_feature_indices:
+            return
+
+        self.draft_model.select_target_context_features(local_feature_indices)
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "DSpark PP-local context projection selected feature indices %s "
+                "from target layers %s for PP rank %s local layers [%s, %s).",
+                local_feature_indices,
+                list(target_layer_ids),
+                self.ps.pp_rank,
+                start_layer,
+                end_layer,
+            )
 
     @property
     def carries_confidence(self) -> bool:
