@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import torch
-
-import triton.experimental.gluon as gluon
 import triton.experimental.gluon.language as gl
+from triton.experimental import gluon
 
 M = gl.constexpr(32)
 H = gl.constexpr(7168)

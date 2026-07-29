@@ -2,9 +2,8 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
-import torch
-
 import sglang.srt.layers.moe.moe_runner.aiter as aiter_runner
+import torch
 from sglang.srt.artemis_kernels.mi355x.dsr1_fp8.fused_moe import (
     dispatcher as artemis_dispatcher,
 )
