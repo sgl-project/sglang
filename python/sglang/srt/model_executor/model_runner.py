@@ -128,6 +128,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     load_kv_cache_scales,
     load_model_with_memory_saver,
     maybe_downgrade_dtype_for_legacy_gpu,
+    maybe_enable_ipc_weight_cache,
     maybe_register_debug_tensor_dump_hook,
     maybe_trigger_remote_instance_nccl_send_group,
     report_online_quantization,
@@ -160,7 +161,12 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    get_global_dwdp_manager,
+    get_parallel,
+    get_server_args,
+    set_global_dwdp_manager,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (  # noqa: F401  (re-export)
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
@@ -318,12 +324,26 @@ class ModelRunner:
         if get_server_args().enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
+        # Set device early so that TransferEngine init (e.g. Ascend NPU)
+        # can access the device context.
+        try:
+            torch.get_device_module(self.device).set_device(ps.gpu_id)
+        except Exception:
+            import os
+
+            logger.warning(
+                f"Context: {self.device=} {ps.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {ps.tp_rank=} {ps.tp_size=}"
+            )
+            raise
+
+        # Initialize MooncakeTransferEngine BEFORE init_torch_distributed so
+        # that the shared TE can be passed to the Mooncake PG backend (avoids
+        # creating duplicate TransferEngines).
+        self.init_shared_mooncake_transfer_engine()
+
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
-
-        # Initialize MooncakeTransferEngine
-        self.init_shared_mooncake_transfer_engine()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -379,39 +399,27 @@ class ModelRunner:
     def _initialize_elastic_ep_joiner(self) -> None:
         if not (
             self.server_args.elastic_ep_backend is not None
-            and self.server_args.is_ep_joiner
+            and self.server_args.is_ep_scale_joiner
         ):
             return
 
-        is_scale_join = self.server_args.ep_join_mode == "scale"
-        if is_scale_join:
-            join_effective_ep_size = (
-                self.server_args.ep_join_rank_offset + self.ps.tp_size
+        join_effective_ep_size = self.server_args.ep_join_rank_offset + self.ps.tp_size
+        dist.barrier(group=self.tp_group.cpu_group)
+        if self.ps.tp_rank == 0:
+            register_scale_cohort(
+                self.server_args.ep_join_rank_offset,
+                join_effective_ep_size,
             )
-            dist.barrier(group=self.tp_group.cpu_group)
-            if self.ps.tp_rank == 0:
-                register_scale_cohort(
-                    self.server_args.ep_join_rank_offset,
-                    join_effective_ep_size,
-                )
-            join_scale_process_group()
-            self.server_args.override(
-                "elastic_ep.scale_join", ep_size=join_effective_ep_size
-            )
-        else:
-            join_process_groups()
+        join_scale_process_group()
+        self.server_args.override(
+            "elastic_ep.scale_join", ep_size=join_effective_ep_size
+        )
 
         global_ep_rank = self.ps.tp_rank + self.server_args.ep_join_rank_offset
         broadcast_global_expert_location_metadata(
             model_config=self.model_config,
             moe_ep_rank=global_ep_rank,
-            src_rank=(
-                0
-                if is_scale_join
-                else get_healthy_expert_location_src_rank(
-                    invoked_in_elastic_ep_rejoin_path=True
-                )
-            ),
+            src_rank=0,
         )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
@@ -420,10 +428,6 @@ class ModelRunner:
                 rank=global_ep_rank,
             )
         )
-
-        if not is_scale_join:
-            ElasticEPStateManager.instance().reset()
-            return
 
         from sglang.srt.layers.dp_attention import (
             enable_joiner_all_gather,
@@ -572,6 +576,9 @@ class ModelRunner:
             moe_ep_size=self.ps.moe_ep_size,
             moe_ep_rank=self.ps.moe_ep_rank,
         )
+
+        self.maybe_init_dwdp()
+
         # Must run before backend/graph init so no draft graph records a
         # routed-experts capture-write kernel.
         if self.is_draft_worker:
@@ -816,6 +823,27 @@ class ModelRunner:
                     resize.capped_max_running_requests
                 )
 
+    def post_capture_elastic_ep_recover(self):
+        join_process_groups()
+
+        global_ep_rank = self.ps.tp_rank + self.server_args.ep_join_rank_offset
+        broadcast_global_expert_location_metadata(
+            model_config=self.model_config,
+            moe_ep_rank=global_ep_rank,
+            src_rank=get_healthy_expert_location_src_rank(
+                invoked_in_elastic_ep_rejoin_path=True
+            ),
+        )
+        set_global_expert_distribution_recorder(
+            ExpertDistributionRecorder.init_new(
+                self.server_args,
+                get_global_expert_location_metadata(),
+                rank=global_ep_rank,
+            )
+        )
+
+        ElasticEPStateManager.instance().reset()
+
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""
         # Must be called BEFORE init_decode_cuda_graph() so CUDA graph capture
@@ -834,6 +862,49 @@ class ModelRunner:
         self.decode_attn_backend_group = backends.decode_attn_backend_group
         self.prefill_attention_backend_str = backends.prefill_attention_backend_str
         self.decode_attention_backend_str = backends.decode_attention_backend_str
+
+        if self.server_args.dcp_size > 1 and self.server_args.dcp_replicate_q_proj:
+            self._prepare_replicated_q_proj()
+
+    def _prepare_replicated_q_proj(self) -> None:
+        # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
+        # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the
+        # MLA decode path can skip the per-layer Q all-gather. bf16/fp16 only.
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+        dcp_group = get_parallel().dcp_group
+        if dcp_group.world_size <= 1:
+            return
+        n_prepared = 0
+        for m in self.model.modules():
+            if not isinstance(m, DeepseekV2AttentionMLA):
+                continue
+            if m.w_kc is None:
+                continue
+            qp = m.q_b_proj if m.has_q_b_proj else m.q_proj
+            # q-replicate only supports the unquantized bf16/fp16 absorb path;
+            # quantized q-proj (packed weights) and non-16-bit w_kc keep the
+            # per-layer Q all-gather.
+            if (
+                m.w_kc.dtype not in (torch.bfloat16, torch.float16)
+                or not isinstance(qp.quant_method, UnquantizedLinearMethod)
+                or qp.weight.dtype not in (torch.bfloat16, torch.float16)
+            ):
+                logger.warning(
+                    "dcp_replicate_q_proj: skipping quantized q-proj/w_kc "
+                    "(bf16/fp16 only); this layer keeps the Q all-gather."
+                )
+                continue
+            m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
+            m.q_b_proj_qrep_weight = dcp_group.all_gather(
+                qp.weight.data.contiguous(), dim=0
+            )
+            n_prepared += 1
+        logger.info(
+            "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
+            n_prepared,
+        )
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         capture = capture_cuda_graphs(
@@ -922,6 +993,18 @@ class ModelRunner:
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
             draft_model_idx=self.draft_model_idx,
+            weight_cache_mode=self.server_args.weight_cache_mode,
+            weight_cache_socket=self.server_args.weight_cache_socket,
+        )
+
+        # If the weight cache is enabled, override the load format to IPC_CACHE
+        # and derive the per-rank daemon socket. Idempotent across reloads.
+        maybe_enable_ipc_weight_cache(
+            load_config=self.load_config,
+            server_args=self.server_args,
+            tp_size=self.ps.tp_size,
+            pp_rank=self.ps.pp_rank,
+            tp_rank=self.ps.tp_rank,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
@@ -1011,8 +1094,19 @@ class ModelRunner:
         dist_barrier_after_load(
             elastic_ep_backend=self.server_args.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
-            is_ep_scale_joiner=self.server_args.is_ep_scale_joiner,
+            is_ep_joiner=self.server_args.is_ep_joiner,
         )
+
+    def maybe_init_dwdp(self):
+        if self.is_draft_worker:
+            return
+        if self.server_args.dwdp_size <= 1:
+            return
+        from sglang.srt.layers.moe.dwdp import DwdpManager
+
+        manager = DwdpManager(self.server_args)
+        set_global_dwdp_manager(manager)
+        manager.setup(self.model)
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
@@ -1061,18 +1155,16 @@ class ModelRunner:
             return self.max_total_num_tokens
 
     def _record_kv_cache_dtype(self, resolved: str) -> None:
-        # Load-time resolution transition: the weight-resolved kv-cache dtype
-        # is declared into the flags tier; the dual-apply inside the helper
-        # replaces the legacy in-place write. Mock runners whose server_args
-        # is not the published object keep the plain write.
+        # the weight-resolved kv-cache dtype is written to the config
+        # bags via get_context().override, so get_model().kv_cache_dtype readers
+        # see it. server_args stays the pristine RAW record -- configure_kv_cache
+        # _dtype reads it as the resolver INPUT. A draft / mock runner whose
+        # server_args is not the published object keeps the private-bag write.
         from sglang.srt.runtime_context import get_context
 
         if get_context()._server_args is self.server_args:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "ModelRunner.configure_kv_cache_dtype",
-                {"kv_cache_dtype": resolved},
+            get_context().override(
+                "ModelRunner.configure_kv_cache_dtype", kv_cache_dtype=resolved
             )
         else:
             self.server_args.override(
@@ -1083,6 +1175,8 @@ class ModelRunner:
         spec_algorithm = getattr(self, "spec_algorithm", None)
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
+                # RAW user intent = resolver INPUT; server_args stays pristine
+                # so read it here -- not the resolved get_model() bag.
                 server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
                 model=getattr(self, "model", None),
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
@@ -1094,6 +1188,15 @@ class ModelRunner:
                     self.server_args, "speculative_draft_attention_backend", None
                 ),
             )
+        )
+        # This runner's OWN resolved dtype string (target or draft). Attention
+        # backends read it directly instead of the process-global get_model()
+        # bag: a draft runner does not publish its args, so the bag would carry
+        # the target's dtype and mis-drive the draft's FP8 cast/descale paths.
+        self.kv_cache_dtype_str = (
+            resolved_kv_cache_dtype
+            if resolved_kv_cache_dtype is not None
+            else self.server_args.kv_cache_dtype
         )
         if resolved_kv_cache_dtype is not None:
             self._record_kv_cache_dtype(resolved_kv_cache_dtype)
@@ -1424,6 +1527,10 @@ class ModelRunner:
             # dispatch below reads the pool.
             self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
 
+            dwdp_mgr = get_global_dwdp_manager()
+            if dwdp_mgr is not None:
+                dwdp_mgr.prefetch_first_layers()
+
             if forward_batch.forward_mode.is_split_prefill():
                 # Layer-split mode; stays on ModelRunner, not the eager runner.
                 ret = self.forward_split_prefill(
@@ -1484,10 +1591,10 @@ class ModelRunner:
 
         # Release the vocab_mask GPU tensor immediately after it has been applied
         # to the logits. In overlap scheduling, the sampling_info (and its
-        # vocab_mask) can be kept alive by the delay_sample_func closure and
+        # grammar_mask) can be kept alive by the delay_sample_func closure and
         # batch_record_buf until the next iteration, causing a steady VRAM leak
         # when structured output (grammar) is used.
-        sampling_info.vocab_mask = None
+        sampling_info.grammar_mask = None
 
     def sample(
         self,
@@ -1552,7 +1659,6 @@ class ModelRunner:
         self.sampler.compute_logprobs_only(
             logits_output,
             forward_batch.sampling_info,
-            forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
         )
@@ -1721,7 +1827,8 @@ class ModelRunner:
             recovered = maybe_recover_ep_ranks(
                 tp_group=self.tp_group,
                 eplb_manager=self.eplb_manager,
-                random_seed=self.server_args.random_seed,
+                model_config=self.model_config,
+                moe_ep_rank=self._elastic_global_rank(),
             )
             if recovered:
                 self.forward_pass_id = 0
