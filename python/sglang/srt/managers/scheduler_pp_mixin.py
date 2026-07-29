@@ -1161,7 +1161,13 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
-        next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        # PP outputs may be on CPU after result processing, while draft state is
+        # filtered with device-resident batch indices.
+        next_token_ids = pp_outputs["next_token_ids"].to(
+            device=batch.device,
+            dtype=torch.int64,
+            non_blocking=True,
+        )
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
