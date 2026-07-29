@@ -57,7 +57,7 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Environment:"
       echo "  ENABLE_CACHE_HOST=1|0"
-      echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 350, otherwise 0."
+      echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 350, otherwise 0. Missing host cache falls back to container-local /sgl-data."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -299,12 +299,13 @@ if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
 fi
 case "${ENABLE_CACHE_HOST,,}" in
   1|true|yes|on|pvc|persistent)
-    if [[ ! -d "$CACHE_HOST" ]]; then
-      echo "Error: ENABLE_CACHE_HOST=1 but ${CACHE_HOST} does not exist." >&2
-      exit 1
+    if [[ -d "$CACHE_HOST" ]]; then
+      CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
+      echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
+    else
+      CACHE_VOLUME=""
+      echo "Warning: ${CACHE_HOST} does not exist; using container-local /sgl-data." >&2
     fi
-    CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
-    echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
     ;;
   0|false|no|off|"")
     CACHE_VOLUME=""

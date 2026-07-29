@@ -240,12 +240,13 @@ if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
 fi
 case "${ENABLE_CACHE_HOST,,}" in
   1|true|yes|on|pvc|persistent)
-    if [[ ! -d "$CACHE_HOST" ]]; then
-      echo "Error: ENABLE_CACHE_HOST=1 but ${CACHE_HOST} does not exist." >&2
-      exit 1
+    if [[ -d "$CACHE_HOST" ]]; then
+      CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
+      echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
+    else
+      CACHE_VOLUME=""
+      echo "Warning: ${CACHE_HOST} does not exist; using container-local /sgl-data." >&2
     fi
-    CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
-    echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
     ;;
   0|false|no|off|"")
     CACHE_VOLUME=""
