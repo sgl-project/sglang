@@ -411,6 +411,8 @@ QWEN3_OMNI_30B_A3B_THINKING_MODEL_PATH = os.path.join(
 )
 # Images path
 IMAGES_EXAMPLE_PATH = os.path.join(IMAGES_DIR, "example_image.png")
+IMAGE_MAN_IRONING_PATH = os.path.join(IMAGES_DIR, "man_ironing_on_back_of_suv.png")
+IMAGE_SGL_LOGO_PATH = os.path.join(IMAGES_DIR, "sgl_logo.png")
 IMAGES_023_PATH = os.path.join(IMAGES_DIR, "023.jpg")
 IMAGES_MAN_PATH = os.path.join(IMAGES_DIR, "man.png")
 IMAGES_LOGO_PATH = os.path.join(IMAGES_DIR, "logo.png")
