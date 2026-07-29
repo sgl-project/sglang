@@ -39,6 +39,8 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     backend.use_sliding_window_kv_pool = False
     backend._swa_kv_pool = None
     backend._swa_full_to_swa_mapping = None
+    backend.dcp_size = 1
+    backend.dcp_rank = 0
     backend.speculative_step_id = 0
     backend.speculative_num_draft_tokens = speculative_num_draft_tokens
     backend.expand_encoder_only_verify = False
@@ -439,6 +441,64 @@ def test_bs_zero_noop():
         max_seq_pages=0,
         page_size=PAGE_SIZE,
     )
+
+
+def test_dcp_metadata_uses_local_lens_and_page_table():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    bs = 3
+    dcp_size = 4
+    dcp_rank = 2
+    global_lens = torch.tensor([1, 257, 1027], dtype=torch.int32, device=DEVICE)
+    max_local_len = (int(global_lens.max().item()) + dcp_size - 1) // dcp_size
+    max_seq_pages = (max_local_len + PAGE_SIZE - 1) // PAGE_SIZE
+    req_to_token = torch.arange(bs * 2048, dtype=torch.int32, device=DEVICE).reshape(
+        bs, 2048
+    )
+    req_pool_indices = torch.arange(bs, dtype=torch.int64, device=DEVICE)
+    cache_seqlens = torch.zeros(bs, dtype=torch.int32, device=DEVICE)
+    cu_seqlens_k = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+    page_table = torch.full((bs, max_seq_pages), -1, dtype=torch.int32, device=DEVICE)
+
+    update_trtllm_mha_graph_metadata(
+        req_pool_indices=req_pool_indices,
+        seq_lens=global_lens,
+        req_to_token=req_to_token,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+        page_table=page_table,
+        bs=bs,
+        seqlen_offset=0,
+        max_seq_pages=max_seq_pages,
+        page_size=PAGE_SIZE,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+    )
+    torch.cuda.synchronize()
+
+    local_lens = (global_lens // dcp_size + (dcp_rank < global_lens % dcp_size)).to(
+        torch.int32
+    )
+    torch.testing.assert_close(cache_seqlens, local_lens, rtol=0, atol=0)
+    torch.testing.assert_close(
+        cu_seqlens_k[1:],
+        torch.cumsum(local_lens, dim=0, dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    for req_idx in range(bs):
+        num_pages = (int(local_lens[req_idx].item()) + PAGE_SIZE - 1) // PAGE_SIZE
+        global_positions = (
+            torch.arange(num_pages, device=DEVICE, dtype=torch.int64)
+            * PAGE_SIZE
+            * dcp_size
+            + dcp_rank
+        )
+        expected = (req_to_token[req_idx, global_positions] // dcp_size) // PAGE_SIZE
+        torch.testing.assert_close(
+            page_table[req_idx, :num_pages], expected, rtol=0, atol=0
+        )
 
 
 if __name__ == "__main__":
