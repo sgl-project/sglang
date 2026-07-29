@@ -13,17 +13,46 @@ paths can resolve NPU classes through ``current_platform`` instead of
 ``device == "npu"`` string checks.
 """
 
+import logging
+from enum import Enum
+from functools import cached_property
 from typing import Optional
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.platforms.capabilities import PlatformFeature
 from sglang.srt.platforms.device_mixin import (
     DeviceCapability,
     DeviceMixin,
     PlatformEnum,
 )
 from sglang.srt.platforms.interface import SRTPlatform
+
+logger = logging.getLogger(__name__)
+
+
+class NpuSocFamily(str, Enum):
+    """Ascend product families used only to build the platform feature set."""
+
+    A2 = "a2"
+    A3 = "a3"
+    A5 = "a5"
+    UNKNOWN = "unknown"
+
+
+_NPU_SOC_FAMILY_RANGES = (
+    (220, 225, NpuSocFamily.A2),
+    (250, 255, NpuSocFamily.A3),
+    (260, 260, NpuSocFamily.A5),
+)
+
+_NPU_FEATURES_BY_SOC = {
+    NpuSocFamily.A2: frozenset({PlatformFeature.NPU_NATIVE_GEMMA_RMS_NORM}),
+    NpuSocFamily.A3: frozenset({PlatformFeature.NPU_NATIVE_GEMMA_RMS_NORM}),
+    NpuSocFamily.A5: frozenset(),
+    NpuSocFamily.UNKNOWN: frozenset(),
+}
 
 
 class NpuDeviceMixin(DeviceMixin):
@@ -32,6 +61,36 @@ class NpuDeviceMixin(DeviceMixin):
     _enum: PlatformEnum = PlatformEnum.NPU
     device_name: str = "npu"
     device_type: str = "npu"
+
+    @cached_property
+    def soc_family(self) -> NpuSocFamily:
+        """Resolve the process-wide Ascend SoC family once, on first use."""
+        try:
+            import torch_npu
+
+            soc_version = int(torch_npu.npu.get_soc_version())
+        except (ImportError, AttributeError, RuntimeError, TypeError, ValueError) as e:
+            logger.warning(
+                "Unable to resolve the Ascend SoC version; optional platform "
+                "features will use safe fallbacks: %s",
+                e,
+            )
+            return NpuSocFamily.UNKNOWN
+
+        for lower, upper, family in _NPU_SOC_FAMILY_RANGES:
+            if lower <= soc_version <= upper:
+                return family
+
+        logger.warning(
+            "Unknown Ascend SoC version %s; optional platform features will "
+            "use safe fallbacks.",
+            soc_version,
+        )
+        return NpuSocFamily.UNKNOWN
+
+    def supports_feature(self, feature: PlatformFeature, device_id: int = 0) -> bool:
+        # torch_npu exposes SoC version process-wide rather than per device.
+        return feature in _NPU_FEATURES_BY_SOC[self.soc_family]
 
     def get_device_total_memory(self, device_id: int = 0) -> int:
         return int(torch.npu.mem_get_info(device_id)[1])

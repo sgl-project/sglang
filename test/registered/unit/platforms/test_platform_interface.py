@@ -5,11 +5,14 @@ Tests DeviceMixin, SRTPlatform, PlatformEnum, CpuArchEnum, DeviceCapability,
 and the platform discovery / lazy initialization mechanism.
 """
 
+import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.platforms import _load_platform_class, _resolve_platform
+from sglang.srt.platforms.capabilities import PlatformFeature
 from sglang.srt.platforms.cpu import CpuDeviceMixin, CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaDeviceMixin, CudaSRTPlatform
 from sglang.srt.platforms.device_mixin import (
@@ -19,6 +22,7 @@ from sglang.srt.platforms.device_mixin import (
     PlatformEnum,
 )
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.npu import NpuSocFamily, NpuSRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -193,6 +197,12 @@ class TestDeviceMixin(CustomTestCase):
         self.assertTrue(oot.is_out_of_tree())
         cuda = _make_device_mixin(PlatformEnum.CUDA, "cuda", "cuda")
         self.assertFalse(cuda.is_out_of_tree())
+
+    def test_optional_features_default_to_false(self):
+        mixin = _make_device_mixin(PlatformEnum.OOT, "custom", "custom")
+        self.assertFalse(
+            mixin.supports_feature(PlatformFeature.NPU_NATIVE_GEMMA_RMS_NORM)
+        )
 
     @patch("platform.machine")
     def test_get_cpu_architecture(self, mock_machine):
@@ -447,6 +457,59 @@ class TestCpuDeviceMixin(CustomTestCase):
         self.assertFalse(base.support_piecewise_cuda_graph())
         # Override of the SRTPlatform default (True) — no GPU to pin to.
         self.assertFalse(base.is_pin_memory_available())
+
+
+class TestNpuDeviceMixin(CustomTestCase):
+    def _platform_for_soc(self, soc_version):
+        get_soc_version = MagicMock(return_value=soc_version)
+        torch_npu = SimpleNamespace(
+            npu=SimpleNamespace(get_soc_version=get_soc_version)
+        )
+        return NpuSRTPlatform(), torch_npu, get_soc_version
+
+    def test_native_gemma_rms_norm_feature_matrix(self):
+        cases = [
+            (220, NpuSocFamily.A2, True),
+            (225, NpuSocFamily.A2, True),
+            (250, NpuSocFamily.A3, True),
+            (255, NpuSocFamily.A3, True),
+            (260, NpuSocFamily.A5, False),
+            (999, NpuSocFamily.UNKNOWN, False),
+        ]
+        for soc_version, expected_family, expected_support in cases:
+            with self.subTest(soc_version=soc_version):
+                platform, torch_npu, _ = self._platform_for_soc(soc_version)
+                with patch.dict(sys.modules, {"torch_npu": torch_npu}):
+                    self.assertEqual(platform.soc_family, expected_family)
+                    self.assertEqual(
+                        platform.supports_feature(
+                            PlatformFeature.NPU_NATIVE_GEMMA_RMS_NORM
+                        ),
+                        expected_support,
+                    )
+
+    def test_soc_detection_is_cached(self):
+        platform, torch_npu, get_soc_version = self._platform_for_soc(220)
+        with patch.dict(sys.modules, {"torch_npu": torch_npu}):
+            self.assertTrue(
+                platform.supports_feature(PlatformFeature.NPU_NATIVE_GEMMA_RMS_NORM)
+            )
+            self.assertTrue(
+                platform.supports_feature(PlatformFeature.NPU_NATIVE_GEMMA_RMS_NORM)
+            )
+        get_soc_version.assert_called_once_with()
+
+    def test_soc_detection_failure_uses_safe_fallback(self):
+        get_soc_version = MagicMock(side_effect=RuntimeError("not initialized"))
+        torch_npu = SimpleNamespace(
+            npu=SimpleNamespace(get_soc_version=get_soc_version)
+        )
+        platform = NpuSRTPlatform()
+        with patch.dict(sys.modules, {"torch_npu": torch_npu}):
+            self.assertEqual(platform.soc_family, NpuSocFamily.UNKNOWN)
+            self.assertFalse(
+                platform.supports_feature(PlatformFeature.NPU_NATIVE_GEMMA_RMS_NORM)
+            )
 
 
 class TestSRTPlatformOverrides(CustomTestCase):

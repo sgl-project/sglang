@@ -33,6 +33,7 @@ import numpy as np
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.platforms.capabilities import PlatformFeature
 
 
 class PlatformEnum(enum.Enum):
@@ -158,6 +159,14 @@ class DeviceMixin:
     ) -> float:
         """[Active] Get current peak memory usage in bytes."""
         raise NotImplementedError
+
+    def supports_feature(self, feature: PlatformFeature, device_id: int = 0) -> bool:
+        """[Active] Whether this platform supports an optional semantic feature.
+
+        Platforms opt in explicitly. The conservative default keeps unknown and
+        out-of-tree devices on the caller's safe fallback implementation.
+        """
+        return False
 
     # ------------------------------------------------------------------
     # Planned methods — reserved interface.  Core still uses hardcoded
