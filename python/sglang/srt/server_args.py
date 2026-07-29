@@ -379,6 +379,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "flashinfer",
     "flashkda",
     "nvidia_kda",
+    "ptx_kda",
 ]
 
 

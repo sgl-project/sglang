@@ -202,8 +202,8 @@ def kda_decode_mtp_kernel(
         k_idx = i * 32 + in_warp_tid
         for w in range(KERNEL_WIDTH - 1):
             r_state[w * VEC_SIZE + i] = cutlass.Float32(cs_q[slot, head_off + k_idx, w])
-            r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + w * VEC_SIZE + i] = (
-                cutlass.Float32(cs_k[slot, head_off + k_idx, w])
+            r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + w * VEC_SIZE + i] = cutlass.Float32(
+                cs_k[slot, head_off + k_idx, w]
             )
 
     if tidx < HEAD_DIM:
@@ -331,9 +331,7 @@ def kda_decode_mtp_kernel(
                     r_xk = cutlass.Float32(x_k[0, token, i_hv, k_idx])
                     r_conv += (
                         r_xk
-                        * sConvW[
-                            (KERNEL_WIDTH - 1) * HEAD_DIM + i * 32 + in_warp_tid
-                        ]
+                        * sConvW[(KERNEL_WIDTH - 1) * HEAD_DIM + i * 32 + in_warp_tid]
                     )
                     r_conv = r_conv * cute.arch.rcp_approx(
                         cutlass.Float32(1.0) + cute.math.exp(-r_conv, fastmath=True)
