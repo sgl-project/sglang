@@ -89,7 +89,7 @@ class TestMmEncoderDataParallelLogging(CustomTestCase):
         self.assertIn("TP=4", logs.output[0])
         self.assertIn("high-resolution or multi-image", logs.output[0])
 
-        
+
 class TestMultimodalFeatureTransport(CustomTestCase):
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):
