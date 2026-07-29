@@ -21,11 +21,13 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
+    DCP_OUTPUT_VMM_MAX_ROWS,
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     alloc_dcp_q_combine_buf,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
+    dcp_output_vmm_lse_reduce,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
@@ -949,7 +951,20 @@ class DeepseekMLAForwardMixin:
                 self.kv_lora_rank,
             )
             dcp_comm_backend = get_server_args().dcp_comm_backend
-            if dcp_comm_backend in ("a2a", "fi_a2a"):
+            use_bounded_vmm = (
+                dcp_comm_backend == "vmm"
+                and forward_batch.forward_mode.is_decode()
+                and attn_output.shape[0] <= DCP_OUTPUT_VMM_MAX_ROWS
+            )
+            if use_bounded_vmm:
+                attn_output = dcp_output_vmm_lse_reduce(
+                    attn_output.contiguous(),
+                    lse.to(torch.float32).contiguous(),
+                    get_parallel().dcp_group,
+                    is_lse_base_on_e=False,
+                    workspace_slot=self.layer_id % 2,
+                )
+            elif dcp_comm_backend in ("a2a", "fi_a2a"):
                 # A2A exchange of head partials + LSE, then local Triton combine.
                 # MLA decode LSE is base-2 (FlashInfer-MLA/FlashMLA) -> base_on_e=False.
                 attn_output = dcp_a2a_lse_reduce(

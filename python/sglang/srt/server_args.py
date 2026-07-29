@@ -1054,8 +1054,10 @@ class ServerArgs:
             "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
             "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
             "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
-            "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
-            choices=["ag_rs", "a2a", "fi_a2a"],
+            "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72), or 'vmm' "
+            "(bounded CUDA decode: producer-direct stores into "
+            "destination-owned peer-mapped Output/LSE buffers).",
+            choices=["ag_rs", "a2a", "fi_a2a", "vmm"],
             resolvable=True,
         ),
         NS("parallel"),
@@ -3729,7 +3731,10 @@ class ServerArgs:
                 "--decode-context-parallel-size) must be >= 1, but got "
                 f"dcp_size={self.dcp_size}."
             )
-        if self.dcp_comm_backend in ("a2a", "fi_a2a") and self.dcp_size <= 1:
+        if (
+            self.dcp_comm_backend in ("a2a", "fi_a2a", "vmm")
+            and self.dcp_size <= 1
+        ):
             raise ValueError(
                 f"--dcp-comm-backend {self.dcp_comm_backend} only affects the "
                 "decode context-parallel attention reduction and therefore "
@@ -3744,6 +3749,19 @@ class ServerArgs:
                 "authoritative fabric probe runs at model-runner init; use 'a2a' "
                 "or 'ag_rs' on clusters without MNNVL."
             )
+        if self.dcp_comm_backend == "vmm":
+            if not is_cuda():
+                raise ValueError(
+                    "--dcp-comm-backend vmm requires a same-host NVIDIA CUDA "
+                    "DCP group with peer access and native peer atomics."
+                )
+            from sglang.srt.configs.model_config import is_deepseek_dsa
+
+            if not is_deepseek_dsa(self.get_model_config().hf_config):
+                raise ValueError(
+                    "--dcp-comm-backend vmm currently supports only the "
+                    "DeepSeek-V3.2/GLM-5.x DSA MLA path."
+                )
         if self.dcp_replicate_q_proj:
             if self.dcp_size <= 1:
                 raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")

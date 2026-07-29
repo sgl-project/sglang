@@ -1,10 +1,11 @@
 """Unit tests for DCP (Decode Context Parallelism) server args configuration.
 
-Covers the ``--dcp-comm-backend`` field ({ag_rs, a2a, fi_a2a}) and its
+Covers the ``--dcp-comm-backend`` field ({ag_rs, a2a, fi_a2a, vmm}) and its
 validation in ``ServerArgs._handle_dcp_validation``:
-  - a2a / fi_a2a require --dcp-size > 1
+  - a2a / fi_a2a / vmm require --dcp-size > 1
   - fi_a2a requires a CUDA platform (the authoritative MNNVL fabric probe runs
     later, at model-runner init)
+  - vmm requires CUDA and a DSA model
   - dcp>1 requires CUDA or HIP (base behavior from the merged DCP PR)
 
 Tests construct with safe defaults (dcp_size=1) then mutate the fields and call
@@ -15,6 +16,7 @@ gate; is_cuda / is_hip are patched per-test to pin the platform deterministicall
 
 import dataclasses
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.server_args import ServerArgs
@@ -67,6 +69,11 @@ class TestDCPCommBackendValidation(CustomTestCase):
         with self.assertRaises(ValueError):
             args._handle_dcp_validation()
 
+    def test_vmm_requires_dcp_size_gt_1(self):
+        args = self._make_args(dcp_size=1, dcp_comm_backend="vmm")
+        with self.assertRaises(ValueError):
+            args._handle_dcp_validation()
+
     @patch("sglang.srt.server_args.is_hip", return_value=False)
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_a2a_with_dcp_size_2_on_cuda_passes(self, *_):
@@ -89,6 +96,43 @@ class TestDCPCommBackendValidation(CustomTestCase):
         args = self._make_args(dcp_size=2, dcp_comm_backend="fi_a2a")
         with self.assertRaises(ValueError):
             args._handle_dcp_validation()
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_vmm_on_non_cuda_raises(self, *_):
+        args = self._make_args(dcp_size=2, dcp_comm_backend="vmm")
+        with self.assertRaises(ValueError):
+            args._handle_dcp_validation()
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_vmm_rejects_non_dsa_model(self, *_):
+        args = self._make_args(dcp_size=2, dcp_comm_backend="vmm")
+        model_config = SimpleNamespace(
+            hf_config={
+                "architectures": ["DeepseekV2ForCausalLM"],
+                "index_topk": None,
+            }
+        )
+        with (
+            patch.object(args, "get_model_config", return_value=model_config),
+            self.assertRaises(ValueError),
+        ):
+            args._handle_dcp_validation()
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_vmm_with_dsa_dcp_on_cuda_passes(self, *_):
+        args = self._make_args(dcp_size=4, dcp_comm_backend="vmm")
+        model_config = SimpleNamespace(
+            hf_config={
+                "architectures": ["GlmMoeDsaForCausalLM"],
+                "index_topk": 2048,
+            }
+        )
+        with patch.object(args, "get_model_config", return_value=model_config):
+            args._handle_dcp_validation()
+        self.assertEqual(args.dcp_comm_backend, "vmm")
 
     @patch("sglang.srt.server_args.is_hip", return_value=False)
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
