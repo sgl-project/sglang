@@ -631,7 +631,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:
+        # Qwen3.5 stores in_proj_qkvz contiguously as [q | k | v | z]
+        # (Qwen3-Next interleaves it per head group), so mixed_qkv is exactly
+        # the leading 2 * k_tp + v_tp columns: slice it as a view instead of
+        # the split/reshape/cat round trip that rebuilds the same bytes.
+        # Decode only -- causal_conv1d_update and packed_decode honor real
+        # row strides, but the extend kernels assume a contiguous layout (see the
+        # TODO in HybridLinearAttnBackend.forward_extend) and target-verify
+        # calls .view() on mixed_qkv.
+        if not (_is_cpu or _is_npu) and forward_batch.forward_mode.is_decode():
+            k_tp = self.key_dim // self.attn_tp_size
+            v_tp = self.value_dim // self.attn_tp_size
+            nv_tp = self.num_v_heads // self.attn_tp_size
+            mixed_qkv, z_flat = projected_states_qkvz.split(
+                [k_tp * 2 + v_tp, v_tp], dim=-1
+            )
+            z = z_flat.reshape(z_flat.shape[0], -1, self.head_v_dim)
+            b, a = projected_states_ba.split([nv_tp, nv_tp], dim=-1)
+        elif self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
                 num_v_heads_tp = self.num_v_heads // self.attn_tp_size
