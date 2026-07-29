@@ -39,6 +39,15 @@ const MAX_BROADCAST_CLONE_BYTES: usize = 64 << 20;
 /// the wire form does not); 8 is the ceiling of that range, not a worst case.
 const JSON_TO_HEAP_FACTOR: usize = 8;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdBootstrap {
+    pub host: String,
+    pub port: u16,
+    pub room: u64,
+    pub attempt_id: String,
+    pub batch_index: u32,
+}
+
 /// The `/generate` wire body before batch splitting: `text`/`input_ids`/`sampling_params`
 /// each scalar-or-list, fanned into per-request [`GenerateRequest`]s by
 /// [`into_requests`](GenerateBody::into_requests).
@@ -84,10 +93,84 @@ pub struct GenerateBody {
     pub return_hidden_states: Option<OneOrMany<bool>>,
     /// Scalar-only in Python too (`return_text_in_logprobs: bool`).
     #[serde(default)]
+    #[allow(dead_code)]
+    pub return_sampling_mask: Option<serde_json::Value>,
+    #[serde(default)]
     pub return_text_in_logprobs: Option<bool>,
+    /// Top-level compatibility field. Upstream ignores it in favor of
+    /// `sampling_params.n`; PD validation retains it so an unsupported request
+    /// cannot be silently accepted.
+    #[serde(default)]
+    pub n: Option<serde_json::Value>,
+    /// Gateway-owned PD identity. These four fields are all-or-none. Scalar
+    /// requests require scalar values; batch requests require exact-length
+    /// arrays so no item can inherit another item's Room identity.
+    #[serde(default)]
+    pub bootstrap_host: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub bootstrap_port: Option<OneOrMany<u16>>,
+    #[serde(default)]
+    pub bootstrap_room: Option<OneOrMany<u64>>,
+    #[serde(default)]
+    pub bootstrap_attempt_id: Option<OneOrMany<String>>,
+
+    // These upstream-compatible fields remain ignored on the ordinary path.
+    // Retaining their arbitrary JSON shape lets PD fail closed without changing
+    // the non-PD parser's permissive unknown-field behavior.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub lora_path: Option<serde_json::Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub return_routed_experts: Option<serde_json::Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub image_data: Option<serde_json::Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub custom_logit_processor: Option<serde_json::Value>,
 }
 
 impl GenerateBody {
+    /// Fail-closed request-level portion of the frozen PD support matrix.
+    ///
+    /// Type/range violations are request-invalid; valid capabilities outside
+    /// the MVP (random sampling, logprobs, grammar, LoRA, multimodal, etc.) are
+    /// unsupported. Startup-level model/topology checks live in `ServerArgs`.
+    pub fn validate_pd_support(&self) -> Result<(), crate::pd::room::PdReason> {
+        use crate::pd::room::PdReason;
+
+        if one_or_many_bool(&self.return_logprob)
+            || one_or_many_nonzero(&self.top_logprobs_num)
+            || self.token_ids_logprob.is_some()
+            || one_or_many_bool(&self.return_hidden_states)
+            || pd_json_flag(&self.return_sampling_mask)?
+            || pd_json_flag(&self.return_routed_experts)?
+            || pd_json_present(&self.lora_path)
+            || pd_json_present(&self.image_data)
+            || pd_json_present(&self.custom_logit_processor)
+        {
+            return Err(PdReason::Unsupported);
+        }
+        if let Some(value) = self.n.as_ref().filter(|value| !value.is_null()) {
+            match value.as_i64() {
+                Some(1) => {}
+                Some(_) => return Err(PdReason::Unsupported),
+                None => return Err(PdReason::RequestInvalid),
+            }
+        }
+
+        let sampling = self.sampling_params.as_ref().ok_or(PdReason::Unsupported)?;
+        let params: Vec<&SamplingParams> = match sampling {
+            SamplingParamsInput::One(params) => vec![params],
+            SamplingParamsInput::Many(params) => params.iter().collect(),
+        };
+        for params in params {
+            validate_pd_sampling_params(params)?;
+        }
+        Ok(())
+    }
+
     /// Validate, normalize and fan the body into one [`GenerateRequest`] per
     /// prompt + `is_batch` (list form — a 1-element list is still a batch → JSON
     /// array response). The Rust counterpart of Python
@@ -95,6 +178,17 @@ impl GenerateBody {
     /// batch is [`Error::Validation`], which the handler surfaces with the
     /// variant's own status (400).
     pub fn into_requests(self) -> Result<(Vec<GenerateRequest>, bool), Error> {
+        self.into_requests_inner(false)
+    }
+
+    /// PD variant of [`Self::into_requests`]: itemizes and validates the
+    /// Gateway-owned bootstrap columns. Ordinary mode keeps ignoring those
+    /// extension fields, preserving upstream request compatibility.
+    pub fn into_pd_requests(self) -> Result<(Vec<GenerateRequest>, bool), Error> {
+        self.into_requests_inner(true)
+    }
+
+    fn into_requests_inner(self, pd_enabled: bool) -> Result<(Vec<GenerateRequest>, bool), Error> {
         let GenerateBody {
             rid,
             text,
@@ -107,8 +201,12 @@ impl GenerateBody {
             token_ids_logprob,
             return_hidden_states,
             return_text_in_logprobs,
+            bootstrap_host,
+            bootstrap_port,
+            bootstrap_room,
+            bootstrap_attempt_id,
             // Unported `GenerateReqInput` fields land here and are dropped, as they
-            // are on the Python path.
+            // are on the ordinary Python-compatible path.
             ..
         } = self;
 
@@ -173,6 +271,19 @@ impl GenerateBody {
                 "batch must contain at least one item".into(),
             ));
         }
+
+        let pd_bootstrap = if pd_enabled {
+            split_pd_bootstrap(
+                bootstrap_host,
+                bootstrap_port,
+                bootstrap_room,
+                bootstrap_attempt_id,
+                n,
+                is_batch,
+            )?
+        } else {
+            vec![None; n]
+        };
 
         // A list is per-item; a single object broadcasts to every item.
         let sps: Vec<SamplingParams> = match sampling_params {
@@ -283,6 +394,7 @@ impl GenerateBody {
             top_logprobs_nums,
             tid_logprobs,
             return_hidden,
+            pd_bootstrap,
         )
         .map(
             |(
@@ -295,6 +407,7 @@ impl GenerateBody {
                 top_logprobs_num,
                 token_ids_logprob,
                 return_hidden_states,
+                pd_bootstrap,
             )| GenerateRequest {
                 rid,
                 text,
@@ -311,11 +424,66 @@ impl GenerateBody {
                 return_sampling_mask: false, // TODO: port Python's `return_sampling_mask`
                 return_hidden_states: return_hidden_states.unwrap_or(false),
                 return_text_in_logprobs,
+                pd_bootstrap,
+                pd_sidecar: None,
             },
         )
         .collect();
         Ok((requests, is_batch))
     }
+}
+
+fn one_or_many_bool(value: &Option<OneOrMany<bool>>) -> bool {
+    match value {
+        Some(OneOrMany::One(value)) => *value,
+        Some(OneOrMany::Many(values)) => values.iter().any(|value| *value),
+        None => false,
+    }
+}
+
+fn one_or_many_nonzero(value: &Option<OneOrMany<i64>>) -> bool {
+    match value {
+        Some(OneOrMany::One(value)) => *value != 0,
+        Some(OneOrMany::Many(values)) => values.iter().any(|value| *value != 0),
+        None => false,
+    }
+}
+
+fn pd_json_present(value: &Option<serde_json::Value>) -> bool {
+    value.as_ref().is_some_and(|value| !value.is_null())
+}
+
+fn pd_json_flag(value: &Option<serde_json::Value>) -> Result<bool, crate::pd::room::PdReason> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(serde_json::Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(crate::pd::room::PdReason::RequestInvalid),
+    }
+}
+
+fn validate_pd_sampling_params(params: &SamplingParams) -> Result<(), crate::pd::room::PdReason> {
+    use crate::pd::room::PdReason;
+
+    if params.n != 1
+        || params.regex.is_some()
+        || params.json_schema.is_some()
+        || params.ebnf.is_some()
+        || params.structural_tag.is_some()
+    {
+        return Err(PdReason::Unsupported);
+    }
+
+    if params.temperature != 0.0 {
+        return Err(PdReason::Unsupported);
+    }
+    if params.top_p != 1.0 || params.min_p != 0.0 {
+        return Err(PdReason::Unsupported);
+    }
+    let max_new_tokens = params.max_new_tokens.unwrap_or(128);
+    if !(0..=256).contains(&max_new_tokens) {
+        return Err(PdReason::RequestInvalid);
+    }
+    Ok(())
 }
 
 /// Request variant — selects the ingress branch, scheduler wire message, and
@@ -380,12 +548,200 @@ pub struct GenerateRequest {
     /// it is consumed on the way out, by `register_detok` → `DetokMsg::Register`
     /// → the shard's `decode_logprob_texts`.
     pub return_text_in_logprobs: Option<bool>,
+    /// Validated Gateway identity, before tokenization/request-digest binding.
+    pub pd_bootstrap: Option<PdBootstrap>,
+    /// Versioned map appended to the Scheduler request only after tokenization
+    /// and frozen sampling normalization have produced the request digest.
+    pub pd_sidecar: Option<rmpv::Value>,
+}
+
+fn split_pd_bootstrap(
+    host: Option<OneOrMany<String>>,
+    port: Option<OneOrMany<u16>>,
+    room: Option<OneOrMany<u64>>,
+    attempt_id: Option<OneOrMany<String>>,
+    count: usize,
+    is_batch: bool,
+) -> Result<Vec<Option<PdBootstrap>>, Error> {
+    let present = [
+        host.is_some(),
+        port.is_some(),
+        room.is_some(),
+        attempt_id.is_some(),
+    ];
+    if present.iter().all(|value| !value) {
+        return Ok(vec![None; count]);
+    }
+    if !present.iter().all(|value| *value) {
+        return Err(Error::Validation(
+            "PD bootstrap fields must be provided together".into(),
+        ));
+    }
+    if count > 8 {
+        return Err(Error::Validation(
+            "PD batch must contain at most 8 items".into(),
+        ));
+    }
+
+    let hosts = exact_column(host.unwrap(), count, is_batch, "bootstrap_host")?;
+    let ports = exact_column(port.unwrap(), count, is_batch, "bootstrap_port")?;
+    let rooms = exact_column(room.unwrap(), count, is_batch, "bootstrap_room")?;
+    let attempts = exact_column(attempt_id.unwrap(), count, is_batch, "bootstrap_attempt_id")?;
+
+    hosts
+        .into_iter()
+        .zip(ports)
+        .zip(rooms)
+        .zip(attempts)
+        .enumerate()
+        .map(|(batch_index, (((host, port), room), attempt_id))| {
+            if host.is_empty() || port == 0 || room > i64::MAX as u64 {
+                return Err(Error::Validation("PD bootstrap identity is invalid".into()));
+            }
+            let parsed = uuid::Uuid::parse_str(&attempt_id).map_err(|_| {
+                Error::Validation("bootstrap_attempt_id must be a canonical UUIDv4".into())
+            })?;
+            if parsed.get_version() != Some(uuid::Version::Random)
+                || parsed.get_variant() != uuid::Variant::RFC4122
+                || parsed.to_string() != attempt_id
+            {
+                return Err(Error::Validation(
+                    "bootstrap_attempt_id must be a canonical UUIDv4".into(),
+                ));
+            }
+            Ok(Some(PdBootstrap {
+                host,
+                port,
+                room,
+                attempt_id,
+                batch_index: u32::try_from(batch_index)
+                    .map_err(|_| Error::Validation("PD batch index is invalid".into()))?,
+            }))
+        })
+        .collect()
+}
+
+fn exact_column<T: OneOrManyItem>(
+    value: OneOrMany<T>,
+    count: usize,
+    is_batch: bool,
+    field: &str,
+) -> Result<Vec<T>, Error> {
+    match (is_batch, value) {
+        (false, OneOrMany::One(value)) => Ok(vec![value]),
+        (true, OneOrMany::Many(values)) if values.len() == count => Ok(values),
+        (false, OneOrMany::Many(_)) => Err(Error::Validation(format!("{field} must be scalar"))),
+        (true, OneOrMany::One(_)) => Err(Error::Validation(format!(
+            "{field} must be a per-item array"
+        ))),
+        (true, OneOrMany::Many(values)) => Err(Error::Validation(format!(
+            "{field} list length {} does not match batch size {count}",
+            values.len()
+        ))),
+    }
 }
 
 impl GenerateRequest {
     /// True when the client already supplied token ids → skip tokenization.
     pub fn already_tokenized(&self) -> bool {
         self.input_ids.as_ref().is_some_and(|v| !v.is_empty())
+    }
+
+    /// Bind the tokenized, normalized request to the Rust transport snapshot.
+    /// The emitted map is the only PD object crossing into Python.
+    pub fn bind_pd_sidecar(
+        &mut self,
+        readiness: Option<&crate::pd::transport::PdReadinessHandle>,
+    ) -> Result<(), crate::pd::room::PdReason> {
+        use crate::pd::protocol::Role;
+        use crate::pd::request::{
+            AuxSchema, RequestContractDigest, RequestContractInput, RequestSampling,
+        };
+        use crate::pd::room::PdReason;
+        use crate::pd::runtime::RuntimeLifecycle;
+
+        if self.pd_bootstrap.is_none() && readiness.is_none() {
+            return Ok(());
+        }
+        if self.pd_sidecar.is_some() {
+            return Ok(());
+        }
+        let bootstrap = self.pd_bootstrap.as_ref().ok_or(PdReason::RequestInvalid)?;
+        let snapshot = readiness.ok_or(PdReason::PeerUnavailable)?.snapshot();
+        if snapshot.runtime.lifecycle != RuntimeLifecycle::PairReady || !snapshot.runtime.pair_ready
+        {
+            return Err(PdReason::PeerUnavailable);
+        }
+        if bootstrap.host != snapshot.expected_bootstrap_host
+            || !snapshot.allowed_bootstrap_ports.contains(&bootstrap.port)
+        {
+            return Err(PdReason::RequestInvalid);
+        }
+
+        let input_ids = self
+            .input_ids
+            .as_ref()
+            .filter(|ids| (1..=4096).contains(&ids.len()))
+            .ok_or(PdReason::RequestInvalid)?
+            .iter()
+            .map(|token| u32::try_from(*token).map_err(|_| PdReason::RequestInvalid))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sampling = RequestSampling::from_normalized(&self.sampling_params)
+            .map_err(|_| PdReason::RequestInvalid)?;
+        let digest = RequestContractDigest::new(RequestContractInput {
+            model_manifest_digest: snapshot.model_manifest_digest,
+            tokenizer_manifest_digest: snapshot.tokenizer_manifest_digest,
+            layout_fingerprint: snapshot.layout_fingerprint,
+            profile_digest: snapshot.runtime.profile_digest,
+            batch_index: bootstrap.batch_index,
+            normalized_input_ids: input_ids,
+            sampling,
+            aux_schema: AuxSchema {
+                version: 1,
+                bytes: 64,
+            },
+        })
+        .map_err(|_| PdReason::RequestInvalid)?;
+        let decode_process_epoch = match snapshot.runtime.role {
+            Role::Decode => snapshot.runtime.process_epoch.as_bytes(),
+            Role::Prefill => snapshot
+                .runtime
+                .peer_process_epoch
+                .ok_or(PdReason::PeerUnavailable)?
+                .into_array(),
+        };
+        self.pd_sidecar = Some(rmpv::Value::Map(vec![
+            (rmpv::Value::from("version"), rmpv::Value::from(1)),
+            (
+                rmpv::Value::from("bootstrap_host"),
+                rmpv::Value::from(bootstrap.host.as_str()),
+            ),
+            (
+                rmpv::Value::from("bootstrap_port"),
+                rmpv::Value::from(bootstrap.port),
+            ),
+            (
+                rmpv::Value::from("bootstrap_room"),
+                rmpv::Value::from(bootstrap.room),
+            ),
+            (
+                rmpv::Value::from("attempt_id"),
+                rmpv::Value::from(bootstrap.attempt_id.as_str()),
+            ),
+            (
+                rmpv::Value::from("batch_index"),
+                rmpv::Value::from(bootstrap.batch_index),
+            ),
+            (
+                rmpv::Value::from("request_digest"),
+                rmpv::Value::from(digest.to_hex()),
+            ),
+            (
+                rmpv::Value::from("decode_process_epoch"),
+                rmpv::Value::from(uuid::Uuid::from_bytes(decode_process_epoch).to_string()),
+            ),
+        ]));
+        Ok(())
     }
 
     /// Multimodal detection hook. Deferred (Encoder stubbed): always false until mm
@@ -494,6 +850,12 @@ mod tests {
         serde_json::from_str::<GenerateBody>(body)
             .unwrap()
             .into_requests()
+    }
+
+    fn pd_requests(body: &str) -> Result<(Vec<GenerateRequest>, bool), Error> {
+        serde_json::from_str::<GenerateBody>(body)
+            .unwrap()
+            .into_pd_requests()
     }
 
     /// Scalar `text` → one item, not a batch (response stays a single object).
@@ -688,6 +1050,114 @@ mod tests {
         .to_string();
         let err = requests(&body).unwrap_err().to_string();
         assert!(err.contains("would allocate more than"), "{err}");
+    }
+
+    #[test]
+    fn pd_bootstrap_scalar_and_batch_are_itemized() {
+        let (scalar_requests, is_batch) = pd_requests(
+            r#"{"input_ids":[1],"bootstrap_host":"prefill.internal",
+                "bootstrap_port":8998,"bootstrap_room":0,
+                "bootstrap_attempt_id":"44444444-4444-4444-8444-444444444444"}"#,
+        )
+        .unwrap();
+        assert!(!is_batch);
+        let scalar = scalar_requests[0].pd_bootstrap.as_ref().unwrap();
+        assert_eq!(scalar.host, "prefill.internal");
+        assert_eq!(scalar.port, 8998);
+        assert_eq!(scalar.room, 0);
+        assert_eq!(scalar.batch_index, 0);
+
+        let (batch_requests, is_batch) = pd_requests(
+            r#"{"input_ids":[[1],[2]],"bootstrap_host":["prefill.internal","prefill.internal"],
+                "bootstrap_port":[8998,8998],"bootstrap_room":[0,9223372036854775807],
+                "bootstrap_attempt_id":["44444444-4444-4444-8444-444444444444",
+                                        "55555555-5555-4555-8555-555555555555"]}"#,
+        )
+        .unwrap();
+        assert!(is_batch);
+        assert_eq!(
+            batch_requests[0].pd_bootstrap.as_ref().unwrap().batch_index,
+            0
+        );
+        assert_eq!(
+            batch_requests[1].pd_bootstrap.as_ref().unwrap().room,
+            i64::MAX as u64
+        );
+        assert_eq!(
+            batch_requests[1].pd_bootstrap.as_ref().unwrap().batch_index,
+            1
+        );
+    }
+
+    #[test]
+    fn pd_bootstrap_is_all_or_none_with_exact_cardinality() {
+        assert!(
+            pd_requests(
+                r#"{"input_ids":[1],"bootstrap_host":"prefill.internal",
+                    "bootstrap_port":8998,"bootstrap_room":0}"#
+            )
+            .is_err()
+        );
+        assert!(
+            pd_requests(
+                r#"{"input_ids":[[1],[2]],"bootstrap_host":"prefill.internal",
+                    "bootstrap_port":[8998,8998],"bootstrap_room":[0,1],
+                    "bootstrap_attempt_id":["44444444-4444-4444-8444-444444444444",
+                                            "55555555-5555-4555-8555-555555555555"]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            pd_requests(
+                r#"{"input_ids":[1],"bootstrap_host":"prefill.internal",
+                    "bootstrap_port":8998,"bootstrap_room":9223372036854775808,
+                    "bootstrap_attempt_id":"44444444-4444-4444-8444-444444444444"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            pd_requests(
+                r#"{"input_ids":[1],"bootstrap_host":"prefill.internal",
+                    "bootstrap_port":8998,"bootstrap_room":0,
+                    "bootstrap_attempt_id":"44444444-4444-1444-8444-444444444445"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pd_support_matrix_distinguishes_invalid_and_unsupported() {
+        let greedy: GenerateBody = serde_json::from_str(
+            r#"{"input_ids":[1],"sampling_params":{"temperature":0,"max_new_tokens":256}}"#,
+        )
+        .unwrap();
+        assert_eq!(greedy.validate_pd_support(), Ok(()));
+
+        let random: GenerateBody =
+            serde_json::from_str(r#"{"input_ids":[1],"sampling_params":{"temperature":0.5}}"#)
+                .unwrap();
+        assert_eq!(
+            random.validate_pd_support(),
+            Err(crate::pd::room::PdReason::Unsupported)
+        );
+
+        let too_long: GenerateBody = serde_json::from_str(
+            r#"{"input_ids":[1],"sampling_params":{"temperature":0,"max_new_tokens":257}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            too_long.validate_pd_support(),
+            Err(crate::pd::room::PdReason::RequestInvalid)
+        );
+
+        let logprobs: GenerateBody = serde_json::from_str(
+            r#"{"input_ids":[1],"sampling_params":{"temperature":0},"return_logprob":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            logprobs.validate_pd_support(),
+            Err(crate::pd::room::PdReason::Unsupported)
+        );
     }
 
     /// `token_ids_logprob` mirrors Python `_normalize_batch`'s nested-structure

@@ -31,6 +31,9 @@ pub enum Error {
     #[error("serialization error: {0}")]
     Codec(String),
 
+    #[error("PD request failed: {0:?}")]
+    Pd(crate::pd::room::PdReason),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -43,7 +46,17 @@ impl Error {
             Error::Validation(_) => 400,
             Error::Disconnected => 499, // nginx-style client closed request
             Error::QueueFull => 503,
+            Error::Pd(reason) => {
+                crate::pd::request::PdPublicError::new(*reason).map_or(500, |error| error.status())
+            }
             _ => 500,
+        }
+    }
+
+    pub const fn pd_reason(&self) -> Option<crate::pd::room::PdReason> {
+        match self {
+            Self::Pd(reason) => Some(*reason),
+            _ => None,
         }
     }
 }

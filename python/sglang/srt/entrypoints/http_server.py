@@ -2243,11 +2243,25 @@ def _execute_server_warmup(server_args: ServerArgs):
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
-            # TODO: @rainj-me fix this when Rust server supports disaggregation
-            assert (
-                not envs.SGLANG_RUST_SERVER.get()
-            ), "Rust server is not supported for disaggregation warmup for now"
-            logger.info(f"Start of pd disaggregation warmup ...")
+            if envs.SGLANG_RUST_SERVER.get():
+                # RustPdSchedulerAdapter.start() has already completed strict
+                # support validation, region registration, authenticated
+                # bootstrap, data canary, and PairReady before the Rust HTTP
+                # server is launched. A local one-sided generation request
+                # cannot be a valid PD warmup because identities are Gateway
+                # owned and P/D must receive the same Attempt. Keep this gate
+                # as an explicit PairReady probe; the first paired generation
+                # warmup is issued through the Gateway deployment gate.
+                readiness = requests.get(
+                    url + "/readiness",
+                    timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                    verify=ssl_verify,
+                )
+                assert readiness.status_code == 200, readiness.text
+                logger.info("Rust PD PairReady warmup gate completed")
+                return success
+
+            logger.info("Start of pd disaggregation warmup ...")
             status_codes = asyncio.run(
                 _send_disaggregation_warmup_requests(
                     server_args=server_args,

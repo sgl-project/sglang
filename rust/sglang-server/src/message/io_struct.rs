@@ -30,6 +30,9 @@ wire_struct! {
         /// Not exposed by this server yet; the scheduler needs the slot filled.
         return_sampling_mask: bool,
         return_hidden_states: bool,
+        /// Versioned Rust-PD identity/digest map. Appended at the Python-owned
+        /// extension slot so upstream positional fields retain their indices.
+        pd_sidecar: Option<&'a rmpv::Value>,
     }
 }
 
@@ -75,6 +78,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             stream: req.stream,
             return_sampling_mask: req.return_sampling_mask,
             return_hidden_states: req.return_hidden_states,
+            pd_sidecar: req.pd_sidecar.as_ref(),
         }
     }
 }
@@ -136,6 +140,10 @@ mod tests {
             top_logprobs_num: 3,
             return_hidden_states: true,
             stream: true,
+            pd_sidecar: Some(rmpv::Value::Map(vec![(
+                rmpv::Value::from("version"),
+                rmpv::Value::from(1),
+            )])),
             ..Default::default()
         };
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
@@ -169,5 +177,6 @@ mod tests {
             Some(true),
             "return_hidden_states at idx 15"
         );
+        assert!(arr[16].is_map(), "pd_sidecar must land at idx 16");
     }
 }

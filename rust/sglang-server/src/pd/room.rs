@@ -144,6 +144,25 @@ pub enum PdReason {
 }
 
 impl PdReason {
+    pub const fn from_code(value: &str) -> Option<Self> {
+        match value.as_bytes() {
+            b"PD_SUCCESS" => Some(Self::Success),
+            b"PD_REQUEST_INVALID" => Some(Self::RequestInvalid),
+            b"PD_UNSUPPORTED" => Some(Self::Unsupported),
+            b"PD_CAPACITY_EXHAUSTED" => Some(Self::CapacityExhausted),
+            b"PD_PROTOCOL_MISMATCH" => Some(Self::ProtocolMismatch),
+            b"PD_PEER_UNAVAILABLE" => Some(Self::PeerUnavailable),
+            b"PD_RENDEZVOUS_TIMEOUT" => Some(Self::RendezvousTimeout),
+            b"PD_TRANSFER_TIMEOUT" => Some(Self::TransferTimeout),
+            b"PD_TRANSFER_FAILED" => Some(Self::TransferFailed),
+            b"PD_ACK_TIMEOUT" => Some(Self::AckTimeout),
+            b"PD_ABORTED" => Some(Self::Aborted),
+            b"PD_STALE_EPOCH" => Some(Self::StaleEpoch),
+            b"PD_LOCAL_FATAL" => Some(Self::LocalFatal),
+            _ => None,
+        }
+    }
+
     pub const fn code(self) -> &'static str {
         match self {
             Self::Success => "PD_SUCCESS",

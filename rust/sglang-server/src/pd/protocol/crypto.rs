@@ -19,7 +19,7 @@ impl Psk {
     pub fn load(path: &Path) -> Result<Self, CryptoError> {
         let mut file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(|_| CryptoError::PskOpen)?;
         let metadata = file.metadata().map_err(|_| CryptoError::PskMetadata)?;
@@ -33,17 +33,7 @@ impl Psk {
             return Err(CryptoError::PskLength);
         }
 
-        let mut bytes = [0_u8; 32];
-        if file.read_exact(&mut bytes).is_err() {
-            bytes.zeroize();
-            return Err(CryptoError::PskRead);
-        }
-        let mut extra = [0_u8; 1];
-        if file.read(&mut extra).map_err(|_| CryptoError::PskRead)? != 0 {
-            bytes.zeroize();
-            return Err(CryptoError::PskLength);
-        }
-        Ok(Self(bytes))
+        read_psk(&mut file)
     }
 
     pub fn id(&self) -> [u8; 8] {
@@ -56,6 +46,20 @@ impl Psk {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+}
+
+fn read_psk(reader: &mut impl Read) -> Result<Psk, CryptoError> {
+    let mut bytes = [0_u8; 32];
+    if reader.read_exact(&mut bytes).is_err() {
+        bytes.zeroize();
+        return Err(CryptoError::PskRead);
+    }
+    let mut extra = [0_u8; 1];
+    if reader.read(&mut extra).map_err(|_| CryptoError::PskRead)? != 0 {
+        bytes.zeroize();
+        return Err(CryptoError::PskLength);
+    }
+    Ok(Psk(bytes))
 }
 
 impl Drop for Psk {
@@ -148,4 +152,27 @@ pub enum CryptoError {
     Random,
     #[error("HKDF-SHA256 expansion failed")]
     Hkdf,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Read};
+
+    use super::*;
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected PSK read failure"))
+        }
+    }
+
+    #[test]
+    fn psk_read_failure_is_fail_closed() {
+        assert!(matches!(
+            read_psk(&mut FailingReader),
+            Err(CryptoError::PskRead)
+        ));
+    }
 }

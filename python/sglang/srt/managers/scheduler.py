@@ -1192,6 +1192,15 @@ class Scheduler(
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
+        self.rust_pd_adapter = None
+        if (
+            envs.SGLANG_RUST_SERVER.get()
+            and self.disaggregation_mode != DisaggregationMode.NULL
+        ):
+            from sglang.srt.disaggregation.rust_pd import RustPdSchedulerAdapter
+
+            self.rust_pd_adapter = RustPdSchedulerAdapter.from_scheduler(self)
+            return
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
         draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
@@ -2240,6 +2249,7 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                pd_sidecar=recv_req.pd_sidecar,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
@@ -2511,6 +2521,9 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
+            return
+        if self.rust_pd_adapter is not None:
+            self.rust_pd_adapter.enqueue(req, is_retracted=is_retracted)
             return
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
@@ -4186,6 +4199,19 @@ class Scheduler(
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        if self.rust_pd_adapter is not None:
+            queued, _ = self.rust_pd_adapter.abort_matching(
+                recv_req.rid, abort_all=recv_req.abort_all
+            )
+            for req in queued:
+                prepare_abort(
+                    req,
+                    "PD_ABORTED",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    pd_reason="PD_ABORTED",
+                )
+                self.output_streamer.stream_output([req], req.return_logprob)
+
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
@@ -4207,11 +4233,17 @@ class Scheduler(
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            if self.rust_pd_adapter is not None:
+                if req.req_pool_idx is not None or req.kv is not None:
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
+            elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if (
+                self.rust_pd_adapter is None
+                and self.disaggregation_mode == DisaggregationMode.PREFILL
+            ):
                 bootstrap_pending = req.pending_bootstrap
                 maybe_release_metadata_buffer(
                     req, self.req_to_metadata_buffer_idx_allocator
@@ -4255,7 +4287,9 @@ class Scheduler(
         self.grammar_manager.abort_requests(recv_req)
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        if self.rust_pd_adapter is not None:
+            pass
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # Abort requests that have not yet been bootstrapped
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):

@@ -237,6 +237,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 senders.clone(),
                 ingress_tx,
                 limits.clone(),
+                cfg.pd_readiness.clone(),
                 shutdown_rx.clone(),
             )
         });
@@ -271,6 +272,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     senders,
                     cfg.rust_server_args.channel_cap,
                     cfg.server_args.clone(),
+                    cfg.pd_readiness.clone(),
                     // Egress heartbeat watched by `/health_generate`.
                     api_activity,
                     shutdown_rx,
@@ -321,6 +323,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            pd_readiness: None,
         };
         // Bind is synchronous in `start`, so the port is already accepting.
         let rt = start(cfg).expect("start runtime");
@@ -361,6 +364,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            pd_readiness: None,
         };
         let rt = start(cfg).expect("start runtime");
 
@@ -406,6 +410,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            pd_readiness: None,
         };
         let rt = start(cfg).expect("start runtime");
 
@@ -467,6 +472,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            pd_readiness: None,
         };
         let err = match start(cfg) {
             Ok(_) => panic!("bind conflict must fail startup, got Ok"),
@@ -500,6 +506,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            pd_readiness: None,
         };
         let err = match start(cfg) {
             Ok(_) => panic!("an incomplete model_config must not boot, got Ok"),

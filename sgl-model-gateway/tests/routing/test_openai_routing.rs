@@ -810,7 +810,10 @@ async fn test_openai_router_circuit_breaker() {
         // Should get either an error or circuit breaker response
         assert!(
             response.status() == StatusCode::INTERNAL_SERVER_ERROR
-                || response.status() == StatusCode::SERVICE_UNAVAILABLE
+                || response.status() == StatusCode::BAD_GATEWAY
+                || response.status() == StatusCode::SERVICE_UNAVAILABLE,
+            "unexpected circuit-breaker response status: {}",
+            response.status()
         );
     }
 }

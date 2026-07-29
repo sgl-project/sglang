@@ -28,6 +28,7 @@ pub use executor::{
     NativeStageCommand, NativeStagePort, SourceExecutionRequest, SourceExecutor,
 };
 pub use fence::{
+    CudaEventQuery, CudaEventRuntime, CudaEventRuntimePort, CudaEventSourceFence,
     CudaHostFlushPort, DestinationVisibilityFence, GpuDirectFlushPort, NativeSafety,
     SourceComputeFence, evaluate_native_fence,
 };

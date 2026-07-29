@@ -29,7 +29,7 @@ use sgl_router::workers::WorkerRegistry;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -127,11 +127,13 @@ async fn shutdown_drains_100_inflight_streaming_chat_completions() {
     }))
     .unwrap();
 
+    let (ready_tx, mut ready_rx) = mpsc::channel(N);
     let mut handles = Vec::with_capacity(N);
     for i in 0..N {
         let c = client.clone();
         let u = url.clone();
         let b = body.clone();
+        let ready = ready_tx.clone();
         handles.push(tokio::spawn(async move {
             let resp = c
                 .post(&u)
@@ -143,6 +145,10 @@ async fn shutdown_drains_100_inflight_streaming_chat_completions() {
             if !resp.status().is_success() {
                 return Err(format!("client {i} non-2xx: {}", resp.status()));
             }
+            ready
+                .send(())
+                .await
+                .map_err(|_| format!("client {i} could not report readiness"))?;
             let bytes: Bytes = resp
                 .bytes()
                 .await
@@ -150,11 +156,21 @@ async fn shutdown_drains_100_inflight_streaming_chat_completions() {
             Ok::<Bytes, String>(bytes)
         }));
     }
+    drop(ready_tx);
 
-    // 4. Let every request grab a connection and start receiving data.
-    //    100 ms is past the first chunk delay (60 ms) for every stream
-    //    but well before the last chunk fires.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // 4. Wait until every request has received response headers. A fixed sleep
+    //    races listener scheduling under load and can shut down before the last
+    //    client attaches, which does not exercise graceful draining.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for _ in 0..N {
+            ready_rx
+                .recv()
+                .await
+                .expect("all client readiness senders remain live");
+        }
+    })
+    .await
+    .expect("all streaming clients attached before shutdown");
 
     // 5. Trigger shutdown. axum stops accepting new connections but
     //    MUST drain the 100 already-attached streams.

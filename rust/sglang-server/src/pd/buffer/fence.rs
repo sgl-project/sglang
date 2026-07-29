@@ -1,13 +1,115 @@
+use std::sync::Arc;
+
 use crate::mooncake::{BatchSnapshot, OperationState};
 use crate::pd::buffer::BufferError;
+use crate::pd::room::Clock;
 
 #[path = "fence_native.rs"]
 mod native;
 
-pub use native::CudaHostFlushPort;
+pub use native::{CudaEventRuntimePort, CudaHostFlushPort};
 
 pub trait SourceComputeFence: Send {
     fn wait_ready(&mut self, deadline_monotonic_ms: u64) -> Result<(), BufferError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CudaEventQuery {
+    Pending,
+    Ready,
+}
+
+/// Injectable boundary around the five CUDA Runtime calls needed by the
+/// source-compute fence. Implementations own no Python objects.
+pub trait CudaEventRuntime: Send {
+    type Event: Copy + Send;
+
+    fn set_device(&mut self, device: u32) -> Result<(), BufferError>;
+    fn create_event(&mut self) -> Result<Self::Event, BufferError>;
+    fn record_event(&mut self, event: Self::Event, stream: u64) -> Result<(), BufferError>;
+    fn query_event(&mut self, event: Self::Event) -> Result<CudaEventQuery, BufferError>;
+    fn destroy_event(&mut self, event: Self::Event);
+}
+
+/// Rust-owned CUDA event recorded on the Scheduler's current compute stream.
+///
+/// The opaque stream value is copied at the boundary. The event itself is
+/// created, recorded, queried, and destroyed entirely in Rust.
+pub struct CudaEventSourceFence<P>
+where
+    P: CudaEventRuntime,
+{
+    port: P,
+    event: Option<P::Event>,
+    clock: Arc<dyn Clock>,
+}
+
+impl<P> CudaEventSourceFence<P>
+where
+    P: CudaEventRuntime,
+{
+    pub fn new<C>(device: u32, stream: u64, mut port: P, clock: Arc<C>) -> Result<Self, BufferError>
+    where
+        C: Clock + 'static,
+    {
+        if !matches!(device, 4 | 5) {
+            return Err(BufferError::SourceFence);
+        }
+        port.set_device(device)
+            .map_err(|_| BufferError::SourceFence)?;
+        let event = port.create_event().map_err(|_| BufferError::SourceFence)?;
+        if port.record_event(event, stream).is_err() {
+            port.destroy_event(event);
+            return Err(BufferError::SourceFence);
+        }
+        Ok(Self {
+            port,
+            event: Some(event),
+            clock,
+        })
+    }
+}
+
+impl CudaEventSourceFence<CudaEventRuntimePort> {
+    pub fn production<C>(device: u32, stream: u64, clock: Arc<C>) -> Result<Self, BufferError>
+    where
+        C: Clock + 'static,
+    {
+        Self::new(device, stream, CudaEventRuntimePort::production()?, clock)
+    }
+}
+
+impl<P> SourceComputeFence for CudaEventSourceFence<P>
+where
+    P: CudaEventRuntime,
+{
+    fn wait_ready(&mut self, deadline_monotonic_ms: u64) -> Result<(), BufferError> {
+        let event = self.event.ok_or(BufferError::SourceFence)?;
+        loop {
+            if self.clock.now_monotonic_ms() >= deadline_monotonic_ms {
+                return Err(BufferError::SourceFence);
+            }
+            match self
+                .port
+                .query_event(event)
+                .map_err(|_| BufferError::SourceFence)?
+            {
+                CudaEventQuery::Ready => return Ok(()),
+                CudaEventQuery::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+}
+
+impl<P> Drop for CudaEventSourceFence<P>
+where
+    P: CudaEventRuntime,
+{
+    fn drop(&mut self) {
+        if let Some(event) = self.event.take() {
+            self.port.destroy_event(event);
+        }
+    }
 }
 
 pub trait GpuDirectFlushPort: Send {

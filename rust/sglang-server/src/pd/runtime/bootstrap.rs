@@ -175,18 +175,25 @@ impl PairConnection {
         &mut self,
         expected: MessageKind,
     ) -> Result<DecodedFrame, RuntimeError> {
-        let wait = deadline_for(expected, &self.profile);
+        let decoded = self.receive_next(expected).await?;
+        if decoded.header.kind != expected {
+            return Err(RuntimeError::UnexpectedMessage);
+        }
+        Ok(decoded)
+    }
+
+    pub async fn receive_next(
+        &mut self,
+        deadline_kind: MessageKind,
+    ) -> Result<DecodedFrame, RuntimeError> {
+        let wait = deadline_for(deadline_kind, &self.profile);
         let frame = timeout(
             Duration::from_millis(wait),
             read_raw_frame(&mut self.stream),
         )
         .await
         .map_err(|_| RuntimeError::Timeout)??;
-        let decoded = self.session.decode(&frame, self.clock.now_unix_ms())?;
-        if decoded.header.kind != expected {
-            return Err(RuntimeError::UnexpectedMessage);
-        }
-        Ok(decoded)
+        Ok(self.session.decode(&frame, self.clock.now_unix_ms())?)
     }
 }
 

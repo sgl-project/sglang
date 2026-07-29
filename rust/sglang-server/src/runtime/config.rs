@@ -3,6 +3,7 @@
 //! dump ([`ServerArgs`] / [`ModelConfig`]), and the [`RuntimeConfig`] pairing
 //! them for `runtime::start`.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -42,6 +43,8 @@ pub struct RuntimeConfig {
     /// config-endpoint metadata). `Arc` so cloning the config (and, downstream,
     /// each `AppState`) is cheap; immutable after construction.
     pub server_args: Arc<ServerArgs>,
+    /// Optional read-only PD snapshot; the frontend cannot stop its owner.
+    pub pd_readiness: Option<crate::pd::transport::PdReadinessHandle>,
 }
 
 impl Default for RuntimeConfig {
@@ -51,13 +54,15 @@ impl Default for RuntimeConfig {
             server_args: Arc::new(
                 ServerArgs::from_json("{}").expect("empty server_args blob parses"),
             ),
+            pd_readiness: None,
         }
     }
 }
 
 /// The scheduler's startup blob (`RustServer._build_server_args`) parsed once into
-/// typed fields: values are post-`__post_init__`, unknown keys (e.g. `api_key`) are dropped.
-#[derive(Debug, serde::Deserialize)]
+/// typed fields: values are post-`__post_init__`; security- and PD-relevant
+/// fields are retained explicitly and never surfaced by raw-dump endpoints.
+#[derive(serde::Deserialize)]
 pub struct ServerArgs {
     /// HF repo id / local dir of the model, reported by `/get_model_info`.
     #[serde(default)]
@@ -124,6 +129,59 @@ pub struct ServerArgs {
     pub version: Option<String>,
     #[serde(default)]
     pub max_total_num_tokens: Option<u64>,
+    /// Bearer token protecting business endpoints. Never rendered by Debug
+    /// logging or server-info responses.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_disaggregation_mode")]
+    pub disaggregation_mode: String,
+    #[serde(default)]
+    pub disaggregation_bootstrap_port: Option<u16>,
+    #[serde(default)]
+    pub pd_control_psk_file: Option<String>,
+}
+
+impl fmt::Debug for ServerArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServerArgs")
+            .field("model_path", &self.model_path)
+            .field("served_model_name", &self.served_model_name)
+            .field("tokenizer_path", &self.tokenizer_path)
+            .field("revision", &self.revision)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("log_level", &self.log_level)
+            .field("log_level_http", &self.log_level_http)
+            .field("tokenizer_worker_num", &self.tokenizer_worker_num)
+            .field("detokenizer_worker_num", &self.detokenizer_worker_num)
+            .field("skip_tokenizer_init", &self.skip_tokenizer_init)
+            .field(
+                "incremental_streaming_output",
+                &self.incremental_streaming_output,
+            )
+            .field("model_config", &self.model_config)
+            .field("preferred_sampling_params", &self.preferred_sampling_params)
+            .field("allow_auto_truncate", &self.allow_auto_truncate)
+            .field(
+                "enable_return_hidden_states",
+                &self.enable_return_hidden_states,
+            )
+            .field("num_reserved_tokens", &self.num_reserved_tokens)
+            .field("version", &self.version)
+            .field("max_total_num_tokens", &self.max_total_num_tokens)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("disaggregation_mode", &self.disaggregation_mode)
+            .field(
+                "disaggregation_bootstrap_port",
+                &self.disaggregation_bootstrap_port,
+            )
+            .field(
+                "pd_control_psk_file",
+                &self.pd_control_psk_file.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// The slice of the resolved Python `ModelConfig` the rust server reads.
@@ -152,6 +210,9 @@ fn default_log_level() -> String {
 fn default_worker_num() -> usize {
     1
 }
+fn default_disaggregation_mode() -> String {
+    "null".into()
+}
 
 impl ServerArgs {
     /// Parse the blob; errors on malformed JSON or a wrongly-typed field.
@@ -169,6 +230,29 @@ impl ServerArgs {
         }
         if self.model_config.vocab_size.is_none() {
             return Err("no resolvable vocab size (model_config.vocab_size)".into());
+        }
+        if self.api_key.as_deref() == Some("") {
+            return Err("api_key must not be empty".into());
+        }
+        if !matches!(
+            self.disaggregation_mode.as_str(),
+            "null" | "prefill" | "decode"
+        ) {
+            return Err("invalid disaggregation_mode".into());
+        }
+        if self.disaggregation_bootstrap_port == Some(0) {
+            return Err("disaggregation_bootstrap_port must be non-zero".into());
+        }
+        if self.disaggregation_mode == "prefill" && self.disaggregation_bootstrap_port.is_none() {
+            return Err("prefill mode requires disaggregation_bootstrap_port".into());
+        }
+        if self.disaggregation_mode != "null"
+            && self
+                .pd_control_psk_file
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            return Err("PD mode requires non-empty pd_control_psk_file".into());
         }
         Ok(())
     }
@@ -199,5 +283,69 @@ impl ServerArgs {
     pub fn api_worker_num(&self) -> usize {
         4.max(self.tokenizer_worker_num)
             .max(self.detokenizer_worker_num)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_pd_json(extra: &str) -> String {
+        format!(
+            r#"{{
+                "served_model_name": "model",
+                "model_config": {{"context_len": 1024, "vocab_size": 32000}},
+                "disaggregation_mode": "prefill",
+                "disaggregation_bootstrap_port": 8998,
+                "pd_control_psk_file": "/run/secrets/pd-control-psk",
+                "api_key": "client-secret"
+                {extra}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn debug_redacts_api_key_and_psk_path() {
+        let args = ServerArgs::from_json(&valid_pd_json("")).unwrap();
+        let debug = format!("{args:?}");
+        assert!(!debug.contains("client-secret"));
+        assert!(!debug.contains("/run/secrets/pd-control-psk"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn pd_config_requires_nonzero_prefill_port_and_nonempty_psk_path() {
+        let valid = ServerArgs::from_json(&valid_pd_json("")).unwrap();
+        assert!(valid.validate_mandatory().is_ok());
+
+        for invalid in [
+            r#"{
+                "served_model_name": "model",
+                "model_config": {"context_len": 1024, "vocab_size": 32000},
+                "disaggregation_mode": "prefill",
+                "pd_control_psk_file": "/run/secrets/pd-control-psk"
+            }"#,
+            r#"{
+                "served_model_name": "model",
+                "model_config": {"context_len": 1024, "vocab_size": 32000},
+                "disaggregation_mode": "prefill",
+                "disaggregation_bootstrap_port": 0,
+                "pd_control_psk_file": "/run/secrets/pd-control-psk"
+            }"#,
+            r#"{
+                "served_model_name": "model",
+                "model_config": {"context_len": 1024, "vocab_size": 32000},
+                "disaggregation_mode": "prefill",
+                "disaggregation_bootstrap_port": 8998,
+                "pd_control_psk_file": ""
+            }"#,
+        ] {
+            assert!(
+                ServerArgs::from_json(invalid)
+                    .unwrap()
+                    .validate_mandatory()
+                    .is_err()
+            );
+        }
     }
 }

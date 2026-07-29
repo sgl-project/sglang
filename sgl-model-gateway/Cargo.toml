@@ -11,6 +11,7 @@ edition = "2021"
 default = ["grpc-client"]
 grpc-client = []
 grpc-server = []
+pd-e2e-test-identity = []
 
 vendored-openssl = ["openssl/vendored"]
 

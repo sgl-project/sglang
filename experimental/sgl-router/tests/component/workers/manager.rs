@@ -7,9 +7,9 @@ use sgl_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, Worke
 use sgl_router::workers::{manager, WorkerRegistry};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// Spin up a tiny fake worker that returns `body` on `GET /server_info`.
 /// Returns the worker base URL and a shutdown channel.
@@ -46,6 +46,32 @@ fn spec_for(id: &str, url: &str, mode: WorkerMode) -> WorkerSpec {
         model_ids: Vec::new(),
         bootstrap_port: None,
     }
+}
+
+async fn wait_for_worker_count(
+    registry: &Arc<WorkerRegistry>,
+    model: &str,
+    mode: Option<WorkerMode>,
+    expected: usize,
+) {
+    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let model = ModelId(model.into());
+            let count = match mode {
+                Some(mode) => registry.workers_for_mode(&model, mode).len(),
+                None => registry.workers_for(&model).len(),
+            };
+            if count == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        observed.is_ok(),
+        "timed out waiting for {expected} workers for model {model} in mode {mode:?}"
+    );
 }
 
 #[tokio::test]
@@ -103,7 +129,7 @@ async fn manager_handles_mode_changed() {
     )))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_worker_count(&registry, "m", Some(WorkerMode::Prefill), 1).await;
     assert_eq!(
         registry
             .workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
@@ -117,7 +143,7 @@ async fn manager_handles_mode_changed() {
     })
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_worker_count(&registry, "m", Some(WorkerMode::Decode), 1).await;
     assert_eq!(
         registry
             .workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
@@ -150,7 +176,7 @@ async fn mode_changed_preserves_active_requests_and_breaker() {
     )))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_worker_count(&registry, "m", Some(WorkerMode::Prefill), 1).await;
 
     // Grab a handle, bump active_requests, and open the breaker.
     let w = registry.get(&WorkerId("w1".into())).unwrap();
@@ -172,7 +198,7 @@ async fn mode_changed_preserves_active_requests_and_breaker() {
     })
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_worker_count(&registry, "m", Some(WorkerMode::Decode), 1).await;
 
     // Re-fetch the Worker handle from the registry.
     let w_after = registry.get(&WorkerId("w1".into())).unwrap();
@@ -280,21 +306,30 @@ async fn manager_handles_duplicate_added_as_upsert() {
     )))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    drop(tx);
+    h.await.unwrap();
 
     assert_eq!(
         registry.workers_for(&ModelId("m1".into())).len(),
         1,
         "w1 still serves m1 after the second Added",
     );
+}
 
-    drop(tx);
-    h.await.unwrap();
+#[derive(Clone)]
+struct RegistrationGate {
+    entered: mpsc::UnboundedSender<()>,
+    release: watch::Receiver<bool>,
 }
 
 /// Spawn a fake worker whose `/server_info` returns `body` only after
 /// sleeping for `delay`. Returns the worker URL and a shutdown channel.
-async fn spawn_slow_worker(body: Value, delay: Duration) -> (String, oneshot::Sender<()>) {
+async fn spawn_slow_worker(
+    body: Value,
+    delay: Duration,
+    gate: Option<RegistrationGate>,
+) -> (String, oneshot::Sender<()>) {
     let body = Arc::new(body);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -302,7 +337,13 @@ async fn spawn_slow_worker(body: Value, delay: Duration) -> (String, oneshot::Se
         "/server_info",
         get(move || {
             let body = body.clone();
+            let gate = gate.clone();
             async move {
+                if let Some(gate) = gate {
+                    let _ = gate.entered.send(());
+                    let mut release = gate.release;
+                    let _ = release.wait_for(|released| *released).await;
+                }
                 tokio::time::sleep(delay).await;
                 Json((*body).clone())
             }
@@ -351,24 +392,34 @@ async fn spawn_counting_worker(body: Value) -> (String, Arc<AtomicUsize>, onesho
 }
 
 /// Registration must run in parallel across multiple `Added` events.
-/// Each fake worker delays its `/server_info` by 200ms; with sequential
-/// processing the manager would take ≥1000ms for 5 workers. We allow
-/// up to 600ms (3x the per-fetch delay) as a generous bound that still
-/// rejects the sequential implementation.
+/// Each fake worker blocks at a shared test gate after entering
+/// `/server_info`. All five must reach the gate before it is released;
+/// a sequential implementation can only reach one and times out.
 #[tokio::test]
 async fn added_events_run_in_parallel() {
-    let delay = Duration::from_millis(200);
     let n = 5;
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+    let (release_tx, release_rx) = watch::channel(false);
     let mut workers = Vec::new();
     for _ in 0..n {
-        workers.push(spawn_slow_worker(json!({"served_model_name": "m"}), delay).await);
+        workers.push(
+            spawn_slow_worker(
+                json!({"served_model_name": "m"}),
+                Duration::ZERO,
+                Some(RegistrationGate {
+                    entered: entered_tx.clone(),
+                    release: release_rx.clone(),
+                }),
+            )
+            .await,
+        );
     }
+    drop(entered_tx);
 
     let (tx, rx) = mpsc::channel(16);
     let registry = Arc::new(WorkerRegistry::default());
     let h = tokio::spawn(manager::run(rx, registry.clone()));
 
-    let start = Instant::now();
     for (i, (url, _s)) in workers.iter().enumerate() {
         tx.send(DiscoveryEvent::Added(spec_for(
             &format!("w{i}"),
@@ -378,6 +429,23 @@ async fn added_events_run_in_parallel() {
         .await
         .unwrap();
     }
+    let all_entered = tokio::time::timeout(Duration::from_secs(5), async {
+        for _ in 0..n {
+            entered_rx
+                .recv()
+                .await
+                .expect("registration gate senders remain live");
+        }
+    })
+    .await;
+    release_tx
+        .send(true)
+        .expect("registration gate receivers remain live");
+    assert!(
+        all_entered.is_ok(),
+        "all {n} /server_info calls must overlap before any response is released"
+    );
+
     let registered = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if registry.workers_for(&ModelId("m".into())).len() == n {
@@ -387,13 +455,7 @@ async fn added_events_run_in_parallel() {
         }
     })
     .await;
-    let elapsed = start.elapsed();
     assert!(registered.is_ok(), "manager failed to register {n} workers");
-    assert!(
-        elapsed < Duration::from_millis(600),
-        "registration of {n} workers took {elapsed:?}; sequential per-worker /server_info \
-         fetches would take ≥1000ms — parallel spawn is required"
-    );
 
     drop(tx);
     h.await.unwrap();
@@ -409,6 +471,7 @@ async fn removed_awaits_pending_added() {
     let (url, _s) = spawn_slow_worker(
         json!({"served_model_name": "m"}),
         Duration::from_millis(300),
+        None,
     )
     .await;
 

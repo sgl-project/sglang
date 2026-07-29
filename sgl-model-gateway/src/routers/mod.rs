@@ -90,6 +90,25 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
+    /// Raw `/generate` boundary. Non-PD routers retain the existing typed
+    /// protocol path; the PD router overrides this hook so text batches and
+    /// frozen internal identity fields never depend on the protocol crate.
+    async fn route_generate_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &serde_json::Value,
+        model_id: Option<&str>,
+    ) -> Response {
+        match serde_json::from_value::<GenerateRequest>(body.clone()) {
+            Ok(typed) => self.route_generate(headers, &typed, model_id).await,
+            Err(error) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid generate request: {error}"),
+            )
+                .into_response(),
+        }
+    }
+
     /// Route a chat completion request
     async fn route_chat(
         &self,

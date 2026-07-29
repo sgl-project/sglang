@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
     extract::State,
     extract::rejection::JsonRejection,
-    http::StatusCode,
+    http::{HeaderName, HeaderValue, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -31,7 +31,13 @@ use super::guard::AbortGuard;
 use super::submit::{pre_submit_error, submit};
 use crate::environ::env_bool;
 use crate::ids::Rid;
-use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams};
+use crate::message::{
+    EgressItem, FinishReason, GenerateBody, GenerateRequest, RequestKind, SamplingParams,
+};
+use crate::pd::protocol::Role;
+use crate::pd::request::PdPublicError;
+use crate::pd::room::PdReason;
+use crate::pd::runtime::RuntimeLifecycle;
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
@@ -132,8 +138,10 @@ async fn generate(
     State(state): State<AppState>,
     body: Result<Json<GenerateBody>, JsonRejection>,
 ) -> Response {
+    let pd_enabled = state.server_args.disaggregation_mode != "null";
     let body = match body {
         Ok(Json(body)) => body,
+        Err(_) if pd_enabled => return pd_error_response(PdReason::RequestInvalid),
         // A body that fails to parse has no readable `stream` flag, so this one
         // can only answer unary — as Python's does (FastAPI rejects before its
         // handler runs).
@@ -141,17 +149,33 @@ async fn generate(
             return pre_submit_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
         }
     };
-    let stream = body.stream;
+    if pd_enabled && let Err(reason) = body.validate_pd_support() {
+        return pd_error_response(reason);
+    }
+    // The PD Gateway fans one client request to both workers. Its Prefill side
+    // is an internal unary barrier: waiting for that terminal response lets the
+    // Gateway observe typed status/headers before it exposes Decode's SSE body.
+    // Decode (and ordinary non-PD requests) retain the client's stream choice.
+    let stream = backend_stream_mode(body.stream, &state.server_args.disaggregation_mode);
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form → the response is a JSON array.
-    let (payloads, is_batch) = match body.into_requests() {
+    let requests = if pd_enabled {
+        body.into_pd_requests()
+    } else {
+        body.into_requests()
+    };
+    let (payloads, is_batch) = match requests {
         Ok(v) => v,
+        Err(_) if pd_enabled => return pd_error_response(PdReason::RequestInvalid),
         // The error carries its own status (a bad batch is `Validation` → 400).
         Err(e) => {
             let code = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::BAD_REQUEST);
             return pre_submit_error(code, &e.to_string(), stream);
         }
     };
+    if pd_enabled && let Err(reason) = validate_pd_ingress(&state, &payloads) {
+        return pd_error_response(reason);
+    }
     if !is_batch {
         // `into_requests` guarantees exactly one payload for a non-batch body.
         let payload = payloads
@@ -164,9 +188,80 @@ async fn generate(
     }
 }
 
-/// Answer an error raised *before* anything was submitted, in the shape the client
-/// asked for.
-///
+fn backend_stream_mode(requested: bool, disaggregation_mode: &str) -> bool {
+    requested && disaggregation_mode != "prefill"
+}
+
+fn validate_pd_ingress(state: &AppState, requests: &[GenerateRequest]) -> Result<(), PdReason> {
+    if !(1..=8).contains(&requests.len()) {
+        return Err(PdReason::RequestInvalid);
+    }
+    let readiness = state
+        .pd_readiness
+        .as_ref()
+        .ok_or(PdReason::PeerUnavailable)?
+        .snapshot();
+    let expected_role = match state.server_args.disaggregation_mode.as_str() {
+        "prefill" => Role::Prefill,
+        "decode" => Role::Decode,
+        _ => return Err(PdReason::Unsupported),
+    };
+    if readiness.runtime.role != expected_role {
+        return Err(PdReason::Unsupported);
+    }
+    if readiness.runtime.lifecycle != RuntimeLifecycle::PairReady || !readiness.runtime.pair_ready {
+        return Err(PdReason::PeerUnavailable);
+    }
+
+    for request in requests {
+        let bootstrap = request
+            .pd_bootstrap
+            .as_ref()
+            .ok_or(PdReason::RequestInvalid)?;
+        if bootstrap.host != readiness.expected_bootstrap_host
+            || !readiness.allowed_bootstrap_ports.contains(&bootstrap.port)
+        {
+            return Err(PdReason::RequestInvalid);
+        }
+        if let Some(input_ids) = &request.input_ids
+            && !(1..=4096).contains(&input_ids.len())
+        {
+            return Err(PdReason::RequestInvalid);
+        }
+    }
+    Ok(())
+}
+
+fn pd_error_response(reason: PdReason) -> Response {
+    let error = PdPublicError::new(reason)
+        .expect("all non-success PdReason variants have a frozen public mapping");
+    let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut response = (status, Json(error.body())).into_response();
+    response.headers_mut().insert(
+        HeaderName::from_static("x-sglang-pd-reason"),
+        HeaderValue::from_static(error.reason()),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-sglang-retryable"),
+        HeaderValue::from_static(if error.retryable() { "true" } else { "false" }),
+    );
+    response
+}
+
+fn pd_error_value(reason: PdReason) -> serde_json::Value {
+    PdPublicError::new(reason)
+        .expect("all non-success PdReason variants have a frozen public mapping")
+        .body()
+}
+
+fn abort_pd_reason(finish_reason: &Option<FinishReason>) -> Option<PdReason> {
+    let code = finish_reason.as_ref()?.pd_reason_code()?;
+    match PdReason::from_code(code) {
+        Some(PdReason::Success) | None => Some(PdReason::ProtocolMismatch),
+        reason => reason,
+    }
+}
+
 /// A single (non-batched) `/generate`: submit one request, then either stream its
 /// SSE frames or fold to one unary response.
 async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -> Response {
@@ -194,11 +289,15 @@ async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -
     } else {
         // Unary: fold to the terminal, respond once. Disarm only on a real terminal
         // (a truncation leaves the guard armed so the scheduler work is aborted).
-        let (status, value, terminal) = drain_unary(&mut rx, rid_str.client_facing()).await;
+        let (status, value, terminal, pd_reason) =
+            drain_unary(&mut rx, rid_str.client_facing()).await;
         if terminal {
             guard.disarm(&rid_str);
         }
-        (status, Json(value)).into_response()
+        match pd_reason {
+            Some(reason) => pd_error_response(reason),
+            None => (status, Json(value)).into_response(),
+        }
     }
 }
 
@@ -207,7 +306,7 @@ async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -
 async fn drain_unary(
     rx: &mut mpsc::Receiver<EgressItem>,
     rid_str: &str,
-) -> (StatusCode, serde_json::Value, bool) {
+) -> (StatusCode, serde_json::Value, bool, Option<PdReason>) {
     let mut acc = OutputAccumulator::default();
     while let Some(item) = rx.recv().await {
         match item {
@@ -215,6 +314,13 @@ async fn drain_unary(
             EgressItem::Done(out) => {
                 acc.fold(&out);
                 let final_out = acc.into_output();
+                if let Some(reason) = abort_pd_reason(&final_out.finish_reason) {
+                    let error = PdPublicError::new(reason)
+                        .expect("typed Scheduler PD terminal cannot be success");
+                    let status = StatusCode::from_u16(error.status())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    return (status, error.body(), true, Some(reason));
+                }
                 // A validation abort carries its own HTTP status + diagnostic.
                 if let Some((code, message)) = final_out
                     .finish_reason
@@ -223,15 +329,18 @@ async fn drain_unary(
                 {
                     let status =
                         StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    return (status, error_value(code, message), true);
+                    return (status, error_value(code, message), true, None);
                 }
-                return (StatusCode::OK, frame_value(&final_out, rid_str), true);
+                return (StatusCode::OK, frame_value(&final_out, rid_str), true, None);
             }
             EgressItem::Error(e) => {
                 let code = e.http_status();
                 let status =
                     StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                return (status, error_value(code, &e.to_string()), true);
+                let pd_reason = e.pd_reason();
+                let value =
+                    pd_reason.map_or_else(|| error_value(code, &e.to_string()), pd_error_value);
+                return (status, value, true, pd_reason);
             }
             EgressItem::Control(_) => continue, // never on `/generate`
         }
@@ -242,6 +351,7 @@ async fn drain_unary(
         StatusCode::INTERNAL_SERVER_ERROR,
         error_value(500, "response truncated before completion"),
         false,
+        None,
     )
 }
 
@@ -282,7 +392,8 @@ async fn generate_batch(
         // Unary: drain each in order (already all submitted, so they run together).
         let mut results = Vec::with_capacity(receivers.len());
         for (rid_str, mut rx) in receivers {
-            let (_status, value, terminal) = drain_unary(&mut rx, rid_str.client_facing()).await;
+            let (_status, value, terminal, _pd_reason) =
+                drain_unary(&mut rx, rid_str.client_facing()).await;
             if terminal {
                 guard.disarm(&rid_str);
             }
@@ -371,14 +482,27 @@ fn generation_event_stream(
             }
 
             if let Some(e) = failed {
-                yield tag_value(error_value(e.http_status(), &e.to_string()), idx(i));
+                let value = e
+                    .pd_reason()
+                    .map_or_else(|| error_value(e.http_status(), &e.to_string()), pd_error_value);
+                yield tag_value(value, idx(i));
                 guard.disarm(&rid_strs[i]);
             } else if let Some(out) = terminal {
-                // A validation abort → an error object, not a frame. The final frame
-                // carries the full cumulative state, so any coalesced ones are moot.
-                yield match out.finish_reason.as_ref().and_then(|f| f.abort_status()) {
-                    Some((code, message)) => tag_value(error_value(code, message), idx(i)),
-                    None => stream_frame_string(out, &accs[i], incremental, rid_strs[i].client_facing(), idx(i)),
+                // A typed PD or validation abort → an error object, not a frame.
+                // The final frame carries the full cumulative state, so any
+                // coalesced ones are moot.
+                yield match abort_pd_reason(&out.finish_reason) {
+                    Some(reason) => tag_value(pd_error_value(reason), idx(i)),
+                    None => match out.finish_reason.as_ref().and_then(|f| f.abort_status()) {
+                        Some((code, message)) => tag_value(error_value(code, message), idx(i)),
+                        None => stream_frame_string(
+                            out,
+                            &accs[i],
+                            incremental,
+                            rid_strs[i].client_facing(),
+                            idx(i),
+                        ),
+                    },
                 };
                 guard.disarm(&rid_strs[i]); // terminal → not re-pushed
             } else {
@@ -428,8 +552,94 @@ mod tests {
             ..Default::default()
         })
     }
+
+    fn pd_done(rid: u64, reason: PdReason) -> EgressItem {
+        EgressItem::Done(ChunkEvent {
+            rid: Rid::from(rid.to_string()),
+            finish_reason: Some(
+                serde_json::from_value(serde_json::json!({
+                    "type": "abort",
+                    "message": "must not drive classification",
+                    "status_code": 500,
+                    "err_type": null,
+                    "pd_reason": reason.code(),
+                }))
+                .expect("PD finish reason must parse"),
+            ),
+            ..Default::default()
+        })
+    }
     fn parse(s: &str) -> serde_json::Value {
         serde_json::from_str(s).expect("frame is JSON")
+    }
+
+    #[test]
+    fn every_public_pd_error_has_typed_headers() {
+        let reasons = [
+            PdReason::RequestInvalid,
+            PdReason::Unsupported,
+            PdReason::CapacityExhausted,
+            PdReason::ProtocolMismatch,
+            PdReason::PeerUnavailable,
+            PdReason::RendezvousTimeout,
+            PdReason::TransferTimeout,
+            PdReason::TransferFailed,
+            PdReason::AckTimeout,
+            PdReason::Aborted,
+            PdReason::StaleEpoch,
+            PdReason::LocalFatal,
+        ];
+        for reason in reasons {
+            let response = pd_error_response(reason);
+            let public = PdPublicError::new(reason).unwrap();
+            assert_eq!(response.status().as_u16(), public.status(), "{reason:?}");
+            assert_eq!(
+                response.headers()["x-sglang-pd-reason"],
+                reason.code(),
+                "{reason:?}",
+            );
+            assert_eq!(
+                response.headers()["x-sglang-retryable"],
+                if reason.retryable() { "true" } else { "false" },
+                "{reason:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn prefill_backend_response_is_unary_even_for_streaming_client() {
+        assert!(!backend_stream_mode(true, "prefill"));
+        assert!(backend_stream_mode(true, "decode"));
+        assert!(backend_stream_mode(true, "null"));
+        assert!(!backend_stream_mode(false, "decode"));
+    }
+
+    #[test]
+    fn pd_abort_classifier_uses_only_the_typed_field_and_fails_closed() {
+        let finish = |value| Some(serde_json::from_value(value).expect("finish reason must parse"));
+        assert_eq!(
+            abort_pd_reason(&finish(serde_json::json!({
+                "type": "abort",
+                "message": "hostile PD_LOCAL_FATAL text",
+                "pd_reason": "PD_TRANSFER_TIMEOUT",
+            }))),
+            Some(PdReason::TransferTimeout),
+        );
+        assert_eq!(
+            abort_pd_reason(&finish(serde_json::json!({
+                "type": "abort",
+                "message": "PD_TRANSFER_TIMEOUT",
+            }))),
+            None,
+            "message text must not classify a PD failure",
+        );
+        assert_eq!(
+            abort_pd_reason(&finish(serde_json::json!({
+                "type": "abort",
+                "pd_reason": "PD_UNKNOWN",
+            }))),
+            Some(PdReason::ProtocolMismatch),
+        );
     }
 
     /// Two sub-requests' frames interleave into one stream, each tagged with its
@@ -495,6 +705,41 @@ mod tests {
         assert_eq!(v["index"], 1);
 
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn scheduler_pd_abort_is_typed_for_unary_and_sse() {
+        let (unary_tx, mut unary_rx) = mpsc::channel(1);
+        unary_tx
+            .send(pd_done(10, PdReason::TransferTimeout))
+            .await
+            .unwrap();
+        drop(unary_tx);
+        let (status, body, terminal, reason) = drain_unary(&mut unary_rx, "10").await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(terminal);
+        assert_eq!(reason, Some(PdReason::TransferTimeout));
+        assert_eq!(body, pd_error_value(PdReason::TransferTimeout));
+
+        let (stream_tx, stream_rx) = mpsc::channel(1);
+        let stream = generation_event_stream(
+            vec![(Rid::from("10"), stream_rx)],
+            AbortGuard::new_empty(senders()),
+            false,
+            false,
+        );
+        futures::pin_mut!(stream);
+        stream_tx
+            .send(pd_done(10, PdReason::TransferTimeout))
+            .await
+            .unwrap();
+        drop(stream_tx);
+        assert_eq!(
+            parse(&stream.next().await.unwrap()),
+            pd_error_value(PdReason::TransferTimeout),
+        );
+        assert_eq!(stream.next().await.unwrap(), "[DONE]");
+        assert!(stream.next().await.is_none());
     }
 
     /// `incremental=true`: each frame carries this step's **delta** text/output_ids,

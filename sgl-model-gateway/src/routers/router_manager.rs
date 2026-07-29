@@ -524,6 +524,33 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn route_generate_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &Value,
+        model_id: Option<&str>,
+    ) -> Response {
+        let effective_model_id = if self.enable_igw {
+            match self.resolve_model_id(model_id) {
+                Ok(id) => Some(id),
+                Err(err_response) => return *err_response,
+            }
+        } else {
+            None
+        };
+        let model_id = effective_model_id.as_deref().or(model_id);
+        let router = self.select_router_for_request(headers, model_id);
+        if let Some(router) = router {
+            router.route_generate_raw(headers, body, model_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for this request",
+            )
+                .into_response()
+        }
+    }
+
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,

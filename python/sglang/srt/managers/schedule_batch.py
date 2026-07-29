@@ -202,19 +202,23 @@ class FINISH_LENGTH(BaseFinishReason):
 
 
 class FINISH_ABORT(BaseFinishReason):
-    def __init__(self, message=None, status_code=None, err_type=None):
+    def __init__(self, message=None, status_code=None, err_type=None, pd_reason=None):
         super().__init__()
         self.message = message or "Aborted"
         self.status_code = status_code
         self.err_type = err_type
+        self.pd_reason = pd_reason
 
     def to_json(self):
-        return {
+        result = {
             "type": "abort",
             "message": self.message,
             "status_code": self.status_code,
             "err_type": self.err_type,
         }
+        if self.pd_reason is not None:
+            result["pd_reason"] = self.pd_reason
+        return result
 
 
 class Modality(Enum):
@@ -741,6 +745,7 @@ class Req(ReqDllmMixin):
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        pd_sidecar: Optional[Dict[str, Any]] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
@@ -1046,6 +1051,7 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        self.pd_sidecar: Optional[Dict[str, Any]] = pd_sidecar
         # Decode-local: the already-emitted boundary token to replay when a
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.

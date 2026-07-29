@@ -94,6 +94,18 @@ fn destination_flushes_before_reads_clears_all_regions_and_commits_once_after_ac
             .expect("duplicate handoff"),
         TransitionResult::AlreadyApplied
     );
+    let completion = destination
+        .consume_after_ack(identity)
+        .expect("consume validated completion")
+        .expect("first consume returns the result");
+    assert!(completion.aux.first_token_valid);
+    assert_eq!(completion.aux.first_token_id, 42);
+    assert_eq!(
+        destination
+            .consume_after_ack(identity)
+            .expect("duplicate consume is stable"),
+        None
+    );
     fixture
         .ledger
         .release_source_safe(fixture.handle)

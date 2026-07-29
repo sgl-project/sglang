@@ -172,8 +172,7 @@ class PrefillBootstrapQueue:
             if server_args.enable_prefill_context_parallel:
                 # CP rewrites index_slice per rank, breaking the chunk grid.
                 raise RuntimeError(
-                    "SGLANG_DISAGG_STAGING_BUFFER does not support "
-                    "prefill context parallelism."
+                    "SGLANG_DISAGG_STAGING_BUFFER does not support prefill context parallelism."
                 )
         self.kv_manager = self._init_kv_manager()
 
@@ -489,6 +488,8 @@ class SchedulerDisaggregationPrefillMixin:
         finalizes optimistic requests whose bootstrap completed so they skip
         the post-forward bootstrap check.
         """
+        if self.rust_pd_adapter is not None:
+            return
         candidates = [req for req in self.waiting_queue if not is_aborted(req)]
         if not candidates:
             return
@@ -557,9 +558,12 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
-            self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            if self.rust_pd_adapter is not None:
+                self.waiting_queue.extend(self.rust_pd_adapter.flush_pending())
+            else:
+                self.waiting_queue.extend(
+                    self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                )
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -596,9 +600,12 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
-            self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            if self.rust_pd_adapter is not None:
+                self.waiting_queue.extend(self.rust_pd_adapter.flush_pending())
+            else:
+                self.waiting_queue.extend(
+                    self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                )
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -647,6 +654,8 @@ class SchedulerDisaggregationPrefillMixin:
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         Adapted from process_batch_result_prefill
         """
+        if self.rust_pd_adapter is not None:
+            return self.process_batch_result_rust_pd_prefill(batch, result)
         (
             logits_output,
             next_token_ids,
@@ -809,6 +818,73 @@ class SchedulerDisaggregationPrefillMixin:
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
+    def process_batch_result_rust_pd_prefill(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        """Submit one Rust-owned transfer after the real prefill forward."""
+
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+        next_token_ids = result.next_token_ids.tolist()
+        if len(next_token_ids) != len(batch.reqs):
+            raise RuntimeError("PD_PROTOCOL_MISMATCH")
+
+        transfer_bytes = []
+        for request, next_token_id in zip(batch.reqs, next_token_ids, strict=True):
+            if request.inflight_middle_chunks > 0:
+                raise RuntimeError("PD_UNSUPPORTED")
+            # TpWorker supplies a shape-preserving dummy zero for prefill-only
+            # requests. It is not a sampled token and must not enter aux-v1 or
+            # the Prefill response when max_new_tokens is zero.
+            if request.sampling_params.max_new_tokens != 0:
+                request.output_ids.append(int(next_token_id))
+            maybe_cache_unfinished_req(request, self.tree_cache)
+            # Each valid token contributes one 2 KiB row in each of the frozen
+            # 56 K/V regions; partial-page tails are never transferred.
+            transfer_bytes.append(len(request.origin_input_ids) * 56 * 2_048)
+            request.time_stats.set_prefill_finished_time()
+            request.time_stats.set_prefill_transfer_queue_entry_time()
+
+        self.rust_pd_adapter.sender_send_chunks(batch.reqs, transfer_bytes)
+        self.rust_pd_adapter.add_prefill_inflight(batch.reqs)
+        self.metrics_reporter.report_prefill_stats(
+            batch=batch,
+            prefill_stats=batch.prefill_stats,
+            can_run_cuda_graph=result.can_run_cuda_graph,
+            dp_cooperation_info=batch.dp_cooperation_info,
+        )
+
+    def process_rust_pd_prefill_inflight(self: Scheduler) -> List[Req]:
+        completed, failures = self.rust_pd_adapter.poll_inflight()
+        terminal = [*completed, *(request for request, _ in failures)]
+        for request in completed:
+            release_kv_cache(request, self.tree_cache)
+            if not isinstance(request.finished_reason, FINISH_ABORT):
+                request.finished_reason = FINISH_LENGTH(length=0)
+            request.time_stats.set_prefill_kv_transfer_finish_time()
+            request.time_stats.set_completion_time()
+
+        for request, result in failures:
+            release_kv_cache(request, self.tree_cache)
+            prepare_abort(
+                request,
+                result.pd_reason,
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                pd_reason=result.pd_reason,
+            )
+            request.time_stats.set_completion_time()
+
+        if terminal:
+            self.output_streamer.stream_output(
+                terminal,
+                any(request.return_logprob for request in terminal),
+                None,
+            )
+            self.rust_pd_adapter.clear_terminal(terminal)
+        return terminal
+
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
@@ -816,6 +892,8 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
+        if self.rust_pd_adapter is not None:
+            return self.process_rust_pd_prefill_inflight()
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
@@ -920,10 +998,7 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler, req: Req
     ) -> Optional[Exception]:
         """Conclude an inflight request whose KV transfer failed."""
-        error_message = (
-            f"Prefill transfer failed for request rank={self.ps.tp_rank} "
-            f"{req.rid=} {req.bootstrap_room=}"
-        )
+        error_message = f"Prefill transfer failed for request rank={self.ps.tp_rank} {req.rid=} {req.bootstrap_room=}"
         exc: Optional[Exception] = None
         try:
             req.disagg_kv_sender.failure_exception()
@@ -964,10 +1039,7 @@ class SchedulerDisaggregationPrefillMixin:
         return transferred_rids
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
-        error_message = (
-            f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
-            f"{req.rid=} {req.bootstrap_room=}"
-        )
+        error_message = f"Prefill bootstrap failed for request rank={self.ps.tp_rank} {req.rid=} {req.bootstrap_room=}"
         is_propagated = False
         try:
             req.disagg_kv_sender.failure_exception()
@@ -1253,8 +1325,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.time_stats.reset_prefill_retry_time()
         if req.prefill_attempt_count >= max_attempts:
             logger.info(
-                f"Req {req.rid} exhausted optimistic prefill attempts "
-                "falling back to bootstrap queue"
+                f"Req {req.rid} exhausted optimistic prefill attempts falling back to bootstrap queue"
             )
             # Reset it so the next real bootstrap done can be recorded.
             req.time_stats.bootstrap_done_time = 0.0
@@ -1262,8 +1333,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             req.prefill_attempt_count += 1
             logger.info(
-                f"Req {req.rid} optimistic prefill yielded "
-                f"({req.prefill_attempt_count}/{max_attempts} attempts used)"
+                f"Req {req.rid} optimistic prefill yielded ({req.prefill_attempt_count}/{max_attempts} attempts used)"
             )
             if self.metrics_reporter.enable_metrics:
                 self.metrics_collector.increment_prefill_retries(1)

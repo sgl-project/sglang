@@ -31,6 +31,10 @@ use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 
+use crate::pd::python::{
+    PyPdBatchItem, PyPdPollResult, PyPdReadinessHandle, PyPdReadinessSnapshot,
+    PyPdResourceSnapshot, PyPdTransport,
+};
 use crate::runtime::{Runtime, RuntimeConfig};
 
 /// Columnar ingress batch handed to Python by [`Server::recv_requests`].
@@ -51,6 +55,7 @@ struct IngressBatch {
 #[pyclass]
 struct Server {
     rt: Runtime,
+    _pd_readiness: Option<crate::pd::transport::PdReadinessHandle>,
 }
 
 #[pymethods]
@@ -63,6 +68,7 @@ impl Server {
         egress_ring_cap = 8192,
         channel_cap = 8192,
         cores = None,
+        pd_readiness = None,
 
         server_args_json = "{}",
     ))]
@@ -75,6 +81,7 @@ impl Server {
         egress_ring_cap: usize,
         channel_cap: usize,
         cores: Option<Vec<usize>>,
+        pd_readiness: Option<PyRef<'_, PyPdReadinessHandle>>,
         server_args_json: &str,
     ) -> PyResult<Self> {
         // Static server metadata (server_args + model_config) dumped by the
@@ -89,6 +96,11 @@ impl Server {
         server_args.validate_mandatory().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("server_args: {e}"))
         })?;
+        if server_args.disaggregation_mode != "null" && pd_readiness.is_none() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "server_args: PD mode requires a started PdTransport readiness handle",
+            ));
+        }
         // The HTTP listen address, tokenizer source/threads/shards all live in the
         // `server_args` blob; resolve them from there so the scheduler doesn't
         // re-pass them. The explicit params stay as optional overrides for
@@ -111,11 +123,15 @@ impl Server {
                 cores,
             },
             server_args: std::sync::Arc::new(server_args),
+            pd_readiness: pd_readiness.as_ref().map(|handle| handle.inner.clone()),
         };
         let rt = runtime::start(cfg).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("runtime start failed: {e}"))
         })?;
-        Ok(Server { rt })
+        Ok(Server {
+            rt,
+            _pd_readiness: pd_readiness.map(|handle| handle.inner.clone()),
+        })
     }
 
     /// Non-blocking drain of the ingress ring, returned **columnar** as an
@@ -248,5 +264,11 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .try_init();
     m.add_class::<Server>()?;
     m.add_class::<IngressBatch>()?;
+    m.add_class::<PyPdTransport>()?;
+    m.add_class::<PyPdReadinessHandle>()?;
+    m.add_class::<PyPdReadinessSnapshot>()?;
+    m.add_class::<PyPdResourceSnapshot>()?;
+    m.add_class::<PyPdBatchItem>()?;
+    m.add_class::<PyPdPollResult>()?;
     Ok(())
 }

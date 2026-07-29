@@ -3,12 +3,14 @@
 //! `/generate` submits a `Request` then awaits one `Done` (unary) or relays SSE
 //! frames (`data: {json}` … `[DONE]`), byte-compatible with Python
 //! `http_server.generate_request`; `/server_info` reuses it for one control result.
+mod auth;
 mod common;
 mod frame;
 mod guard;
 mod log;
 mod native_api;
 mod openai;
+mod readiness;
 mod submit;
 
 use std::sync::Arc;
@@ -28,6 +30,7 @@ struct AppState {
     server_args: Arc<ServerArgs>,
     /// Egress heartbeat (bumped per drained ring frame).
     egress_activity: ActivityCounter,
+    pd_readiness: Option<crate::pd::transport::PdReadinessHandle>,
 }
 
 pub async fn serve(
@@ -35,6 +38,7 @@ pub async fn serve(
     senders: Senders,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
+    pd_readiness: Option<crate::pd::transport::PdReadinessHandle>,
     egress_activity: ActivityCounter,
     // The SAME set ingress releases from — see `Ingress::on_abort`. Constructing a
     // local one here would leave the api server admitting rids that nothing ever
@@ -46,19 +50,19 @@ pub async fn serve(
         egress_buf,
         server_args: server_args.clone(),
         egress_activity,
+        pd_readiness,
     };
     // Each endpoint module registers its own routes and merges here.
     let app = Router::new()
         .merge(common::routes())
         .merge(native_api::routes())
         .merge(openai::routes())
-        // TODO(auth): no API-key boundary yet. Python gates every route (except
-        // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,
-        // a configured `api_key` does NOT protect these routes.
+        .merge(readiness::routes())
         //
         // No body limit, matching the Python server.
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state);
+    let app = auth::apply(app, &server_args);
     let app = log::apply(app, &server_args);
 
     // The listener was already bound synchronously in `runtime::start` (so a port

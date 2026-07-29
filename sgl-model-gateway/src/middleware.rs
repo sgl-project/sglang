@@ -117,34 +117,24 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Result<Response, StatusCode> {
     if let Some(expected_key) = &auth_config.api_key {
-        // Extract Authorization header
         let auth_header = request
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok());
-
-        match auth_header {
-            Some(header_value) if header_value.starts_with("Bearer ") => {
-                let token = &header_value[7..]; // Skip "Bearer "
-                                                // Use constant-time comparison to prevent timing attacks
-                let token_bytes = token.as_bytes();
-                let expected_bytes = expected_key.as_bytes();
-
-                // Check if lengths match first (this is not constant-time but necessary)
-                if token_bytes.len() != expected_bytes.len() {
-                    return Err(StatusCode::UNAUTHORIZED);
-                }
-
-                // Constant-time comparison of the actual values
-                if token_bytes.ct_eq(expected_bytes).unwrap_u8() != 1 {
-                    return Err(StatusCode::UNAUTHORIZED);
-                }
-            }
-            _ => return Err(StatusCode::UNAUTHORIZED),
+        if !is_api_key_authorized(auth_header, expected_key) {
+            return Err(StatusCode::UNAUTHORIZED);
         }
     }
 
     Ok(next.run(request).await)
+}
+
+fn is_api_key_authorized(authorization: Option<&str>, expected_key: &str) -> bool {
+    let Some((scheme, token)) = authorization.and_then(|value| value.split_once(' ')) else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("bearer")
+        && token.as_bytes().ct_eq(expected_key.as_bytes()).unwrap_u8() == 1
 }
 
 /// Alphanumeric characters for request ID generation (as bytes for O(1) indexing)
@@ -982,6 +972,15 @@ pub async fn wasm_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_key_auth_matches_python_bearer_semantics() {
+        assert!(!is_api_key_authorized(None, "secret"));
+        assert!(!is_api_key_authorized(Some("Basic secret"), "secret"));
+        assert!(!is_api_key_authorized(Some("Bearer wrong"), "secret"));
+        assert!(is_api_key_authorized(Some("Bearer secret"), "secret"));
+        assert!(is_api_key_authorized(Some("bEaReR secret"), "secret"));
+    }
 
     #[test]
     fn test_normalize_path_no_ids() {

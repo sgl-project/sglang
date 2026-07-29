@@ -835,6 +835,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Versioned Rust-PD identity/digest map. Kept as one sidecar field so future
+    # contract additions do not continue expanding the top-level IPC schema.
+    pd_sidecar: Optional[Dict[str, Any]] = None
+
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     # See GenerateReqInput.routed_experts_start_len.

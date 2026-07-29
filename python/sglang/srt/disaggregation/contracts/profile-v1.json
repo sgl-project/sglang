@@ -1,0 +1,120 @@
+{
+  "profile_version": 1,
+  "control": {
+    "magic": "SGPD",
+    "schema_major": 1,
+    "schema_minor": 0,
+    "max_payload_bytes": 524288
+  },
+  "security": {
+    "mac": "hmac-sha256",
+    "kdf": "hkdf-sha256",
+    "psk_bytes": 32,
+    "nonce_bytes": 32,
+    "session_key_bytes": 32,
+    "tag_bytes": 32,
+    "psk_id_bytes": 8
+  },
+  "topology": {
+    "host_count": 1,
+    "prefill_ranks": 1,
+    "decode_ranks": 1,
+    "tp": 1,
+    "pp": 1,
+    "dp": 1,
+    "prefill_gpu": 4,
+    "decode_gpu": 5
+  },
+  "platform": {
+    "os": "linux",
+    "arch": "x86_64",
+    "distribution": "ubuntu",
+    "distribution_version": "22.04",
+    "gpu": "NVIDIA A800-SXM4-80GB",
+    "sm": 80,
+    "cuda": "13.2"
+  },
+  "model": {
+    "architecture": "Qwen3ForCausalLM",
+    "dtype": "bf16",
+    "quantization": "none",
+    "attention": "gqa",
+    "state": "kv",
+    "layers": 28,
+    "attention_heads": 16,
+    "kv_heads": 8,
+    "head_dimension": 128,
+    "kv_layout": "nhd",
+    "region_layout": "layer-major-separate-kv",
+    "page_size_tokens": 64,
+    "kernel": "flashinfer",
+    "enabled_runtime_features": []
+  },
+  "request": {
+    "endpoint": "/generate",
+    "input_kinds": [
+      "input_ids",
+      "text"
+    ],
+    "batch_min": 1,
+    "batch_max": 8,
+    "input_tokens_min": 1,
+    "input_tokens_max": 4096,
+    "max_new_tokens_min": 0,
+    "max_new_tokens_max": 256,
+    "n": 1,
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "min_p": 0.0,
+    "features": [
+      "ignore_eos",
+      "penalties",
+      "stop_regex",
+      "stop_string",
+      "stop_token_ids"
+    ]
+  },
+  "transport": {
+    "backend": "mooncake",
+    "version": "0.3.11.post1",
+    "commit": "e9c61075720039bcfc5fffd19f847608402be3d0",
+    "header_sha256": "1c128925bc63839fca0fce3cfacd84a400f10a7891bdf9fa86840261ee6e299d",
+    "components": [
+      "p2p_handshake",
+      "rdma"
+    ],
+    "auto_discover": false,
+    "fallback_allowed": false,
+    "rdma_devices": [
+      "mlx5_1",
+      "mlx5_2",
+      "mlx5_3",
+      "mlx5_4"
+    ],
+    "gpudirect_host_flush_required": true
+  },
+  "capacity": {
+    "active_rooms_per_pair": 32,
+    "native_transfers_per_pair": 4,
+    "kv_pages_per_room": 64,
+    "leased_kv_pages_per_endpoint": 2048,
+    "aux_slots_per_endpoint": 32,
+    "completion_slots_per_endpoint": 32,
+    "request_slots_per_endpoint": 32,
+    "pending_transfer_bytes_per_pair": 2147483648,
+    "tombstones_per_pair": 4096
+  },
+  "deadline_ms": {
+    "local_initialization": 60000,
+    "connect_and_hello": 30000,
+    "room_rendezvous": 300000,
+    "destination_allocation": 30000,
+    "native_transfer": 60000,
+    "completion_ack": 10000,
+    "abort_ack": 10000,
+    "heartbeat_interval": 5000,
+    "heartbeat_misses": 2,
+    "tombstone_retention": 300000
+  }
+}

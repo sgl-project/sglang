@@ -159,6 +159,10 @@ impl DataPlaneWorker {
             Err(TrySendError::Disconnected(_)) => Err(BufferError::NativeTransfer),
         }
     }
+
+    pub fn pending_count(&self) -> usize {
+        self.commands.len()
+    }
 }
 
 pub struct DataPlaneWorkerTicket {

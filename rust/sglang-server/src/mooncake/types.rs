@@ -145,6 +145,12 @@ impl PinnedMemory {
         Ok(memory)
     }
 
+    pub(crate) fn borrowed(address: u64, length: usize) -> Result<Self, EngineError> {
+        Ok(Self {
+            inner: NativeMemory::borrowed_pinned(address, length)?,
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.inner.len()
     }
@@ -189,6 +195,15 @@ impl CudaMemory {
         let memory = Self::new(device, bytes.len())?;
         memory.write(0, bytes)?;
         Ok(memory)
+    }
+
+    pub(crate) fn borrowed(device: u32, address: u64, length: usize) -> Result<Self, EngineError> {
+        if !matches!(device, 4 | 5) {
+            return Err(EngineError::UnsupportedGpu { device });
+        }
+        Ok(Self {
+            inner: NativeMemory::borrowed_cuda(device, address, length)?,
+        })
     }
 
     pub fn device(&self) -> u32 {
@@ -247,6 +262,30 @@ impl MemoryBuffer {
             Self::Host(memory) => memory.address(),
             Self::Pinned(memory) => memory.address(),
             Self::Cuda(memory) => memory.address(),
+        }
+    }
+
+    pub(crate) fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), EngineError> {
+        match self {
+            Self::Host(memory) => memory.write(offset, bytes),
+            Self::Pinned(memory) => memory.write(offset, bytes),
+            Self::Cuda(memory) => memory.write(offset, bytes),
+        }
+    }
+
+    pub(crate) fn read(&self, offset: usize, length: usize) -> Result<Vec<u8>, EngineError> {
+        match self {
+            Self::Host(memory) => memory.read(offset, length),
+            Self::Pinned(memory) => memory.read(offset, length),
+            Self::Cuda(memory) => memory.read(offset, length),
+        }
+    }
+
+    pub(crate) fn fill(&self, value: u8) -> Result<(), EngineError> {
+        match self {
+            Self::Host(memory) => memory.fill(value),
+            Self::Pinned(memory) => memory.fill(value),
+            Self::Cuda(memory) => memory.fill(value),
         }
     }
 }

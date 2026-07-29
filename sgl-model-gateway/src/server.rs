@@ -44,7 +44,6 @@ use crate::{
         classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
-        generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::V1RerankReqInput,
         responses::{ResponsesGetParams, ResponsesRequest},
@@ -172,12 +171,12 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
 async fn generate(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<GenerateRequest>,
+    Json(body): Json<Value>,
 ) -> Response {
-    let model_id = body.model.as_deref();
+    let model_id = body.get("model").and_then(Value::as_str);
     state
         .router
-        .route_generate(Some(&headers), &body, model_id)
+        .route_generate_raw(Some(&headers), &body, model_id)
         .await
 }
 

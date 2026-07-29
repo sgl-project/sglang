@@ -58,8 +58,19 @@ pub struct BatchRequestWithBootstrap<'a, T: Serialize> {
 
 /// Generate a random bootstrap room ID.
 pub fn generate_room_id() -> u64 {
+    #[cfg(feature = "pd-e2e-test-identity")]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_ROOM: AtomicU64 = AtomicU64::new(0);
+        NEXT_ROOM.fetch_add(1, Ordering::Relaxed) & (i64::MAX as u64)
+    }
+
+    #[cfg(not(feature = "pd-e2e-test-identity"))]
     // Generate a value in the range [0, 2^63 - 1] to match Python's random.randint(0, 2**63 - 1)
-    rand::random::<u64>() & (i64::MAX as u64)
+    {
+        rand::random::<u64>() & (i64::MAX as u64)
+    }
 }
 
 /// PD-specific routing policies.

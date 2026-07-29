@@ -21,6 +21,7 @@ use bytes::Bytes;
 
 use crate::error::Error;
 use crate::fsm::{Event, RequestState, ValidationOutcome};
+use crate::ids::HEALTH_CHECK_RID_PREFIX;
 
 use crate::message::{
     AbortReq, ControlRequest, DetokMsg, EgressItem, GenerateRequest, IngressMsg, Request,
@@ -41,6 +42,7 @@ pub struct Ingress {
     senders: Senders,
     ingress: IngressProducer,
     limits: Limits,
+    pd_readiness: Option<crate::pd::transport::PdReadinessHandle>,
     shutdown: flume::Receiver<()>,
 }
 
@@ -104,6 +106,7 @@ impl Ingress {
         senders: Senders,
         ingress: IngressProducer,
         limits: Limits,
+        pd_readiness: Option<crate::pd::transport::PdReadinessHandle>,
         shutdown: flume::Receiver<()>,
     ) -> Self {
         Self {
@@ -112,6 +115,7 @@ impl Ingress {
             senders,
             ingress,
             limits,
+            pd_readiness,
             shutdown,
         }
     }
@@ -284,6 +288,20 @@ impl Ingress {
                 }
                 // Push the wire message (control frame or generate payload) to the ring.
                 RequestState::Queued => {
+                    if let RequestKind::Generate(generate) = &mut req.kind {
+                        let is_health_check = generate
+                            .rid
+                            .as_str()
+                            .strip_prefix(HEALTH_CHECK_RID_PREFIX)
+                            .is_some_and(|suffix| suffix.starts_with('_'));
+                        if !is_health_check
+                            && let Err(reason) =
+                                generate.bind_pd_sidecar(self.pd_readiness.as_ref())
+                        {
+                            let _ = req.state.apply(Event::Error(Error::Pd(reason)));
+                            continue;
+                        }
+                    }
                     // `matches!` reads the discriminant without holding a borrow,
                     // so `req` can be moved into the push below.
                     if matches!(req.kind, RequestKind::Generate(_)) {
@@ -567,9 +585,17 @@ fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Er
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
     use super::*;
     use crate::fsm::RequestState;
     use crate::message::{EgressSink, GenerateRequest, SamplingParams};
+    use crate::pd::config::PdProfileV1;
+    use crate::pd::protocol::{FixedBytes, Role};
+    use crate::pd::room::{ManualClock, ProcessEpoch, RegistrationEpoch};
+    use crate::pd::runtime::RuntimeIdentity;
+    use crate::pd::transport::{PdReadinessHandle, PdTransportCore};
     use crate::ring::{IngressConsumer, ingress_ring};
     use tokio::sync::mpsc;
 
@@ -584,6 +610,19 @@ mod tests {
         make_ingress_with(test_limits())
     }
 
+    fn make_ingress_with_readiness(
+        pd_readiness: Option<PdReadinessHandle>,
+    ) -> (
+        Ingress,
+        flume::Receiver<DetokMsg>,
+        IngressConsumer,
+        flume::Sender<TmEvent>,
+    ) {
+        let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
+        std::mem::forget(abort_tx);
+        make_ingress_inner(test_limits(), abort_rx, pd_readiness)
+    }
+
     fn make_ingress_with_abort(
         abort_rx: flume::Receiver<AbortSource>,
     ) -> (
@@ -592,7 +631,7 @@ mod tests {
         IngressConsumer,
         flume::Sender<TmEvent>,
     ) {
-        make_ingress_inner(test_limits(), abort_rx)
+        make_ingress_inner(test_limits(), abort_rx, None)
     }
 
     fn make_ingress_with(
@@ -605,12 +644,13 @@ mod tests {
     ) {
         let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
         std::mem::forget(abort_tx); // keep the lane open; tests end by dropping tm_tx
-        make_ingress_inner(limits, abort_rx)
+        make_ingress_inner(limits, abort_rx, None)
     }
 
     fn make_ingress_inner(
         limits: Limits,
         abort_rx: flume::Receiver<AbortSource>,
+        pd_readiness: Option<PdReadinessHandle>,
     ) -> (
         Ingress,
         flume::Receiver<DetokMsg>,
@@ -631,7 +671,15 @@ mod tests {
         // end `run` by dropping `tm_tx`, not by shutdown.
         let (sd_tx, sd_rx) = flume::unbounded::<()>();
         std::mem::forget(sd_tx);
-        let ingress = Ingress::new(tm_rx, abort_rx, senders, ingress_producer, limits, sd_rx);
+        let ingress = Ingress::new(
+            tm_rx,
+            abort_rx,
+            senders,
+            ingress_producer,
+            limits,
+            pd_readiness,
+            sd_rx,
+        );
         (ingress, detok_rx, consumer, tm_tx)
     }
 
@@ -665,6 +713,7 @@ mod tests {
                 },
                 ingress_producer,
                 test_limits(),
+                None,
                 sd_rx,
             );
 
@@ -702,6 +751,32 @@ mod tests {
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
         }
+    }
+
+    fn test_epoch(fill: u8) -> [u8; 16] {
+        let mut bytes = [fill; 16];
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        bytes
+    }
+
+    fn pd_readiness() -> PdReadinessHandle {
+        let identity = RuntimeIdentity::new(
+            Role::Prefill,
+            ProcessEpoch::from_bytes(test_epoch(0x11)).unwrap(),
+            RegistrationEpoch::from_bytes(test_epoch(0x22)).unwrap(),
+            FixedBytes::new([0x11; 32]),
+            FixedBytes::new([0x22; 32]),
+            FixedBytes::new([0x33; 32]),
+            FixedBytes::new([0x44; 32]),
+            "127.0.0.1".to_string(),
+            BTreeSet::from([8998]),
+            Arc::new(PdProfileV1::load_embedded().unwrap()),
+        )
+        .unwrap();
+        PdTransportCore::new(identity, Arc::new(ManualClock::new(1_000)))
+            .unwrap()
+            .readiness()
     }
 
     fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
@@ -967,7 +1042,15 @@ mod tests {
         let (_tm_tx, tm_rx) = flume::unbounded();
         let (sd_tx, sd_rx) = flume::unbounded::<()>();
         std::mem::forget(sd_tx);
-        let ingress = Ingress::new(tm_rx, abort_rx, senders, producer, test_limits(), sd_rx);
+        let ingress = Ingress::new(
+            tm_rx,
+            abort_rx,
+            senders,
+            producer,
+            test_limits(),
+            None,
+            sd_rx,
+        );
 
         ingress.on_abort(AbortSource::Guard("pushed".into()));
         ingress.on_abort(AbortSource::Guard("dropped".into()));
@@ -1119,6 +1202,32 @@ mod tests {
             detok_rx.try_recv().is_err(),
             "admitted request must not be deregistered",
         );
+    }
+
+    /// Internal health probes have no Gateway bootstrap identity. They must
+    /// still reach the Scheduler ring when the Frontend owns a PD readiness
+    /// handle; only client business requests require a bound PD sidecar.
+    #[test]
+    fn health_probe_bypasses_pd_sidecar_binding() {
+        let (ingress, detok_rx, consumer, _tm_tx) =
+            make_ingress_with_readiness(Some(pd_readiness()));
+        let mut req = generate_req(10, SamplingParams::default());
+        req.rid = "HEALTH_CHECK_test".into();
+        if let RequestKind::Generate(generate) = &mut req.kind {
+            generate.rid = req.rid.clone();
+        }
+
+        ingress.drive(req);
+
+        assert!(
+            matches!(
+                detok_rx.try_recv(),
+                Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "HEALTH_CHECK_test"
+            ),
+            "expected health request registration"
+        );
+        assert!(detok_rx.try_recv().is_err());
+        assert_eq!(consumer.drain(1).headers.len(), 1);
     }
 
     /// A pool return in `Failed` state (failed encode) is rejected via the same

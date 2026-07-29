@@ -46,6 +46,29 @@ pub struct RuntimeSnapshot {
 }
 
 impl RuntimeSnapshot {
+    pub fn starting(
+        role: Role,
+        process_epoch: ProcessEpoch,
+        registration_epoch: RegistrationEpoch,
+        profile_digest: FixedBytes<32>,
+    ) -> Self {
+        Self {
+            role,
+            lifecycle: RuntimeLifecycle::Starting,
+            local_ready: false,
+            pair_ready: false,
+            session_count: 0,
+            process_epoch,
+            registration_epoch,
+            peer_process_epoch: None,
+            peer_registration_epoch: None,
+            profile_digest,
+            active_rooms: 0,
+            tombstones: 0,
+            last_reason: None,
+        }
+    }
+
     pub fn local_ready(
         role: Role,
         process_epoch: ProcessEpoch,
@@ -98,12 +121,23 @@ impl PairState {
         Self { snapshot }
     }
 
+    pub fn enter_local_ready(&mut self) -> Result<(), PdReason> {
+        if self.snapshot.lifecycle != RuntimeLifecycle::Starting {
+            return Err(PdReason::ProtocolMismatch);
+        }
+        self.snapshot.lifecycle = RuntimeLifecycle::LocalReady;
+        self.snapshot.local_ready = true;
+        self.snapshot.last_reason = None;
+        Ok(())
+    }
+
     pub fn activate(
         &mut self,
         readiness: &PairReadiness,
         rooms: &mut RoomTable,
     ) -> Result<Vec<RoomId>, PdReason> {
-        if !readiness.ready
+        if !self.snapshot.local_ready
+            || !readiness.ready
             || readiness.role != self.snapshot.role
             || readiness.local_process_epoch
                 != FixedBytes::new(self.snapshot.process_epoch.as_bytes())
@@ -155,6 +189,42 @@ impl PairState {
 
     pub const fn snapshot(&self) -> &RuntimeSnapshot {
         &self.snapshot
+    }
+
+    pub fn update_rooms(&mut self, rooms: &RoomSnapshot) {
+        self.snapshot.active_rooms = rooms.active_rooms;
+        self.snapshot.tombstones = rooms.tombstones;
+    }
+
+    pub fn begin_draining(&mut self, rooms: Option<&RoomSnapshot>) {
+        self.snapshot.lifecycle = RuntimeLifecycle::Draining;
+        self.snapshot.pair_ready = false;
+        if let Some(rooms) = rooms {
+            self.update_rooms(rooms);
+        }
+    }
+
+    pub fn mark_fatal(&mut self, reason: PdReason, rooms: Option<&RoomSnapshot>) {
+        self.snapshot.lifecycle = RuntimeLifecycle::Fatal;
+        self.snapshot.local_ready = false;
+        self.snapshot.pair_ready = false;
+        self.snapshot.last_reason = Some(if reason == PdReason::Success {
+            PdReason::LocalFatal
+        } else {
+            reason
+        });
+        if let Some(rooms) = rooms {
+            self.update_rooms(rooms);
+        }
+    }
+
+    pub fn stop(&mut self, rooms: Option<&RoomSnapshot>) {
+        self.snapshot.lifecycle = RuntimeLifecycle::Stopped;
+        self.snapshot.local_ready = false;
+        self.snapshot.pair_ready = false;
+        if let Some(rooms) = rooms {
+            self.update_rooms(rooms);
+        }
     }
 }
 

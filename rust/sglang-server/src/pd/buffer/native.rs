@@ -33,6 +33,12 @@ impl AuthenticatedRemoteRegionTable {
     pub const fn epoch(&self) -> RegistrationEpoch {
         self.epoch
     }
+
+    pub(crate) fn region(&self, region_id: u16) -> Result<&RemoteRegionDescriptor, BufferError> {
+        self.regions
+            .get(usize::from(region_id))
+            .ok_or(BufferError::StaleRegistration)
+    }
 }
 
 /// Mooncake-backed production adapter for the typed PD data-plane stages.

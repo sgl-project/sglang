@@ -1,4 +1,6 @@
+use std::ffi::CString;
 use std::fs::{self, OpenOptions};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::path::PathBuf;
 
@@ -678,18 +680,30 @@ fn psk_loader_accepts_only_exact_mode_regular_non_symlink_files() {
     fs::set_permissions(&wrong_mode, fs::Permissions::from_mode(0o600)).expect("wrong mode");
     assert!(Psk::load(&wrong_mode).is_err());
 
-    let wrong_length = temp.join("wrong-length.psk");
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true).mode(0o400);
-    let mut file = options.open(&wrong_length).expect("create short PSK");
-    std::io::Write::write_all(&mut file, &[7; 31]).expect("write short PSK");
-    drop(file);
-    assert!(Psk::load(&wrong_length).is_err());
+    for length in [31, 33] {
+        let wrong_length = temp.join(format!("wrong-length-{length}.psk"));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o400);
+        let mut file = options.open(&wrong_length).expect("create wrong-size PSK");
+        std::io::Write::write_all(&mut file, &vec![7; length]).expect("write wrong-size PSK");
+        drop(file);
+        assert!(Psk::load(&wrong_length).is_err());
+    }
 
     let link = temp.join("link.psk");
     symlink(&good, &link).expect("create symlink");
     assert!(Psk::load(&link).is_err());
     assert!(Psk::load(&temp).is_err());
+    assert!(Psk::load(&temp.join("missing.psk")).is_err());
+
+    let fifo = temp.join("fifo.psk");
+    let fifo_path = CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path");
+    assert_eq!(
+        unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o400) },
+        0,
+        "create FIFO"
+    );
+    assert!(Psk::load(&fifo).is_err());
 
     fs::remove_dir_all(&temp).expect("remove temp directory");
 }

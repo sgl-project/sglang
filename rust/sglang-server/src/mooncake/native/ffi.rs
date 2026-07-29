@@ -36,6 +36,7 @@ struct NativeAllocation {
     address: usize,
     length: usize,
     kind: AllocationKind,
+    owned: bool,
     free: CudaFree,
     memcpy: CudaMemcpy,
     set_device: CudaSetDevice,
@@ -44,6 +45,9 @@ struct NativeAllocation {
 
 impl Drop for NativeAllocation {
     fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
         if let AllocationKind::Cuda { device } = self.kind {
             let Ok(device) = c_int::try_from(device) else {
                 return;
@@ -78,6 +82,65 @@ impl NativeMemory {
 
     pub(crate) fn cuda(device: u32, length: usize) -> Result<Self, EngineError> {
         Self::allocate(length, AllocationKind::Cuda { device })
+    }
+
+    pub(crate) fn borrowed_pinned(address: u64, length: usize) -> Result<Self, EngineError> {
+        Self::borrow(address, length, AllocationKind::Pinned)
+    }
+
+    pub(crate) fn borrowed_cuda(
+        device: u32,
+        address: u64,
+        length: usize,
+    ) -> Result<Self, EngineError> {
+        Self::borrow(address, length, AllocationKind::Cuda { device })
+    }
+
+    fn borrow(address: u64, length: usize, kind: AllocationKind) -> Result<Self, EngineError> {
+        if address == 0 || !address.is_multiple_of(64) || length == 0 {
+            return Err(EngineError::InvalidDescriptor {
+                field: "memory",
+                detail: "borrowed memory must be non-empty and 64-byte aligned".into(),
+            });
+        }
+        address
+            .checked_add(length as u64)
+            .ok_or(EngineError::RangeOverflow {
+                field: "memory.address",
+            })?;
+        let address = usize::try_from(address).map_err(|_| EngineError::RangeOverflow {
+            field: "memory.address",
+        })?;
+        let library = load_cudart()?;
+        let free: CudaFree = unsafe {
+            match kind {
+                AllocationKind::Pinned => load_symbol(&library, b"cudaFreeHost\0", "cudaFreeHost")?,
+                AllocationKind::Cuda { .. } => load_symbol(&library, b"cudaFree\0", "cudaFree")?,
+            }
+        };
+        let memcpy: CudaMemcpy = unsafe { load_symbol(&library, b"cudaMemcpy\0", "cudaMemcpy")? };
+        let set_device: CudaSetDevice =
+            unsafe { load_symbol(&library, b"cudaSetDevice\0", "cudaSetDevice")? };
+        if let AllocationKind::Cuda { device } = kind {
+            let raw_device =
+                c_int::try_from(device).map_err(|_| EngineError::UnsupportedGpu { device })?;
+            check_code(NativeOperation::SetCudaDevice, unsafe {
+                set_device(raw_device)
+            })?;
+        }
+        Ok(Self {
+            inner: Arc::new(NativeAllocation {
+                _library: library,
+                address,
+                length,
+                kind,
+                owned: false,
+                free,
+                memcpy,
+                set_device,
+                access: Mutex::new(()),
+            }),
+        })
     }
 
     fn allocate(length: usize, kind: AllocationKind) -> Result<Self, EngineError> {
@@ -129,6 +192,7 @@ impl NativeMemory {
                 address: address as usize,
                 length,
                 kind,
+                owned: true,
                 free,
                 memcpy,
                 set_device,

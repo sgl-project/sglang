@@ -20,6 +20,7 @@ pub use egress::{
     EgressSink, SinkError, for_each_chunk, frame_egress_batch_cols, frame_egress_error,
     frame_egress_result,
 };
+pub(crate) use finish_reason::FinishReason;
 pub use finish_reason::Matched;
 pub(crate) use io_struct::{AbortReq, ControlRequest, GetInternalStateReq};
 pub use request::{GenerateBody, GenerateRequest, RequestKind};

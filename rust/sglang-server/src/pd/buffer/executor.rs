@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -7,7 +7,7 @@ use crate::pd::buffer::{
     AUX_BYTES, BufferError, CapacityLedger, CompletionRecordInput, CompletionWrites,
     DestinationVisibilityFence, GpuDirectFlushPort, LeaseHandle, NativeBatchToken, NativeSafety,
     QuarantineManager, SourceComputeFence, TransferPlan, TransferPlanDigest, TransferStage,
-    TransitionResult, evaluate_native_fence, validate_completion,
+    TransitionResult, ValidatedCompletion, evaluate_native_fence, validate_completion,
 };
 use crate::pd::protocol::KvBlock;
 use crate::pd::room::{Clock, PdReason, RoomId};
@@ -402,15 +402,20 @@ pub trait DestinationRecordPort: Send {
 
 pub struct DestinationExecutor {
     ledger: Arc<CapacityLedger>,
-    validated: Mutex<HashSet<DataPlaneIdentity>>,
+    validated: Mutex<HashMap<DataPlaneIdentity, CompletionResultSlot>>,
     committed: Mutex<HashSet<DataPlaneIdentity>>,
+}
+
+struct CompletionResultSlot {
+    completion: ValidatedCompletion,
+    consumed: bool,
 }
 
 impl DestinationExecutor {
     pub fn new(ledger: Arc<CapacityLedger>) -> Self {
         Self {
             ledger,
-            validated: Mutex::new(HashSet::new()),
+            validated: Mutex::new(HashMap::new()),
             committed: Mutex::new(HashSet::new()),
         }
     }
@@ -439,19 +444,28 @@ impl DestinationExecutor {
             .validated
             .lock()
             .map_err(|_| BufferError::InvalidTransition)?
-            .contains(&identity)
+            .contains_key(&identity)
         {
             return Ok(DataPlaneEffect::TransferComplete { identity });
         }
 
-        if let Err(error) = self.validate_visible_records(plan, visibility, records, expected) {
-            let _ = self.ledger.release_failed_safe(handle);
-            return Err(error);
-        }
+        let completion = match self.validate_visible_records(plan, visibility, records, expected) {
+            Ok(completion) => completion,
+            Err(error) => {
+                let _ = self.ledger.release_failed_safe(handle);
+                return Err(error);
+            }
+        };
         self.validated
             .lock()
             .map_err(|_| BufferError::InvalidTransition)?
-            .insert(identity);
+            .insert(
+                identity,
+                CompletionResultSlot {
+                    completion,
+                    consumed: false,
+                },
+            );
         Ok(DataPlaneEffect::TransferComplete { identity })
     }
 
@@ -467,7 +481,7 @@ impl DestinationExecutor {
             .validated
             .lock()
             .map_err(|_| BufferError::InvalidTransition)?
-            .contains(&identity)
+            .contains_key(&identity)
         {
             return Err(BufferError::InvalidTransition);
         }
@@ -487,13 +501,41 @@ impl DestinationExecutor {
         }
     }
 
+    /// Returns a validated completion exactly once, and only after the
+    /// destination lease has crossed the Ack-safe allocator handoff.
+    pub fn consume_after_ack(
+        &self,
+        identity: DataPlaneIdentity,
+    ) -> Result<Option<ValidatedCompletion>, BufferError> {
+        if !self
+            .committed
+            .lock()
+            .map_err(|_| BufferError::InvalidTransition)?
+            .contains(&identity)
+        {
+            return Err(BufferError::InvalidTransition);
+        }
+        let mut validated = self
+            .validated
+            .lock()
+            .map_err(|_| BufferError::InvalidTransition)?;
+        let result = validated
+            .get_mut(&identity)
+            .ok_or(BufferError::InvalidTransition)?;
+        if result.consumed {
+            return Ok(None);
+        }
+        result.consumed = true;
+        Ok(Some(result.completion.clone()))
+    }
+
     fn validate_visible_records<P, V>(
         &self,
         plan: &TransferPlan,
         visibility: &mut DestinationVisibilityFence<V>,
         records: &mut P,
         expected: &CompletionRecordInput,
-    ) -> Result<(), BufferError>
+    ) -> Result<ValidatedCompletion, BufferError>
     where
         P: DestinationRecordPort + ?Sized,
         V: GpuDirectFlushPort,
@@ -501,7 +543,7 @@ impl DestinationExecutor {
         visibility.flush()?;
         let completion = records.read_completion(plan.destination_completion_slot())?;
         let aux = records.read_aux(plan.destination_aux_slot())?;
-        validate_completion(&completion, &aux, expected)?;
+        let validated = validate_completion(&completion, &aux, expected)?;
         let final_page = *plan
             .destination_pages()
             .last()
@@ -511,6 +553,6 @@ impl DestinationExecutor {
         for region_id in 0_u16..56 {
             records.clear_final_kv_page_tail(region_id, final_page, plan.valid_token_count())?;
         }
-        Ok(())
+        Ok(validated)
     }
 }

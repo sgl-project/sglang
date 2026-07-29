@@ -2275,6 +2275,31 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        if self.rust_pd_adapter is not None:
+            self.rust_pd_adapter.flush_pending()
+            completed, failures = self.rust_pd_adapter.poll_inflight()
+            for request in completed:
+                request.time_stats.set_decode_transfer_queue_entry_time()
+                request.time_stats.set_bootstrap_done_time()
+            for request, result in failures:
+                release_kv_cache(request, self.tree_cache, is_insert=False)
+                prepare_abort(
+                    request,
+                    result.pd_reason,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    pd_reason=result.pd_reason,
+                )
+                request.time_stats.set_completion_time()
+            terminal = [*completed, *(request for request, _ in failures)]
+            self.rust_pd_adapter.clear_terminal(terminal)
+            if failures:
+                self.output_streamer.stream_output(
+                    [request for request, _ in failures],
+                    any(request.return_logprob for request, _ in failures),
+                )
+            self.waiting_queue.extend(completed)
+            return
+
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 

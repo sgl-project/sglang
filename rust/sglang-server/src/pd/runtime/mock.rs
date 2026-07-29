@@ -89,7 +89,7 @@ fn frozen_mock_regions(
     (0_u16..58)
         .map(|region_id| {
             let (length_bytes, location) = match region_id {
-                0..=55 => (131_072, "cuda:5"),
+                0..=55 => (64 * 131_072, "cuda:5"),
                 56 => (32 * 64, "cpu:1"),
                 57 => (32 * 192, "cpu:1"),
                 _ => unreachable!(),

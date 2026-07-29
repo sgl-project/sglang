@@ -83,6 +83,11 @@ class RustServer:
             cores=server_cores,
             http_addr=http_addr,
             server_args_json=cls._build_server_args(scheduler),
+            pd_readiness=(
+                scheduler.rust_pd_adapter.readiness_handle
+                if scheduler.rust_pd_adapter is not None
+                else None
+            ),
         )
 
         # Narrow the scheduler thread only after the server threads are launched.

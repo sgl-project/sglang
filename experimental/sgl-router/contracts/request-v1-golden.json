@@ -1,0 +1,473 @@
+{
+  "golden_version": 1,
+  "profile_file": "profile-v1.json",
+  "domains": {
+    "request": "SGLANG-PD-REQUEST-V1"
+  },
+  "digest_inputs": {
+    "model_manifest_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+    "tokenizer_manifest_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "layout_fingerprint": "3333333333333333333333333333333333333333333333333333333333333333",
+    "profile_digest": "5b5f8ff14bb542b5e848c4331fbe4872c94793dee9c9cd079a3445ba41ed863d"
+  },
+  "request_schema": [
+    "model_manifest_digest:bin32",
+    "tokenizer_manifest_digest:bin32",
+    "layout_fingerprint:bin32",
+    "profile_digest:bin32",
+    "batch_index:u32",
+    "normalized_input_ids:list<u32>",
+    "temperature:f64",
+    "top_k:u32",
+    "top_p:f64",
+    "min_p:f64",
+    "frequency_penalty:f64",
+    "presence_penalty:f64",
+    "repetition_penalty:f64",
+    "min_new_tokens:u32",
+    "max_new_tokens:u32",
+    "stop:set<utf8>",
+    "stop_regex:set<utf8>",
+    "stop_token_ids:set<u32>",
+    "ignore_eos:bool",
+    "n:u32",
+    "aux_schema_version:u16",
+    "aux_schema_bytes:u16"
+  ],
+  "request_cases": [
+    {
+      "name": "text_utf8_tokenized_scalar_room_zero",
+      "request": {
+        "batch_index": 0,
+        "normalized_input_ids": [
+          1,
+          2,
+          3,
+          151643
+        ],
+        "sampling": {
+          "temperature": 1.0,
+          "top_k": 1,
+          "top_p": 1.0,
+          "min_p": 0.0,
+          "frequency_penalty": -0.0,
+          "presence_penalty": 0.25,
+          "repetition_penalty": 1.0,
+          "min_new_tokens": 0,
+          "max_new_tokens": 1,
+          "stop": [
+            "停止",
+            "END",
+            "END"
+          ],
+          "stop_regex": [
+            "z+$",
+            "a{1,3}"
+          ],
+          "stop_token_ids": [
+            151645,
+            151643,
+            151645
+          ],
+          "ignore_eos": false,
+          "n": 1
+        },
+        "aux_schema": {
+          "version": 1,
+          "bytes": 64
+        }
+      },
+      "excluded_fields": {
+        "source_kind": "text_tokenized",
+        "rid": "local-rid-not-digested",
+        "bootstrap_host": "prefill.internal",
+        "bootstrap_port": 8998,
+        "bootstrap_room": 0,
+        "bootstrap_attempt_id": "44444444-4444-4444-8444-444444444444",
+        "authorization_present": true,
+        "stream": true
+      },
+      "expected_canonical_bytes": 296,
+      "expected_canonical_hex": "53474c414e472d50442d524551554553542d5631001111111111111111111111111111111111111111111111111111111111111111222222222222222222222222222222222222222222222222222222222222222233333333333333333333333333333333333333333333333333333333333333335b5f8ff14bb542b5e848c4331fbe4872c94793dee9c9cd079a3445ba41ed863d00000000000000040000000100000002000000030002505b3ff0000000000000000000013ff0000000000000000000000000000000000000000000003fd00000000000003ff000000000000000000000000000010000000200000003454e4400000006e5819ce6ada200000002000000037a2b2400000006617b312c337d000000020002505b0002505d000000000100010040",
+      "expected_digest_hex": "54ba708b917a0cdb33c27e413b26b9c750e0e6f790dd934708a2a27e41b2ffa4"
+    },
+    {
+      "name": "input_ids_batch_item_room_max",
+      "request": {
+        "batch_index": 1,
+        "normalized_input_ids": [
+          9,
+          8,
+          7
+        ],
+        "sampling": {
+          "temperature": 1.0,
+          "top_k": 1,
+          "top_p": 1.0,
+          "min_p": 0.0,
+          "frequency_penalty": -0.0,
+          "presence_penalty": 0.25,
+          "repetition_penalty": 1.0,
+          "min_new_tokens": 0,
+          "max_new_tokens": 0,
+          "stop": [],
+          "stop_regex": [],
+          "stop_token_ids": [],
+          "ignore_eos": true,
+          "n": 1
+        },
+        "aux_schema": {
+          "version": 1,
+          "bytes": 64
+        }
+      },
+      "excluded_fields": {
+        "source_kind": "input_ids",
+        "rid": "batch-rid-not-digested",
+        "bootstrap_host": "prefill.internal",
+        "bootstrap_port": 8998,
+        "bootstrap_room": 9223372036854775807,
+        "bootstrap_attempt_id": "55555555-5555-4555-8555-555555555555",
+        "authorization_present": false,
+        "stream": false
+      },
+      "expected_canonical_bytes": 250,
+      "expected_canonical_hex": "53474c414e472d50442d524551554553542d5631001111111111111111111111111111111111111111111111111111111111111111222222222222222222222222222222222222222222222222222222222222222233333333333333333333333333333333333333333333333333333333333333335b5f8ff14bb542b5e848c4331fbe4872c94793dee9c9cd079a3445ba41ed863d00000001000000030000000900000008000000073ff0000000000000000000013ff0000000000000000000000000000000000000000000003fd00000000000003ff00000000000000000000000000000000000000000000000000000010000000100010040",
+      "expected_digest_hex": "aa1c2d808ba9d42a7fad59f1fd4904d17ba9ea02e0e989242ae217585b0512b1"
+    }
+  ],
+  "mutation_checks": [
+    {
+      "name": "bootstrap_identity_is_excluded",
+      "changes_digest": false,
+      "expected_digest_hex": "54ba708b917a0cdb33c27e413b26b9c750e0e6f790dd934708a2a27e41b2ffa4"
+    },
+    {
+      "name": "negative_zero_is_positive_zero",
+      "changes_digest": false,
+      "expected_digest_hex": "54ba708b917a0cdb33c27e413b26b9c750e0e6f790dd934708a2a27e41b2ffa4"
+    },
+    {
+      "name": "unordered_sets_are_sorted_and_deduplicated",
+      "changes_digest": false,
+      "expected_digest_hex": "54ba708b917a0cdb33c27e413b26b9c750e0e6f790dd934708a2a27e41b2ffa4"
+    },
+    {
+      "name": "input_id_mutation_changes_digest",
+      "changes_digest": true,
+      "expected_digest_hex": "8d471c2f51b7bb10f5cf346db24d98b18ec43c36763341c42e3547bff76099a3"
+    },
+    {
+      "name": "batch_index_mutation_changes_digest",
+      "changes_digest": true,
+      "expected_digest_hex": "931238d1f6b1f4aa5a768883cdf39b2a799e6d15240b18a819493d80cf13dffa"
+    },
+    {
+      "name": "sampling_mutation_changes_digest",
+      "changes_digest": true,
+      "expected_digest_hex": "f9ba0917430359ec31181ab018e9c329bba83e437a82d80cac2baf14f04fa964"
+    }
+  ],
+  "pd_metadata": {
+    "sidecar_version": 1,
+    "scalar": {
+      "bootstrap_host": "prefill.internal",
+      "bootstrap_port": 8998,
+      "bootstrap_room": 0,
+      "bootstrap_attempt_id": "44444444-4444-4444-8444-444444444444",
+      "batch_index": 0
+    },
+    "batch": {
+      "bootstrap_host": [
+        "prefill.internal",
+        "prefill.internal"
+      ],
+      "bootstrap_port": [
+        8998,
+        8998
+      ],
+      "bootstrap_room": [
+        0,
+        9223372036854775807
+      ],
+      "bootstrap_attempt_id": [
+        "44444444-4444-4444-8444-444444444444",
+        "55555555-5555-4555-8555-555555555555"
+      ],
+      "batch_index": [
+        0,
+        1
+      ]
+    }
+  },
+  "public_errors": [
+    {
+      "reason": "PD_REQUEST_INVALID",
+      "status": 400,
+      "retryable": false,
+      "headers": {
+        "x-sglang-pd-reason": "PD_REQUEST_INVALID",
+        "x-sglang-retryable": "false"
+      },
+      "body": {
+        "error": {
+          "message": "PD request is invalid",
+          "type": "pd_error",
+          "code": 400,
+          "pd_reason": "PD_REQUEST_INVALID",
+          "retryable": false
+        }
+      }
+    },
+    {
+      "reason": "PD_UNSUPPORTED",
+      "status": 422,
+      "retryable": false,
+      "headers": {
+        "x-sglang-pd-reason": "PD_UNSUPPORTED",
+        "x-sglang-retryable": "false"
+      },
+      "body": {
+        "error": {
+          "message": "PD request uses an unsupported capability",
+          "type": "pd_error",
+          "code": 422,
+          "pd_reason": "PD_UNSUPPORTED",
+          "retryable": false
+        }
+      }
+    },
+    {
+      "reason": "PD_CAPACITY_EXHAUSTED",
+      "status": 429,
+      "retryable": true,
+      "headers": {
+        "x-sglang-pd-reason": "PD_CAPACITY_EXHAUSTED",
+        "x-sglang-retryable": "true"
+      },
+      "body": {
+        "error": {
+          "message": "PD capacity is exhausted",
+          "type": "pd_error",
+          "code": 429,
+          "pd_reason": "PD_CAPACITY_EXHAUSTED",
+          "retryable": true
+        }
+      }
+    },
+    {
+      "reason": "PD_PROTOCOL_MISMATCH",
+      "status": 503,
+      "retryable": false,
+      "headers": {
+        "x-sglang-pd-reason": "PD_PROTOCOL_MISMATCH",
+        "x-sglang-retryable": "false"
+      },
+      "body": {
+        "error": {
+          "message": "PD protocol mismatch",
+          "type": "pd_error",
+          "code": 503,
+          "pd_reason": "PD_PROTOCOL_MISMATCH",
+          "retryable": false
+        }
+      }
+    },
+    {
+      "reason": "PD_PEER_UNAVAILABLE",
+      "status": 503,
+      "retryable": true,
+      "headers": {
+        "x-sglang-pd-reason": "PD_PEER_UNAVAILABLE",
+        "x-sglang-retryable": "true"
+      },
+      "body": {
+        "error": {
+          "message": "PD peer is unavailable",
+          "type": "pd_error",
+          "code": 503,
+          "pd_reason": "PD_PEER_UNAVAILABLE",
+          "retryable": true
+        }
+      }
+    },
+    {
+      "reason": "PD_RENDEZVOUS_TIMEOUT",
+      "status": 504,
+      "retryable": true,
+      "headers": {
+        "x-sglang-pd-reason": "PD_RENDEZVOUS_TIMEOUT",
+        "x-sglang-retryable": "true"
+      },
+      "body": {
+        "error": {
+          "message": "PD room rendezvous timed out",
+          "type": "pd_error",
+          "code": 504,
+          "pd_reason": "PD_RENDEZVOUS_TIMEOUT",
+          "retryable": true
+        }
+      }
+    },
+    {
+      "reason": "PD_TRANSFER_TIMEOUT",
+      "status": 504,
+      "retryable": true,
+      "headers": {
+        "x-sglang-pd-reason": "PD_TRANSFER_TIMEOUT",
+        "x-sglang-retryable": "true"
+      },
+      "body": {
+        "error": {
+          "message": "PD transfer timed out",
+          "type": "pd_error",
+          "code": 504,
+          "pd_reason": "PD_TRANSFER_TIMEOUT",
+          "retryable": true
+        }
+      }
+    },
+    {
+      "reason": "PD_TRANSFER_FAILED",
+      "status": 502,
+      "retryable": true,
+      "headers": {
+        "x-sglang-pd-reason": "PD_TRANSFER_FAILED",
+        "x-sglang-retryable": "true"
+      },
+      "body": {
+        "error": {
+          "message": "PD transfer failed",
+          "type": "pd_error",
+          "code": 502,
+          "pd_reason": "PD_TRANSFER_FAILED",
+          "retryable": true
+        }
+      }
+    },
+    {
+      "reason": "PD_ACK_TIMEOUT",
+      "status": 504,
+      "retryable": true,
+      "headers": {
+        "x-sglang-pd-reason": "PD_ACK_TIMEOUT",
+        "x-sglang-retryable": "true"
+      },
+      "body": {
+        "error": {
+          "message": "PD completion acknowledgement timed out",
+          "type": "pd_error",
+          "code": 504,
+          "pd_reason": "PD_ACK_TIMEOUT",
+          "retryable": true
+        }
+      }
+    },
+    {
+      "reason": "PD_ABORTED",
+      "status": 499,
+      "retryable": false,
+      "headers": {
+        "x-sglang-pd-reason": "PD_ABORTED",
+        "x-sglang-retryable": "false"
+      },
+      "body": {
+        "error": {
+          "message": "PD request was aborted",
+          "type": "pd_error",
+          "code": 499,
+          "pd_reason": "PD_ABORTED",
+          "retryable": false
+        }
+      }
+    },
+    {
+      "reason": "PD_STALE_EPOCH",
+      "status": 409,
+      "retryable": true,
+      "headers": {
+        "x-sglang-pd-reason": "PD_STALE_EPOCH",
+        "x-sglang-retryable": "true"
+      },
+      "body": {
+        "error": {
+          "message": "PD handle or epoch is stale",
+          "type": "pd_error",
+          "code": 409,
+          "pd_reason": "PD_STALE_EPOCH",
+          "retryable": true
+        }
+      }
+    },
+    {
+      "reason": "PD_LOCAL_FATAL",
+      "status": 503,
+      "retryable": true,
+      "headers": {
+        "x-sglang-pd-reason": "PD_LOCAL_FATAL",
+        "x-sglang-retryable": "true"
+      },
+      "body": {
+        "error": {
+          "message": "PD local runtime failed",
+          "type": "pd_error",
+          "code": 503,
+          "pd_reason": "PD_LOCAL_FATAL",
+          "retryable": true
+        }
+      }
+    }
+  ],
+  "kv_poll": [
+    {
+      "value": 0,
+      "name": "Failed"
+    },
+    {
+      "value": 1,
+      "name": "Bootstrapping"
+    },
+    {
+      "value": 2,
+      "name": "WaitingForInput"
+    },
+    {
+      "value": 3,
+      "name": "Transferring"
+    },
+    {
+      "value": 4,
+      "name": "Success"
+    }
+  ],
+  "completion_results": [
+    {
+      "name": "first_token_once",
+      "terminal_generation": 7,
+      "first_poll": {
+        "status": 4,
+        "first_token_id": 42,
+        "first_token_consumed": false
+      },
+      "second_poll": {
+        "status": 4,
+        "first_token_id": null,
+        "first_token_consumed": true
+      }
+    },
+    {
+      "name": "max_new_tokens_zero",
+      "terminal_generation": 8,
+      "first_poll": {
+        "status": 4,
+        "first_token_id": null,
+        "first_token_consumed": true
+      },
+      "second_poll": {
+        "status": 4,
+        "first_token_id": null,
+        "first_token_consumed": true
+      }
+    }
+  ]
+}

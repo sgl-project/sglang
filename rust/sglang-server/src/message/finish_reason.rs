@@ -46,6 +46,8 @@ pub enum FinishKind {
 /// The `FINISH_ABORT` payload. `status_code`/`err_type` are `None` for a plain
 /// abort and set for a request error (e.g. over-context → 400); Python emits all
 /// three keys, nulls included, so none of them is skipped on the way out.
+/// `pd_reason` is a Rust-PD extension and is omitted when absent so ordinary
+/// aborts retain their upstream wire shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AbortReason {
     #[serde(default)]
@@ -54,6 +56,8 @@ pub struct AbortReason {
     pub status_code: Option<u16>,
     #[serde(default)]
     pub err_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pd_reason: Option<String>,
 }
 
 /// A terminal finish reason exactly as `BaseFinishReason.to_json()`
@@ -96,6 +100,15 @@ impl FinishReason {
                 a.status_code?,
                 a.message.as_deref().unwrap_or("request aborted"),
             )),
+            _ => None,
+        }
+    }
+
+    /// Scheduler-owned PD terminal discriminator. Message text and HTTP status
+    /// deliberately do not participate in PD classification.
+    pub fn pd_reason_code(&self) -> Option<&str> {
+        match self {
+            FinishReason::Known(FinishKind::Abort(a)) => a.pd_reason.as_deref(),
             _ => None,
         }
     }
@@ -148,6 +161,38 @@ mod tests {
             .is_none()
         );
         assert!(abort_status(&None).is_none());
+    }
+
+    #[test]
+    fn pd_reason_is_typed_and_round_trips_only_on_abort() {
+        let wire = serde_json::json!({
+            "type": "abort",
+            "message": "must not drive classification",
+            "status_code": 500,
+            "err_type": null,
+            "pd_reason": "PD_TRANSFER_TIMEOUT",
+        });
+        let parsed: FinishReason = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(parsed.pd_reason_code(), Some("PD_TRANSFER_TIMEOUT"));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), wire);
+
+        let ordinary = fr(serde_json::json!({
+            "type": "abort",
+            "message": "Aborted",
+            "status_code": null,
+            "err_type": null
+        }))
+        .unwrap();
+        assert_eq!(ordinary.pd_reason_code(), None);
+        assert_eq!(
+            serde_json::to_value(&ordinary).unwrap(),
+            serde_json::json!({
+                "type": "abort",
+                "message": "Aborted",
+                "status_code": null,
+                "err_type": null
+            })
+        );
     }
 
     /// The `matched` accessor reads only a stop, and reads every shape of one.

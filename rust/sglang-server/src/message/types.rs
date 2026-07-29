@@ -31,8 +31,8 @@ pub enum OneOrMany<T: OneOrManyItem> {
 /// [`TokenIds`] is the one member that does accept a sequence, and that ambiguity
 /// is the intended semantics: flat `[1,2]` is one prompt's ids (or a broadcast),
 /// `[[1],[2]]` is per-prompt — the shapes Python's `_normalize_batch`
-/// distinguishes. `String` / `bool` / `i64` never match a list, so both forms
-/// round-trip.
+/// distinguishes. `String` and the scalar bool/integer types never match a
+/// list, so both forms round-trip.
 pub trait OneOrManyItem: sealed::SealedItem {}
 
 impl<T: sealed::SealedItem> OneOrManyItem for T {}
@@ -43,6 +43,8 @@ mod sealed {
 
     impl SealedItem for bool {}
     impl SealedItem for i64 {}
+    impl SealedItem for u16 {}
+    impl SealedItem for u64 {}
     impl SealedItem for String {}
     impl SealedItem for super::TokenIds {}
 }
