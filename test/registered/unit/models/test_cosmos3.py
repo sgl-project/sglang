@@ -115,6 +115,39 @@ class TestCosmos3WeightsMapper(CustomTestCase):
         ]
         self.assertEqual(self.mapper.apply_list(dropped), [])
 
+    def test_modelopt_quantizer_buffers_are_dropped(self):
+        # FP8 Cosmos3 exports keep ModelOpt TensorQuantizer state alongside the
+        # inference weight_scale/input_scale tensors. SGLang uses the latter;
+        # transformers restores the former via ModelOpt HF checkpointing.
+        dropped = [
+            "layers.0.mlp.gate_proj.input_quantizer._amax",
+            "layers.0.mlp.gate_proj.weight_quantizer._amax",
+            "layers.0.mlp.gate_proj.weight_quantizer._scale",
+            "layers.0.self_attn.to_q.input_quantizer._amax",
+            "layers.0.self_attn.to_q.weight_quantizer._amax",
+            "layers.0.self_attn.to_q.weight_quantizer._scale",
+        ]
+        self.assertEqual(self.mapper.apply_list(dropped), [])
+
+    def test_fp8_inference_scales_are_kept(self):
+        inputs = [
+            "layers.0.mlp.gate_proj.weight",
+            "layers.0.mlp.gate_proj.weight_scale",
+            "layers.0.mlp.gate_proj.input_scale",
+            "layers.0.self_attn.to_q.weight",
+            "layers.0.self_attn.to_q.weight_scale",
+            "layers.0.self_attn.to_q.input_scale",
+        ]
+        expected = [
+            "model.language_model.layers.0.mlp.gate_proj.weight",
+            "model.language_model.layers.0.mlp.gate_proj.weight_scale",
+            "model.language_model.layers.0.mlp.gate_proj.input_scale",
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.self_attn.q_proj.weight_scale",
+            "model.language_model.layers.0.self_attn.q_proj.input_scale",
+        ]
+        self.assertEqual(self.mapper.apply_list(inputs), expected)
+
     def test_moe_gen_substring_wins_over_norm_prefix(self):
         # `norm_moe_gen.weight` must be dropped (generation), not routed to the
         # final `norm.` -> language-model norm.

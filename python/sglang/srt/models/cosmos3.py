@@ -42,6 +42,12 @@ class Cosmos3ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     # Qwen3-VL checkpoint form consumed by the parent ``load_weights``.
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
+            # Drop ModelOpt calibration buffers. The FP8 export already ships
+            # inference ``weight_scale`` / ``input_scale``; transformers restores
+            # ``*_quantizer._amax`` via ModelOpt HF checkpointing, but SGLang's
+            # ModelOptFp8 path does not register those modules. Same drop as the
+            # diffusion Cosmos3 loader.
+            "_quantizer.": None,
             # Drop the generation (diffusion) tower.
             "_moe_gen": None,
             ".add_q_proj.": None,
