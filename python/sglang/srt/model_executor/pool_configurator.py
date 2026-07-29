@@ -21,6 +21,7 @@ import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -91,6 +92,55 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     if cell_size is None or int(cell_size) <= 0:
         return 0
     return int(cell_size) * get_parallel().attn_dcp_size
+
+
+def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
+    """Global layer ids represented by the local DSA pool's dense layer slots."""
+    if kvc.mambaish_config and not kvc.is_draft_worker:
+        layer_ids = [
+            layer_id
+            for layer_id in kvc.mambaish_config.full_attention_layer_ids
+            if kvc.layer_info.start_layer <= layer_id < kvc.layer_info.end_layer
+        ]
+    else:
+        layer_ids = list(range(kvc.layer_info.start_layer, kvc.layer_info.end_layer))
+    # Draft pools and a few platform-specific pools may expose a synthetic layer
+    # count. They do not use indexShare, so only the length matters for sizing.
+    if len(layer_ids) != num_layers:
+        return list(range(num_layers))
+    return layer_ids
+
+
+def _get_dsa_indexer_effective_num_layers(
+    kvc: KVCacheConfigurator, cache_layer_ids: list[int]
+) -> int:
+    """Indexer buffers materialized per rank, including split remote scratch."""
+    enable_hisparse = kvc.server_args.enable_hisparse
+    if enable_hisparse or kvc.is_draft_worker:
+        included_layers = [True] * len(cache_layer_ids)
+    else:
+        included_layers = [
+            not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+            for layer_id in cache_layer_ids
+        ]
+
+    from sglang.srt.layers.cp.utils import (
+        get_glm_dsa_cp_layer_shard_info,
+        get_layer_shard_range,
+    )
+
+    layer_shard_rank, shard_size = get_glm_dsa_cp_layer_shard_info(kvc)
+    if enable_hisparse or layer_shard_rank is None:
+        return sum(included_layers)
+
+    # All ranks must derive the same token capacity. Use the maximum number of
+    # non-skipped owned layers across shards, then account for the one full-size
+    # remote indexer scratch buffer allocated by LayerSplitDSATokenToKVPool.
+    max_owned_layers = 0
+    for rank in range(shard_size):
+        start, end = get_layer_shard_range(rank, shard_size, len(cache_layer_ids))
+        max_owned_layers = max(max_owned_layers, sum(included_layers[start:end]))
+    return max(1, max_owned_layers + 1)
 
 
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
@@ -211,8 +261,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             get_glm_dsa_layer_split_effective_num_layers,
         )
 
-        effective_num_layers = get_glm_dsa_layer_split_effective_num_layers(
-            kvc, num_layers
+        effective_num_layers = (
+            num_layers
+            if kvc.server_args.enable_hisparse
+            else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
+        )
+
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
         )
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
@@ -255,6 +311,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
+                num_indexer_layers = _get_dsa_indexer_effective_num_layers(
+                    kvc, _get_dsa_cache_layer_ids(kvc, num_layers)
+                )
                 indexer_ratio = 1
                 if kvc.server_args.enable_hisparse:
                     from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -264,7 +323,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     ).host_to_device_ratio
                 cell_size += int(
                     indexer_size_per_token
-                    * effective_num_layers
+                    * num_indexer_layers
                     * element_size
                     * indexer_ratio
                 )

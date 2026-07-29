@@ -24,6 +24,7 @@ class KVCacheBuildResult:
 from typing import TYPE_CHECKING
 
 from sglang.srt.configs.hybrid_arch import (
+    glm5_next_config,
     hybrid_gdn_config,
     hybrid_lightning_config,
     kimi_linear_config,
@@ -31,6 +32,7 @@ from sglang.srt.configs.hybrid_arch import (
     mamba2_config,
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
+from sglang.srt.disaggregation.utils import should_bypass_dsa_cp_prefix_cache
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -164,6 +166,7 @@ def build_kv_cache(
         or mamba2_config(tp_worker.model_runner.model_config) is not None
         or _registry_needs_mamba
         or kimi_linear_config(tp_worker.model_runner.model_config) is not None
+        or glm5_next_config(tp_worker.model_runner.model_config) is not None
         or hybrid_lightning_config(tp_worker.model_runner.model_config) is not None
     )
     is_dsa = is_deepseek_dsa(model_config.hf_config)
@@ -178,14 +181,24 @@ def build_kv_cache(
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
 
-    disable_radix_cache = server_args.disable_radix_cache or (
-        model_config.is_multimodal and uses_transformers_backend
+    bypass_dsa_cp_prefix_cache = should_bypass_dsa_cp_prefix_cache(server_args)
+    disable_radix_cache = (
+        server_args.disable_radix_cache
+        or (model_config.is_multimodal and uses_transformers_backend)
+        or bypass_dsa_cp_prefix_cache
     )
     if disable_radix_cache and not server_args.disable_radix_cache:
-        logger.warning(
-            "Radix cache is disabled for multimodal models with the "
-            "Transformers backend to avoid multimodal prefix-cache mismatches."
-        )
+        if bypass_dsa_cp_prefix_cache:
+            logger.warning(
+                "Radix cache is disabled on this PD Prefill worker because DSA "
+                "Prefill CP requires CP-aware KV-cache resharding. Target-model "
+                "CP, speculative decoding, and P-to-D transfer remain enabled."
+            )
+        else:
+            logger.warning(
+                "Radix cache is disabled for multimodal models with the "
+                "Transformers backend to avoid multimodal prefix-cache mismatches."
+            )
 
     # Decode radix cache is unsupported with hybrid SWA/SSM models —
     # these use specialized memory pools incompatible with the
