@@ -152,6 +152,12 @@ print("Embedding:", response["data"][0]["embedding"])
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Latest Qwen3-based text embedding model for semantic representation</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3 (bare backbone)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`microsoft/harrier-oss-v1-0.6b`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bare <code>Qwen3Model</code> backbone (no LM head); served natively on SGLang's fused Qwen3 kernels and auto-classified as an embedding model</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>BGE</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`BAAI/bge-large-en-v1.5`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A</td>
