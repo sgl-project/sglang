@@ -1734,6 +1734,7 @@ multimodal_model_archs = [
     "LlavaMistralForCausalLM",
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
+    "MageVLForConditionalGeneration",
     "LlavaVidForCausalLM",
     "Lfm2VlForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
