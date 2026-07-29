@@ -1445,12 +1445,12 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.prompt_tokens_total = Counter(
             name="sglang:prompt_tokens_total",
             documentation="Number of prefill tokens processed.",
-            labelnames=labels.keys(),
+            labelnames=list(labels.keys()) + ["stream"],
         )
         self.generation_tokens_total = Counter(
             name="sglang:generation_tokens_total",
             documentation="Number of generation tokens processed.",
-            labelnames=labels.keys(),
+            labelnames=list(labels.keys()) + ["stream"],
         )
         self.spec_verify_calls_total = Counter(
             name="sglang:spec_verify_calls_total",
@@ -1530,7 +1530,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.num_requests_total = Counter(
             name="sglang:num_requests_total",
             documentation="Number of requests processed.",
-            labelnames=labels.keys(),
+            labelnames=list(labels.keys()) + ["stream"],
         )
 
         self.get_loads_duration_seconds = Histogram(
@@ -1645,7 +1645,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.histogram_e2e_request_latency = Histogram(
             name="sglang:e2e_request_latency_seconds",
             documentation="Histogram of End-to-end request latency in seconds",
-            labelnames=labels.keys(),
+            labelnames=list(labels.keys()) + ["stream"],
             buckets=bucket_e2e_request_latency,
         )
 
@@ -1659,9 +1659,11 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         has_grammar: bool,
         cached_tokens_details: Optional[Dict[str, Any]] = None,
         spec_verify_ct: int = 0,
+        stream: bool = False,
     ):
-        self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
-        self.generation_tokens_total.labels(**labels).inc(generation_tokens)
+        stream_labels = {**labels, "stream": "true" if stream else "false"}
+        self.prompt_tokens_total.labels(**stream_labels).inc(prompt_tokens)
+        self.generation_tokens_total.labels(**stream_labels).inc(generation_tokens)
         if spec_verify_ct > 0:
             self.spec_verify_calls_total.labels(**labels).inc(spec_verify_ct)
 
@@ -1690,10 +1692,12 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 labels_total = {**labels, "cache_source": "total"}
                 self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
 
-        self.num_requests_total.labels(**labels).inc(1)
+        self.num_requests_total.labels(**stream_labels).inc(1)
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)
-        self.histogram_e2e_request_latency.labels(**labels).observe(float(e2e_latency))
+        self.histogram_e2e_request_latency.labels(**stream_labels).observe(
+            float(e2e_latency)
+        )
         self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
         self.uncached_prompt_tokens_histogram.labels(**labels).observe(
             float(prompt_tokens - cached_tokens)
