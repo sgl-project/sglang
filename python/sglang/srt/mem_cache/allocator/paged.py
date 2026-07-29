@@ -282,29 +282,27 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         Caller contract (see base): slice of one request's kv row (or a
         page-aligned copy) whose pages no other call in the same group frees.
         """
-        n = free_index.numel()
-        if n == 0:
+        if free_index.numel() == 0:
             return
 
-        offset = start_pos % self.page_size
+        ps = self.page_size
+        offset = start_pos % ps
         if offset == 0:
-            pieces = (free_index[:: self.page_size],)
+            pieces = (free_index[::ps],)
         else:
-            rest = free_index[self.page_size - offset :: self.page_size]
-            head = free_index[:1]
-            pieces = (head, rest) if rest.numel() else (head,)
+            pieces = (free_index[:1], free_index[ps - offset :: ps])
 
         if self.debug_mode:
             # unique on CPU: the NPU subclass's free() deliberately avoids
             # device-side unique, keep the debug reference off-device too.
-            page_ids = torch.cat([p // self.page_size for p in pieces])
+            page_ids = torch.cat([p // ps for p in pieces])
             assert torch.equal(
                 torch.sort(page_ids.cpu())[0],
-                torch.unique(free_index.cpu() // self.page_size),
+                torch.unique(free_index.cpu() // ps),
             )
 
         if self.is_not_in_free_group:
-            self._release_page_ids(*(p // self.page_size for p in pieces))
+            self._release_page_ids(*(p // ps for p in pieces))
             if self.debug_mode:
                 self._debug_check_no_duplicate_pages()
         else:

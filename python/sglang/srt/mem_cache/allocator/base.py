@@ -125,18 +125,16 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """Free disjoint ascending ``(free_index, start_pos)`` segments of one
         request's kv row; a boundary page shared by consecutive segments is
         emitted once (the later segment's head is trimmed)."""
+        ps = self.page_size
         prev_end = None
         for free_index, start_pos in segments:
             n = free_index.numel()
             if n == 0:
                 continue
             seg_end = start_pos + n
-            if (
-                prev_end is not None
-                and start_pos // self.page_size == (prev_end - 1) // self.page_size
-            ):
-                trim = (start_pos // self.page_size + 1) * self.page_size - start_pos
-                free_index = free_index[trim:]
-                start_pos = start_pos + trim
+            if prev_end is not None and start_pos // ps == (prev_end - 1) // ps:
+                boundary = (start_pos // ps + 1) * ps
+                free_index = free_index[boundary - start_pos :]
+                start_pos = boundary
             prev_end = seg_end
             self.free_segment(free_index, start_pos=start_pos)

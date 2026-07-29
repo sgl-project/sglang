@@ -38,10 +38,6 @@ def _make_kv_row(alloc, num_tokens):
     return indices[:num_tokens]
 
 
-def _pages_of(alloc):
-    return torch.cat((alloc.free_pages, alloc.release_pages))
-
-
 class TestFreeSegment(unittest.TestCase):
     def test_matches_unique_over_alignments(self):
         # Sweep (start, end) so segments cover: aligned/unaligned head and
