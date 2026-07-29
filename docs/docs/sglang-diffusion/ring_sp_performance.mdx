@@ -120,6 +120,27 @@ sglang serve \
 Omit `--sp-attention-mode kv_gather` to use TP plus Ulysses with the same
 `tp=2, sp=2` topology.
 
+### FSDP Plus Sequence Parallelism
+
+FSDP can shard DiT weights across the same workers that participate in SP.
+Unlike TP times SP, the FSDP and SP degrees do not multiply the required GPU
+count. This is useful when pure SP is fast enough but replicated DiT weights
+or long-sequence activations leave too little memory headroom:
+
+```bash
+sglang serve \
+  --model-path Lightricks/LTX-2.3 \
+  --num-gpus 2 \
+  --use-fsdp-inference true \
+  --sp-degree 2 \
+  --sp-attention-mode kv_gather \
+  --port 8898
+```
+
+FSDP adds weight all-gather communication, so compare it with pure SP when
+both fit. K/V gather has the same non-causal and `ring_degree=1` constraints
+under FSDP.
+
 ### Ring Sequence Parallelism
 
 This example uses two GPUs with `sp=2`, `ulysses=1`, and `ring=2`.
