@@ -153,7 +153,9 @@ class ResponsesSamplingParamsTestCase(CustomTestCase):
                 }
             },
         )
-        with self.assertRaises(ValueError):
+        # The message must name text.format: it is the only source of the
+        # conflict a /v1/responses caller can actually set.
+        with self.assertRaisesRegex(ValueError, r"text\.format"):
             request.to_sampling_params(
                 default_max_tokens=128,
                 default_params={},

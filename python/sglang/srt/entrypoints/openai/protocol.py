@@ -1698,10 +1698,13 @@ class ResponsesRequest(BaseModel):
             or params.get("json_schema")
         )
         if tool_call_constraint and has_existing_constraints:
-            # Refuse rather than silently drop the tool-call grammar.
+            # Refuse rather than silently drop the tool-call grammar. ``text.format``
+            # is named first because it is the only client-settable source here;
+            # the rest can only arrive via --preferred-sampling-params.
             raise ValueError(
                 "Cannot combine tool calls with constrained decoding "
-                "(regex / ebnf / structural_tag / json_schema). Remove one."
+                "(text.format / regex / ebnf / structural_tag / json_schema). "
+                "Remove one."
             )
         if tool_call_constraint:
             constraint_type, constraint_value = tool_call_constraint

@@ -98,14 +98,19 @@ class HarmonyContext(ConversationContext):
                     self.num_cached_tokens = meta_info["cached_tokens"]
                 if "completion_tokens" in meta_info:
                     self.num_output_tokens += meta_info["completion_tokens"]
-                finish_reason = meta_info.get("finish_reason")
-                if finish_reason:
-                    self.finish_reason = finish_reason
+                self._record_finish_reason(meta_info)
 
         else:
             output_msgs = output
 
         self._messages.extend(output_msgs)
+
+    def _record_finish_reason(self, meta_info: dict) -> None:
+        # Last non-null wins: a builtin-tool continuation turn supersedes the
+        # reason recorded for the turn before it.
+        reason = meta_info.get("finish_reason")
+        if reason is not None:
+            self.finish_reason = reason
 
     @property
     def messages(self) -> list:
@@ -214,9 +219,7 @@ class StreamingHarmonyContext(HarmonyContext):
                 new_token_ids = output_token_ids
                 self.num_processed_tokens += len(output_token_ids)
 
-            finish_reason = meta_info.get("finish_reason")
-            if finish_reason:
-                self.finish_reason = finish_reason
+            self._record_finish_reason(meta_info)
 
             for token_id in new_token_ids:
                 self.parser.process(token_id)
