@@ -423,6 +423,62 @@ def _maybe_mux_audio_into_mp4(
         )
 
 
+def _try_save_video_with_audio(
+    *,
+    save_file_path: str,
+    frames: list,
+    fps: int,
+    audio: Any,
+    audio_sample_rate: Optional[int],
+    output_format: str,
+    quality: float,
+) -> bool:
+    """Encode video and audio in one ffmpeg pass when audio is available."""
+    audio_np = _normalize_audio_to_numpy(audio)
+    if audio_np is None:
+        return False
+
+    selected_sr = _pick_audio_sample_rate(
+        audio_np=audio_np,
+        audio_sample_rate=audio_sample_rate,
+        fps=fps,
+        num_frames=len(frames),
+    )
+    tmp_wav_path = None
+    try:
+        if scipy_wavfile is None:
+            raise RuntimeError(
+                "scipy is required to mux audio into mp4 (pip install scipy)"
+            )
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_wav_path = f.name
+        scipy_wavfile.write(tmp_wav_path, selected_sr, audio_np)
+        imageio.mimsave(
+            save_file_path,
+            frames,
+            fps=fps,
+            format=output_format,
+            codec="libx264",
+            quality=quality,
+            audio_path=tmp_wav_path,
+            audio_codec="aac",
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            "Failed to encode video and audio in one pass; "
+            "falling back to the compatible two-pass path: %s",
+            str(e),
+        )
+        return False
+    finally:
+        if tmp_wav_path:
+            try:
+                os.remove(tmp_wav_path)
+            except OSError:
+                pass
+
+
 def prepare_request(
     server_args: ServerArgs,
     sampling_params: SamplingParams,
@@ -502,7 +558,23 @@ def _sample_to_uint8_frames(sample: Any) -> list[Any]:
         if sample.dim() == 3:
             sample = sample.unsqueeze(1)
         sample = (sample * 255).clamp(0, 255).to(torch.uint8)
-        videos = sample.permute(1, 2, 3, 0).contiguous().cpu().numpy()
+        videos = sample.permute(1, 2, 3, 0).contiguous()
+        if videos.device.type == "cuda":
+            try:
+                host_videos = torch.empty(
+                    videos.shape,
+                    dtype=videos.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            except RuntimeError:
+                videos = videos.cpu().numpy()
+            else:
+                host_videos.copy_(videos, non_blocking=True)
+                torch.cuda.current_stream(videos.device).synchronize()
+                videos = host_videos.numpy()
+        else:
+            videos = videos.cpu().numpy()
         return list(videos)
 
     if not isinstance(sample, np.ndarray):
@@ -592,22 +664,33 @@ def save_materialized_output(
     os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
     if data_type == DataType.VIDEO:
         quality = output_compression / 10 if output_compression is not None else 5
-        imageio.mimsave(
-            save_file_path,
-            materialized.frames,
-            fps=materialized.fps,
-            format=data_type.get_default_extension(),
-            codec="libx264",
-            quality=quality,
-        )
-
-        _maybe_mux_audio_into_mp4(
+        output_format = data_type.get_default_extension()
+        saved_with_audio = _try_save_video_with_audio(
             save_file_path=save_file_path,
-            audio=materialized.audio,
             frames=materialized.frames,
             fps=materialized.fps,
+            audio=materialized.audio,
             audio_sample_rate=audio_sample_rate,
+            output_format=output_format,
+            quality=quality,
         )
+        if not saved_with_audio:
+            imageio.mimsave(
+                save_file_path,
+                materialized.frames,
+                fps=materialized.fps,
+                format=output_format,
+                codec="libx264",
+                quality=quality,
+            )
+
+            _maybe_mux_audio_into_mp4(
+                save_file_path=save_file_path,
+                audio=materialized.audio,
+                frames=materialized.frames,
+                fps=materialized.fps,
+                audio_sample_rate=audio_sample_rate,
+            )
     else:
         quality = output_compression if output_compression is not None else 75
         if len(materialized.frames) > 1:

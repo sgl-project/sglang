@@ -4,7 +4,11 @@ from PIL import Image
 
 import sglang.multimodal_gen.runtime.entrypoints.utils as output_utils
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
-from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    MaterializedOutput,
+    post_process_sample,
+    save_materialized_output,
+)
 
 
 def _rgb_frame() -> np.ndarray:
@@ -66,3 +70,82 @@ def test_png_output_saving_uses_fast_pillow_path(
     )
 
     assert save_calls == [("PNG", expected_compress_level)]
+
+
+def test_video_with_audio_uses_single_pass_encoder(tmp_path, monkeypatch):
+    output_path = tmp_path / "sample.mp4"
+    calls = []
+
+    class FakeWavFile:
+        @staticmethod
+        def write(*_args, **_kwargs):
+            pass
+
+    def mimsave_spy(path, frames, **kwargs):
+        calls.append((path, frames, kwargs))
+        assert kwargs["audio_path"].endswith(".wav")
+        assert kwargs["audio_codec"] == "aac"
+
+    def fail_legacy_mux(**_kwargs):
+        raise AssertionError("the two-pass mux path should not run")
+
+    monkeypatch.setattr(output_utils.imageio, "mimsave", mimsave_spy)
+    monkeypatch.setattr(output_utils, "scipy_wavfile", FakeWavFile)
+    monkeypatch.setattr(output_utils, "_maybe_mux_audio_into_mp4", fail_legacy_mux)
+
+    materialized = MaterializedOutput(
+        sample=None,
+        frames=[_rgb_frame()],
+        audio=np.zeros((320, 2), dtype=np.float32),
+        fps=24,
+    )
+    save_materialized_output(
+        materialized,
+        DataType.VIDEO,
+        str(output_path),
+        audio_sample_rate=32000,
+    )
+
+    assert len(calls) == 1
+
+
+def test_video_audio_single_pass_failure_falls_back(tmp_path, monkeypatch):
+    output_path = tmp_path / "sample.mp4"
+    calls = []
+    mux_calls = []
+
+    class FakeWavFile:
+        @staticmethod
+        def write(*_args, **_kwargs):
+            pass
+
+    def mimsave_spy(path, frames, **kwargs):
+        calls.append((path, frames, kwargs))
+        if "audio_path" in kwargs:
+            raise RuntimeError("unsupported audio input")
+
+    monkeypatch.setattr(output_utils.imageio, "mimsave", mimsave_spy)
+    monkeypatch.setattr(output_utils, "scipy_wavfile", FakeWavFile)
+    monkeypatch.setattr(
+        output_utils,
+        "_maybe_mux_audio_into_mp4",
+        lambda **kwargs: mux_calls.append(kwargs),
+    )
+
+    materialized = MaterializedOutput(
+        sample=None,
+        frames=[_rgb_frame()],
+        audio=np.zeros((320, 2), dtype=np.float32),
+        fps=24,
+    )
+    save_materialized_output(
+        materialized,
+        DataType.VIDEO,
+        str(output_path),
+        audio_sample_rate=32000,
+    )
+
+    assert len(calls) == 2
+    assert "audio_path" in calls[0][2]
+    assert "audio_path" not in calls[1][2]
+    assert len(mux_calls) == 1
