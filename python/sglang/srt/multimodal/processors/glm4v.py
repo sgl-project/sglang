@@ -16,6 +16,11 @@ try:
 except ImportError:
     GlmOcrForConditionalGeneration = None
 
+try:
+    from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+except ImportError:
+    Glm5NextForConditionalGeneration = None
+
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
     models = [
@@ -23,6 +28,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         for m in [
             Glm4vForConditionalGeneration,
             Glm4vMoeForConditionalGeneration,
+            Glm5NextForConditionalGeneration,
             GlmOcrForConditionalGeneration,
         ]
         if m is not None
@@ -46,6 +52,8 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         self.IMAGE_END_TOKEN_ID = hf_config.image_end_token_id
         self.VIDEO_START_TOKEN_ID = hf_config.video_start_token_id
         self.VIDEO_END_TOKEN_ID = hf_config.video_end_token_id
+        self.IM_START_TOKEN_ID = self.IMAGE_START_TOKEN_ID
+        self.IM_END_TOKEN_ID = self.IMAGE_END_TOKEN_ID
 
         # Vision config
         self.IMAGE_FACTOR = 28

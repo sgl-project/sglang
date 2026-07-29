@@ -5234,6 +5234,7 @@ class ServerArgs:
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
+            "Glm5NextForConditionalGeneration",
             "LongcatFlashForCausalLM",
         ]:
             # Set attention backend for DeepSeek
@@ -8083,6 +8084,7 @@ class ServerArgs:
                         "PixtralForConditionalGeneration",
                         "GlmMoeDsaForCausalLM",
                         "Glm4MoeLiteForCausalLM",
+                        "Glm5NextForConditionalGeneration",
                     ]
                 except Exception:
                     pass

@@ -51,13 +51,9 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import (
-    is_cuda,
-    is_hip,
-    is_npu,
-    support_triton,
-)
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.speculative.spec_info import SpecInputType
+from sglang.srt.utils import is_cuda, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -1586,6 +1582,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     logits_output.hidden_states = logits_output.hidden_states[
                         :num_tokens
                     ]
+            elif (
+                self.spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT_EXTEND
+                and not self.forward_mode.is_draft_extend_v2()
+            ):
+                if self.spec_info.num_correct_drafts is not None:
+                    self.spec_info.num_correct_drafts = (
+                        self.spec_info.num_correct_drafts[:bs]
+                    )
+                if self.spec_info.num_accept_tokens is not None:
+                    self.spec_info.num_accept_tokens = self.spec_info.num_accept_tokens[
+                        :bs
+                    ]
+                if self.extend_seq_lens is not None:
+                    self.extend_seq_lens = self.extend_seq_lens[:bs]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :bs
+                    ]
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
                 bs = bs * self.spec_info.num_tokens_per_req
                 if logits_output.next_token_logits is not None:
