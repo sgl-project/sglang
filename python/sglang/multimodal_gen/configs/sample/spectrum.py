@@ -51,9 +51,9 @@ class SpectrumParams(CacheParams):
             Order of the local discrete Taylor fallback used in the blend when
             `w < 1.0`. Supported values: `1`, `2`, or `3`.
         separate_cfg_branches (not a field — determined by the DiT model):
-            Wan and Hunyuan maintain independent Spectrum state per CFG branch.
-            Other ``CachableDiT`` models use one counter for all forwards; see
-            ``get_total_forward_steps()``.
+            Wan, Hunyuan, and SD3 maintain independent Spectrum state per CFG
+            branch. Other ``CachableDiT`` models use one counter for all
+            forwards; see ``get_total_forward_steps()``.
     """
 
     cache_type: str = "spectrum"
@@ -76,13 +76,15 @@ class SpectrumParams(CacheParams):
         by (2) ``begin_spectrum_step`` to wrap branch counters at end-of-run.
         Not used for logging.
 
-        - **Separate counters** (Wan, Hunyuan): each CFG branch has its own
+        - **Separate counters** (Wan, Hunyuan, SD3): each CFG branch has its own
           ``spectrum_cnt`` / forecaster. Every denoising step triggers one cond
           forward and one uncond forward, but each counter only advances on its
           branch → ``num_inference_steps`` calls per counter.
 
-        - **Single counter** (FLUX, SD3, …): one counter interleaves cond and
+        - **Single counter** (FLUX, …): one counter interleaves cond and
           uncond forwards when CFG is enabled → ``2 * num_inference_steps`` calls.
+          FLUX.1-dev uses embedded guidance (no true CFG), so this path is
+          normally single-branch in practice.
 
         When CFG is off, every model performs one forward per denoising step.
         """

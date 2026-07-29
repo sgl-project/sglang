@@ -238,13 +238,13 @@ class SpectrumMixin:
     - ``spectrum_record_features()`` — after a real forward, store block outputs.
     - ``spectrum_predict_features()`` — on skipped steps, return forecasted outputs.
 
-    Models with separate CFG branches (Wan, Hunyuan) list their config prefix in
-    ``_CFG_SUPPORTED_PREFIXES`` so cond/uncond maintain independent counters and
+    Models with separate CFG branches (Wan, Hunyuan, SD3) list their config prefix
+    in ``_CFG_SUPPORTED_PREFIXES`` so cond/uncond maintain independent counters and
     forecasters. All other ``CachableDiT`` subclasses share one counter.
     """
 
     # DiT config prefixes that run separate cond/uncond forwards (see TeaCache).
-    _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan"}
+    _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "sd3"}
 
     def _init_spectrum_state(self) -> None:
         """Initialize Spectrum state variables. Dual-branch models (Wan, Hunyuan) track separate
