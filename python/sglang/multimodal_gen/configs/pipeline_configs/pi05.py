@@ -84,7 +84,7 @@ class Pi05PipelineConfig(PipelineConfig):
         }
     )
 
-    def supports_dynamic_batching(self):
+    def supports_dynamic_batching(self, _server_args=None):
         return True
 
     def supports_native_grouped_requests(self):

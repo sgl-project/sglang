@@ -339,7 +339,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self, reqs: List[Req]
     ) -> List[OutputBatch] | _IncrementalOutputs:
         batch_size = len(reqs)
-        if self.server_args.pipeline_config.incremental_grouped_stage_count():
+        if self.server_args.pipeline_config.num_grouped_prefix_stages:
             return _IncrementalOutputs(self._iter_incremental_grouped_outputs(reqs))
 
         try:
@@ -892,15 +892,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         This is the coarse gate; request-level checks decide which requests can
         actually be merged.
         """
-        pipeline_config = self.server_args.pipeline_config
-        supports_dynamic_batching = getattr(
-            pipeline_config, "supports_dynamic_batching_for_server", None
-        )
-        if callable(supports_dynamic_batching):
-            return self._batch_admission.enabled and supports_dynamic_batching(
+        return (
+            self._batch_admission.enabled
+            and self.server_args.pipeline_config.supports_dynamic_batching(
                 self.server_args
             )
-        return self._batch_admission.enabled
+        )
 
     def get_next_batch_to_run(self) -> list[tuple[bytes | None, Any]] | None:
         """Return the next dispatchable queue item or dynamic batch.

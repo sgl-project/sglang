@@ -7,7 +7,7 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import PIL
@@ -386,24 +386,19 @@ class PipelineConfig:
     def allow_set_num_frames(self):
         return False
 
-    def supports_dynamic_batching(self):
+    def supports_dynamic_batching(self, _server_args=None):
         """Return whether this pipeline can opt in to dynamic batching.
 
         The scheduler still checks each request before merging it into a batch.
         """
         return self.task_type in (ModelTaskType.T2I, ModelTaskType.T2V)
 
-    def supports_dynamic_batching_for_server(self, server_args):
-        """Return whether dynamic batching is available for this server setup."""
-        return self.supports_dynamic_batching()
-
     def supports_native_grouped_requests(self):
         """Return whether dynamic batches should run as grouped Req lists."""
         return False
 
-    def incremental_grouped_stage_count(self):
-        """Return the shared prefix length; zero disables incremental outputs."""
-        return 0
+    # Leading stages run as a group before per-request outputs are yielded.
+    num_grouped_prefix_stages: ClassVar[int] = 0
 
     def estimate_request_cost(self, batch) -> float:
         """Return the relative cost used for batching admission caps.
