@@ -24,7 +24,6 @@ CACHE_DIR = Path(
 ).expanduser()
 SUPPORTED_WORKLOADS = ("gsm8k", "math500", "humaneval", "mbpp", "mt-bench")
 DEFAULT_WORKLOADS = "gsm8k"
-# This is the target identifier recorded in the local DFlash checkpoint.
 DEFAULT_TARGET_MODEL = "moonshotai/Kimi-K3"
 DEFAULT_TARGET_MODEL_REVISION = "9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
 DEFAULT_DFLASH_DRAFT_MODEL = "/tmp/dflash/draft-step-7000"
@@ -113,10 +112,7 @@ class DFlashConfig:
     draft_model: str
     block_size: Optional[int] = None
     draft_attention_backend: str = DEFAULT_DFLASH_DRAFT_ATTENTION_BACKEND
-    # KDA ReplaySSM ring for spec verify: skips the per-draft-token SSM
-    # snapshots in favor of raw-input rings + a commit-time exact fold.
-    # Measured on B300 TP8 humaneval conc-1 (seed 42, 64 samples):
-    # block 8 341.00 -> 361.93 tok/s, block 16 342.52 -> 366.64 tok/s.
+    # Replace per-token SSM snapshots with ReplaySSM raw-input rings.
     enable_replayssm: bool = True
 
     @property
@@ -138,10 +134,7 @@ class DFlashConfig:
         return True
 
     def _replayssm_cache_len(self) -> int:
-        # Server validation requires a power-of-two ring with
-        # L >= 2 * num_draft_tokens. 32 is the measured configuration for
-        # blocks up to 16 (the model-default block is 16 when block_size is
-        # None); larger blocks scale up to stay valid.
+        # Server validation requires a power-of-two ring at least 2x the block size.
         block = 16 if self.block_size is None else int(self.block_size)
         return max(32, 1 << (2 * block - 1).bit_length())
 
@@ -466,11 +459,11 @@ def _sampling_config_from_payload(payload: dict[str, Any]) -> SamplingConfig:
 def _methodology_to_payload(config: BenchmarkMethodologyConfig) -> dict[str, Any]:
     return {
         "num_samples": config.num_samples,
-        "min_generation_turns_per_config": (config.min_generation_turns_per_config),
+        "min_generation_turns_per_config": config.min_generation_turns_per_config,
         "min_warmup_generation_turns": config.min_warmup_generation_turns,
         "runs_per_config": config.runs_per_config,
         "timeout_s": config.timeout_s,
-        "server_shutdown_drain_timeout_s": (config.server_shutdown_drain_timeout_s),
+        "server_shutdown_drain_timeout_s": config.server_shutdown_drain_timeout_s,
         "server_shutdown_timeout_s": config.server_shutdown_timeout_s,
     }
 
@@ -648,17 +641,21 @@ def _load_user_turns(workload: str) -> list[list[str]]:
     raise ValueError(f"Unknown workload: {workload}")
 
 
+def _request_flush_cache(base_url: str, timeout_s: float) -> None:
+    import requests
+
+    requests.get(
+        base_url + "/flush_cache",
+        params={"timeout": float(timeout_s)},
+        timeout=max(float(timeout_s) + 5.0, 10.0),
+    ).raise_for_status()
+
+
 def _flush_cache(
     base_url: str, timeout_s: float = SERVER_SHUTDOWN_DRAIN_TIMEOUT_S
 ) -> None:
-    import requests
-
     try:
-        requests.get(
-            base_url + "/flush_cache",
-            params={"timeout": float(timeout_s)},
-            timeout=max(float(timeout_s) + 5.0, 10.0),
-        ).raise_for_status()
+        _request_flush_cache(base_url, timeout_s)
     except Exception as exc:
         raise RuntimeError(
             "Failed to flush cache before the next benchmark phase; "
@@ -667,14 +664,8 @@ def _flush_cache(
 
 
 def _flush_cache_best_effort(base_url: str, timeout_s: float) -> None:
-    import requests
-
     try:
-        requests.get(
-            base_url + "/flush_cache",
-            params={"timeout": float(timeout_s)},
-            timeout=max(float(timeout_s) + 5.0, 10.0),
-        ).raise_for_status()
+        _request_flush_cache(base_url, timeout_s)
     except Exception as exc:
         print(f"[shutdown] /flush_cache failed before server shutdown: {exc}")
 
@@ -1062,7 +1053,6 @@ def _run_sample(
         if decode_interval is not None:
             decode_intervals.append(decode_interval)
         spec_verify_ct_sum += spec_verify_ct
-        # Zero-verify requests have no defined acceptance length.
         if spec_verify_ct > 0:
             accept_lengths_per_request.append(
                 float(output_tokens) / float(spec_verify_ct)
@@ -2270,9 +2260,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--workloads",
-        dest="workloads",
         default=DEFAULT_WORKLOADS,
-        help=("Comma-separated workloads to run, or `all`."),
+        help="Comma-separated workloads to run, or `all`.",
     )
     parser.add_argument(
         "--csv-output",
@@ -2304,7 +2293,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--dflash-draft-model",
-        dest="dflash_draft_model",
         default=DEFAULT_DFLASH_DRAFT_MODEL,
         help="DFlash draft checkpoint path.",
     )
@@ -2353,7 +2341,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--concurrencies", default="1,32")
     parser.add_argument(
         "--num-samples",
-        dest="num_samples",
         type=int,
         default=None,
         help=(
@@ -2372,7 +2359,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--min-generation-turns-per-config",
-        dest="min_generation_turns_per_config",
         type=int,
         default=1024,
         help=(

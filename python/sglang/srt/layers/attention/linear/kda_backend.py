@@ -876,8 +876,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if ragged_layout is not None or retrieve_parent_token is not None:
             return False
         # draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
-        # specialized per block size and capped at 8 by shared-memory growth.
-        if not 2 <= draft_token_num <= 8:
+        # specialized per block size, with a single-request width-16 split-V path.
+        if not (
+            2 <= draft_token_num <= 8
+            or (draft_token_num == 16 and mixed_qkv.shape[0] == 16)
+        ):
             return False
         if layer.bias is not None or layer.lower_bound is None:
             return False
@@ -980,6 +983,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         ic_q, ic_k, ic_v = intermediate_conv_window_cache.split(
             [layer.q_dim, layer.k_dim, layer.v_dim], dim=-2
         )
+        split_v = seq_len == 16 and query_start_loc.shape[0] == 2
         # The kernel owns all 128 output channels and can fold gated RMSNorm
         # into the recurrence.
         onorm_gate = getattr(layer, "_k3_onorm_gate", None)
@@ -1018,6 +1022,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cu_seqlens=query_start_loc.to(torch.int32),
             lower_bound=float(layer.lower_bound),
             scale=layer.head_q_dim**-0.5,
+            split_v=split_v,
             replayssm_rawv=replayssm_rawv,
             replayssm_rawk=replayssm_rawk,
             replayssm_g=replayssm_g,

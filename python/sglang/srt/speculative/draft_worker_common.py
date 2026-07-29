@@ -22,8 +22,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# trtllm_mha supports dense DSPARK drafts and DFLASH checkpoints whose layer
-# policy is admitted by speculative_hook.py (currently all-causal SWA).
+# DFLASH trtllm_mha admission is validated in speculative_hook.py.
 _SUPPORTED_DRAFT_BACKENDS = (
     "flashinfer",
     "fa3",

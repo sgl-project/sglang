@@ -629,9 +629,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             return {}
 
         state = {
-            # Keep the timing payload enabled across both IPC hops
-            # (scheduler -> detokenizer -> tokenizer). The collector stays local.
-            "enable_metrics": self.enable_metrics,
+            "enable_metrics": self.enable_metrics,  # Preserve timing across both IPC hops.
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
