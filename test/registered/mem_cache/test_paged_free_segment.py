@@ -1,0 +1,126 @@
+"""Tests for PagedTokenToKVPoolAllocator.free_segment / free_segments.
+
+free_segment replaces torch.unique in the request-free path: unique's
+data-dependent output shape forces a device-to-host sync that blocks the
+scheduler behind the in-flight forward. These CPU tests check the stride-based
+page extraction against the unique reference over segment alignments, and the
+boundary-page dedup of free_segments.
+
+    python -m pytest test/registered/mem_cache/test_paged_free_segment.py -v
+"""
+
+import unittest
+
+import torch
+
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+
+PAGE_SIZE = 4
+NUM_PAGES = 64
+
+
+def _make_allocator(need_sort=False):
+    return PagedTokenToKVPoolAllocator(
+        size=NUM_PAGES * PAGE_SIZE,
+        page_size=PAGE_SIZE,
+        dtype=torch.float16,
+        device="cpu",
+        kvcache=None,
+        need_sort=need_sort,
+    )
+
+
+def _make_kv_row(alloc, num_tokens):
+    # Page-aligned allocation, then trim to num_tokens: mirrors a request's
+    # req_to_token row (token position t lives at page*page_size + t%page_size).
+    num_pages = -(num_tokens // -PAGE_SIZE)
+    indices = alloc.alloc(num_pages * PAGE_SIZE)
+    return indices[:num_tokens]
+
+
+def _pages_of(alloc):
+    return torch.cat((alloc.free_pages, alloc.release_pages))
+
+
+class TestFreeSegment(unittest.TestCase):
+    def test_matches_unique_over_alignments(self):
+        # Sweep (start, end) so segments cover: aligned/unaligned head and
+        # tail, single partial page, full row.
+        for num_tokens in (1, PAGE_SIZE, PAGE_SIZE + 1, 3 * PAGE_SIZE - 1):
+            for start in range(num_tokens):
+                for end in range(start + 1, num_tokens + 1):
+                    alloc = _make_allocator()
+                    row = _make_kv_row(alloc, num_tokens)
+                    expected = torch.unique(row[start:end] // PAGE_SIZE)
+                    before = len(alloc.free_pages)
+                    alloc.free_segment(row[start:end], start_pos=start)
+                    freed = alloc.free_pages[: len(alloc.free_pages) - before]
+                    self.assertTrue(
+                        torch.equal(torch.sort(freed)[0], expected),
+                        f"{num_tokens=} {start=} {end=}",
+                    )
+
+    def test_empty_segment_is_noop(self):
+        alloc = _make_allocator()
+        row = _make_kv_row(alloc, PAGE_SIZE)
+        before = len(alloc.free_pages)
+        alloc.free_segment(row[:0], start_pos=0)
+        self.assertEqual(len(alloc.free_pages), before)
+
+    def test_need_sort_routes_to_release_pages(self):
+        alloc = _make_allocator(need_sort=True)
+        row = _make_kv_row(alloc, 2 * PAGE_SIZE)
+        alloc.free_segment(row, start_pos=0)
+        self.assertEqual(len(alloc.release_pages), 2)
+
+    def test_group_defers_until_group_end(self):
+        alloc = _make_allocator()
+        row = _make_kv_row(alloc, 2 * PAGE_SIZE)
+        before = len(alloc.free_pages)
+        alloc.free_group_begin()
+        alloc.free_segment(row, start_pos=0)
+        self.assertEqual(len(alloc.free_pages), before)
+        alloc.free_group_end()
+        self.assertEqual(len(alloc.free_pages), before + 2)
+
+
+class TestFreeSegments(unittest.TestCase):
+    def _freed_by_segments(self, num_tokens, spans):
+        alloc = _make_allocator()
+        row = _make_kv_row(alloc, num_tokens)
+        before = len(alloc.free_pages)
+        alloc.free_segments([(row[a:b], a) for a, b in spans])
+        freed = alloc.free_pages[: len(alloc.free_pages) - before]
+        reference = torch.unique(torch.cat([row[a:b] for a, b in spans]) // PAGE_SIZE)
+        return freed, reference
+
+    def test_adjacent_segments_share_boundary_page(self):
+        # [0, 6) and [6, 11) with page_size 4: page 1 spans both segments and
+        # must be freed exactly once.
+        freed, reference = self._freed_by_segments(11, [(0, 6), (6, 11)])
+        self.assertTrue(torch.equal(torch.sort(freed)[0], reference))
+
+    def test_disjoint_segments_share_boundary_page(self):
+        # [0, 5) and [7, 11): gap [5, 7) stays within page 1, which both
+        # segments touch.
+        freed, reference = self._freed_by_segments(11, [(0, 5), (7, 11)])
+        self.assertTrue(torch.equal(torch.sort(freed)[0], reference))
+
+    def test_second_segment_inside_shared_page_is_skipped(self):
+        # [0, 5) and [5, 7): the second segment lies entirely in page 1,
+        # already emitted by the first.
+        freed, reference = self._freed_by_segments(7, [(0, 5), (5, 7)])
+        self.assertTrue(torch.equal(torch.sort(freed)[0], reference))
+
+    def test_page_aligned_segments_no_trim(self):
+        freed, reference = self._freed_by_segments(
+            3 * PAGE_SIZE, [(0, PAGE_SIZE), (PAGE_SIZE, 3 * PAGE_SIZE)]
+        )
+        self.assertTrue(torch.equal(torch.sort(freed)[0], reference))
+
+
+if __name__ == "__main__":
+    unittest.main()
