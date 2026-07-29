@@ -15,7 +15,8 @@ mod request;
 mod sampling;
 mod types;
 
-pub use egress::{ChunkEvent, EgressSink};
+pub use egress::{ChunkEvent, EgressItem, EgressSink};
+pub(crate) use io_struct::{AbortReq, ControlRequest};
 pub use request::{GenerateRequest, RequestKind};
 pub(crate) use sampling::{SamplingParams, SamplingParamsInput};
 pub(crate) use types::{OneOrMany, OneOrManyItem, TokenIds};

@@ -10,6 +10,8 @@
 //! the rest of the pipeline only through `flume` channels: [`TmEvent`] into the
 //! ingress loop, [`Senders`] fanning out to the pools.
 
+mod ingress;
+
 use crate::ids::Rid;
 use crate::message::{DetokMsg, Request};
 
