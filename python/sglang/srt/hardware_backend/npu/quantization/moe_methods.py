@@ -1,7 +1,8 @@
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
+from torch.nn.parameter import Parameter
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
@@ -13,12 +14,54 @@ if TYPE_CHECKING:
 
 import logging
 
-from sglang.srt.hardware_backend.npu.moe.hidden_states_quant import (
-    HiddenStatesDynamicQuant,
+from sglang.srt.hardware_backend.npu.moe.matmul import (
+    GroupedMatmul,
+    GroupedMatmulSwigluQuant,
 )
-from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmul
+from sglang.srt.hardware_backend.npu.moe.quant import HiddenStatesDynamicQuant
+from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+    _get_float8_e8m0fnu_dtype,
+)
 
 logger = logging.getLogger(__name__)
+
+
+_E8M0_DTYPE = None
+
+
+def _require_e8m0_dtype():
+    """Resolve the e8m0 block-scale dtype, failing loudly if it is unavailable.
+
+    The grouped matmuls validate their scale-dtype arguments against torch_npu's
+    own dtype enum (``torch_npu.float8_e8m0fnu``, 293 on A5) and reject the torch
+    dtype object with "weight_scale_dtype only supports float8_e8m0fnu or None,
+    but the actual value is Float8_e8m0fnu" — hence torch_npu first, torch only
+    as a fallback. Dense ``npu_quant_matmul`` accepts either, which is why
+    ``_get_float8_e8m0fnu_dtype`` reads it off torch.
+
+    The MXFP8 ops take the scale dtype explicitly; passing None silently changes
+    how they interpret the scales, so a missing dtype must raise rather than
+    propagate.
+
+    torch_npu is imported lazily (and cached) so this module stays importable on
+    CUDA/CPU/AMD/XPU CI.
+    """
+    global _E8M0_DTYPE
+    if _E8M0_DTYPE is None:
+        from sglang.srt.utils import is_npu
+
+        if is_npu():
+            import torch_npu
+
+            _E8M0_DTYPE = getattr(torch_npu, "float8_e8m0fnu", None)
+        if _E8M0_DTYPE is None:
+            _E8M0_DTYPE = _get_float8_e8m0fnu_dtype()
+        if _E8M0_DTYPE is None:
+            raise RuntimeError(
+                "float8_e8m0fnu dtype not found — MXFP8 MoE requires Ascend A5 "
+                "with a torch_npu build exposing float8_e8m0fnu (torch_npu >= 2.9)."
+            )
+    return _E8M0_DTYPE
 
 
 # DEPRECATED METHOD
@@ -713,4 +756,197 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             group_list_type=group_list_type,
             transposed=False,
             **self._get_bias_args(quant_info, weight_prefix),
+        )
+
+
+# ---------------------------------------------------------------------------
+#  NPUMXFP8MoEMethod
+# ---------------------------------------------------------------------------
+class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
+    """MXFP8 MoE on Ascend A5 – float8_e4m3fn weights with e8m0 block scales.
+
+    Serves both the online config path (``--quantization mxfp8``, weights
+    quantised at load time) and the offline ModelSlim ``W8A8_MXFP8`` scheme
+    (weights already quantised); ``process_weights_after_loading`` tells the two
+    apart by weight dtype.
+
+    gmm1 re-quantises its own output, so it is a single fused kernel rather than
+    a matmul plus a separate activation: the runner calls
+    ``apply_fused_gmm1_swiglu`` for w13 and ``apply`` only for w2 — hence the
+    per-prefix matmul chosen here.
+
+    Where the *activation* quant happens depends on the dispatcher. On
+    ``ascend_tp`` it comes for free from ``npu_moe_init_routing_v2(quant_mode=3)``,
+    which emits the e4m3 payload and e8m0 scale as part of routing. DeepEP has no
+    mxfp8 dispatch dtype, so it hands over bf16 and w13 quantises the hidden
+    states itself before gmm1.
+    """
+
+    def __init__(self, weight_prefix: str):
+        super().__init__(quant_config=None)
+        if weight_prefix == "w13":
+            self.matmul = GroupedMatmulSwigluQuant()
+            self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+                quant_dtype=torch.float8_e4m3fn
+            )
+        else:
+            self.matmul = GroupedMatmul()
+            self.hidden_states_quantizer = None
+
+    @staticmethod
+    def _quantize_weight_online(
+        weight: torch.Tensor, weight_prefix: str
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantise BF16/FP16 expert weights ``[E, N, K]`` to MXFP8 at load time.
+
+        Returns the e4m3 payload ``[E, N, K]`` and its e8m0 block scale
+        ``[E, N, K//64, 2]`` (block_size=32, already pair-split by the op).
+        """
+        if weight.dtype not in (torch.float16, torch.bfloat16):
+            logger.warning(
+                "NPUMXFP8MoEMethod: %s_weight dtype %s is not float16/bfloat16; "
+                "casting to bfloat16 before MXFP8 quantisation.",
+                weight_prefix,
+                weight.dtype,
+            )
+            weight = weight.to(torch.bfloat16)
+        # cpu offload may have moved the weight back to host memory.
+        if not weight.is_npu:
+            weight = weight.to(f"npu:{torch.npu.current_device()}")
+        return torch.ops.npu.npu_dynamic_mx_quant(weight, dst_type=torch.float8_e4m3fn)
+
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, weight_prefix: str
+    ) -> None:
+        self._validate_weight_prefix(layer, weight_prefix)
+
+        weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight").data
+        if weight.dtype == torch.float8_e4m3fn:
+            # Offline (ModelSlim) path: the checkpoint already holds e4m3 weights
+            # and {prefix}_weight_scale holds uint8 block scales [E, N, K//32].
+            # Only re-layout: split the flat scale axis into pairs to match what
+            # npu_dynamic_mx_quant produces online.
+            scale: torch.Tensor = getattr(layer, f"{weight_prefix}_weight_scale").data
+            scale = scale.reshape(scale.shape[0], -1, scale.shape[-1] // 2, 2)
+        else:
+            weight, scale = self._quantize_weight_online(weight, weight_prefix)
+
+        # FRACTAL_NZ before the transpose, never after. gmm1 asserts that weight
+        # and weight_scale carry the SAME transpose flag (CheckMXTranspose: "the
+        # transposition of weightScale/weight should be equal"), and the cast
+        # yields a physically retiled — hence non-transposed — tensor. Casting
+        # the [E, K, N] view would therefore leave the weight at false against a
+        # true scale and fail outright, which is why this cannot copy the int8
+        # MoE methods above (they transpose first, but carry no MX scale to keep
+        # in sync). Same order as the dense W4A8 path in linear_method_npu.py.
+        #
+        # A5 measurement, Qwen3-30B-A3B shapes, 128 experts (see
+        # llm/probe_mxfp8_moe_nz.py): +1.4% decode, +3.8% prefill against a 0.2-
+        # 0.3% noise floor, bit-identical outputs. Set
+        # SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT to fall back to plain ND.
+        weight = npu_format_cast(weight)
+
+        # Both paths hand the grouped matmul weight [E, K, N] and scale
+        # [E, K//64, N, 2] as strided transpose views — DO NOT call
+        # .contiguous(). Beyond breaking the transpose-flag match above, it
+        # measures slower on the same probe: making both sides contiguous costs
+        # 6.2% on decode. This matches NPUMXFP8LinearMethod, msmodelslim's
+        # offline layout and vllm-ascend's AscendW8A8MXFP8DynamicFusedMoEMethod.
+        setattr(
+            layer,
+            f"{weight_prefix}_weight",
+            Parameter(weight.transpose(1, 2), requires_grad=False),
+        )
+        setattr(
+            layer,
+            f"{weight_prefix}_weight_scale",
+            Parameter(scale.transpose(1, 2), requires_grad=False),
+        )
+
+        if weight_prefix == "w13":
+            from sglang.srt.layers.moe import get_moe_a2a_backend
+
+            # DeepEP has no mxfp8 entry in its dispatch dtype table, so let it
+            # keep sending bf16; apply_fused_gmm1_swiglu quantises instead.
+            dispatcher_dtype = "bf16" if get_moe_a2a_backend().is_deepep() else "mxfp8"
+            self._set_dispatcher_output_dtype(layer, dispatcher_dtype)
+
+    def apply_fused_gmm1_swiglu(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        group_list_type,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gate/up projection, swiglu and requantisation in one kernel (gmm1).
+
+        Returns the e4m3 activations and their e8m0 block scale, i.e. exactly
+        what the w2 gmm needs, which is why the runner skips its activation step
+        for MXFP8.
+
+        ``pertoken_scale`` is None when the dispatcher handed over unquantised
+        hidden states (the DeepEP path), in which case the activation quant that
+        ascend_tp fuses into routing is done here instead. Both dispatchers
+        therefore reach the kernel below with the same e4m3 + e8m0 input.
+        """
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+
+        e8m0_dtype = _require_e8m0_dtype()
+        return self.matmul.forward(
+            quant_info,
+            "w13",
+            hidden_states,
+            expert_tokens,
+            group_list_type=group_list_type,
+            transposed=True,
+            weight_scale=[quant_info.w13_weight_scale],
+            x_scale=pertoken_scale,
+            dequant_mode=2,
+            quant_mode=2,
+            dequant_dtype=torch.float32,
+            quant_dtype=torch.float8_e4m3fn,
+            # e4m3 is implicit for these two — it is not in the op's QUANT_DTYPES.
+            x_dtype=None,
+            weight_dtype=None,
+            weight_scale_dtype=e8m0_dtype,
+            x_scale_dtype=e8m0_dtype,
+        )
+
+    def apply(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+        weight_prefix: str,
+        group_list_type,
+    ) -> torch.Tensor:
+        if weight_prefix != "w2":
+            raise ValueError(
+                f"NPUMXFP8MoEMethod.apply only serves the w2 gmm, got "
+                f"'{weight_prefix}'. gmm1 fuses swiglu into a single op and must "
+                f"go through apply_fused_gmm1_swiglu, which returns a scale too."
+            )
+
+        e8m0_dtype = _require_e8m0_dtype()
+        scale_args: Dict[str, Any] = {
+            "scale": [getattr(quant_info, f"{weight_prefix}_weight_scale", None)],
+            "per_token_scale": [pertoken_scale],
+            "scale_dtype": e8m0_dtype,
+            "per_token_scale_dtype": e8m0_dtype,
+            "x_dtype": None,
+            "weight_dtype": None,
+        }
+        return self.matmul.forward(
+            quant_info,
+            weight_prefix,
+            hidden_states,
+            expert_tokens,
+            output_dtype,
+            group_list_type=group_list_type,
+            transposed=True,
+            **scale_args,
         )

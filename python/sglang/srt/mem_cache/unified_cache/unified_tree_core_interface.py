@@ -102,13 +102,13 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
+    from sglang.srt.mem_cache.unified_cache.components import (
+        CacheTransferPhase,
+        ComponentType,
+    )
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
         StorageBackupSpec,
         UnifiedTreeNode,
-    )
-    from sglang.srt.mem_cache.unified_cache_components import (
-        CacheTransferPhase,
-        ComponentType,
     )
 
 

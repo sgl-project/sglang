@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentHostSlot,
     MambaEvictExcessPathStates,
 )
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
