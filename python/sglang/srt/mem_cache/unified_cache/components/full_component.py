@@ -45,7 +45,7 @@ class FullComponent(TreeComponent):
         self._full_kv_pool_host = None
 
     def create_match_validator(
-        self, match_device_only: bool = False
+        self, match_device_only: bool = False, skip_mamba_match: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
         if match_device_only:
             return (
