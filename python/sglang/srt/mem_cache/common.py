@@ -196,7 +196,11 @@ def _release_overallocated_kv_indices(
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
-        tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+        # start_p is ceil-aligned above: never shares a page with
+        # cache_finished_req's tail frees in the same group.
+        tree_cache.token_to_kv_pool_allocator.free_segment(
+            indices_to_free, start_pos=start_p
+        )
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
