@@ -994,6 +994,20 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             patch.object(overrides_module, "is_npu", return_value=False),
             patch.object(overrides_module, "is_xpu", return_value=False),
+            patch.object(overrides_module, "is_hip", return_value=False),
+            patch("torch.cuda.get_device_capability", return_value=(12, 0)),
+        ):
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(arch="GlmMoeDsaForCausalLM")),
+                {
+                    "dsa_prefill_backend": "flashinfer_sparse_mla",
+                    "dsa_decode_backend": "flashinfer_sparse_mla",
+                },
+            )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch.object(overrides_module, "is_npu", return_value=False),
+            patch.object(overrides_module, "is_xpu", return_value=False),
             patch.object(overrides_module, "is_hip", return_value=True),
             patch("torch.cuda.get_device_capability", return_value=(9, 4)),
         ):
