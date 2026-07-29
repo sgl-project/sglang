@@ -116,20 +116,13 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         raise NotImplementedError()
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int = 0):
-        """Free a contiguous token-position segment of one request's kv indices.
-
-        ``free_index`` must be ``kv_row[start_pos : start_pos + n]`` of a single
-        request (or a page-aligned copy of one, e.g. a radix tree node value).
-        Subclasses may use ``start_pos`` to derive the freed pages without a
-        data-dependent dedup; the default ignores it and falls back to free().
-        """
+        """Free ``kv_row[start_pos : start_pos + n]`` of one request (or a
+        page-aligned copy); subclasses may use ``start_pos`` to skip the
+        data-dependent dedup. Default: plain free()."""
         self.free(free_index)
 
     def free_segments(self, segments):
-        """Free ``(free_index, start_pos)`` segments of one request's kv row.
-
-        Segments must be disjoint and in ascending token-position order;
-        consecutive segments may share a boundary page.
-        """
+        """Free disjoint ascending ``(free_index, start_pos)`` segments of one
+        request's kv row; consecutive segments may share a boundary page."""
         for free_index, start_pos in segments:
             self.free_segment(free_index, start_pos=start_pos)
