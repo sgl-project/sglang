@@ -59,7 +59,9 @@ pub(super) trait Tagged {
 /// the [`Tagged`] impl are generated. **The struct name is the Python class
 /// name** (via `stringify!`), so name it exactly as `io_struct.py` does — the
 /// per-message tests assert the tag, so a rename fails loudly. Field attributes
-/// pass through.
+/// pass through. The http_worker_ipc is just a placeholder for the scheduler's
+/// `BaseReq` and is always `()`, without it the scheduler's `BaseReq` would be
+/// misaligned on the wire.
 ///
 /// Two forms, and **one invocation may use only one** (an arm matches the whole
 /// invocation): `Name<'a>` borrows its rid — zero-copy, for the hot path;
