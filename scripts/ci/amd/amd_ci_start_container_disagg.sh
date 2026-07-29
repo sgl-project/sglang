@@ -228,9 +228,7 @@ else
   retry_with_backoff 6 docker pull "${IMAGE}"
 fi
 
-# Keep disaggregation on its separate host cache to avoid exhausting the
-# shared cache volume (#26905).
-CACHE_HOST=/home/runner/temp-sglang-data
+CACHE_HOST=/home/runner/sglang-data
 if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
   RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
   RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"
