@@ -262,7 +262,7 @@ class PipelineExecutor(ABC):
             batches = stage.run_grouped_requests(batches, server_args)
         return batches
 
-    def execute_group_iter(
+    def execute_group_sequentially(
         self,
         stages: List["PipelineStage"],
         batches: list[Req],
