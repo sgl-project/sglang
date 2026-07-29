@@ -1018,6 +1018,7 @@ class AscendAttnBackend(AttentionBackend):
             not is_prefill
             and not self.graph_mode
             and num_token_non_padded is not None
+            and num_token_non_padded > 0
             and num_token_padding > num_token_non_padded
         )
         if trim_eager_padding:
