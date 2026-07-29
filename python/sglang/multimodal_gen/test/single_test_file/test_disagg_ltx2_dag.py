@@ -8,9 +8,13 @@ GPU 1) so it fits the multimodal ``2-gpu`` CI suite alongside Z-Image disagg.
 
 Run directly:
 
-    CUDA_VISIBLE_DEVICES=0,1 MC_FORCE_TCP=1 \\
+    CUDA_VISIBLE_DEVICES=0,1 MC_GID_INDEX=3 \\
         pytest -v python/sglang/multimodal_gen/test/single_test_file/test_disagg_ltx2_dag.py
     pytest -v ... -k DualVae
+
+On RoCE hosts set ``MC_GID_INDEX`` to a global RoCEv2 GID before launch.
+Use ``MC_FORCE_TCP=1`` only when RDMA is unavailable (e.g. container without
+``--net=host``).
 """
 
 from __future__ import annotations
@@ -167,11 +171,6 @@ class TestDisaggLtx2DualVaeDag(_DisaggTestBase):
         "vae_audio": list(_LTX2_TRANSFER_ARGS),
         "server": ["--disagg-timeout", "900"],
     }
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        os.environ.setdefault("MC_FORCE_TCP", "1")
-        super().setUpClass()
 
     def test_generates_muxed_av_mp4(self) -> None:
         """Fan-out + dual terminals produce one mp4 with video and audio streams."""
