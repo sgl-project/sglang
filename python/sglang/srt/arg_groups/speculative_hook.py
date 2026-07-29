@@ -438,7 +438,14 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     """
     from sglang.srt.utils import is_hip
 
-    supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
+    supported_draft_backends = (
+        "flashinfer",
+        "fa3",
+        "fa4",
+        "triton",
+        "trtllm_mha",
+        "ascend",
+    )
     # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
     fallback_backend = "triton" if is_hip() else "flashinfer"
 
@@ -453,13 +460,38 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     if draft_backend is None:
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
-        logger.warning(
-            "DFLASH draft worker does not support 'trtllm_mha' because the "
-            "draft path requires per-layer DFlash attention. Falling back to "
-            "'%s'.",
-            fallback_backend,
+        from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        draft_hf_config = get_config(
+            server_args.speculative_draft_model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.speculative_draft_model_revision,
+            model_override_args=json.loads(server_args.json_model_override_args),
         )
-        draft_backend = fallback_backend
+        draft_text_config = (
+            getattr(draft_hf_config, "text_config", None) or draft_hf_config
+        )
+        layer_types = get_dflash_layer_types(draft_hf_config)
+        num_layers = getattr(draft_text_config, "num_hidden_layers", None)
+        all_sliding = (
+            layer_types is not None
+            and isinstance(num_layers, int)
+            and not isinstance(num_layers, bool)
+            and num_layers > 0
+            and len(layer_types) == num_layers
+            and all(layer_type == "sliding_attention" for layer_type in layer_types)
+        )
+        if not all_sliding:
+            logger.warning(
+                "DFLASH only enables 'trtllm_mha' when every draft layer uses "
+                "causal sliding attention; got num_hidden_layers=%r, "
+                "layer_types=%r. Falling back to '%s'.",
+                num_layers,
+                layer_types,
+                fallback_backend,
+            )
+            draft_backend = fallback_backend
     elif draft_backend not in supported_draft_backends:
         logger.warning(
             "DFLASH draft worker only supports attention_backend in %s for now, "

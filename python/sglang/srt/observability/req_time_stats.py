@@ -629,9 +629,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             return {}
 
         state = {
+            # Keep the timing payload enabled across both IPC hops
+            # (scheduler -> detokenizer -> tokenizer). The collector stays local.
+            "enable_metrics": self.enable_metrics,
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
+            "last_decode_finish_time": self.last_decode_finish_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         return state
@@ -1153,6 +1157,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if self.prefill_finished_time > 0.0:
             meta_data["prefill_finished_time"] = convert_time_to_realtime(
                 self.prefill_finished_time
+            )
+        if self.last_decode_finish_time > 0.0:
+            meta_data["last_decode_finish_time"] = convert_time_to_realtime(
+                self.last_decode_finish_time
             )
         meta_data.update(
             {
