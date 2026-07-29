@@ -13,7 +13,7 @@
 # ==============================================================================
 """Common utilities."""
 
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional
 
 from sglang.kernels.ops.kvcache.mla_buffer import (
     get_mla_kv_buffer_kernel as get_mla_kv_buffer_kernel,
@@ -39,7 +39,6 @@ from sglang.kernels.ops.kvcache.mla_buffer import (
 from sglang.kernels.ops.kvcache.mla_buffer import (
     set_mla_kv_scale_buffer_triton as set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cpp_utils.native_hash import get_native_hash
 from sglang.srt.mem_cache.evict_policy import (
     EvictionStrategy,
@@ -72,35 +71,6 @@ def get_eviction_strategy(eviction_policy: str) -> EvictionStrategy:
         raise ValueError(
             f"Unknown eviction policy: {policy}. Supported policies: '{supported}'."
         ) from None
-
-
-def maybe_init_custom_mem_pool(
-    device: str,
-) -> Tuple[bool, Optional[Any], Optional[str]]:
-    """
-    Initialize custom memory pool based on environment variable.
-
-    This function can be modified to support more features that require a custom memory pool.
-
-    Args:
-        device: The device to allocate memory on
-
-    Returns:
-        Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
-    """
-    enable_custom_mem_pool = (
-        True if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None else False
-    )
-
-    if enable_custom_mem_pool:
-        # Currently, only mooncake requires a custom mem pool for MNNVL/Barex PD disaggregation
-        from sglang.srt.disaggregation.mooncake.utils import (
-            init_mooncake_custom_mem_pool,
-        )
-
-        return init_mooncake_custom_mem_pool(device)
-    else:
-        return False, None, None
 
 
 def get_hash_str(

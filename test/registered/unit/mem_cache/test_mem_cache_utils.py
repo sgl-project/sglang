@@ -1,11 +1,9 @@
 """Unit tests for mem_cache/utils.py — no server, no model loading."""
 
 import hashlib
-import sys
-import types
 import unittest
 from array import array
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from sglang.srt.mem_cache.evict_policy import (
     FIFOStrategy,
@@ -21,7 +19,6 @@ from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     get_hash_str,
     hash_str_to_int64,
-    maybe_init_custom_mem_pool,
     split_node_hash_value,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -179,38 +176,6 @@ class TestGetEvictionStrategy(unittest.TestCase):
         s1 = get_eviction_strategy("lru")
         s2 = get_eviction_strategy("lru")
         self.assertIsNot(s1, s2)
-
-
-class TestMaybeInitCustomMemPool(unittest.TestCase):
-    @patch("sglang.srt.mem_cache.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get")
-    def test_disabled_by_default(self, mock_env_get):
-        mock_env_get.return_value = None
-        enabled, pool, pool_type = maybe_init_custom_mem_pool("cuda:0")
-        self.assertFalse(enabled)
-        self.assertIsNone(pool)
-        self.assertIsNone(pool_type)
-
-    @patch("sglang.srt.mem_cache.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get")
-    def test_enabled_via_env(self, mock_env_get):
-        mock_env_get.return_value = "enabled"
-        mock_init = MagicMock()
-        mock_init.return_value = (True, "mock_pool_instance", "mooncake")
-
-        mooncake_pkg = types.ModuleType("sglang.srt.disaggregation.mooncake")
-        mooncake_utils = types.ModuleType("sglang.srt.disaggregation.mooncake.utils")
-        mooncake_utils.init_mooncake_custom_mem_pool = mock_init
-        with patch.dict(
-            sys.modules,
-            {
-                "sglang.srt.disaggregation.mooncake": mooncake_pkg,
-                "sglang.srt.disaggregation.mooncake.utils": mooncake_utils,
-            },
-        ):
-            enabled, pool, pool_type = maybe_init_custom_mem_pool("cuda:0")
-        self.assertTrue(enabled)
-        self.assertEqual(pool, "mock_pool_instance")
-        self.assertEqual(pool_type, "mooncake")
-        mock_init.assert_called_once_with("cuda:0")
 
 
 class TestGetHashStr(unittest.TestCase):
