@@ -18,7 +18,7 @@ register_cuda_ci(
     runner_config="4-gpu-b200",
 )
 
-WORLD_SIZE = 4
+WORLD_SIZE = int(os.environ.get("DCP_TEST_WORLD_SIZE", "4"))
 ROWS = (1, 8, 32, 64)
 LOCAL_HEADS = 4
 HEAD_DIM = 64
