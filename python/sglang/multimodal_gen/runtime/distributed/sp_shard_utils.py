@@ -218,10 +218,10 @@ def plan_text_strategy(txt_len: int) -> str:
     sp_size = get_sp_world_size()
     if sp_size <= 1:
         return "replicate"
-    # a shorter stream would leave more than one rank with only padding, so
-    # the padding could no longer form the single global-tail block expected
-    # by tail_attn_meta
-    if txt_len < sp_size:
+    local_len = (txt_len + sp_size - 1) // sp_size
+    num_pad = local_len * sp_size - txt_len
+    # padding must fit in the final shard to remain one global-tail block
+    if num_pad > local_len:
         return "replicate"
     if txt_len % sp_size != 0 and get_ring_parallel_world_size() > 1:
         return "replicate"
