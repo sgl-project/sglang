@@ -18,7 +18,11 @@ from typing import TYPE_CHECKING, Dict, Union
 
 import torch
 
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    is_deepseek_dsa,
+    is_deepseek_v4,
+)
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -83,7 +87,8 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         return bool(decision.item())
 
     def _replay_graph(self, shape_key, forward_batch):
-        if not is_deepseek_dsa(self.model_runner.model_config.hf_config):
+        hf_config = self.model_runner.model_config.hf_config
+        if not (is_deepseek_dsa(hf_config) and is_deepseek_v4(hf_config)):
             seq_lens_for_each_draft_step = []
             for speculative_step_id in range(self.speculative_num_steps - 1):
                 seq_lens_cpu = (
