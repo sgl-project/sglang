@@ -386,7 +386,7 @@ class PipelineConfig:
     def allow_set_num_frames(self):
         return False
 
-    def supports_dynamic_batching(self, _server_args=None):
+    def supports_dynamic_batching(self):
         """Return whether this pipeline can opt in to dynamic batching.
 
         The scheduler still checks each request before merging it into a batch.

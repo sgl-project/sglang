@@ -487,7 +487,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         # Flux2 does not use pooler output.
         return None
 
-    def supports_dynamic_batching(self, _server_args=None):
+    def supports_dynamic_batching(self):
         """Allow batching for Flux2 text-only requests.
 
         Flux2 is a TI2I pipeline, so image-input requests are rejected by the
