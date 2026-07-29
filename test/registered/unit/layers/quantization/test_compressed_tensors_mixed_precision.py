@@ -1,24 +1,10 @@
 """CPU regression tests for multi-group ("mixed-precision") compressed-tensors configs.
 
-Two independent bugs made every layer of such a checkpoint fall back to an
-unquantized method, which surfaces as an OOM (weights allocated in bf16) or as
-``KeyError: '...experts.w2_input_global_scale'`` while loading weights -- never
-as a readable "this layer is not quantized" message.
-
-1. ``ignore`` was matched by raw substring. llm-compressor writes *parent*
-   modules into ``ignore`` (e.g. ``model.layers.0.mlp.experts.0``, which owns no
-   weights of its own), so such an entry swallowed its quantized children
-   (``model.layers.0.mlp.experts.0.gate_proj``). A real Qwen3.5-VL NVFP4
-   checkpoint has 10240 such entries and lost 30810 quantized modules this way.
-
-2. The activation-quantization gate read the *top-level* ``format``. When
-   config_groups disagree, compressed-tensors sets the top-level format to
-   ``mixed-precision`` and puts the real format on each group, so
-   ``input_activations`` was dropped for every group and no W4A4 / W8A8 scheme
-   could ever be selected.
-
-These are pure config-parsing paths (no weights are created and no kernels run),
-so they run on CPU.
+Such a checkpoint used to load completely unquantized. ``ignore`` was matched by
+substring, so a parent module entry swallowed its quantized children, and the
+activation-quantization gate read the top-level format -- which compressed-tensors
+sets to ``mixed-precision`` when groups disagree -- dropping ``input_activations``
+for every group. Both are config-parsing paths, so these tests run on CPU.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -26,11 +12,15 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from unittest import mock
 
 import torch
 
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
+)
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsWNA16,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
@@ -40,62 +30,78 @@ from sglang.test.test_utils import CustomTestCase
 
 EXPERTS_LAYER = "model.language_model.layers.0.mlp.experts"
 GATE_PROJ = f"{EXPERTS_LAYER}.0.gate_proj"
+MLP_LAYER = "model.language_model.layers.0.mlp.gate_proj"
 
-# NVFP4 experts + FP8 attention/GDN projections, i.e. two groups with different
-# formats -> compressed-tensors writes format="mixed-precision" at the top level.
-MIXED_PRECISION_CONFIG = {
-    "quant_method": "compressed-tensors",
-    "format": "mixed-precision",
-    "config_groups": {
-        "group_0": {
-            "format": "float-quantized",
-            "targets": ["re:.*self_attn\\.(q|k|v|o)_proj$"],
-            "weights": {
-                "num_bits": 8,
-                "type": "float",
-                "symmetric": True,
-                "strategy": "channel",
-                "dynamic": False,
-            },
-            "input_activations": {
-                "num_bits": 8,
-                "type": "float",
-                "symmetric": True,
-                "strategy": "token",
-                "dynamic": True,
-            },
-        },
-        "group_1": {
-            "format": "nvfp4-pack-quantized",
-            "targets": ["re:.*mlp\\.experts\\.\\d+\\.(gate|up|down)_proj$"],
-            "weights": {
-                "num_bits": 4,
-                "type": "float",
-                "symmetric": True,
-                "strategy": "tensor_group",
-                "group_size": 16,
-                "dynamic": False,
-            },
-            "input_activations": {
-                "num_bits": 4,
-                "type": "float",
-                "symmetric": True,
-                "strategy": "tensor_group",
-                "group_size": 16,
-                "dynamic": "local",
-            },
-        },
+FP8_TARGET = "re:.*self_attn\\.(q|k|v|o)_proj$"
+NVFP4_TARGET = "re:.*mlp\\.experts\\.\\d+\\.(gate|up|down)_proj$"
+WNA16_TARGET = "re:.*mlp\\.(gate|up|down)_proj$"
+
+# FP8 W8A8 attention projections.
+FP8_GROUP = {
+    "format": "float-quantized",
+    "targets": [FP8_TARGET],
+    "weights": {
+        "num_bits": 8,
+        "type": "float",
+        "symmetric": True,
+        "strategy": "channel",
+        "dynamic": False,
     },
-    # The parent-module entries llm-compressor emits. They own no weights, so
-    # they are no-ops for quantization -- but they must not swallow their
-    # children either.
-    "ignore": [
-        "model.language_model.layers.0.mlp.gate",
-        "model.language_model.layers.0.linear_attn",
-        f"{EXPERTS_LAYER}.0",
-        f"{EXPERTS_LAYER}.1",
-    ],
+    "input_activations": {
+        "num_bits": 8,
+        "type": "float",
+        "symmetric": True,
+        "strategy": "token",
+        "dynamic": True,
+    },
 }
+
+# NVFP4 W4A4 expert projections.
+NVFP4_GROUP = {
+    "format": "nvfp4-pack-quantized",
+    "targets": [NVFP4_TARGET],
+    "weights": {
+        "num_bits": 4,
+        "type": "float",
+        "symmetric": True,
+        "strategy": "tensor_group",
+        "group_size": 16,
+        "dynamic": False,
+    },
+    "input_activations": {
+        "num_bits": 4,
+        "type": "float",
+        "symmetric": True,
+        "strategy": "tensor_group",
+        "group_size": 16,
+        "dynamic": "local",
+    },
+}
+
+# Weight-only INT4: a group whose format is not an activation format.
+WNA16_GROUP = {
+    "format": "pack-quantized",
+    "targets": [WNA16_TARGET],
+    "weights": {
+        "num_bits": 4,
+        "type": "int",
+        "symmetric": True,
+        "strategy": "group",
+        "group_size": 128,
+        "dynamic": False,
+    },
+    "input_activations": None,
+}
+
+
+def _mixed_precision_config(*groups, ignore=()):
+    """Groups disagree, so compressed-tensors writes format="mixed-precision"."""
+    return {
+        "quant_method": "compressed-tensors",
+        "format": "mixed-precision",
+        "config_groups": {f"group_{i}": g for i, g in enumerate(groups)},
+        "ignore": list(ignore),
+    }
 
 
 class TestIgnoreListPrefixMatching(CustomTestCase):
@@ -148,7 +154,8 @@ class TestMixedPrecisionFormat(CustomTestCase):
     """The per-group `format` must win over a top-level "mixed-precision"."""
 
     def test_input_activations_survive_mixed_precision(self):
-        quant_config = CompressedTensorsConfig.from_config(MIXED_PRECISION_CONFIG)
+        config = _mixed_precision_config(FP8_GROUP, NVFP4_GROUP)
+        quant_config = CompressedTensorsConfig.from_config(config)
 
         for target, scheme in quant_config.target_scheme_map.items():
             self.assertIsNotNone(
@@ -156,24 +163,29 @@ class TestMixedPrecisionFormat(CustomTestCase):
                 f"input_activations dropped for target {target}",
             )
 
-        expert_target = "re:.*mlp\\.experts\\.\\d+\\.(gate|up|down)_proj$"
-        expert_scheme = quant_config.target_scheme_map[expert_target]
+        expert_scheme = quant_config.target_scheme_map[NVFP4_TARGET]
         self.assertEqual(expert_scheme["format"], "nvfp4-pack-quantized")
         self.assertEqual(expert_scheme["weights"].num_bits, 4)
         self.assertEqual(expert_scheme["input_activations"].num_bits, 4)
 
-    def test_moe_resolves_nvfp4_scheme(self):
-        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-            CompressedTensorsW4A4Nvfp4MoE,
-        )
+    def test_linear_scheme_uses_per_group_format(self):
+        # WNA16 is selected only when the format is "pack-quantized". Reading the
+        # top-level format instead of the matched group's would see
+        # "mixed-precision" and resolve no scheme at all.
+        config = _mixed_precision_config(WNA16_GROUP, NVFP4_GROUP)
+        quant_config = CompressedTensorsConfig.from_config(config)
 
-        quant_config = CompressedTensorsConfig.from_config(MIXED_PRECISION_CONFIG)
-        # Before the fix this returned None (experts ignored) -> the MoE fell back
-        # to UnquantizedFusedMoEMethod and blew up later in load_weights.
-        scheme = quant_config.get_moe_scheme(
-            torch.nn.Module(), layer_name=EXPERTS_LAYER
-        )
-        self.assertIsInstance(scheme, CompressedTensorsW4A4Nvfp4MoE)
+        with mock.patch.object(
+            CompressedTensorsConfig, "_check_scheme_supported", return_value=True
+        ):
+            scheme = quant_config.get_linear_scheme(
+                torch.nn.Module(), layer_name=MLP_LAYER
+            )
+
+        self.assertIsInstance(scheme, CompressedTensorsWNA16)
+        self.assertEqual(scheme.pack_factor, 32 // 4)
+        self.assertEqual(scheme.strategy, "group")
+        self.assertEqual(scheme.group_size, 128)
 
 
 if __name__ == "__main__":
