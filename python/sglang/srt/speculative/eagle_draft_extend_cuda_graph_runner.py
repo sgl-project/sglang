@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.cuda_event_ring import ReusableEventRing
 
 _is_hip = is_hip()
 
@@ -98,6 +99,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Fields the parent's capture() reads:
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
+        # Depth 2: at most one read_done record is in flight (the WAR barrier
+        # wait_events and clears it right after run_batch).
+        self._war_read_done_events = ReusableEventRing(
+            self.device_module.Event, depth=2
+        )
         self.tp_size = model_runner.ps.tp_size
         self.attn_dp_size = model_runner.ps.attn_dp_size
         self.pp_size = model_runner.server_args.pp_size
@@ -608,7 +614,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Snapshot built -- the forward is done reading the shared pool. Publish
         # a read-done event the scheduler's WAR barrier waits on.
-        read_done = self.device_module.Event()
+        read_done = self._war_read_done_events.next()
         read_done.record()
         self.model_runner.war_fastpath_read_done_event = read_done
 
