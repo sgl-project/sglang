@@ -24,7 +24,6 @@ register_cuda_ci(est_time=240, stage="extra-b", runner_config="4-gpu-b200")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 CUDA_GRAPH_MAX_BS_DECODE = 256
-EAGER_BATCH_SIZE = CUDA_GRAPH_MAX_BS_DECODE + 1
 
 
 def _has_four_blackwell_gpus() -> bool:
@@ -130,7 +129,7 @@ class TestKimiLinearDCP4(GSM8KMixin, CustomTestCase):
             "eager DCP decode is unreachable: concurrency was capped at or "
             "below the CUDA graph capture ceiling",
         )
-        self._assert_batch_completes(EAGER_BATCH_SIZE)
+        self._assert_batch_completes(CUDA_GRAPH_MAX_BS_DECODE + 1)
 
     def test_physical_capacity_sanity(self):
         response = requests.get(self.base_url + "/server_info", timeout=30)

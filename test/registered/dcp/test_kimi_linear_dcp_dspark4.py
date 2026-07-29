@@ -29,7 +29,6 @@ GSM8K_SCORE_THRESHOLD = 0.88
 # Speculative decoding derives concurrency from the draft-token memory reserve
 # and capture clamps to it, so a ceiling past this covers no reachable batch.
 CUDA_GRAPH_MAX_BS_DECODE = 64
-GSM8K_NUM_THREADS = 128
 
 
 def _has_four_blackwell_gpus() -> bool:
@@ -191,7 +190,7 @@ class TestKimiLinearDCPDSpark4(CustomTestCase):
                     api="completion",
                     max_tokens=512,
                     num_examples=200,
-                    num_threads=GSM8K_NUM_THREADS,
+                    num_threads=128,
                     num_shots=5,
                 )
             )

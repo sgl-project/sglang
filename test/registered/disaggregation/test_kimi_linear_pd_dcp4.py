@@ -34,7 +34,6 @@ LOGPROB_ATOL = 0.20
 NIAH_KEY = "739391"
 KIMI_LINEAR_MAX_CONTEXT = 1_048_576
 CUDA_GRAPH_MAX_BS_DECODE = 256
-EAGER_BATCH_SIZE = CUDA_GRAPH_MAX_BS_DECODE + 1
 
 
 def _has_eight_blackwell_gpus() -> bool:
@@ -478,7 +477,7 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
             "eager DCP decode is unreachable: concurrency was capped at or "
             "below the CUDA graph capture ceiling",
         )
-        self._assert_batch_completes(EAGER_BATCH_SIZE)
+        self._assert_batch_completes(CUDA_GRAPH_MAX_BS_DECODE + 1)
 
     def test_decode_physical_capacity_sanity(self):
         response = requests.get(self.decode_url + "/server_info", timeout=30)
