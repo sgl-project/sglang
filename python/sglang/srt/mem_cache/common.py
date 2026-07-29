@@ -196,8 +196,8 @@ def _release_overallocated_kv_indices(
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
-        # start_p is ceil-aligned above, so this never shares a boundary page
-        # with the tail pages cache_finished_req freed in the same group.
+        # start_p is ceil-aligned above: never shares a page with
+        # cache_finished_req's tail frees in the same group.
         tree_cache.token_to_kv_pool_allocator.free_segment(
             indices_to_free, start_pos=start_p
         )

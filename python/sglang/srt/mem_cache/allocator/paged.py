@@ -271,17 +271,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._debug_check_no_duplicate_pages()
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
-        """Free a contiguous token-position segment [start_pos, start_pos + n).
-
-        Fixed-shape counterpart of free(): tokens [k*ps, (k+1)*ps) of a request
-        share a page, so page representatives are a host-computed stride slice
-        instead of torch.unique (data-dependent shape -> device sync). The
-        views are batched; free_group_end turns them into page ids with one
-        cat + floor_divide.
-
-        Caller contract (see base): slice of one request's kv row (or a
-        page-aligned copy) whose pages no other call in the same group frees.
-        """
+        """Fixed-shape counterpart of free(): a page's tokens sit consecutively
+        in the kv row, so page representatives are stride slices -- no
+        torch.unique, whose data-dependent output shape forces a device sync.
+        Contract: see base; a page must be freed by only one call per group."""
         if free_index.numel() == 0:
             return
 
@@ -293,8 +286,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             pieces = (free_index[:1], free_index[ps - offset :: ps])
 
         if self.debug_mode:
-            # unique on CPU: the NPU subclass's free() deliberately avoids
-            # device-side unique, keep the debug reference off-device too.
+            # reference unique on CPU: the NPU subclass deliberately avoids device unique
             page_ids = torch.cat([p // ps for p in pieces])
             assert torch.equal(
                 torch.sort(page_ids.cpu())[0],
@@ -309,8 +301,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_page_reps_group.extend(pieces)
 
     def _debug_check_no_duplicate_pages(self):
-        # need_sort routes frees into release_pages, so the duplicate check
-        # must span both containers or it is vacuous under PD disaggregation.
+        # span both containers: need_sort (PD disagg) routes frees into release_pages
         pages = torch.cat((self.free_pages, self.release_pages))
         assert len(torch.unique(pages)) == len(pages)
 
@@ -332,8 +323,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
             self.free_page_reps_group = []
         if self.debug_mode:
-            # The no-double-free contract can only be violated across the
-            # calls a group aggregates; check it where they merge.
+            # the no-double-free contract can only break across a group's calls
             self._debug_check_no_duplicate_pages()
 
     def clear(self):

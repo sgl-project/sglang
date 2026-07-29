@@ -470,7 +470,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
             session_leaf = result.last_device_node
-            # Free the duplicates that were already in the tree
             freed_end = result.prefix_len
         else:
             session_leaf = None

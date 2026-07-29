@@ -80,9 +80,8 @@ class TestFreeSegment(unittest.TestCase):
         self.assertEqual(len(alloc.free_pages), before + 2)
 
     def test_group_end_debug_assert_catches_cross_call_double_free(self):
-        # The no-double-free contract can only break across the calls a group
-        # aggregates (e.g. legacy free() and free_segment() covering the same
-        # page); free_group_end's debug assert must catch it.
+        # legacy free() + free_segment() on the same page in one group must
+        # trip free_group_end's debug assert
         alloc = _make_allocator()
         alloc.debug_mode = True
         row = _make_kv_row(alloc, PAGE_SIZE)
@@ -167,9 +166,8 @@ class _RecordingBaseAllocator(BaseTokenToKVPoolAllocator):
 
 class TestBaseFallbackFreeSegments(unittest.TestCase):
     def test_trim_dedups_boundary_page_before_fallback_free(self):
-        # Allocators without a free_segment override (UnifiedMamba/SWA) dedup
-        # per free() call at best, so base free_segments must hand them
-        # segments whose shared boundary page appears in exactly one call.
+        # fallback allocators (UnifiedMamba/SWA) dedup per free() call at best;
+        # the shared boundary page must reach free() in exactly one call
         alloc = _RecordingBaseAllocator()
         row = torch.arange(11)  # position i lives on page i // PAGE_SIZE
         alloc.free_segments([(row[0:6], 0), (row[6:11], 6)])

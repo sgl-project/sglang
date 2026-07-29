@@ -1250,9 +1250,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             if prev_prefix_len < total_prefix_length + prefix_len:
                 start = max(0, prev_prefix_len - total_prefix_length)
-                # value is page-aligned and offset total_prefix_length from the
-                # request's kv row; match() rounds prefix_len down to a page
-                # multiple, so successive frees never share a page.
+                # value sits at offset total_prefix_length of the kv row; match()
+                # rounds prefix_len to page multiples, so frees never share a page.
                 self.token_to_kv_pool_allocator.free_segment(
                     value[start:prefix_len],
                     start_pos=total_prefix_length + start,

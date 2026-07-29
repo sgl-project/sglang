@@ -619,9 +619,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
 
-            # Truncate if needed. The truncation tail is freed together with
-            # the unaligned tail below, so free_segments can emit a boundary
-            # page shared by the two segments exactly once.
+            # Truncate if needed; the tail free is deferred and batched with
+            # the unaligned tail below so a shared boundary page is emitted once.
             kv_indices_full = kv_indices
             tail_free_start = None
             if effective_cache_len < len(token_ids):
@@ -793,8 +792,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 [action.new_node_id, action.new_child_node_id],
             )
         elif isinstance(action, FreeDeviceKV):
-            # Tree values are page-aligned (RadixKey.match rounds down to
-            # page_size), so each tensor is a page-exact segment.
+            # tree values are page-aligned copies of a kv row: page-exact segments
             for indices in action.indices:
                 self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
