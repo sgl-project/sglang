@@ -265,13 +265,13 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             mm_inputs: (),
             token_type_ids: (),
             sampling_params: SamplingParamsMap(&req.sampling_params),
-            return_logprob: req.return_logprob.unwrap_or(false),
-            logprob_start_len: req.logprob_start_len.unwrap_or(-1),
-            top_logprobs_num: req.top_logprobs_num.unwrap_or(0),
+            return_logprob: req.return_logprob,
+            logprob_start_len: req.logprob_start_len,
+            top_logprobs_num: req.top_logprobs_num,
             token_ids_logprob: req.token_ids_logprob.as_ref(),
             stream: req.stream,
             return_sampling_mask: false,
-            return_hidden_states: req.return_hidden_states.unwrap_or(false),
+            return_hidden_states: req.return_hidden_states,
         }
     }
 }
@@ -328,10 +328,10 @@ mod tests {
                 max_new_tokens: Some(5),
                 ..Default::default()
             },
-            return_logprob: Some(true),
-            logprob_start_len: Some(-1),
-            top_logprobs_num: Some(3),
-            return_hidden_states: Some(true),
+            return_logprob: true,
+            logprob_start_len: -1,
+            top_logprobs_num: 3,
+            return_hidden_states: true,
             stream: true,
             ..Default::default()
         };

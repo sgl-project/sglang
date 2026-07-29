@@ -475,7 +475,7 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
     // this the request would 200 with `meta_info.hidden_states` silently absent
     // (Python `TokenizerManager._validate_one_request`).
     if !limits.enable_return_hidden_states
-        && matches!(&req.kind, RequestKind::Generate(g) if g.return_hidden_states == Some(true))
+        && matches!(&req.kind, RequestKind::Generate(g) if g.return_hidden_states)
     {
         return Err(Error::Validation(
             "The server is not configured to return the hidden states. \
@@ -871,20 +871,21 @@ mod tests {
             r
         };
         let disabled = test_limits();
-        let err = validate(&mut req(Some(true)), &disabled).unwrap_err();
+        let err = validate(&mut req(true), &disabled).unwrap_err();
         assert_eq!(err.http_status(), 400);
         assert!(
             err.to_string().contains("--enable-return-hidden-states"),
             "message must name the flag: {err}"
         );
-        // Not asking for them, or asking on a server that supports them, is fine.
-        assert!(validate(&mut req(Some(false)), &disabled).is_ok());
-        assert!(validate(&mut req(None), &disabled).is_ok());
+        // Not asking for them (the client sent `false`, or sent nothing and
+        // `into_requests` resolved the default), or asking on a server that
+        // supports them, is fine.
+        assert!(validate(&mut req(false), &disabled).is_ok());
         let enabled = Limits {
             enable_return_hidden_states: true,
             ..test_limits()
         };
-        assert!(validate(&mut req(Some(true)), &enabled).is_ok());
+        assert!(validate(&mut req(true), &enabled).is_ok());
     }
 
     /// End-to-end through `drive`: an over-context request is rejected on the way
