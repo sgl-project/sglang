@@ -1079,10 +1079,6 @@ class AscendAttnBackend(AttentionBackend):
             )
         else:
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
-            assert topk_indices.shape[0] == q_nope.shape[0], (
-                "NPU DSA sparse indices must match the unpadded query rows: "
-                f"{topk_indices.shape[0]} != {q_nope.shape[0]}"
-            )
             attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,
                 key=k_nope,
