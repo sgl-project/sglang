@@ -418,5 +418,6 @@ class TestRealtimeBufferLifecycle(CustomTestCase):
         self.assertEqual(conn.asr_state.audio.attempted_offset_bytes, 0)
         self.assertEqual(conn.asr_state.audio.accepted_offset_bytes, 0)
 
+
 if __name__ == "__main__":
     unittest.main()
