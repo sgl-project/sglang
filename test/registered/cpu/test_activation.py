@@ -2,7 +2,7 @@ import sys
 
 import pytest
 import torch
-from utils import GeluAndMul, SiluAndMul, precision
+from utils import GeluAndMul, NewGELU, QuickGELU, SiluAndMul, precision
 
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -41,6 +41,12 @@ def test_activation(m, n, dtype):
         GeluAndMul(x, approximate="tanh"),
         torch.ops.sgl_kernel.gelu_tanh_and_mul_cpu(x),
     )
+
+    x = torch.randn([m, n], dtype=dtype)
+    _assert_close(QuickGELU(x), torch.ops.sgl_kernel.quick_gelu_cpu(x))
+
+    x = torch.randn([m, n], dtype=dtype)
+    _assert_close(NewGELU(x), torch.ops.sgl_kernel.new_gelu_cpu(x))
 
 
 @pytest.mark.parametrize("gate_3d", [False, True])
