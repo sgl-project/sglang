@@ -566,11 +566,18 @@ class MambaAttnBackendBase(AttentionBackend):
             self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
+        # Hand out a BATCH-LENGTH view, not the whole max_bs buffer: the Mamba2
+        # decode track-save indexes this tensor tail-relative ([-num_decodes:]),
+        # the eager mixed-batch convention where prefill rows lead and decode rows
+        # trail. Returning the max_bs buffer whole makes that slice land on the
+        # untouched tail (zeros -> virtual slot 0) instead of the rows refreshed
+        # here, so every tracked row checkpoints into one wrong cache slot.
         track_buf = None
         if mamba_track_indices is not None:
-            track_buf = self.mamba_track_indices_buf
-            track_buf[: len(mamba_track_indices)].copy_(
-                self._translate_mamba_indices(mamba_track_indices)
+            track_buf = self.mamba_track_indices_buf[:bs]
+            num_track = min(len(mamba_track_indices), bs)
+            track_buf[:num_track].copy_(
+                self._translate_mamba_indices(mamba_track_indices[:num_track])
             )
         # Refresh the static write cursor in-place (mirrors the eager
         # snapshot-then-advance). Skip the advance during capture: dummy slots
@@ -841,12 +848,22 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
             if self.forward_metadata.num_decodes > 0:
                 num_decodes = self.forward_metadata.num_decodes
+                # Head-relative, not [-num_decodes:]: decode rows sit right after
+                # the prefill rows, and the per-row tensors are not all exactly
+                # num_prefills + num_decodes long (padded batches carry trailing
+                # rows; the cuda-graph track-dest buffer is batch-length only by
+                # contract). Slicing from the tail silently walks off the real
+                # rows and checkpoints into the wrong cache slots.
+                decode_rows = slice(
+                    self.forward_metadata.num_prefills,
+                    self.forward_metadata.num_prefills + num_decodes,
+                )
                 track_mamba_states_if_needed(
                     layer_cache.conv[0],
                     layer_cache.temporal,
-                    self.forward_metadata.mamba_cache_indices[-num_decodes:],
-                    forward_batch.mamba_track_mask[-num_decodes:],
-                    self.forward_metadata.mamba_track_indices[-num_decodes:],
+                    self.forward_metadata.mamba_cache_indices[decode_rows],
+                    forward_batch.mamba_track_mask[decode_rows],
+                    self.forward_metadata.mamba_track_indices[decode_rows],
                     num_decodes,
                     check_freed_slots=self.enable_unified_memory,
                 )
