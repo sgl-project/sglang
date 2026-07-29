@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from unittest.mock import Mock, patch
 
@@ -523,6 +524,49 @@ class HarmonyResponsesTestCase(unittest.TestCase):
         ]
         msg = get_developer_message(instructions="be helpful", tools=tools)
         self.assertIsNotNone(msg)
+
+
+class ErrorEnvelopeSchemaTestCase(unittest.TestCase):
+    """`error.code` must be a string in the /v1/responses error envelope.
+
+    The OpenAI schema types `error.code` as a nullable string slug (e.g.
+    "context_length_exceeded"), never the HTTP status as a number -- the status is
+    already carried by the response status. Strict clients enforce this: the OpenAI
+    Java SDK types ErrorObject.code() as Optional<String> and raises
+    OpenAIInvalidDataException on access, which hides the real error from the caller.
+    """
+
+    def test_create_error_response_code_is_a_string(self):
+        serving = make_serving()
+        response = serving.create_error_response("boom", status_code=400)
+        error = json.loads(response.body)["error"]
+        self.assertIsInstance(error["code"], str)
+        self.assertEqual(error["code"], "400")
+
+    def test_create_error_response_code_is_a_string_for_non_400(self):
+        serving = make_serving()
+        response = serving.create_error_response("nope", status_code=404)
+        self.assertEqual(json.loads(response.body)["error"]["code"], "404")
+
+    def test_create_streaming_error_response_code_is_a_string(self):
+        serving = make_serving()
+        error = json.loads(serving.create_streaming_error_response("boom"))["error"]
+        self.assertIsInstance(error["code"], str)
+        self.assertEqual(error["code"], "400")
+
+    def test_request_error_path_emits_a_string_code(self):
+        """Same guarantee end-to-end through create_responses, not just the helper."""
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            tool_choice="required",
+            tools=[{"type": "web_search"}, {"type": "mcp"}],
+            store=False,
+        )
+        result = asyncio.run(serving.create_responses(request, raw_request=None))
+        self.assertEqual(result.status_code, 400)
+        self.assertEqual(json.loads(result.body)["error"]["code"], "400")
 
 
 if __name__ == "__main__":

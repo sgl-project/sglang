@@ -496,7 +496,7 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     """Enrich HTTP exception with status code and other details.
 
     For /v1/responses, emit OpenAI-style nested error envelope:
-    {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
+    {"error": {"message": "...", "type": "...", "param": null, "code": "<status>"}}
     For /v1/messages, emit Anthropic-style envelope so SDK clients can parse it.
     """
     if request.url.path.startswith("/v1/messages"):
@@ -532,7 +532,8 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
             "message": exc.detail,
             "type": HTTPStatus(exc.status_code).phrase,
             "param": None,
-            "code": exc.status_code,
+            # A string, per OpenAIServingResponses.create_error_response.
+            "code": str(exc.status_code),
         }
         return ORJSONResponse(
             content={"error": nested_error}, status_code=exc.status_code
@@ -578,7 +579,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "message": message,
             "type": HTTPStatus.BAD_REQUEST.phrase,
             "param": None,
-            "code": HTTPStatus.BAD_REQUEST.value,
+            # A string, per OpenAIServingResponses.create_error_response.
+            "code": str(HTTPStatus.BAD_REQUEST.value),
         }
         return ORJSONResponse(status_code=400, content={"error": nested_error})
 

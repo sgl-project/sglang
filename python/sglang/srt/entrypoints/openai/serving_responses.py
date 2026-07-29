@@ -153,7 +153,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             "message": message,
             "type": err_type,
             "param": param,
-            "code": status_code,
+            # The OpenAI schema types `error.code` as a nullable *string* (a slug such
+            # as "context_length_exceeded"), not the HTTP status -- that is already
+            # carried by the response status. Strict clients reject a number here: the
+            # OpenAI Java SDK types ErrorObject.code() as Optional<String> and raises
+            # OpenAIInvalidDataException on access, hiding the real error.
+            "code": str(status_code),
         }
         return ORJSONResponse(content={"error": nested_error}, status_code=status_code)
 
@@ -169,7 +174,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                     "message": message,
                     "type": err_type,
                     "param": None,
-                    "code": status_code,
+                    # A string, per create_error_response above.
+                    "code": str(status_code),
                 }
             }
         )
