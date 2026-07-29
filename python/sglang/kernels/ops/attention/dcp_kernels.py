@@ -242,6 +242,10 @@ def _correct_attn_cp_out_kernel(
     # Apply correction and store
     output = tl.load(outputs_ptr + output_offsets)
     output = output * factor
+    # A zero-weight rank's raw output can be NaN (e.g. a degenerate DCP shard
+    # with no owned tokens); NaN * 0.0 == NaN, so guard explicitly rather than
+    # trust the multiply.
+    output = tl.where(factor == 0.0, 0.0, output)
     tl.store(new_output_ptr + new_output_offsets, output)
 
 
