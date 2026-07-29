@@ -1618,6 +1618,20 @@ class DeepseekV4AttnBackend(
                 extra_indices = core_attn_metadata.c128_page_indices
                 extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
 
+            # --- MXFP4 path (before FP8-specific reshapes) ---
+            if token_to_kv_pool.dsv4_kv_cache_store_mxfp4:
+                return self._forward_mxfp4_decode(
+                    q=q,
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=core_attn_metadata.swa_page_indices,
+                    swa_topk_lengths=core_attn_metadata.swa_topk_lengths,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    compress_ratio=compress_ratio,
+                    attn_sink=attn_sink,
+                )
+
             swa_window_size = token_to_kv_pool.swa_window_size
             assert swa_k_cache.ndim == 2
             k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
@@ -1730,6 +1744,79 @@ class DeepseekV4AttnBackend(
             return o
 
         raise NotImplementedError("ragged attention")
+
+    def _forward_mxfp4_decode(
+        self,
+        q: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        extra_k_cache: torch.Tensor | None,
+        extra_indices: torch.Tensor | None,
+        extra_topk_lengths: torch.Tensor | None,
+        compress_ratio: int,
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """MXFP4 decode: dequant + attention for SWA (fused kernel) and extras (SDPA)."""
+        from sglang.jit_kernel.dsv4.mxfp4_decode import mxfp4_decode_attention
+        from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
+            MXFP4_BYTES_PER_TOKEN,
+            MXFP4_TOTAL_DIM,
+        )
+
+        N_heads = q.shape[0]
+        if q.ndim >= 3:
+            q = q.squeeze(1)  # [N, 1, 512] → [N, 512]
+        assert q.ndim == 2 and q.shape[1] == MXFP4_TOTAL_DIM
+
+        # Pad indices/attn_sink to match q shape
+        def _match(x, value):
+            if x is None or x.shape[0] == N_heads:
+                return x
+            if x.shape[0] > N_heads:
+                return x[:N_heads]
+            return torch.nn.functional.pad(
+                x, (0, 0) * (x.ndim - 1) + (0, N_heads - x.shape[0]), value=value
+            )
+
+        swa_page_indices = _match(swa_page_indices, 0)
+        swa_topk_lengths = _match(swa_topk_lengths, 1)
+        extra_indices = _match(extra_indices, -1)
+        attn_sink = _match(attn_sink, 0.0)
+
+        swa_physical_page_size = self.token_to_kv_pool.swa_page_size
+        swa_window = 128  # DSV4 SWA attention window (tokens per page)
+
+        # SWA: use fused decode kernel (one page per head for standard SWA)
+        k_cache_flat = swa_k_cache.view(-1, MXFP4_BYTES_PER_TOKEN)
+        page_ratio = swa_physical_page_size // swa_window
+        swa_kernel_indices = (
+            (swa_page_indices[:, 0] * page_ratio).to(torch.int32).contiguous()
+        )
+
+        out = mxfp4_decode_attention(
+            q=q,
+            k_cache=k_cache_flat,
+            page_indices=swa_kernel_indices,
+            sm_scale=self.softmax_scale,
+            page_size=swa_window,
+            attn_sink=attn_sink if attn_sink is not None else None,
+        )
+
+        # C4/C128 extra pages: not yet supported with fused MXFP4 kernel.
+        # The fused kernel computes SWA-only attention; adding extra attention
+        # scores would require access to the kernel's internal softmax state.
+        # For now, raise so the unsupported case is explicit.
+        if extra_k_cache is not None and extra_indices is not None:
+            has_extras = bool((extra_topk_lengths > 0).any().item())
+            if has_extras:
+                raise NotImplementedError(
+                    "MXFP4 decode does not yet support C4/C128 compressed "
+                    "attention.  Use SWA-only layers (compress_ratio=0) or "
+                    "disable MXFP4 KV cache."
+                )
+
+        return out
 
     def _forward_prefill_sparse(
         self,

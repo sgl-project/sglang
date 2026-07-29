@@ -623,7 +623,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 )
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        if envs.SGLANG_OPT_DSV4_MXFP4_KVCACHE.get():
+            from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
+                MXFP4_BYTES_PER_TOKEN,
+            )
+
+            kv_bytes = MXFP4_BYTES_PER_TOKEN
+        else:
+            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
 
         quant_block_size = 128
         indexer_bytes = (
