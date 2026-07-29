@@ -1222,8 +1222,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and not self.enable_pdmux
             and not self.model_runner.server_args.enable_lora
         ):
+            # actual_forward_mode belongs in the key even though the captured
+            # graph always targets capture_forward_mode: DSV4's replay prep
+            # substitutes seq_lens / seq_lens_cpu / seq_lens_sum /
+            # req_pool_indices / out_cache_loc when the runtime mode is IDLE,
+            # so IDLE and active DECODE are different python branches and must
+            # not share a captured graph.
             self._metadata_glue.run(
-                attn_backend, fb_view, (bs, str(self.capture_forward_mode))
+                attn_backend,
+                fb_view,
+                (
+                    bs,
+                    str(self.capture_forward_mode),
+                    str(fb_view.actual_forward_mode),
+                ),
             )
         else:
             attn_backend.init_forward_metadata_out_graph(fb_view)
