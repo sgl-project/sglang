@@ -5,7 +5,7 @@ from typing import List, NamedTuple, Union
 
 import torch
 
-from sglang.jit_kernel.hisparse import (
+from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
 )
