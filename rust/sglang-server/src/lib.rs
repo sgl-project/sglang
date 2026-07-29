@@ -16,6 +16,7 @@ mod error;
 mod fsm;
 mod ids;
 mod message;
+mod utils;
 
 use pyo3::prelude::*;
 
