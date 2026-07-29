@@ -766,6 +766,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         self.scheduler = scheduler
         self.server_args = server_args
         self._logged_parallel_config = False
+        self._logged_cfg_split = False
 
         # Apply torch.compile if enabled
         if server_args is not None:
@@ -1067,7 +1068,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                         action_start_frame_offset=action_start_frame_offset,
                     )
                 else:
-                    noise_pred = self._predict_noise_cfg_batched(
+                    noise_pred = self._predict_noise_cfg(
                         latents=latents,
                         timestep=timestep,
                         cond_text_ids=cond_text_ids,
@@ -1078,10 +1079,8 @@ class Cosmos3DenoisingStage(PipelineStage):
                         fps=fps,
                         guidance_scale=effective_scale,
                         noisy_frame_mask=velocity_mask,
-                        max_text_seq_len=max(
-                            batch.extra["cond_text_seq_len"],
-                            batch.extra["uncond_text_seq_len"],
-                        ),
+                        cond_text_seq_len=batch.extra["cond_text_seq_len"],
+                        uncond_text_seq_len=batch.extra["uncond_text_seq_len"],
                         current_timestep=i,
                         sound_latents=sound_latents,
                         action_latents=action_latents,
@@ -1186,6 +1185,87 @@ class Cosmos3DenoisingStage(PipelineStage):
             batch.audio_latents = sound_latents
         self.log_info("Denoising complete")
         return batch
+
+    def _predict_noise_cfg(
+        self,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        cond_text_ids: torch.Tensor,
+        cond_text_mask: torch.Tensor,
+        uncond_text_ids: torch.Tensor,
+        uncond_text_mask: torch.Tensor,
+        video_shape: tuple[int, int, int],
+        fps: float,
+        guidance_scale: float,
+        cond_text_seq_len: int,
+        uncond_text_seq_len: int,
+        **kwargs: Any,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Run CFG, batching the two branches only when that is lossless.
+
+        A batched forward needs one shared text length, so the shorter prompt
+        gets right-padded. Those pad positions carry all-zero UND K/V, and the
+        GEN cross-attention runs unmasked over the full text K/V — a zero key
+        scores logit 0 and still takes softmax mass while contributing nothing,
+        which weakens the padded branch's conditioning. Fall back to one
+        forward per branch, each trimmed to its own length, whenever the
+        prompts differ in length.
+        """
+        if cond_text_seq_len == uncond_text_seq_len:
+            return self._predict_noise_cfg_batched(
+                latents=latents,
+                timestep=timestep,
+                cond_text_ids=cond_text_ids,
+                cond_text_mask=cond_text_mask,
+                uncond_text_ids=uncond_text_ids,
+                uncond_text_mask=uncond_text_mask,
+                video_shape=video_shape,
+                fps=fps,
+                guidance_scale=guidance_scale,
+                max_text_seq_len=cond_text_seq_len,
+                **kwargs,
+            )
+
+        if not self._logged_cfg_split and not self._current_batch_is_warmup:
+            self._logged_cfg_split = True
+            self.log_info(
+                "Prompt and negative prompt tokenize to different lengths "
+                f"({cond_text_seq_len} vs {uncond_text_seq_len}); running the "
+                "CFG branches in separate forwards to keep padding out of the "
+                "cross-attention"
+            )
+
+        cond = self._run_transformer(
+            latents=latents,
+            timestep=timestep,
+            text_ids=cond_text_ids,
+            text_mask=cond_text_mask,
+            video_shape=video_shape,
+            fps=fps,
+            cache_key="cond",
+            max_text_seq_len=cond_text_seq_len,
+            **kwargs,
+        )
+        uncond = self._run_transformer(
+            latents=latents,
+            timestep=timestep,
+            text_ids=uncond_text_ids,
+            text_mask=uncond_text_mask,
+            video_shape=video_shape,
+            fps=fps,
+            cache_key="uncond",
+            max_text_seq_len=uncond_text_seq_len,
+            **kwargs,
+        )
+
+        def _cfg_combine(
+            cond_pred: torch.Tensor, uncond_pred: torch.Tensor
+        ) -> torch.Tensor:
+            return uncond_pred + guidance_scale * (cond_pred - uncond_pred)
+
+        if isinstance(cond, tuple):
+            return tuple(_cfg_combine(c, u) for c, u in zip(cond, uncond, strict=True))
+        return _cfg_combine(cond, uncond)
 
     def _predict_noise_cfg_batched(
         self,

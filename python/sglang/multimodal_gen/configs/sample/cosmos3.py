@@ -24,6 +24,11 @@ COSMOS3_EDGE_T2V_WIDTH = 832
 COSMOS3_EDGE_T2V_HEIGHT = 480
 COSMOS3_EDGE_T2I_SIZE = 640
 
+# Image generation applies guidance only over a high-noise window; guiding the
+# low-noise steps degrades sample quality (Kynkaeaenniemi et al. 2024). Video
+# modes guide at every step.
+COSMOS3_T2I_GUIDANCE_INTERVAL = (400.0, 1000.0)
+
 # Edge is trained at 256p/480p only; larger frames push the spatial mRoPE grid
 # past its trained range and shatter the output.
 COSMOS3_EDGE_SUPPORTED_RESOLUTIONS = [
@@ -135,6 +140,8 @@ class Cosmos3SamplingParams(SamplingParams):
                 if is_t2i
                 else COSMOS3_EDGE_T2V_GUIDANCE_SCALE
             )
+        if is_t2i and not is_distilled and self.guidance_interval is None:
+            self.guidance_interval = COSMOS3_T2I_GUIDANCE_INTERVAL
         if is_edge:
             self.supported_resolutions = COSMOS3_EDGE_SUPPORTED_RESOLUTIONS
             if self.height is None and self.width is None:
