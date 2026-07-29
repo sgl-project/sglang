@@ -94,20 +94,6 @@ fast_mode = False
 intra_batch_mode = True if _use_mla_ps_kernel else False
 
 
-def _quant_fp8_pertensor(x, num_heads, head_dim):
-    """Dynamic per-tensor fp8 quantization for the hd256 prefill fast-path.
-
-    Scales amax to fp8's max so the full range is used, and returns the descale
-    so the kernel can recover true magnitudes (real = quantized * descale). Used
-    for a bf16 KV cache, where no calibrated k/v scales are available.
-    """
-    fp8_max = torch.finfo(fp8_dtype).max
-    x = x.contiguous().view(-1, num_heads, head_dim)
-    scale = (x.abs().amax().to(torch.float32) / fp8_max).clamp(min=1e-12)
-    x_f8 = (x / scale).to(fp8_dtype)
-    return x_f8, scale.view(1)
-
-
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
@@ -2357,7 +2343,8 @@ class AiterAttnBackend(AttentionBackend):
             #             and (is_gfx95_supported() or is_gfx942_supported())
             #         )
             #     )
-            use_fp8_asm = (
+
+            if (
                 get_bool_env_var("SGLANG_AITER_FMHA_FP8_ASM", "False")
                 and is_gfx95_supported()
                 and forward_batch.forward_mode.is_extend()
@@ -2368,62 +2355,27 @@ class AiterAttnBackend(AttentionBackend):
                 and self.logits_soft_cap == 0.0
                 and layer.qk_head_dim == 256
                 and layer.v_head_dim == 256
-            )
-
-            if use_fp8_asm:
-                cu_seqlens_q = self.qo_indptr[:bs0]
-                max_q_len = self.forward_metadata.max_q_len
-
-                if self.kv_cache_dtype == fp8_dtype:
-                    # fp8 KV cache: reuse the model's calibrated per-tensor scales
-                    # (k_descale/v_descale) and only pay the contiguous cast, no
-                    # amax reduction. q reuses the k scale (matches #28482).
-                    q_scale = (
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    )
-                    q_f8 = (
-                        q.contiguous()
-                        .view(-1, layer.tp_q_head_num, layer.head_dim)
-                        .to(fp8_dtype)
-                    )
-                    k_f8 = (
-                        k.contiguous()
-                        .view(-1, layer.tp_k_head_num, layer.head_dim)
-                        .to(fp8_dtype)
-                    )
-                    v_f8 = (
-                        v.contiguous()
-                        .view(-1, layer.tp_v_head_num, layer.head_dim)
-                        .to(fp8_dtype)
-                    )
-                    k_scale = k_descale
-                    v_scale = v_descale
-                else:
-                    # bf16 KV cache: no calibrated scales exist, so quantize
-                    # dynamically with per-tensor amax scaling.
-                    q_f8, q_scale = _quant_fp8_pertensor(
-                        q, layer.tp_q_head_num, layer.head_dim
-                    )
-                    k_f8, k_scale = _quant_fp8_pertensor(
-                        k, layer.tp_k_head_num, layer.head_dim
-                    )
-                    v_f8, v_scale = _quant_fp8_pertensor(
-                        v, layer.tp_v_head_num, layer.head_dim
-                    )
-
+                and self.kv_cache_dtype == fp8_dtype
+            ):
+                q_c = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                k_c = k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim)
+                v_c = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
+                fp8_q_descale = (
+                    layer.k_scale if layer.k_scale is not None else self.k_scale
+                )
                 o = flash_attn_varlen_fp8_pertensor_func(
-                    q_f8,
-                    k_f8,
-                    v_f8,
-                    q_scale,
-                    k_scale,
-                    v_scale,
-                    cu_seqlens_q,
-                    cu_seqlens_q,
-                    max_q_len,
-                    max_q_len,
-                    causal=True,
+                    q_c.to(fp8_dtype),
+                    k_c.to(fp8_dtype),
+                    v_c.to(fp8_dtype),
+                    fp8_q_descale,
+                    k_descale,
+                    v_descale,
+                    self.qo_indptr[:bs0],
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_q_len,
                     softmax_scale=layer.scaling,
+                    causal=True,
                 )
                 if o.dtype != self.input_dtype:
                     o = o.to(self.input_dtype)
