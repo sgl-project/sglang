@@ -127,14 +127,6 @@ def zimage_rmsnorm_scale(
     return norm(x) * scale
 
 
-class SelectFirstElement(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        return x[0]
-
-
 class TimestepEmbedder(nn.Module):
     def __init__(self, out_size, mid_size=None, frequency_embedding_size=256):
         super().__init__()
