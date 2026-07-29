@@ -342,7 +342,13 @@ inline bool getEnvEnablePDL() {
 #ifndef USE_ROCM
 #define WARP_SIZE 32
 #else
-#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
+// ROCm: host and device passes must agree on the logical warp width. Historically
+// host code (__HIP_DEVICE_COMPILE__ undefined) always saw 64 while RDNA device code
+// saw 32, mismatching grid/block math in the MoE topk launchers. setup_rocm.py passes
+// SGL_ROCM_WARP_SIZE (64 on CDNA, 32 on RDNA) so both passes agree.
+#ifdef SGL_ROCM_WARP_SIZE
+#define WARP_SIZE SGL_ROCM_WARP_SIZE
+#elif defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
 #define WARP_SIZE 64
 #else
 #define WARP_SIZE 32

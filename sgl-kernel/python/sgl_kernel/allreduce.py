@@ -2,7 +2,30 @@ from typing import List, Optional, Tuple
 
 import torch
 
-if torch.version.hip is not None:
+
+def _has_custom_ar() -> bool:
+    """True if the custom all-reduce operators are compiled and registered.
+
+    The custom/deterministic/quick all-reduce ops are CDNA-only and are omitted
+    from the RDNA build (see sgl-kernel/setup_rocm.py). Probing the registered
+    ops instead of the device arch avoids initializing CUDA at import time:
+    eagerly calling torch.cuda.get_device_properties(0) here would force CUDA
+    init on device 0, which breaks fork-based multiprocessing and pins the
+    process to device 0 before CUDA_VISIBLE_DEVICES is honored. common_ops is
+    loaded before this module, so the registry is already populated.
+    """
+    try:
+        return hasattr(torch.ops.sgl_kernel, "init_custom_ar")
+    except Exception:
+        return False
+
+
+# CDNA ROCm builds compile the custom all-reduce ops; RDNA builds omit them
+# (multi-GPU all-reduce falls back to RCCL). CUDA always has them and is handled
+# by the final `else` branch, so gate the ROCm wrappers on hip + op presence.
+_HAS_CUSTOM_AR = torch.version.hip is not None and _has_custom_ar()
+
+if _HAS_CUSTOM_AR:
     # ROCM custom allreduce
     def init_custom_ar(
         meta: torch.Tensor,
@@ -91,6 +114,12 @@ if torch.version.hip is not None:
 
     def qr_max_size() -> int:
         return torch.ops.sgl_kernel.qr_max_size.default()
+
+elif torch.version.hip is not None:
+    # RDNA (e.g. gfx1151 / Strix Halo): the CDNA-only custom/deterministic/quick
+    # all-reduce ops are not built, so no wrappers are exposed here. Multi-GPU
+    # all-reduce falls back to RCCL; single-GPU never calls all-reduce.
+    pass
 
 else:
 
