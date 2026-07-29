@@ -10,6 +10,7 @@
 //! the rest of the pipeline only through `flume` channels: [`TmEvent`] into the
 //! ingress loop, [`Senders`] fanning out to the pools.
 
+mod egress;
 mod ingress;
 
 use crate::ids::Rid;
