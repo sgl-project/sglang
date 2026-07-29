@@ -10,6 +10,9 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+    FlashInferGDNKernel,
+)
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
@@ -230,6 +233,62 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
                     head_k_dim=self.HEAD_K_DIM,
                     head_v_dim=self.HEAD_V_DIM,
                 )
+
+    def test_bf16_state_decode_aligns_gate_views(self):
+        num_heads = 2
+        num_v_heads = 8
+        head_dim = 128
+
+        projected_ba = torch.randn(
+            1, 2 * num_v_heads, dtype=torch.bfloat16, device="cuda"
+        )
+        b, a = projected_ba.split([num_v_heads, num_v_heads], dim=-1)
+        b = b.contiguous()
+        a = a.contiguous()
+        self.assertEqual(b.data_ptr() % 32, 0)
+        self.assertEqual(a.data_ptr() % 32, 16)
+
+        captured_gates = {}
+
+        def decode_fn(**kwargs):
+            captured_gates["a"] = kwargs["a"]
+            captured_gates["b"] = kwargs["b"]
+            return torch.zeros_like(kwargs["v"]), None
+
+        kernel = object.__new__(FlashInferGDNKernel)
+        kernel.use_state_pool = True
+        kernel._decode_fn = decode_fn
+
+        q = torch.randn(1, 1, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn_like(q)
+        v = torch.randn(
+            1, 1, num_v_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        output = kernel.decode(
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log=torch.randn(num_v_heads, dtype=torch.float32, device="cuda"),
+            dt_bias=torch.randn(num_v_heads, dtype=torch.float32, device="cuda"),
+            ssm_states=torch.zeros(
+                1,
+                num_v_heads,
+                head_dim,
+                head_dim,
+                dtype=torch.bfloat16,
+                device="cuda",
+            ),
+            cache_indices=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        )
+
+        self.assertEqual(captured_gates["a"].data_ptr() % 32, 0)
+        self.assertEqual(captured_gates["b"].data_ptr() % 32, 0)
+        torch.testing.assert_close(captured_gates["a"].view_as(a), a)
+        torch.testing.assert_close(captured_gates["b"].view_as(b), b)
+        self.assertEqual(output.shape, (1, 1, num_v_heads, head_dim))
 
     # Layout-robustness. See dense/test_triton.py for the rationale.
     LAYOUT_ROBUSTNESS_CASES = (
