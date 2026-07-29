@@ -4371,9 +4371,28 @@ class ServerArgs:
             if predicate():
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
-    def _disable_breakable_cudagraph_if_incompatible(self):
-        from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
+    def _supports_breakable_prefill_cp(self) -> bool:
+        resolved = self._resolved()
+        prefill_attention_backend, _ = self._resolved_attention_backends()
+        return (
+            self.enable_prefill_cp
+            and resolved.attn_cp_size == self.tp_size
+            and self.cp_strategy == "zigzag"
+            and prefill_attention_backend == "trtllm_mha"
+            and self.get_model_config().hf_config.architectures == ["GptOssForCausalLM"]
+        )
 
+    def _supports_breakable_moe_a2a(self) -> bool:
+        resolved = self._resolved()
+        if resolved.moe_a2a_backend == "none":
+            return True
+        return (
+            resolved.moe_a2a_backend == "flashinfer"
+            and self.moe_runner_backend == "flashinfer_trtllm_routed"
+            and self._supports_breakable_prefill_cp()
+        )
+
+    def _disable_breakable_cudagraph_if_incompatible(self):
         """Breakable (segmented capture, no torch.compile). Breakable enforces
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
@@ -4392,7 +4411,8 @@ class ServerArgs:
             # CP all_gather replay size mismatch under BCG.
             (
                 "context parallel (attn_cp_size > 1)",
-                lambda: self._resolved().attn_cp_size > 1,
+                lambda: self._resolved().attn_cp_size > 1
+                and not self._supports_breakable_prefill_cp(),
             ),
             # Capture builds a dummy extend forward with attn_dcp_metadata=None.
             (
@@ -4402,7 +4422,7 @@ class ServerArgs:
             # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
             (
                 "MoE A2A backend",
-                lambda: _resolved_view(self).moe_a2a_backend != "none",
+                lambda: not self._supports_breakable_moe_a2a(),
             ),
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
@@ -6505,6 +6525,14 @@ class ServerArgs:
                 f"(e.g. --max-prefill-tokens) to <= {max_cutedsl_tokens}."
             )
 
+    def _supports_flashinfer_a2a_parallelism(self) -> bool:
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        resolved = resolved_view(self)
+        return (resolved.enable_dp_attention and self.dp_size == self.tp_size) or (
+            self.enable_prefill_cp and resolved.attn_cp_size == self.tp_size
+        )
+
     def _handle_a2a_moe(self):
         # The backend overrides and the ep_size=tp_size adjustments moved to
         # the resolution pipeline (arg_groups/overrides.py:
@@ -6586,8 +6614,8 @@ class ServerArgs:
             )
         if self.moe_a2a_backend == "flashinfer":
             assert (
-                resolved_view(self).enable_dp_attention and self.dp_size == self.tp_size
-            ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
+                self._supports_flashinfer_a2a_parallelism()
+            ), "Flashinfer MoE A2A is only supported with either dp_size == tp_size and --enable-dp-attention, or full prefill context parallelism with attn_cp_size == tp_size"
             logger.warning(
                 f"Flashinfer MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )

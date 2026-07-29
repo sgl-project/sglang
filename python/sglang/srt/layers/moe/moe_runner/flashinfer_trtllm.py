@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Generator, Optional, cast
 
 import torch
+import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
@@ -1157,6 +1158,11 @@ class FlashInferTrtllmBf16MoeQuantInfo(MoeQuantInfo):
     # Expert-parallel metadata
     global_num_experts: int
     local_expert_offset: int
+    kernel_hidden_size: int
+    input_pad_value: float
+    gemm1_alpha: Optional[torch.Tensor] = None
+    gemm1_beta: Optional[torch.Tensor] = None
+    gemm1_clamp_limit: Optional[torch.Tensor] = None
 
 
 def fused_experts_none_to_flashinfer_trtllm_bf16(
@@ -1206,6 +1212,19 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
     )
 
     hidden_states = dispatch_output.hidden_states
+    logical_hidden_size = hidden_states.shape[-1]
+    if quant_info.kernel_hidden_size < logical_hidden_size:
+        raise ValueError(
+            "FlashInfer TRT-LLM BF16 kernel hidden size cannot be smaller than "
+            f"the logical hidden size: {quant_info.kernel_hidden_size} < "
+            f"{logical_hidden_size}"
+        )
+    if quant_info.kernel_hidden_size != logical_hidden_size:
+        hidden_states = F.pad(
+            hidden_states,
+            (0, quant_info.kernel_hidden_size - logical_hidden_size),
+            value=quant_info.input_pad_value,
+        )
     topk_output = dispatch_output.topk_output
 
     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
@@ -1240,6 +1259,9 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 ),
                 tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
                 activation_type=activation_type,
+                gemm1_alpha=quant_info.gemm1_alpha,
+                gemm1_beta=quant_info.gemm1_beta,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             )
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
@@ -1263,9 +1285,14 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 routed_scaling_factor=runner_config.routed_scaling_factor,
                 tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
                 activation_type=activation_type,
+                gemm1_alpha=quant_info.gemm1_alpha,
+                gemm1_beta=quant_info.gemm1_beta,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             )
 
-    return StandardCombineInput(hidden_states=final_hidden_states)
+    return StandardCombineInput(
+        hidden_states=final_hidden_states[:, :logical_hidden_size].contiguous()
+    )
 
 
 @register_fused_func("none", "flashinfer_trtllm")

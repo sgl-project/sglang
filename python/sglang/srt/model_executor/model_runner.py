@@ -229,6 +229,13 @@ elif current_platform.is_out_of_tree():
 logger = logging.getLogger(__name__)
 
 
+def _prefill_cuda_graph_allows_context_parallel(prefill_runner) -> bool:
+    """Allow CP only through a runner that captured the validated CP-v2 body."""
+    return get_cp_strategy() is None or bool(
+        getattr(prefill_runner, "enable_cp_v2_body_capture", False)
+    )
+
+
 @dataclass
 class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
@@ -1545,7 +1552,9 @@ class ModelRunner:
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
-                and get_cp_strategy() is None
+                and _prefill_cuda_graph_allows_context_parallel(
+                    self.prefill_cuda_graph_runner
+                )
             ):
                 category = (
                     "target_verify"
