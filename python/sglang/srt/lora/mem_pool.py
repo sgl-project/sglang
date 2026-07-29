@@ -26,14 +26,14 @@ from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.utils import (
+    ATTN_TP_LORA_MODULE_NAMES,
     EMBEDDING_NAMES,
-    LoRAParallelism,
-    LoRAShardGroup,
+    REPLICATED_LINEAR_LORA_NAMES,
+    ROW_PARALLELISM_LINEAR_LORA_NAMES,
     LoRAType,
     copy_weight_into_buffer,
     get_hidden_dim,
     get_lm_head_lora_b_shard_size,
-    get_lora_shard_spec,
     get_normalized_target_modules,
     get_stacked_multiply,
     get_target_module_name,
@@ -262,23 +262,24 @@ class LoRAMemoryPool:
         """Check if module is part of MoE experts."""
         return "moe" in module_name
 
+    @staticmethod
+    def is_shared_moe_module(module_name: str) -> bool:
+        """Whether this buffer belongs to the shared-expert MoE namespace."""
+        return module_name.endswith("_shared_moe")
+
     def _effective_tp_size(self, module_name: str) -> int:
         """TP width the module's weights are actually sharded along: routed
         MoE experts shard by `moe_tp_size` (shared experts by the outer
         `tp_size` at EP=1), attention projections by `attn_tp_size` (smaller
         than the outer `tp_size` under `--enable-dp-attention`), everything
         else by the outer `tp_size`."""
-        _, shard_group = get_lora_shard_spec(module_name)
-        if shard_group is LoRAShardGroup.MOE_TP:
+        if self.is_moe_module(module_name) and not self.is_shared_moe_module(
+            module_name
+        ):
             return self.moe_tp_size
-        if shard_group is LoRAShardGroup.ATTN_TP:
+        if module_name in ATTN_TP_LORA_MODULE_NAMES:
             return self.attn_tp_size
         return self.tp_size
-
-    @staticmethod
-    def is_shared_moe_module(module_name: str) -> bool:
-        """Whether this buffer belongs to the shared-expert MoE namespace."""
-        return module_name.endswith("_shared_moe")
 
     @staticmethod
     def _get_num_experts(base_model: torch.nn.Module) -> int:
@@ -374,6 +375,22 @@ class LoRAMemoryPool:
             f"Expected dict or 3D torch.Tensor, got {type(weights).__name__}."
         )
 
+    def _get_standard_shape(
+        self,
+        module_name: str,
+        base_model: torch.nn.Module,
+        max_lora_dim: int,
+        layer_idx: int,
+    ) -> Tuple[int]:
+        """Get 3D shape for standard (non-MoE) modules."""
+        input_dim, _ = get_hidden_dim(
+            module_name, self.base_hf_config, base_model, layer_idx
+        )
+        c = get_stacked_multiply(module_name, base_model)
+        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+            input_dim = divide(input_dim, self.tp_size)
+        return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
+
     def get_lora_A_shape(
         self,
         module_name: str,
@@ -393,8 +410,11 @@ class LoRAMemoryPool:
         )
         c = get_stacked_multiply(module_name, base_model)
         effective_tp_size = self._effective_tp_size(module_name)
-        parallelism, _ = get_lora_shard_spec(module_name)
-        if effective_tp_size > 1 and parallelism is LoRAParallelism.ROW:
+        if (
+            effective_tp_size > 1
+            and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            and module_name not in REPLICATED_LINEAR_LORA_NAMES
+        ):
             input_dim = divide(input_dim, effective_tp_size)
 
         if self.is_moe_module(module_name):
@@ -486,9 +506,13 @@ class LoRAMemoryPool:
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
+        # Same sharding rule as get_lora_A_shape above.
         effective_tp_size = self._effective_tp_size(module_name)
-        parallelism, _ = get_lora_shard_spec(module_name)
-        if effective_tp_size > 1 and parallelism is LoRAParallelism.COLUMN:
+        if (
+            effective_tp_size > 1
+            and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            and module_name not in REPLICATED_LINEAR_LORA_NAMES
+        ):
             output_dim = self._column_parallel_lora_b_per_rank_dim(
                 module_name, output_dim, effective_tp_size
             )
