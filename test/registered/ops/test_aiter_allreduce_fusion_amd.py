@@ -418,11 +418,11 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
                 )
             )
             stack.enter_context(
-                mock.patch.object(comm, "get_global_server_args", lambda: server_args)
+                mock.patch.object(comm, "get_server_args", lambda: server_args)
             )
-            stack.enter_context(
-                mock.patch.object(comm, "is_dp_attention_enabled", lambda: dp_attention)
-            )
+            from sglang.srt.runtime_context import get_flags
+
+            stack.enter_context(get_flags().dp.override(enabled=dp_attention))
             stack.enter_context(
                 mock.patch.object(comm, "get_moe_a2a_backend", lambda: a2a_backend)
             )

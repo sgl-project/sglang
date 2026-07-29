@@ -370,6 +370,27 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         ), "sliding_window_size must be set for SWARadixCache"
         return True
 
+    def swa_reprefill_tail_tokens(self) -> int:
+        """Tokens at the tail of a matched prefix that must NOT be reused.
+
+        The DeepSeek-V4 unified_kv layout keeps SWA in a per-request ring
+        (addressed by ``req_pool_idx * window + pos % window``), which is NOT
+        content-stable and is never stored in the radix tree. A reused prefix
+        therefore carries another request's stale SWA in the ring. Hold back the
+        trailing sliding window from the match so it gets re-prefilled into THIS
+        request's ring, making the decode window read freshly-written data.
+
+        No-op (0) for the index-addressed SWA pool, whose slots are
+        content-stable and safe to reuse.
+        """
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        if self.sliding_window_size and is_unified_kv_triton():
+            return self.sliding_window_size
+        return 0
+
     def reset(self) -> None:
         self.root_node = TreeNode()
         self.root_node.key = []
@@ -435,19 +456,20 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         return InsertResult(prefix_len=prefix_len)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ) -> None:
         """Cache request when it finishes."""
-        kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
+                req.req_pool_idx, :kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.req_pool_idx, :kv_len_to_handle
         ]
 
         radix_key = RadixKey(
@@ -465,7 +487,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     key=radix_key,
                     value=values,
                     prev_prefix_len=old_prefix_len,
-                    swa_evicted_seqlen=req.swa_evicted_seqlen,
+                    swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
                 )
             )
         else:

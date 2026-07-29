@@ -623,9 +623,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
 
-    # Number of prefill retries for this request
-    prefill_retry_count: int = 0
-
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
         if not self.enable_metrics:
@@ -1089,8 +1086,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"entry_time={self.format_wallclock(self.prefill_bootstrap_queue_entry_time)}, "
                 f"transfer_speed={self.transfer_speed_gb_s:.2f} GB/s, "
-                f"transfer_total={self.transfer_total_mb:.2f} MB, "
-                f"#retries={self.prefill_retry_count}"
+                f"transfer_total={self.transfer_total_mb:.2f} MB"
             )
         elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = self.duration_between(
