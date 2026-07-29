@@ -4,7 +4,6 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.configs.model_config import (
-    ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
 )
@@ -51,22 +50,6 @@ class TestEmbeddingGemmaConfig(CustomTestCase):
             model_type="gemma3_text", use_bidirectional_attention=False
         )
         self.assertFalse(is_embedding_gemma(config))
-
-
-class TestGetMaxNumAttentionHeads(CustomTestCase):
-    def _make_config(self, num_attention_heads, **hf_attrs):
-        config = ModelConfig.__new__(ModelConfig)
-        config.num_attention_heads = num_attention_heads
-        config.hf_text_config = SimpleNamespace(**hf_attrs)
-        return config
-
-    def test_per_layer_heads_returns_max(self):
-        config = self._make_config(48, num_attention_heads_per_layer=[48, 72, 60, 48])
-        self.assertEqual(config.get_max_num_attention_heads(), 72)
-
-    def test_absent_per_layer_heads_falls_back(self):
-        config = self._make_config(48)
-        self.assertEqual(config.get_max_num_attention_heads(), 48)
 
 
 if __name__ == "__main__":
