@@ -4758,9 +4758,9 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         return not (is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config))
 
-    def mamba_pre_capture_reserve_mb(self, gpu_mem: Optional[float]) -> float:
-        # Realistic runtime reserve for the fixed (non-resizable) mamba state cache,
-        # which post-capture can't size from measured free memory.
+    def pre_capture_activation_reserve_mb(self, gpu_mem: Optional[float]) -> float:
+        # Runtime activation working-set reserve for eager decode above the captured
+        # max_bs and transient prefill/logits; also covers fixed state caches.
         if self.disaggregation_mode == "decode":
             running_requests = (
                 self.max_running_requests or self.cuda_graph_config.decode.max_bs or 1
@@ -5406,7 +5406,7 @@ class ServerArgs:
             # _glm4_moe_overrides).
             pass
 
-        elif model_arch in ["Lfm2ForCausalLM"]:
+        elif model_arch in ["Lfm2ForCausalLM", "Lfm2MoeForCausalLM"]:
             # Attention backend selection moved to the override registry
             # (arg_groups/overrides.py: _lfm2_overrides).
             assert resolved_view(self).attention_backend != "triton", (
@@ -5576,6 +5576,10 @@ class ServerArgs:
                     or self.speculative_eagle_topk is not None
                 )
             ):
+                # trtllm_mha requires equal K/V row widths; fa4 carries
+                # v_head_dim through.
+                if model_config.has_asymmetric_kv:
+                    return "fa4"
                 return "trtllm_mha"
             elif is_hip():
                 return "aiter"
