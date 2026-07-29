@@ -126,9 +126,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // Aborts get their own UNBOUNDED lane: on the bounded inbox they are dropped
     // exactly under the overload that makes them necessary (see `Senders::abort`).
     let (abort_tx, abort_rx) = flume::unbounded::<crate::tokenizer_manager::AbortSource>();
-    // Shared with the api server: it admits a rid, ingress releases it once the
-    // abort has actually been issued (see `Ingress::on_abort`).
-    let live_rids = tokenizer_manager::LiveRids::default();
     let senders = Senders {
         tm: tm_tx.clone(),
         abort: abort_tx.clone(),
@@ -201,7 +198,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // --- Egress dispatcher: drains egress ring → routes chunks to shards ---
     {
         // First TM core; egress is the hotter router (every output token). One
-        // worker today via `spawn_pool`, so sharding by `RidHash` later (see
+        // worker today via `spawn_pool`, so sharding by `Rid::shard` later (see
         // `TM_CORES`) is just a larger count + per-shard receivers.
         let cores = plan
             .as_ref()
@@ -235,7 +232,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             tokenizer_manager::Ingress::new(
                 tm_rx,
                 abort_rx.clone(),
-                live_rids.clone(),
                 senders.clone(),
                 ingress_tx,
                 tokenizer_manager::Limits::from_server_args(&cfg.server_args),
@@ -275,7 +271,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     cfg.server_args.clone(),
                     // Egress heartbeat watched by `/health_generate`.
                     api_activity,
-                    live_rids.clone(),
                     shutdown_rx,
                 ))
             })
@@ -402,12 +397,16 @@ mod tests {
         };
         let rt = start(cfg).expect("start runtime");
 
-        // ~3MB of input_ids + an unknown field: deny_unknown_fields fails it
-        // fast at the JSON layer with a 400 — proving the body got past any
-        // size limit (a 413 would fire before parsing).
+        // ~3MB of input_ids plus a `text`, which is mutually exclusive with them:
+        // the body parses in full and is then rejected by `into_requests` with a
+        // 400, proving it got past any size limit (a 413 would fire before
+        // parsing). The rejection must come from OUR validation, not from serde —
+        // an unknown field used to serve here, but unknown fields are now ignored
+        // to match Python, so such a body would be accepted, dispatched to a ring
+        // nobody drains in this test, and hang the connection.
         let ids = "1,".repeat(1_500_000);
         let body = format!(
-            r#"{{"input_ids":[{}1],"bogus":1,"sampling_params":{{"max_new_tokens":1}}}}"#,
+            r#"{{"input_ids":[{}1],"text":"x","sampling_params":{{"max_new_tokens":1}}}}"#,
             ids
         );
         assert!(body.len() > 2 * 1024 * 1024, "test body must exceed 2MB");
@@ -430,8 +429,8 @@ mod tests {
             .nth(1)
             .and_then(|c| c.parse().ok())
             .unwrap_or(0);
-        // 422 (axum Json unknown-field rejection) proves the body was parsed;
-        // 413 would mean it was rejected on size before parsing.
+        // A 400 from the mutually-exclusive-inputs check proves the body was read
+        // and parsed in full; 413 would mean it was rejected on size beforehand.
         assert!(
             (400..500).contains(&code) && code != 413,
             "expected a JSON-layer 4xx (not 413), got: {status_line}"

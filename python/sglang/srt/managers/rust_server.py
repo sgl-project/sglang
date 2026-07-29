@@ -286,17 +286,37 @@ class RustServer:
                 ),
             )
 
-            # Every column is all-or-nothing per payload.
+            # Every column is all-or-nothing per payload — which is also what makes
+            # a family's emptiness a reliable "nobody asked for this" signal.
+            active = []
             for extra in extras:
+                populated = False
                 for name, col in extra.columns():
                     assert len(col) in (
                         0,
                         batch_size,
                     ), f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
+                    populated |= len(col) > 0
+                if populated:
+                    active.append(extra)
 
-            for i in range(batch_size):
-                for extra in extras:
-                    extra.accept(i)
+            # Flatten only the families someone asked for. `has_extra` above is a
+            # per-FRAME guard, so one client enabling logprobs used to drag all
+            # seven families through the per-request loop: at B=4096 that is 28,672
+            # bound-method calls per decode step, materializing 12 columns of 4096
+            # zeros nobody reads. Measured 0.37 ms -> 7.90 ms GIL-held per step,
+            # i.e. 25-75% of a decode step added to the scheduler's critical path.
+            #
+            # Skipping `accept` leaves a family's buffers empty, which is exactly
+            # the wire form the Rust decoder already treats as absent (`per_req_ok`
+            # admits an empty column, `lens_i` reads 0 for every request). The
+            # `header_cols`/`data_cols` loops below still walk all seven, so column
+            # ORDER and arity are unchanged — an inactive family contributes empty
+            # columns in place rather than disappearing.
+            for extra in active:
+                accept = extra.accept  # hoisted: this is the hottest loop here
+                for i in range(batch_size):
+                    accept(i)
 
             for extra in extras:
                 header_cols += extra.header_cols()

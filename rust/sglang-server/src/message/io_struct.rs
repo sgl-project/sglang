@@ -6,7 +6,7 @@
 use bytes::Bytes;
 use serde::Serialize;
 
-use super::types::{StructTag, Tagged, control_messages, wire_struct};
+use super::types::{Tagged, control_messages, wire_struct};
 use super::{GenerateRequest, SamplingParams, TokenIds};
 use crate::error::Error;
 
@@ -21,7 +21,6 @@ wire_struct! {
         input_embeds: (),
         mm_inputs: (),
         token_type_ids: (),
-        #[serde(serialize_with = "sampling_params_as_map")]
         sampling_params: &'a SamplingParams,
         return_logprob: bool,
         logprob_start_len: i64,
@@ -51,20 +50,6 @@ control_messages! {
     GetInternalStateReq {}
 }
 
-/// Python's `SamplingParams` is a plain msgspec Struct (not `array_like`), so it
-/// must be a **map** inside the positional header — but `rmp_serde` writes every
-/// struct positionally. Routing through `serde_json::Value`, whose `Serialize`
-/// emits a map, keeps the field list in exactly one place (the derive on
-/// [`SamplingParams`]) instead of a hand-written 30-entry `serialize_map`.
-fn sampling_params_as_map<S: serde::Serializer>(
-    params: &&SamplingParams,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    serde_json::to_value(params)
-        .map_err(serde::ser::Error::custom)? // codespell:ignore ser
-        .serialize(serializer)
-}
-
 /// Borrow a request as its wire struct, resolving `Option` scalars to the wire
 /// defaults Python's own fields carry. Borrowed, not owned: every field is a
 /// reference into `req`, so an owning `From` would return references to a
@@ -76,42 +61,34 @@ fn sampling_params_as_map<S: serde::Serializer>(
 impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
     fn from(req: &'a GenerateRequest) -> Self {
         Self {
-            tag: StructTag::default(),
             rid: &req.rid,
-            http_worker_ipc: (),
             input_text: req.text.as_deref(),
             input_ids: (),
             input_embeds: (),
             mm_inputs: (),
             token_type_ids: (),
             sampling_params: &req.sampling_params,
-            return_logprob: req.return_logprob.unwrap_or(false),
-            logprob_start_len: req.logprob_start_len.unwrap_or(-1),
-            top_logprobs_num: req.top_logprobs_num.unwrap_or(0),
+            return_logprob: req.return_logprob,
+            logprob_start_len: req.logprob_start_len,
+            top_logprobs_num: req.top_logprobs_num,
             token_ids_logprob: req.token_ids_logprob.as_ref(),
             stream: req.stream,
-            return_sampling_mask: false,
-            return_hidden_states: req.return_hidden_states.unwrap_or(false),
+            return_sampling_mask: req.return_sampling_mask,
+            return_hidden_states: req.return_hidden_states,
         }
     }
 }
 
 impl GetInternalStateReq {
     pub fn new(rid: String) -> Self {
-        Self {
-            tag: StructTag::default(),
-            rid,
-            http_worker_ipc: (),
-        }
+        Self { rid }
     }
 }
 
 impl AbortReq {
     pub fn new(rid: String, abort_all: bool) -> Self {
         Self {
-            tag: StructTag::default(),
             rid,
-            http_worker_ipc: (),
             abort_all,
             finished_reason: (),
             abort_message: (),
@@ -154,10 +131,10 @@ mod tests {
                 max_new_tokens: Some(5),
                 ..Default::default()
             },
-            return_logprob: Some(true),
-            logprob_start_len: Some(-1),
-            top_logprobs_num: Some(3),
-            return_hidden_states: Some(true),
+            return_logprob: true,
+            logprob_start_len: -1,
+            top_logprobs_num: 3,
+            return_hidden_states: true,
             stream: true,
             ..Default::default()
         };
@@ -174,7 +151,9 @@ mod tests {
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
         assert!(arr[7].is_nil(), "idx 7 must be token_type_ids (nil)");
-        assert!(arr[8].is_map(), "sampling_params must land at idx 8");
+        // An ARRAY, not a map: Python's `SamplingParams` is
+        // `msgspec.Struct(array_like=True)`, so it decodes positionally.
+        assert!(arr[8].is_array(), "sampling_params must land at idx 8");
         assert_eq!(arr[9].as_bool(), Some(true), "return_logprob at idx 9");
         assert_eq!(arr[11].as_u64(), Some(3), "top_logprobs_num at idx 11");
         assert_eq!(arr[13].as_bool(), Some(true), "stream at idx 13");

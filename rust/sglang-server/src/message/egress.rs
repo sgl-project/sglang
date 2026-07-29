@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use super::TokenIds;
 use super::finish_reason::FinishReason;
 use crate::error::Error;
-use crate::ids::RidHash;
+use crate::ids::Rid;
 
 /// Per-request back-channel the detok shard writes egress frames to and the API
 /// handler drains for SSE; bounded, and receiver-drop (disconnect) = stream end.
@@ -119,7 +119,7 @@ pub fn frame_egress_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
 pub struct BatchHeader {
     /// Request ids, as the same strings Python holds (`Req.rid`, uuid hex) —
     /// hashed back to the internal routing key in `decode_one`
-    /// (`RidHash::from_rid`), mirroring the control path. The wire has no
+    /// (`Rid::shard`), mirroring the control path. The wire has no
     /// rid-shape coupling; any string is a valid rid.
     pub rids: Vec<String>,
     pub finish_reasons: Vec<Option<FinishReason>>,
@@ -226,42 +226,20 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     let Some(header) = body.get(4..4 + hlen) else {
         return decoded;
     };
-    let data = &body[4 + hlen..];
-    let h = match rmp_serde::from_slice::<BatchHeader>(header) {
-        Ok(h) => h,
-        Err(_) => {
-            // A typed decode failure (any column whose Python type widens) yields no
-            // rids, so the caller would fail nobody and every request in the frame
-            // would hang. Re-read just the rid column, which is positional element 0
-            // and independent of every other field's type.
-            // Two-stage via `rmpv`: read the header as a generic value, then take
-            // element 0. A serde tuple cannot do this — `(Vec<String>,)` decodes
-            // ONLY a 1-element array, while real headers carry 4 or 16 columns, so
-            // it returned `Err(LengthMismatch(1))` every time and named nobody.
-            // Arity independence is the whole point: the trigger for this path is
-            // Python appending a column an older Rust build does not know.
-            decoded.rids = rmpv::decode::read_value(&mut &header[..])
-                .ok()
-                .and_then(|v| match v {
-                    rmpv::Value::Array(cols) => cols.into_iter().next(),
-                    _ => None,
-                })
-                .and_then(|c| match c {
-                    rmpv::Value::Array(rids) => Some(
-                        rids.iter()
-                            .filter_map(|r| r.as_str().map(RidHash::from_rid))
-                            .collect(),
-                    ),
-                    _ => None,
-                })
-                .unwrap_or_default();
+    // Every rejection past the header slice names its requests by re-reading the
+    // rid column, rather than the whole frame paying a clone for the error path.
+    macro_rules! reject {
+        () => {{
+            decoded.rids = recover_rids(header);
             return decoded;
-        }
-    };
-    // Every rid in the frame, known as soon as the header parses — so a rejection
-    // below can still name the requests that were waiting on it.
-    decoded.rids = h.rids.iter().map(|r| RidHash::from_rid(r)).collect();
+        }};
+    }
 
+    let data = &body[4 + hlen..];
+    let mut h = match rmp_serde::from_slice::<BatchHeader>(header) {
+        Ok(h) => h,
+        Err(_) => reject!(),
+    };
     let n = h.rids.len();
     // Every column must agree with `rids`. A SHORT column contributes nothing to
     // `base`, so the `base != data.len()` check below cannot see it: a short
@@ -270,7 +248,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     // and its unary drain pended forever. The producer already asserts this for the
     // extras columns; the four core ones were unchecked.
     if h.finish_reasons.len() != n || h.prompt_tokens.len() != n || h.tok_lens.len() != n {
-        return decoded;
+        reject!()
     }
     // The per-request extras columns are either absent (no request asked) or one
     // entry per request — never partial.
@@ -283,7 +261,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         || !per_req_ok(&h.in_tid_reqlens)
         || !per_req_ok(&h.hidden_reqlens)
     {
-        return decoded;
+        reject!()
     }
     let sum = |v: &[u32]| v.iter().map(|&x| x as usize).sum::<usize>();
     // Each ragged family's per-request counts must consume its position column
@@ -295,7 +273,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         || sum(&h.in_tid_reqlens) != h.in_tid_poslens.len()
         || sum(&h.hidden_reqlens) != h.hidden_poslens.len()
     {
-        return decoded;
+        reject!()
     }
 
     // Per-column byte cursors, advanced per request — no whole-column read. Columns
@@ -339,7 +317,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     // Accepting the surplus let a producer-side val/idx mismatch through with a
     // 200, every later column reading off by the difference.
     if base != data.len() {
-        return decoded;
+        reject!()
     }
 
     // Mirror of Python's `has_extra` guard: checking once per frame lets the
@@ -451,7 +429,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         Some(ChunkEvent {
             // Any string is a valid rid; hash to the routing key. An unknown
             // rid routes to a shard whose table has no entry → dropped there.
-            rid_hash: RidHash::from_rid(&h.rids[i]).0,
+            rid: std::mem::take(&mut h.rids[i]).into(),
             token_ids,
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
@@ -466,13 +444,43 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     };
 
     for i in 0..n {
-        let Some(ev) = decode_one(i) else {
-            return decoded;
-        };
+        let Some(ev) = decode_one(i) else { reject!() };
         route(ev);
     }
     decoded.ok = true;
     decoded
+}
+
+/// Recover the rid column straight from the header bytes.
+///
+/// Read through `rmpv` rather than a serde tuple: `(Vec<String>,)` decodes ONLY a
+/// 1-element array, while real headers carry 4 or 16 columns, so it returned
+/// `Err(LengthMismatch(1))` every time and named nobody. Arity independence is the
+/// whole point — the trigger for the typed-decode-failure path is Python appending
+/// a column an older Rust build does not know.
+///
+/// Called only when a frame is rejected, which is why the accepted path no longer
+/// clones the column up front. That clone was discarded unread on every good frame
+/// and cost ~27% of the whole decode at batch 4096, plus a third of the crate's
+/// steady-state allocations. It also has to be a re-read rather than a snapshot:
+/// `decode_one` moves each rid out of the header as it goes, so by the time the
+/// routing loop can fail, the decoded header no longer holds the earlier ones.
+fn recover_rids(header: &[u8]) -> Vec<Rid> {
+    rmpv::decode::read_value(&mut &header[..])
+        .ok()
+        .and_then(|v| match v {
+            rmpv::Value::Array(cols) => cols.into_iter().next(),
+            _ => None,
+        })
+        .and_then(|c| match c {
+            rmpv::Value::Array(rids) => Some(
+                rids.iter()
+                    .filter_map(|r| r.as_str().map(Rid::from))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// Outcome of [`for_each_chunk`]: whether the frame was accepted, plus the rids it
@@ -482,7 +490,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
 #[derive(Debug, Default)]
 pub struct Decoded {
     pub ok: bool,
-    pub rids: Vec<RidHash>,
+    pub rids: Vec<Rid>,
 }
 
 /// Frame a control result `[rid, payload]` for the egress ring (tag prepended).
@@ -517,8 +525,11 @@ pub fn frame_egress_error(rid: &str, message: &str) -> Bytes {
 /// frame and moved between stages in-process (never serialized), so no serde.
 #[derive(Debug, Clone, Default)]
 pub struct ChunkEvent {
-    /// `RidHash` digest of the rid — the shard routing key; `Copy`, no clone.
-    pub rid_hash: u64,
+    /// Client-visible rid — the request's IDENTITY. Moved out of the frame header
+    /// (which owns it and drops it), so carrying it costs no allocation. The shard
+    /// is still chosen by `Rid::shard`, but a hash collision there now only
+    /// co-locates two requests instead of merging them.
+    pub rid: Rid,
     /// New token ids for this step. Empty allowed (e.g. metadata-only frames).
     pub token_ids: TokenIds,
     /// `None` while streaming, the [`FinishReason`] on the final chunk.
@@ -597,9 +608,6 @@ mod tests {
     use super::*;
     use crate::message::finish_reason::{FinishKind, Matched};
 
-    /// Concatenating N data columns produces the exact same frame as one joined
-    /// buffer (the `b"".join` the Python side used to do), with the layout
-    /// `[tag][u32 header len][header][col0 col1 …]`.
     #[test]
     fn batch_cols_match_single_joined_buffer() {
         let header = [1u8, 2, 3];
@@ -656,11 +664,11 @@ mod tests {
         let mut events = Vec::new();
         assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].rid_hash, RidHash::from_rid("1").0);
+        assert_eq!(events[0].rid, Rid::from("1"));
         assert_eq!(events[0].token_ids, vec![10, 11]);
         assert_eq!(events[0].prompt_tokens, 4);
         assert!(events[0].finish_reason.is_none());
-        assert_eq!(events[1].rid_hash, RidHash::from_rid("2").0);
+        assert_eq!(events[1].rid, Rid::from("2"));
         assert!(events[1].token_ids.is_empty());
         // The whole reason survives msgpack (type + matched), not just the type.
         assert_eq!(
@@ -672,7 +680,7 @@ mod tests {
                 .into()
             )
         );
-        assert_eq!(events[2].rid_hash, RidHash::from_rid("3").0);
+        assert_eq!(events[2].rid, Rid::from("3"));
         assert_eq!(events[2].token_ids, vec![12]);
         assert_eq!(events[2].prompt_tokens, 6);
         // A plain decode frame carries no extras columns at all, so the per-frame
@@ -711,7 +719,7 @@ mod tests {
         assert_eq!(routed, 0, "no request may be routed from a rejected frame");
         // The rid is still reported, so the caller can fail the request that was
         // waiting on this frame instead of letting it hang.
-        assert_eq!(decoded.rids, vec![RidHash::from_rid("1")]);
+        assert_eq!(decoded.rids, vec![Rid::from("1")]);
     }
 
     /// A header whose `reqlens` claim more positions than `poslens` carries is
@@ -806,7 +814,7 @@ mod tests {
         assert_eq!(routed, 0, "fails at request 0 — nothing bucketed");
         assert_eq!(
             decoded.rids,
-            vec![RidHash::from_rid("r0"), RidHash::from_rid("r1")],
+            vec![Rid::from("r0"), Rid::from("r1")],
             "both requests must be nameable so the caller can fail them"
         );
     }
@@ -831,19 +839,19 @@ mod tests {
         assert!(!decoded.ok, "header and data must agree exactly");
     }
 
-    /// Ingress/egress rid agreement: the routing key decoded from a uuid-rid
-    /// batch frame must equal `RidHash::from_rid` of the same string — the
-    /// invariant that lets shard routing work without any shared map. Guards a
-    /// rewrite that hashes differently on the two sides (e.g. a keyed hasher).
+    /// Ingress/egress rid agreement: the rid decoded from the frame must be the
+    /// one Python sent, AND both sides must derive the same shard from it. The
+    /// partition key is memoized inside `Rid`, so a per-conversion hasher seed
+    /// would send a request's chunks to a shard that never registered it.
     #[test]
-    fn uuid_rid_decodes_to_from_rid_key() {
+    fn uuid_rid_decodes_to_the_same_rid_and_shard() {
         use rmpv::Value;
-        let rid = "9f86d081884c7d659a2feaa0c55ad015";
+        let rid = Rid::from("9f86d081884c7d659a2feaa0c55ad015");
         let header_arr = Value::Array(vec![
-            Value::Array(vec![Value::from(rid)]),  // rids
-            Value::Array(vec![Value::Nil]),        // finish_reasons
-            Value::Array(vec![Value::from(1u32)]), // prompt_tokens
-            Value::Array(vec![Value::from(1u32)]), // tok_lens
+            Value::Array(vec![Value::from(rid.to_string())]), // rids
+            Value::Array(vec![Value::Nil]),                   // finish_reasons
+            Value::Array(vec![Value::from(1u32)]),            // prompt_tokens
+            Value::Array(vec![Value::from(1u32)]),            // tok_lens
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
@@ -858,14 +866,24 @@ mod tests {
         // is meant to catch: a decoder that parsed the rid as an integer (a uuid
         // is not numeric, so it would fall back to 0), and one that keyed off the
         // request's position in the batch rather than its rid.
-        assert_ne!(events[0].rid_hash, 0, "uuid rid must not degrade to 0");
-        assert_ne!(events[0].rid_hash, RidHash::from_rid("0").0);
-        assert_ne!(
-            events[0].rid_hash,
-            RidHash::from_rid("another-rid").0,
-            "distinct rids must not collide on the routing key"
+        assert_eq!(
+            events[0].rid, rid,
+            "the rid IS the identity — carried, not hashed"
         );
-        assert_eq!(events[0].rid_hash, RidHash::from_rid(rid).0);
+        assert_ne!(events[0].rid, Rid::from("0"));
+        // Same string, independently constructed → same shard, on any shard count.
+        for shards in [1usize, 3, 8, 64] {
+            assert_eq!(
+                events[0].rid.shard(shards),
+                Rid::from("9f86d081884c7d659a2feaa0c55ad015").shard(shards),
+                "the partition key must not depend on WHERE the Rid was built"
+            );
+        }
+        assert_ne!(
+            events[0].rid,
+            Rid::from("another-rid"),
+            "distinct rids stay distinct — identity is the string, not a digest"
+        );
     }
 
     /// A batch frame carrying the numeric columns (extras path): 2 requests,
@@ -926,6 +944,97 @@ mod tests {
         // req1 has a token id but no numeric columns → no extras box allocated.
         assert_eq!(events[1].token_ids, vec![20]);
         assert!(events[1].extras.is_none());
+    }
+
+    /// An inactive extras family may arrive as EMPTY columns or as `batch_size`
+    /// zeros, and both must decode to exactly the same events.
+    ///
+    /// This is the contract the Python producer's per-family gating relies on. It
+    /// used to run all seven families whenever any one of them was active, so an
+    /// inactive family shipped 4096 zeros per column; it now skips `accept`, which
+    /// leaves those columns empty. `per_req_ok` admits either and `lens_i` reads 0
+    /// past the end — but nothing pinned that, so a later tightening of the column
+    /// validation (say, requiring every column to be `batch_size` long) would
+    /// silently start rejecting whole frames, hanging every request in them.
+    #[test]
+    fn empty_and_zero_filled_inactive_families_decode_alike() {
+        use rmpv::Value;
+        let f = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let i = |xs: &[i32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
+
+        // Only `out_lp` is active; the other six families are inactive. `zeros`
+        // picks how they are spelled: the old producer's per-request zeros, or the
+        // gated producer's empty column.
+        let build = |zeros: bool| {
+            // Inactive: the old producer ran `accept` anyway and appended a 0 per
+            // request; the gated producer skips it and leaves the column empty.
+            let reqlens = if zeros { arr_u(&[0, 0]) } else { arr_u(&[]) };
+            let header_arr = Value::Array(vec![
+                Value::Array(vec![Value::from("1"), Value::from("2")]), // rids
+                Value::Array(vec![Value::Nil, Value::Nil]),             // finish
+                arr_u(&[3, 4]),                                         // prompt
+                arr_u(&[1, 1]),                                         // tok_lens
+                arr_u(&[2, 0]),                                         // out_lp_lens (ACTIVE)
+                reqlens.clone(),                                        // in_lp_lens
+                reqlens.clone(),                                        // out_top_reqlens
+                arr_u(&[]),                                             // out_top_poslens
+                reqlens.clone(),                                        // in_top_reqlens
+                arr_u(&[]),                                             // in_top_poslens
+                reqlens.clone(),                                        // out_tid_reqlens
+                arr_u(&[]),                                             // out_tid_poslens
+                reqlens.clone(),                                        // in_tid_reqlens
+                arr_u(&[]),                                             // in_tid_poslens
+                reqlens,                                                // hidden_reqlens
+                arr_u(&[]),                                             // hidden_poslens
+            ]);
+            let mut header = Vec::new();
+            rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+            let mut data = Vec::new();
+            data.extend(i(&[10, 20])); // token_ids
+            data.extend(f(&[-0.5, -0.6])); // out_lp_val (req0)
+            data.extend(i(&[10, 99])); // out_lp_idx
+            let framed = frame_egress_batch_cols(&header, &[&data]);
+            let mut events = Vec::new();
+            assert!(
+                for_each_chunk(&framed[1..], |ev| events.push(ev)).ok,
+                "frame rejected (zeros={zeros})"
+            );
+            events
+        };
+
+        let old = build(true);
+        let new = build(false);
+        assert_eq!(old.len(), 2);
+        assert_eq!(old.len(), new.len());
+        for (o, n) in old.iter().zip(&new) {
+            assert_eq!(o.rid, n.rid);
+            assert_eq!(o.token_ids, n.token_ids);
+            match (o.extras.as_deref(), n.extras.as_deref()) {
+                (Some(a), Some(b)) => {
+                    assert_eq!(a.out_lp_val, b.out_lp_val);
+                    assert_eq!(a.out_lp_idx, b.out_lp_idx);
+                    // Every inactive family stays empty in BOTH spellings.
+                    assert!(a.in_lp_val.is_empty() && b.in_lp_val.is_empty());
+                    assert!(a.out_top_lens.is_empty() && b.out_top_lens.is_empty());
+                    assert!(a.in_top_lens.is_empty() && b.in_top_lens.is_empty());
+                    assert!(a.out_tid_lens.is_empty() && b.out_tid_lens.is_empty());
+                    assert!(a.in_tid_lens.is_empty() && b.in_tid_lens.is_empty());
+                    assert!(a.hidden_lens.is_empty() && b.hidden_lens.is_empty());
+                }
+                (None, None) => {}
+                _ => panic!("extras presence differs between the two spellings"),
+            }
+        }
+        // req0 really did carry its active family through both spellings.
+        assert_eq!(
+            new[0]
+                .extras
+                .as_deref()
+                .expect("req0 has out_lp")
+                .out_lp_val,
+            vec![-0.5, -0.6]
+        );
     }
 
     /// All SEVEN extras families in one frame, each with a distinct length AND
@@ -1007,14 +1116,44 @@ mod tests {
         assert_eq!(events[0].token_ids, vec![100]);
     }
 
+    /// Two DISTINCT rids that hash to the same shard must stay separate requests.
+    /// Identity is the rid string now, so a shard-hash collision can only co-locate
+    /// them — it can no longer merge their `DetokState`, which used to evict one
+    /// client's sink and deliver their tokens to the other's connection.
+    #[test]
+    fn colliding_rids_stay_distinct_requests() {
+        use rmpv::Value;
+        let header_arr = Value::Array(vec![
+            Value::Array(vec![Value::from("alice"), Value::from("bob")]),
+            Value::Array(vec![Value::Nil, Value::Nil]),
+            Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
+            Value::Array(vec![Value::from(1u32), Value::from(1u32)]),
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+        let data: Vec<u8> = [7i32, 8].iter().flat_map(|x| x.to_le_bytes()).collect();
+        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
+        // Each chunk carries its OWN rid — the value a shard keys its table on.
+        assert_eq!(events[0].rid, Rid::from("alice"));
+        assert_eq!(events[1].rid, Rid::from("bob"));
+        assert_ne!(events[0].rid, events[1].rid);
+    }
+
     /// The common frame must stay small: logprob/hidden columns are boxed behind
     /// `ChunkExtras`, so the inline decode array is a few KiB — not MiB — even at
     /// batch 4096. A regression that inlines a rare column would blow this up.
+    ///
+    /// The budget moved 128 → 144 when the rid gained its memoized partition key
+    /// (`String` + `u64`). That costs 8 bytes × batch per decode step and buys not
+    /// re-hashing the rid on every chunk in the egress bucketing loop — a
+    /// deliberate trade, not drift.
     #[test]
     fn chunk_event_frame_stays_small() {
         let sz = std::mem::size_of::<ChunkEvent>();
         assert!(
-            sz <= 128,
+            sz <= 144,
             "ChunkEvent grew to {sz} bytes; keep rare columns behind ChunkExtras"
         );
     }
@@ -1043,7 +1182,7 @@ mod rid_recovery_tests {
             assert!(!decoded.ok, "arity {extra_cols}: must reject");
             assert_eq!(
                 decoded.rids,
-                vec![RidHash::from_rid("a"), RidHash::from_rid("b")],
+                vec![Rid::from("a"), Rid::from("b")],
                 "arity {extra_cols}: rids must survive so the caller can fail them"
             );
         }

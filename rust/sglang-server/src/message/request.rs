@@ -4,6 +4,7 @@
 //! control/abort, `IngressMsg`).
 
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 use bytes::Bytes;
 use itertools::izip;
@@ -11,11 +12,23 @@ use serde::Deserialize;
 
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::{OneOrMany, OneOrManyItem, SamplingParams, SamplingParamsInput, TokenIds};
+use crate::environ::env_u64;
 use crate::error::Error;
+use crate::ids::Rid;
 
-/// Hard cap on prompts per `/generate` body. Every column below is allocated per
-/// item, so this bounds the work a single request can ask for.
-const MAX_BATCH_SIZE: usize = 4096;
+/// Hard cap on how many scheduler requests one `/generate` HTTP call may expand
+/// into. Every column below is allocated per item before anything is dispatched,
+/// so this bounds the work — and the resident memory — a single call can ask for.
+///
+/// NOT a concurrency limit: it is a pure function of the body being parsed, so
+/// separate HTTP calls never interact with it.
+///
+/// Read once from `SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ` (registered in
+/// `python/sglang/srt/environ.py`, which owns the default). Memoized because the
+/// value is process-static — Python sets it before launching this server — and a
+/// per-request `env::var` would take a lock on the hot path for a constant.
+static MAX_BATCH_REQS_PER_HTTP_REQ: LazyLock<usize> =
+    LazyLock::new(|| env_u64("SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ", 4096) as usize);
 
 /// Hard cap on the total bytes a broadcast value may clone into the batch (see
 /// the `One` arms of the fan-out).
@@ -28,9 +41,17 @@ const JSON_TO_HEAP_FACTOR: usize = 8;
 
 /// The `/generate` wire body before batch splitting: `text`/`input_ids`/`sampling_params`
 /// each scalar-or-list, fanned into per-request [`GenerateRequest`]s by
-/// [`into_requests`](GenerateBody::into_requests). `deny_unknown_fields` rejects (4xx) unknowns.
+/// [`into_requests`](GenerateBody::into_requests).
+///
+/// Unknown keys are IGNORED, matching Python: FastAPI builds `GenerateReqInput`
+/// as a pydantic dataclass, which drops extras. `deny_unknown_fields` here turned
+/// every `GenerateReqInput` field this server has not ported — `priority`,
+/// `extra_key`, `session_id`, `session_params`, `return_sampling_mask`,
+/// `custom_logit_processor`, and ~40 more — into a 400, so a client that worked
+/// against the Python server broke against this one. The cost of dropping it is
+/// that a typo (`temperature`) is silently ignored rather than reported; that is
+/// the same trade Python already makes.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GenerateBody {
     /// Optional client-supplied request id(s): a single string (a batch fans it
     /// out as `{rid}_{i}`, mirroring Python `_normalize_batch`) or one per item.
@@ -64,21 +85,6 @@ pub struct GenerateBody {
     /// Scalar-only in Python too (`return_text_in_logprobs: bool`).
     #[serde(default)]
     pub return_text_in_logprobs: Option<bool>,
-    // Accepted for wire-compat with the native `bench_serving` payload (a full
-    // `GenerateReqInput`) but NOT yet wired into the scheduler — parsed and
-    // dropped in `into_requests`. Declaring them keeps `deny_unknown_fields` (typos still
-    // 400) while letting a benchmark request through. Permissive `Value` types so
-    // any valid shape (str / list / list-of-lists) parses. `dead_code`-allowed:
-    // deserialized then intentionally ignored.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub lora_path: Option<rmpv::Value>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub return_routed_experts: Option<bool>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub image_data: Option<rmpv::Value>,
 }
 
 impl GenerateBody {
@@ -101,7 +107,8 @@ impl GenerateBody {
             token_ids_logprob,
             return_hidden_states,
             return_text_in_logprobs,
-            // Accepted for bench_serving compat, not wired through — see the struct.
+            // Unported `GenerateReqInput` fields land here and are dropped, as they
+            // are on the Python path.
             ..
         } = self;
 
@@ -114,9 +121,10 @@ impl GenerateBody {
             (None, Some(OneOrMany::Many(v))) => v.len(),
             _ => 1,
         };
-        if declared_n > MAX_BATCH_SIZE {
+        if declared_n > *MAX_BATCH_REQS_PER_HTTP_REQ {
             return Err(Error::Validation(format!(
-                "batch size {declared_n} exceeds the maximum of {MAX_BATCH_SIZE}"
+                "batch size {declared_n} exceeds the maximum of {}",
+                *MAX_BATCH_REQS_PER_HTTP_REQ
             )));
         }
 
@@ -207,12 +215,22 @@ impl GenerateBody {
         // rid: absent → mint one uuid per item here, so every request carries its
         // final rid from this point on; a single string fans out as `{rid}_{i}`
         // for a batch (Python `_normalize_batch`); a list is per-item.
-        let rids: Vec<String> = match rid {
-            None => (0..n).map(|_| crate::ids::new_rid()).collect(),
-            Some(OneOrMany::One(r)) if !is_batch => vec![r],
+        //
+        // Every CLIENT-supplied rid goes through `Rid::from_client`, which appends a
+        // uniquifier so two concurrent requests sharing an rid cannot collide on the
+        // detok table. `client_facing` strips it back off for `meta_info.id`, so the
+        // client sees exactly what it sent. Minted rids (`Rid::default`) are already
+        // unique and are left bare.
+        let rids: Vec<Rid> = match rid {
+            None => (0..n).map(|_| Rid::default()).collect(),
+            Some(OneOrMany::One(r)) if !is_batch => vec![Rid::from_client(&r)],
             Some(OneOrMany::One(r)) => {
                 check_broadcast_budget(r.len(), n, "rid")?;
-                (0..n).map(|i| format!("{r}_{i}")).collect()
+                // Uniquify AFTER the `_{i}` split, so the split index stays part of
+                // the rid the client gets back.
+                (0..n)
+                    .map(|i| Rid::from_client(&format!("{r}_{i}")))
+                    .collect()
             }
             Some(OneOrMany::Many(v)) => {
                 if !is_batch || v.len() != n {
@@ -221,8 +239,12 @@ impl GenerateBody {
                         v.len()
                     )));
                 }
-                // Python `_validate_rid_uniqueness`: two items sharing an rid would
-                // share a `RidHash` slot, so the first is orphaned before it starts.
+                // Python `_validate_rid_uniqueness`. `from_client` below would make
+                // even these unique, so this is parity rather than safety: Python
+                // 400s a request that names one id twice, and echoing the same
+                // `meta_info.id` on two entries of one batch response is useless to
+                // the client regardless. Checked on the RAW strings, before the
+                // uniquifier hides the duplication.
                 {
                     let mut seen = HashSet::with_capacity(v.len());
                     let duplicates: Vec<&String> = v.iter().filter(|r| !seen.insert(*r)).collect();
@@ -232,7 +254,7 @@ impl GenerateBody {
                         )));
                     }
                 }
-                v
+                v.iter().map(|r| Rid::from_client(r)).collect()
             }
         };
 
@@ -279,13 +301,15 @@ impl GenerateBody {
                 input_ids,
                 sampling_params,
                 stream,
-                return_logprob,
-                logprob_start_len,
-                top_logprobs_num,
+                // Python `GenerateReqInput` defaults.
+                return_logprob: return_logprob.unwrap_or(false),
+                logprob_start_len: logprob_start_len.unwrap_or(-1),
+                top_logprobs_num: top_logprobs_num.unwrap_or(0),
                 // `Some` here means "these ids were requested", so an empty list
                 // collapses to None.
                 token_ids_logprob: token_ids_logprob.filter(|ids| !ids.is_empty()),
-                return_hidden_states,
+                return_sampling_mask: false, // TODO: port Python's `return_sampling_mask`
+                return_hidden_states: return_hidden_states.unwrap_or(false),
                 return_text_in_logprobs,
             },
         )
@@ -313,15 +337,21 @@ pub enum RequestKind {
 #[derive(Debug, Default)]
 pub struct GenerateRequest {
     /// This item's final rid: the client's (normalized per item by `into_requests`) or a
-    /// uuid minted there when none was sent.
+    /// uuid minted there when none was sent. A [`Rid`], not a `String`: the wire
+    /// forms stay textual (`GenerateBody` on the way in, `TokenizedGenerateReqInput`
+    /// on the way out) but every in-process carrier names the type.
     ///
     /// Duplicates *within* one request are rejected by `into_requests` (Python
     /// `_validate_rid_uniqueness`). A collision with a *concurrent* request's rid
-    /// is rejected too, by the in-flight registry `api_server::submit` consults —
-    /// as Python's `TokenizerManager` does ("Duplicate request ID detected"). It
-    /// used to overwrite the earlier request's `RidHash` slot, and this comment
-    /// used to call that parity with Python; both were wrong.
-    pub rid: String,
+    /// cannot arise: [`Rid::from_client`] appends a uniquifier to every
+    /// client-supplied rid, so this value is unique for the process's lifetime and
+    /// only [`client_facing`](Rid::client_facing) is ever shown back.
+    ///
+    /// This diverges from Python, which 400s the second request ("Duplicate request
+    /// ID detected"). Serving both is the friendlier answer and strictly safer —
+    /// what the rejection protected against was one request evicting the other's
+    /// detok sink, which is now unrepresentable.
+    pub rid: Rid,
     pub text: Option<String>,
     /// Client-supplied token ids, or filled by the Tokenizer stage.
     pub input_ids: Option<TokenIds>,
@@ -331,15 +361,19 @@ pub struct GenerateRequest {
     /// Whether the client asked for SSE streaming.
     pub stream: bool,
     /// Logprob / hidden-state options. This path bypasses the Python
-    /// `TokenizerManager`, so the ingress replicates its scalar normalization
-    /// (defaults applied in `to_header_msgpack`) before the scheduler sees them.
-    pub return_logprob: Option<bool>,
-    pub logprob_start_len: Option<i64>,
-    pub top_logprobs_num: Option<i64>,
+    /// `TokenizerManager`, so `into_requests` replicates its scalar
+    /// normalization. Resolved to concrete values THERE rather than at the wire
+    /// boundary: an `Option` surviving past construction invites two call sites
+    /// to disagree about what absent means, and only the wire knew the answer.
+    /// The defaults are `GenerateReqInput`'s own.
+    pub return_logprob: bool,
+    pub logprob_start_len: i64,
+    pub top_logprobs_num: i64,
     /// This request's `token_ids_logprob` ids, fanned out by `into_requests` and
     /// collapsed to `None` when empty (the scheduler branches on `is not None`).
     pub token_ids_logprob: Option<TokenIds>,
-    pub return_hidden_states: Option<bool>,
+    pub return_sampling_mask: bool,
+    pub return_hidden_states: bool,
     /// Decode logprob token ids to text in each `[logprob, token_id, text]` tuple
     /// (default leaves the text slot null). Deliberately NOT in the scheduler
     /// header — Python's `TokenizedGenerateReqInput` has no such field either;
@@ -516,43 +550,71 @@ mod tests {
         assert_eq!(ps[1].input_ids, Some(vec![3]));
     }
 
-    /// Both / neither of text+input_ids is a 400; the wire still rejects unknowns.
+    /// Both / neither of text+input_ids is a 400.
     #[test]
     fn split_validates_inputs() {
         assert!(requests(r#"{"text": "a", "input_ids": [1]}"#).is_err());
         assert!(requests(r#"{"stream": true}"#).is_err());
-        assert!(
-            serde_json::from_str::<GenerateBody>(r#"{"text": "hi", "bogus": 1}"#).is_err(),
-            "GenerateBody must deny unknown fields"
-        );
-        // Python's `GenerateReqInput` has no top-level `n` either (parallel
-        // sampling reads `sampling_params.n`) — but FastAPI builds it from a
-        // pydantic dataclass, which *ignores* the extra key, where
-        // `deny_unknown_fields` makes it a 400. Deliberately stricter: a
-        // top-level `n` is a client bug that Python swallows silently.
-        assert!(serde_json::from_str::<GenerateBody>(r#"{"text": "a", "n": 1}"#).is_err());
         // Parallel sampling is rejected where Python reads it — in the params,
         // at normalization (the ingress step), not here.
         let (mut ps, _) = requests(r#"{"text": "a", "sampling_params": {"n": 2}}"#).unwrap();
         assert!(ps[0].sampling_params.normalize(false, None).is_err());
     }
 
+    /// Unported `GenerateReqInput` fields are IGNORED, not rejected.
+    ///
+    /// These are all real fields on Python's `GenerateReqInput` that this server
+    /// has not ported. `deny_unknown_fields` turned every one of them into a 400,
+    /// so a client that worked against the Python server broke here — and the
+    /// wire-compat fields (`lora_path`, `image_data`, `return_routed_experts`) had
+    /// to be declared and dropped by hand just to let `bench_serving` through.
+    /// FastAPI's pydantic dataclass drops extras, so ignoring them is the parity
+    /// behavior; a typo being silently ignored is the same trade Python makes.
+    #[test]
+    fn unported_generate_req_input_fields_are_ignored() {
+        for field in [
+            r#""priority": 3"#,
+            r#""extra_key": "k""#,
+            r#""session_id": "s""#,
+            r#""session_params": {"a": 1}"#,
+            r#""return_sampling_mask": true"#,
+            r#""custom_logit_processor": "cls""#,
+            r#""lora_path": "adapter""#,
+            r#""image_data": "base64""#,
+            r#""return_routed_experts": true"#,
+            r#""bootstrap_host": "h""#,
+            // Python has no top-level `n` either, and ignores it just the same.
+            r#""n": 1"#,
+            r#""totally_made_up": 1"#,
+        ] {
+            let body = format!(r#"{{"text": "hi", {field}}}"#);
+            let (ps, _) = requests(&body)
+                .unwrap_or_else(|e| panic!("{field} must be ignored, not rejected: {e}"));
+            assert_eq!(ps.len(), 1, "{field}");
+            assert_eq!(ps[0].text.as_deref(), Some("hi"), "{field}");
+        }
+    }
+
     /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a
     /// single string passes through for a single request, fans out as
     /// `{rid}_{i}` for a batch, and a list must match the batch length. An
     /// absent rid is minted here, one uuid per item.
+    ///
+    /// Asserted on `client_facing()`, which is what `meta_info.id` echoes: the
+    /// internal rid additionally carries the `from_client` uniquifier, and that
+    /// suffix must never be visible in the parity-defined shape.
     #[test]
     fn split_rid_matches_python_normalize() {
         let (ps, _) = requests(r#"{"text": "a", "rid": "r"}"#).unwrap();
-        assert_eq!(ps[0].rid, "r");
+        assert_eq!(ps[0].rid.client_facing(), "r");
 
         let (ps, _) = requests(r#"{"text": ["a", "b"], "rid": "base"}"#).unwrap();
-        assert_eq!(ps[0].rid, "base_0");
-        assert_eq!(ps[1].rid, "base_1");
+        assert_eq!(ps[0].rid.client_facing(), "base_0");
+        assert_eq!(ps[1].rid.client_facing(), "base_1");
 
         let (ps, _) = requests(r#"{"text": ["a", "b"], "rid": ["x", "y"]}"#).unwrap();
-        assert_eq!(ps[0].rid, "x");
-        assert_eq!(ps[1].rid, "y");
+        assert_eq!(ps[0].rid.client_facing(), "x");
+        assert_eq!(ps[1].rid.client_facing(), "y");
 
         let (ps, _) = requests(r#"{"text": ["a", "b"]}"#).unwrap();
         // Absent → `into_requests` mints one uuid per item, all distinct.
@@ -595,18 +657,25 @@ mod tests {
     /// capped before any column is built.
     #[test]
     fn oversized_batches_are_rejected_before_allocating() {
-        let texts: Vec<String> = (0..MAX_BATCH_SIZE + 1).map(|i| i.to_string()).collect();
+        let texts: Vec<String> = (0..*MAX_BATCH_REQS_PER_HTTP_REQ + 1)
+            .map(|i| i.to_string())
+            .collect();
         let body = serde_json::json!({ "text": texts }).to_string();
         let err = requests(&body).unwrap_err().to_string();
         assert!(err.contains("exceeds the maximum"), "{err}");
 
         // At the cap it is accepted.
-        let texts: Vec<String> = (0..MAX_BATCH_SIZE).map(|i| i.to_string()).collect();
+        let texts: Vec<String> = (0..*MAX_BATCH_REQS_PER_HTTP_REQ)
+            .map(|i| i.to_string())
+            .collect();
         let (reqs, _) = requests(&serde_json::json!({ "text": texts }).to_string()).unwrap();
-        assert_eq!(reqs.len(), MAX_BATCH_SIZE);
+        assert_eq!(reqs.len(), *MAX_BATCH_REQS_PER_HTTP_REQ);
 
         // A small batch with a huge broadcast `custom_params` is the quadratic case:
-        // few items, but each clone carries the whole blob.
+        // few items, but each clone carries the whole blob. The item count is a
+        // literal because this half asserts the BYTE budget, not the item cap —
+        // it therefore assumes the default `SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ`, since
+        // a cap below 200 would trip the item check first and report that instead.
         let blob = "x".repeat(1 << 20); // 1 MiB
         let body = serde_json::json!({
             "text": vec!["hi"; 200],
@@ -678,19 +747,19 @@ mod tests {
         let (ps, _) =
             requests(r#"{"text": ["a", "b"], "return_logprob": true, "top_logprobs_num": 3}"#)
                 .unwrap();
-        assert_eq!(ps[0].return_logprob, Some(true));
-        assert_eq!(ps[1].top_logprobs_num, Some(3));
+        assert!(ps[0].return_logprob);
+        assert_eq!(ps[1].top_logprobs_num, 3);
 
         let (ps, _) = requests(
             r#"{"text": ["a", "b"], "return_logprob": [true, false],
                 "logprob_start_len": [0, 2], "return_hidden_states": [false, true]}"#,
         )
         .unwrap();
-        assert_eq!(ps[0].return_logprob, Some(true));
-        assert_eq!(ps[1].return_logprob, Some(false));
-        assert_eq!(ps[0].logprob_start_len, Some(0));
-        assert_eq!(ps[1].logprob_start_len, Some(2));
-        assert_eq!(ps[1].return_hidden_states, Some(true));
+        assert!(ps[0].return_logprob);
+        assert!(!ps[1].return_logprob);
+        assert_eq!(ps[0].logprob_start_len, 0);
+        assert_eq!(ps[1].logprob_start_len, 2);
+        assert!(ps[1].return_hidden_states);
 
         let err = requests(r#"{"text": ["a", "b"], "return_logprob": [true]}"#).unwrap_err();
         assert!(
@@ -717,8 +786,10 @@ mod tests {
         assert!(requests(r#"{"input_ids": [[1], [2]]}"#).is_ok());
     }
 
-    /// Two items in one request cannot share an rid: they would map to the same
-    /// `RidHash` slot. Mirrors Python `_validate_rid_uniqueness`.
+    /// Two items in one request cannot share an rid. Mirrors Python
+    /// `_validate_rid_uniqueness` — and it must be checked on the RAW strings,
+    /// because `Rid::from_client` would otherwise make the duplicates distinct and
+    /// the client would get two response entries carrying the same `meta_info.id`.
     #[test]
     fn duplicate_rids_within_one_request_are_rejected() {
         let err = requests(r#"{"text": ["a", "b"], "rid": ["x", "x"]}"#).unwrap_err();
@@ -726,7 +797,24 @@ mod tests {
 
         assert!(requests(r#"{"text": ["a", "b"], "rid": ["x", "y"]}"#).is_ok());
         let (ps, _) = requests(r#"{"text": ["a", "b"], "rid": "x"}"#).unwrap();
-        assert_eq!(ps[0].rid, "x_0");
-        assert_eq!(ps[1].rid, "x_1");
+        assert_eq!(ps[0].rid.client_facing(), "x_0");
+        assert_eq!(ps[1].rid.client_facing(), "x_1");
+    }
+
+    /// The collision this whole scheme exists to prevent: two CONCURRENT requests
+    /// naming the same rid. They must end up with different internal `Rid`s — the
+    /// detok table is keyed on it, and `Register` is an insert-overwrite, so equal
+    /// rids would evict the first client's sink and deliver its remaining chunks to
+    /// the second's connection. Both still see their own rid echoed back.
+    #[test]
+    fn concurrent_requests_sharing_an_rid_get_distinct_internal_rids() {
+        let (a, _) = requests(r#"{"text": "a", "rid": "same"}"#).unwrap();
+        let (b, _) = requests(r#"{"text": "b", "rid": "same"}"#).unwrap();
+        assert_ne!(
+            a[0].rid, b[0].rid,
+            "a shared client rid must not become a shared internal rid"
+        );
+        assert_eq!(a[0].rid.client_facing(), "same");
+        assert_eq!(b[0].rid.client_facing(), "same");
     }
 }

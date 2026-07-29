@@ -1,7 +1,6 @@
 //! Shared wire-shape types: the token-id buffer alias, the scalar-or-list
 //! adapter (with the sealed allowlist that keeps its `untagged` selection safe),
 //! and the msgspec tagging machinery behind [`wire_struct!`].
-use std::marker::PhantomData;
 
 use serde::{Deserialize, Serialize};
 
@@ -36,10 +35,7 @@ pub enum OneOrMany<T: OneOrManyItem> {
 /// round-trip.
 pub trait OneOrManyItem: sealed::SealedItem {}
 
-impl OneOrManyItem for bool {}
-impl OneOrManyItem for i64 {}
-impl OneOrManyItem for String {}
-impl OneOrManyItem for TokenIds {}
+impl<T: sealed::SealedItem> OneOrManyItem for T {}
 
 mod sealed {
     /// Supertrait no downstream module can implement, sealing [`super::OneOrManyItem`].
@@ -58,35 +54,14 @@ pub(super) trait Tagged {
     const TAG: &'static str;
 }
 
-/// Zero-sized tag slot, serialized as its owner's [`Tagged::TAG`] — serde has no
-/// attribute for a constant array element, so the tag rides as a field whose
-/// value lives in the type and cannot be mistyped.
-pub(super) struct StructTag<T: Tagged>(PhantomData<T>);
-
-impl<T: Tagged> Default for StructTag<T> {
-    fn default() -> Self {
-        Self(PhantomData)
-    }
-}
-
-impl<T: Tagged> std::fmt::Debug for StructTag<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(T::TAG)
-    }
-}
-
-impl<T: Tagged> Serialize for StructTag<T> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(T::TAG)
-    }
-}
-
 /// Declare msgspec `array_like=True` wire structs by their *own* fields, in wire
 /// order; the inherited `BaseReq` preamble (`tag`, `rid`, `http_worker_ipc`) and
 /// the [`Tagged`] impl are generated. **The struct name is the Python class
 /// name** (via `stringify!`), so name it exactly as `io_struct.py` does — the
 /// per-message tests assert the tag, so a rename fails loudly. Field attributes
-/// pass through.
+/// pass through. The http_worker_ipc is just a placeholder for the scheduler's
+/// `BaseReq` and is always `()`, without it the scheduler's `BaseReq` would be
+/// misaligned on the wire.
 ///
 /// Two forms, and **one invocation may use only one** (an arm matches the whole
 /// invocation): `Name<'a>` borrows its rid — zero-copy, for the hot path;
@@ -99,12 +74,38 @@ macro_rules! wire_struct {
         }
     )+) => {$(
         $(#[$meta])*
-        #[derive(Debug, Serialize)]
+        #[derive(Debug)]
         $vis struct $name<$lt> {
-            tag: StructTag<Self>,
             rid: &$lt str,
-            http_worker_ipc: (),
             $($(#[$field_meta])* $field: $ty,)*
+        }
+
+        /// Hand-written so the `BaseReq` preamble is SYNTHESIZED rather than stored.
+        ///
+        /// `tag` and `http_worker_ipc` are the same two values for every message, so
+        /// carrying them as fields meant every constructor restated them — and a
+        /// `Default`-based shortcut is the wrong fix twice over: the borrowed form
+        /// holds `&SamplingParams`, which has no `Default` at all, and
+        /// `..Default::default()` would let a field added here but missed in a
+        /// constructor ship a silent default on a POSITIONAL wire. Emitting them
+        /// here instead means the tag comes from [`Tagged::TAG`] and cannot be
+        /// forgotten, mistyped, or paired with the wrong struct.
+        ///
+        /// `serialize_struct` (not `serialize_seq`) keeps `rmp_serde` on exactly the
+        /// code path the derive used, so the bytes are unchanged — which
+        /// `to_header_msgpack_is_positionally_aligned` asserts index by index.
+        impl<$lt> Serialize for $name<$lt> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeStruct; // codespell:ignore ser
+                // Annotated so the zero-field case (a bare `BaseReq`) still infers.
+                let own = <[&'static str]>::len(&[$(stringify!($field)),*]);
+                let mut st = serializer.serialize_struct(stringify!($name), 3 + own)?;
+                st.serialize_field("tag", <Self as Tagged>::TAG)?;
+                st.serialize_field("rid", &self.rid)?;
+                st.serialize_field("http_worker_ipc", &())?;
+                $(st.serialize_field(stringify!($field), &self.$field)?;)*
+                st.end()
+            }
         }
 
         impl<$lt> $name<$lt> {
@@ -126,12 +127,38 @@ macro_rules! wire_struct {
         }
     )+) => {$(
         $(#[$meta])*
-        #[derive(Debug, Serialize)]
+        #[derive(Debug)]
         $vis struct $name {
-            tag: StructTag<Self>,
             rid: String,
-            http_worker_ipc: (),
             $($(#[$field_meta])* $field: $ty,)*
+        }
+
+        /// Hand-written so the `BaseReq` preamble is SYNTHESIZED rather than stored.
+        ///
+        /// `tag` and `http_worker_ipc` are the same two values for every message, so
+        /// carrying them as fields meant every constructor restated them — and a
+        /// `Default`-based shortcut is the wrong fix twice over: the borrowed form
+        /// holds `&SamplingParams`, which has no `Default` at all, and
+        /// `..Default::default()` would let a field added here but missed in a
+        /// constructor ship a silent default on a POSITIONAL wire. Emitting them
+        /// here instead means the tag comes from [`Tagged::TAG`] and cannot be
+        /// forgotten, mistyped, or paired with the wrong struct.
+        ///
+        /// `serialize_struct` (not `serialize_seq`) keeps `rmp_serde` on exactly the
+        /// code path the derive used, so the bytes are unchanged — which
+        /// `to_header_msgpack_is_positionally_aligned` asserts index by index.
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeStruct; // codespell:ignore ser
+                // Annotated so the zero-field case (a bare `BaseReq`) still infers.
+                let own = <[&'static str]>::len(&[$(stringify!($field)),*]);
+                let mut st = serializer.serialize_struct(stringify!($name), 3 + own)?;
+                st.serialize_field("tag", <Self as Tagged>::TAG)?;
+                st.serialize_field("rid", &self.rid)?;
+                st.serialize_field("http_worker_ipc", &())?;
+                $(st.serialize_field(stringify!($field), &self.$field)?;)*
+                st.end()
+            }
         }
 
         impl $name {

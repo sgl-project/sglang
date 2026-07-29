@@ -30,7 +30,9 @@ template <
                                          // fetch pipeline
     const int group_blocks,              // number of consecutive 16x16 blocks
                                          // with a separate quantization scale
-    const bool is_zp_float               // is zero point of float16 type?
+    const bool is_zp_float,              // is zero point of float16 type?
+    const bool kIsEP,                    // expert parallelism
+    const bool kHasBias                  // has per-expert bias
     >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 

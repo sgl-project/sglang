@@ -21,14 +21,13 @@ use bytes::Bytes;
 
 use crate::error::Error;
 use crate::fsm::{Event, RequestState, ValidationOutcome};
-use crate::ids::RidHash;
 use crate::message::{
     AbortReq, ControlRequest, DetokMsg, EgressItem, GenerateRequest, IngressMsg, Request,
     RequestKind,
 };
 use crate::ring::IngressProducer;
 use crate::runtime::Runnable;
-use crate::tokenizer_manager::{AbortSource, LiveRids, Senders, TmEvent};
+use crate::tokenizer_manager::{AbortSource, Senders, TmEvent};
 
 /// Ingress FSM dispatcher stage. Owns its inbox + downstream handles, so the
 /// runtime spawns it as a [`Runnable`] rather than calling a free `run_*` fn
@@ -38,14 +37,15 @@ pub struct Ingress {
     /// Unbounded abort lane (see [`Senders::abort`]). Selected against `rx` so an
     /// abort is handled promptly even while the bounded inbox is saturated.
     abort_rx: flume::Receiver<AbortSource>,
-    /// In-flight rid registry. Released HERE, not by the guard that queued the
-    /// abort — see [`Ingress::on_abort`].
-    live_rids: LiveRids,
     senders: Senders,
     ingress: IngressProducer,
     limits: Limits,
     shutdown: flume::Receiver<()>,
 }
+
+/// Longest client-supplied rid accepted. It keys the detok table and travels on
+/// every chunk, so its length is a recurring cost; Python mints 32-byte uuid hex.
+const MAX_RID_LEN: usize = 128;
 
 /// What ingress admits, resolved once at boot from the scheduler's `server_args`.
 /// A struct rather than more positional `new` arguments — these grew from two to
@@ -86,7 +86,6 @@ impl Ingress {
     pub fn new(
         rx: flume::Receiver<TmEvent>,
         abort_rx: flume::Receiver<AbortSource>,
-        live_rids: LiveRids,
         senders: Senders,
         ingress: IngressProducer,
         limits: Limits,
@@ -95,7 +94,6 @@ impl Ingress {
         Self {
             rx,
             abort_rx,
-            live_rids,
             senders,
             ingress,
             limits,
@@ -145,24 +143,22 @@ impl Ingress {
     /// Reject a request: → `Failed`, notify the client, deregister (unconditional
     /// — a no-op when nothing was registered).
     /// `registered` says whether this request ever reached `register_detok`. It
-    /// must: `Deregister`'s handler is a bare `table.remove(&rid_hash)`, so a
+    /// must: `Deregister`'s handler is a bare `table.remove(&rid)`, so a
     /// request rejected BEFORE registering would evict whatever entry currently
     /// holds that key — a concurrent request's sink — leaving that client with no
     /// terminal frame and a hung connection. Python cannot hit this because it
     /// validates before `rid_to_state[obj.rid] = state`.
     fn fail(&self, req: &mut Request, err: Error, registered: bool) {
-        let id = req.rid_hash;
         // Log only server faults (500); 4xx/499/503 are expected and would spam.
         if err.http_status() == 500 {
-            tracing::error!(rid = id.0, error = %err, "ingress rejected request");
+            tracing::error!(rid = %req.rid, error = %err, "ingress rejected request");
         }
         let _ = req.state.apply(Event::Error(err.clone()));
         let _ = req.sink.try_send(EgressItem::Error(err)); // client may be gone
         if registered {
-            let _ = self
-                .senders
-                .detok_for(id)
-                .send(DetokMsg::Deregister { rid_hash: id });
+            let _ = self.senders.detok_for(&req.rid).send(DetokMsg::Deregister {
+                rid: req.rid.clone(),
+            });
         }
     }
 
@@ -315,9 +311,8 @@ impl Ingress {
             RequestKind::Control(_) => (false, false),
         };
         self.senders
-            .detok_for(req.rid_hash)
+            .detok_for(&req.rid)
             .send(DetokMsg::Register {
-                rid_hash: req.rid_hash,
                 rid: req.rid.clone(),
                 sink: req.sink.clone(),
                 decode_logprob_text,
@@ -352,45 +347,37 @@ impl Ingress {
         }
     }
 
-    /// Client disconnected: deregister, then push an `AbortReq(rid)` so the
-    /// scheduler stops generating. Fire-and-forget (a full ring drops the abort;
-    /// the request then finishes at EOS).
+    /// Client disconnected (or a detok terminal): deregister the sink, then push an
+    /// `AbortReq(rid)` so the scheduler stops generating for it.
+    ///
+    /// A failed push is logged, not retried: the scheduler keeps generating and the
+    /// chunks arrive for a rid no longer in the detok table, where they are dropped.
+    /// That wastes GPU work until the request finishes on its own, but it cannot be
+    /// misdelivered — the rid is unique to this request for the process's lifetime
+    /// ([`Rid::from_client`]), so no later request can ever answer to it.
     fn on_abort(&self, source: AbortSource) {
-        let rid = source.rid().to_string();
-        let id = RidHash::from_rid(&rid);
+        let rid = source.rid().clone();
         let _ = self
             .senders
-            .detok_for(id)
-            .send(DetokMsg::Deregister { rid_hash: id });
+            .detok_for(&rid)
+            .send(DetokMsg::Deregister { rid: rid.clone() });
 
-        match ControlRequest::AbortReq(AbortReq::new(rid.clone(), false)).encode() {
+        // The ring is BOUNDED and drops pushes under exactly the load this matters
+        // for, so report the miss rather than assuming the scheduler was told.
+        match ControlRequest::AbortReq(AbortReq::new(rid.as_str().to_string(), false)).encode() {
             Ok(header) => {
                 if !self.ingress.try_push(IngressMsg {
                     header,
                     ids: Bytes::new(),
                 }) {
-                    tracing::warn!(rid = %rid, "abort dropped: ingress ring full");
+                    tracing::error!(
+                        rid = %rid,
+                        "abort dropped: ingress ring full; the scheduler keeps generating \
+                         for this request until it finishes on its own"
+                    );
                 }
             }
-            Err(e) => tracing::warn!(rid = %rid, error = %e, "abort encode failed"),
-        }
-
-        // Release the rid only now — AFTER the deregister and the ring push have
-        // been issued. `AbortGuard::drop` used to release it right after enqueuing
-        // the abort, which orders the SEND, not the EFFECT: this handler runs later
-        // and can stall on either bounded send above, so a retry could pass the
-        // duplicate check and register before the stale abort drained. The shard
-        // then saw [Register, Deregister] and the retry got a 500, while a real
-        // `AbortReq` naming it went to the scheduler. An epoch on the detok
-        // messages cannot fix that — `AbortReq` matches by rid STRING.
-        //
-        // …and only for a GUARD abort. A detok-originated one (failed request,
-        // decoder error, full sink) leaves the handler's guard armed and still
-        // owning the entry, so releasing here would hand the same rid out twice.
-        if matches!(source, AbortSource::Guard(_))
-            && let Ok(mut live) = self.live_rids.lock()
-        {
-            live.remove(&rid);
+            Err(e) => tracing::error!(rid = %rid, error = %e, "abort encode failed"),
         }
     }
 
@@ -433,6 +420,20 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
     let _ = req
         .state
         .apply(Event::Validated(ValidationOutcome::NeedsTokenize));
+
+    // The rid is the request's identity everywhere downstream: it keys the detok
+    // table, and it rides on EVERY chunk of EVERY decode step. An unbounded
+    // client-supplied rid is therefore a per-step cost, not a one-off. Python's is
+    // a 32-byte uuid hex, so this is generous.
+    // Measured on the CLIENT-facing form: the uniquifier `Rid::from_client` appends
+    // is this server's own overhead, and charging the client for bytes it did not
+    // send would reject a rid exactly at the documented limit.
+    let client_rid_len = req.rid.client_facing().len();
+    if client_rid_len > MAX_RID_LEN {
+        return Err(Error::Validation(format!(
+            "rid is {client_rid_len} bytes, over the {MAX_RID_LEN}-byte limit"
+        )));
+    }
     if skip_tokenizer_init
         && matches!(&req.kind, RequestKind::Generate(g) if !g.already_tokenized())
     {
@@ -473,7 +474,7 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
     // this the request would 200 with `meta_info.hidden_states` silently absent
     // (Python `TokenizerManager._validate_one_request`).
     if !limits.enable_return_hidden_states
-        && matches!(&req.kind, RequestKind::Generate(g) if g.return_hidden_states == Some(true))
+        && matches!(&req.kind, RequestKind::Generate(g) if g.return_hidden_states)
     {
         return Err(Error::Validation(
             "The server is not configured to return the hidden states. \
@@ -617,142 +618,55 @@ mod tests {
         // end `run` by dropping `tm_tx`, not by shutdown.
         let (sd_tx, sd_rx) = flume::unbounded::<()>();
         std::mem::forget(sd_tx);
-        let ingress = Ingress::new(
-            tm_rx,
-            abort_rx,
-            LiveRids::default(),
-            senders,
-            ingress_producer,
-            limits,
-            sd_rx,
-        );
+        let ingress = Ingress::new(tm_rx, abort_rx, senders, ingress_producer, limits, sd_rx);
         (ingress, detok_rx, consumer, tm_tx)
     }
 
-    /// `on_abort` must release the rid only AFTER the deregister has actually been
-    /// delivered — ordering the EFFECT, not the send.
+    /// Both abort sources do the same two things: drop the detok entry so no
+    /// further chunk can be delivered, and tell the scheduler to stop generating.
     ///
-    /// Regression for the disconnect/retry race: `AbortGuard::drop` used to release
-    /// the rid right after enqueuing the abort on the lane. This handler runs later
-    /// and can stall on either bounded send below, so a retry could pass the
-    /// duplicate check and `Register` ahead of the stale abort; the shard then saw
-    /// `[Register, Deregister]`, the retry's sink was torn down (500 "response
-    /// truncated") and a real `AbortReq` naming it went to the scheduler.
-    ///
-    /// Deterministic by construction: the detok channel is a rendezvous
-    /// (`bounded(0)`), so `on_abort` provably cannot progress past the deregister
-    /// until this thread receives it. Correct code therefore CANNOT release the rid
-    /// during the wait below; a release-first regression does so immediately.
+    /// Neither releases anything, and nothing needs them to. Release ordering used
+    /// to be the delicate part here — `AbortGuard::drop` releasing a rid right
+    /// after enqueuing the abort ordered the SEND, not the EFFECT, so a retry of
+    /// the same rid could `Register` ahead of the stale abort and be torn down by
+    /// it. `Rid::from_client` removes the premise: a retry carries a different
+    /// `Rid`, so no abort in flight can name it.
     #[test]
-    fn on_abort_releases_the_rid_only_after_the_deregister_lands() {
-        let live: LiveRids = Default::default();
-        live.lock().unwrap().insert("x".to_string());
-
-        // Rendezvous shard channel: the send blocks until we receive.
-        let (detok_tx, detok_rx) = flume::bounded::<DetokMsg>(0);
-        let (ingress_producer, consumer) = ingress_ring(16);
-        let (sd_tx, sd_rx) = flume::unbounded::<()>();
-        std::mem::forget(sd_tx);
-        let ingress = Ingress::new(
-            flume::unbounded().1,
-            flume::unbounded().1,
-            live.clone(),
-            Senders {
-                tm: flume::unbounded().0,
-                abort: flume::unbounded().0,
-                tok: flume::unbounded().0,
-                detok: vec![detok_tx],
-            },
-            ingress_producer,
-            test_limits(),
-            sd_rx,
-        );
-
-        let handle =
-            std::thread::spawn(move || ingress.on_abort(AbortSource::Guard("x".to_string())));
-
-        // The abort handler is parked on the rendezvous send. The rid MUST still be
-        // held: releasing it here is what let a retry register ahead of the abort.
-        for _ in 0..50 {
-            assert!(
-                live.lock().unwrap().contains("x"),
-                "rid released before the deregister was delivered — a retry could \
-                 now register ahead of this abort and be torn down by it"
+    fn every_abort_source_deregisters_and_stops_the_scheduler() {
+        for source in [
+            AbortSource::Guard("x".into()),
+            AbortSource::Detok("x".into()),
+        ] {
+            let (detok_tx, detok_rx) = flume::unbounded::<DetokMsg>();
+            let (ingress_producer, consumer) = ingress_ring(16);
+            let (sd_tx, sd_rx) = flume::unbounded::<()>();
+            std::mem::forget(sd_tx);
+            let ingress = Ingress::new(
+                flume::unbounded().1,
+                flume::unbounded().1,
+                Senders {
+                    tm: flume::unbounded().0,
+                    abort: flume::unbounded().0,
+                    tok: flume::unbounded().0,
+                    detok: vec![detok_tx],
+                },
+                ingress_producer,
+                test_limits(),
+                sd_rx,
             );
-            std::thread::sleep(std::time::Duration::from_millis(2));
+
+            ingress.on_abort(source.clone());
+
+            assert!(
+                matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "x"),
+                "{source:?} must drop the detok entry",
+            );
+            assert_eq!(
+                consumer.drain(8).headers.len(),
+                1,
+                "{source:?} must push an AbortReq so the scheduler stops",
+            );
         }
-
-        assert!(matches!(
-            detok_rx.recv().unwrap(),
-            DetokMsg::Deregister { .. }
-        ));
-        handle.join().unwrap();
-        // The doc claims the release trails the deregister AND the ring push, so
-        // pin both halves: without this, moving the push after the release passes.
-        assert_eq!(
-            consumer.drain(8).headers.len(),
-            1,
-            "the AbortReq must reach the ring before the rid is released"
-        );
-        assert!(
-            !live.lock().unwrap().contains("x"),
-            "the rid must be released once the abort has taken effect"
-        );
-    }
-
-    /// A detokenizer-originated abort deregisters and tells the scheduler to stop,
-    /// but must NOT release the rid: the handler's `AbortGuard` is still armed and
-    /// still owns that registry entry.
-    ///
-    /// Regression for two distinct cross-client failures that both start here. The
-    /// detok shard aborts from three terminal paths (`handle_fail`, the decoder
-    /// error, and a full sink), none of which the guard knows about. Releasing on
-    /// those admitted a retry of the same rid while the original guard was live,
-    /// and then either (a) the guard's own later abort deregistered the RETRY —
-    /// 500 mid-generation plus a real `AbortReq` naming it — or (b) on the paths
-    /// where the handler disarms, the guard's later release freed the retry's entry
-    /// and a THIRD request was admitted whose `Register` overwrote the retry's sink.
-    #[test]
-    fn detok_originated_abort_does_not_release_the_rid() {
-        let live: LiveRids = Default::default();
-        live.lock().unwrap().insert("x".to_string());
-        let (detok_tx, detok_rx) = flume::unbounded::<DetokMsg>();
-        let (ingress_producer, consumer) = ingress_ring(16);
-        let (sd_tx, sd_rx) = flume::unbounded::<()>();
-        std::mem::forget(sd_tx);
-        let ingress = Ingress::new(
-            flume::unbounded().1,
-            flume::unbounded().1,
-            live.clone(),
-            Senders {
-                tm: flume::unbounded().0,
-                abort: flume::unbounded().0,
-                tok: flume::unbounded().0,
-                detok: vec![detok_tx],
-            },
-            ingress_producer,
-            test_limits(),
-            sd_rx,
-        );
-
-        ingress.on_abort(AbortSource::Detok("x".to_string()));
-
-        // The scheduler-facing half still happens — this abort is real work.
-        assert!(matches!(
-            detok_rx.try_recv().unwrap(),
-            DetokMsg::Deregister { .. }
-        ));
-        assert_eq!(consumer.drain(8).headers.len(), 1);
-        // …but the registry entry stays with the guard that owns it.
-        assert!(
-            live.lock().unwrap().contains("x"),
-            "a detok abort must not release a rid whose AbortGuard is still armed — \
-             doing so admits a retry that the guard then tears down"
-        );
-
-        // The guard's own abort is what releases it.
-        ingress.on_abort(AbortSource::Guard("x".to_string()));
-        assert!(!live.lock().unwrap().contains("x"));
     }
 
     /// The default test limits: a real tokenizer, vocab 1000, no context ceiling.
@@ -766,12 +680,11 @@ mod tests {
     fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
         let (tx, _rx) = mpsc::channel(8);
         Request {
-            rid_hash: RidHash(id),
-            rid: id.to_string(),
+            rid: id.to_string().into(),
             state: RequestState::Received,
             sink: EgressSink::Local(tx),
             kind: RequestKind::Generate(Box::new(GenerateRequest {
-                rid: id.to_string(),
+                rid: id.to_string().into(),
                 input_ids: Some(vec![1, 2, 3]),
                 sampling_params,
                 ..Default::default()
@@ -957,20 +870,21 @@ mod tests {
             r
         };
         let disabled = test_limits();
-        let err = validate(&mut req(Some(true)), &disabled).unwrap_err();
+        let err = validate(&mut req(true), &disabled).unwrap_err();
         assert_eq!(err.http_status(), 400);
         assert!(
             err.to_string().contains("--enable-return-hidden-states"),
             "message must name the flag: {err}"
         );
-        // Not asking for them, or asking on a server that supports them, is fine.
-        assert!(validate(&mut req(Some(false)), &disabled).is_ok());
-        assert!(validate(&mut req(None), &disabled).is_ok());
+        // Not asking for them (the client sent `false`, or sent nothing and
+        // `into_requests` resolved the default), or asking on a server that
+        // supports them, is fine.
+        assert!(validate(&mut req(false), &disabled).is_ok());
         let enabled = Limits {
             enable_return_hidden_states: true,
             ..test_limits()
         };
-        assert!(validate(&mut req(Some(true)), &enabled).is_ok());
+        assert!(validate(&mut req(true), &enabled).is_ok());
     }
 
     /// End-to-end through `drive`: an over-context request is rejected on the way
@@ -989,11 +903,11 @@ mod tests {
             },
         ));
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid_hash, .. }) if rid_hash == RidHash(33)),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "33"),
             "registered before the check",
         );
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid_hash }) if rid_hash == RidHash(33)),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "33"),
             "must deregister on reject",
         );
         assert!(
@@ -1002,8 +916,62 @@ mod tests {
         );
     }
 
+    /// A dropped ring push is survivable, and this pins WHY. The ring is bounded,
+    /// so under load the scheduler never learns to stop and keeps generating; its
+    /// chunks then arrive for a rid the detok table no longer holds and are
+    /// dropped. That wastes GPU work but cannot MISDELIVER, because
+    /// `Rid::from_client` guarantees no later request ever answers to that rid.
+    /// The detok entry is dropped either way — that is the half that must not
+    /// depend on the ring.
+    ///
+    /// Ring capacity 1: the first abort pushes, the second finds it full.
+    #[test]
+    fn abort_deregisters_even_when_the_ring_push_is_dropped() {
+        let (tok_tx, _tok_rx) = flume::unbounded();
+        let (detok_tx, detok_rx) = flume::unbounded();
+        let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
+        let senders = Senders {
+            tm: flume::unbounded().0,
+            abort: abort_tx,
+            tok: tok_tx,
+            detok: vec![detok_tx],
+        };
+        let (producer, _consumer) = ingress_ring(1);
+        let (_tm_tx, tm_rx) = flume::unbounded();
+        let (sd_tx, sd_rx) = flume::unbounded::<()>();
+        std::mem::forget(sd_tx);
+        let ingress = Ingress::new(tm_rx, abort_rx, senders, producer, test_limits(), sd_rx);
+
+        ingress.on_abort(AbortSource::Guard("pushed".into()));
+        ingress.on_abort(AbortSource::Guard("dropped".into()));
+
+        // Both deregisters land regardless of whether the ring accepted the push.
+        for expected in ["pushed", "dropped"] {
+            assert!(
+                matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == expected),
+                "{expected}: the detok entry must be dropped even when the ring is full",
+            );
+        }
+    }
+
+    /// The rid keys the detok table and rides on every chunk of every decode step,
+    /// so an unbounded client-supplied one is a recurring cost, not a one-off.
+    #[test]
+    fn oversized_rid_is_rejected() {
+        let mut req = generate_req(51, SamplingParams::default());
+        req.rid = "x".repeat(MAX_RID_LEN + 1).into();
+        let err = validate(&mut req, &test_limits()).expect_err("must be rejected");
+        assert_eq!(err.http_status(), 400);
+        assert!(err.to_string().contains("over the"), "{err}");
+
+        // A uuid-sized rid — what Python mints — is nowhere near the cap.
+        let mut req = generate_req(52, SamplingParams::default());
+        req.rid = "0123456789abcdef0123456789abcdef".into();
+        assert!(validate(&mut req, &test_limits()).is_ok());
+    }
+
     /// A request rejected BEFORE `register_detok` must not send `Deregister`: the
-    /// handler is a bare `table.remove(&rid_hash)`, so it would evict whatever entry
+    /// handler is a bare `table.remove(&rid)`, so it would evict whatever entry
     /// holds that key — a concurrent request's sink — leaving that client hung with
     /// no terminal frame. Python validates before it inserts, so it cannot hit this.
     #[test]
@@ -1050,11 +1018,11 @@ mod tests {
         ingress.drive(generate_req(7, bad));
 
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid_hash, .. }) if rid_hash == RidHash(7)),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "7"),
             "expected Register for rid 7",
         );
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid_hash }) if rid_hash == RidHash(7)),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "7"),
             "expected Deregister for rid 7 (leak fix)",
         );
         assert!(
@@ -1117,7 +1085,7 @@ mod tests {
         ingress.drive(generate_req(9, SamplingParams::default()));
 
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid_hash, .. }) if rid_hash == RidHash(9)),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "9"),
             "expected Register for rid 9",
         );
         assert!(
@@ -1142,7 +1110,7 @@ mod tests {
         ingress.run();
 
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid_hash }) if rid_hash == RidHash(11)),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "11"),
             "tokenize failure must deregister rid 11",
         );
         assert!(detok_rx.try_recv().is_err(), "no further shard messages");
@@ -1155,17 +1123,14 @@ mod tests {
         // Aborts arrive on their own unbounded lane now, not the request inbox.
         let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
         let (ingress, detok_rx, _consumer, tm_tx) = make_ingress_with_abort(abort_rx);
-        abort_tx
-            .send(AbortSource::Guard("rid-13".to_string()))
-            .unwrap();
+        abort_tx.send(AbortSource::Guard("rid-13".into())).unwrap();
         drop(abort_tx);
         drop(tm_tx);
         ingress.run();
 
-        let want = RidHash::from_rid("rid-13");
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid_hash }) if rid_hash == want),
-            "abort must deregister the hashed rid",
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "rid-13"),
+            "abort must deregister by rid",
         );
         assert!(detok_rx.try_recv().is_err(), "no further shard messages");
     }
@@ -1206,11 +1171,11 @@ mod tests {
         ingress.drive(req);
 
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid_hash, .. }) if rid_hash == RidHash(21)),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "21"),
             "expected Register for rid 21",
         );
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid_hash }) if rid_hash == RidHash(21)),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "21"),
             "pool-gone hand-off must deregister rid 21",
         );
         assert!(detok_rx.try_recv().is_err(), "no further shard messages");

@@ -28,13 +28,8 @@ const DEFAULT_PREDICT_ROUTE: &str = "/vertex_generate";
 pub(super) fn routes() -> Router<AppState> {
     let route =
         std::env::var("AIP_PREDICT_ROUTE").unwrap_or_else(|_| DEFAULT_PREDICT_ROUTE.to_string());
-    routes_at(&route)
+    Router::new().route(&route, post(vertex_generate))
 }
-
-fn routes_at(route: &str) -> Router<AppState> {
-    Router::new().route(route, post(vertex_generate))
-}
-
 #[derive(Debug, Deserialize)]
 struct VertexGenerateRequest {
     instances: Vec<VertexInstance>,
@@ -98,34 +93,25 @@ impl TryFrom<VertexGenerateRequest> for GenerateBody {
     /// Translate the Vertex envelope into the native generation body.
     fn try_from(vertex: VertexGenerateRequest) -> Result<Self, Self::Error> {
         let VertexGenerateRequest {
-            mut instances,
+            instances,
             parameters,
         } = vertex;
         let mut parameters = parameters.unwrap_or_default();
         for (present, name) in [
             (parameters.text.is_some(), "text"),
             (parameters.input_ids.is_some(), "input_ids"),
-            (parameters.image_data.is_some(), "image_data"),
         ] {
             if present {
                 return Err(VertexError::InputInParameters(name));
             }
         }
-        if parameters.lora_path.is_some() {
-            return Err(VertexError::UnsupportedField("lora_path"));
-        }
-        if parameters.return_routed_experts.unwrap_or_default() {
-            return Err(VertexError::UnsupportedField("return_routed_experts"));
-        }
 
-        let image_data = instances
-            .iter_mut()
-            .filter_map(|instance| instance.image_data.take())
-            .collect::<Vec<_>>();
-        if !image_data.is_empty() {
-            parameters.image_data = Some(rmpv::Value::Array(image_data));
+        if instances
+            .iter()
+            .any(|instance| instance.image_data.as_ref().is_some_and(|v| !v.is_nil()))
+        {
+            return Err(VertexError::UnsupportedField("image_data"));
         }
-
         let first = instances.first().ok_or(VertexError::EmptyInstances)?;
         if first.text.as_ref().is_some_and(|text| !text.is_empty()) {
             let texts = instances
@@ -246,9 +232,13 @@ mod tests {
                 crate::runtime::ServerArgs::from_json(r#"{"model_path": "/m"}"#).unwrap(),
             ),
             egress_activity: Arc::new(AtomicU64::new(0)),
-            live_rids: Default::default(),
         };
-        (routes_at(route).with_state(state), tm_rx)
+        (
+            Router::new()
+                .route(route, post(vertex_generate))
+                .with_state(state),
+            tm_rx,
+        )
     }
 
     async fn post_json(app: Router, path: &str, body: &str) -> Response {
@@ -354,7 +344,7 @@ mod tests {
                 let RequestKind::Generate(generate) = &request.kind else {
                     panic!("Vertex generation must submit a generate request");
                 };
-                assert_eq!(generate.rid, rid);
+                assert_eq!(generate.rid.client_facing(), rid);
                 assert_eq!(generate.text.as_deref(), Some(text));
                 request
                     .sink
@@ -407,14 +397,10 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].text.as_deref(), Some("one"));
         assert_eq!(requests[1].text.as_deref(), Some("two"));
-        assert_eq!(requests[0].rid, "vertex_0");
-        assert_eq!(requests[1].rid, "vertex_1");
+        assert_eq!(requests[0].rid.client_facing(), "vertex_0");
+        assert_eq!(requests[1].rid.client_facing(), "vertex_1");
         assert!(requests.iter().all(|request| request.stream));
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.return_logprob == Some(true))
-        );
+        assert!(requests.iter().all(|request| request.return_logprob));
         assert!(
             requests
                 .iter()
@@ -471,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_parameters_reject_invalid_and_unknown_fields() {
+    fn typed_parameters_reject_invalid_types_and_ignore_unknown_fields() {
         let invalid = serde_json::from_value::<VertexGenerateRequest>(json!({
             "instances": [{"text": "hello"}],
             "parameters": {"stream": "yes"}
@@ -482,16 +468,12 @@ mod tests {
             "instances": [{"text": "hello"}],
             "parameters": {"not_a_parameter": true}
         }));
-        assert!(unknown.is_err());
+        assert!(unknown.is_ok());
     }
 
     #[test]
     fn instance_inputs_are_rejected_inside_parameters() {
-        for (name, value) in [
-            ("text", json!("other")),
-            ("input_ids", json!([1, 2])),
-            ("image_data", json!("image.jpg")),
-        ] {
+        for (name, value) in [("text", json!("other")), ("input_ids", json!([1, 2]))] {
             let result = converted_result(json!({
                 "instances": [{"text": "hello"}],
                 "parameters": {name: value}
@@ -505,22 +487,29 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_native_extension_parameters_are_rejected_explicitly() {
-        let lora = converted_result(json!({
-            "instances": [{"text": "hello"}],
-            "parameters": {"lora_path": "adapter"}
-        }))
-        .unwrap_err();
-        assert!(matches!(lora, VertexError::UnsupportedField("lora_path")));
+    fn unported_native_parameters_follow_generate_body_and_are_ignored() {
+        for (name, value) in [
+            ("image_data", json!("image.jpg")),
+            ("lora_path", json!("adapter")),
+            ("return_routed_experts", json!(true)),
+        ] {
+            let (requests, _) = converted(json!({
+                "instances": [{"text": "hello"}],
+                "parameters": {name: value}
+            }));
+            assert_eq!(requests[0].text.as_deref(), Some("hello"));
+        }
+    }
 
-        let routed = converted_result(json!({
-            "instances": [{"text": "hello"}],
-            "parameters": {"return_routed_experts": true}
-        }))
-        .unwrap_err();
+    #[test]
+    fn unsupported_instance_image_data_is_rejected_explicitly() {
+        let result = converted_result(json!({
+            "instances": [{"text": "hello", "image_data": "image.jpg"}]
+        }));
+
         assert!(matches!(
-            routed,
-            VertexError::UnsupportedField("return_routed_experts")
+            result,
+            Err(VertexError::UnsupportedField("image_data"))
         ));
     }
 
