@@ -311,7 +311,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         bootstrap_port: int,
         max_total_num_tokens: int,
         pp_rank: int,
-        pp_size: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
     ):
@@ -333,7 +332,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
         self.pp_rank = pp_rank
-        self.pp_size = pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
@@ -450,8 +448,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_layer_ids = []
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
-        transfer_draft_cache = self.pp_size <= 1 or self.pp_rank == self.pp_size - 1
-        if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
+        if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -480,7 +477,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         setup_state_kv_args(
             kv_args,
             self.token_to_kv_pool,
-            self.draft_token_to_kv_pool if transfer_draft_cache else None,
+            self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
         )
