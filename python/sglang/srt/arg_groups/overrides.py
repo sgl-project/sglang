@@ -453,11 +453,8 @@ def _mimo_v2_overrides(server_args: Any, hf_config: Any) -> dict:
         logger.info("Enable multi-layer EAGLE speculative decoding for MiMoV2 model.")
         overrides["enable_multi_layer_eagle"] = True
 
-    # Blackwell: the FP8 checkpoints are verified against the flashinfer_trtllm
-    # MoE runner. Leaving moe_runner_backend on "auto" falls through to the
-    # triton fused-MoE runner (auto only picks DeepGEMM when the a2a backend is
-    # deepep/mooncake/nixl), which measured ~12% lower bs=1 decode throughput.
-    # Gate on fp8: the FP4 checkpoints run through flashinfer_mxfp4 instead.
+    # On Blackwell "auto" falls through to the triton fused-MoE runner, ~12%
+    # slower at bs=1 decode. FP4 checkpoints use flashinfer_mxfp4 instead.
     if (
         is_sm100_supported()
         and server_args.moe_runner_backend == "auto"

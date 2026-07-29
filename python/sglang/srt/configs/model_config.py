@@ -715,12 +715,10 @@ class ModelConfig:
 
     @property
     def has_asymmetric_kv(self) -> bool:
-        """Whether K and V rows differ in width (head_dim != v_head_dim).
+        """Whether K and V rows differ in width (MiMoV2 is 192 / 128).
 
-        MiMoV2 is 192 / 128. A property rather than an ``__init__`` field
-        because the MLA special-casing below still rewrites ``v_head_dim``.
-        MLA models are asymmetric by construction, but they are dispatched
-        through the separate MLA branch, so this only gates MHA backends.
+        Not an ``__init__`` field because the MLA special-casing below still
+        rewrites ``v_head_dim``.
         """
         return (
             self.head_dim != self.v_head_dim or self.swa_head_dim != self.swa_v_head_dim
