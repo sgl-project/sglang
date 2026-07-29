@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
+from sglang.srt.model_executor import model_runner as model_runner_module
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -213,6 +214,28 @@ class TestPrefillCudaGraphCPStaticInputs(CustomTestCase):
 
 
 class TestPrefillCudaGraphCPBodyCapture(CustomTestCase):
+    @patch(
+        "sglang.srt.model_executor.model_runner.get_cp_strategy",
+        return_value=object(),
+    )
+    def test_model_runner_dispatch_allows_validated_cp_body_capture(self, _):
+        runner = SimpleNamespace(enable_cp_v2_body_capture=True)
+
+        self.assertTrue(
+            model_runner_module._prefill_cuda_graph_allows_context_parallel(runner)
+        )
+
+    @patch(
+        "sglang.srt.model_executor.model_runner.get_cp_strategy",
+        return_value=object(),
+    )
+    def test_model_runner_dispatch_rejects_other_cp_graphs(self, _):
+        runner = SimpleNamespace(enable_cp_v2_body_capture=False)
+
+        self.assertFalse(
+            model_runner_module._prefill_cuda_graph_allows_context_parallel(runner)
+        )
+
     def test_capture_prepares_cp_before_attention_metadata(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         forward_batch = SimpleNamespace(lora_ids=None)
