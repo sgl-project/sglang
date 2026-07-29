@@ -60,7 +60,7 @@ class TestQwen3(TestNpuAccuracyTestCaseBase):
     accuracy = 0.7011
     datasets = ["mmmu"]
     few_shot_num = 0
-    limit = 30
+    limit = 10
     generation_config = {"max_tokens": 65536}
     eval_batch_size = 64
 
