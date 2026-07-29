@@ -339,6 +339,11 @@ _KERNEL_MODULES = (
     "lora_a_shared.py",
     "lora_b_candidates.py",
     "lora_b_execution.py",
+    # S5/6 measured modules (their kernels/launchers ARE measured code;
+    # absent from this list, an edit to them left table transfer identity
+    # unchanged — m16).
+    "fused_middle_candidates.py",
+    "fused_middle_cutedsl.py",
     "r10_joint_route.py",
     "reference.py",
     "routes.py",
