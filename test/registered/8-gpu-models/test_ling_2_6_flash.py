@@ -20,7 +20,7 @@ class TestLing26Flash(GSM8KMixin, DefaultServerBase):
 
     # Native 128K context (no YaRN) — avoids the
     # SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN env-var dance and keeps the
-    # smoke test focused on the dispatcher / hybrid-attention path.
+    # coverage focused on the dispatcher / hybrid-attention path.
     other_args = [
         "--tp-size",
         "4",

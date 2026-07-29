@@ -33,9 +33,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.fp8_quantize import fp8_quantize
-from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import mla_kv_pack_quantize_fp8
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
+    mla_kv_pack_quantize_fp8,
+)
+from sglang.kernels.ops.quantization.fp8_quantize import fp8_quantize
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
@@ -62,12 +64,12 @@ logger = logging.getLogger(__name__)
 # MAX_Q_LEN=8 covers EAGLE3 num_draft_tokens=4 plus headroom.
 _TOKENSPEED_MAX_Q_LEN = 8
 
-_g_tokenspeed_workspace: dict[torch.device, torch.Tensor] = {}
-
 
 def _get_tokenspeed_workspace(
     device: torch.device, num_heads: int, kv_lora_rank: int
 ) -> torch.Tensor:
+    from sglang.srt.runtime_context import get_resources
+
     needed = (
         tokenspeed_mla.get_num_sm(device)
         * num_heads
@@ -75,12 +77,12 @@ def _get_tokenspeed_workspace(
         * (kv_lora_rank + 1)
         * 4
     )
-    existing = _g_tokenspeed_workspace.get(device)
+    buffers = get_resources().buffers
+    key = f"tokenspeed_mla_workspace:{device}"
+    existing = buffers.get(key)
     if existing is None or existing.numel() < needed:
-        _g_tokenspeed_workspace[device] = torch.empty(
-            needed, dtype=torch.int8, device=device
-        )
-    return _g_tokenspeed_workspace[device]
+        buffers[key] = torch.empty(needed, dtype=torch.int8, device=device)
+    return buffers[key]
 
 
 # TODO(Qiaolin-Yu): Merge this attention backend into trtllm_mla_backend.py
@@ -91,7 +93,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
     def __init__(
         self,
-        model_runner: "ModelRunner",
+        model_runner: ModelRunner,
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
@@ -221,8 +223,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         kv_a: torch.Tensor,
         k_pe: torch.Tensor,
         positions: torch.Tensor,
-        layer: "DeepseekV2AttentionMLA",
-        forward_batch: "ForwardBatch",
+        layer: DeepseekV2AttentionMLA,
+        forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build FP8 (Q, K, V) for the FMHA kernel and write FP8 KV cache."""
         kv = layer.kv_b_proj(kv_a)[0]
@@ -278,7 +280,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         max_seq_len: int,
-        layer: "RadixAttention",
+        layer: RadixAttention,
     ) -> torch.Tensor:
         k_scale = getattr(layer, "k_scale_float", None)
         if k_scale is None:
@@ -308,7 +310,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        layer: "RadixAttention",
+        layer: RadixAttention,
         batch_size: int,
         cum_seq_lens_q: torch.Tensor,
         max_q_len: int,
@@ -342,7 +344,7 @@ class TokenspeedMLAMultiStepDraftBackend(TRTLLMMLAMultiStepDraftBackend):
     """Multi-step draft backend for tokenspeed_mla used by EAGLE."""
 
     def __init__(
-        self, model_runner: "ModelRunner", topk: int, speculative_num_steps: int
+        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
     ):
         super().__init__(model_runner, topk, speculative_num_steps)
         # Parent populates self.attn_backends with TRT-LLM instances; replace

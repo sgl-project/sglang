@@ -34,7 +34,7 @@ runs:
   steps:
     - name: Wait for jobs to complete
       id: wait
-      uses: actions/github-script@v7
+      uses: actions/github-script@v8
       env:
         INPUT_STAGE_NAME: ${{ inputs.stage-name }}
         INPUT_JOBS: ${{ inputs.jobs }}

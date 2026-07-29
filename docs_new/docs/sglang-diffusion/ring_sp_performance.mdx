@@ -1,46 +1,108 @@
 ---
-title: "Ring SP Benchmark: Wan2.2-TI2V-5B (u1r2 vs Baseline)"
+title: "Sequence Parallelism"
+tag: "preserve"
 metatags:
-    description: "Review Ring-SP benchmark results for Wan2.2-TI2V-5B-Diffusers in SGLang Diffusion."
+    description: "Configure sequence parallelism, Ulysses, and ring-based sequence splitting for SGLang Diffusion workloads."
 ---
 
-This page reports Ring-SP performance for `Wan2.2-TI2V-5B-Diffusers` using:
+Sequence parallelism splits long image or video latent sequences across GPUs. In SGLang Diffusion, the public controls are:
 
-- Parallel config: `sp=2, ulysses=1, ring=2` (short: `u1r2`)
-- Baseline config: `sp=1, ulysses=1, ring=1` (short: `u1r1`)
+- `--sp-degree`: total sequence parallel degree
+- `--ulysses-degree`: Ulysses parallel degree
+- `--ring-degree`: ring parallel degree
 
-## Benchmark Setup
+The degrees must satisfy:
 
-- Model: `Wan2.2-TI2V-5B-Diffusers`
-- GPU: `48G RTX40 series * 2`
+```text
+sp_degree = ulysses_degree * ring_degree
+```
 
-## Online Serving
+Use SP when sequence length or video shape makes the DiT forward pass the bottleneck and the model supports sequence sharding. For latency-oriented multi-GPU Qwen/Wan deployments, also compare against CFG parallelism and FSDP; SP is not automatically the best multi-GPU setting for every model.
 
-### Ring SP (`u1r2`)
+## Recommended Commands
+
+### Two-GPU Sequence Parallelism
+
+This example uses two GPUs with `sp=2`, `ulysses=1`, and `ring=2`.
 
 ```bash
 sglang serve \
-  --model-type diffusion \
-  --model-path /model/HuggingFace/Wan-AI/Wan2.2-TI2V-5B-Diffusers \
-  --num-gpus 2 --sp-degree 2 --ulysses-degree 1 --ring-degree 2 \
+  --model-path Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+  --num-gpus 2 \
+  --sp-degree 2 \
+  --ulysses-degree 1 \
+  --ring-degree 2 \
   --port 8898
 ```
 
-### Baseline (`u1r1`)
+### Single-GPU Baseline
+
+Use an explicit single-GPU baseline before attributing a gain to sequence parallelism.
 
 ```bash
 sglang serve \
-  --model-type diffusion \
-  --model-path /model/HuggingFace/Wan-AI/Wan2.2-TI2V-5B-Diffusers \
-  --num-gpus 1 --sp-degree 1 --ulysses-degree 1 --ring-degree 1 \
+  --model-path Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+  --num-gpus 1 \
+  --sp-degree 1 \
+  --ulysses-degree 1 \
+  --ring-degree 1 \
   --port 8898
 ```
 
-## Benchmarks
+## Choosing The Degrees
 
-### Benchmark Disclaimer
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "28%"}} />
+    <col style={{width: "32%"}} />
+    <col style={{width: "40%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Setting</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Typical use</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>--sp-degree 1</code></td>
+      <td style={{padding: "9px 12px"}}>Single-GPU or no sequence splitting</td>
+      <td style={{padding: "9px 12px"}}>Use this as the baseline.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>--ulysses-degree N</code></td>
+      <td style={{padding: "9px 12px"}}>Ulysses-only sequence parallelism</td>
+      <td style={{padding: "9px 12px"}}>When ring parallelism is not needed, keep <code>--ring-degree 1</code>.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>--ring-degree N</code></td>
+      <td style={{padding: "9px 12px"}}>Ring-based sequence splitting over long sequences</td>
+      <td style={{padding: "9px 12px"}}>Keep <code>--sp-degree</code> equal to <code>ulysses_degree * ring_degree</code>.</td>
+    </tr>
+  </tbody>
+</table>
 
-These benchmarks are provided for reference under one specific setup and command configuration. Actual performance may vary with model settings, runtime environment, and request patterns.
+## Benchmarking Guidance
+
+When benchmarking SP, compare the same model, precision, resolution, frame count, step count, scheduler settings, prompt type, and output path. Report both stage latency and peak GPU memory; SP can reduce per-GPU memory while adding communication overhead.
+
+Useful metrics:
+
+- End-to-end latency
+- Denoising stage latency
+- Decoding stage latency
+- Peak GPU memory and peak allocated memory
+- Communication or runtime overhead when available
+
+## Reference Benchmark
+
+The following numbers are a reference measurement for one setup. They are not a general promise for all Wan2.2 deployments.
+
+- Model: `Wan-AI/Wan2.2-TI2V-5B-Diffusers`
+- Hardware: two 48 GB RTX 40-series GPUs for sequence parallelism, one 48 GB RTX 40-series GPU for baseline
+- Sequence parallel config: `sp=2, ulysses=1, ring=2` (`u1r2`)
+- Baseline config: `sp=1, ulysses=1, ring=1` (`u1r1`)
 
 ### Stage Time Breakdown
 
@@ -150,9 +212,4 @@ These benchmarks are provided for reference under one specific setup and command
   </tbody>
 </table>
 
-## Summary
-
-- End-to-end latency improves from `90.63s` to `63.74s` (`1.42x`).
-- Main gains come from `Denoising` (`1.36x`) and `Decoding` (`1.75x`).
-- Absolute memory usage drops noticeably on Ring-SP (`Peak GPU Memory -7.33GB`, `Peak Allocated -7.05GB`).
-- Overhead ratio rises (`+7.9pp`), so future tuning can focus on reducing communication/runtime overhead while preserving the latency gain.
+In this setup, end-to-end latency improved from `90.63s` to `63.74s` (`1.42x`) and peak GPU memory dropped by `7.33GB`. The overhead ratio increased, so future tuning should still check communication and runtime overhead on the target hardware.

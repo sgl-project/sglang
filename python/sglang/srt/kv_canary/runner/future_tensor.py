@@ -22,7 +22,7 @@ class FutureTensors:
     @classmethod
     def device_to_host(
         cls, xs_device: _TensorOrDict, *, d2h_stream: torch.cuda.Stream
-    ) -> "FutureTensors":
+    ) -> FutureTensors:
         assert not torch.cuda.is_current_stream_capturing(), (
             "FutureTensors.device_to_host must not be called during cuda-graph "
             "capture: the d2h side-stream copy + pinned-host alloc cannot be "

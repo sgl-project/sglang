@@ -12,6 +12,7 @@ import json
 import math
 import os
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 import yaml  # PyYAML; preinstalled on ubuntu-latest GHA runners.
 
@@ -34,10 +35,10 @@ HWBackend = _ci_register.HWBackend
 # pr-test-amd.yml / pr-test-npu.yml have their own dispatch.
 _TARGET_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 
-# base-a is the critical-path entry gate; pin its fanout to smoke-coverage
+# base-a is the critical-path entry gate; pin its fanout to sanity-coverage
 # defaults instead of est_time. max_parallel = size (no throttle).
 _BASE_A_OVERRIDES = {
-    "base-a-test-cpu": 4,
+    "base-a-test-cpu": 8,
     "base-a-test-1-gpu-small": 1,
 }
 
@@ -147,6 +148,11 @@ def compute_partitions(
         fit = fit_table.get(suite) or {}
         coeff = fit.get("coeff", 1.0)
         bias = fit.get("bias", 0.0)
+        # Defense in depth: a non-positive slope is regression noise (more
+        # work cannot reduce wall time), and its runaway intercept can push
+        # every shard budget negative. Fall back to the static estimate.
+        if coeff <= 0:
+            coeff, bias = 1.0, 0.0
 
         # Each shard pays `bias` once, so size >= coeff*total / (target-bias).
         if suite in _BASE_A_OVERRIDES:
@@ -177,6 +183,21 @@ def compute_partitions(
             "max_parallel": max_parallel,
         }
     return result
+
+
+def format_fit_window(model: dict) -> str:
+    """Render the model's fit window as `[start, end)` for the step summary.
+
+    Surfacing the whole span keeps the lower-bound date from reading as a
+    staleness marker (it trails today by fit_window_days)."""
+    start = model.get("fit_window_start")
+    days = model.get("fit_window_days")
+    if not start or not isinstance(days, int):
+        return f"fit_window_start={start}"
+    end = (datetime.strptime(start[:10], "%Y-%m-%d") + timedelta(days=days)).strftime(
+        "%Y-%m-%d"
+    )
+    return f"fit over [{start[:10]}, {end}) ({days}d window)"
 
 
 def main():
@@ -234,7 +255,7 @@ def main():
                 src_note = "no live model -- static est_time + (coeff=1, bias=0)"
             else:
                 src_note = (
-                    f"live model `data_as_of={partition_model.get('data_as_of')}`, "
+                    f"live model: {format_fit_window(partition_model)}, "
                     f"`n_runs={partition_model.get('n_runs')}`"
                 )
             f.write(

@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import VIOLATION_FIELDS
+from sglang.kernels.ops.kv_canary.consts import VIOLATION_FIELDS
 from sglang.srt.kv_canary.config import CanaryConfig
 
 
@@ -16,7 +16,7 @@ class ViolationLog:
     One instance per canary runner — every launch (head / tail / sweep, K / V half, FULL / SWA group) writes
     into the same ring. The kernel_kind field stamped into each violation row identifies which launch fired
     (kernel_kind is a static IntEnum tag — :class:`CanaryLaunchTag` in
-    ``sglang.jit_kernel.kv_canary.verify`` — with a unique value per (head|tail|sweep, K|V, FULL|SWA) tuple).
+    ``sglang.kernels.ops.kv_canary.verify`` — with a unique value per (head|tail|sweep, K|V, FULL|SWA) tuple).
 
     Ring capacity is sized generously (≥ 1024) so overflow is a non-concern in practice — violations are
     cold-path and the host raises at the first one anyway (or just logs it in mode="log"). atomicAdd
@@ -41,7 +41,7 @@ class ViolationLog:
     violation_write_index: torch.Tensor
 
     @classmethod
-    def allocate(cls, *, ring_capacity: int, device: torch.device) -> "ViolationLog":
+    def allocate(cls, *, ring_capacity: int, device: torch.device) -> ViolationLog:
         if ring_capacity <= 0:
             raise ValueError(
                 f"kv-canary: ViolationLog ring_capacity must be positive, got {ring_capacity}"
@@ -102,7 +102,7 @@ class CanaryDeviceState:
         num_tags: int,
         req_to_token_alloc_size: Optional[int] = None,
         max_context_len: Optional[int] = None,
-    ) -> "CanaryDeviceState":
+    ) -> CanaryDeviceState:
         if num_tags <= 0:
             raise ValueError(
                 f"kv-canary: CanaryDeviceState num_tags must be positive, got {num_tags}"

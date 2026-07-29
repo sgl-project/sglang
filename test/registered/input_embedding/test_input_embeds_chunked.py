@@ -3,14 +3,14 @@
 Covers two bugs with the same crash signature
 (RuntimeError: shape mismatch in set_kv_buffer) but opposite polarity:
 
-- Chunked prefill truncation (#20376): PrefillAdder truncates fill_ids and
+- Chunked prefill truncation (#20376): PrefillAdder shrinks fill_len and
   extend_input_len on chunk overflow but not input_embeds, so the full array
   flows through while out_cache_loc is sized for the truncated length.
   Polarity: cache_k > loc.
 
-- Retraction with output_ids (#14110): after retraction, fill_ids includes
-  accumulated output_ids but input_embeds only covers origin_input_ids.
-  Polarity: cache_k < loc.
+- Retraction with output_ids (#14110): after retraction, get_fill_ids()
+  includes accumulated output_ids but input_embeds only covers
+  origin_input_ids. Polarity: cache_k < loc.
 """
 
 import unittest
@@ -94,7 +94,7 @@ class TestInputEmbedsChunkedAndRetract(CustomTestCase):
                     "--disable-radix-cache",
                     "--chunked-prefill-size",
                     str(CHUNKED_PREFILL_SIZE),
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "4",
                 ],
             )
@@ -162,8 +162,8 @@ class TestInputEmbedsChunkedAndRetract(CustomTestCase):
         SGLANG_TEST_RETRACT forces retraction every few scheduler iterations.
         Combined with ignore_eos and a reasonable max_new_tokens, at least one
         request is retracted mid-decode with non-empty output_ids, then
-        re-prefilled. Pre-#14110 this crashes (cache_k < loc) because fill_ids
-        includes output_ids but input_embeds does not.
+        re-prefilled. Pre-#14110 this crashes (cache_k < loc) because the
+        filled token sequence includes output_ids but input_embeds does not.
         """
         text = "The quick brown fox jumps over the lazy dog. " * 4
         embeds = _embeds_for(text)

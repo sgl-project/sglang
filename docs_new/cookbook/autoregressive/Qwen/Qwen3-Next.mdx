@@ -32,6 +32,8 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
@@ -52,9 +54,11 @@ The Qwen3-Next series comes in only one size but offers different thinking modes
 
 - `--mamba-full-memory-ratio`: Adjust `--mamba-full-memory-ratio` to set the ratio of mamba state memory to full kv cache memory. The default setting is `0.9`.
 
-- **Mamba Radix Cache**: Qwen3-Next's hybrid Gated Delta Networks architecture supports two mamba scheduling strategies via `--mamba-scheduler-strategy`:
+- **Mamba Radix Cache**: Qwen3-Next's hybrid Gated Delta Networks architecture supports two mamba scheduling strategies via `--mamba-radix-cache-strategy`:
   - **V1 (`no_buffer`)**: Default. No overlap scheduler, lower memory usage.
-  - **V2 (`extra_buffer`)**: Enables overlap scheduling and branching point caching with `--mamba-scheduler-strategy extra_buffer --page-size 64`. Requires FLA kernel backend. Trades higher mamba state memory for better throughput. Strictly superior in non-KV-cache-bound scenarios; in KV-cache-bound cases, weigh the overlap scheduling benefit against reduced max concurrency. `--page-size` must satisfy `FLA_CHUNK_SIZE % page_size == 0` or `page_size % FLA_CHUNK_SIZE == 0` (`FLA_CHUNK_SIZE` is currently 64).
+  - **V2 (`extra_buffer`)**: Enables overlap scheduling and branching point caching with `--mamba-radix-cache-strategy extra_buffer --page-size 64`. Requires FLA kernel backend. Trades higher mamba state memory for better throughput. Strictly superior in non-KV-cache-bound scenarios; in KV-cache-bound cases, weigh the overlap scheduling benefit against reduced max concurrency. `--page-size` must satisfy `FLA_CHUNK_SIZE % page_size == 0` or `page_size % FLA_CHUNK_SIZE == 0` (`FLA_CHUNK_SIZE` is currently 64).
+
+- **Xeon CPU service configuration**: Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 
@@ -568,7 +572,7 @@ SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 python -m sglang.launch_server --mod
 
 #### 4.2.4 Multi-Token Prediction (NEXTN Speculative Decoding)
 
-Qwen3-Next ships built-in Multi-Token Prediction (MTP) layers and supports [EAGLE-style speculative decoding](../../../docs/advanced_features/speculative_decoding#EAGLE-Decoding) through the `NEXTN` algorithm. The MTP weights are bundled in the main checkpoint, so no separate draft model is required.
+Qwen3-Next ships built-in Multi-Token Prediction (MTP) layers and supports [EAGLE-style speculative decoding](../../../docs/advanced_features/speculative_decoding#eagle-decoding) through the `NEXTN` algorithm. The MTP weights are bundled in the main checkpoint, so no separate draft model is required.
 
 ```shell Command
 python3 -m sglang.launch_server \

@@ -9,6 +9,7 @@ import weakref
 from abc import ABC, abstractmethod
 from array import array
 from collections import OrderedDict, defaultdict
+from contextlib import asynccontextmanager
 from enum import IntEnum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -16,8 +17,12 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import aiohttp
 import numpy as np
 import torch
+import uvicorn
 import zmq
 import zmq.asyncio
+from aiohttp import ClientSession, ClientTimeout
+from fastapi import FastAPI
+from fastapi.responses import ORJSONResponse, Response
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed.parallel_state import (
@@ -42,6 +47,276 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+
+
+class EncoderBootstrapServer:
+    """Lightweight bootstrap server for dynamic encoder discovery.
+
+    Built on FastAPI + uvicorn to match the style of
+    :mod:`sglang.srt.entrypoints.http_server`.  Runs in a daemon thread so
+    the language-only tokenizer manager's main loop is unblocked.
+
+    The set of registered URLs is exposed as the ``urls`` list passed in at
+    construction time.  Callers that want to observe registrations without
+    going through HTTP -- typically a co-located :class:`MMReceiver` -- share
+    that list by reference: register/unregister mutate it in place under an
+    internal lock, and the receiver simply reads ``self.encode_urls`` (the
+    same list).  When ``urls`` is ``None`` the server allocates its own list,
+    accessible through :meth:`list_urls`.
+
+    Health-check tuning is controlled by env vars
+    ``SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL`` (seconds; 0 disables),
+    ``SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT`` (seconds), and
+    ``SGLANG_ENCODER_BOOTSTRAP_EVICTED_TTL`` (seconds; 0 keeps probing
+    forever). Explicit constructor args take precedence over the env vars.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        urls: Optional[List[str]] = None,
+        health_check_interval: Optional[float] = None,
+        health_check_timeout: Optional[float] = None,
+        evicted_ttl: Optional[float] = None,
+    ):
+
+        self.host = host
+        self.port = port
+        self._urls: List[str] = urls if urls is not None else []
+        self._lock = threading.Lock()
+        self._server: Optional[uvicorn.Server] = None  # set in _run_server
+        self._health_check_interval = (
+            health_check_interval
+            if health_check_interval is not None
+            else envs.SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL.get()
+        )
+        self._health_check_timeout = (
+            health_check_timeout
+            if health_check_timeout is not None
+            else envs.SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT.get()
+        )
+        self._evicted_ttl = (
+            evicted_ttl
+            if evicted_ttl is not None
+            else envs.SGLANG_ENCODER_BOOTSTRAP_EVICTED_TTL.get()
+        )
+        # Evict only after this many consecutive probe failures (a busy
+        # encoder can miss a single 2s probe under load), and keep probing
+        # evicted URLs so they re-register automatically once healthy.
+        # Values are eviction timestamps; URLs older than ``_evicted_ttl``
+        # (when > 0) are permanently dropped.
+        self._health_fail_threshold = 3
+        self._health_fail_counts: Dict[str, int] = {}
+        self._evicted_urls: Dict[str, float] = {}
+
+        @asynccontextmanager
+        async def lifespan(fast_api_app: FastAPI):
+            task: Optional[asyncio.Task] = None
+            if self._health_check_interval > 0:
+                task = asyncio.create_task(self._health_check_loop())
+            try:
+                yield
+            finally:
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+        self.app = FastAPI(lifespan=lifespan, openapi_url=None)
+
+        @self.app.get("/health")
+        async def _health() -> Response:
+            return Response("OK")
+
+        @self.app.post("/register_encoder_url")
+        async def _register(data: dict):
+            url = data.get("url") if isinstance(data, dict) else None
+            if not url:
+                return ORJSONResponse(
+                    {"error": "Missing or empty 'url' field"}, status_code=400
+                )
+            self.register(url)
+            return Response("OK")
+
+        @self.app.delete("/unregister_encoder_url")
+        async def _unregister(data: dict):
+            url = data.get("url") if isinstance(data, dict) else None
+            if not url:
+                return ORJSONResponse(
+                    {"error": "Missing or empty 'url' field"}, status_code=400
+                )
+            self.unregister(url)
+            return Response("OK")
+
+        @self.app.get("/list_encoder_urls")
+        async def _list():
+            return {"encoder_urls": self.list_urls()}
+
+        self.thread = threading.Thread(
+            target=self._run_server, daemon=True, name="EncoderBootstrap"
+        )
+        self.thread.start()
+
+    # ------------------------------------------------------------------ #
+    # In-process API (thread-safe; safe to call from any thread)         #
+    # ------------------------------------------------------------------ #
+    def register(self, url: str) -> bool:
+        """Add *url* if not already present.  Returns True if added."""
+        with self._lock:
+            self._health_fail_counts.pop(url, None)
+            self._evicted_urls.pop(url, None)
+            if url not in self._urls:
+                self._urls.append(url)
+                logger.info(f"Registered encoder URL: {url}")
+                return True
+            logger.debug(f"Encoder URL already registered: {url}")
+            return False
+
+    def unregister(self, url: str) -> bool:
+        """Remove *url* if present.  Returns True if removed.
+
+        An explicit unregister also drops the URL from the health-check
+        revival set so it does not come back automatically.
+        """
+        with self._lock:
+            removed = url in self._urls or url in self._evicted_urls
+            if url in self._urls:
+                self._urls.remove(url)
+            self._evicted_urls.pop(url, None)
+            self._health_fail_counts.pop(url, None)
+            if removed:
+                logger.info(f"Unregistered encoder URL: {url}")
+            return removed
+
+    def list_urls(self) -> List[str]:
+        """Return a snapshot of all registered encoder URLs."""
+        with self._lock:
+            return list(self._urls)
+
+    # ------------------------------------------------------------------ #
+    # Health check                                                       #
+    # ------------------------------------------------------------------ #
+    async def _probe(self, session, url: str) -> bool:
+        try:
+            async with session.get(f"{url}/health") as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    async def _health_check_loop(self):
+        """Probe registered (and previously evicted) encoders periodically.
+
+        A URL is evicted only after ``_health_fail_threshold`` consecutive
+        probe failures — a busy encoder may miss a single short-timeout probe
+        under load. Evicted URLs keep being probed and re-register
+        automatically once they respond again. After ``_evicted_ttl`` seconds
+        without a successful probe (when > 0), they are permanently dropped
+        so a dead encoder does not get probed forever.
+        """
+
+        timeout = ClientTimeout(total=self._health_check_timeout)
+        while True:
+            try:
+                await asyncio.sleep(self._health_check_interval)
+                now = time.time()
+                with self._lock:
+                    expired = []
+                    if self._evicted_ttl > 0:
+                        expired = [
+                            url
+                            for url, ts in self._evicted_urls.items()
+                            if now - ts >= self._evicted_ttl
+                        ]
+                        for url in expired:
+                            self._evicted_urls.pop(url, None)
+                            self._health_fail_counts.pop(url, None)
+                    candidates = list(
+                        dict.fromkeys(self._urls + list(self._evicted_urls))
+                    )
+                if expired:
+                    logger.warning(
+                        f"Health check permanently dropped {len(expired)} "
+                        f"encoder(s) after {self._evicted_ttl}s unhealthy: "
+                        f"{expired}"
+                    )
+                if not candidates:
+                    continue
+                async with ClientSession(timeout=timeout) as session:
+                    results = await asyncio.gather(
+                        *(self._probe(session, url) for url in candidates),
+                        return_exceptions=True,
+                    )
+                evicted, revived = [], []
+                with self._lock:
+                    for url, ok in zip(candidates, results):
+                        if ok is True:
+                            self._health_fail_counts.pop(url, None)
+                            if url in self._evicted_urls:
+                                self._evicted_urls.pop(url, None)
+                                if url not in self._urls:
+                                    self._urls.append(url)
+                                revived.append(url)
+                        else:
+                            if url in self._evicted_urls:
+                                continue
+                            count = self._health_fail_counts.get(url, 0) + 1
+                            self._health_fail_counts[url] = count
+                            if count >= self._health_fail_threshold:
+                                if url in self._urls:
+                                    self._urls.remove(url)
+                                self._evicted_urls[url] = now
+                                self._health_fail_counts.pop(url, None)
+                                evicted.append(url)
+                if revived:
+                    logger.info(
+                        f"Health check revived {len(revived)} encoder(s): {revived}"
+                    )
+                if evicted:
+                    logger.warning(
+                        f"Health check evicted {len(evicted)} encoder(s) after "
+                        f"{self._health_fail_threshold} consecutive failures "
+                        f"(will re-add when healthy): {evicted}"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Health check loop error: {e}", exc_info=True)
+
+    # ------------------------------------------------------------------ #
+    # Lifecycle                                                          #
+    # ------------------------------------------------------------------ #
+    def _run_server(self):
+
+        config = uvicorn.Config(
+            self.app,
+            host=self.host,
+            port=self.port,
+            log_level="warning",
+            access_log=False,
+            loop="auto",
+        )
+        self._server = uvicorn.Server(config)
+        logger.info(
+            f"EncoderBootstrapServer starting on {self.host}:{self.port} "
+            f"(health_check every {self._health_check_interval}s, "
+            f"timeout {self._health_check_timeout}s)"
+        )
+        try:
+            self._server.run()
+        except Exception as e:
+            logger.error(f"EncoderBootstrapServer error: {e}", exc_info=True)
+
+    def close(self):
+        if self._server is not None:
+            # uvicorn polls should_exit on its own event loop; thread-safe.
+            self._server.should_exit = True
+            logger.info("Stopping EncoderBootstrapServer...")
+        if self.thread.is_alive():
+            self.thread.join(timeout=5)
+            logger.info("EncoderBootstrapServer thread stopped")
 
 
 def _grpc_target(url: str) -> str:
@@ -156,7 +431,9 @@ class EmbeddingData:
             self.shape = list(embedding.shape) if embedding is not None else None
         self.cached_embedding = None
         self.error_msg = error_msg
-        self.error_code = error_code
+        # Coerce to plain int: this object crosses process boundaries via
+        # safe_pickle_loads, whose allowlist blocks http.HTTPStatus.
+        self.error_code = int(error_code) if error_code is not None else None
         # Store additional metadata (e.g., video_timestamps for qwen3_vl)
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -564,51 +841,78 @@ class WaitingImageRequest:
             except zmq.Again:
                 # No data available yet, wait a bit and retry
                 return
-            recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
-            if getattr(recv_obj, "error_msg", None) is not None:
-                logger.warning(
-                    f"Received error signal from encoder for {self.rid}: {recv_obj.error_msg} {recv_obj.error_code = }"
+            try:
+                recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
+                if getattr(recv_obj, "error_msg", None) is not None:
+                    logger.warning(
+                        f"Received error signal from encoder for {self.rid}: {recv_obj.error_msg} {recv_obj.error_code = }"
+                    )
+                    self.error_msg = recv_obj.error_msg
+                    self.error_code = recv_obj.error_code
+                    self.status = WaitingImageRequestStatus.FAIL
+                    self.recv_socket.close()
+                    return
+
+                # Extract original req_id from part_req_id and drop stale payloads
+                # that may arrive on a reused ZMQ port after a prior request aborted.
+                original_req_id = extract_original_req_id(recv_obj.req_id)
+                if original_req_id != self.recv_req.rid:
+                    logger.warning(
+                        f"Dropping stale embedding data: expected rid={self.recv_req.rid}, "
+                        f"got rid={recv_obj.req_id} (likely from ZMQ port reuse)"
+                    )
+                    continue
+                recv_obj.req_id = original_req_id
+
+                buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
+                recv_obj.embedding = (
+                    torch.frombuffer(buffer, dtype=recv_obj.dtype)
+                    .reshape(recv_obj.shape)
+                    .clone()
                 )
-                self.error_msg = recv_obj.error_msg
-                self.error_code = recv_obj.error_code
+
+                if self.recv_embedding_data is None:
+                    self.recv_embedding_data = (
+                        MultiModalEmbeddingData.from_embedding_data(
+                            recv_obj, model_type=self.model_type
+                        )
+                    )
+                else:
+                    self.recv_embedding_data.add(recv_obj)
+            except Exception as e:
+                # A message the scheduler cannot decode (blocked unpickle,
+                # bad shape/dtype, ...) must fail this request, not crash the
+                # scheduler event loop; FAIL still reaches the TP-wide status
+                # all-reduce in _process_waiting_requests.
+                logger.exception(
+                    "Failed to decode embedding message for rid=%s", self.rid
+                )
+                self.error_msg = f"Failed to decode embedding message: {e}"
                 self.status = WaitingImageRequestStatus.FAIL
+                self._cleanup_gpu_buffer()
                 self.recv_socket.close()
                 return
 
-            # Extract original req_id from part_req_id and drop stale payloads
-            # that may arrive on a reused ZMQ port after a prior request aborted.
-            original_req_id = extract_original_req_id(recv_obj.req_id)
-            if original_req_id != self.recv_req.rid:
-                logger.warning(
-                    f"Dropping stale embedding data: expected rid={self.recv_req.rid}, "
-                    f"got rid={recv_obj.req_id} (likely from ZMQ port reuse)"
-                )
-                continue
-            recv_obj.req_id = original_req_id
-
-            buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
-            recv_obj.embedding = (
-                torch.frombuffer(buffer, dtype=recv_obj.dtype)
-                .reshape(recv_obj.shape)
-                .clone()
+        # Assemble mm_inputs. Wrapped so an assembly failure still reaches the
+        # TP-wide status all-reduce in _process_waiting_requests instead of
+        # raising past it.
+        try:
+            recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
+            mm_inputs = self.mm_processor.get_mm_data(
+                self.recv_req.input_text,
+                recv_embedding,
+                **self.recv_embedding_data.get_mm_extra_meta(),
             )
-
-            if self.recv_embedding_data is None:
-                self.recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
-                    recv_obj, model_type=self.model_type
-                )
-            else:
-                self.recv_embedding_data.add(recv_obj)
-
-        recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
-        mm_inputs = self.mm_processor.get_mm_data(
-            self.recv_req.input_text,
-            recv_embedding,
-            **self.recv_embedding_data.get_mm_extra_meta(),
-        )
-        self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = array("q", mm_inputs.input_ids)
-        self.status = WaitingImageRequestStatus.SUCCESS
+            self.recv_req.mm_inputs = mm_inputs
+            self.recv_req.input_ids = array("q", mm_inputs.input_ids)
+            self.status = WaitingImageRequestStatus.SUCCESS
+        except Exception as e:
+            logger.exception(
+                "Failed to assemble multimodal inputs for rid=%s", self.rid
+            )
+            self.status = WaitingImageRequestStatus.FAIL
+            self.error_msg = f"Failed to assemble multimodal inputs: {e}"
+            self._cleanup_gpu_buffer()
         self.recv_socket.close()
 
     def _cleanup_gpu_buffer(self):
@@ -902,6 +1206,10 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                 parts = self.recv_socket.recv_multipart(flags=zmq.NOBLOCK, copy=False)
             except zmq.Again:
                 return
+            except zmq.ZMQError:
+                # The RDMA pipeline thread closed the socket after an encoder
+                # error (e.g. OOM).  It already set status=FAIL; just bail.
+                return
 
             recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
             if getattr(recv_obj, "error_msg", None) is not None:
@@ -963,7 +1271,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             self.embeddings_buffer = None
             self._buffer_from_pool = False
         self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = mm_inputs.input_ids
+        self.recv_req.input_ids = array("q", mm_inputs.input_ids)
         self.status = WaitingImageRequestStatus.SUCCESS
         self._cleanup_gpu_buffer()
         self.recv_socket.close()
@@ -1198,10 +1506,18 @@ class MMReceiverBase(ABC):
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
+        encode_urls: Optional[List[str]] = None,
     ):
         self.context = zmq.asyncio.Context(20)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
-        self.encode_urls = server_args.encoder_urls
+        # When ``encode_urls`` is shared with an :class:`EncoderBootstrapServer`
+        # (tokenizer manager process), it grows / shrinks in place as encoders
+        # register or unregister; the receiver always sees the current set.
+        # When None (e.g. in a scheduler subprocess that has no in-process
+        # bootstrap), fall back to a snapshot of the static --encoder-urls.
+        self.encode_urls: List[str] = (
+            encode_urls if encode_urls is not None else list(server_args.encoder_urls)
+        )
         self.recv_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.host = get_local_ip_auto(server_args.host)
         self.pp_rank = pp_rank
@@ -1328,7 +1644,13 @@ class MMReceiverBase(ABC):
     ):
         req_id = None
         try:
-            if len(self.encode_urls) == 0 or not need_wait_for_mm_inputs:
+            # ``self.encode_urls`` is shared by reference with the bootstrap
+            # server (when running) so it always reflects the current set.
+            # Snapshot once for the duration of this request to avoid races
+            # against concurrent register / unregister.
+            encode_urls = list(self.encode_urls)
+
+            if len(encode_urls) == 0 or not need_wait_for_mm_inputs:
                 return None
             req_id = uuid.uuid4().hex
             embedding_port, recv_socket = get_zmq_socket_on_host(
@@ -1342,7 +1664,14 @@ class MMReceiverBase(ABC):
             )
             send_time = time.monotonic()
             asyncio.create_task(
-                self.encode(req_id, mm_data, embedding_port, "encode", "send")
+                self.encode(
+                    req_id,
+                    mm_data,
+                    embedding_port,
+                    "encode",
+                    "send",
+                    encode_urls=encode_urls,
+                )
             )
             result = await asyncio.wait_for(
                 self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
@@ -1444,21 +1773,33 @@ class MMReceiverBase(ABC):
         finally:
             recv_socket.close()
 
-    def send_encode_request(self, obj):
-        self._send_encode_request(obj)
+    def send_encode_request(self, obj, time_stats_json=None):
+        self._send_encode_request(obj, time_stats_json=time_stats_json)
 
-    def _send_encode_request(self, obj):
+    def _send_encode_request(self, obj, time_stats_json=None):
         mm_data = self._extract_url_data(obj)
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
-        if mm_data and self.encode_urls:
-            logger.info(f"Processing {len(mm_data)} mm items for request {obj.rid}")
+
+        # ``self.encode_urls`` is the shared list maintained by the bootstrap
+        # server (and pre-populated with --encoder-urls); take a snapshot for
+        # the duration of this dispatch.
+        encode_urls = list(self.encode_urls)
+
+        if mm_data and encode_urls:
+            logger.info(
+                f"Dispatching {len(mm_data)} mm items to {len(encode_urls)} "
+                f"encoder(s) {encode_urls} for request {obj.rid}"
+            )
             obj.need_wait_for_mm_inputs = True
 
             num_items_assigned = self._assign_items_by_modality(
-                mm_data, len(self.encode_urls)
+                mm_data, len(encode_urls)
             )
             obj.num_items_assigned = num_items_assigned
+            # Freeze the encoder URL snapshot onto obj so the scheduler
+            # subprocess uses the same list when indexing encoder_idx.
+            obj.encoder_urls = encode_urls
 
             # For mooncake, No tokenizer-side thread.
             # Save mm_data (extracted URL list) onto obj so the scheduler-side
@@ -1477,10 +1818,48 @@ class MMReceiverBase(ABC):
                     "encode",
                     num_items_assigned,
                     None,
+                    encode_urls,
+                    time_stats_json,
                 ),
                 daemon=True,
             )
             encode_thread.start()
+        else:
+            # No encoder URLs available (bootstrap may not have any registered yet);
+            # reset the flag so the scheduler does not wait for embeddings that will
+            # never arrive.  A warning is emitted so the user can diagnose why
+            # disaggregation is not happening for this request.
+            if mm_data:
+                logger.warning(
+                    f"No encoder URLs available for request {obj.rid}; "
+                    "processing without encoder disaggregation."
+                )
+            obj.need_wait_for_mm_inputs = False
+
+    def _sync_fail_info_across_tp(self, waiting_req: WaitingImageRequest) -> None:
+        """Share encoder error fields across TP ranks before abort.
+
+        The encoder sends ZMQ error signals to each TP rank's receive socket,
+        but they can arrive at different times. ``all_reduce`` on status makes
+        every rank enter FAIL together while only some ranks have populated
+        ``error_msg`` / ``error_code``. attn_tp_rank 0 streams the abort to the
+        client, so merge the best-known payload from all ranks first.
+        """
+        if self.tp_size <= 1 or self.tp_group is None:
+            return
+
+        gathered = self.tp_group.all_gather_object(
+            (waiting_req.error_msg, waiting_req.error_code)
+        )
+        best_msg = waiting_req.error_msg
+        best_code = waiting_req.error_code
+        for msg, code in gathered:
+            if msg is not None:
+                best_msg = msg
+            if code is not None:
+                best_code = code
+        waiting_req.error_msg = best_msg
+        waiting_req.error_code = best_code
 
     # For zmq_to_scheduler
     def _process_waiting_requests(self, recv_reqs, waiting_cls, **extra_kwargs):
@@ -1490,11 +1869,18 @@ class MMReceiverBase(ABC):
                 isinstance(recv_req, TokenizedGenerateReqInput)
                 and recv_req.need_wait_for_mm_inputs is True
             ):
+                # Use the URL snapshot frozen by the tokenizer when it
+                # computed num_items_assigned -- the encoder_idx values in
+                # that assignment must index into this exact list.  Falling
+                # back to ``self.encode_urls`` would only matter if the
+                # tokenizer never set encoder_urls (legacy / static path).
+                encode_urls = recv_req.encoder_urls or list(self.encode_urls)
+
                 waiting_req = waiting_cls(
                     rid=recv_req.rid,
                     recv_req=recv_req,
                     mm_processor=self.mm_processor,
-                    encoder_urls=self.encode_urls,
+                    encoder_urls=encode_urls,
                     model_type=self.model_type,
                     host_name=self.hostname,
                     receive_count=self.tp_size,
@@ -1533,6 +1919,7 @@ class MMReceiverBase(ABC):
             if status_value == WaitingImageRequestStatus.SUCCESS:
                 new_recv_reqs.append(waiting_req.recv_req)
             elif status_value == WaitingImageRequestStatus.FAIL:
+                self._sync_fail_info_across_tp(waiting_req)
                 logger.error(
                     f"Waiting request {waiting_req.rid} failed: {waiting_req.error_msg} {waiting_req.error_code = }"
                 )
@@ -1561,7 +1948,14 @@ class MMReceiverBase(ABC):
         return new_recv_reqs, abort_reqs
 
     def _run_encode_in_thread(
-        self, req_id, mm_data, endpoint_encode, num_items_assigned, embedding_port
+        self,
+        req_id,
+        mm_data,
+        endpoint_encode,
+        num_items_assigned,
+        embedding_port,
+        encode_urls=None,
+        time_stats_json=None,
     ):
         try:
             asyncio.run(
@@ -1572,6 +1966,8 @@ class MMReceiverBase(ABC):
                     endpoint_encode=endpoint_encode,
                     endpoint_send=None,
                     num_items_assigned=num_items_assigned,
+                    encode_urls=encode_urls,
+                    time_stats_json=time_stats_json,
                 )
             )
         except Exception as e:
@@ -1724,6 +2120,7 @@ class MMReceiverHTTP(MMReceiverBase):
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
+        encode_urls: Optional[List[str]] = None,
     ):
         super().__init__(
             server_args,
@@ -1733,6 +2130,7 @@ class MMReceiverHTTP(MMReceiverBase):
             tp_rank=tp_rank,
             tp_group=tp_group,
             scheduler=scheduler,
+            encode_urls=encode_urls,
         )
 
     # For zmq_to_scheduler and mooncake
@@ -1754,10 +2152,13 @@ class MMReceiverHTTP(MMReceiverBase):
         for i, response in enumerate(responses):
             if isinstance(response, asyncio.TimeoutError):
                 timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
+                encoder_label = encode_requests[i].get(
+                    "encoder_url", f"idx={encode_requests[i].get('encoder_idx')}"
+                )
                 logger.error(
                     f"Encoder HTTP request timeout ({timeout_val}s) for req_id={req_id} "
                     f"(request {i}), "
-                    f"encoder={self.encode_urls[encode_requests[i]['encoder_idx']]}"
+                    f"encoder={encoder_label}"
                 )
                 return False
             elif isinstance(response, Exception):
@@ -1785,9 +2186,13 @@ class MMReceiverHTTP(MMReceiverBase):
         endpoint_encode,
         endpoint_send,
         num_items_assigned=None,
+        encode_urls=None,
+        time_stats_json=None,
     ):
         if len(mm_data) == 0:
             return
+
+        effective_urls = encode_urls if encode_urls is not None else self.encode_urls
 
         # get unique modalities with order preserved
         modalities = [mm_item.get("modality") for mm_item in mm_data]
@@ -1796,7 +2201,7 @@ class MMReceiverHTTP(MMReceiverBase):
 
         if num_items_assigned is None:
             num_items_assigned = self._assign_items_by_modality(
-                mm_data, len(self.encode_urls)
+                mm_data, len(effective_urls)
             )
 
         # Calculate total num_parts across all modalities
@@ -1822,6 +2227,7 @@ class MMReceiverHTTP(MMReceiverBase):
                 encode_requests.append(
                     {
                         "encoder_idx": idx,
+                        "encoder_url": effective_urls[idx],
                         "mm_items": [
                             mm_item.get("url")
                             for mm_item in mm_data_modality[
@@ -1834,6 +2240,7 @@ class MMReceiverHTTP(MMReceiverBase):
                         "modality": modality.name,  # convert enum to string for json serialization
                         "prefill_host": self.host,
                         "embedding_port": embedding_port,
+                        "time_stats_json": time_stats_json,
                     }
                 )
                 cum_idx += 1
@@ -1847,7 +2254,7 @@ class MMReceiverHTTP(MMReceiverBase):
 
             tasks = [
                 session.post(
-                    f"{self.encode_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
+                    f"{effective_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
                     json=encode_request,
                 )
                 for encode_request in encode_requests
@@ -1891,7 +2298,7 @@ class MMReceiverHTTP(MMReceiverBase):
                 )
                 metadata_tasks.append(
                     session.post(
-                        f"{self.encode_urls[response_json['encoder_idx']]}/{endpoint_send}",
+                        f"{effective_urls[response_json['encoder_idx']]}/{endpoint_send}",
                         json=response_json,
                     )
                 )
@@ -1909,6 +2316,7 @@ class MMReceiverGrpc(MMReceiverBase):
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
+        encode_urls: Optional[List[str]] = None,
     ):
         super().__init__(
             server_args,
@@ -1918,6 +2326,7 @@ class MMReceiverGrpc(MMReceiverBase):
             tp_rank=tp_rank,
             tp_group=tp_group,
             scheduler=scheduler,
+            encode_urls=encode_urls,
         )
 
     def build_and_send_encode_request(self, image_urls, rid):
@@ -1940,9 +2349,12 @@ class MMReceiverGrpc(MMReceiverBase):
         endpoint_encode,
         endpoint_send,
         num_items_assigned=None,
+        encode_urls=None,
     ):
         if not mm_data:
             return
+
+        effective_urls = encode_urls if encode_urls is not None else self.encode_urls
 
         # gRPC currently only supports image; flatten new dict formats to simple lists
         if mm_data and isinstance(mm_data[0], dict):
@@ -1963,10 +2375,10 @@ class MMReceiverGrpc(MMReceiverBase):
 
         encode_requests = []
         if num_items_assigned is None:
-            encode_idx = list(range(len(self.encode_urls)))
+            encode_idx = list(range(len(effective_urls)))
             random.shuffle(encode_idx)
             num_items_assigned = [
-                (idx + len(img_data)) // len(self.encode_urls) for idx in encode_idx
+                (idx + len(img_data)) // len(effective_urls) for idx in encode_idx
             ]
         num_parts = sum(1 for x in num_items_assigned if x != 0)
         cum_num_items = 0
@@ -1993,7 +2405,7 @@ class MMReceiverGrpc(MMReceiverBase):
         grpc_tasks = [
             asyncio.to_thread(
                 _grpc_encode_request,
-                _grpc_target(self.encode_urls[encode_request["encoder_idx"]]),
+                _grpc_target(effective_urls[encode_request["encoder_idx"]]),
                 encode_request,
             )
             for encode_request in encode_requests
@@ -2039,7 +2451,7 @@ class MMReceiverGrpc(MMReceiverBase):
             grpc_metadata_tasks.append(
                 asyncio.to_thread(
                     _grpc_send_request,
-                    _grpc_target(self.encode_urls[response_json["encoder_idx"]]),
+                    _grpc_target(effective_urls[response_json["encoder_idx"]]),
                     response_json,
                 )
             )
@@ -2084,12 +2496,13 @@ def create_mm_receiver(
     tp_group: Optional[GroupCoordinator] = None,
     scheduler: Optional["Scheduler"] = None,
     transport_mode: Optional[str] = None,
+    encode_urls: Optional[List[str]] = None,
 ):
     if transport_mode is None:
         transport_mode = envs.SGLANG_ENCODER_MM_RECEIVER_MODE.get()
         logger.debug(f"MMReceiver transport_mode from env: {transport_mode}")
 
-    _validate_transport_mode(transport_mode, server_args.encoder_urls)
+    _validate_transport_mode(transport_mode, encode_urls or server_args.encoder_urls)
     logger.info(f"EPD MMReceiver: using transport_mode={transport_mode}")
 
     receiver_cls = _MM_RECEIVER_BY_MODE.get(transport_mode)
@@ -2103,4 +2516,5 @@ def create_mm_receiver(
         tp_rank=tp_rank,
         tp_group=tp_group,
         scheduler=scheduler,
+        encode_urls=encode_urls,
     )

@@ -403,6 +403,30 @@ class BaseLayerWithLoRA(nn.Module):
 
         self.merged = False
 
+    @torch.no_grad()
+    def commit_merged_as_base(self) -> None:
+        """Promote the currently merged weights to the permanent base.
+
+        Re-snapshots ``cpu_weight`` so the merged weights become the restore
+        target and resets adapter bookkeeping (``merged=False``). A later dynamic
+        ``set_lora_weights`` then adds its delta on top of the merged base instead
+        of unmerging it.
+        """
+        if not self.merged:
+            return
+        weight = self.base_layer.weight
+        if isinstance(weight, DTensor):
+            weight = weight.to_local()
+        # clone(): to("cpu") may alias storage; we must not mutate this backup.
+        self.cpu_weight = weight.detach().to("cpu").clone()
+        self.merged = False
+        self.disable_lora = True
+        self.lora_weights_list = []
+        self.lora_A = None
+        self.lora_B = None
+        self.lora_path = None
+        self.strength = 1.0
+
 
 class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     """

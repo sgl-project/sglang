@@ -1,19 +1,21 @@
 export const GLM51Deployment = () => {
   // Config mirrors sgl-cookbook src/components/autoregressive/GLM51ConfigGenerator/index.js.
   //
-  // Supported quantization per hardware:
-  //   H100 / H200 / B200 → BF16 + FP8
-  //   GB300 → FP8 only
-  //   MI300X/MI325X/MI355X → BF16 (FP8 not verified on AMD)
+  // Recommended quantization per hardware:
+  //   H100 / H200 → FP8
+  //   B300 / GB300 → NVFP4
+  //   MI300X / MI325X → BF16 (FP8 not verified on AMD)
+  //   MI355X (gfx950) → MXFP4 (amd/GLM-5.1-MXFP4); BF16 also supported.
+  //     MI350X is identical to MI355X (cooling only) and is omitted here.
   const options = {
     hardware: {
       name: 'hardware',
       title: 'Hardware Platform',
       items: [
-        { id: 'h200',   label: 'H200',          default: true  },
-        { id: 'b200',   label: 'B200',          default: false },
-        { id: 'gb300',  label: 'GB300',         default: false },
         { id: 'h100',   label: 'H100',          default: false },
+        { id: 'h200',   label: 'H200',          default: true  },
+        { id: 'b300',   label: 'B300',          default: false },
+        { id: 'gb300',  label: 'GB300',         default: false },
         { id: 'mi300x', label: 'MI300X',        default: false },
         { id: 'mi325x', label: 'MI325X',        default: false },
         { id: 'mi355x', label: 'MI355X',        default: false }
@@ -25,10 +27,15 @@ export const GLM51Deployment = () => {
       getDynamicItems: (values) => {
         const hw = values.hardware;
         const isAMD = ['mi300x', 'mi325x', 'mi355x'].includes(hw);
+        const isGfx950 = hw === 'mi355x'; // MI350X identical (cooling only)
+        const supportsNVFP4 = ['b300', 'gb300'].includes(hw);
+        const isB300 = hw === 'b300';
         const isGB300 = hw === 'gb300';
         return [
-          { id: 'bf16', label: 'BF16', subtitle: 'Full Weights',    default: isAMD,  disabled: isGB300, disabledReason: isGB300 ? 'BF16 is not recommended on GB300 for GLM-5.1' : '' },
-          { id: 'fp8',  label: 'FP8',  subtitle: 'High Throughput', default: !isAMD, disabled: isAMD,   disabledReason: isAMD ? 'FP8 not verified on AMD' : '' }
+          { id: 'mxfp4', label: 'MXFP4', subtitle: 'gfx950',             default: isGfx950,                 disabled: !isGfx950, disabledReason: !isGfx950 ? 'MXFP4 verified on MI355X (gfx950)' : '' },
+          { id: 'bf16',  label: 'BF16',  subtitle: 'Full Weights',       default: isAMD && !isGfx950,       disabled: !isAMD, disabledReason: supportsNVFP4 ? 'NVFP4 is recommended for this hardware' : 'FP8 is recommended for this hardware' },
+          { id: 'fp8',   label: 'FP8',   subtitle: 'High Throughput',    default: !isAMD && !supportsNVFP4, disabled: isAMD || supportsNVFP4, disabledReason: isAMD ? 'FP8 not verified on AMD' : (supportsNVFP4 ? 'NVFP4 is recommended for this hardware' : '') },
+          { id: 'nvfp4', label: 'NVFP4', subtitle: 'Blackwell FP4',      default: isB300 || isGB300,        disabled: !supportsNVFP4, disabledReason: !supportsNVFP4 ? 'NVFP4 only on B300/GB300' : '' }
         ];
       }
     },
@@ -55,26 +62,17 @@ export const GLM51Deployment = () => {
         { id: 'disabled', label: 'Disabled', subtitle: 'Low Latency',     default: true  },
         { id: 'enabled',  label: 'Enabled',  subtitle: 'High Throughput', default: false }
       ]
-    },
-    speculative: {
-      name: 'speculative',
-      title: 'Speculative Decoding',
-      condition: (values) => !['mi300x', 'mi325x', 'mi355x'].includes(values.hardware),
-      items: [
-        { id: 'disabled', label: 'Disabled', default: false },
-        { id: 'enabled',  label: 'Enabled',  default: true  }
-      ]
     }
   };
 
   const modelConfigs = {
-    h100:   { fp8: { tp: 16, mem: 0.85 }, bf16: { tp: 32, mem: 0.85 } },
-    h200:   { fp8: { tp: 8,  mem: 0.85 }, bf16: { tp: 16, mem: 0.85 } },
-    b200:   { fp8: { tp: 8,  mem: 0.9  }, bf16: { tp: 16, mem: 0.9  } },
-    gb300:  { fp8: { tp: 4,  mem: 0.9  } },
+    h100:   { fp8: { tp: 16, mem: 0.85 } },
+    h200:   { fp8: { tp: 8,  mem: 0.85 } },
+    b300:   { nvfp4: { tp: 8, mem: 0.80 }, fp8: { tp: 8,  mem: 0.9  }, bf16: { tp: 16, mem: 0.9  } },
+    gb300:  { nvfp4: { tp: 4, mem: 0.80 }, fp8: { tp: 4,  mem: 0.9  } },
     mi300x: { bf16: { tp: 8, mem: 0.80 } },
     mi325x: { bf16: { tp: 8, mem: 0.80 } },
-    mi355x: { bf16: { tp: 8, mem: 0.80 } }
+    mi355x: { bf16: { tp: 8, mem: 0.80 }, mxfp4: { tp: 4, mem: 0.85 } }
   };
 
   const resolveItems = (option, values) => {
@@ -132,26 +130,35 @@ export const GLM51Deployment = () => {
   const generateCommand = () => {
     const { hardware, quantization } = values;
     const isAMD = ['mi300x', 'mi325x', 'mi355x'].includes(hardware);
-    const isGB300 = hardware === 'gb300';
-    const effectiveQuant = isAMD ? 'bf16' : (isGB300 && quantization === 'bf16' ? 'fp8' : quantization);
+    const isGfx950 = hardware === 'mi355x'; // MI350X identical (cooling only)
+    const recommendsNVFP4 = ['b300', 'gb300'].includes(hardware);
+    const effectiveQuant = isAMD
+      ? (isGfx950 && quantization === 'mxfp4' ? 'mxfp4' : 'bf16')
+      : (recommendsNVFP4 ? 'nvfp4' : 'fp8');
     const suffix = effectiveQuant === 'fp8' ? '-FP8' : '';
-    const modelName = `zai-org/GLM-5.1${suffix}`;
+    const modelName =
+      effectiveQuant === 'nvfp4' ? 'nvidia/GLM-5.1-NVFP4'
+        : effectiveQuant === 'mxfp4' ? 'amd/GLM-5.1-MXFP4'
+          : `zai-org/GLM-5.1${suffix}`;
 
     const hwConfig = modelConfigs[hardware][effectiveQuant];
     if (!hwConfig) return '# Configuration not available for the selected hardware and quantization.';
 
     const tpValue = hwConfig.tp;
     const memFraction = hwConfig.mem;
-    const enableSpec = values.speculative === 'enabled';
 
-    let cmd = '';
-    if (enableSpec) cmd += 'SGLANG_ENABLE_SPEC_V2=1 ';
-    cmd += 'sglang serve \\\n';
+    let cmd = 'sglang serve \\\n';
     cmd += `  --model-path ${modelName}`;
     cmd += ` \\\n  --tp ${tpValue}`;
 
+    if (effectiveQuant === 'nvfp4') {
+      cmd += ' \\\n  --quantization modelopt_fp4';
+      cmd += ' \\\n  --trust-remote-code';
+    }
+
     if (isAMD) {
       cmd += ' \\\n  --trust-remote-code';
+      if (effectiveQuant === 'mxfp4') cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
       cmd += ' \\\n  --dsa-prefill-backend tilelang';
       cmd += ' \\\n  --dsa-decode-backend tilelang';
       cmd += ' \\\n  --chunked-prefill-size 131072';
@@ -163,12 +170,16 @@ export const GLM51Deployment = () => {
     }
     if (values.reasoning === 'enabled') cmd += ' \\\n  --reasoning-parser glm45';
     if (values.toolcall  === 'enabled') cmd += ' \\\n  --tool-call-parser glm47';
-    if (enableSpec) {
-      cmd += ' \\\n  --speculative-algorithm EAGLE';
-      cmd += ' \\\n  --speculative-num-steps 3';
-      cmd += ' \\\n  --speculative-eagle-topk 1';
-      cmd += ' \\\n  --speculative-num-draft-tokens 4';
-    }
+    // EAGLE MTP speculative decoding: emitted by default (recommended) on all
+    // hardware. Verified on NVIDIA and on AMD MI300X/MI325X (gfx942) and
+    // MI355X (gfx950).
+    cmd += ' \\\n  --speculative-algorithm EAGLE';
+    cmd += ' \\\n  --speculative-num-steps 3';
+    cmd += ' \\\n  --speculative-eagle-topk 1';
+    cmd += ' \\\n  --speculative-num-draft-tokens 4';
+    // On AMD GPUs the aiter custom all-reduce kernel deadlocks during EAGLE
+    // verify at high concurrency, so disable it to avoid server hangs.
+    if (isAMD) cmd += ' \\\n  --disable-custom-all-reduce';
 
     cmd += ` \\\n  --mem-fraction-static ${memFraction}`;
     return cmd;

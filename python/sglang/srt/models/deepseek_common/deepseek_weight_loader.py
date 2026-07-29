@@ -58,6 +58,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
+    is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
@@ -74,6 +75,52 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
         return tensor.clone().detach()
     return tensor
+
+
+def _load_fused_indexer_wk(
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: Dict[str, torch.Tensor],
+    pending: Dict[str, Dict[str, torch.Tensor]],
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Load an indexer wk / weights_proj shard into the fused bf16 wk_weights_proj
+    param: wk fills the top head_dim rows (dequantized from block-fp8 if needed),
+    weights_proj the bottom n_heads rows.
+
+    Returns False when there is no fused param (non-CUDA, or CUDA with
+    SGLANG_DISABLE_DSA_INDEXER_FUSION set, where wk and weights_proj are
+    separate) so the caller falls through to per-tensor loading.
+    """
+    fused_name = name.rsplit(".indexer.", 1)[0] + ".indexer.wk_weights_proj.weight"
+    fused_param = params_dict.get(fused_name)
+    if fused_param is None or fused_param.dtype != torch.bfloat16:
+        return False
+
+    if ".indexer.weights_proj." in name:
+        w = _clone_if_runai_streamed_tensor(loaded_weight)
+        fused_param.data[-w.shape[0] :].copy_(w)
+        return True
+
+    # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
+    is_scale = name.endswith(".weight_scale_inv")
+    if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
+        w = _clone_if_runai_streamed_tensor(loaded_weight)
+        fused_param.data[: w.shape[0]].copy_(w)
+        return True
+
+    entry = pending.setdefault(fused_name, {})
+    entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
+        loaded_weight
+    )
+    if "weight" in entry and "scale" in entry:
+        pending.pop(fused_name)
+        block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
+        wk_bf16 = block_quant_dequant(
+            entry["weight"], entry["scale"], block_size, torch.bfloat16
+        )
+        fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
+    return True
 
 
 @dataclass(frozen=True)
@@ -136,7 +183,7 @@ class DeepseekV2WeightLoaderMixin:
         # Params for special naming rules in mixed-precision models, for example:
         # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
         # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
-        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+        if is_wint4afp8_or_wint4a16_config(self.quant_config):
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
@@ -147,6 +194,8 @@ class DeepseekV2WeightLoaderMixin:
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
+        pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
+
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
@@ -155,6 +204,7 @@ class DeepseekV2WeightLoaderMixin:
             futures = []
             params_dict = dict(self.named_parameters())
             weight_names = []
+
             for name, loaded_weight in weights:
                 use_async_loading = should_async_load(loaded_weight)
                 layer_id = get_layer_id(name)
@@ -205,6 +255,19 @@ class DeepseekV2WeightLoaderMixin:
                                     continue
 
                 if "rotary_emb.inv_freq" in name:
+                    continue
+
+                # CUDA fuses wk + weights_proj into one bf16 wk_weights_proj; the
+                # helper returns True once it has consumed the shard.
+                if (
+                    ".indexer.wk." in name or ".indexer.weights_proj." in name
+                ) and _load_fused_indexer_wk(
+                    name,
+                    loaded_weight,
+                    params_dict,
+                    pending_indexer_wk,
+                    self.quant_config,
+                ):
                     continue
 
                 for param_name, weight_name, shard_id in stacked_params_mapping:

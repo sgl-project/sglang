@@ -43,11 +43,11 @@ class CanaryLaunchCapacities:
     def from_args(
         cls,
         *,
-        server_args: "ServerArgs",
+        server_args: ServerArgs,
         req_to_token_pool_size: int,
         max_seq_len_per_req: int,
         pool_slot_count: int,
-    ) -> "CanaryLaunchCapacities":
+    ) -> CanaryLaunchCapacities:
         if req_to_token_pool_size <= 0:
             raise ValueError(
                 "kv-canary: req_to_token_pool_size must be positive, "
@@ -63,7 +63,10 @@ class CanaryLaunchCapacities:
                 f"kv-canary: pool_slot_count must be positive, got {pool_slot_count}"
             )
 
-        cuda_graph_max_bs = server_args.cuda_graph_max_bs or 0
+        cuda_graph_config = server_args.cuda_graph_config
+        cuda_graph_max_bs = (
+            cuda_graph_config.decode.max_bs if cuda_graph_config is not None else 0
+        ) or 0
         if cuda_graph_max_bs < 0:
             raise ValueError(
                 f"kv-canary: cuda_graph_max_bs must be non-negative, got {cuda_graph_max_bs}"
@@ -84,9 +87,9 @@ class CanaryLaunchCapacities:
                 f"kv-canary: max_prefill_tokens must be positive, got {max_prefill_tokens}"
             )
 
-        num_tokens_per_bs = 1
+        num_tokens_per_req = 1
         if spec_num_draft_tokens:
-            num_tokens_per_bs = max(num_tokens_per_bs, spec_num_draft_tokens)
+            num_tokens_per_req = max(num_tokens_per_req, spec_num_draft_tokens)
 
         max_bs = max(cuda_graph_max_bs, req_to_token_pool_size)
 
@@ -99,7 +102,7 @@ class CanaryLaunchCapacities:
         max_extend_tokens_per_forward = min(max_prefill_tokens, chunked_limit)
 
         write_entry_capacity = max(
-            max_bs * num_tokens_per_bs, max_extend_tokens_per_forward
+            max_bs * num_tokens_per_req, max_extend_tokens_per_forward
         )
 
         # Radix prefix sharing lets sum_r prefix_lens[r] exceed pool_slot_count; observed up to ~2x

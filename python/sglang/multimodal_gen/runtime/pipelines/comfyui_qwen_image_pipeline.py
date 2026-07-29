@@ -35,7 +35,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, set_mixed_precision_policy
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
+from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
 logger = init_logger(__name__)
 
@@ -185,7 +186,9 @@ class ComfyUIQwenImagePipelineBase(LoRAPipeline, ComposedPipelineBase):
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
         logger.info("Resolved transformer class: %s", cls_name)
 
-        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        default_dtype = resolve_precision(
+            server_args, "dit", precision_attr="dit_precision"
+        )
         server_args.model_paths["transformer"] = os.path.dirname(self.model_path) or "."
         assert server_args.hsdp_shard_dim is not None, "hsdp_shard_dim must be set"
         logger.info(
@@ -214,6 +217,8 @@ class ComfyUIQwenImagePipelineBase(LoRAPipeline, ComposedPipelineBase):
         )
 
         try:
+            # precision-constraint: FSDP mixed precision currently uses bf16
+            # parameters and fp32 reduction regardless of model load dtype.
             mp_policy = MixedPrecisionPolicy(
                 torch.bfloat16, torch.float32, None, cast_forward_inputs=False
             )
