@@ -1222,6 +1222,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             req_pool_size, dtype=torch.int32, device=self.device
         )
+        # Fresh-assignment generation per mamba slot, bumped when the allocator
+        # recycles a slot for a new request. A draft-side state plane compares
+        # it against the generation it last built states at to detect staleness.
+        self.mamba_slot_generation: torch.Tensor = torch.zeros(
+            mamba_size, dtype=torch.int64, device=self.device
+        )
         if enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
@@ -1260,6 +1266,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             speculative_eagle_topk=speculative_eagle_topk,
         )
         clone.req_index_to_mamba_index_mapping = self.req_index_to_mamba_index_mapping
+        # Slot ids in the shared mapping are issued by the original pool, so the
+        # clone must observe the original's recycling generations as well.
+        clone.mamba_slot_generation = self.mamba_slot_generation
         if enable_mamba_extra_buffer:
             clone.req_index_to_mamba_ping_pong_track_buffer_mapping = (
                 self.req_index_to_mamba_ping_pong_track_buffer_mapping
@@ -1288,6 +1297,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
                 req.mamba_pool_idx = mid[0]
                 req.mamba_needs_clear = True
+                self.mamba_slot_generation[req.mamba_pool_idx] += 1
                 # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
                 # ring. write_pos=0 means "ring empty", so the decode kernel
                 # ignores ring contents and reads only the checkpoint state
