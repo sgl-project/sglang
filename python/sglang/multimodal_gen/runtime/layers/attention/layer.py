@@ -959,7 +959,7 @@ class USPAttention(nn.Module):
             )
 
         # Ulysses-style All-to-All for sequence/head sharding
-        if sp_size > 1:
+        if sp_size > 1 and not qkv_pre_all_to_all:
             # -> [B, S, H_local, D]
             if self.enable_packed_qkv_input_a2a and q.device.type == "cuda":
                 q, k, v = async_a2a_communicate(
