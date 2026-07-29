@@ -1,6 +1,6 @@
 import logging
 import math
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 
