@@ -168,7 +168,7 @@ pub(super) fn error_value(code: u16, message: &str) -> serde_json::Value {
 /// Format a decoded [`ChunkEvent`] as one SGLang `/generate` frame's JSON. `rid`
 /// (response `meta_info.id`) is passed as a string; the event's numeric `rid` is
 /// just the shard routing key.
-pub(super) fn sglang_frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
+pub(super) fn frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
     let mut v = serde_json::json!({
         "text": out.text,
         "meta_info": {
@@ -238,7 +238,7 @@ pub(super) fn sglang_frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Val
 /// accumulated length, where rebuilding the `Value` is O(T) per frame and so O(T²)
 /// per request.
 ///
-/// Byte-identical to `sglang_frame_value(..).to_string()`, which requires emitting
+/// Byte-identical to `frame_value(..).to_string()`, which requires emitting
 /// `meta_info`'s keys in the alphabetical order `serde_json`'s `BTreeMap` gives
 /// them — pinned for both the plain and the logprob shapes by
 /// `cumulative_frame_json_matches_serde`. `None` only when the extras memo was
@@ -338,7 +338,7 @@ pub(super) fn cumulative_frame_string(
     index: Option<usize>,
 ) -> String {
     cumulative_frame_json(acc, rid_str, index)
-        .unwrap_or_else(|| tag_value(sglang_frame_value(acc.snapshot(), rid_str), index))
+        .unwrap_or_else(|| tag_value(frame_value(acc.snapshot(), rid_str), index))
 }
 
 /// Format one streaming frame: the accumulator's cumulative view (default), or this
@@ -352,9 +352,9 @@ pub(super) fn stream_frame_value(
     if incremental {
         let mut d = delta;
         d.completion_tokens = acc.snapshot().completion_tokens;
-        sglang_frame_value(&d, rid_str)
+        frame_value(&d, rid_str)
     } else {
-        sglang_frame_value(acc.snapshot(), rid_str)
+        frame_value(acc.snapshot(), rid_str)
     }
 }
 
@@ -396,7 +396,7 @@ pub(super) struct OutputAccumulator {
     /// either a text per value or none at all. That is what a real request does —
     /// `return_text_in_logprobs` is per-request, so the detok shard fills `*_txt`
     /// for all deltas or none — but a mixed sequence would silently diverge from
-    /// `sglang_frame_value`, so it is detected rather than assumed.
+    /// `frame_value`, so it is detected rather than assumed.
     extras_memo_broken: bool,
 }
 
@@ -620,7 +620,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let frame = sglang_frame_value(&out, "1");
+        let frame = frame_value(&out, "1");
         assert_eq!(
             frame["meta_info"]["input_token_logprobs"],
             serde_json::json!([[serde_json::Value::Null, 10, "<s>"], [-0.5f32, 20, "hi"]])
@@ -719,7 +719,7 @@ mod tests {
             for d in &deltas {
                 acc.fold(d);
                 let fast = cumulative_frame_json(&acc, "7", index).expect("no extras → fast path");
-                let slow = tag_value(sglang_frame_value(acc.snapshot(), "7"), index);
+                let slow = tag_value(frame_value(acc.snapshot(), "7"), index);
                 assert_eq!(fast, slow, "index={index:?} text={:?}", acc.snapshot().text);
             }
         }
@@ -823,7 +823,7 @@ mod tests {
                     acc.fold(d);
                     let fast = cumulative_frame_json(&acc, "9", index)
                         .expect("the extras memo must stay valid for a well-formed request");
-                    let slow = tag_value(sglang_frame_value(acc.snapshot(), "9"), index);
+                    let slow = tag_value(frame_value(acc.snapshot(), "9"), index);
                     assert_eq!(fast, slow, "with_texts={with_texts} index={index:?}");
                 }
             }

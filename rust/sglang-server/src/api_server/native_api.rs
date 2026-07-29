@@ -24,11 +24,11 @@ use tokio::sync::mpsc;
 
 use super::AppState;
 use super::frame::{
-    OutputAccumulator, cumulative_frame_string, error_value, sglang_frame_value,
-    stream_frame_string, tag_value,
+    OutputAccumulator, cumulative_frame_string, error_value, frame_value, stream_frame_string,
+    tag_value,
 };
 use super::guard::AbortGuard;
-use super::submit::submit;
+use super::submit::{pre_submit_error, submit};
 use crate::environ::env_bool;
 use crate::ids::Rid;
 use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams};
@@ -167,28 +167,11 @@ async fn generate(
 /// Answer an error raised *before* anything was submitted, in the shape the client
 /// asked for.
 ///
-/// Two parity points with Python's `generate_request`. The body is the same
-/// `{"error": {...}}` object every other path emits — not bare text, which a client
-/// parsing JSON chokes on. And a streaming request gets 200 plus one SSE error
-/// frame and `[DONE]`, not a 400: the client has already committed to reading a
-/// stream, and Python answers it inside `stream_results()`.
-pub(super) fn pre_submit_error(code: StatusCode, message: &str, stream: bool) -> Response {
-    let body = error_value(code.as_u16(), message);
-    if !stream {
-        return (code, Json(body)).into_response();
-    }
-    let frames = [body.to_string(), "[DONE]".to_string()];
-    Sse::new(futures::stream::iter(
-        frames.map(|data| Ok::<_, Infallible>(Event::default().data(data))),
-    ))
-    .into_response()
-}
-
 /// A single (non-batched) `/generate`: submit one request, then either stream its
 /// SSE frames or fold to one unary response.
 async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
-    // `sglang_frame_value` just reads them — no tokenizer needed here.
+    // `frame_value` just reads them — no tokenizer needed here.
     let (rid_str, mut rx) = match submit(state, RequestKind::Generate(Box::new(req)), stream).await
     {
         Ok(v) => v,
@@ -242,11 +225,7 @@ async fn drain_unary(
                         StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     return (status, error_value(code, message), true);
                 }
-                return (
-                    StatusCode::OK,
-                    sglang_frame_value(&final_out, rid_str),
-                    true,
-                );
+                return (StatusCode::OK, frame_value(&final_out, rid_str), true);
             }
             EgressItem::Error(e) => {
                 let code = e.http_status();
@@ -619,39 +598,5 @@ mod tests {
                 "count stays cumulative"
             );
         }
-    }
-    /// Pre-submit errors must look like every other error the server emits — a
-    /// JSON `{"error": …}` object, not bare text — and a streaming request must get
-    /// 200 + an SSE error frame rather than a 400, because Python answers it from
-    /// inside `stream_results()` after the stream has already been committed to.
-    #[tokio::test]
-    async fn pre_submit_errors_match_python_shape() {
-        let unary = pre_submit_error(StatusCode::BAD_REQUEST, "bad input", false);
-        assert_eq!(unary.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(unary.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
-        assert_eq!(v["error"]["message"], "bad input");
-        assert_eq!(v["error"]["code"], 400);
-
-        let streamed = pre_submit_error(StatusCode::BAD_REQUEST, "bad input", true);
-        assert_eq!(
-            streamed.status(),
-            StatusCode::OK,
-            "the stream itself is 200"
-        );
-        let body = axum::body::to_bytes(streamed.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(
-            text.contains(r#""code":400"#),
-            "carries the status in-band: {text}"
-        );
-        assert!(
-            text.trim_end().ends_with("data: [DONE]"),
-            "terminated: {text}"
-        );
     }
 }
