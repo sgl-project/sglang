@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, TypeVar
+from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
 import torch
 
@@ -535,13 +535,15 @@ class UnifiedRadixCache(BasePrefixCache):
             finally:
                 self.tree_core.evict_device_end(ct)
 
-    def inc_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
+    def inc_lock_ref(
+        self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
+    ) -> IncLockRefResult:
         result = self.session.try_inc_lock_ref(node_id)
         if result is not None:
             return result
         if self.disable:
             return IncLockRefResult()
-        return self.tree_core.inc_lock_ref(node_id)
+        return self.tree_core.inc_lock_ref(node_id, skip_lock_components)
 
     def dec_lock_ref(
         self,
@@ -556,14 +558,29 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_lock_ref(node_id, params, skip_swa)
 
+    def _dec_req_lock(self, req: Req, *, skip_swa: bool = False) -> None:
+        """Release the tree lock a request holds on its last_node, honoring the
+        components it skipped locking so it never drops a lock it never took."""
+        self.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                skip_lock_node_ids=req.skip_lock_node_ids,
+            ),
+            skip_swa=skip_swa,
+        )
+
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
         swa_uuid_for_lock: Optional[int] = None,
+        skip_lock_node_ids: Optional[dict] = None,
     ) -> None:
         if self.disable:
             return
-        result = self.tree_core.dec_swa_lock_only(node_id, swa_uuid_for_lock)
+        result = self.tree_core.dec_swa_lock_only(
+            node_id, swa_uuid_for_lock, skip_lock_node_ids
+        )
         self._free_values(result.device_frees, result.host_frees)
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
@@ -649,11 +666,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 start_pos=req.cache_protected_len,
             )
 
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
-            skip_swa=getattr(req, "swa_prefix_lock_released", False),
-        )
+        self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
 
         # cleanup
         for comp in self._components_tuple:
@@ -739,11 +752,21 @@ class UnifiedRadixCache(BasePrefixCache):
             new_indices[req.cache_protected_len :],
         )
 
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        self._dec_req_lock(req)
+        # Opt-in: leave the matched-prefix mamba evictable during decode (it is
+        # already COW'd to the request's own slot, never read from this node again).
+        # Safe only because any future COW source is the COWing request's own
+        # admission-locked last_node (recorded only if still present, locked before
+        # the next alloc) -- not this evictable node. A scheduler that matched a
+        # whole batch before locking would break that. Off = original full lock.
+        skip_lock_components = (
+            (ComponentType.MAMBA,)
+            if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+            else ()
         )
-        lock_result = self.inc_lock_ref(new_last_node)
+        lock_result = self.inc_lock_ref(
+            new_last_node, skip_lock_components=skip_lock_components
+        )
 
         # Update req fields
         if len(new_indices) < len(kv_indices_orig):
@@ -755,6 +778,8 @@ class UnifiedRadixCache(BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        # carry the skip set so this node's dec releases only what we locked
+        req.skip_lock_node_ids = lock_result.skip_lock_node_ids
         # The rematch acquired a new SWA prefix lock.
         req.swa_prefix_lock_released = False
 
