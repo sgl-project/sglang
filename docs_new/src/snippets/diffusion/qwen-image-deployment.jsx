@@ -13,7 +13,9 @@ export const QwenImageDeployment = () => {
           { id: 'h100', label: 'H100', default: false },
           { id: 'mi300x', label: 'MI300X', default: false },
           { id: 'mi325x', label: 'MI325X', default: false },
-          { id: 'mi355x', label: 'MI355X', default: false }
+          { id: 'mi355x', label: 'MI355X', default: false },
+          { id: 'a2', label: 'A2', default: false },
+          { id: 'a3', label: 'A3', default: false }
         ]
       },
       precision: {
@@ -33,6 +35,21 @@ export const QwenImageDeployment = () => {
     },
 
     generateCommand: function(values) {
+      if (values.hardware === 'a2') {
+        return `sglang serve \\
+  --model-path Qwen/Qwen-Image \\
+  --num-gpus 1`;
+      }
+
+      if (values.hardware === 'a3') {
+        return `#One A3 card has 2 npu chips
+sglang serve \\
+  --model-path Qwen/Qwen-Image \\
+  --tp-size 1 \\
+  --sp-degree 2 \\
+  --num-gpus 2`;
+      }
+
       const isBlackwell = ['b200', 'b300'].includes(values.hardware);
       const isNvfp4 = values.precision === 'nvfp4' && isBlackwell;
       const modelPath = isNvfp4
@@ -111,6 +128,22 @@ export const QwenImageDeployment = () => {
 
     return () => observer.disconnect();
   }, []);
+
+  useEffect(() => {
+    let targetTabName = 'AMD MI300X';
+    if (values.hardware === 'a2') targetTabName = 'Ascend A2';
+    if (values.hardware === 'a3') targetTabName = 'Ascend A3';
+
+    const allTabs = document.querySelectorAll('button, [role="tab"]');
+
+    allTabs.forEach((tab) => {
+      const text = tab.textContent.trim();
+
+      if (text === targetTabName && tab.getAttribute('aria-selected') !== 'true') {
+        tab.click();
+      }
+    });
+  }, [values.hardware]);
 
   const handleRadioChange = (optionName, value) => {
     setValues((prev) => {
