@@ -8,7 +8,6 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,

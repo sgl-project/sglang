@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     act_and_mul_triton,
     invoke_fused_moe_kernel,
@@ -39,7 +40,6 @@ from sglang.srt.utils import (
     is_xpu,
     use_intel_xpu_backend,
 )
-from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.utils.custom_op import register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
@@ -534,9 +534,7 @@ def _fused_moe_kernel_sequence(
             and gemm1_limit is None
             and swiglu_limit is None
             and b1 is None
-            and not (
-                use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16
-            )
+            and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
             and not apply_router_weight_on_input
             and hooks is None
             and hidden_states.dtype == torch.bfloat16

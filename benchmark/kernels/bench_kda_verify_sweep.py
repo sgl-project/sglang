@@ -66,9 +66,7 @@ def build_layer(args, device, dtype, seed):
         dt_bias=r(HV * K, dt=torch.float32) * 0.1,
         ssm=r(1, HV, V, K, dt=torch.float32) * 0.2,
         h0_idx=torch.zeros(1, dtype=torch.int32, device=device),
-        inter_states=torch.zeros(
-            1, T, HV, V, K, device=device, dtype=torch.float32
-        ),
+        inter_states=torch.zeros(1, T, HV, V, K, device=device, dtype=torch.float32),
         o=torch.empty(T, HV, V, device=device, dtype=dtype),
     )
     return layer
@@ -162,7 +160,9 @@ def main():
     REF = (32, 4, 3)
     sweep = [
         (bv, w, s)
-        for bv, w, s in itertools.product([2, 4, 8, 16, 32, 64, 128], [2, 4, 8], [1, 2, 3])
+        for bv, w, s in itertools.product(
+            [2, 4, 8, 16, 32, 64, 128], [2, 4, 8], [1, 2, 3]
+        )
         if not (bv == 128 and w == 2)  # hopeless register pressure, skip
     ]
     if REF not in sweep:
@@ -180,7 +180,11 @@ def main():
                 launch(l, args, BV, w, s)
             torch.cuda.synchronize()
         except Exception as e:
-            results.append(dict(BV=BV, warps=w, stages=s, status=f"COMPILE_FAIL {type(e).__name__}"))
+            results.append(
+                dict(
+                    BV=BV, warps=w, stages=s, status=f"COMPILE_FAIL {type(e).__name__}"
+                )
+            )
             continue
 
         # correctness snapshot from a fresh state
@@ -196,7 +200,7 @@ def main():
         else:
             max_diff = 0.0
             bit_equal = True
-            for (o, cs, ist), (ro, rcs, rist) in zip(outs, ref_out):
+            for (o, cs, st), (ro, rcs, rist) in zip(outs, ref_out):
                 max_diff = max(
                     max_diff,
                     (o.float() - ro.float()).abs().max().item(),
@@ -243,15 +247,21 @@ def main():
     if args.json:
         print(json.dumps(results, indent=1))
     else:
-        print(f"shapes: H={args.H} HV={args.HV} K={args.K} V={args.V} T={args.T}, "
-              f"{NLAYER} rotated layers, in-graph, ref={REF}")
-        print(f"{'BV':>4} {'warps':>5} {'stages':>6} {'us/layer':>9} "
-              f"{'max_diff':>10} {'bit==ref':>8}  status")
+        print(
+            f"shapes: H={args.H} HV={args.HV} K={args.K} V={args.V} T={args.T}, "
+            f"{NLAYER} rotated layers, in-graph, ref={REF}"
+        )
+        print(
+            f"{'BV':>4} {'warps':>5} {'stages':>6} {'us/layer':>9} "
+            f"{'max_diff':>10} {'bit==ref':>8}  status"
+        )
         for r in results:
-            print(f"{r['BV']:>4} {r['warps']:>5} {r['stages']:>6} "
-                  f"{r.get('us_per_layer', float('nan')):>9} "
-                  f"{r.get('max_diff', float('nan')):>10.2e} "
-                  f"{str(r.get('bit_equal_ref', '-')):>8}  {r['status']}")
+            print(
+                f"{r['BV']:>4} {r['warps']:>5} {r['stages']:>6} "
+                f"{r.get('us_per_layer', float('nan')):>9} "
+                f"{r.get('max_diff', float('nan')):>10.2e} "
+                f"{str(r.get('bit_equal_ref', '-')):>8}  {r['status']}"
+            )
 
 
 if __name__ == "__main__":

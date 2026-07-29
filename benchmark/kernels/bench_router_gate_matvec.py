@@ -32,8 +32,16 @@ def matvec(hidden, weight, block_e, warps):
     out = torch.empty((M, E), dtype=torch.float32, device=DEV)
     block_k = min(4096, triton.next_power_of_2(K))
     router_gate_matvec_kernel[(M, triton.cdiv(E, block_e))](
-        hidden, weight, out, K, E, hidden.stride(0), weight.stride(0),
-        BLOCK_E=block_e, BLOCK_K=block_k, num_warps=warps,
+        hidden,
+        weight,
+        out,
+        K,
+        E,
+        hidden.stride(0),
+        weight.stride(0),
+        BLOCK_E=block_e,
+        BLOCK_K=block_k,
+        num_warps=warps,
     )
     return out
 
@@ -65,7 +73,9 @@ def bench_cold(fn_per_layer, tag):
 
 def main():
     torch.manual_seed(0)
-    wf = [torch.randn(E, K, device=DEV, dtype=torch.float32) * 0.02 for _ in range(NLAYER)]
+    wf = [
+        torch.randn(E, K, device=DEV, dtype=torch.float32) * 0.02 for _ in range(NLAYER)
+    ]
     wb = [w.to(torch.bfloat16).contiguous() for w in wf]
 
     # correctness: fp32 path must match the fp32 reference bit-tightly and
@@ -91,7 +101,9 @@ def main():
         h = torch.randn(m, K, device=DEV, dtype=torch.bfloat16) * 0.7
         print(f"---- M={m} ----")
         bench_cold(lambda i: F.linear(h, wb[i]), "lib bf16 F.linear")
-        bench_cold(lambda i: F.linear(h.to(torch.float32), wf[i]), "lib fp32 upcast+linear")
+        bench_cold(
+            lambda i: F.linear(h.to(torch.float32), wf[i]), "lib fp32 upcast+linear"
+        )
         for be in (2, 4, 8):
             for warps in (4, 8):
                 bench_cold(

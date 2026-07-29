@@ -216,7 +216,9 @@ class KimiDeltaAttention(nn.Module):
         self.num_v_heads = config.linear_attn_config["num_heads"]
         self.head_k_dim = config.linear_attn_config["head_dim"]
         self.head_v_dim = (
-            v_head_dim if v_head_dim is not None else config.linear_attn_config["head_dim"]
+            v_head_dim
+            if v_head_dim is not None
+            else config.linear_attn_config["head_dim"]
         )
         self.layer_idx = layer_idx
         self.prefix = prefix
@@ -366,7 +368,9 @@ class KimiDeltaAttention(nn.Module):
             )
 
         self.dt_bias = nn.Parameter(
-            torch.empty(divide(projection_size, self.shard_tp_size), dtype=torch.float32)
+            torch.empty(
+                divide(projection_size, self.shard_tp_size), dtype=torch.float32
+            )
         )
 
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})

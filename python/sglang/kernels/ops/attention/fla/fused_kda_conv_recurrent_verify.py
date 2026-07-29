@@ -217,19 +217,47 @@ def fused_kda_conv_gating_verify_kernel(
         v_c2 = x_v
 
         if SAVE_INTERMEDIATE_WINDOW:
-            iw_base = (
-                inter_conv_window + iw_idx * stride_iw_line + t * stride_iw_step
-            )
+            iw_base = inter_conv_window + iw_idx * stride_iw_line + t * stride_iw_step
             if is_qk_owner:
-                tl.store(iw_base + q_ch * stride_iw_dim + 0 * stride_iw_win, q_c0, mask=mask_k)
-                tl.store(iw_base + q_ch * stride_iw_dim + 1 * stride_iw_win, q_c1, mask=mask_k)
-                tl.store(iw_base + q_ch * stride_iw_dim + 2 * stride_iw_win, q_c2, mask=mask_k)
-                tl.store(iw_base + k_ch * stride_iw_dim + 0 * stride_iw_win, k_c0, mask=mask_k)
-                tl.store(iw_base + k_ch * stride_iw_dim + 1 * stride_iw_win, k_c1, mask=mask_k)
-                tl.store(iw_base + k_ch * stride_iw_dim + 2 * stride_iw_win, k_c2, mask=mask_k)
-            tl.store(iw_base + v_ch * stride_iw_dim + 0 * stride_iw_win, v_c0, mask=mask_v)
-            tl.store(iw_base + v_ch * stride_iw_dim + 1 * stride_iw_win, v_c1, mask=mask_v)
-            tl.store(iw_base + v_ch * stride_iw_dim + 2 * stride_iw_win, v_c2, mask=mask_v)
+                tl.store(
+                    iw_base + q_ch * stride_iw_dim + 0 * stride_iw_win,
+                    q_c0,
+                    mask=mask_k,
+                )
+                tl.store(
+                    iw_base + q_ch * stride_iw_dim + 1 * stride_iw_win,
+                    q_c1,
+                    mask=mask_k,
+                )
+                tl.store(
+                    iw_base + q_ch * stride_iw_dim + 2 * stride_iw_win,
+                    q_c2,
+                    mask=mask_k,
+                )
+                tl.store(
+                    iw_base + k_ch * stride_iw_dim + 0 * stride_iw_win,
+                    k_c0,
+                    mask=mask_k,
+                )
+                tl.store(
+                    iw_base + k_ch * stride_iw_dim + 1 * stride_iw_win,
+                    k_c1,
+                    mask=mask_k,
+                )
+                tl.store(
+                    iw_base + k_ch * stride_iw_dim + 2 * stride_iw_win,
+                    k_c2,
+                    mask=mask_k,
+                )
+            tl.store(
+                iw_base + v_ch * stride_iw_dim + 0 * stride_iw_win, v_c0, mask=mask_v
+            )
+            tl.store(
+                iw_base + v_ch * stride_iw_dim + 1 * stride_iw_win, v_c1, mask=mask_v
+            )
+            tl.store(
+                iw_base + v_ch * stride_iw_dim + 2 * stride_iw_win, v_c2, mask=mask_v
+            )
 
         # SiLU, then round to the activation dtype: the unfused path stores the
         # conv output to a bf16 tensor and reloads it for the recurrence; the

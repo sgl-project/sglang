@@ -491,11 +491,15 @@ def router_gate_matvec(
 
     Callers must gate on M <= ROUTER_GATE_MATVEC_MAX_M; prefill-sized M
     keeps the library GEMM."""
-    assert weight.dtype in (
-        torch.float32,
-        torch.bfloat16,
-        torch.float16,
-    ) and weight.is_contiguous()
+    assert (
+        weight.dtype
+        in (
+            torch.float32,
+            torch.bfloat16,
+            torch.float16,
+        )
+        and weight.is_contiguous()
+    )
     M, K = hidden_states.shape
     E = weight.shape[0]
     out = torch.empty((M, E), dtype=torch.float32, device=hidden_states.device)

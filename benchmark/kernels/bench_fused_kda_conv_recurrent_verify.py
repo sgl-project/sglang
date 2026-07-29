@@ -173,9 +173,7 @@ def main():
     t_ref_eager = bench_eager(lambda: ref_step(*bufs))
     bufs = make_bufs()
     t_ref_graph = bench_graph(lambda: ref_step(*bufs))
-    print(
-        f"reference : eager {t_ref_eager:7.2f} us   cuda-graph {t_ref_graph:7.2f} us"
-    )
+    print(f"reference : eager {t_ref_eager:7.2f} us   cuda-graph {t_ref_graph:7.2f} us")
 
     for nw in [1, 2, 4, 8]:
         cp, sm, wn, ic = make_bufs()

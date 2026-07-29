@@ -649,9 +649,7 @@ def fused_moe_kernel(
         # activation at float, so silu stays f32 and the multiply runs in
         # f32 with a single final rounding to bf16 -- rounding silu to bf16
         # before the multiply diverges on ~25% of inputs (double rounding).
-        acc_pairs = tl.reshape(
-            accumulator, (BLOCK_SIZE_M, BLOCK_SIZE_N // 2, 2)
-        )
+        acc_pairs = tl.reshape(accumulator, (BLOCK_SIZE_M, BLOCK_SIZE_N // 2, 2))
         gate_b, up_b = tl.split(acc_pairs)
         gate_f = gate_b.to(tl.float32)
         # __expf(-x): x * (-log2(e)), then ex2.approx (0fBFB8AA3B = -log2(e);
@@ -689,9 +687,7 @@ def fused_moe_kernel(
             )
         else:
             c_ptrs = (
-                c_ptr
-                + stride_cm * offs_token[:, None]
-                + stride_cn * offs_half[None, :]
+                c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_half[None, :]
             )
         c_mask = token_mask[:, None] & (offs_half[None, :] < N // 2)
         tl.store(c_ptrs, out_act, mask=c_mask)
@@ -1279,9 +1275,7 @@ def moe_sum_reduce_triton(
         triton.cdiv(hidden_dim, BLOCK_DIM),
     )
 
-    pdl_kwargs = (
-        {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-    )
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     _moe_sum_reduce_kernel[grid](
         input,
         *input.stride(),

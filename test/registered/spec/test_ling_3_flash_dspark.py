@@ -25,6 +25,22 @@ DRAFT_MODEL = "/root/models/ling-3.0-flash-dspark-draft"
 GSM8K_DATA_PATH = "/root/datasets/gsm8k/test.jsonl"
 GSM8K_NUM_EXAMPLES: int | None = None
 GSM8K_SCORE_THRESHOLD = 0.90
+# Fraction of requests that must end on EOS / a stop token. Score alone
+# cannot see a no-EOS run (answer extraction still finds the answer in the
+# rambling text), and stop corruption is a classic spec-decoding failure.
+STOP_RATE_THRESHOLD = 0.95
+# Max score the DSpark run may lose vs the same-session baseline. Greedy
+# spec decoding should be lossless; 0.02 (~26 of 1319 examples) absorbs the
+# known benign single-token flips (bf16 lm_head) without letting a real
+# regression through two independent absolute checks.
+DSPARK_SCORE_DROP_TOLERANCE = 0.02
+
+# Baseline -> DSpark metric channel. unittest collects classes in module
+# alphabetical order (...Baseline before ...DSpark), so within one file run
+# the baseline fills this before the DSpark test reads it. When the DSpark
+# class is run standalone the dict stays empty and only the absolute gates
+# apply.
+_baseline_metrics: dict = {}
 
 # Shared target launch knobs for both runs.
 COMMON_ARGS = [
@@ -62,8 +78,7 @@ def _run_gsm8k(test_case) -> dict:
     print(f"[{type(test_case).__name__}] {metrics=}")
     if is_in_ci():
         write_github_step_summary(
-            f"### {type(test_case).__name__}\n"
-            f"score={metrics['score']:.4f}\n"
+            f"### {type(test_case).__name__}\n" f"score={metrics['score']:.4f}\n"
         )
     return metrics
 
@@ -101,6 +116,10 @@ class _Ling3FlashServerMixin:
     def _run_gsm8k_and_assert(self) -> dict:
         metrics = _run_gsm8k(self)
         self.assertGreaterEqual(metrics["score"], GSM8K_SCORE_THRESHOLD)
+        # Fail loudly if the eval stack stops reporting finish reasons rather
+        # than silently dropping the no-EOS gate.
+        self.assertIn("stop_rate", metrics)
+        self.assertGreaterEqual(metrics["stop_rate"], STOP_RATE_THRESHOLD)
         return metrics
 
 
@@ -112,7 +131,7 @@ class TestLing3FlashBaseline(_Ling3FlashServerMixin, CustomTestCase):
     """
 
     def test_gsm8k(self):
-        self._run_gsm8k_and_assert()
+        _baseline_metrics.update(self._run_gsm8k_and_assert())
 
 
 class TestLing3FlashDSpark(_Ling3FlashServerMixin, CustomTestCase):
@@ -120,9 +139,10 @@ class TestLing3FlashDSpark(_Ling3FlashServerMixin, CustomTestCase):
 
     Guards the DSpark worker's hybrid linear-attention state commit: without
     ``commit_mamba_states_after_verify`` after accept, the Bailing-MoE-V3 target
-    diverges from pure-target greedy decoding on multi-step outputs. The score
-    must match the no-spec baseline (both >= 0.90), so spec decoding leaves
-    accuracy intact.
+    diverges from pure-target greedy decoding on multi-step outputs. Gated
+    three ways: absolute score floor, stop-rate (no-EOS runs keep scoring),
+    and score relative to the same-session no-spec baseline (two independent
+    absolute checks would pass a substantial regression).
     """
 
     _server_extra_args = [
@@ -134,7 +154,25 @@ class TestLing3FlashDSpark(_Ling3FlashServerMixin, CustomTestCase):
     _server_env = {"SGLANG_RAGGED_VERIFY_MODE": "static"}
 
     def test_gsm8k(self):
-        self._run_gsm8k_and_assert()
+        metrics = self._run_gsm8k_and_assert()
+        if _baseline_metrics:
+            # Relative gate: two independent absolute >= 0.90 checks would
+            # pass e.g. a 0.97 -> 0.91 drop, which for greedy spec decoding
+            # is a real regression, not noise.
+            self.assertGreaterEqual(
+                metrics["score"],
+                _baseline_metrics["score"] - DSPARK_SCORE_DROP_TOLERANCE,
+                msg=(
+                    f"DSpark score {metrics['score']:.4f} regressed more than "
+                    f"{DSPARK_SCORE_DROP_TOLERANCE} below the baseline "
+                    f"{_baseline_metrics['score']:.4f}"
+                ),
+            )
+        else:
+            print(
+                "Baseline metrics unavailable (DSpark class run standalone); "
+                "only the absolute score / stop-rate gates applied."
+            )
 
 
 if __name__ == "__main__":

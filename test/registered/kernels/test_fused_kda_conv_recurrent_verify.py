@@ -88,9 +88,7 @@ def _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed):
     if neg_slot and B >= 2:
         idx_vals[1] = -1
     inputs["idx_vals"] = idx_vals
-    inputs["cache_indices"] = torch.tensor(
-        idx_vals, device=_DEVICE, dtype=torch.int32
-    )
+    inputs["cache_indices"] = torch.tensor(idx_vals, device=_DEVICE, dtype=torch.int32)
     inputs["inter_indices"] = torch.arange(B, device=_DEVICE, dtype=torch.int32)
     return inputs
 

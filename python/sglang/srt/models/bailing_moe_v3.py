@@ -10,6 +10,13 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.moe.router import (
+    ROUTER_GATE_MATVEC_MAX_M,
+    router_gate_matvec,
+)
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    is_fp8_fnuz,
+)
 from sglang.srt.configs import KimiLinearConfig
 from sglang.srt.distributed import (
     get_pp_group,
@@ -40,15 +47,8 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.kernels.ops.moe.router import (
-    ROUTER_GATE_MATVEC_MAX_M,
-    router_gate_matvec,
-)
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    is_fp8_fnuz,
-)
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,

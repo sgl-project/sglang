@@ -71,9 +71,7 @@ def _moe_align_small_numel_kernel(
     bucket = tl.where(mask_p, (ids + 1).to(tl.int32), num_experts)
 
     # Pairwise stats: stable rank within the bucket and bucket population.
-    same = (
-        (bucket[None, :] == bucket[:, None]) & mask_p[None, :] & mask_p[:, None]
-    )
+    same = (bucket[None, :] == bucket[:, None]) & mask_p[None, :] & mask_p[:, None]
     earlier = offs_p[None, :] < offs_p[:, None]
     rank = tl.sum((same & earlier).to(tl.int32), axis=1)  # [NP]
     cnt = tl.sum(same.to(tl.int32), axis=1)  # [NP], own-bucket population

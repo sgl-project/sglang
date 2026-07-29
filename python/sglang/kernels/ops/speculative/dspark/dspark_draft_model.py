@@ -324,9 +324,7 @@ def _markov_greedy_combine_kernel(
     offs = tl.arange(0, BLOCK_TILES)
     mask = offs < n_tiles
     vals = tl.load(tile_val_ptr + row * n_tiles + offs, mask=mask, other=float("-inf"))
-    idxs = tl.load(
-        tile_idx_ptr + row * n_tiles + offs, mask=mask, other=_IDX_SENTINEL
-    )
+    idxs = tl.load(tile_idx_ptr + row * n_tiles + offs, mask=mask, other=_IDX_SENTINEL)
     best = tl.max(vals, axis=0)
     # Lowest global index among equal-valued tiles, matching torch.argmax.
     cand = tl.where(vals == best, idxs, _IDX_SENTINEL)

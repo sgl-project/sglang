@@ -329,9 +329,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         stride = int(self.verify_num_draft_tokens)
         device = self.device
         # accept_index[i, j] = i*stride + j  -> relative step index for request i.
-        accept_index = torch.arange(
-            bs * stride, dtype=torch.int64, device=device
-        ).view(bs, stride)
+        accept_index = torch.arange(bs * stride, dtype=torch.int64, device=device).view(
+            bs, stride
+        )
         commit_mamba_states_after_verify(
             self.target_worker,
             batch,
@@ -681,9 +681,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
-        self._commit_mamba_state_after_accept(
-            batch=batch, accept=accept, bs=bs
-        )
+        self._commit_mamba_state_after_accept(batch=batch, accept=accept, bs=bs)
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)
