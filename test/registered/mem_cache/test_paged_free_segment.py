@@ -1,10 +1,6 @@
-"""Tests for PagedTokenToKVPoolAllocator.free_segment / free_segments.
-
-free_segment replaces torch.unique in the request-free path: unique's
-data-dependent output shape forces a device-to-host sync that blocks the
-scheduler behind the in-flight forward. These CPU tests check the stride-based
-page extraction against the unique reference over segment alignments, and the
-boundary-page dedup of free_segments.
+"""free_segment / free_segments vs the torch.unique reference: stride page
+extraction over all segment alignments, plus boundary-page dedup and free-group
+deferral. See PagedTokenToKVPoolAllocator.free_segment for why unique is avoided.
 
     python -m pytest test/registered/mem_cache/test_paged_free_segment.py -v
 """
