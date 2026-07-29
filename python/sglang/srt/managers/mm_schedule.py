@@ -212,6 +212,12 @@ def _acknowledge_deferred_cuda_ipc_cache_hits(
         item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
 
 
+def _embedding_token_count(embedding: torch.Tensor) -> int:
+    if embedding.ndim == 0 or embedding.shape[-1] == 0:
+        return 0
+    return embedding.numel() // embedding.shape[-1]
+
+
 def _get_chunked_embedding_full(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items_per_req: List[MultimodalDataItem],
@@ -227,7 +233,16 @@ def _get_chunked_embedding_full(
     """
     item_hashes = [item.hash for item in embedding_items_per_req]
     embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
-    embedding_per_req = embedding_cache.get(item_hashes)
+    use_cache = all(item.use_embedding_cache for item in embedding_items_per_req)
+    embedding_per_req = embedding_cache.get(item_hashes) if use_cache else None
+    expected_tokens = sum(end - start + 1 for start, end in items_offset)
+    if (
+        isinstance(embedding_per_req, EmbeddingResult)
+        and not isinstance(embedding_per_req, EVSEmbeddingResult)
+        and _embedding_token_count(embedding_per_req.embedding) != expected_tokens
+    ):
+        embedding_cache.free(embedding_items_hash, None)
+        embedding_per_req = None
 
     if embedding_per_req is None:
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
@@ -242,7 +257,8 @@ def _get_chunked_embedding_full(
             if isinstance(embedding, torch.Tensor)
             else embedding
         )
-        embedding_cache.set(embedding_items_hash, embedding_per_req)
+        if use_cache:
+            embedding_cache.set(embedding_items_hash, embedding_per_req)
     else:
         _acknowledge_deferred_cuda_ipc_cache_hits(embedding_items_per_req)
 
@@ -310,18 +326,38 @@ def _batch_encode_per_image_misses(
         req_info.overlapping = overlapping
 
         for _idx, item, start, end in overlapping:
+            if item.hash is None:
+                raise RuntimeError("multimodal item is missing its cache identity")
+            token_count = end - start + 1
             if item.hash in hash_to_embedding:
+                if _embedding_token_count(hash_to_embedding[item.hash]) != token_count:
+                    raise RuntimeError(
+                        "Multimodal items sharing a hash have different token geometry"
+                    )
+                _acknowledge_deferred_cuda_ipc_cache_hits([item])
                 continue
             cached = (
                 embedding_cache.get_single(item.hash)
                 if item.use_embedding_cache
                 else None
             )
+            if (
+                cached is not None
+                and _embedding_token_count(cached.embedding) != token_count
+            ):
+                embedding_cache.free(item.hash, None)
+                cached = None
             if cached is not None:
                 hash_to_embedding[item.hash] = cached.embedding
+                _acknowledge_deferred_cuda_ipc_cache_hits([item])
             elif item.hash not in unique_misses:
-                token_count = end - start + 1
                 unique_misses[item.hash] = (item, token_count)
+            elif unique_misses[item.hash][1] != token_count:
+                raise RuntimeError(
+                    "Multimodal items sharing a hash have different token geometry"
+                )
+            else:
+                _acknowledge_deferred_cuda_ipc_cache_hits([item])
 
     # Phase 1b: single ViT call for all unique cache misses
     if unique_misses:
@@ -345,13 +381,26 @@ def _batch_encode_per_image_misses(
             split_embeddings = [
                 emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
             ]
+            if any(
+                _embedding_token_count(embedding) != token_count
+                for embedding, token_count in zip(split_embeddings, token_counts)
+            ):
+                raise RuntimeError(
+                    "Multimodal encoder output does not match per-item token geometry"
+                )
         else:
             all_miss_embedding = all_miss_embedding.reshape(
                 -1, all_miss_embedding.shape[-1]
             )
+            if all_miss_embedding.shape[0] != sum(token_counts):
+                raise RuntimeError(
+                    "Multimodal encoder output does not match per-item token geometry: "
+                    f"expected={sum(token_counts)}, "
+                    f"actual={all_miss_embedding.shape[0]}"
+                )
             split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
-        for h, emb in zip(ordered_hashes, split_embeddings):
-            if unique_misses[h][0].use_embedding_cache:
+        for (h, (item, _)), emb in zip(unique_misses.items(), split_embeddings):
+            if item.use_embedding_cache:
                 embedding_cache.set(h, EmbeddingResult(embedding=emb))
             # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
             hash_to_embedding[h] = emb
@@ -390,9 +439,16 @@ def _get_chunked_embedding_by_item(
     cached_embeddings = {}
     miss_items = []
     for idx, item, start, end in overlapping:
+        token_count = end - start + 1
         cached = (
             embedding_cache.get_single(item.hash) if item.use_embedding_cache else None
         )
+        if (
+            cached is not None
+            and _embedding_token_count(cached.embedding) != token_count
+        ):
+            embedding_cache.free(item.hash, None)
+            cached = None
         if cached is not None:
             cached_embeddings[idx] = cached.embedding
             _acknowledge_deferred_cuda_ipc_cache_hits([item])
@@ -416,12 +472,26 @@ def _get_chunked_embedding_by_item(
             split_embeddings = [
                 emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
             ]
+            token_counts = [end - start + 1 for _, _, start, end in miss_items]
+            if any(
+                _embedding_token_count(embedding) != token_count
+                for embedding, token_count in zip(split_embeddings, token_counts)
+            ):
+                raise RuntimeError(
+                    "Multimodal encoder output does not match per-item token geometry"
+                )
         else:
             all_miss_embedding = all_miss_embedding.reshape(
                 -1, all_miss_embedding.shape[-1]
             )
             # Split output by per-item token count
             token_counts = [end - start + 1 for _, _, start, end in miss_items]
+            if all_miss_embedding.shape[0] != sum(token_counts):
+                raise RuntimeError(
+                    "Multimodal encoder output does not match per-item token geometry: "
+                    f"expected={sum(token_counts)}, "
+                    f"actual={all_miss_embedding.shape[0]}"
+                )
             split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
 
         for (idx, item, _, _), emb in zip(miss_items, split_embeddings):

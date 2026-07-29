@@ -21,10 +21,8 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from sglang.srt.managers.mm_utils import (
-    _get_chunked_embedding_by_item,
-    get_new_expanded_mm_items,
-)
+from sglang.srt.managers.mm_schedule import _get_chunked_embedding_by_item
+from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -175,7 +173,7 @@ class TestGetNewExpandedMMItems(CustomTestCase):
 
         args = (encode, [stable, tail], [(0, 1), (2, 2)], 0, 3, torch.device("cpu"))
         cache = MultiModalStaticCache(1024 * 1024)
-        with patch("sglang.srt.managers.mm_utils.embedding_cache", cache):
+        with patch("sglang.srt.managers.mm_schedule.embedding_cache", cache):
             first = _get_chunked_embedding_by_item(*args)
             second = _get_chunked_embedding_by_item(*args)
 
@@ -184,6 +182,36 @@ class TestGetNewExpandedMMItems(CustomTestCase):
         self.assertEqual(encoded_item_counts, [2, 1])
         self.assertTrue(cache.has(stable.hash))
         self.assertFalse(cache.has(tail.hash))
+
+    def test_stale_cache_geometry_is_reencoded(self):
+        cache = MultiModalStaticCache(1024 * 1024)
+        encoded_lengths = []
+
+        def encode(items):
+            encoded_lengths.append(items[0].feature.shape[0])
+            return items[0].feature
+
+        def run(token_count):
+            item = MultimodalDataItem(
+                modality=Modality.AUDIO,
+                hash=7,
+                offsets=[(0, token_count - 1)],
+                feature=torch.ones(token_count, 3),
+            )
+            return _get_chunked_embedding_by_item(
+                encode,
+                [item],
+                item.offsets,
+                0,
+                token_count,
+                torch.device("cpu"),
+            )
+
+        with patch("sglang.srt.managers.mm_schedule.embedding_cache", cache):
+            self.assertEqual(run(1).shape[0], 1)
+            self.assertEqual(run(2).shape[0], 2)
+
+        self.assertEqual(encoded_lengths, [1, 2])
 
 
 if __name__ == "__main__":
