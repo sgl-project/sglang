@@ -416,6 +416,9 @@ class KimiK2Detector(BaseReasoningFormatDetector):
         )
 
 
+_THINK_CLOSE_WITHOUT_SEP = THINK_CLOSE.split("<|sep|>")[0]
+
+
 class KimiK3Detector(BaseReasoningFormatDetector):
     """Detector for the Kimi K3 XTML think channel.
 
@@ -484,6 +487,18 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             return -1, -1
         return m.start(), m.end()
 
+    def _next_channel_idx(self, text: str, start: int = 0) -> int:
+        found = [
+            idx
+            for token in (RESPONSE_OPEN, self.tool_start_token)
+            if (idx := text.find(token, start)) != -1
+        ]
+        return min(found) if found else -1
+
+    @staticmethod
+    def _strip_dangling_think_close(text: str) -> str:
+        return text.removesuffix(_THINK_CLOSE_WITHOUT_SEP)
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         in_reasoning = self._in_reasoning or self.think_start_token in text
         if not in_reasoning and self._find_think_close(text, at_eof=True)[0] == -1:
@@ -493,13 +508,17 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         start = open_idx + len(self.think_start_token) if open_idx != -1 else 0
         close_idx, close_end = self._find_think_close(text, start, at_eof=True)
         if close_idx == -1:
-            tools_idx = text.find(self.tool_start_token, start)
-            if tools_idx != -1:
+            channel_idx = self._next_channel_idx(text, start)
+            if channel_idx != -1:
                 return StreamingParseResult(
-                    reasoning_text=text[start:tools_idx],
-                    normal_text=text[tools_idx:],
+                    reasoning_text=self._strip_dangling_think_close(
+                        text[start:channel_idx]
+                    ),
+                    normal_text=self._clean_content(text[channel_idx:]),
                 )
-            return StreamingParseResult(reasoning_text=text[start:])
+            return StreamingParseResult(
+                reasoning_text=self._strip_dangling_think_close(text[start:])
+            )
 
         reasoning_text = text[start:close_idx]
         rest = text[close_end:]
@@ -541,13 +560,15 @@ class KimiK3Detector(BaseReasoningFormatDetector):
                     normal_text=self._drain_content() or None,
                 )
 
-            tools_idx = buf.find(self.tool_start_token)
-            if tools_idx != -1:
-                reasoning_text = buf[:tools_idx]
-                self._buffer = buf[tools_idx:]
+            channel_idx = self._next_channel_idx(buf)
+            if channel_idx != -1:
+                reasoning_text = self._strip_dangling_think_close(buf[:channel_idx])
+                self._buffer = buf[channel_idx:]
                 self._in_reasoning = False
                 self._reasoning_done = True
-                self._tools_passthrough = True
+                self._tools_passthrough = buf.startswith(
+                    self.tool_start_token, channel_idx
+                )
                 return StreamingParseResult(
                     reasoning_text=reasoning_text or None,
                     normal_text=self._drain_content() or None,
@@ -563,11 +584,13 @@ class KimiK3Detector(BaseReasoningFormatDetector):
                 THINK_CLOSE_NOSEP + "[EOS]",
                 THINK_CLOSE_NOSEP + "[EOT]",
                 self.tool_start_token,
+                RESPONSE_OPEN,
             ]
             if not self.stripped_think_start:
                 markers.append(self.think_start_token)
             holdback = _partial_suffix_len(buf, markers)
             emit = buf[: len(buf) - holdback] if holdback else buf
+            emit = self._strip_dangling_think_close(emit)
             self._buffer = buf[len(emit) :]
             return StreamingParseResult(reasoning_text=emit)
 
