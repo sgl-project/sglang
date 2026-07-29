@@ -3634,6 +3634,12 @@ class HybridLinearKVPool(KVCache):
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
 
+    def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
+        # Hybrid layer ids are global model-layer ids, while the backing pool
+        # is dense over only full-attention layers. Shape discovery does not
+        # need a global layer lookup, so delegate it to that backing pool.
+        return self.full_kv_pool.get_kv_buffer_shape()
+
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
 
