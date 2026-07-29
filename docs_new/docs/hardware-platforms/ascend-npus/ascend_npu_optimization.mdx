@@ -137,7 +137,7 @@ The following system-level tuning steps reduce OS interference and improve CPU s
     </tr>
     <tr>
       <td>`TASK_QUEUE_ENABLE`</td>
-      <td>Controls the ASCEND Runtime task queue optimization level: `0` = disabled, `1` = default optimization, `2` = aggressive optimization with greater task fusion and overlap. Higher levels improve throughput but may interfere with CUDA Graph-launched tasks. Start with `1` for general use. Use `2` for throughput-critical prefill workloads; use `0` for decode where CUDA Graph compatibility is needed.</td>
+      <td>Controls the ASCEND Runtime task queue optimization level: `0` = disabled, `1` = default optimization, `2` = aggressive optimization with greater task fusion and overlap. Higher levels improve throughput but may interfere with NPU Graph-launched tasks. Start with `1` for general use. Use `2` for throughput-critical prefill workloads; use `0` for decode where NPU Graph compatibility is needed.</td>
       <td>Prefill: `2`, Decode: `0`</td>
     </tr>
     <tr>
@@ -304,7 +304,7 @@ Speculative decoding reduces per-token latency by generating draft tokens that a
   <tbody>
     <tr>
       <td>`--quantization modelslim`</td>
-      <td>Uses the Ascend ModelSlim quantization tool to load W8A8 pre-quantized model weights. This reduces model weight footprint by approximately 50% compared to BF16, allowing larger models to fit in NPU memory with minimal accuracy degradation. The quantization method is auto-detected from the model's `quant_model_description.json` file.</td>
+      <td>Uses the Ascend ModelSlim quantization tool to load W4A4/W4A8/W8A8/W4A16 pre-quantized model weights. This reduces model weight footprint by approximately 50% (for w8) or 75% (for w4) compared to BF16, allowing larger models to fit in NPU memory with minimal accuracy degradation. The quantization method is auto-detected from the model's `quant_model_description.json` file.</td>
       <td>`modelslim`</td>
     </tr>
   </tbody>
@@ -356,11 +356,6 @@ The following environment variables are used in other best practice configuratio
       <td>`HCCL_OP_EXPANSION_MODE=AIV`</td>
       <td>Configures the HCCL communication algorithm scheduling to use AIV (Ascend Intelligent Vision) expansion mode, which can improve communication efficiency for certain collective operations.</td>
       <td>Used in Qwen MoE and R1 non-DSA configurations</td>
-    </tr>
-    <tr>
-      <td>`SGLANG_NPU_FUSED_MOE_MODE`</td>
-      <td>Controls the fused MoE optimization mode on Ascend NPU. `1` is default; `2` enables a more aggressive fusion strategy (`DISPATCH_FFN_COMBINE`) that can improve MoE dispatch throughput. Mode `2` requires `--quantization modelslim`. Used primarily with DeepSeek R1 models.</td>
-      <td>`1` or `2`</td>
     </tr>
     <tr>
       <td>`SGLANG_NPU_USE_MLAPO=1`</td>
@@ -742,7 +737,7 @@ Each device holds a subset of experts and routes tokens via all-to-all communica
 
 ### Context Parallelism (`--attn-cp-size`)
 
-Splits long input sequences across devices so that the KV cache and attention computation for a single request are distributed. This enables serving very long context lengths (e.g., 128K tokens) that exceed single-device memory. On Ascend, `--attn-cp-size` must equal `--tp-size`.
+Splits long input sequences across devices so that the KV cache and attention computation for a single request are distributed. This enables serving very long context lengths (e.g., 128k tokens) that exceed single-device memory. On Ascend, `--attn-cp-size` must equal `--tp-size`.
 
 ### PD Disaggregation (`--disaggregation-mode`)
 
@@ -750,7 +745,11 @@ Separates the prefill (P) and decode (D) phases onto different device groups, al
 
 ### Quantization (`--quantization`)
 
-Reduces model weight and activation precision (e.g., W8A8, W4A8, W4A16) to decrease memory usage and increase throughput. On Ascend, the natively supported and highly optimized quantization method is ModelSlim (supporting W4A4, W8A8, W4A8 dynamic/static). Support for other community formats (such as AWQ, GPTQ, Auto-round, and Compressed-tensors) depends on the availability of specific Ascend custom kernels in your environment; see quantization for details and compatibility matrices.
+Reduces model weight and activation precision (e.g., W8A8, W4A8, W4A16) to decrease memory usage and increase throughput.
+On Ascend, the natively supported and highly optimized quantization method is ModelSlim (supporting W4A4, W8A8, W4A8 dynamic/static).
+Support for other community formats (such as AWQ, GPTQ, Auto-round, and Compressed-tensors) depends on the availability
+of specific Ascend custom kernels in your environment;
+see [Quantization on Ascend](/docs/hardware-platforms/ascend-npus/ascend_npu_quantization) for details and compatibility matrices.
 
 ### Chunked Prefill (`--chunked-prefill-size`)
 

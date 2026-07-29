@@ -675,6 +675,10 @@ class PipelineConfig:
     def get_neg_prompt_embeds(self, batch):
         return batch.negative_prompt_embeds
 
+    def expand_conditioning_to_sample_batch(self, batch):
+        """Used for single-request multi-output generation case."""
+        return batch
+
     def post_denoising_loop(self, latents, batch):
         latents = maybe_unpad_latents(latents, batch)
         return latents
@@ -1183,7 +1187,9 @@ class ImagePipelineConfig(PipelineConfig):
 
         latents = maybe_unpad_latents(latents, batch)
 
-        latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
+        latents = latents.reshape(
+            batch_size, height // 2, width // 2, channels // 4, 2, 2
+        )
         latents = latents.permute(0, 3, 1, 4, 2, 5)
         return latents, batch_size, channels, height, width
 

@@ -63,6 +63,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
+    ReqKvInfo,
     ScheduleBatch,
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
@@ -86,12 +87,14 @@ from sglang.srt.observability.req_time_stats import (
     set_time_batch,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_num_new_pages
+from sglang.srt.utils import get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -143,6 +146,10 @@ class DecodeReqToTokenPool:
             )
 
         self.free_slots = list(range(1, self._alloc_size))
+        # Slot-reuse generation counter; mirrors ReqToTokenPool. Required even
+        # here: HybridMambaDecodeReqToTokenPool borrows this __init__ while
+        # inheriting ReqToTokenPool.alloc, which bumps it.
+        self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -171,6 +178,7 @@ class DecodeReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
+                self.req_generation[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
@@ -181,6 +189,7 @@ class DecodeReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
+        self.req_generation.zero_()
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
@@ -444,6 +453,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_layer_ids = (
+            self.token_to_kv_pool.get_kv_layer_ids()
+            if self.draft_token_to_kv_pool is None
+            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
+            else []
+        )
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
@@ -1034,6 +1049,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
+            if total_prefix_len != 0 and hasattr(
+                self.token_to_kv_pool_allocator, "c4_attn_allocator"
+            ):
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                raise RuntimeError(
+                    "DSV4 NPU PD disaggregation does not support decode-side "
+                    "prefix cache yet; disable disaggregation decode radix/HiCache "
+                    "for PD + chunked prefill."
+                )
+
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -1070,22 +1096,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "hisparse_page_size",
                     page_size,
                 )
-                # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
-                kv_indices = (
-                    dst_kv_indices[: origin_input_len - prefix_len]
-                    .cpu()
-                    .numpy()
-                    .astype(np.int32)
-                )
+                kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
             else:
                 # Only send delta indices (beyond prefix) to prefill.
-                kv_indices = (
-                    self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
-                        total_prefix_len:origin_input_len
-                    ]
-                    .cpu()
-                    .numpy()
-                )
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx
+                ][total_prefix_len:origin_input_len]
 
             seq_len = origin_input_len
 
@@ -1110,9 +1126,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         window_kv_indices_full
                     )
                 )
-                return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
-                )
+                return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _dsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -1120,9 +1134,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
-                return kv_to_page_indices(
-                    kv_indices_full.cpu().numpy(), device_page_size
-                )
+                return kv_to_page_indices(kv_indices_full, device_page_size)
 
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
@@ -1146,36 +1158,68 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
 
             state_types = self.kv_manager.kv_args.state_types
-            state_indices: Optional[List] = []
             if StateType.C128_STATE in state_types:
                 clear_c128_state = getattr(
                     self.token_to_kv_pool, "clear_c128_req_state", None
                 )
                 if clear_c128_state is not None:
                     clear_c128_state(int(decode_req.req.req_pool_idx))
-            for st in state_types:
-                if st == StateType.MAMBA:
-                    state_indices.append(_mamba_payload())
-                elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
-                elif st == StateType.DSA:
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.MINIMAX_INDEX_K:
-                    # Index rows live at the same loc as main KV on the same
-                    # page_size, so reuse the full-seq page-ids.
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.SWA_RING:
-                    state_indices.append(_swa_ring_payload())
-                elif st == StateType.C128_STATE:
-                    state_indices.append(_c128_state_payload())
-                else:
-                    state_indices.append(None)
+            # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
+            # as main KV on the same page_size.
+            payloads = {
+                StateType.MAMBA: _mamba_payload,
+                StateType.SWA: _swa_payload,
+                StateType.DSA: _dsa_payload,
+                StateType.MINIMAX_INDEX_K: _dsa_payload,
+                StateType.SWA_RING: _swa_ring_payload,
+                StateType.C128_STATE: _c128_state_payload,
+            }
+            if hasattr(self.req_to_token_pool, "req_to_token_c4"):
+                # DSV4 on NPU: per-pool dst page indices, produced by the same
+                # shared builder prefill uses so src/dst line up positionally.
+                if total_prefix_len != 0:
+                    raise RuntimeError(
+                        "DSV4 NPU PD disaggregation does not support decode-side "
+                        "prefix cache yet; disable disaggregation decode radix/HiCache "
+                        "for PD + chunked prefill."
+                    )
+            if _is_npu and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                    dsv4_state_payloads,
+                )
+
+                payloads.update(
+                    dsv4_state_payloads(
+                        self.req_to_token_pool,
+                        decode_req.req.req_pool_idx,
+                        seq_len,
+                        self.token_to_kv_pool_allocator.page_size,
+                        self.scheduler.sliding_window_size,
+                        prefix_len=total_prefix_len,
+                    )
+                )
+            state_indices: Optional[List] = [
+                payloads[st]() if st in payloads else None for st in state_types
+            ]
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
+            # int32 for ZMQ serialization -- from_zmq reads np.int32.
+            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
+                np.int32
+            )
+            if (
+                self.transfer_queue.enable_staging
+                and hasattr(decode_req.kv_receiver, "require_staging")
+                and decode_req.kv_receiver.require_staging
+            ):
+                # Register before send_metadata, which triggers the STAGING_REQ
+                # prefetch (dropped for an unregistered room); tiny race, correct order.
+                self.transfer_queue.staging_handler.register_decode_req(
+                    decode_req.req.bootstrap_room, decode_req
+                )
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
@@ -1186,14 +1230,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
                     decode_req.req.build_rebootstrap_payload(),
-                )
-            if (
-                self.transfer_queue.enable_staging
-                and hasattr(decode_req.kv_receiver, "require_staging")
-                and decode_req.kv_receiver.require_staging
-            ):
-                self.transfer_queue.staging_handler.register_decode_req(
-                    decode_req.req.bootstrap_room, decode_req
                 )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
@@ -1425,7 +1461,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
         fill_len = self._pre_alloc_fill_len(req)
-        req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
 
         if prefix_len > 0:
@@ -1463,6 +1498,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     f"req={req.rid}"
                 )
 
+        allocator = self.token_to_kv_pool_allocator
         if self.scheduler.enable_hisparse:
             # HiSparse is incompatible with decode-side L1 radix cache. Keep
             # this path on the upstream full-allocation semantics.
@@ -1471,34 +1507,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
-            device = self.token_to_kv_pool_allocator.device
-            prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
-            prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
-            seq_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
-            seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
-            last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
-            if self._uses_swa_tail_prealloc():
-                swa_tail_len = self._swa_tail_len(fill_len)
-                kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
-                    prefix_lens=prefix_lens,
-                    prefix_lens_cpu=prefix_lens_cpu,
-                    seq_lens=seq_lens,
-                    seq_lens_cpu=seq_lens_cpu,
-                    last_loc=last_loc,
-                    extend_num_tokens=fill_len,
-                    swa_tail_len=swa_tail_len,
-                )
-                req.swa_evicted_seqlen = fill_len - swa_tail_len
-            else:
-                kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
-                    prefix_lens=prefix_lens,
-                    prefix_lens_cpu=prefix_lens_cpu,
-                    seq_lens=seq_lens,
-                    seq_lens_cpu=seq_lens_cpu,
-                    last_loc=last_loc,
-                    extend_num_tokens=fill_len,
-                )
-
+            kv_loc = alloc_for_decode_prealloc_hisparse(
+                allocator,
+                req=req,
+                fill_len=fill_len,
+                uses_swa_tail=self._uses_swa_tail_prealloc(),
+                swa_tail_len=self._swa_tail_len(fill_len),
+            )
             # Allocate host indices for the RDMA transfer target.
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
                 coordinator.req_to_host_pool,
@@ -1507,42 +1522,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 0,
                 coordinator.host_token_len(fill_len),
             )
-        elif self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
         else:
-            device = self.token_to_kv_pool_allocator.device
-            last_loc = (
-                prefix_indices[-1:].to(dtype=torch.int64, device=device)
-                if prefix_len > 0
-                else torch.tensor([-1], dtype=torch.int64, device=device)
+            uses_swa_tail = self._uses_swa_tail_prealloc() and prefix_len == 0
+            swa_tail_len = self._swa_tail_len(fill_len)
+            kv_loc = alloc_for_decode_prealloc(
+                allocator,
+                req=req,
+                fill_len=fill_len,
+                delta_len=delta_len,
+                prefix_len=prefix_len,
+                total_prefix_len=total_prefix_len,
+                prefix_indices=prefix_indices,
+                uses_swa_tail=uses_swa_tail,
+                swa_tail_len=swa_tail_len,
+                req_to_token_pool=self.req_to_token_pool,
             )
-            if self._uses_swa_tail_prealloc() and prefix_len == 0:
-                # Tail-only SWA allocation: only valid when prefix_len == 0.
-                # When prefix_len > 0 (radix cache hit), we fall back to
-                # alloc_extend which allocates SWA at full page count; the
-                # SWA budget in that case may slightly under-estimate.
-                kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
-                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                    last_loc=last_loc,
-                    extend_num_tokens=fill_len,
-                    swa_tail_len=self._swa_tail_len(fill_len),
-                )
-                req.swa_evicted_seqlen = fill_len - self._swa_tail_len(fill_len)
-            else:
-                kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
-                    prefix_lens=torch.tensor(
-                        [total_prefix_len], dtype=torch.int64, device=device
-                    ),
-                    prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
-                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                    last_loc=last_loc,
-                    extend_num_tokens=delta_len,
-                )
-
         assert kv_loc is not None, (
             f"KV cache is full! Bug in memory estimation. "
             f"available={self.token_to_kv_pool_allocator.available_size()}, "
@@ -1581,6 +1575,124 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return kv_loc
 
 
+def alloc_for_decode_prealloc_hisparse(
+    allocator: BaseTokenToKVPoolAllocator,
+    *,
+    req: Req,
+    fill_len: int,
+    uses_swa_tail: bool,
+    swa_tail_len: int,
+) -> torch.Tensor:
+    if req.kv is None:
+        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
+    else:
+        req.kv.kv_allocated_len = fill_len
+    device = allocator.device
+    prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
+    prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
+    seq_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
+    seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
+    last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+    if uses_swa_tail:
+        kv_loc = allocator.alloc_extend_swa_tail(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=last_loc,
+            extend_num_tokens=fill_len,
+            swa_tail_len=swa_tail_len,
+        )
+        req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
+    else:
+        kv_loc = allocator.alloc_logical_only(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=last_loc,
+            extend_num_tokens=fill_len,
+        )
+    return kv_loc
+
+
+def alloc_for_decode_prealloc(
+    allocator: BaseTokenToKVPoolAllocator,
+    *,
+    req: Req,
+    fill_len: int,
+    delta_len: int,
+    prefix_len: int,
+    total_prefix_len: int,
+    prefix_indices: Optional[torch.Tensor],
+    uses_swa_tail: bool,
+    swa_tail_len: int,
+    req_to_token_pool: Optional[ReqToTokenPool] = None,
+) -> torch.Tensor:
+    if req.kv is None:
+        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
+    else:
+        req.kv.kv_allocated_len = fill_len
+    if allocator.page_size == 1:
+        kv_loc = allocator.alloc(delta_len)
+    else:
+        device = allocator.device
+        last_loc = (
+            prefix_indices[-1:].to(dtype=torch.int64, device=device)
+            if prefix_len > 0
+            else torch.tensor([-1], dtype=torch.int64, device=device)
+        )
+        extra_kwargs = {}
+        dsv4_unwrap_prealloc = None
+        if hasattr(allocator, "c4_attn_allocator"):
+            assert req_to_token_pool is not None
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                dsv4_prealloc_kwargs,
+                dsv4_unwrap_prealloc,
+            )
+
+            extra_kwargs = dsv4_prealloc_kwargs(
+                allocator,
+                req,
+                fill_len,
+                req_to_token_pool,
+                device=device,
+            )
+        if uses_swa_tail:
+            # Tail-only SWA allocation: only valid when prefix_len == 0.
+            # When prefix_len > 0 (radix cache hit), we fall back to
+            # alloc_extend which allocates SWA at full page count; the
+            # SWA budget in that case may slightly under-estimate.
+            kv_loc = allocator.alloc_extend_swa_tail(
+                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=last_loc,
+                extend_num_tokens=fill_len,
+                swa_tail_len=swa_tail_len,
+                **extra_kwargs,
+            )
+            req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
+        else:
+            kv_loc = allocator.alloc_extend(
+                prefix_lens=torch.tensor(
+                    [total_prefix_len], dtype=torch.int64, device=device
+                ),
+                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=last_loc,
+                extend_num_tokens=delta_len,
+                **extra_kwargs,
+            )
+        if dsv4_unwrap_prealloc is not None:
+            kv_loc = dsv4_unwrap_prealloc(
+                kv_loc, req_to_token_pool, req, total_prefix_len, fill_len
+            )
+    return kv_loc
+
+
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
     Store the requests that is polling kv
@@ -1611,13 +1723,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
-        if self.enable_staging:
-            for dr in decode_reqs:
-                if (
-                    hasattr(dr.kv_receiver, "require_staging")
-                    and dr.kv_receiver.require_staging
-                ):
-                    self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
@@ -1628,9 +1733,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_token_logprobs_idx,
             output_top_logprobs_val,
             output_top_logprobs_idx,
+            output_token_sampling_mask_len,
+            output_token_sampling_mask_idx,
+            output_token_sampling_logprobs,
             output_topk_p,
             output_topk_index,
             output_hidden_states,
+            output_dsa_topk_indices,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
 
@@ -1724,6 +1833,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
             decode_req.req.hidden_states_tensor = output_hidden_states
+            if (
+                output_dsa_topk_indices is not None
+                and torch.all(output_dsa_topk_indices < 0).item()
+            ):
+                output_dsa_topk_indices = None
+            decode_req.req.output_dsa_topk_indices = output_dsa_topk_indices
 
         if decode_req.req.return_logprob and not replayed_boundary:
             decode_req.req.logprob.output_token_logprobs_val.append(
@@ -1742,6 +1857,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     : decode_req.req.logprob.top_logprobs_num
                 ].tolist()
             )
+        if decode_req.req.return_sampling_mask:
+            assert (
+                output_token_sampling_mask_idx is not None
+            ), "sampling mask buffer disabled on decode side"
+            sampling_mask_len = int(output_token_sampling_mask_len[0].item())
+            if sampling_mask_len < 0:
+                decode_req.req.output_token_sampling_mask.append(None)
+                decode_req.req.output_token_sampling_logprobs.append(None)
+            else:
+                decode_req.req.output_token_sampling_mask.append(
+                    output_token_sampling_mask_idx[:sampling_mask_len].cpu().tolist()
+                )
+                decode_req.req.output_token_sampling_logprobs.append(
+                    float(output_token_sampling_logprobs[0].item())
+                )
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
@@ -1928,6 +2058,9 @@ class SchedulerDisaggregationDecodeMixin:
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
+            batch = self.ngram_embedding_manager.prepare_for_forward(
+                batch, chunked_req=self.chunked_req
+            )
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
@@ -1958,14 +2091,15 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
             self.process_decode_queue()
 
-            self._apply_war_barrier()
-
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
                 running_batch=self.running_batch
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
+            batch = self.ngram_embedding_manager.prepare_for_forward(
+                batch, chunked_req=self.chunked_req
+            )
             self.cur_batch_for_debug = batch
             # overlap + spec + grammar is unsupported (would desync DP ranks).
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
@@ -1978,6 +2112,7 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
+                self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None

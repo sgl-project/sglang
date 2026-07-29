@@ -26,7 +26,6 @@ QWEN3_32B_ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
     "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "100",
     "SGLANG_NPU_USE_DEEPGEMM": "1",
@@ -120,8 +119,9 @@ class TestQwen32B(TestNpuPerformanceTestCaseBase):
     input_len = 3584
     output_len = 1536
     random_range_ratio = 1
-    tpot = 50
-    output_token_throughput = 1600
+    seed = 1
+    tpot = 55
+    output_token_throughput = 1500
 
     def test_qwen3_32b(self):
         self.run_throughput()

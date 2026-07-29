@@ -12,6 +12,7 @@ def moe_align_block_size(
     num_tokens_post_pad,
     cumsum_buffer,
     pad_sorted_token_ids=False,
+    ignore_invalid_expert=False,
 ):
     torch.ops.sgl_kernel.moe_align_block_size.default(
         topk_ids,
@@ -22,6 +23,7 @@ def moe_align_block_size(
         num_tokens_post_pad,
         cumsum_buffer,
         pad_sorted_token_ids,
+        ignore_invalid_expert,
     )
 
 
@@ -104,7 +106,7 @@ def moe_sum(
 
 # moe_fused_gate / kimi_k2_moe_fused_gate (AOT gate kernels) retired — the gate/topk
 # path is consolidated onto the unified Triton router in
-# python/sglang/jit_kernel/moe_fused_gate.py (sglang issue #26771).
+# python/sglang/kernels/ops/moe/moe_fused_gate.py (sglang issue #26771).
 
 
 def fp8_blockwise_scaled_grouped_mm(
