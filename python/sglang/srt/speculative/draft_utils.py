@@ -239,7 +239,18 @@ class DraftBackendFactory:
         )
 
     def _create_cutedsl_mla_decode_backend(self):
-        return self._create_trtllm_mla_decode_backend(backend="cute-dsl")
+        if not self.draft_model_runner.use_mla_backend:
+            raise ValueError(
+                "cutedsl_mla backend requires MLA model (use_mla_backend=True)."
+            )
+
+        from sglang.srt.layers.attention.cutedsl_mla_backend import (
+            CuteDslMLAMultiStepDraftBackend,
+        )
+
+        return CuteDslMLAMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
 
     def _create_tokenspeed_mla_decode_backend(self):
         if not self.draft_model_runner.use_mla_backend:

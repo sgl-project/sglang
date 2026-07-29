@@ -103,10 +103,15 @@ class MoeRunnerBackend(Enum):
     CUTLASS = "cutlass"
     MARLIN = "marlin"
     HUMMING = "humming"
+    EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
+    HPC_OPS = "hpc_ops"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
+
+    def is_hpc_ops(self):
+        return self == MoeRunnerBackend.HPC_OPS
 
     def is_deep_gemm(self):
         return self == MoeRunnerBackend.DEEP_GEMM
@@ -147,7 +152,16 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.CUTLASS
 
     def is_marlin(self):
-        return self == MoeRunnerBackend.MARLIN
+        # experimental_sgl_marlin shares the marlin weight repack, quant-method
+        # selection, and base fused path; divergent sites (the LoRA MoE dispatch)
+        # check is_experimental_sgl_marlin() first.
+        return self in (
+            MoeRunnerBackend.MARLIN,
+            MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN,
+        )
+
+    def is_experimental_sgl_marlin(self):
+        return self == MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN
 
     def is_humming(self):
         return self == MoeRunnerBackend.HUMMING
@@ -195,12 +209,14 @@ class DispatcherOutputDtype(Enum):
     - FP8: dispatch hidden states in fp8
     - INT8: dispatch hidden states in int8
     - NVFP4: dispatch hidden states in nvfp4
+    - MXFP8: dispatch hidden states in mxfp8 (fp8_e4m3 + e8m0 block scale)
     """
 
     BF16 = "bf16"
     FP8 = "fp8"
     INT8 = "int8"
     NVFP4 = "nvfp4"
+    MXFP8 = "mxfp8"
 
 
 def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
@@ -479,6 +495,8 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
     """
     if should_skip_mlp_all_reduce():
+        return True
+    if get_server_args().dwdp_size > 1:
         return True
     if should_use_dp_reduce_scatterv():
         return True

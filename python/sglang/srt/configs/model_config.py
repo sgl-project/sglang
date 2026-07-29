@@ -211,6 +211,9 @@ def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
+REQUANTIZATION_METHODS = ["quark_mxfp4"]
+
+
 def get_num_indexer_layers(config) -> int:
     """Layer count for the global indexer-topk capturer's host buffer.
 
@@ -289,6 +292,7 @@ class ModelConfig:
             )
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
 
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
@@ -310,6 +314,7 @@ class ModelConfig:
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
+                "InklingForConditionalGeneration",
             ]
             if (
                 self.hf_config.architectures[0] in mm_disabled_models
@@ -395,7 +400,7 @@ class ModelConfig:
             self.hf_text_config, "attention_chunk_size", None
         )
         self.sliding_window_size = self._get_sliding_window_size()
-        self.is_generation = is_generation_model(
+        self.is_generation = not self.is_embedding_gemma and is_generation_model(
             self.hf_config.architectures, is_embedding
         )
         # The vision_config/audio_config attribute heuristic is only applied when
@@ -610,6 +615,11 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Step3p5MTP"
         if (
             is_draft_model
+            and self.hf_config.architectures[0] == "InklingForConditionalGeneration"
+        ):
+            self.hf_config.architectures[0] = "InklingForConditionalGenerationMTP"
+        if (
+            is_draft_model
             and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"
         ):
             self.hf_config = self.hf_text_config
@@ -637,6 +647,8 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] in [
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForCausalLM",
             "InternS2PreviewForConditionalGeneration",
         ]:
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
@@ -692,6 +704,8 @@ class ModelConfig:
             "MiMoV2MTP",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
+            "InklingForConditionalGeneration",
+            "InklingForConditionalGenerationMTP",
             "Gemma4UnifiedForConditionalGeneration",
         ]
 
@@ -1234,7 +1248,7 @@ class ModelConfig:
             log_str = f"quant={quant_method}"
 
             # Append interesting fields if they exist
-            for field in ["bits", "quant_algo", "fmt"]:
+            for field in ["bits", "quant_algo", "fmt", "requantization_method"]:
                 if field in quant_cfg:
                     log_str += f", {field}={quant_cfg[field]}"
 
@@ -1433,6 +1447,10 @@ class ModelConfig:
                         f"Using draft model's detected quantization: {quant_method}"
                     )
                     self.quantization = quant_method
+                elif self.quantization in REQUANTIZATION_METHODS:
+                    logger.info_once(
+                        f"Requantizing from quant_method='{quant_method}' to the requested online quantization='{self.quantization}'. Beware that requantization may incur a loss in accuracy, the requantized model should be re-validated/re-evaluated. More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."
+                    )
                 else:
                     raise ValueError(
                         "Quantization method specified in the model config "
@@ -1653,6 +1671,18 @@ def _get_and_verify_dtype(
     return torch_dtype
 
 
+def is_embedding_gemma(config) -> bool:
+    """Whether ``config`` is Google's bidirectional EmbeddingGemma checkpoint.
+
+    EmbeddingGemma uses the otherwise generative ``Gemma3TextModel``
+    architecture, so its model type alone is insufficient for dispatch.  The
+    upstream ``use_bidirectional_attention`` flag is the defining distinction.
+    """
+    return getattr(config, "model_type", None) == "gemma3_text" and getattr(
+        config, "use_bidirectional_attention", False
+    )
+
+
 def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
     # We have two ways to determine whether a model is a generative model.
     # 1. Check the model architecture
@@ -1668,6 +1698,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "Qwen3ForRewardModel" in model_architectures
         or "Qwen2ForSequenceClassification" in model_architectures
         or "Qwen3ForSequenceClassification" in model_architectures
+        or "Qwen3Model" in model_architectures
         or "CLIPModel" in model_architectures
         or "BertModel" in model_architectures
         or "Contriever" in model_architectures
@@ -1675,6 +1706,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "XLMRobertaModel" in model_architectures
         or "XLMRobertaForSequenceClassification" in model_architectures
         or "Gemma2ForSequenceClassification" in model_architectures
+        or "Lfm2BidirectionalModel" in model_architectures
     ):
         return False
     else:
@@ -1913,6 +1945,8 @@ def is_hybrid_swa_model(
         "Gemma4UnifiedForConditionalGeneration",
         "LagunaForCausalLM",
         "MellumForCausalLM",
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationMTP",
         "UnlimitedOCRForCausalLM",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
@@ -1993,6 +2027,37 @@ def get_hybrid_layer_ids(
         ]
         full_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "full_attention"
+        ]
+    elif "InklingForConditionalGenerationMTP" in model_architectures:
+        # One block per MTP depth; a banded head marks its sliding-window depths
+        # in mtp_local_layer_ids. The per-depth pool routing in the KV-cache
+        # mixin is authoritative; this keeps model_config's swa/full lists
+        # self-consistent for other consumers.
+        mtp_local_layer_ids = hf_text_config.mtp_local_layer_ids
+        if mtp_local_layer_ids:
+            num_depths = hf_text_config.num_nextn_predict_layers
+            local_set = set(mtp_local_layer_ids)
+            swa_attention_layer_ids = sorted(local_set)
+            full_attention_layer_ids = [
+                i for i in range(num_depths) if i not in local_set
+            ]
+        else:
+            swa_attention_layer_ids = []
+            full_attention_layer_ids = [0]
+    elif "InklingForConditionalGeneration" in model_architectures:
+        local_layer_ids = hf_text_config.local_layer_ids
+        local_layer_id_set = set(local_layer_ids)
+        assert len(local_layer_id_set) == len(
+            local_layer_ids
+        ), f"Inkling local_layer_ids must be unique: {local_layer_ids}"
+        assert all(
+            0 <= layer_id < num_hidden_layers for layer_id in local_layer_id_set
+        ), f"Inkling local_layer_ids must be in [0, {num_hidden_layers}): {local_layer_ids}"
+        swa_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if i in local_layer_id_set
+        ]
+        full_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if i not in local_layer_id_set
         ]
     elif "UnlimitedOCRForCausalLM" in model_architectures:
         swa_attention_layer_ids = list(range(num_hidden_layers))
