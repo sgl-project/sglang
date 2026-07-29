@@ -40,25 +40,27 @@ class RolloutDenoisingMixin:
 
     def _maybe_prepare_rollout(self, batch: Req):
         """Prepare denoising loop for rollout."""
-        if not isinstance(self.scheduler, SchedulerRLMixin):
+        scheduler = batch.scheduler
+        if not isinstance(scheduler, SchedulerRLMixin):
             if batch.rollout:
                 raise ValueError(
-                    f"Scheduler {type(self.scheduler)} does not support rollout"
+                    f"Scheduler {type(scheduler)} does not support rollout"
                 )
             return
 
-        self.scheduler.release_rollout_resources(batch)
+        scheduler.release_rollout_resources(batch)
         if batch.rollout:
-            self.scheduler.prepare_rollout(
+            scheduler.prepare_rollout(
                 batch=batch,
                 pipeline_config=self.server_args.pipeline_config,
             )
 
     def _maybe_collect_rollout_log_probs(self, batch: Req):
-        if not isinstance(self.scheduler, SchedulerRLMixin):
+        scheduler = batch.scheduler
+        if not isinstance(scheduler, SchedulerRLMixin):
             if batch.rollout:
                 raise ValueError(
-                    f"Scheduler {type(self.scheduler)} does not support rollout"
+                    f"Scheduler {type(scheduler)} does not support rollout"
                 )
             return
 
@@ -66,13 +68,13 @@ class RolloutDenoisingMixin:
             if batch.rollout_trajectory_data is None:
                 batch.rollout_trajectory_data = RolloutTrajectoryData()
             batch.rollout_trajectory_data.rollout_log_probs = (
-                self.scheduler.collect_rollout_log_probs(batch)
+                scheduler.collect_rollout_log_probs(batch)
             )
             if batch.rollout_debug_mode:
                 batch.rollout_trajectory_data.rollout_debug_tensors = (
-                    self.scheduler.collect_rollout_debug_tensors(batch)
+                    scheduler.collect_rollout_debug_tensors(batch)
                 )
-            self.scheduler.release_rollout_resources(batch)
+            scheduler.release_rollout_resources(batch)
 
     def _postprocess_rollout_outputs(
         self,
