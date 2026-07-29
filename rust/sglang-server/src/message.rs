@@ -20,8 +20,8 @@ pub use egress::{
     EgressSink, SinkError, for_each_chunk,
 };
 pub use finish_reason::Matched;
-pub(crate) use io_struct::{AbortReq, ControlRequest};
-pub use request::{GenerateRequest, RequestKind};
+pub(crate) use io_struct::{AbortReq, ControlRequest, GetInternalStateReq};
+pub use request::{GenerateBody, GenerateRequest, RequestKind};
 pub(crate) use sampling::{SamplingParams, SamplingParamsInput};
 pub(crate) use types::{OneOrMany, OneOrManyItem, TokenIds};
 
