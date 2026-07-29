@@ -41,7 +41,7 @@ import torch
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -342,8 +342,12 @@ class HiSparseV2Coordinator:
                 self._host_kv_cache = host_pool.get_pool(PoolName.KV)
             else:
                 self._host_kv_cache = host_pool
-            tree_cache._hisparse_v2_on_evict = self._on_node_evicted
-            tree_cache._hisparse_v2_node_active = self._node_backs_active_request
+            # Eviction lives in UnifiedTreeCore (main's TreeCore split reads
+            # these hooks there); fall back to the cache for legacy trees that
+            # keep eviction inline.
+            hook_target = getattr(tree_cache, "tree_core", tree_cache)
+            hook_target._hisparse_v2_on_evict = self._on_node_evicted
+            hook_target._hisparse_v2_node_active = self._node_backs_active_request
             self._host_capacity_tokens = int(getattr(cc.mem_pool_host, "size", 0))
 
             # Publish host base pointers + row stride for the swap-in kernel.
@@ -622,7 +626,7 @@ class HiSparseV2Coordinator:
         # Release the host locks taken at eviction time on this request's
         # behalf (see _on_node_evicted).
         for node in self._req_host_nodes.pop(req_pool_idx, ()):
-            self.tree_cache.dec_host_lock_ref(node)
+            self.tree_cache.dec_host_lock_ref(node.id)
         # Free temp slots (whole allocation: buffer size is page-aligned).
         # clone() is required: allocator.free() may defer the free into a
         # free-group that holds a reference, and we overwrite the buffer
@@ -721,7 +725,7 @@ class HiSparseV2Coordinator:
         # churn nodes are never pinned for the lifetime of long decodes.
         locked = None
         if sorted_host is not None:
-            self.tree_cache.inc_host_lock_ref(node)
+            self.tree_cache.inc_host_lock_ref(node.id)
             locked = node
         self._eviction_queue.append(_EvictionEvent(sorted_dev, sorted_host, locked))
 
@@ -784,11 +788,11 @@ class HiSparseV2Coordinator:
             for (ei, req_pool_idx), hit in zip(match_flags, hits):
                 if hit and req_pool_idx in self._active_reqs:
                     node = self._eviction_queue[ei].node
-                    self.tree_cache.inc_host_lock_ref(node)
+                    self.tree_cache.inc_host_lock_ref(node.id)
                     self._req_host_nodes.setdefault(req_pool_idx, []).append(node)
         for ev in self._eviction_queue:
             if ev.node is not None:
-                self.tree_cache.dec_host_lock_ref(ev.node)
+                self.tree_cache.dec_host_lock_ref(ev.node.id)
         self._eviction_queue.clear()
 
     # ------------------------------------------------------------------
