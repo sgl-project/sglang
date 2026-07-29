@@ -17,8 +17,9 @@ mod types;
 
 pub use egress::{
     ChunkEvent, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, EgressItem, EgressSink,
-    for_each_chunk,
+    SinkError, for_each_chunk,
 };
+pub use finish_reason::Matched;
 pub(crate) use io_struct::{AbortReq, ControlRequest};
 pub use request::{GenerateRequest, RequestKind};
 pub(crate) use sampling::{SamplingParams, SamplingParamsInput};
