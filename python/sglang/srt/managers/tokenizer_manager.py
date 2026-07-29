@@ -149,6 +149,23 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS = 15
+_RUST_PD_SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS = 620
+
+
+def scheduler_shutdown_timeout_seconds(server_args: ServerArgs) -> int:
+    """Return the host watchdog budget without changing non-Rust-PD behavior."""
+    mode = getattr(server_args, "disaggregation_mode", DisaggregationMode.NULL.value)
+    if isinstance(mode, DisaggregationMode):
+        mode = mode.value
+    if (
+        envs.SGLANG_RUST_SERVER.get()
+        and mode in (DisaggregationMode.PREFILL.value, DisaggregationMode.DECODE.value)
+        and getattr(server_args, "disaggregation_transfer_backend", None) == "mooncake"
+    ):
+        return _RUST_PD_SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS
+    return _DEFAULT_SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS
+
 
 @lru_cache(maxsize=1)
 def _ragged_verify_cap_accept() -> bool:
@@ -2874,7 +2891,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Ask schedulers to release resources in userspace and exit (see
         # ShutdownReq), then wait for them before hard-killing the rest.
         self._dispatch_to_scheduler(ShutdownReq())
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + scheduler_shutdown_timeout_seconds(
+            self.server_args
+        )
         while time.monotonic() < deadline and collect_scheduler_processes():
             time.sleep(0.1)
         kill_process_tree(os.getpid(), include_parent=True)

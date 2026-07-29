@@ -120,7 +120,7 @@ pub trait NativeStagePort: Send {
     fn free_safe(&mut self, batch: NativeBatchToken) -> Result<(), BufferError>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataPlaneEffect {
     DataReady {
         identity: DataPlaneIdentity,
@@ -135,6 +135,7 @@ pub enum DataPlaneEffect {
     Quarantined {
         identity: DataPlaneIdentity,
         batch: NativeBatchToken,
+        expected_lengths: Vec<u64>,
         reason: PdReason,
     },
 }
@@ -329,6 +330,7 @@ impl SourceExecutor {
                     return Ok(Some(DataPlaneEffect::Quarantined {
                         identity: command.identity,
                         batch,
+                        expected_lengths: command.expected_lengths().to_vec(),
                         reason: PdReason::TransferTimeout,
                     }));
                 }

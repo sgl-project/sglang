@@ -1,14 +1,15 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
+use std::time::Duration;
 
 use sglang_server::mooncake::{BatchSnapshot, OperationProgress, OperationState};
 use sglang_server::pd::buffer::{
     AUX_BYTES, AuxRecord, AuxRecordInput, BufferError, CapacityLedger, CompletionRecordInput,
-    CompletionWrites, DataPlaneEffect, DataPlaneIdentity, DataPlaneWorker, DestinationExecutor,
-    DestinationRecordPort, DestinationVisibilityFence, DestinationWorkRequest, GpuDirectFlushPort,
-    NativeBatchToken, NativePhase, NativeSafety, NativeStageCommand, NativeStagePort,
-    QuarantineManager, QuarantineUpdate, ReservationRequest, SourceComputeFence,
+    CompletionWrites, DataPlaneEffect, DataPlaneIdentity, DataPlaneWorker, DataPlaneWorkerState,
+    DestinationExecutor, DestinationRecordPort, DestinationVisibilityFence, DestinationWorkRequest,
+    GpuDirectFlushPort, NativeBatchToken, NativePhase, NativeSafety, NativeStageCommand,
+    NativeStagePort, QuarantineManager, QuarantineUpdate, ReservationRequest, SourceComputeFence,
     SourceExecutionRequest, SourceExecutor, SourceWorkRequest, TableUseTracker, TransferPlan,
     TransferPlanInput, TransitionResult, apply_decode_ack, apply_decode_data_effect,
     apply_prefill_data_effect, apply_prepare_accepted,
@@ -49,6 +50,79 @@ struct CpuNativePort {
     in_flight: Option<NativeBatchToken>,
     events: Vec<NativeEvent>,
     clock: Arc<ManualClock>,
+}
+
+struct RecoverableNativePort {
+    recovered: Arc<AtomicBool>,
+    clock: Arc<ManualClock>,
+    batch: Option<NativeBatchToken>,
+    lengths: Vec<u64>,
+}
+
+impl NativeStagePort for RecoverableNativePort {
+    fn submit(&mut self, command: &NativeStageCommand) -> Result<NativeBatchToken, BufferError> {
+        let batch = NativeBatchToken::new(1)?;
+        self.batch = Some(batch);
+        self.lengths = command.expected_lengths().to_vec();
+        Ok(batch)
+    }
+
+    fn poll(&mut self, batch: NativeBatchToken) -> Result<BatchSnapshot, BufferError> {
+        if self.batch != Some(batch) {
+            return Err(BufferError::StaleHandle);
+        }
+        if self.recovered.load(Ordering::SeqCst) {
+            return Ok(BatchSnapshot {
+                operations: self
+                    .lengths
+                    .iter()
+                    .map(|length| OperationProgress {
+                        state: OperationState::Completed,
+                        transferred_bytes: *length,
+                    })
+                    .collect(),
+                logical_aborted: false,
+                safe_terminal: true,
+            });
+        }
+        self.clock.advance_monotonic(10);
+        Ok(BatchSnapshot {
+            operations: self
+                .lengths
+                .iter()
+                .map(|_| OperationProgress {
+                    state: OperationState::Pending,
+                    transferred_bytes: 0,
+                })
+                .collect(),
+            logical_aborted: false,
+            safe_terminal: false,
+        })
+    }
+
+    fn free_safe(&mut self, batch: NativeBatchToken) -> Result<(), BufferError> {
+        if self.batch != Some(batch) || !self.recovered.load(Ordering::SeqCst) {
+            return Err(BufferError::NativeTransfer);
+        }
+        self.batch = None;
+        Ok(())
+    }
+}
+
+struct PanicNativePort;
+
+impl NativeStagePort for PanicNativePort {
+    fn submit(&mut self, _command: &NativeStageCommand) -> Result<NativeBatchToken, BufferError> {
+        panic!("injected native worker panic");
+    }
+
+    fn poll(&mut self, _batch: NativeBatchToken) -> Result<BatchSnapshot, BufferError> {
+        unreachable!("panic port never submits")
+    }
+
+    fn free_safe(&mut self, _batch: NativeBatchToken) -> Result<(), BufferError> {
+        unreachable!("panic port never frees")
+    }
 }
 
 impl CpuNativePort {
@@ -728,6 +802,128 @@ fn unsafe_timeout_stays_quarantined_and_emits_one_hard_deadline_fatal() {
     );
     port.free_safe(batch).expect("free safe terminal batch");
     assert_eq!(fixture.ledger.snapshot().active_rooms, 0);
+}
+
+#[test]
+fn data_plane_worker_observes_late_terminal_then_joins_idempotently() {
+    let fixture = fixture();
+    let clock = Arc::new(ManualClock::new(1_000));
+    let recovered = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(SourceExecutor::new(
+        Arc::clone(&fixture.ledger),
+        Arc::clone(&fixture.quarantine),
+        Arc::clone(&clock),
+    ));
+    let mut worker = DataPlaneWorker::start(
+        4,
+        executor,
+        RecoverableNativePort {
+            recovered: Arc::clone(&recovered),
+            clock: Arc::clone(&clock),
+            batch: None,
+            lengths: Vec::new(),
+        },
+    )
+    .expect("start lifecycle worker");
+    let effect = worker
+        .try_execute_source(SourceWorkRequest {
+            plan: fixture.plan.clone(),
+            handle: fixture.handle,
+            source_fence: ComputeFence {
+                ready: true,
+                calls: 0,
+            },
+            aux: fixture.aux,
+            completion: fixture.completion.clone(),
+            deadline_monotonic_ms: 1_020,
+        })
+        .expect("submit source work")
+        .wait()
+        .expect("quarantine effect");
+    let DataPlaneEffect::Quarantined {
+        batch,
+        expected_lengths,
+        ..
+    } = effect
+    else {
+        panic!("expected quarantined native batch");
+    };
+
+    assert_eq!(worker.lifecycle(), DataPlaneWorkerState::Running);
+    assert_eq!(
+        worker
+            .observe_native(batch, &expected_lengths)
+            .expect("pending observation"),
+        NativeSafety::Pending
+    );
+    recovered.store(true, Ordering::SeqCst);
+    assert_eq!(
+        worker
+            .observe_native(batch, &expected_lengths)
+            .expect("late safe observation"),
+        NativeSafety::SafeSuccess
+    );
+    assert_eq!(
+        fixture
+            .quarantine
+            .observe(
+                fixture.handle,
+                batch,
+                NativeSafety::SafeSuccess,
+                clock.now_monotonic_ms(),
+            )
+            .expect("release quarantine"),
+        QuarantineUpdate::Released
+    );
+    assert_eq!(
+        worker
+            .shutdown(Duration::from_secs(1))
+            .expect("join data worker"),
+        DataPlaneWorkerState::Joined
+    );
+    assert_eq!(
+        worker
+            .shutdown(Duration::from_secs(1))
+            .expect("idempotent worker shutdown"),
+        DataPlaneWorkerState::Joined
+    );
+}
+
+#[test]
+fn data_plane_worker_panic_is_visible_to_the_lifecycle_owner() {
+    let fixture = fixture();
+    let executor = Arc::new(SourceExecutor::new(
+        Arc::clone(&fixture.ledger),
+        Arc::clone(&fixture.quarantine),
+        Arc::new(ManualClock::new(1_000)),
+    ));
+    let mut worker =
+        DataPlaneWorker::start(1, executor, PanicNativePort).expect("start panic worker");
+    let ticket = worker
+        .try_execute_source(SourceWorkRequest {
+            plan: fixture.plan,
+            handle: fixture.handle,
+            source_fence: ComputeFence {
+                ready: true,
+                calls: 0,
+            },
+            aux: fixture.aux,
+            completion: fixture.completion,
+            deadline_monotonic_ms: 2_000,
+        })
+        .expect("enqueue panic work");
+    assert_eq!(ticket.wait(), Err(BufferError::NativeTransfer));
+    for _ in 0..100 {
+        if worker.lifecycle() == DataPlaneWorkerState::Failed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(worker.lifecycle(), DataPlaneWorkerState::Failed);
+    assert_eq!(
+        worker.shutdown(Duration::from_secs(1)),
+        Err(BufferError::NativeTransfer)
+    );
 }
 
 #[path = "pd_executor/destination_worker.rs"]

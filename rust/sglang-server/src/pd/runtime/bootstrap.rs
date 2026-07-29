@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,16 +7,20 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::pd::buffer::AuthenticatedRemoteRegionTable;
-use crate::pd::config::{PdProfileV1, ProfileError};
+use crate::pd::config::{MAX_CONTROL_PAYLOAD_BYTES, PdProfileV1, ProfileError};
 use crate::pd::protocol::{
-    ClientHello, ControlPayload, DecodedFrame, Direction, DirectionalSession, FixedBytes,
-    FrameCodec, FrameError, MessageKind, ProbeAck, ProbeReady, Psk, RegisterRegions,
-    RegistrationDecision, Role, ServerHello, SessionError, TranscriptConfirmation,
-    derive_session_keys, frame_hash, random_nonce, read_raw_frame, transcript_hash,
-    write_raw_frame,
+    ClientHello, ControlPayload, DecodedFrame, Direction, DirectionalSession, Drain, FixedBytes,
+    FrameCodec, FrameError, HEADER_BYTES, MessageKind, PingPong, ProbeAck, ProbeReady, Psk,
+    RegisterRegions, RegistrationDecision, Role, ServerHello, SessionError, TAG_BYTES,
+    TranscriptConfirmation, derive_session_keys, frame_hash, random_nonce, read_raw_frame,
+    transcript_hash, write_raw_frame,
 };
 use crate::pd::room::{Clock, PdReason, ProcessEpoch, RegistrationEpoch};
-use crate::pd::runtime::state::PairReadiness;
+use crate::pd::runtime::state::{
+    HeartbeatAction, HeartbeatSnapshot, HeartbeatTracker, PairReadiness,
+};
+
+const MAX_PENDING_CONTROL_FRAMES: usize = 64;
 
 #[derive(Clone)]
 pub struct RuntimeIdentity {
@@ -147,15 +152,116 @@ pub struct PairConnection {
     profile: Arc<PdProfileV1>,
     clock: Arc<dyn Clock>,
     peer_regions: Option<AuthenticatedRemoteRegionTable>,
+    heartbeat: HeartbeatTracker,
+    receive_buffer: Vec<u8>,
+    pending_frames: VecDeque<DecodedFrame>,
+    peer_eof: bool,
+    peer_draining_generation: Option<u64>,
+    goaway_ack_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionLifecycle {
+    Idle,
+    PingSent(u64),
+    PongReceived(u64),
+    PeerDraining(u64),
+    GoAwayAcked(u64),
+    PeerLost,
 }
 
 impl PairConnection {
+    fn new(
+        stream: TcpStream,
+        session: DirectionalSession,
+        readiness: PairReadiness,
+        profile: Arc<PdProfileV1>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, RuntimeError> {
+        let heartbeat = HeartbeatTracker::new(&profile, Arc::clone(&clock))
+            .map_err(|_| RuntimeError::Configuration)?;
+        Ok(Self {
+            stream,
+            session,
+            readiness,
+            profile,
+            clock,
+            peer_regions: None,
+            heartbeat,
+            receive_buffer: Vec::new(),
+            pending_frames: VecDeque::new(),
+            peer_eof: false,
+            peer_draining_generation: None,
+            goaway_ack_generation: None,
+        })
+    }
+
     pub const fn readiness(&self) -> &PairReadiness {
         &self.readiness
     }
 
     pub const fn peer_regions(&self) -> Option<&AuthenticatedRemoteRegionTable> {
         self.peer_regions.as_ref()
+    }
+
+    pub const fn heartbeat_snapshot(&self) -> HeartbeatSnapshot {
+        self.heartbeat.snapshot()
+    }
+
+    pub const fn peer_draining_generation(&self) -> Option<u64> {
+        self.peer_draining_generation
+    }
+
+    pub fn goaway_acked(&self, generation: u64) -> bool {
+        self.goaway_ack_generation == Some(generation)
+    }
+
+    pub async fn send_goaway(&mut self, generation: u64) -> Result<(), RuntimeError> {
+        if generation == 0 {
+            return Err(RuntimeError::Configuration);
+        }
+        self.send(&ControlPayload::GoAway(Drain {
+            drain_generation: generation,
+        }))
+        .await
+    }
+
+    pub async fn lifecycle_tick(&mut self) -> Result<ConnectionLifecycle, RuntimeError> {
+        self.read_available()?;
+        let mut observed = ConnectionLifecycle::Idle;
+        while let Some(decoded) = self.decode_buffered_frame()? {
+            match self.handle_lifecycle(decoded).await? {
+                Incoming::Application(frame) => {
+                    if self.pending_frames.len() >= MAX_PENDING_CONTROL_FRAMES {
+                        return Err(RuntimeError::UnexpectedMessage);
+                    }
+                    self.pending_frames.push_back(*frame);
+                }
+                Incoming::Lifecycle(event) => {
+                    observed = event;
+                    if matches!(event, ConnectionLifecycle::PeerDraining(_)) {
+                        return Ok(event);
+                    }
+                }
+            }
+        }
+        if self.peer_eof {
+            return if observed == ConnectionLifecycle::Idle {
+                Ok(ConnectionLifecycle::PeerLost)
+            } else {
+                Ok(observed)
+            };
+        }
+
+        match self.heartbeat.poll() {
+            HeartbeatAction::Wait => Ok(observed),
+            HeartbeatAction::SendPing(ping_id) => {
+                self.send(&ControlPayload::Ping(PingPong { ping_id }))
+                    .await?;
+                Ok(ConnectionLifecycle::PingSent(ping_id))
+            }
+            HeartbeatAction::PeerLost => Ok(ConnectionLifecycle::PeerLost),
+        }
     }
 
     pub async fn send(&mut self, payload: &ControlPayload) -> Result<(), RuntimeError> {
@@ -187,14 +293,118 @@ impl PairConnection {
         deadline_kind: MessageKind,
     ) -> Result<DecodedFrame, RuntimeError> {
         let wait = deadline_for(deadline_kind, &self.profile);
-        let frame = timeout(
-            Duration::from_millis(wait),
-            read_raw_frame(&mut self.stream),
-        )
+        timeout(Duration::from_millis(wait), async {
+            loop {
+                let decoded = if let Some(frame) = self.pending_frames.pop_front() {
+                    frame
+                } else {
+                    self.receive_decoded().await?
+                };
+                match self.handle_lifecycle(decoded).await? {
+                    Incoming::Application(frame) => return Ok(*frame),
+                    Incoming::Lifecycle(ConnectionLifecycle::PeerDraining(_)) => {
+                        return Err(RuntimeError::PeerDraining);
+                    }
+                    Incoming::Lifecycle(_) => {}
+                }
+            }
+        })
         .await
-        .map_err(|_| RuntimeError::Timeout)??;
-        Ok(self.session.decode(&frame, self.clock.now_unix_ms())?)
+        .map_err(|_| RuntimeError::Timeout)?
     }
+
+    async fn receive_decoded(&mut self) -> Result<DecodedFrame, RuntimeError> {
+        loop {
+            if let Some(decoded) = self.decode_buffered_frame()? {
+                return Ok(decoded);
+            }
+            if self.peer_eof {
+                return Err(RuntimeError::Session(SessionError::Read));
+            }
+            self.stream
+                .readable()
+                .await
+                .map_err(|_| RuntimeError::Session(SessionError::Read))?;
+            self.read_available()?;
+        }
+    }
+
+    fn read_available(&mut self) -> Result<(), RuntimeError> {
+        loop {
+            let mut buffer = [0_u8; 8 * 1024];
+            match self.stream.try_read(&mut buffer) {
+                Ok(0) => {
+                    self.peer_eof = true;
+                    return Ok(());
+                }
+                Ok(length) => self.receive_buffer.extend_from_slice(&buffer[..length]),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
+                Err(_) => return Err(RuntimeError::Session(SessionError::Read)),
+            }
+        }
+    }
+
+    fn decode_buffered_frame(&mut self) -> Result<Option<DecodedFrame>, RuntimeError> {
+        if self.receive_buffer.len() < HEADER_BYTES {
+            return Ok(None);
+        }
+        let payload_length = u32::from_be_bytes(
+            self.receive_buffer[12..16]
+                .try_into()
+                .map_err(|_| RuntimeError::Session(SessionError::Header))?,
+        ) as usize;
+        if payload_length > MAX_CONTROL_PAYLOAD_BYTES {
+            return Err(RuntimeError::Session(SessionError::PayloadTooLarge));
+        }
+        let frame_length = HEADER_BYTES
+            .checked_add(payload_length)
+            .and_then(|length| length.checked_add(TAG_BYTES))
+            .ok_or(RuntimeError::Session(SessionError::PayloadTooLarge))?;
+        if self.receive_buffer.len() < frame_length {
+            return Ok(None);
+        }
+        let frame = self
+            .receive_buffer
+            .drain(..frame_length)
+            .collect::<Vec<_>>();
+        Ok(Some(self.session.decode(&frame, self.clock.now_unix_ms())?))
+    }
+
+    async fn handle_lifecycle(&mut self, decoded: DecodedFrame) -> Result<Incoming, RuntimeError> {
+        match &decoded.payload {
+            ControlPayload::Ping(ping) => {
+                self.send(&ControlPayload::Pong(ping.clone())).await?;
+                Ok(Incoming::Lifecycle(ConnectionLifecycle::Idle))
+            }
+            ControlPayload::Pong(pong) => {
+                self.heartbeat
+                    .on_pong(pong.ping_id)
+                    .map_err(|_| RuntimeError::UnexpectedMessage)?;
+                Ok(Incoming::Lifecycle(ConnectionLifecycle::PongReceived(
+                    pong.ping_id,
+                )))
+            }
+            ControlPayload::GoAway(drain) => {
+                self.peer_draining_generation = Some(drain.drain_generation);
+                self.send(&ControlPayload::GoAwayAck(drain.clone())).await?;
+                Ok(Incoming::Lifecycle(ConnectionLifecycle::PeerDraining(
+                    drain.drain_generation,
+                )))
+            }
+            ControlPayload::GoAwayAck(drain) => {
+                self.goaway_ack_generation = Some(drain.drain_generation);
+                Ok(Incoming::Lifecycle(ConnectionLifecycle::GoAwayAcked(
+                    drain.drain_generation,
+                )))
+            }
+            _ => Ok(Incoming::Application(Box::new(decoded))),
+        }
+    }
+}
+
+enum Incoming {
+    Application(Box<DecodedFrame>),
+    Lifecycle(ConnectionLifecycle),
 }
 
 pub async fn bootstrap_decode(
@@ -224,10 +434,10 @@ pub async fn bootstrap_decode(
         return Err(RuntimeError::Compatibility);
     }
     let destination_epoch = registration.registration_epoch;
-    let mut connection = PairConnection {
+    let mut connection = PairConnection::new(
         stream,
         session,
-        readiness: PairReadiness {
+        PairReadiness {
             role: identity.role,
             ready: false,
             local_process_epoch: identity.process_epoch_bytes(),
@@ -237,10 +447,9 @@ pub async fn bootstrap_decode(
             profile_digest: identity.profile_digest,
             probe_generation: 0,
         },
-        profile: Arc::clone(&identity.profile),
+        Arc::clone(&identity.profile),
         clock,
-        peer_regions: None,
-    };
+    )?;
     connection
         .send(&ControlPayload::RegisterRegions(
             registration.into_payload(),
@@ -304,10 +513,10 @@ pub async fn bootstrap_prefill(
     }
     let (stream, session, peer_process_epoch) =
         server_handshake(stream, &identity, psk, Arc::clone(&clock)).await?;
-    let mut connection = PairConnection {
+    let mut connection = PairConnection::new(
         stream,
         session,
-        readiness: PairReadiness {
+        PairReadiness {
             role: identity.role,
             ready: false,
             local_process_epoch: identity.process_epoch_bytes(),
@@ -317,10 +526,9 @@ pub async fn bootstrap_prefill(
             profile_digest: identity.profile_digest,
             probe_generation: 0,
         },
-        profile: Arc::clone(&identity.profile),
+        Arc::clone(&identity.profile),
         clock,
-        peer_regions: None,
-    };
+    )?;
     let registration = connection
         .receive_expected(MessageKind::RegisterRegions)
         .await?;
@@ -667,6 +875,8 @@ pub enum RuntimeError {
     PeerRejected,
     #[error("PD peer sent a message outside the required state")]
     UnexpectedMessage,
+    #[error("PD peer entered draining state")]
+    PeerDraining,
     #[error("PD control operation exceeded its frozen deadline")]
     Timeout,
     #[error("PD bootstrap worker exited unexpectedly")]

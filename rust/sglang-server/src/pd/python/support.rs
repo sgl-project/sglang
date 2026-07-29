@@ -51,10 +51,11 @@ pub(super) fn validate_prepare(
         || prepare.chunk_count != 1
         || !prepare.is_last_chunk
     {
-        return Err(TransportError::LocalFatal(PdReason::ProtocolMismatch));
+        return Err(TransportError::Peer(PdReason::ProtocolMismatch));
     }
     let pages = destination_pages(prepare)?;
     validate_pages(&pages, prepare.valid_token_count)
+        .map_err(|_| TransportError::Peer(PdReason::ProtocolMismatch))
 }
 
 pub(super) fn destination_blocks(pages: &[u32]) -> Vec<DestinationBlock> {
@@ -83,7 +84,7 @@ pub(super) fn destination_pages(prepare: &PrepareRoom) -> Result<Vec<u32>, Trans
         .map(|block| block.destination_page)
         .collect::<Vec<_>>();
     if prepare.destination_blocks != destination_blocks(&pages) {
-        return Err(TransportError::LocalFatal(PdReason::ProtocolMismatch));
+        return Err(TransportError::Peer(PdReason::ProtocolMismatch));
     }
     Ok(pages)
 }
@@ -96,7 +97,7 @@ pub(super) fn source_pages(accepted: &PrepareAccepted) -> Result<Vec<u32>, Trans
         .map(|block| block.source_page)
         .collect::<Vec<_>>();
     if pages.is_empty() {
-        return Err(TransportError::InvalidBatch);
+        return Err(TransportError::Peer(PdReason::ProtocolMismatch));
     }
     Ok(pages)
 }
@@ -105,7 +106,7 @@ pub(super) fn registration_epoch(
     bytes: FixedBytes<16>,
 ) -> Result<RegistrationEpoch, TransportError> {
     RegistrationEpoch::from_bytes(*bytes.as_array())
-        .map_err(|_| TransportError::LocalFatal(PdReason::ProtocolMismatch))
+        .map_err(|_| TransportError::Peer(PdReason::ProtocolMismatch))
 }
 
 pub(super) fn planned_room(context: TransportRoomContext, plan: &TransferPlan) -> PlannedRoom {
@@ -191,30 +192,30 @@ pub(super) fn mock_receive_records(
 ) -> Result<([u8; AUX_BYTES], [u8; COMPLETION_BYTES]), TransportError> {
     let (mut stream, _) = listener
         .accept()
-        .map_err(|_| TransportError::LocalFatal(PdReason::TransferFailed))?;
+        .map_err(|_| TransportError::Peer(PdReason::PeerUnavailable))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
-        .map_err(|_| TransportError::LocalFatal(PdReason::TransferFailed))?;
+        .map_err(|_| TransportError::Peer(PdReason::PeerUnavailable))?;
     let mut payload = vec![0_u8; 4 + AUX_BYTES + COMPLETION_BYTES];
     let mut tag = [0_u8; 32];
     stream
         .read_exact(&mut payload)
         .and_then(|()| stream.read_exact(&mut tag))
-        .map_err(|_| TransportError::LocalFatal(PdReason::TransferFailed))?;
+        .map_err(|_| TransportError::Peer(PdReason::PeerUnavailable))?;
     if &payload[..4] != b"SGMD" {
-        return Err(TransportError::LocalFatal(PdReason::ProtocolMismatch));
+        return Err(TransportError::Peer(PdReason::ProtocolMismatch));
     }
     let mut mac = Hmac::<Sha256>::new_from_slice(psk.as_bytes())
         .map_err(|_| TransportError::LocalFatal(PdReason::LocalFatal))?;
     mac.update(&payload);
     mac.verify_slice(&tag)
-        .map_err(|_| TransportError::LocalFatal(PdReason::ProtocolMismatch))?;
+        .map_err(|_| TransportError::Peer(PdReason::ProtocolMismatch))?;
     let aux = payload[4..4 + AUX_BYTES]
         .try_into()
-        .map_err(|_| TransportError::LocalFatal(PdReason::ProtocolMismatch))?;
+        .map_err(|_| TransportError::Peer(PdReason::ProtocolMismatch))?;
     let completion = payload[4 + AUX_BYTES..]
         .try_into()
-        .map_err(|_| TransportError::LocalFatal(PdReason::ProtocolMismatch))?;
+        .map_err(|_| TransportError::Peer(PdReason::ProtocolMismatch))?;
     Ok((aux, completion))
 }
 
@@ -225,25 +226,28 @@ pub(super) fn mock_data_tag(psk: &Psk, payload: &[u8]) -> Result<[u8; 32], Trans
     Ok(mac.finalize().into_bytes().into())
 }
 
-pub(super) fn buffer_transport_error(_error: crate::pd::buffer::BufferError) -> TransportError {
-    TransportError::LocalFatal(PdReason::ProtocolMismatch)
+pub(super) fn buffer_transport_error(error: crate::pd::buffer::BufferError) -> TransportError {
+    classified_transport_error(crate::pd::runtime::FailureClass::for_buffer(&error))
 }
 
 pub(super) fn runtime_transport_error(error: RuntimeError) -> TransportError {
-    let reason = match error {
-        RuntimeError::Configuration
-        | RuntimeError::Compatibility
-        | RuntimeError::PeerRejected
-        | RuntimeError::UnexpectedMessage
-        | RuntimeError::Profile(_)
-        | RuntimeError::Frame(_)
-        | RuntimeError::Session(_)
-        | RuntimeError::Crypto(_) => PdReason::ProtocolMismatch,
-        RuntimeError::Timeout => PdReason::PeerUnavailable,
-        RuntimeError::Worker => PdReason::LocalFatal,
-        RuntimeError::Bootstrap(reason) => reason,
-    };
-    TransportError::LocalFatal(reason)
+    classified_transport_error(crate::pd::runtime::FailureClass::for_runtime(&error))
+}
+
+fn classified_transport_error(class: crate::pd::runtime::FailureClass) -> TransportError {
+    use crate::pd::runtime::FailureScope;
+
+    match class.scope {
+        FailureScope::Request => match class.reason {
+            PdReason::CapacityExhausted => TransportError::CapacityExhausted,
+            PdReason::StaleEpoch => TransportError::StaleHandle,
+            PdReason::Unsupported => TransportError::WrongRole,
+            _ => TransportError::InvalidBatch,
+        },
+        FailureScope::Room => TransportError::Room(class.reason),
+        FailureScope::PeerSession => TransportError::Peer(class.reason),
+        FailureScope::LocalFatal => TransportError::LocalFatal(class.reason),
+    }
 }
 
 pub(super) fn parse_digest(value: &str) -> PyResult<FixedBytes<32>> {
@@ -368,10 +372,163 @@ pub(super) fn lifecycle_name(lifecycle: RuntimeLifecycle) -> &'static str {
     }
 }
 
+pub(super) fn fatal_source_name(source: crate::pd::runtime::FatalSource) -> &'static str {
+    match source {
+        crate::pd::runtime::FatalSource::StartupInvariant => "StartupInvariant",
+        crate::pd::runtime::FatalSource::WorkerExit => "WorkerExit",
+        crate::pd::runtime::FatalSource::CommandChannelClosed => "CommandChannelClosed",
+        crate::pd::runtime::FatalSource::EngineOwner => "EngineOwner",
+        crate::pd::runtime::FatalSource::RegistryInvariant => "RegistryInvariant",
+        crate::pd::runtime::FatalSource::QuarantineHardDeadline => "QuarantineHardDeadline",
+        crate::pd::runtime::FatalSource::ShutdownUnsafe => "ShutdownUnsafe",
+        crate::pd::runtime::FatalSource::ProtocolInvariant => "ProtocolInvariant",
+    }
+}
+
+pub(super) fn shutdown_phase_name(phase: crate::pd::runtime::ShutdownPhase) -> &'static str {
+    match phase {
+        crate::pd::runtime::ShutdownPhase::Idle => "Idle",
+        crate::pd::runtime::ShutdownPhase::ReadinessDown => "ReadinessDown",
+        crate::pd::runtime::ShutdownPhase::GoAway => "GoAway",
+        crate::pd::runtime::ShutdownPhase::StopAccepting => "StopAccepting",
+        crate::pd::runtime::ShutdownPhase::DrainingRooms => "DrainingRooms",
+        crate::pd::runtime::ShutdownPhase::AbortingRooms => "AbortingRooms",
+        crate::pd::runtime::ShutdownPhase::NativeSafety => "NativeSafety",
+        crate::pd::runtime::ShutdownPhase::SchedulerRelease => "SchedulerRelease",
+        crate::pd::runtime::ShutdownPhase::WorkerJoin => "WorkerJoin",
+        crate::pd::runtime::ShutdownPhase::EngineQuiesce => "EngineQuiesce",
+        crate::pd::runtime::ShutdownPhase::ConnectionClose => "ConnectionClose",
+        crate::pd::runtime::ShutdownPhase::RegionUnregister => "RegionUnregister",
+        crate::pd::runtime::ShutdownPhase::EngineDestroy => "EngineDestroy",
+        crate::pd::runtime::ShutdownPhase::Stopped => "Stopped",
+    }
+}
+
+pub(super) fn shutdown_outcome_name(
+    outcome: crate::pd::runtime::RuntimeShutdownOutcome,
+) -> &'static str {
+    match outcome {
+        crate::pd::runtime::RuntimeShutdownOutcome::SafeTerminal => "SafeTerminal",
+        crate::pd::runtime::RuntimeShutdownOutcome::FatalUnsafe => "FatalUnsafe",
+    }
+}
+
+pub(super) fn worker_lifecycle_name(
+    lifecycle: crate::pd::runtime::WorkerLifecycle,
+) -> &'static str {
+    match lifecycle {
+        crate::pd::runtime::WorkerLifecycle::Starting => "Starting",
+        crate::pd::runtime::WorkerLifecycle::Running => "Running",
+        crate::pd::runtime::WorkerLifecycle::Quiescing => "Quiescing",
+        crate::pd::runtime::WorkerLifecycle::Joined => "Joined",
+        crate::pd::runtime::WorkerLifecycle::Failed => "Failed",
+    }
+}
+
 pub(super) fn py_transport_error(error: TransportError) -> PyErr {
     let message = error.reason().code();
     match error {
         TransportError::InvalidBatch => PyErr::new::<pyo3::exceptions::PyValueError, _>(message),
         _ => PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::pd::runtime::{
+        FailureClass, FailureScope, FatalSource, RuntimeShutdownOutcome, ShutdownPhase,
+        WorkerLifecycle,
+    };
+
+    use super::*;
+
+    #[test]
+    fn frozen_lifecycle_names_cover_every_internal_state() {
+        for (source, expected) in [
+            (FatalSource::StartupInvariant, "StartupInvariant"),
+            (FatalSource::WorkerExit, "WorkerExit"),
+            (FatalSource::CommandChannelClosed, "CommandChannelClosed"),
+            (FatalSource::EngineOwner, "EngineOwner"),
+            (FatalSource::RegistryInvariant, "RegistryInvariant"),
+            (
+                FatalSource::QuarantineHardDeadline,
+                "QuarantineHardDeadline",
+            ),
+            (FatalSource::ShutdownUnsafe, "ShutdownUnsafe"),
+            (FatalSource::ProtocolInvariant, "ProtocolInvariant"),
+        ] {
+            assert_eq!(fatal_source_name(source), expected);
+        }
+        for (phase, expected) in [
+            (ShutdownPhase::Idle, "Idle"),
+            (ShutdownPhase::ReadinessDown, "ReadinessDown"),
+            (ShutdownPhase::GoAway, "GoAway"),
+            (ShutdownPhase::StopAccepting, "StopAccepting"),
+            (ShutdownPhase::DrainingRooms, "DrainingRooms"),
+            (ShutdownPhase::AbortingRooms, "AbortingRooms"),
+            (ShutdownPhase::NativeSafety, "NativeSafety"),
+            (ShutdownPhase::SchedulerRelease, "SchedulerRelease"),
+            (ShutdownPhase::WorkerJoin, "WorkerJoin"),
+            (ShutdownPhase::EngineQuiesce, "EngineQuiesce"),
+            (ShutdownPhase::ConnectionClose, "ConnectionClose"),
+            (ShutdownPhase::RegionUnregister, "RegionUnregister"),
+            (ShutdownPhase::EngineDestroy, "EngineDestroy"),
+            (ShutdownPhase::Stopped, "Stopped"),
+        ] {
+            assert_eq!(shutdown_phase_name(phase), expected);
+        }
+        assert_eq!(
+            shutdown_outcome_name(RuntimeShutdownOutcome::SafeTerminal),
+            "SafeTerminal"
+        );
+        assert_eq!(
+            shutdown_outcome_name(RuntimeShutdownOutcome::FatalUnsafe),
+            "FatalUnsafe"
+        );
+        for (lifecycle, expected) in [
+            (WorkerLifecycle::Starting, "Starting"),
+            (WorkerLifecycle::Running, "Running"),
+            (WorkerLifecycle::Quiescing, "Quiescing"),
+            (WorkerLifecycle::Joined, "Joined"),
+            (WorkerLifecycle::Failed, "Failed"),
+        ] {
+            assert_eq!(worker_lifecycle_name(lifecycle), expected);
+        }
+    }
+
+    #[test]
+    fn classified_transport_errors_preserve_all_four_failure_scopes() {
+        for (class, expected) in [
+            (
+                FailureClass::new(FailureScope::Request, PdReason::CapacityExhausted),
+                TransportError::CapacityExhausted,
+            ),
+            (
+                FailureClass::new(FailureScope::Request, PdReason::StaleEpoch),
+                TransportError::StaleHandle,
+            ),
+            (
+                FailureClass::new(FailureScope::Request, PdReason::Unsupported),
+                TransportError::WrongRole,
+            ),
+            (
+                FailureClass::new(FailureScope::Request, PdReason::RequestInvalid),
+                TransportError::InvalidBatch,
+            ),
+            (
+                FailureClass::new(FailureScope::Room, PdReason::TransferFailed),
+                TransportError::Room(PdReason::TransferFailed),
+            ),
+            (
+                FailureClass::new(FailureScope::PeerSession, PdReason::ProtocolMismatch),
+                TransportError::Peer(PdReason::ProtocolMismatch),
+            ),
+            (
+                FailureClass::new(FailureScope::LocalFatal, PdReason::LocalFatal),
+                TransportError::LocalFatal(PdReason::LocalFatal),
+            ),
+        ] {
+            assert_eq!(classified_transport_error(class), expected);
+        }
     }
 }

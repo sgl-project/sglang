@@ -25,7 +25,15 @@ pub(super) fn error_for_reason(reason: PdReason) -> TransportError {
         PdReason::StaleEpoch => TransportError::StaleHandle,
         PdReason::PeerUnavailable => TransportError::NotReady,
         PdReason::LocalFatal => TransportError::LocalFatal(reason),
-        _ => TransportError::InvalidTransition,
+        PdReason::RendezvousTimeout
+        | PdReason::TransferTimeout
+        | PdReason::TransferFailed
+        | PdReason::AckTimeout
+        | PdReason::Aborted => TransportError::Room(reason),
+        PdReason::Success
+        | PdReason::RequestInvalid
+        | PdReason::Unsupported
+        | PdReason::ProtocolMismatch => TransportError::InvalidTransition,
     }
 }
 

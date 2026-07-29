@@ -1546,6 +1546,18 @@ class Scheduler(
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
 
+    def shutdown_rust_pd_before_host_resources(self) -> None:
+        if self.rust_pd_adapter is not None:
+            from sglang.srt.disaggregation.rust_pd import RustPdFatalError
+
+            outcome = self.rust_pd_adapter.shutdown()
+            if (
+                outcome != "SafeTerminal"
+                or not self.rust_pd_adapter.safe_to_release_pools
+            ):
+                raise RustPdFatalError(f"PD_LOCAL_FATAL shutdown={outcome}")
+        self.release_host_resources()
+
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
 
@@ -2523,7 +2535,18 @@ class Scheduler(
         if not self._set_or_validate_priority(req):
             return
         if self.rust_pd_adapter is not None:
-            self.rust_pd_adapter.enqueue(req, is_retracted=is_retracted)
+            try:
+                self.rust_pd_adapter.enqueue(req, is_retracted=is_retracted)
+            except RuntimeError as error:
+                if str(error) != "PD_PEER_UNAVAILABLE":
+                    raise
+                prepare_abort(
+                    req,
+                    "PD_PEER_UNAVAILABLE",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    pd_reason="PD_PEER_UNAVAILABLE",
+                )
+                self.output_streamer.stream_output([req], req.return_logprob)
             return
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
@@ -4812,7 +4835,10 @@ def run_scheduler_process(
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
     # Create a scheduler and run the event loop
+    from sglang.srt.disaggregation.rust_pd import RustPdFatalError
+
     scheduler = None
+    rust_pd_fatal = None
     try:
         scheduler = Scheduler(
             server_args,
@@ -4832,6 +4858,11 @@ def run_scheduler_process(
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
 
+    except RustPdFatalError as error:
+        rust_pd_fatal = error
+        traceback = get_exception_traceback()
+        logger.error(f"Rust PD scheduler hit a fatal lifecycle error: {traceback}")
+        parent_process.send_signal(signal.SIGQUIT)
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
@@ -4851,4 +4882,10 @@ def run_scheduler_process(
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
-                scheduler.release_host_resources()
+                try:
+                    scheduler.shutdown_rust_pd_before_host_resources()
+                except RustPdFatalError as error:
+                    rust_pd_fatal = rust_pd_fatal or error
+                    parent_process.send_signal(signal.SIGQUIT)
+    if rust_pd_fatal is not None:
+        raise rust_pd_fatal

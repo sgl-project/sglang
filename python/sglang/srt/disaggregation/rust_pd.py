@@ -25,6 +25,10 @@ from sglang.srt.disaggregation.rust_pd_contract import contract_digests
 PD_BATCH_MAX = 8
 
 
+class RustPdFatalError(RuntimeError):
+    """First process-wide Rust PD fatal or unsafe shutdown outcome."""
+
+
 @dataclass(frozen=True)
 class PdRequestSidecar:
     version: int
@@ -103,6 +107,10 @@ class RustPdSchedulerAdapter:
         self._bindings: dict[str, _RequestBinding] = {}
         self._pending: list[Any] = []
         self._inflight: list[Any] = []
+        readiness = getattr(transport, "readiness", None)
+        self.readiness_handle = readiness() if callable(readiness) else None
+        self._draining = False
+        self._shutdown_outcome: str | None = None
 
     @classmethod
     def from_scheduler(cls, scheduler: Any) -> RustPdSchedulerAdapter:
@@ -166,7 +174,33 @@ class RustPdSchedulerAdapter:
     def inflight_count(self) -> int:
         return len(self._inflight)
 
+    @property
+    def safe_to_release_pools(self) -> bool:
+        return self._shutdown_outcome == "SafeTerminal"
+
+    def lifecycle_tick(self) -> Any:
+        if self.readiness_handle is None:
+            return None
+        snapshot = self.readiness_handle.snapshot()
+        fatal_generation = getattr(snapshot, "fatal_generation", None)
+        lifecycle = getattr(snapshot, "lifecycle", None)
+        if fatal_generation is not None or lifecycle == "Fatal":
+            source = getattr(snapshot, "fatal_source", None) or "Unknown"
+            raise RustPdFatalError(
+                f"PD_LOCAL_FATAL source={source} generation={fatal_generation}"
+            )
+        return snapshot
+
     def enqueue(self, request: Any, *, is_retracted: bool = False) -> None:
+        snapshot = self.lifecycle_tick()
+        if self._draining or (
+            snapshot is not None
+            and (
+                not getattr(snapshot, "pair_ready", False)
+                or not getattr(snapshot, "accepting_rooms", False)
+            )
+        ):
+            raise RuntimeError("PD_PEER_UNAVAILABLE")
         if is_retracted:
             raise RuntimeError("PD_UNSUPPORTED")
         self._sidecar(request)
@@ -197,8 +231,13 @@ class RustPdSchedulerAdapter:
                     self._prepare_decode_batch(requests)
                     self.receiver_prepare_many(requests)
                     self._inflight.extend(requests)
-            except Exception:
-                self.abort_many(requests)
+            except Exception as error:
+                try:
+                    self.abort_many(requests)
+                except Exception:
+                    error.add_note(
+                        "Rust PD best-effort abort failed after the primary transport error"
+                    )
                 raise
             finally:
                 del self._pending[: len(requests)]
@@ -322,6 +361,15 @@ class RustPdSchedulerAdapter:
             raise
 
     def create_many(self, requests: Sequence[Any]) -> None:
+        snapshot = self.lifecycle_tick()
+        if self._draining or (
+            snapshot is not None
+            and (
+                not getattr(snapshot, "pair_ready", False)
+                or not getattr(snapshot, "accepting_rooms", False)
+            )
+        ):
+            raise RuntimeError("PD_PEER_UNAVAILABLE")
         self._validate_requests(requests, allow_existing=False)
         sidecars = [self._sidecar(request) for request in requests]
         if self.role == "prefill":
@@ -435,6 +483,50 @@ class RustPdSchedulerAdapter:
         self._require_success(results, [binding.handle for binding in bindings])
         for request in requests:
             del self._bindings[request.rid]
+
+    def begin_drain(self) -> None:
+        if self._draining:
+            return
+        self._draining = True
+        self._pending.clear()
+        active = list(
+            {
+                binding.request.rid: binding.request
+                for binding in self._bindings.values()
+            }.values()
+        )
+        for offset in range(0, len(active), PD_BATCH_MAX):
+            requests = active[offset : offset + PD_BATCH_MAX]
+            try:
+                self.abort_many(requests)
+            except RuntimeError as error:
+                if "PD_PEER_UNAVAILABLE" not in str(error):
+                    raise
+            self.clear_many(requests)
+        self._inflight.clear()
+
+    def shutdown(self) -> str:
+        if self._shutdown_outcome is not None:
+            if self._shutdown_outcome != "SafeTerminal":
+                raise RustPdFatalError(
+                    f"PD_LOCAL_FATAL shutdown={self._shutdown_outcome}"
+                )
+            return self._shutdown_outcome
+        try:
+            self.begin_drain()
+            outcome = self.transport.shutdown()
+        except RustPdFatalError:
+            raise
+        except Exception as error:
+            raise RustPdFatalError("PD_LOCAL_FATAL shutdown=TransportError") from error
+        if outcome not in ("SafeTerminal", "FatalUnsafe"):
+            raise RustPdFatalError(
+                f"PD_LOCAL_FATAL shutdown=InvalidOutcome:{outcome!r}"
+            )
+        self._shutdown_outcome = outcome
+        if outcome != "SafeTerminal":
+            raise RustPdFatalError(f"PD_LOCAL_FATAL shutdown={outcome}")
+        return outcome
 
     def _batch_transition(self, requests: Sequence[Any], method: Any) -> None:
         bindings = self._bindings_for(requests)

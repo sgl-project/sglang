@@ -7,7 +7,8 @@ use serde::Deserialize;
 
 use crate::mooncake::{
     CudaMemory, EngineOwner, MemoryBuffer, NativeEngineConfig, NativeEngineFactory, OwnerConfig,
-    Peer, PeerDescriptor, PinnedMemory, Region as MooncakeRegion, TransferOperation,
+    Peer, PeerDescriptor, PinnedMemory, Region as MooncakeRegion, ShutdownOutcome,
+    TransferOperation,
 };
 #[cfg(test)]
 use crate::mooncake::{MockEngineFactory, MockPlan};
@@ -18,6 +19,7 @@ use crate::pd::buffer::{
 };
 use crate::pd::protocol::{FixedBytes, RegisterRegions, Role};
 use crate::pd::room::{PdReason, RegistrationEpoch};
+use crate::pd::runtime::RuntimeShutdownOutcome;
 use crate::pd::runtime::bootstrap::{BootstrapPort, BootstrapRegistration};
 
 const KV_PAGE_BYTES: u64 = 131_072;
@@ -40,10 +42,11 @@ pub struct NativeBootstrapPort {
     role: Role,
     endpoint: SocketAddr,
     owner: Arc<EngineOwner>,
-    table: Arc<RegisteredRegionTable<MooncakeRegion>>,
+    table: Mutex<Option<Arc<RegisteredRegionTable<MooncakeRegion>>>>,
     buffers: BTreeMap<u16, MemoryBuffer>,
     peer: Mutex<Option<Peer>>,
     remote: Mutex<Option<AuthenticatedRemoteRegionTable>>,
+    shutdown_outcome: Mutex<Option<RuntimeShutdownOutcome>>,
 }
 
 impl NativeBootstrapPort {
@@ -74,10 +77,11 @@ impl NativeBootstrapPort {
             role,
             endpoint,
             owner,
-            table,
+            table: Mutex::new(Some(table)),
             buffers,
             peer: Mutex::new(None),
             remote: Mutex::new(None),
+            shutdown_outcome: Mutex::new(None),
         })
     }
 
@@ -108,19 +112,25 @@ impl NativeBootstrapPort {
             role,
             endpoint,
             owner,
-            table,
+            table: Mutex::new(Some(table)),
             buffers,
             peer: Mutex::new(None),
             remote: Mutex::new(None),
+            shutdown_outcome: Mutex::new(None),
         })
     }
 
-    pub fn registration_epoch(&self) -> RegistrationEpoch {
-        self.table.epoch()
+    pub fn registration_epoch(&self) -> Result<RegistrationEpoch, PdReason> {
+        Ok(self.table()?.epoch())
     }
 
-    pub fn table(&self) -> Arc<RegisteredRegionTable<MooncakeRegion>> {
-        Arc::clone(&self.table)
+    pub fn table(&self) -> Result<Arc<RegisteredRegionTable<MooncakeRegion>>, PdReason> {
+        self.table
+            .lock()
+            .map_err(|_| PdReason::LocalFatal)?
+            .as_ref()
+            .cloned()
+            .ok_or(PdReason::LocalFatal)
     }
 
     pub fn buffers(&self) -> BTreeMap<u16, MemoryBuffer> {
@@ -145,12 +155,56 @@ impl NativeBootstrapPort {
             .ok_or(PdReason::ProtocolMismatch)?;
         MooncakeNativeStagePort::new(
             Arc::clone(&self.owner),
-            Arc::clone(&self.table),
+            self.table()?,
             peer,
             self.buffers.clone(),
             remote,
         )
         .map_err(|_| PdReason::LocalFatal)
+    }
+
+    pub fn reset_peer(&self) -> Result<(), PdReason> {
+        if let Some(peer) = self.peer.lock().map_err(|_| PdReason::LocalFatal)?.take() {
+            peer.close().map_err(|_| PdReason::LocalFatal)?;
+        }
+        self.remote.lock().map_err(|_| PdReason::LocalFatal)?.take();
+        Ok(())
+    }
+
+    pub fn shutdown(&self) -> Result<RuntimeShutdownOutcome, PdReason> {
+        if let Some(outcome) = *self
+            .shutdown_outcome
+            .lock()
+            .map_err(|_| PdReason::LocalFatal)?
+        {
+            return Ok(outcome);
+        }
+        let mut safe = self.reset_peer().is_ok();
+        let table = self.table.lock().map_err(|_| PdReason::LocalFatal)?.take();
+        if let Some(table) = table {
+            match Arc::try_unwrap(table) {
+                Ok(mut table) => {
+                    let mut registration =
+                        MooncakeRegistrationPort::new(&self.owner, self.buffers.clone());
+                    safe &= table.unregister(&mut registration).is_ok();
+                }
+                Err(table) => {
+                    *self.table.lock().map_err(|_| PdReason::LocalFatal)? = Some(table);
+                    safe = false;
+                }
+            }
+        }
+        safe &= matches!(self.owner.shutdown(), Ok(ShutdownOutcome::SafeTerminal));
+        let outcome = if safe {
+            RuntimeShutdownOutcome::SafeTerminal
+        } else {
+            RuntimeShutdownOutcome::FatalUnsafe
+        };
+        *self
+            .shutdown_outcome
+            .lock()
+            .map_err(|_| PdReason::LocalFatal)? = Some(outcome);
+        Ok(outcome)
     }
 }
 
@@ -159,8 +213,9 @@ impl BootstrapPort for NativeBootstrapPort {
         if self.role != Role::Decode {
             return Err(PdReason::ProtocolMismatch);
         }
+        let table = self.table()?;
         BootstrapRegistration::from_registered_table(
-            &self.table,
+            &table,
             self.endpoint.ip().to_string(),
             self.endpoint.port(),
         )
@@ -207,8 +262,9 @@ impl BootstrapPort for NativeBootstrapPort {
             .map_err(|_| PdReason::TransferFailed)?;
         let peer = self.peer.lock().map_err(|_| PdReason::LocalFatal)?;
         let remote = self.remote.lock().map_err(|_| PdReason::LocalFatal)?;
+        let table = self.table()?;
         let operation = TransferOperation::write(
-            self.table
+            table
                 .registered_handle(56)
                 .map_err(|_| PdReason::LocalFatal)?,
             0,
@@ -511,8 +567,11 @@ mod tests {
     fn mock_native_ports_cover_registration_canary_and_stage_handoff() {
         let (prefill, _prefill_owners) = mock_port(Role::Prefill, 19000);
         let (decode, _decode_owners) = mock_port(Role::Decode, 19001);
-        assert_ne!(prefill.registration_epoch(), decode.registration_epoch());
-        assert!(prefill.table().region(57).is_ok());
+        assert_ne!(
+            prefill.registration_epoch().expect("prefill epoch"),
+            decode.registration_epoch().expect("decode epoch")
+        );
+        assert!(prefill.table().expect("prefill table").region(57).is_ok());
         assert_eq!(decode.buffers().len(), 58);
         assert_eq!(prefill.registration(), Err(PdReason::ProtocolMismatch));
         assert_eq!(
@@ -557,5 +616,18 @@ mod tests {
             decode.take_stage_port().err(),
             Some(PdReason::ProtocolMismatch)
         );
+        assert_eq!(
+            prefill.shutdown().expect("prefill native shutdown"),
+            RuntimeShutdownOutcome::SafeTerminal
+        );
+        assert_eq!(
+            decode.shutdown().expect("decode native shutdown"),
+            RuntimeShutdownOutcome::SafeTerminal
+        );
+        assert_eq!(
+            prefill.shutdown().expect("idempotent prefill shutdown"),
+            RuntimeShutdownOutcome::SafeTerminal
+        );
+        assert!(prefill.table().is_err());
     }
 }

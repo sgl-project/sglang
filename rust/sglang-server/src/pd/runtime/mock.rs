@@ -67,9 +67,7 @@ impl CpuMockBootstrapPort {
     }
 
     pub fn shutdown(&self) -> Result<(), PdReason> {
-        if let Some(peer) = self.peer.lock().map_err(|_| PdReason::LocalFatal)?.take() {
-            peer.close().map_err(|_| PdReason::LocalFatal)?;
-        }
+        self.reset_peer()?;
         if let Some(region) = self.region.lock().map_err(|_| PdReason::LocalFatal)?.take() {
             region.close().map_err(|_| PdReason::LocalFatal)?;
         }
@@ -78,6 +76,13 @@ impl CpuMockBootstrapPort {
             ShutdownOutcome::SafeTerminal => Ok(()),
             ShutdownOutcome::NotSafe { .. } => Err(PdReason::LocalFatal),
         }
+    }
+
+    pub fn reset_peer(&self) -> Result<(), PdReason> {
+        if let Some(peer) = self.peer.lock().map_err(|_| PdReason::LocalFatal)?.take() {
+            peer.close().map_err(|_| PdReason::LocalFatal)?;
+        }
+        Ok(())
     }
 }
 

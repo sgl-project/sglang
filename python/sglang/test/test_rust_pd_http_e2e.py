@@ -48,11 +48,20 @@ def _worker_main(
     psk_file: str,
     commands: multiprocessing.Queue,
     events: multiprocessing.Queue,
+    process_epoch: str | None = None,
+    registration_epoch: str | None = None,
 ) -> None:
     module = importlib.import_module(os.environ.get("SGLANG_PD_CORE_MODULE", "_core"))
     sys.modules["sglang.srt.server._core"] = module
     transport = module.PdTransport(
-        transport_config(role, control_port, data_port, psk_file)
+        transport_config(
+            role,
+            control_port,
+            data_port,
+            psk_file,
+            process_epoch=process_epoch,
+            registration_epoch=registration_epoch,
+        )
     )
     server = None
     try:
@@ -232,7 +241,12 @@ def _http_request(
 
 
 def _wait_ready(port: int, timeout: float = 30) -> None:
+    _wait_readiness_status(port, 200, timeout)
+
+
+def _wait_readiness_status(port: int, expected: int, timeout: float = 30) -> None:
     deadline = time.monotonic() + timeout
+    last_status = None
     while time.monotonic() < deadline:
         try:
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
@@ -240,12 +254,15 @@ def _wait_ready(port: int, timeout: float = 30) -> None:
             response = connection.getresponse()
             response.read()
             connection.close()
-            if response.status == 200:
+            last_status = response.status
+            if response.status == expected:
                 return
         except OSError:
-            pass
+            last_status = "connection-error"
         time.sleep(0.5)
-    raise AssertionError("Gateway never became ready")
+    raise AssertionError(
+        f"readiness never became {expected}; last status={last_status}"
+    )
 
 
 def _get(port: int, path: str) -> tuple[int, bytes]:
@@ -286,8 +303,8 @@ class RustPdHttpE2ETest(unittest.TestCase):
             commands = {role: context.Queue() for role in ("prefill", "decode")}
             event_queue = context.Queue()
             inbox = _EventInbox(event_queue)
-            workers = [
-                context.Process(
+            workers = {
+                role: context.Process(
                     target=_worker_main,
                     args=(
                         role,
@@ -300,8 +317,8 @@ class RustPdHttpE2ETest(unittest.TestCase):
                     ),
                 )
                 for role in ("prefill", "decode")
-            ]
-            for worker in workers:
+            }
+            for worker in workers.values():
                 worker.start()
 
             router = None
@@ -538,6 +555,77 @@ class RustPdHttpE2ETest(unittest.TestCase):
                             inbox.take(role, "aborted", timeout=15)[3],
                             CLEAN_RESOURCES,
                         )
+
+                retired_decode = workers["decode"]
+                retired_decode.kill()
+                retired_decode.join(timeout=5)
+                self.assertEqual(retired_decode.exitcode, -9)
+                _wait_readiness_status(gateway_port, 503, timeout=15)
+
+                commands["decode"] = context.Queue()
+                replacement_decode_epoch = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+                replacement_decode = context.Process(
+                    target=_worker_main,
+                    args=(
+                        "decode",
+                        decode_port,
+                        control_port,
+                        data_port,
+                        str(psk_file),
+                        commands["decode"],
+                        event_queue,
+                        replacement_decode_epoch,
+                        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    ),
+                )
+                workers["decode"] = replacement_decode
+                replacement_decode.start()
+                inbox.take("decode", "ready", timeout=30)
+                _wait_ready(gateway_port, timeout=15)
+
+                status, _, body = _http_request(gateway_port, request)
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body)["output_ids"], [42, 43])
+                for role in ("prefill", "decode"):
+                    self.assertEqual(
+                        inbox.take(role, "complete", timeout=15)[3],
+                        CLEAN_RESOURCES,
+                    )
+
+                retired_prefill = workers["prefill"]
+                retired_prefill.kill()
+                retired_prefill.join(timeout=5)
+                self.assertEqual(retired_prefill.exitcode, -9)
+                _wait_readiness_status(gateway_port, 503, timeout=15)
+
+                commands["prefill"] = context.Queue()
+                replacement_prefill = context.Process(
+                    target=_worker_main,
+                    args=(
+                        "prefill",
+                        prefill_port,
+                        control_port,
+                        data_port,
+                        str(psk_file),
+                        commands["prefill"],
+                        event_queue,
+                        "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                        "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                    ),
+                )
+                workers["prefill"] = replacement_prefill
+                replacement_prefill.start()
+                inbox.take("prefill", "ready", timeout=30)
+                _wait_ready(gateway_port, timeout=15)
+
+                status, _, body = _http_request(gateway_port, request)
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body)["output_ids"], [42, 43])
+                for role in ("prefill", "decode"):
+                    self.assertEqual(
+                        inbox.take(role, "complete", timeout=15)[3],
+                        CLEAN_RESOURCES,
+                    )
             finally:
                 if router is not None:
                     if router.poll() is None:
@@ -550,9 +638,12 @@ class RustPdHttpE2ETest(unittest.TestCase):
                 gateway_log.close()
                 for role in ("prefill", "decode"):
                     commands[role].put("stop")
-                for worker in workers:
+                for worker in workers.values():
                     worker.join(timeout=15)
                     if worker.is_alive():
                         worker.terminate()
                         worker.join(timeout=5)
-                self.assertEqual([worker.exitcode for worker in workers], [0, 0])
+                self.assertEqual(
+                    [workers[role].exitcode for role in ("prefill", "decode")],
+                    [0, 0],
+                )

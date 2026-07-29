@@ -553,6 +553,10 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
+            if self.gracefully_exit:
+                break
+            if self.rust_pd_adapter is not None:
+                self.rust_pd_adapter.lifecycle_tick()
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -595,6 +599,10 @@ class SchedulerDisaggregationPrefillMixin:
         self.result_queue = deque()
 
         while True:
+            if self.gracefully_exit:
+                break
+            if self.rust_pd_adapter is not None:
+                self.rust_pd_adapter.lifecycle_tick()
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)

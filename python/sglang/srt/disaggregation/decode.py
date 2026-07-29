@@ -2075,6 +2075,10 @@ class SchedulerDisaggregationDecodeMixin:
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
         while True:
+            if self.gracefully_exit:
+                break
+            if self.rust_pd_adapter is not None:
+                self.rust_pd_adapter.lifecycle_tick()
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -2114,6 +2118,10 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            if self.gracefully_exit:
+                break
+            if self.rust_pd_adapter is not None:
+                self.rust_pd_adapter.lifecycle_tick()
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)

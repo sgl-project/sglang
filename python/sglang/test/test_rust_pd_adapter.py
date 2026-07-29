@@ -4,6 +4,7 @@ import pytest
 
 from sglang.srt.disaggregation.rust_pd import (
     PdRequestSidecar,
+    RustPdFatalError,
     RustPdSchedulerAdapter,
     StablePdRegionTable,
 )
@@ -100,6 +101,17 @@ class FakeTransport:
     def __init__(self):
         self.calls = []
         self.poll_count = 0
+        self.snapshot = SimpleNamespace(
+            lifecycle="PairReady",
+            pair_ready=True,
+            accepting_rooms=True,
+            fatal_generation=None,
+            fatal_source=None,
+            shutdown_outcome=None,
+        )
+
+    def readiness(self):
+        return SimpleNamespace(snapshot=lambda: self.snapshot)
 
     def sender_create_many(self, epochs, rooms, attempts, digests):
         self.calls.append(("sender_create_many", list(rooms)))
@@ -146,6 +158,10 @@ class FakeTransport:
     def clear_many(self, handles):
         self.calls.append(("clear_many", list(handles)))
         return [Item(handle) for handle in handles]
+
+    def shutdown(self):
+        self.calls.append(("shutdown",))
+        return self.snapshot.shutdown_outcome or "SafeTerminal"
 
 
 def sidecar(index, room):
@@ -244,3 +260,89 @@ def test_decode_first_token_and_terminal_generation_are_committed_once():
 
     adapter.clear_many(requests)
     assert adapter.active_count == 0
+
+
+def test_lifecycle_tick_stops_new_admission_and_surfaces_first_fatal():
+    pool, table = region_table("cuda:4")
+    transport = FakeTransport()
+    adapter = RustPdSchedulerAdapter(transport, "prefill", table, pool)
+
+    transport.snapshot = SimpleNamespace(
+        lifecycle="LocalReady",
+        pair_ready=False,
+        accepting_rooms=False,
+        fatal_generation=None,
+        fatal_source=None,
+        shutdown_outcome=None,
+    )
+    with pytest.raises(RuntimeError, match="PD_PEER_UNAVAILABLE"):
+        adapter.enqueue(request(0, 0))
+    assert adapter.pending_count == 0
+
+    transport.snapshot = SimpleNamespace(
+        lifecycle="Fatal",
+        pair_ready=False,
+        accepting_rooms=False,
+        fatal_generation=1,
+        fatal_source="WorkerExit",
+        shutdown_outcome=None,
+    )
+    with pytest.raises(RustPdFatalError, match="WorkerExit"):
+        adapter.lifecycle_tick()
+
+
+def test_flush_pending_preserves_primary_error_when_cleanup_also_fails():
+    pool, table = region_table("cuda:4")
+    transport = FakeTransport()
+    adapter = RustPdSchedulerAdapter(transport, "prefill", table, pool)
+    adapter.enqueue(request(0, 0))
+
+    def fail_primary(_handles):
+        raise RuntimeError("PD_PROTOCOL_MISMATCH")
+
+    def fail_cleanup(_handles, _reason):
+        raise RuntimeError("PD_PEER_UNAVAILABLE")
+
+    transport.sender_init_many = fail_primary
+    transport.abort_many = fail_cleanup
+    with pytest.raises(RuntimeError, match="PD_PROTOCOL_MISMATCH") as raised:
+        adapter.flush_pending()
+
+    assert raised.value.__notes__ == [
+        "Rust PD best-effort abort failed after the primary transport error"
+    ]
+    assert adapter.pending_count == 0
+
+
+def test_shutdown_aborts_and_clears_before_transport_allows_pool_release():
+    pool, table = region_table("cuda:4")
+    transport = FakeTransport()
+    adapter = RustPdSchedulerAdapter(transport, "prefill", table, pool)
+    requests = [request(0, 0), request(1, 1)]
+    adapter.create_many(requests)
+    adapter.add_prefill_inflight(requests)
+    transport.calls.clear()
+
+    assert adapter.shutdown() == "SafeTerminal"
+    assert adapter.safe_to_release_pools
+    assert adapter.active_count == 0
+    assert adapter.pending_count == 0
+    assert adapter.inflight_count == 0
+    assert transport.calls == [
+        ("abort_many", [100, 101], "PD_ABORTED"),
+        ("clear_many", [100, 101]),
+        ("shutdown",),
+    ]
+    assert adapter.shutdown() == "SafeTerminal"
+    assert transport.calls[-1] == ("shutdown",)
+
+
+def test_fatal_unsafe_shutdown_never_authorizes_python_pool_reuse():
+    pool, table = region_table("cuda:4")
+    transport = FakeTransport()
+    transport.snapshot.shutdown_outcome = "FatalUnsafe"
+    adapter = RustPdSchedulerAdapter(transport, "prefill", table, pool)
+
+    with pytest.raises(RustPdFatalError, match="FatalUnsafe"):
+        adapter.shutdown()
+    assert not adapter.safe_to_release_pools

@@ -4,7 +4,10 @@ use std::sync::Arc;
 use sglang_server::pd::config::PdProfileV1;
 use sglang_server::pd::protocol::{FixedBytes, Role};
 use sglang_server::pd::room::{AttemptId, ManualClock, PdReason, ProcessEpoch, RegistrationEpoch};
-use sglang_server::pd::runtime::{PairReadiness, RuntimeIdentity, RuntimeLifecycle};
+use sglang_server::pd::runtime::{
+    FatalPublish, FatalSource, PairReadiness, RuntimeIdentity, RuntimeLifecycle,
+    RuntimeShutdownOutcome, ShutdownPhase,
+};
 use sglang_server::pd::transport::{
     PdTransportCore, ReceiverCreateInput, SenderChunk, SenderCreateInput, TerminalEvent,
     TransportError,
@@ -163,6 +166,48 @@ fn generation_role_and_epoch_bound_handles_fail_closed_after_reuse() {
 }
 
 #[test]
+fn room_generation_restarts_with_each_authenticated_peer_session() {
+    let first_decode = identity(Role::Decode, 0x20);
+    let restarted_decode = identity(Role::Decode, 0x40);
+    let prefill = identity(Role::Prefill, 0x30);
+    let (mut core, _) = started(prefill.clone(), &first_decode);
+    let first = core
+        .sender_create(SenderCreateInput {
+            decode_process_epoch: first_decode.process_epoch,
+            bootstrap_room: 0,
+            attempt_id: AttemptId::random(),
+            request_digest: FixedBytes::new([0xa1; 32]),
+        })
+        .expect("first-session sender");
+    assert_eq!(
+        core.room_context(first)
+            .expect("first-session room")
+            .room
+            .generation,
+        1
+    );
+
+    core.peer_lost();
+    core.activate_pair(pair_ready(&prefill, &restarted_decode, 2), 58, true)
+        .expect("replacement authenticated pair");
+    let after_restart = core
+        .sender_create(SenderCreateInput {
+            decode_process_epoch: restarted_decode.process_epoch,
+            bootstrap_room: 1,
+            attempt_id: AttemptId::random(),
+            request_digest: FixedBytes::new([0xa2; 32]),
+        })
+        .expect("replacement-session sender");
+    assert_eq!(
+        core.room_context(after_restart)
+            .expect("replacement-session room")
+            .room
+            .generation,
+        1
+    );
+}
+
+#[test]
 fn destination_terminal_first_token_is_consumed_exactly_once() {
     let decode = identity(Role::Decode, 0x20);
     let prefill = identity(Role::Prefill, 0x30);
@@ -224,6 +269,80 @@ fn destination_terminal_first_token_is_consumed_exactly_once() {
 }
 
 #[test]
+fn peer_loss_and_fatal_converge_handles_without_overwriting_first_terminal() {
+    let decode = identity(Role::Decode, 0x20);
+    let prefill = identity(Role::Prefill, 0x30);
+    let (mut core, _) = started(decode, &prefill);
+    let create = |index: u8| ReceiverCreateInput {
+        bootstrap_room: u64::from(index),
+        attempt_id: AttemptId::random(),
+        request_digest: FixedBytes::new([index; 32]),
+    };
+    let mut handles = core
+        .receiver_create_many(&[create(1), create(2)])
+        .expect("batch shape")
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("receiver handles");
+    core.receiver_prepare_many(&handles)
+        .expect("batch shape")
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("prepared");
+    let already_terminal = handles.remove(0);
+    core.record_terminal(TerminalEvent {
+        handle: already_terminal,
+        reason: PdReason::TransferFailed,
+        first_token_id: None,
+        transfer_bytes: 0,
+    })
+    .expect("first terminal");
+
+    let terminated = core.peer_lost();
+    assert_eq!(terminated, handles);
+    let snapshot = core.readiness().snapshot();
+    assert_eq!(snapshot.runtime.lifecycle, RuntimeLifecycle::LocalReady);
+    assert_eq!(snapshot.runtime.reconnect_generation, 1);
+    assert!(!snapshot.accepting_rooms);
+    assert_eq!(snapshot.runtime.active_rooms, 0);
+    assert_eq!(
+        core.poll_many(&[already_terminal])
+            .expect("batch shape")
+            .remove(0)
+            .expect("old terminal")
+            .reason,
+        PdReason::TransferFailed
+    );
+    assert_eq!(
+        core.poll_many(&handles)
+            .expect("batch shape")
+            .remove(0)
+            .expect("peer terminal")
+            .reason,
+        PdReason::PeerUnavailable
+    );
+
+    let FatalPublish::First(first) =
+        core.publish_fatal(FatalSource::WorkerExit, PdReason::LocalFatal)
+    else {
+        panic!("worker fatal did not win");
+    };
+    assert_eq!(first.generation, 1);
+    let FatalPublish::Duplicate(duplicate) = core.publish_fatal(
+        FatalSource::QuarantineHardDeadline,
+        PdReason::TransferTimeout,
+    ) else {
+        panic!("later fatal source overwrote the first");
+    };
+    assert_eq!(duplicate, first);
+    let snapshot = core.readiness().snapshot();
+    assert_eq!(snapshot.runtime.lifecycle, RuntimeLifecycle::Fatal);
+    assert_eq!(snapshot.runtime.fatal, Some(first));
+    assert_eq!(snapshot.runtime.fatal_duplicate_sources, 1);
+    assert!(!snapshot.accepting_rooms);
+}
+
+#[test]
 fn sender_batch_path_is_bounded_and_tracks_typed_terminal_results() {
     let decode = identity(Role::Decode, 0x20);
     let prefill = identity(Role::Prefill, 0x30);
@@ -274,4 +393,84 @@ fn sender_batch_path_is_bounded_and_tracks_typed_terminal_results() {
                 && result.retryable
         })
     }));
+}
+
+#[test]
+fn graceful_shutdown_aborts_only_active_handles_and_is_idempotent() {
+    let decode = identity(Role::Decode, 0x20);
+    let prefill = identity(Role::Prefill, 0x30);
+    let (mut core, _) = started(prefill, &decode);
+    let create = |room: u64, digest: u8| SenderCreateInput {
+        decode_process_epoch: decode.process_epoch,
+        bootstrap_room: room,
+        attempt_id: AttemptId::random(),
+        request_digest: FixedBytes::new([digest; 32]),
+    };
+    let completed = core
+        .sender_create(create(1, 0xa1))
+        .expect("completed handle");
+    let active = core.sender_create(create(2, 0xa2)).expect("active handle");
+    core.abort_many(&[completed], PdReason::TransferFailed)
+        .expect("completed batch")
+        .remove(0)
+        .expect("completed terminal");
+
+    assert_eq!(
+        core.shutdown().expect("graceful shutdown"),
+        RuntimeShutdownOutcome::SafeTerminal
+    );
+    let snapshot = core.readiness().snapshot();
+    assert_eq!(snapshot.runtime.lifecycle, RuntimeLifecycle::Stopped);
+    assert_eq!(snapshot.runtime.shutdown_phase, ShutdownPhase::Stopped);
+    assert_eq!(
+        snapshot.runtime.shutdown_outcome,
+        Some(RuntimeShutdownOutcome::SafeTerminal)
+    );
+    assert!(!snapshot.accepting_rooms);
+    assert_eq!(
+        core.poll_many(&[completed])
+            .expect("completed batch")
+            .remove(0)
+            .expect("completed result")
+            .reason,
+        PdReason::TransferFailed
+    );
+    assert_eq!(
+        core.poll_many(&[active])
+            .expect("active batch")
+            .remove(0)
+            .expect("aborted result")
+            .reason,
+        PdReason::Aborted
+    );
+    assert_eq!(
+        core.shutdown().expect("duplicate shutdown"),
+        RuntimeShutdownOutcome::SafeTerminal
+    );
+}
+
+#[test]
+fn shutdown_before_local_registration_is_fatal_unsafe_and_idempotent() {
+    let decode = identity(Role::Decode, 0x20);
+    let clock = Arc::new(ManualClock::new(1_000));
+    let mut core = PdTransportCore::new(decode, clock).expect("transport core");
+
+    assert_eq!(
+        core.shutdown().expect("fatal shutdown"),
+        RuntimeShutdownOutcome::FatalUnsafe
+    );
+    let snapshot = core.readiness().snapshot();
+    assert_eq!(snapshot.runtime.lifecycle, RuntimeLifecycle::Stopped);
+    assert_eq!(
+        snapshot.runtime.shutdown_outcome,
+        Some(RuntimeShutdownOutcome::FatalUnsafe)
+    );
+    assert_eq!(
+        snapshot.runtime.fatal.map(|record| record.source),
+        Some(FatalSource::ShutdownUnsafe)
+    );
+    assert_eq!(
+        core.shutdown().expect("duplicate fatal shutdown"),
+        RuntimeShutdownOutcome::FatalUnsafe
+    );
 }

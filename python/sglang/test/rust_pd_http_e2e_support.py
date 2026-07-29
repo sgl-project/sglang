@@ -122,13 +122,19 @@ def region_table(role: str) -> tuple[_FakePool, StablePdRegionTable]:
 
 
 def transport_config(
-    role: str, control_port: int, data_port: int, psk_file: str
+    role: str,
+    control_port: int,
+    data_port: int,
+    psk_file: str,
+    *,
+    process_epoch: str | None = None,
+    registration_epoch: str | None = None,
 ) -> str:
     return json.dumps(
         {
             "role": role,
-            "process_epoch": PROCESS_EPOCH[role],
-            "registration_epoch": REGISTRATION_EPOCH[role],
+            "process_epoch": process_epoch or PROCESS_EPOCH[role],
+            "registration_epoch": registration_epoch or REGISTRATION_EPOCH[role],
             "model_manifest_digest": "11" * 32,
             "tokenizer_manifest_digest": "22" * 32,
             "layout_fingerprint": "33" * 32,

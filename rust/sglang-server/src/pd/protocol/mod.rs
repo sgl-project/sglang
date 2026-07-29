@@ -4,7 +4,7 @@ mod session;
 mod types;
 mod validation;
 
-pub use codec::{DecodedFrame, FrameCodec, FrameError, FrameHeader};
+pub use codec::{DecodedFrame, FrameCodec, FrameError, FrameHeader, HEADER_BYTES, TAG_BYTES};
 pub use crypto::{
     CryptoError, Psk, SessionKeys, derive_session_keys, frame_hash, random_nonce, transcript_hash,
 };

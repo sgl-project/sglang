@@ -8,7 +8,8 @@ use crate::pd::room::{
     RoomTable,
 };
 use crate::pd::runtime::{
-    PairReadiness, PairState, RuntimeIdentity, RuntimeLifecycle, RuntimeSnapshot,
+    FatalPublish, FatalSource, PairReadiness, PairState, RuntimeIdentity, RuntimeLifecycle,
+    RuntimeShutdownOutcome, RuntimeSnapshot, ShutdownMode, ShutdownPhase,
 };
 
 mod helpers;
@@ -164,10 +165,20 @@ impl PdTransportCore {
         .map_err(|_| TransportError::LocalFatal(PdReason::ProtocolMismatch))?;
         self.pair
             .activate(&readiness, &mut rooms)
-            .map_err(TransportError::LocalFatal)?;
+            .map_err(TransportError::Peer)?;
         self.rooms = Some(rooms);
+        // Room generations are session-local wire data. A restarted peer also
+        // starts at one, so both sides must reset only after the new
+        // authenticated session has been accepted.
+        self.next_room_generation = 1;
         self.sync_snapshot();
         Ok(())
+    }
+
+    pub fn validate_pair_candidate(&self, readiness: &PairReadiness) -> Result<(), TransportError> {
+        self.pair
+            .validate_candidate(readiness)
+            .map_err(TransportError::Peer)
     }
 
     pub fn sender_create(
@@ -389,9 +400,7 @@ impl PdTransportCore {
         Ok(true)
     }
 
-    pub fn shutdown(&mut self) {
-        let room_snapshot = self.rooms.as_ref().map(RoomTable::snapshot);
-        self.pair.begin_draining(room_snapshot.as_ref());
+    pub fn peer_lost(&mut self) -> Vec<OpaqueHandle> {
         let handles: Vec<_> = self
             .slots
             .iter()
@@ -403,17 +412,138 @@ impl PdTransportCore {
                 })
             })
             .collect();
-        for handle in handles {
+        for handle in &handles {
             let _ = self.record_terminal(TerminalEvent {
-                handle,
-                reason: PdReason::Aborted,
+                handle: *handle,
+                reason: PdReason::PeerUnavailable,
                 first_token_id: None,
                 transfer_bytes: 0,
             });
         }
-        let room_snapshot = self.rooms.as_ref().map(RoomTable::snapshot);
-        self.pair.stop(room_snapshot.as_ref());
+        if let Some(rooms) = self.rooms.as_mut() {
+            self.pair.disconnect(rooms);
+        }
         self.sync_snapshot();
+        handles
+    }
+
+    pub fn publish_fatal(&mut self, source: FatalSource, reason: PdReason) -> FatalPublish {
+        let published = self.pair.publish_fatal(source, reason, self.rooms.as_mut());
+        self.sync_snapshot();
+        if let FatalPublish::First(record) = published {
+            let handles: Vec<_> = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, value)| {
+                    value.entry.as_ref().and_then(|entry| {
+                        (entry.state != HandleState::Terminal)
+                            .then(|| self.handle_for(slot, value.generation, entry.role))
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let _ = self.record_terminal(TerminalEvent {
+                    handle,
+                    reason: record.reason,
+                    first_token_id: None,
+                    transfer_bytes: 0,
+                });
+            }
+        }
+        self.sync_snapshot();
+        published
+    }
+
+    pub fn begin_shutdown(&mut self, mode: ShutdownMode) -> Result<u64, TransportError> {
+        if self.pair.snapshot().lifecycle == RuntimeLifecycle::Starting {
+            self.publish_fatal(FatalSource::ShutdownUnsafe, PdReason::LocalFatal);
+        }
+        let rooms = self.rooms.as_ref().map(RoomTable::snapshot);
+        let generation = self
+            .pair
+            .begin_draining(mode, rooms.as_ref())
+            .map_err(TransportError::LocalFatal)?;
+        self.sync_snapshot();
+        Ok(generation)
+    }
+
+    pub fn advance_shutdown(&mut self, phase: ShutdownPhase) -> Result<(), TransportError> {
+        self.pair
+            .advance_shutdown(phase)
+            .map_err(TransportError::LocalFatal)?;
+        if phase == ShutdownPhase::AbortingRooms {
+            let handles: Vec<_> = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, value)| {
+                    value.entry.as_ref().and_then(|entry| {
+                        (entry.state != HandleState::Terminal)
+                            .then(|| self.handle_for(slot, value.generation, entry.role))
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let _ = self.record_terminal(TerminalEvent {
+                    handle,
+                    reason: PdReason::Aborted,
+                    first_token_id: None,
+                    transfer_bytes: 0,
+                });
+            }
+        }
+        self.sync_snapshot();
+        Ok(())
+    }
+
+    pub fn complete_shutdown(
+        &mut self,
+        outcome: RuntimeShutdownOutcome,
+    ) -> Result<RuntimeShutdownOutcome, TransportError> {
+        let rooms = self.rooms.as_ref().map(RoomTable::snapshot);
+        let outcome = self
+            .pair
+            .stop(outcome, rooms.as_ref())
+            .map_err(TransportError::LocalFatal)?;
+        self.sync_snapshot();
+        Ok(outcome)
+    }
+
+    pub fn shutdown(&mut self) -> Result<RuntimeShutdownOutcome, TransportError> {
+        if let Some(outcome) = self.pair.snapshot().shutdown_outcome {
+            return Ok(outcome);
+        }
+        let mode = if matches!(
+            self.pair.snapshot().lifecycle,
+            RuntimeLifecycle::Starting | RuntimeLifecycle::Fatal
+        ) {
+            ShutdownMode::Fatal
+        } else {
+            ShutdownMode::Graceful
+        };
+        self.begin_shutdown(mode)?;
+        for phase in [
+            ShutdownPhase::GoAway,
+            ShutdownPhase::StopAccepting,
+            ShutdownPhase::DrainingRooms,
+            ShutdownPhase::AbortingRooms,
+            ShutdownPhase::NativeSafety,
+            ShutdownPhase::SchedulerRelease,
+            ShutdownPhase::WorkerJoin,
+            ShutdownPhase::EngineQuiesce,
+            ShutdownPhase::ConnectionClose,
+            ShutdownPhase::RegionUnregister,
+            ShutdownPhase::EngineDestroy,
+        ] {
+            self.advance_shutdown(phase)?;
+        }
+        let outcome = if mode == ShutdownMode::Fatal {
+            RuntimeShutdownOutcome::FatalUnsafe
+        } else {
+            RuntimeShutdownOutcome::SafeTerminal
+        };
+        self.complete_shutdown(outcome)
     }
 
     fn create_handle(
@@ -734,12 +864,7 @@ impl PdTransportCore {
     }
 
     fn fail_local<T>(&mut self, reason: PdReason) -> Result<T, TransportError> {
-        if let Some(rooms) = self.rooms.as_mut() {
-            rooms.fail_all(reason);
-        }
-        let room_snapshot = self.rooms.as_ref().map(RoomTable::snapshot);
-        self.pair.mark_fatal(reason, room_snapshot.as_ref());
-        self.sync_snapshot();
+        self.publish_fatal(FatalSource::ProtocolInvariant, reason);
         Err(TransportError::LocalFatal(reason))
     }
 

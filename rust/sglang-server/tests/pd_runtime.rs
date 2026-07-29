@@ -15,9 +15,9 @@ use sglang_server::pd::room::{
     RoomOutcome, RoomRole, RoomSpec, RoomTable,
 };
 use sglang_server::pd::runtime::{
-    BootstrapPort, BootstrapRegistration, CpuMockBootstrapPort, HeartbeatAction, HeartbeatTracker,
-    PairReadiness, PairState, RuntimeIdentity, RuntimeSnapshot, bootstrap_decode,
-    bootstrap_prefill,
+    BootstrapPort, BootstrapRegistration, ConnectionLifecycle, CpuMockBootstrapPort,
+    HeartbeatAction, HeartbeatTracker, PairReadiness, PairState, RuntimeIdentity, RuntimeSnapshot,
+    bootstrap_decode, bootstrap_prefill,
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -398,6 +398,154 @@ fn heartbeat_requires_valid_pong_and_closes_after_two_missed_periods() {
     assert_eq!(tracker.consecutive_misses(), 0);
 }
 
+#[tokio::test]
+async fn pair_connection_drives_heartbeat_goaway_and_two_miss_peer_loss() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("lifecycle listener");
+    let address = listener.local_addr().expect("lifecycle address");
+    let psk = Arc::new(test_psk(7));
+    let prefill_identity = identity(Role::Prefill, 0x11);
+    let decode_identity = identity(Role::Decode, 0x11);
+    let prefill_port =
+        Arc::new(CpuMockBootstrapPort::new(&prefill_identity).expect("prefill port"));
+    let decode_port = Arc::new(CpuMockBootstrapPort::new(&decode_identity).expect("decode port"));
+    let prefill_clock = Arc::new(ManualClock::new(1_700_000_000_000));
+    let decode_clock = Arc::new(ManualClock::new(1_700_000_000_000));
+
+    let server = tokio::spawn({
+        let psk = Arc::clone(&psk);
+        let port = Arc::clone(&prefill_port);
+        let clock = Arc::clone(&prefill_clock);
+        async move {
+            let (stream, _) = listener.accept().await.expect("accept decode");
+            bootstrap_prefill(stream, prefill_identity, &psk, port, clock).await
+        }
+    });
+    let stream = TcpStream::connect(address).await.expect("connect prefill");
+    let mut decode = bootstrap_decode(
+        stream,
+        decode_identity,
+        &psk,
+        decode_port.clone(),
+        decode_clock.clone(),
+    )
+    .await
+    .expect("decode bootstrap");
+    let mut prefill = server
+        .await
+        .expect("prefill bootstrap task")
+        .expect("prefill bootstrap");
+
+    prefill_clock.advance(5_000);
+    decode_clock.advance(5_000);
+    let (prefill_action, decode_action) =
+        tokio::join!(prefill.lifecycle_tick(), decode.lifecycle_tick());
+    assert_eq!(
+        prefill_action.expect("prefill heartbeat"),
+        ConnectionLifecycle::PingSent(1)
+    );
+    assert_eq!(
+        decode_action.expect("decode heartbeat"),
+        ConnectionLifecycle::PingSent(1)
+    );
+    for _ in 0..8 {
+        let _ = tokio::join!(prefill.lifecycle_tick(), decode.lifecycle_tick());
+        if prefill.heartbeat_snapshot().outstanding_ping.is_none()
+            && decode.heartbeat_snapshot().outstanding_ping.is_none()
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(prefill.heartbeat_snapshot().last_pong_id, Some(1));
+    assert_eq!(decode.heartbeat_snapshot().last_pong_id, Some(1));
+
+    prefill.send_goaway(9).await.expect("send GoAway");
+    for _ in 0..8 {
+        let _ = decode.lifecycle_tick().await;
+        let _ = prefill.lifecycle_tick().await;
+        if prefill.goaway_acked(9) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(decode.peer_draining_generation(), Some(9));
+    assert!(prefill.goaway_acked(9));
+
+    prefill.send_goaway(10).await.expect("send final GoAway");
+    drop(prefill);
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(
+        decode
+            .lifecycle_tick()
+            .await
+            .expect("decode consumes GoAway before EOF"),
+        ConnectionLifecycle::PeerDraining(10)
+    );
+    assert_eq!(decode.peer_draining_generation(), Some(10));
+    drop(decode);
+    prefill_port.shutdown().expect("prefill shutdown");
+    decode_port.shutdown().expect("decode shutdown");
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("miss listener");
+    let address = listener.local_addr().expect("miss address");
+    let prefill_identity = identity(Role::Prefill, 0x11);
+    let decode_identity = identity(Role::Decode, 0x11);
+    let prefill_port =
+        Arc::new(CpuMockBootstrapPort::new(&prefill_identity).expect("prefill miss port"));
+    let decode_port =
+        Arc::new(CpuMockBootstrapPort::new(&decode_identity).expect("decode miss port"));
+    let prefill_clock = Arc::new(ManualClock::new(1_700_000_000_000));
+    let server = tokio::spawn({
+        let psk = Arc::clone(&psk);
+        let port = Arc::clone(&prefill_port);
+        let clock = Arc::clone(&prefill_clock);
+        async move {
+            let (stream, _) = listener.accept().await.expect("accept miss peer");
+            bootstrap_prefill(stream, prefill_identity, &psk, port, clock).await
+        }
+    });
+    let stream = TcpStream::connect(address)
+        .await
+        .expect("connect miss peer");
+    let silent_decode = bootstrap_decode(
+        stream,
+        decode_identity,
+        &psk,
+        decode_port.clone(),
+        Arc::new(ManualClock::new(1_700_000_000_000)),
+    )
+    .await
+    .expect("silent decode bootstrap");
+    let mut prefill = server
+        .await
+        .expect("miss server task")
+        .expect("prefill miss bootstrap");
+    prefill_clock.advance(5_000);
+    assert_eq!(
+        prefill.lifecycle_tick().await.expect("first ping"),
+        ConnectionLifecycle::PingSent(1)
+    );
+    prefill_clock.advance(5_000);
+    assert_eq!(
+        prefill.lifecycle_tick().await.expect("second ping"),
+        ConnectionLifecycle::PingSent(2)
+    );
+    prefill_clock.advance(5_000);
+    assert_eq!(
+        prefill.lifecycle_tick().await.expect("peer loss"),
+        ConnectionLifecycle::PeerLost
+    );
+
+    drop(prefill);
+    drop(silent_decode);
+    prefill_port.shutdown().expect("prefill miss shutdown");
+    decode_port.shutdown().expect("decode miss shutdown");
+}
+
 #[test]
 fn new_peer_epoch_and_disconnect_terminate_old_rooms_without_overwriting_reason() {
     let identity = identity(Role::Decode, 0x11);
@@ -479,6 +627,11 @@ fn new_peer_epoch_and_disconnect_terminate_old_rooms_without_overwriting_reason(
     assert!(pair.disconnect(&mut rooms).is_empty());
     assert_eq!(pair.snapshot().last_reason, Some(PdReason::PeerUnavailable));
     assert_eq!(pair.snapshot().session_count, 2);
+    assert_eq!(
+        pair.activate(&second, &mut rooms),
+        Err(PdReason::ProtocolMismatch),
+        "a disconnected peer epoch must not reclaim the current session"
+    );
 }
 
 fn test_psk(byte: u8) -> Psk {

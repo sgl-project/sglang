@@ -95,7 +95,7 @@ enum TransportCommand {
         reply: Reply<PyPdResourceSnapshot>,
     },
     Shutdown {
-        reply: Reply<()>,
+        reply: Reply<crate::pd::runtime::RuntimeShutdownOutcome>,
     },
 }
 
@@ -126,6 +126,11 @@ enum MockDataEndpoint {
     Decode { listener: StdTcpListener },
 }
 
+enum ControlEndpoint {
+    Prefill { listener: tokio::net::TcpListener },
+    Decode { address: String },
+}
+
 enum BootstrapOwner {
     Mock(Arc<CpuMockBootstrapPort>),
     Native(Arc<NativeBootstrapPort>),
@@ -136,6 +141,13 @@ impl BootstrapOwner {
         match self {
             Self::Mock(port) => port.clone(),
             Self::Native(port) => port.clone(),
+        }
+    }
+
+    fn reset_peer(&self) -> Result<(), TransportError> {
+        match self {
+            Self::Mock(port) => port.reset_peer().map_err(TransportError::LocalFatal),
+            Self::Native(port) => port.reset_peer().map_err(TransportError::LocalFatal),
         }
     }
 }
@@ -193,10 +205,23 @@ pub struct PyPdReadinessSnapshot {
     local_ready: bool,
     pair_ready: bool,
     accepting_rooms: bool,
+    session_count: u64,
+    reconnect_generation: u64,
+    process_epoch: String,
+    registration_epoch: String,
+    peer_process_epoch: Option<String>,
+    peer_registration_epoch: Option<String>,
     active_handles: usize,
     result_slots: usize,
     abort_generation: u64,
     last_pd_reason: Option<String>,
+    fatal_generation: Option<u64>,
+    fatal_source: Option<String>,
+    fatal_duplicate_sources: u64,
+    drain_generation: u64,
+    shutdown_phase: String,
+    shutdown_outcome: Option<String>,
+    worker_lifecycle: String,
 }
 
 #[pyclass(name = "PdResourceSnapshot", frozen, get_all)]
@@ -237,6 +262,22 @@ impl PyPdReadinessHandle {
             local_ready: snapshot.runtime.local_ready,
             pair_ready: snapshot.runtime.pair_ready,
             accepting_rooms: snapshot.accepting_rooms,
+            session_count: snapshot.runtime.session_count,
+            reconnect_generation: snapshot.runtime.reconnect_generation,
+            process_epoch: uuid::Uuid::from_bytes(snapshot.runtime.process_epoch.as_bytes())
+                .to_string(),
+            registration_epoch: uuid::Uuid::from_bytes(
+                snapshot.runtime.registration_epoch.as_bytes(),
+            )
+            .to_string(),
+            peer_process_epoch: snapshot
+                .runtime
+                .peer_process_epoch
+                .map(|epoch| uuid::Uuid::from_bytes(epoch.into_array()).to_string()),
+            peer_registration_epoch: snapshot
+                .runtime
+                .peer_registration_epoch
+                .map(|epoch| uuid::Uuid::from_bytes(epoch.into_array()).to_string()),
             active_handles: snapshot.active_handles,
             result_slots: snapshot.result_slots,
             abort_generation: snapshot.abort_generation,
@@ -245,6 +286,19 @@ impl PyPdReadinessHandle {
                 .last_reason
                 .or(snapshot.last_abort_reason)
                 .map(|reason| reason.code().to_string()),
+            fatal_generation: snapshot.runtime.fatal.map(|fatal| fatal.generation),
+            fatal_source: snapshot
+                .runtime
+                .fatal
+                .map(|fatal| fatal_source_name(fatal.source).to_string()),
+            fatal_duplicate_sources: snapshot.runtime.fatal_duplicate_sources,
+            drain_generation: snapshot.runtime.drain_generation,
+            shutdown_phase: shutdown_phase_name(snapshot.runtime.shutdown_phase).to_string(),
+            shutdown_outcome: snapshot
+                .runtime
+                .shutdown_outcome
+                .map(|outcome| shutdown_outcome_name(outcome).to_string()),
+            worker_lifecycle: worker_lifecycle_name(snapshot.runtime.worker).to_string(),
         }
     }
 }
@@ -332,7 +386,9 @@ impl PyPdTransport {
                     NativeBootstrapPort::new(role, endpoint, layout_fingerprint, regions)
                 })
                 .map_err(|reason| py_transport_error(TransportError::LocalFatal(reason)))?;
-            let registration_epoch = port.registration_epoch();
+            let registration_epoch = port
+                .registration_epoch()
+                .map_err(|reason| py_transport_error(TransportError::LocalFatal(reason)))?;
             if configured_registration_epoch
                 .is_some_and(|configured| configured != registration_epoch)
             {
@@ -676,16 +732,22 @@ impl PyPdTransport {
         self.dispatch(py, |reply| TransportCommand::Snapshot { reply })
     }
 
-    fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
+    fn shutdown(&self, py: Python<'_>) -> PyResult<String> {
         if self
             .worker
             .lock()
             .map_err(|_| py_transport_error(TransportError::LocalFatal(PdReason::LocalFatal)))?
             .is_none()
         {
-            return Ok(());
+            let outcome = self
+                .readiness
+                .snapshot()
+                .runtime
+                .shutdown_outcome
+                .unwrap_or(crate::pd::runtime::RuntimeShutdownOutcome::FatalUnsafe);
+            return Ok(shutdown_outcome_name(outcome).to_string());
         }
-        self.dispatch(py, |reply| TransportCommand::Shutdown { reply })?;
+        let outcome = self.dispatch(py, |reply| TransportCommand::Shutdown { reply })?;
         if let Some(worker) = self
             .worker
             .lock()
@@ -696,7 +758,7 @@ impl PyPdTransport {
                 py_transport_error(TransportError::LocalFatal(PdReason::LocalFatal))
             })?;
         }
-        Ok(())
+        Ok(shutdown_outcome_name(outcome).to_string())
     }
 }
 
@@ -738,8 +800,19 @@ impl Drop for PyPdTransport {
             return;
         };
         let (reply, response) = std::sync::mpsc::sync_channel(1);
-        let _ = self.commands.send(TransportCommand::Shutdown { reply });
-        let _ = response.recv();
-        let _ = worker.join();
+        if self
+            .commands
+            .try_send(TransportCommand::Shutdown { reply })
+            .is_ok()
+        {
+            let _ = response.recv_timeout(Duration::from_millis(100));
+        }
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while !worker.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if worker.is_finished() {
+            let _ = worker.join();
+        }
     }
 }

@@ -5,9 +5,10 @@ use crate::mooncake::{MemoryBuffer, Region as MooncakeRegion};
 use crate::pd::buffer::{
     AUX_BYTES, BufferError, CapacityLedger, CompletionRecordInput, CompletionWrites,
     CudaEventSourceFence, CudaHostFlushPort, DataPlaneEffect, DataPlaneIdentity, DataPlaneWorker,
-    DestinationExecutor, DestinationRecordPort, DestinationVisibilityFence, LeaseHandle,
-    QuarantineManager, ReservationRequest, SourceExecutor, SourceWorkRequest, TableUseTracker,
-    TransferPlan, TransferStage, ValidatedCompletion,
+    DataPlaneWorkerState, DestinationExecutor, DestinationRecordPort, DestinationVisibilityFence,
+    LeaseHandle, NativeBatchToken, NativeObservationTicket, QUARANTINE_HARD_DEADLINE_MS,
+    QuarantineManager, QuarantineUpdate, ReservationRequest, SourceExecutor, SourceWorkRequest,
+    TableUseTracker, TransferPlan, TransferStage, ValidatedCompletion,
 };
 use crate::pd::config::PdProfileV1;
 use crate::pd::room::{Clock, PdReason, SystemClock};
@@ -19,9 +20,25 @@ use super::PyPdResourceSnapshot;
 pub(super) struct NativeSender {
     worker: DataPlaneWorker,
     ledger: Arc<CapacityLedger>,
+    quarantine: Arc<QuarantineManager>,
     clock: Arc<SystemClock>,
     deadline_ms: u64,
     leases: HashMap<u64, LeaseHandle>,
+    quarantined: HashMap<u64, QuarantinedLease>,
+}
+
+struct QuarantinedLease {
+    lease: LeaseHandle,
+    batch: NativeBatchToken,
+    expected_lengths: Vec<u64>,
+    observation: Option<NativeObservationTicket>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeLifecycleEffect {
+    Idle,
+    Released { raw_handle: u64 },
+    HardDeadline,
 }
 
 impl NativeSender {
@@ -29,7 +46,7 @@ impl NativeSender {
         port: &NativeBootstrapPort,
         profile: &PdProfileV1,
     ) -> Result<Self, TransportError> {
-        let table = port.table();
+        let table = port.table().map_err(TransportError::LocalFatal)?;
         let ledger = Arc::new(CapacityLedger::new(
             profile,
             table.tracker(),
@@ -39,7 +56,7 @@ impl NativeSender {
         let clock = Arc::new(SystemClock::default());
         let executor = Arc::new(SourceExecutor::new(
             Arc::clone(&ledger),
-            quarantine,
+            Arc::clone(&quarantine),
             Arc::clone(&clock),
         ));
         let stage = port.take_stage_port().map_err(TransportError::LocalFatal)?;
@@ -47,9 +64,11 @@ impl NativeSender {
         Ok(Self {
             worker,
             ledger,
+            quarantine,
             clock,
             deadline_ms: profile.deadline_ms.native_transfer,
             leases: HashMap::new(),
+            quarantined: HashMap::new(),
         })
     }
 
@@ -100,9 +119,23 @@ impl NativeSender {
                 self.leases.insert(raw_handle, lease);
                 Ok(())
             }
-            DataPlaneEffect::TransferFailed { reason, .. }
-            | DataPlaneEffect::Quarantined { reason, .. } => {
-                Err(TransportError::LocalFatal(reason))
+            DataPlaneEffect::TransferFailed { reason, .. } => Err(TransportError::Room(reason)),
+            DataPlaneEffect::Quarantined {
+                batch,
+                expected_lengths,
+                reason,
+                ..
+            } => {
+                self.quarantined.insert(
+                    raw_handle,
+                    QuarantinedLease {
+                        lease,
+                        batch,
+                        expected_lengths,
+                        observation: None,
+                    },
+                );
+                Err(TransportError::Room(reason))
             }
             DataPlaneEffect::TransferComplete { .. } => Err(TransportError::InvalidTransition),
         }
@@ -124,14 +157,103 @@ impl NativeSender {
     }
 
     pub(super) fn abort(&mut self, raw_handle: u64) -> Result<(), TransportError> {
+        if self.quarantined.contains_key(&raw_handle) {
+            return Err(TransportError::Room(PdReason::TransferTimeout));
+        }
         if self.leases.contains_key(&raw_handle) {
             self.finish_after_ack(raw_handle)?;
         }
         Ok(())
     }
 
+    pub(super) fn lifecycle_tick(&mut self) -> Result<NativeLifecycleEffect, TransportError> {
+        if self.worker.lifecycle() == DataPlaneWorkerState::Failed {
+            return Err(TransportError::LocalFatal(PdReason::LocalFatal));
+        }
+        let Some(raw_handle) = self.quarantined.keys().next().copied() else {
+            return Ok(NativeLifecycleEffect::Idle);
+        };
+        let entry = self
+            .quarantined
+            .get_mut(&raw_handle)
+            .ok_or(TransportError::StaleHandle)?;
+        if entry.observation.is_none() {
+            match self
+                .worker
+                .try_observe_native(entry.batch, &entry.expected_lengths)
+            {
+                Ok(observation) => entry.observation = Some(observation),
+                Err(BufferError::WorkerFull) => return Ok(NativeLifecycleEffect::Idle),
+                Err(error) => return Err(buffer_error(error)),
+            }
+            return Ok(NativeLifecycleEffect::Idle);
+        }
+        let Some(safety) = entry
+            .observation
+            .as_ref()
+            .ok_or(TransportError::InvalidTransition)?
+            .try_wait()
+            .map_err(buffer_error)?
+        else {
+            return Ok(NativeLifecycleEffect::Idle);
+        };
+        entry.observation.take();
+        match self
+            .quarantine
+            .observe(
+                entry.lease,
+                entry.batch,
+                safety,
+                self.clock.now_monotonic_ms(),
+            )
+            .map_err(buffer_error)?
+        {
+            QuarantineUpdate::Pending => Ok(NativeLifecycleEffect::Idle),
+            QuarantineUpdate::Released | QuarantineUpdate::AlreadyApplied => {
+                self.quarantined.remove(&raw_handle);
+                Ok(NativeLifecycleEffect::Released { raw_handle })
+            }
+            QuarantineUpdate::LocalFatal => Ok(NativeLifecycleEffect::HardDeadline),
+        }
+    }
+
+    pub(super) fn has_unsafe_leases(&self) -> bool {
+        !self.quarantined.is_empty()
+    }
+
+    pub(super) fn isolate_peer(&mut self) -> Result<bool, TransportError> {
+        for raw_handle in self.leases.keys().copied().collect::<Vec<_>>() {
+            self.abort(raw_handle)?;
+        }
+        Ok(self.has_unsafe_leases())
+    }
+
+    pub(super) fn shutdown_worker(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<DataPlaneWorkerState, TransportError> {
+        if self.has_unsafe_leases() {
+            return Err(TransportError::LocalFatal(PdReason::LocalFatal));
+        }
+        for raw_handle in self.leases.keys().copied().collect::<Vec<_>>() {
+            self.abort(raw_handle)?;
+        }
+        self.worker.shutdown(timeout).map_err(buffer_error)
+    }
+
+    pub(super) fn shutdown_worker_unsafe(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<DataPlaneWorkerState, TransportError> {
+        self.worker.shutdown(timeout).map_err(buffer_error)
+    }
+
     pub(super) fn resource_snapshot(&self) -> PyPdResourceSnapshot {
-        resource_snapshot(&self.ledger, self.leases.len(), self.worker.pending_count())
+        resource_snapshot(
+            &self.ledger,
+            self.leases.len() + self.quarantined.len(),
+            self.worker.pending_count() + self.quarantined.len(),
+        )
     }
 }
 
@@ -141,25 +263,43 @@ pub(super) struct NativeReceiver {
     buffers: BTreeMap<u16, MemoryBuffer>,
     ledger: Arc<CapacityLedger>,
     executor: DestinationExecutor,
-    leases: HashMap<u64, LeaseHandle>,
+    clock: Arc<SystemClock>,
+    leases: HashMap<u64, DestinationLease>,
+    quarantined: HashMap<u64, QuarantinedDestinationLease>,
+}
+
+#[derive(Clone, Copy)]
+struct DestinationLease {
+    lease: LeaseHandle,
+}
+
+struct QuarantinedDestinationLease {
+    _lease: LeaseHandle,
+    entered_monotonic_ms: u64,
+    fatal_emitted: bool,
 }
 
 impl NativeReceiver {
-    pub(super) fn new(port: &NativeBootstrapPort, profile: &PdProfileV1) -> Self {
-        let table = port.table();
+    pub(super) fn new(
+        port: &NativeBootstrapPort,
+        profile: &PdProfileV1,
+    ) -> Result<Self, TransportError> {
+        let table = port.table().map_err(TransportError::LocalFatal)?;
         let ledger = Arc::new(CapacityLedger::new(
             profile,
             TableUseTracker::new(),
             table.tracker(),
         ));
-        Self {
+        Ok(Self {
             device: 5,
             table,
             buffers: port.buffers(),
             executor: DestinationExecutor::new(Arc::clone(&ledger)),
             ledger,
+            clock: Arc::new(SystemClock::default()),
             leases: HashMap::new(),
-        }
+            quarantined: HashMap::new(),
+        })
     }
 
     pub(super) fn reserve(
@@ -168,7 +308,7 @@ impl NativeReceiver {
         plan: &TransferPlan,
         deadline_monotonic_ms: u64,
     ) -> Result<(), TransportError> {
-        if self.leases.contains_key(&raw_handle) {
+        if self.leases.contains_key(&raw_handle) || self.quarantined.contains_key(&raw_handle) {
             return Err(TransportError::StaleHandle);
         }
         for block in plan.kv_blocks() {
@@ -186,7 +326,7 @@ impl NativeReceiver {
             .ledger
             .reserve(reservation(plan, deadline_monotonic_ms))
             .map_err(buffer_error)?;
-        self.leases.insert(raw_handle, lease);
+        self.leases.insert(raw_handle, DestinationLease { lease });
         Ok(())
     }
 
@@ -196,10 +336,11 @@ impl NativeReceiver {
         plan: &TransferPlan,
         expected: &CompletionRecordInput,
     ) -> Result<(), TransportError> {
-        let lease = *self
+        let lease = self
             .leases
             .get(&raw_handle)
-            .ok_or(TransportError::StaleHandle)?;
+            .ok_or(TransportError::StaleHandle)?
+            .lease;
         for stage in [
             TransferStage::Kv,
             TransferStage::Aux,
@@ -244,7 +385,8 @@ impl NativeReceiver {
         let lease = self
             .leases
             .remove(&raw_handle)
-            .ok_or(TransportError::StaleHandle)?;
+            .ok_or(TransportError::StaleHandle)?
+            .lease;
         let identity = DataPlaneIdentity::from_plan(plan);
         self.executor
             .commit_after_ack(lease, identity)
@@ -261,22 +403,60 @@ impl NativeReceiver {
         Ok(completion)
     }
 
-    pub(super) fn abort(&mut self, raw_handle: u64) -> Result<(), TransportError> {
-        let Some(lease) = self.leases.remove(&raw_handle) else {
+    pub(super) fn abort_after_peer_ack(&mut self, raw_handle: u64) -> Result<(), TransportError> {
+        if self.quarantined.contains_key(&raw_handle) {
+            return Err(TransportError::Room(PdReason::TransferTimeout));
+        }
+        let Some(lease) = self.leases.remove(&raw_handle).map(|entry| entry.lease) else {
             return Ok(());
         };
-        match self.ledger.abort_pre_submit(lease) {
-            Ok(_) => Ok(()),
-            Err(_) => self
-                .ledger
-                .release_failed_safe(lease)
-                .map(|_| ())
-                .map_err(buffer_error),
+        self.ledger
+            .release_failed_safe(lease)
+            .map(|_| ())
+            .map_err(buffer_error)
+    }
+
+    pub(super) fn isolate_peer(&mut self) -> Result<(), TransportError> {
+        let entered_monotonic_ms = self.clock.now_monotonic_ms();
+        for (raw_handle, entry) in self.leases.drain() {
+            self.ledger
+                .quarantine_remote_exposed(entry.lease)
+                .map_err(buffer_error)?;
+            self.quarantined.insert(
+                raw_handle,
+                QuarantinedDestinationLease {
+                    _lease: entry.lease,
+                    entered_monotonic_ms,
+                    fatal_emitted: false,
+                },
+            );
         }
+        Ok(())
+    }
+
+    pub(super) fn lifecycle_tick(&mut self) -> Result<NativeLifecycleEffect, TransportError> {
+        let now = self.clock.now_monotonic_ms();
+        for entry in self.quarantined.values_mut() {
+            if !entry.fatal_emitted
+                && now.saturating_sub(entry.entered_monotonic_ms) >= QUARANTINE_HARD_DEADLINE_MS
+            {
+                entry.fatal_emitted = true;
+                return Ok(NativeLifecycleEffect::HardDeadline);
+            }
+        }
+        Ok(NativeLifecycleEffect::Idle)
+    }
+
+    pub(super) fn has_unsafe_leases(&self) -> bool {
+        !self.quarantined.is_empty()
     }
 
     pub(super) fn resource_snapshot(&self) -> PyPdResourceSnapshot {
-        resource_snapshot(&self.ledger, self.leases.len(), 0)
+        resource_snapshot(
+            &self.ledger,
+            self.leases.len() + self.quarantined.len(),
+            self.quarantined.len(),
+        )
     }
 }
 
@@ -384,20 +564,16 @@ fn reservation(plan: &TransferPlan, deadline_monotonic_ms: u64) -> ReservationRe
 }
 
 fn buffer_error(error: BufferError) -> TransportError {
-    match error {
-        BufferError::CapacityExhausted { .. } | BufferError::WorkerFull => {
-            TransportError::CapacityExhausted
-        }
-        BufferError::StaleRegistration | BufferError::StaleHandle => TransportError::StaleHandle,
-        BufferError::InvalidDescriptor { .. }
-        | BufferError::PlanLimit { .. }
-        | BufferError::PlanMismatch { .. }
-        | BufferError::DataRecord { .. } => TransportError::LocalFatal(PdReason::ProtocolMismatch),
-        BufferError::SourceFence
-        | BufferError::VisibilityFence
-        | BufferError::NativeTransfer
-        | BufferError::Deadline => TransportError::LocalFatal(PdReason::TransferFailed),
-        _ => TransportError::InvalidTransition,
+    let class = crate::pd::runtime::FailureClass::for_buffer(&error);
+    match class.scope {
+        crate::pd::runtime::FailureScope::Request => match class.reason {
+            PdReason::CapacityExhausted => TransportError::CapacityExhausted,
+            PdReason::StaleEpoch => TransportError::StaleHandle,
+            _ => TransportError::InvalidBatch,
+        },
+        crate::pd::runtime::FailureScope::Room => TransportError::Room(class.reason),
+        crate::pd::runtime::FailureScope::PeerSession => TransportError::Peer(class.reason),
+        crate::pd::runtime::FailureScope::LocalFatal => TransportError::LocalFatal(class.reason),
     }
 }
 
@@ -508,9 +684,16 @@ mod tests {
         let (prefill, _prefill_owners) = native_port(Role::Prefill, 19100);
         let (decode, _decode_owners) = native_port(Role::Decode, 19101);
         connect_prefill(&prefill, &decode);
-        let transfer = plan(prefill.registration_epoch(), decode.registration_epoch());
+        let transfer = plan(
+            prefill.registration_epoch().expect("prefill epoch"),
+            decode.registration_epoch().expect("decode epoch"),
+        );
 
-        let mut receiver = NativeReceiver::new(&decode, &profile);
+        let mut receiver = NativeReceiver::new(&decode, &profile).expect("receiver");
+        assert_eq!(
+            receiver.lifecycle_tick().expect("idle receiver"),
+            NativeLifecycleEffect::Idle
+        );
         receiver
             .reserve(11, &transfer, u64::MAX)
             .expect("receiver reserve");
@@ -521,12 +704,44 @@ mod tests {
         let snapshot = receiver.resource_snapshot();
         assert_eq!(snapshot.native_leases, 1);
         assert_eq!(snapshot.destination_kv_pages, 1);
-        receiver.abort(11).expect("receiver pre-submit abort");
-        receiver.abort(11).expect("receiver duplicate abort");
+        receiver
+            .abort_after_peer_ack(11)
+            .expect("receiver abort after safe peer ack");
+        receiver
+            .abort_after_peer_ack(11)
+            .expect("receiver duplicate abort");
         assert_eq!(receiver.resource_snapshot().native_leases, 0);
+
+        let exposed_transfer = plan(
+            prefill.registration_epoch().expect("prefill epoch"),
+            decode.registration_epoch().expect("decode epoch"),
+        );
+        receiver
+            .reserve(12, &exposed_transfer, u64::MAX)
+            .expect("receiver exposed reserve");
+        receiver.isolate_peer().expect("isolate exposed peer");
+        assert!(receiver.has_unsafe_leases());
+        assert_eq!(
+            receiver
+                .lifecycle_tick()
+                .expect("pending receiver quarantine"),
+            NativeLifecycleEffect::Idle
+        );
+        assert_eq!(
+            receiver.abort_after_peer_ack(12),
+            Err(TransportError::Room(PdReason::TransferTimeout))
+        );
+        let snapshot = receiver.resource_snapshot();
+        assert_eq!(snapshot.native_leases, 1);
+        assert_eq!(snapshot.destination_kv_pages, 1);
+        assert_eq!(snapshot.quarantined_rooms, 1);
 
         let mut sender = NativeSender::new(&prefill, &profile).expect("sender");
         assert_eq!(sender.resource_snapshot().native_leases, 0);
+        assert_eq!(
+            sender.lifecycle_tick().expect("idle sender"),
+            NativeLifecycleEffect::Idle
+        );
         sender.abort(77).expect("unknown sender abort");
         let deadline = u64::MAX;
         let lease = sender
@@ -548,8 +763,112 @@ mod tests {
                 .finish_stage(lease, stage)
                 .expect("finish stage");
         }
-        sender.abort(77).expect("safe sender abort");
+        assert!(!sender.isolate_peer().expect("safe sender isolation"));
         assert_eq!(sender.resource_snapshot().native_leases, 0);
+        assert_eq!(
+            sender
+                .shutdown_worker(std::time::Duration::from_secs(1))
+                .expect("safe sender worker shutdown"),
+            DataPlaneWorkerState::Joined
+        );
+        assert_eq!(
+            sender
+                .shutdown_worker(std::time::Duration::from_secs(1))
+                .expect("duplicate sender worker shutdown"),
+            DataPlaneWorkerState::Joined
+        );
+
+        let (unsafe_prefill, _unsafe_prefill_owners) = native_port(Role::Prefill, 19102);
+        let (unsafe_decode, _unsafe_decode_owners) = native_port(Role::Decode, 19103);
+        connect_prefill(&unsafe_prefill, &unsafe_decode);
+        let unsafe_transfer = plan(
+            unsafe_prefill
+                .registration_epoch()
+                .expect("unsafe prefill epoch"),
+            unsafe_decode
+                .registration_epoch()
+                .expect("unsafe decode epoch"),
+        );
+        let mut unsafe_sender =
+            NativeSender::new(&unsafe_prefill, &profile).expect("unsafe sender");
+        let unsafe_lease = unsafe_sender
+            .ledger
+            .reserve(reservation(&unsafe_transfer, u64::MAX))
+            .expect("unsafe lease");
+        unsafe_sender
+            .ledger
+            .begin_stage(unsafe_lease, TransferStage::Kv)
+            .expect("submitted stage");
+        let batch = NativeBatchToken::new(99).expect("batch token");
+        unsafe_sender
+            .quarantine
+            .insert(
+                unsafe_lease,
+                batch,
+                unsafe_sender.clock.now_monotonic_ms(),
+                PdReason::TransferTimeout,
+            )
+            .expect("quarantine lease");
+        unsafe_sender.quarantined.insert(
+            88,
+            QuarantinedLease {
+                lease: unsafe_lease,
+                batch,
+                expected_lengths: vec![131_072],
+                observation: None,
+            },
+        );
+        assert_eq!(
+            unsafe_sender
+                .lifecycle_tick()
+                .expect("schedule native observation"),
+            NativeLifecycleEffect::Idle
+        );
+        assert!(
+            unsafe_sender
+                .quarantined
+                .get(&88)
+                .expect("quarantined handle")
+                .observation
+                .is_some()
+        );
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            assert_eq!(
+                unsafe_sender
+                    .lifecycle_tick()
+                    .expect("observe pending native batch"),
+                NativeLifecycleEffect::Idle
+            );
+            if unsafe_sender
+                .quarantined
+                .get(&88)
+                .expect("quarantined handle")
+                .observation
+                .is_none()
+            {
+                break;
+            }
+        }
+        assert!(
+            unsafe_sender
+                .quarantined
+                .get(&88)
+                .expect("quarantined handle")
+                .observation
+                .is_none()
+        );
+        assert!(unsafe_sender.has_unsafe_leases());
+        assert_eq!(
+            unsafe_sender.shutdown_worker(std::time::Duration::from_secs(1)),
+            Err(TransportError::LocalFatal(PdReason::LocalFatal))
+        );
+        assert_eq!(
+            unsafe_sender
+                .shutdown_worker_unsafe(std::time::Duration::from_secs(1))
+                .expect("unsafe worker shutdown"),
+            DataPlaneWorkerState::Joined
+        );
     }
 
     #[test]
@@ -607,15 +926,15 @@ mod tests {
         );
         assert_eq!(
             buffer_error(BufferError::PlanMismatch { field: "test" }),
-            TransportError::LocalFatal(PdReason::ProtocolMismatch)
+            TransportError::InvalidBatch
         );
         assert_eq!(
             buffer_error(BufferError::SourceFence),
-            TransportError::LocalFatal(PdReason::TransferFailed)
+            TransportError::Room(PdReason::TransferFailed)
         );
         assert_eq!(
             buffer_error(BufferError::InvalidTransition),
-            TransportError::InvalidTransition
+            TransportError::LocalFatal(PdReason::LocalFatal)
         );
     }
 }

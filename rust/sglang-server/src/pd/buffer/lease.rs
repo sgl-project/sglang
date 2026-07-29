@@ -392,6 +392,27 @@ impl CapacityLedger {
         Ok(TransitionResult::Applied)
     }
 
+    /// Quarantine a destination lease after its descriptor was exposed to a
+    /// remote peer. The local stage can still be `Kv` because remote DMA is
+    /// not represented by this endpoint's stage tracker.
+    pub(crate) fn quarantine_remote_exposed(
+        &self,
+        handle: LeaseHandle,
+    ) -> Result<TransitionResult, BufferError> {
+        let mut state = self.lock()?;
+        if state.terminal.contains(&handle) {
+            return Ok(TransitionResult::AlreadyApplied);
+        }
+        let room = room_mut(&mut state, handle)?;
+        if room.quarantined {
+            return Ok(TransitionResult::AlreadyApplied);
+        }
+        room.quarantined = true;
+        room.source_table_use.quarantine();
+        room.destination_table_use.quarantine();
+        Ok(TransitionResult::Applied)
+    }
+
     pub fn release_failed_safe(
         &self,
         handle: LeaseHandle,

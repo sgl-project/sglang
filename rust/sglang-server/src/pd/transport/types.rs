@@ -159,6 +159,10 @@ pub enum TransportError {
     WrongRole,
     #[error("PD transport transition is invalid")]
     InvalidTransition,
+    #[error("PD Room reached a typed terminal: {0:?}")]
+    Room(PdReason),
+    #[error("PD peer session failed: {0:?}")]
+    Peer(PdReason),
     #[error("PD transport entered a local fatal state: {0:?}")]
     LocalFatal(PdReason),
 }
@@ -172,7 +176,7 @@ impl TransportError {
             Self::StaleHandle => PdReason::StaleEpoch,
             Self::WrongRole => PdReason::Unsupported,
             Self::InvalidTransition => PdReason::ProtocolMismatch,
-            Self::LocalFatal(reason) => *reason,
+            Self::Room(reason) | Self::Peer(reason) | Self::LocalFatal(reason) => *reason,
         }
     }
 }

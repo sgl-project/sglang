@@ -6,6 +6,11 @@ use crate::pd::room::{
     Clock, PdReason, ProcessEpoch, RegistrationEpoch, RoomId, RoomSnapshot, RoomTable,
 };
 
+use super::{
+    FatalPublish, FatalRecord, FatalSource, FirstFatal, RuntimeShutdownOutcome, ShutdownMode,
+    ShutdownPhase, ShutdownTracker, WorkerLifecycle,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeLifecycle {
     Starting,
@@ -35,6 +40,7 @@ pub struct RuntimeSnapshot {
     pub local_ready: bool,
     pub pair_ready: bool,
     pub session_count: u64,
+    pub reconnect_generation: u64,
     pub process_epoch: ProcessEpoch,
     pub registration_epoch: RegistrationEpoch,
     pub peer_process_epoch: Option<FixedBytes<16>>,
@@ -43,6 +49,12 @@ pub struct RuntimeSnapshot {
     pub active_rooms: usize,
     pub tombstones: usize,
     pub last_reason: Option<PdReason>,
+    pub fatal: Option<FatalRecord>,
+    pub fatal_duplicate_sources: u64,
+    pub drain_generation: u64,
+    pub shutdown_phase: ShutdownPhase,
+    pub shutdown_outcome: Option<RuntimeShutdownOutcome>,
+    pub worker: WorkerLifecycle,
 }
 
 impl RuntimeSnapshot {
@@ -58,6 +70,7 @@ impl RuntimeSnapshot {
             local_ready: false,
             pair_ready: false,
             session_count: 0,
+            reconnect_generation: 0,
             process_epoch,
             registration_epoch,
             peer_process_epoch: None,
@@ -66,6 +79,12 @@ impl RuntimeSnapshot {
             active_rooms: 0,
             tombstones: 0,
             last_reason: None,
+            fatal: None,
+            fatal_duplicate_sources: 0,
+            drain_generation: 0,
+            shutdown_phase: ShutdownPhase::Idle,
+            shutdown_outcome: None,
+            worker: WorkerLifecycle::Starting,
         }
     }
 
@@ -81,6 +100,7 @@ impl RuntimeSnapshot {
             local_ready: true,
             pair_ready: false,
             session_count: 0,
+            reconnect_generation: 0,
             process_epoch,
             registration_epoch,
             peer_process_epoch: None,
@@ -89,6 +109,12 @@ impl RuntimeSnapshot {
             active_rooms: 0,
             tombstones: 0,
             last_reason: None,
+            fatal: None,
+            fatal_duplicate_sources: 0,
+            drain_generation: 0,
+            shutdown_phase: ShutdownPhase::Idle,
+            shutdown_outcome: None,
+            worker: WorkerLifecycle::Running,
         }
     }
 
@@ -104,6 +130,9 @@ impl RuntimeSnapshot {
     pub fn leave_pair_ready(&mut self, reason: PdReason, rooms: Option<&RoomSnapshot>) {
         self.lifecycle = RuntimeLifecycle::LocalReady;
         self.pair_ready = false;
+        self.peer_process_epoch = None;
+        self.peer_registration_epoch = None;
+        self.reconnect_generation = self.reconnect_generation.saturating_add(1);
         self.last_reason = Some(reason);
         if let Some(rooms) = rooms {
             self.active_rooms = rooms.active_rooms;
@@ -114,11 +143,19 @@ impl RuntimeSnapshot {
 
 pub struct PairState {
     snapshot: RuntimeSnapshot,
+    fatal: FirstFatal,
+    shutdown: ShutdownTracker,
+    retired_peer_process_epoch: Option<FixedBytes<16>>,
 }
 
 impl PairState {
     pub const fn new(snapshot: RuntimeSnapshot) -> Self {
-        Self { snapshot }
+        Self {
+            snapshot,
+            fatal: FirstFatal::new(),
+            shutdown: ShutdownTracker::new(),
+            retired_peer_process_epoch: None,
+        }
     }
 
     pub fn enter_local_ready(&mut self) -> Result<(), PdReason> {
@@ -128,6 +165,7 @@ impl PairState {
         self.snapshot.lifecycle = RuntimeLifecycle::LocalReady;
         self.snapshot.local_ready = true;
         self.snapshot.last_reason = None;
+        self.snapshot.worker = WorkerLifecycle::Running;
         Ok(())
     }
 
@@ -136,25 +174,15 @@ impl PairState {
         readiness: &PairReadiness,
         rooms: &mut RoomTable,
     ) -> Result<Vec<RoomId>, PdReason> {
-        if !self.snapshot.local_ready
-            || !readiness.ready
-            || readiness.role != self.snapshot.role
-            || readiness.local_process_epoch
-                != FixedBytes::new(self.snapshot.process_epoch.as_bytes())
-            || readiness.local_registration_epoch
-                != FixedBytes::new(self.snapshot.registration_epoch.as_bytes())
-            || readiness.profile_digest != self.snapshot.profile_digest
-        {
-            return Err(PdReason::ProtocolMismatch);
-        }
-        if self.snapshot.pair_ready
-            && self.snapshot.peer_process_epoch == Some(readiness.peer_process_epoch)
-        {
-            return Err(PdReason::ProtocolMismatch);
-        }
+        self.validate_candidate(readiness)?;
         let replacing_peer = self.snapshot.pair_ready;
         let terminated = if replacing_peer {
-            rooms.fail_all(PdReason::PeerUnavailable)
+            self.retired_peer_process_epoch = self.snapshot.peer_process_epoch;
+            let terminated = rooms.fail_all(PdReason::PeerUnavailable);
+            let room_snapshot = rooms.snapshot();
+            self.snapshot
+                .leave_pair_ready(PdReason::PeerUnavailable, Some(&room_snapshot));
+            terminated
         } else {
             Vec::new()
         };
@@ -172,8 +200,41 @@ impl PairState {
         Ok(terminated)
     }
 
+    pub fn validate_candidate(&self, readiness: &PairReadiness) -> Result<(), PdReason> {
+        if !self.snapshot.local_ready
+            || !readiness.ready
+            || readiness.role != self.snapshot.role
+            || readiness.local_process_epoch
+                != FixedBytes::new(self.snapshot.process_epoch.as_bytes())
+            || readiness.local_registration_epoch
+                != FixedBytes::new(self.snapshot.registration_epoch.as_bytes())
+            || readiness.profile_digest != self.snapshot.profile_digest
+        {
+            return Err(PdReason::ProtocolMismatch);
+        }
+        if self.snapshot.pair_ready
+            && self.snapshot.peer_process_epoch == Some(readiness.peer_process_epoch)
+        {
+            return Err(PdReason::ProtocolMismatch);
+        }
+        if self.retired_peer_process_epoch == Some(readiness.peer_process_epoch) {
+            return Err(PdReason::ProtocolMismatch);
+        }
+        if !matches!(
+            self.snapshot.lifecycle,
+            RuntimeLifecycle::LocalReady | RuntimeLifecycle::PairReady
+        ) {
+            return Err(PdReason::ProtocolMismatch);
+        }
+        Ok(())
+    }
+
     pub fn disconnect(&mut self, rooms: &mut RoomTable) -> Vec<RoomId> {
+        if self.snapshot.lifecycle != RuntimeLifecycle::PairReady {
+            return Vec::new();
+        }
         let terminated = rooms.fail_all(PdReason::PeerUnavailable);
+        self.retired_peer_process_epoch = self.snapshot.peer_process_epoch;
         let rooms = rooms.snapshot();
         self.snapshot
             .leave_pair_ready(PdReason::PeerUnavailable, Some(&rooms));
@@ -196,37 +257,104 @@ impl PairState {
         self.snapshot.tombstones = rooms.tombstones;
     }
 
-    pub fn begin_draining(&mut self, rooms: Option<&RoomSnapshot>) {
+    pub fn begin_draining(
+        &mut self,
+        mode: ShutdownMode,
+        rooms: Option<&RoomSnapshot>,
+    ) -> Result<u64, PdReason> {
+        if matches!(
+            self.snapshot.lifecycle,
+            RuntimeLifecycle::Draining | RuntimeLifecycle::Stopped
+        ) {
+            return Ok(self.shutdown.generation());
+        }
+        if self.snapshot.lifecycle == RuntimeLifecycle::Fatal {
+            let generation = self.shutdown.begin(ShutdownMode::Fatal);
+            self.snapshot.drain_generation = generation;
+            self.snapshot.shutdown_phase = self.shutdown.phase();
+            return Ok(generation);
+        }
+        if !self
+            .snapshot
+            .lifecycle
+            .can_transition_to(RuntimeLifecycle::Draining)
+        {
+            return Err(PdReason::ProtocolMismatch);
+        }
+        let generation = self.shutdown.begin(mode);
         self.snapshot.lifecycle = RuntimeLifecycle::Draining;
         self.snapshot.pair_ready = false;
+        self.snapshot.drain_generation = generation;
+        self.snapshot.shutdown_phase = self.shutdown.phase();
+        self.snapshot.worker = WorkerLifecycle::Quiescing;
         if let Some(rooms) = rooms {
             self.update_rooms(rooms);
         }
+        Ok(generation)
     }
 
-    pub fn mark_fatal(&mut self, reason: PdReason, rooms: Option<&RoomSnapshot>) {
-        self.snapshot.lifecycle = RuntimeLifecycle::Fatal;
-        self.snapshot.local_ready = false;
-        self.snapshot.pair_ready = false;
-        self.snapshot.last_reason = Some(if reason == PdReason::Success {
-            PdReason::LocalFatal
-        } else {
-            reason
-        });
-        if let Some(rooms) = rooms {
-            self.update_rooms(rooms);
+    pub fn publish_fatal(
+        &mut self,
+        source: FatalSource,
+        reason: PdReason,
+        rooms: Option<&mut RoomTable>,
+    ) -> FatalPublish {
+        let published = self.fatal.publish(source, reason);
+        let fatal = self.fatal.snapshot();
+        self.snapshot.fatal = fatal.first;
+        self.snapshot.fatal_duplicate_sources = fatal.duplicate_sources;
+        if let FatalPublish::First(record) = published {
+            self.snapshot.lifecycle = RuntimeLifecycle::Fatal;
+            self.snapshot.local_ready = false;
+            self.snapshot.pair_ready = false;
+            self.snapshot.last_reason = Some(record.reason);
+            self.snapshot.worker = if source == FatalSource::WorkerExit {
+                WorkerLifecycle::Failed
+            } else {
+                WorkerLifecycle::Quiescing
+            };
+            if let Some(rooms) = rooms {
+                rooms.fail_all(record.reason);
+                self.update_rooms(&rooms.snapshot());
+            }
         }
+        published
     }
 
-    pub fn stop(&mut self, rooms: Option<&RoomSnapshot>) {
+    pub fn mark_fatal(&mut self, reason: PdReason, rooms: Option<&mut RoomTable>) {
+        self.publish_fatal(FatalSource::ProtocolInvariant, reason, rooms);
+    }
+
+    pub fn advance_shutdown(&mut self, phase: ShutdownPhase) -> Result<(), PdReason> {
+        self.shutdown.advance(phase)?;
+        self.snapshot.shutdown_phase = phase;
+        if phase == ShutdownPhase::WorkerJoin {
+            self.snapshot.worker = WorkerLifecycle::Joined;
+        }
+        Ok(())
+    }
+
+    pub fn stop(
+        &mut self,
+        outcome: RuntimeShutdownOutcome,
+        rooms: Option<&RoomSnapshot>,
+    ) -> Result<RuntimeShutdownOutcome, PdReason> {
+        let outcome = self.shutdown.complete(outcome)?;
         self.snapshot.lifecycle = RuntimeLifecycle::Stopped;
         self.snapshot.local_ready = false;
         self.snapshot.pair_ready = false;
+        self.snapshot.shutdown_phase = self.shutdown.phase();
+        self.snapshot.shutdown_outcome = Some(outcome);
+        self.snapshot.worker = WorkerLifecycle::Joined;
         if let Some(rooms) = rooms {
             self.update_rooms(rooms);
         }
+        Ok(outcome)
     }
 }
+
+/// Backward-compatible name for the process-wide lifecycle coordinator.
+pub type LifecycleCoordinator = PairState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeartbeatAction {
@@ -241,6 +369,7 @@ pub struct HeartbeatTracker {
     next_deadline_monotonic_ms: u64,
     next_ping_id: u64,
     outstanding_ping: Option<u64>,
+    last_pong_id: Option<u64>,
     consecutive_misses: u8,
     clock: Arc<dyn Clock>,
 }
@@ -259,6 +388,7 @@ impl HeartbeatTracker {
             next_deadline_monotonic_ms: now.saturating_add(profile.deadline_ms.heartbeat_interval),
             next_ping_id: 1,
             outstanding_ping: None,
+            last_pong_id: None,
             consecutive_misses: 0,
             clock,
         })
@@ -287,6 +417,7 @@ impl HeartbeatTracker {
             return Err(PdReason::ProtocolMismatch);
         }
         self.outstanding_ping = None;
+        self.last_pong_id = Some(ping_id);
         self.consecutive_misses = 0;
         self.next_deadline_monotonic_ms = self
             .clock
@@ -298,4 +429,19 @@ impl HeartbeatTracker {
     pub const fn consecutive_misses(&self) -> u8 {
         self.consecutive_misses
     }
+
+    pub const fn snapshot(&self) -> HeartbeatSnapshot {
+        HeartbeatSnapshot {
+            outstanding_ping: self.outstanding_ping,
+            last_pong_id: self.last_pong_id,
+            consecutive_misses: self.consecutive_misses,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatSnapshot {
+    pub outstanding_ping: Option<u64>,
+    pub last_pong_id: Option<u64>,
+    pub consecutive_misses: u8,
 }

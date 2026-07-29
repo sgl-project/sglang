@@ -40,9 +40,13 @@ pub use lease::{
 };
 pub use native::{AuthenticatedRemoteRegionTable, MooncakeNativeStagePort};
 pub use plan::{TransferPlan, TransferPlanDigest, TransferPlanInput};
-pub use quarantine::{NativeBatchToken, QuarantineManager, QuarantineSnapshot, QuarantineUpdate};
+pub use quarantine::{
+    NativeBatchToken, QUARANTINE_HARD_DEADLINE_MS, QuarantineManager, QuarantineSnapshot,
+    QuarantineUpdate,
+};
 pub use worker::{
-    DataPlaneWorker, DataPlaneWorkerTicket, DestinationWorkRequest, SourceWorkRequest,
+    DataPlaneWorker, DataPlaneWorkerState, DataPlaneWorkerTicket, DestinationWorkRequest,
+    NativeObservationTicket, SourceWorkRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
