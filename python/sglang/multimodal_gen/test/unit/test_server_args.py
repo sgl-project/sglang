@@ -1862,6 +1862,24 @@ class TestSPAttentionMode(unittest.TestCase):
         self.assertEqual(args.sp_degree, 2)
         self.assertEqual(args.sp_attention_mode, "kv_gather")
 
+    def test_kv_gather_supports_fsdp_and_sp(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 2,
+                "sp_degree": 2,
+                "ulysses_degree": 2,
+                "ring_degree": 1,
+                "sp_attention_mode": "kv_gather",
+                "use_fsdp_inference": True,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertEqual(args.sp_degree, 2)
+        self.assertEqual(args.sp_attention_mode, "kv_gather")
+
     def test_kv_gather_rejects_ring_parallelism(self):
         with self.assertRaisesRegex(ValueError, "requires --ring-degree 1"):
             _from_dict_without_model_resolution(
