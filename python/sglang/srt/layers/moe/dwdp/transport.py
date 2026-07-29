@@ -9,7 +9,6 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from cuda.bindings import driver as cuda
 
 from sglang.srt.distributed.device_communicators.vmm_utils import (
     check_drv,
@@ -76,6 +75,7 @@ def _copy_local_weights_to_handles(
         set_access(temp_va, phys_size, device_id)
 
         nbytes = param.numel() * param.element_size()
+        from cuda.bindings import driver as cuda  # CUDA-only; imported lazily to avoid crash on non-CUDA platforms
         check_drv(
             cuda.cuMemcpyDtoD(temp_va + data_offset, param.data_ptr(), nbytes),
             "cuMemcpyDtoD",

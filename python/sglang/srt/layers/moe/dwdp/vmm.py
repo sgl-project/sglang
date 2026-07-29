@@ -8,7 +8,6 @@ import logging
 from typing import Tuple
 
 import torch
-from cuda.bindings import driver as cuda
 
 from sglang.srt.distributed.device_communicators.vmm_utils import (
     check_drv,
@@ -16,6 +15,42 @@ from sglang.srt.distributed.device_communicators.vmm_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _LazyCudaDriver:
+    """Proxy for cuda.bindings.driver that defers the import until first use.
+
+    DWDP is CUDA/NVLink-only, but vmm.py sits on an import chain that is
+    resolved on every platform (layout.py imports align_up/align_down from
+    here).  A top-level ``from cuda.bindings import driver`` crashes on XPU,
+    CPU, and ROCm builds where cuda-python is absent, even though no VMM
+    symbol is ever referenced on those platforms.  This proxy defers the
+    import to the first attribute access so non-CUDA platforms can load the
+    module safely.
+    """
+
+    __slots__ = ("_mod",)
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "_mod", None)
+
+    def __getattr__(self, name: str):
+        mod = object.__getattribute__(self, "_mod")
+        if mod is None:
+            try:
+                from cuda.bindings import driver as _d
+            except ImportError as exc:
+                raise ImportError(
+                    "DWDP requires cuda-python >= 13.0. "
+                    "Install it with: pip install 'cuda-python>=13.0'. "
+                    "This feature is only supported on CUDA platforms."
+                ) from exc
+            object.__setattr__(self, "_mod", _d)
+            mod = _d
+        return getattr(mod, name)
+
+
+cuda = _LazyCudaDriver()
 
 
 def align_up(value: int, alignment: int) -> int:
