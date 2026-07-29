@@ -130,6 +130,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
+        self._pp_context_feature_indices: Optional[list[int]] = None
 
         if self.ps.tp_rank == 0:
             logger.info(
@@ -272,17 +273,17 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
-            self._select_pp_local_context_features_for_injection()
+            self._init_pp_context_feature_indices()
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
         return target_model.model.get_input_embeddings()
 
-    def _select_pp_local_context_features_for_injection(self) -> None:
+    def _init_pp_context_feature_indices(self) -> None:
         if self.ps.pp_size <= 1:
             return
-        if not hasattr(self.draft_model, "select_target_context_features"):
+        if not hasattr(self.draft_model, "project_target_hidden_partial"):
             return
 
         target_layer_ids = getattr(
@@ -294,18 +295,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         target_model = self.target_worker.model_runner.model
         start_layer = int(getattr(target_model, "start_layer", 0))
         end_layer = int(getattr(target_model, "end_layer", 0))
+        target_layer_to_feature = {
+            int(layer_id): idx for idx, layer_id in enumerate(target_layer_ids)
+        }
         local_feature_indices = [
-            idx
-            for idx, layer_id in enumerate(target_layer_ids)
-            if start_layer <= int(layer_id) < end_layer
+            target_layer_to_feature[layer_id]
+            for layer_id in range(start_layer, end_layer)
+            if layer_id in target_layer_to_feature
         ]
         if not local_feature_indices:
             return
 
-        self.draft_model.select_target_context_features(local_feature_indices)
+        self._pp_context_feature_indices = local_feature_indices
         if self.ps.tp_rank == 0:
             logger.info(
-                "DSpark PP-local context projection selected feature indices %s "
+                "DSpark PP-local context projection will accumulate feature indices %s "
                 "from target layers %s for PP rank %s local layers [%s, %s).",
                 local_feature_indices,
                 list(target_layer_ids),
@@ -423,6 +427,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
             raise ValueError(
@@ -432,31 +437,35 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish)
+            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
 
     def _forward_prefill(
-        self, batch: ScheduleBatch, on_publish
+        self, batch: ScheduleBatch, on_publish, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if self.server_args.enable_dp_attention:
                 self.target_worker.forward_batch_generation(
-                    batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                    batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
         batch_output = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
         )
         logits_output = batch_output.logits_output
-        pp_proxy_tensors = batch_output.pp_hidden_states_proxy_tensors
+        output_pp_proxy_tensors = batch_output.pp_hidden_states_proxy_tensors
         target_hidden = (
             logits_output.hidden_states
             if logits_output is not None
             else (
-                pp_proxy_tensors.tensors.get("dspark_aux_hidden_states")
-                if pp_proxy_tensors is not None
+                output_pp_proxy_tensors.tensors.get("dspark_aux_hidden_states")
+                if output_pp_proxy_tensors is not None
                 else None
             )
         )
@@ -498,7 +507,41 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
-        if has_local_target_hidden:
+        incoming_ctx = (
+            pp_proxy_tensors.tensors.get("dspark_ctx_acc")
+            if pp_proxy_tensors is not None
+            else None
+        )
+        local_ctx = None
+        if (
+            self.ps.pp_size > 1
+            and has_local_target_hidden
+            and self._pp_context_feature_indices is not None
+        ):
+            local_ctx = self.draft_model.project_target_hidden_partial(
+                target_hidden, self._pp_context_feature_indices
+            )
+        ctx_acc = None
+        if incoming_ctx is not None and local_ctx is not None:
+            ctx_acc = (
+                incoming_ctx.to(device=local_ctx.device, dtype=local_ctx.dtype)
+                + local_ctx
+            )
+        elif incoming_ctx is not None:
+            ctx_acc = incoming_ctx.to(device=self.device, non_blocking=True)
+        elif local_ctx is not None:
+            ctx_acc = local_ctx
+
+        if output_pp_proxy_tensors is not None:
+            if ctx_acc is not None:
+                output_pp_proxy_tensors.tensors["dspark_ctx_acc"] = ctx_acc
+        elif ctx_acc is not None:
+            self._kv_injector.inject_projected_context(
+                projected_context=ctx_acc,
+                cache_loc=batch.out_cache_loc,
+                positions=positions,
+            )
+        elif has_local_target_hidden and not (self.ps.pp_size > 1 and not self._draft_is_moe):
             self._kv_injector.inject_target_hidden(
                 target_hidden=target_hidden,
                 cache_loc=batch.out_cache_loc,

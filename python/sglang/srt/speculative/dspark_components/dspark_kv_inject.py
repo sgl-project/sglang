@@ -77,6 +77,44 @@ class TargetHiddenKvInjector:
                 commit_lens=commit_lens,
             )
 
+    def inject_projected_context(
+        self,
+        *,
+        projected_context: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
+    ) -> None:
+        if projected_context is None or projected_context.numel() == 0:
+            return
+        device = self.model_runner.device
+        cache_loc = cache_loc.to(device=device, dtype=torch.int64, non_blocking=True)
+        positions = positions.to(device=device, dtype=torch.int64, non_blocking=True)
+        projected_context = projected_context.to(device=device, non_blocking=True)
+        n_real = positions.shape[0]
+        if projected_context.shape[0] > n_real:
+            projected_context = projected_context[:n_real]
+        if cache_loc_2d is not None:
+            cache_loc_2d = cache_loc_2d.to(
+                device=device, dtype=torch.int64, non_blocking=True
+            )
+        if commit_lens is not None:
+            commit_lens = commit_lens.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            )
+
+        pool = self.draft_model_runner.token_to_kv_pool
+        with torch.inference_mode():
+            self.draft_model.write_projected_context_kv(
+                projected_context=projected_context,
+                pool=pool,
+                positions=positions,
+                cache_loc=cache_loc,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commit_lens,
+            )
+
     def _inject_mla(
         self,
         *,

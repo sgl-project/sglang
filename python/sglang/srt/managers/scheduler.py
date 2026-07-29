@@ -3482,7 +3482,15 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    fwd_kwargs = {}
+                    if (
+                        pp_proxy_tensors is not None
+                        and batch.spec_algorithm.is_dspark()
+                    ):
+                        fwd_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **fwd_kwargs
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
