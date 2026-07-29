@@ -20,6 +20,7 @@ from sglang.srt.hardware_backend.npu.moe.matmul import (
 )
 from sglang.srt.hardware_backend.npu.moe.quant import HiddenStatesDynamicQuant
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+    _get_float4_e2m1fn_x2_dtype,
     _get_float8_e8m0fnu_dtype,
 )
 
@@ -193,8 +194,12 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
     def __init__(self):
         super().__init__(quant_config=None)
         self.matmul = GroupedMatmul()
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        if fp4_dtype is None:
+            raise RuntimeError("NPU W4A4 MXFP4 MoE requires float4 support.")
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(
-            quant_dtype=torch.float4_e2m1fn_x2
+            quant_dtype=fp4_dtype,
+            use_mx_quant=True,
         )
 
     def process_weights_after_loading(
