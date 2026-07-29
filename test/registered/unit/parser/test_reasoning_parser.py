@@ -6,6 +6,7 @@ from sglang.srt.parser.reasoning_parser import (
     Apertus2509Detector,
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
+    DeepSeekV4Detector,
     Gemma4Detector,
     Glm45Detector,
     HunyuanDetector,
@@ -167,6 +168,21 @@ class TestQwen3Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
 
 
+class TestDeepSeekV4Detector(CustomTestCase):
+    def test_strict_thinking_excludes_deepseek_control_tokens(self):
+        detector = ReasoningParser(model_type="deepseek-v4").detector
+        self.assertIsInstance(detector, DeepSeekV4Detector)
+        self.assertEqual(
+            detector.think_excluded_tokens,
+            ["<｜end▁of▁sentence｜>", "｜DSML｜"],
+        )
+
+    def test_thinking_stays_explicit_opt_in(self):
+        detector = ReasoningParser(model_type="deepseek-v4").detector
+        self.assertEqual(detector.reasoning_default, "explicit_thinking")
+        self.assertTrue(detector.thinks_internally)
+
+
 class TestInklingDetector(CustomTestCase):
     def test_streaming_routes_blocks_across_all_string_boundaries(self):
         detector = InklingDetector()
@@ -248,6 +264,24 @@ class TestInklingDetector(CustomTestCase):
             for chunk in chunks:
                 content += detector.parse_streaming_increment(chunk).normal_text
             self.assertEqual(content, " worldnext", msg=f"chunks={chunks!r}")
+
+    def test_finish_flushes_reasoning_truncated_before_end_token(self):
+        """Bug regression: with stream_reasoning=False the detector buffers the
+        thinking block and only flushes it on a control/end token. When
+        generation is cut mid-block (e.g. max_tokens) the stream ends with no
+        end token, so the buffered trace was dropped entirely; finish() must
+        emit it, matching the non-streaming detect_and_parse path."""
+        detector = InklingDetector(stream_reasoning=False)
+        source = "<|message_model|><|content_thinking|>truncated thinking"
+        streamed_reasoning = ""
+        for char in source:
+            streamed_reasoning += detector.parse_streaming_increment(
+                char
+            ).reasoning_text
+        # The block never closed, so nothing surfaces mid-stream.
+        self.assertEqual(streamed_reasoning, "")
+        # finish() flushes the buffered trace instead of dropping it.
+        self.assertEqual(detector.finish().reasoning_text, "truncated thinking")
 
 
 class TestKimiDetector(CustomTestCase):

@@ -85,6 +85,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",
                     "fp8_gemm_runner_backend",
+                    "disable_custom_all_reduce",
+                    "enable_aiter_allreduce_fusion",
                 }
             ),
         )
@@ -987,6 +989,20 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             # non-family arch declares nothing
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(arch="LlamaForCausalLM")), {}
+            )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch.object(overrides_module, "is_npu", return_value=False),
+            patch.object(overrides_module, "is_xpu", return_value=False),
+            patch.object(overrides_module, "is_hip", return_value=False),
+            patch("torch.cuda.get_device_capability", return_value=(12, 0)),
+        ):
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(arch="GlmMoeDsaForCausalLM")),
+                {
+                    "dsa_prefill_backend": "flashinfer_sparse_mla",
+                    "dsa_decode_backend": "flashinfer_sparse_mla",
+                },
             )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),

@@ -105,9 +105,13 @@ class MoeRunnerBackend(Enum):
     HUMMING = "humming"
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
+    HPC_OPS = "hpc_ops"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
+
+    def is_hpc_ops(self):
+        return self == MoeRunnerBackend.HPC_OPS
 
     def is_deep_gemm(self):
         return self == MoeRunnerBackend.DEEP_GEMM
@@ -489,6 +493,8 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
     """
     if should_skip_mlp_all_reduce():
+        return True
+    if get_server_args().dwdp_size > 1:
         return True
     if should_use_dp_reduce_scatterv():
         return True
