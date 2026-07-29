@@ -514,6 +514,7 @@ class FlyDSLEPDispatcher(BaseDispatcher):
         instance_id: int = 0,
     ):
         super().__init__()
+        os.environ.setdefault("AITER_FLYDSL_EP_NO_FAKE_EXPERT", "1")
         try:
             import flydsl  # noqa: F401
             import mori  # noqa: F401

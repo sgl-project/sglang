@@ -1,3 +1,4 @@
+import os
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
@@ -248,6 +249,26 @@ def test_telemetry_keys_distinguish_dispatchers_with_same_child_id(monkeypatch):
     assert telemetry.log(first_key, "dispatch", child_id=first.instance_id)
     assert telemetry.log(second_key, "dispatch", child_id=second.instance_id)
     assert not telemetry.log(first_key, "dispatch", child_id=first.instance_id)
+
+
+@pytest.mark.parametrize(("existing", "expected"), [(None, "1"), ("0", "0")])
+def test_flydsl_dispatcher_defaults_no_fake_expert_with_explicit_rollback(
+    monkeypatch, existing, expected
+):
+    for module_name in ("aiter", "flydsl", "mori"):
+        monkeypatch.setitem(sys.modules, module_name, ModuleType(module_name))
+    monkeypatch.setattr(flydslep, "_use_aiter", False)
+    monkeypatch.setattr(flydslep, "is_tbo_enabled", lambda: False)
+    monkeypatch.delenv("AITER_CONFIG_FMOE", raising=False)
+    if existing is None:
+        monkeypatch.delenv("AITER_FLYDSL_EP_NO_FAKE_EXPERT", raising=False)
+    else:
+        monkeypatch.setenv("AITER_FLYDSL_EP_NO_FAKE_EXPERT", existing)
+
+    flydslep.FlyDSLEPDispatcher(object(), router_topk=6)
+
+    assert os.environ["AITER_FLYDSL_EP_NO_FAKE_EXPERT"] == expected
+    assert "AITER_CONFIG_FMOE" not in os.environ
 
 
 def test_recv_count_values_and_diagnostic_formatting():
