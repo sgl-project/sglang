@@ -927,6 +927,9 @@ def resolve_dcp_dst_entry_indices(
     ]
 
 
+_DRAFT_KV_LAYER_ID_BASE = 1_000_000
+
+
 def get_transfer_kv_layer_ids(kv_pool, num_entries: int) -> List[int]:
     """Return global layer ids aligned with ``kv_pool.get_contiguous_buf_infos``.
 
@@ -952,6 +955,18 @@ def get_transfer_kv_layer_ids(kv_pool, num_entries: int) -> List[int]:
             return layer_ids * 2
 
     return []
+
+
+def get_transfer_draft_kv_layer_ids(num_entries: int) -> List[int]:
+    """Return layer-id metadata for draft KV entries.
+
+    Draft KV is not target-model KV and should not share the target layer-id
+    namespace, especially when PP prefill sends target KV by layer subset but a
+    single rank also sends replicated draft KV.
+    """
+    if num_entries <= 0:
+        return []
+    return [_DRAFT_KV_LAYER_ID_BASE + i for i in range(num_entries)]
 
 
 def append_state_component(

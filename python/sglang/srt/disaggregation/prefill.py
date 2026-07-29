@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_transfer_draft_kv_layer_ids,
     get_transfer_kv_layer_ids,
     is_aborted,
     is_dsv4_c128_online_enabled,
@@ -217,9 +218,7 @@ class PrefillBootstrapQueue:
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
-            kv_layer_ids += get_transfer_kv_layer_ids(
-                self.draft_token_to_kv_pool, len(draft_kv_data_ptrs)
-            )
+            kv_layer_ids += get_transfer_draft_kv_layer_ids(len(draft_kv_data_ptrs))
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
