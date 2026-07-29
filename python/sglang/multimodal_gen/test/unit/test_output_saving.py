@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import torch
 from PIL import Image
 
 import sglang.multimodal_gen.runtime.entrypoints.utils as output_utils
@@ -149,3 +150,52 @@ def test_video_audio_single_pass_failure_falls_back(tmp_path, monkeypatch):
     assert "audio_path" in calls[0][2]
     assert "audio_path" not in calls[1][2]
     assert len(mux_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("height", "available_cpus", "expected_threads"),
+    [
+        (768, 256, 24),
+        (720, 256, 22),
+        (2160, 16, 24),
+        (4320, 256, 128),
+        (16, 1, 1),
+    ],
+)
+def test_x264_auto_thread_count(monkeypatch, height, available_cpus, expected_threads):
+    monkeypatch.setattr(
+        output_utils.os,
+        "sched_getaffinity",
+        lambda _pid: set(range(available_cpus)),
+    )
+
+    assert output_utils._x264_auto_thread_count(height) == expected_threads
+
+
+def test_video_direct_save_short_circuits_materialization(tmp_path, monkeypatch):
+    output_path = tmp_path / "sample.mp4"
+    direct_calls = []
+
+    monkeypatch.setattr(
+        output_utils,
+        "_try_save_cuda_video_direct",
+        lambda **kwargs: direct_calls.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        output_utils,
+        "post_process_sample",
+        lambda *_args, **_kwargs: pytest.fail(
+            "successful direct save should skip frame materialization"
+        ),
+    )
+
+    paths = output_utils.save_outputs(
+        [torch.zeros((3, 1, 2, 3))],
+        DataType.VIDEO,
+        fps=24,
+        save_output=True,
+        build_output_path=lambda _idx: str(output_path),
+    )
+
+    assert paths == [str(output_path)]
+    assert len(direct_calls) == 1
