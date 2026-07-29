@@ -1811,50 +1811,76 @@ class DeepseekV4AttnBackend(
                 attn_sink=attn_sink if attn_sink is not None else None,
             )
 
-        # ── C4/C128: dequant SWA + extra pages → SDPA per head ──────────
+        # ── C4/C128: batch-dequant unique pages, then SDPA per head ──────
+        swa_phys_page_size = self.token_to_kv_pool.swa_page_size
+        extra_page_size = self.token_to_kv_pool.page_size // compress_ratio
         q_f32 = q.float()  # [N_heads, 512]
         out = torch.zeros(N_heads, MXFP4_TOTAL_DIM, dtype=torch.float32, device=dev)
 
+        # --- collect unique page indices across all heads ---
+        per_head_swa = []
+        per_head_extra = []
+        unique_swa = set()
+        unique_extra = set()
+
         for h in range(N_heads):
-            qi = q_f32[h]  # [512]
+            swa_pids = swa_page_indices[h, : int(swa_topk_lengths[h].item())].long()
+            swa_pids = swa_pids[swa_pids >= 0].tolist()
+            extra_pids = extra_indices[h, : int(extra_topk_lengths[h].item())].long()
+            extra_pids = extra_pids[extra_pids >= 0].tolist()
 
-            swa_topk = int(swa_topk_lengths[h].item())
-            extra_topk = int(extra_topk_lengths[h].item())
+            per_head_swa.append(swa_pids)
+            per_head_extra.append(extra_pids)
+            unique_swa.update(swa_pids)
+            unique_extra.update(extra_pids)
 
-            swa_pids = swa_page_indices[h, :swa_topk].long()
-            swa_pids = swa_pids[swa_pids >= 0]
-            extra_pids = extra_indices[h, :extra_topk].long()
-            extra_pids = extra_pids[extra_pids >= 0]
+        # --- batch-dequant unique pages → flat row-indexed BF16 ---
+        def _dequant_pages(cache, page_ids, page_sz):
+            """Dequant multiple pages into a flat [total_tokens, 512] tensor."""
+            if not page_ids:
+                return None, {}
+            flat_indices = []
+            page_to_start = {}
+            for pid in sorted(page_ids):
+                page_to_start[pid] = len(flat_indices)
+                flat_indices.extend(range(pid * page_sz, (pid + 1) * page_sz))
+            indices_t = torch.tensor(flat_indices, dtype=torch.int32, device=dev)
+            deq = dequantize_dsv4_mxfp4_k_cache_paged(cache, indices_t, page_sz)
+            return deq[:, 0, :], page_to_start  # [total_tokens, 512], dict
 
-            # Dequant each page and concatenate K rows
-            k_parts = []
-            for pid in swa_pids:
-                kp = dequantize_dsv4_mxfp4_k_cache_paged(
-                    swa_k_cache,
-                    pid.unsqueeze(0),
-                    self.token_to_kv_pool.swa_page_size,
-                )  # [1, 1, 512]
-                k_parts.append(kp[0, 0, :])
-            if extra_k_cache is not None:
-                extra_page_size = self.token_to_kv_pool.page_size // compress_ratio
-                for pid in extra_pids:
-                    kp = dequantize_dsv4_mxfp4_k_cache_paged(
-                        extra_k_cache,
-                        pid.unsqueeze(0),
-                        extra_page_size,
-                    )  # [1, 1, 512]
-                    k_parts.append(kp[0, 0, :])
+        swa_deq, swa_lookup = _dequant_pages(
+            swa_k_cache, unique_swa, swa_phys_page_size
+        )
+        extra_deq, extra_lookup = (
+            _dequant_pages(extra_k_cache, unique_extra, extra_page_size)
+            if extra_k_cache is not None
+            else (None, {})
+        )
 
-            if not k_parts:
+        # --- per-head SDPA (lightweight: only torch matmul ops) ---
+        for h in range(N_heads):
+            k_rows = []
+
+            for pid in per_head_swa[h]:
+                start = swa_lookup[pid]
+                k_rows.append(swa_deq[start : start + swa_phys_page_size])
+
+            if extra_deq is not None:
+                for pid in per_head_extra[h]:
+                    start = extra_lookup[pid]
+                    k_rows.append(extra_deq[start : start + extra_page_size])
+
+            if not k_rows:
                 continue
 
-            k_all = torch.stack(k_parts).float()  # [T, 512]
-            scores = (qi.unsqueeze(0) @ k_all.T).squeeze(0) * self.softmax_scale  # [T]
+            k_all = torch.cat(k_rows, dim=0).float()  # [T, 512]
+            qi = q_f32[h : h + 1]  # [1, 512]
+            scores = (qi @ k_all.T).squeeze(0) * self.softmax_scale  # [T]
 
             # Attn_sink: virtual token with V=0
             sink_val = float(attn_sink[h])
-            scores_full = torch.cat([scores, torch.tensor([sink_val], device=dev)])
-            weights = torch.softmax(scores_full, dim=0)[: scores.numel()]
+            scores_aug = torch.cat([scores, torch.tensor([sink_val], device=dev)])
+            weights = torch.softmax(scores_aug, dim=0)[: scores.numel()]
             out[h] = (weights.unsqueeze(0) @ k_all).squeeze(0)
 
         return out.to(torch.bfloat16)
