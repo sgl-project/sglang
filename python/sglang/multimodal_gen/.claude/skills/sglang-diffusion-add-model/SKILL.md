@@ -65,7 +65,7 @@ See existing Modular examples: `QwenImagePipeline` (uses `add_standard_t2i_stage
 | Model/VAE/DiT configs | `python/sglang/multimodal_gen/configs/models/dits/`, `vaes/`, `encoders/` |
 | Central registry | `python/sglang/multimodal_gen/registry.py` |
 | Model component registry | `python/sglang/multimodal_gen/runtime/models/registry.py` |
-| Current support list | `docs/diffusion/compatibility_matrix.md` |
+| Current support list | `docs_new/docs/sglang-diffusion/compatibility_matrix.mdx` |
 
 ---
 
@@ -621,6 +621,6 @@ Before submitting, verify:
 After the model produces non-noise output, read
 [references/testing-and-accuracy.md](references/testing-and-accuracy.md) before
 adding GPU cases, component-accuracy skips/hooks, suite entries, or benchmark
-claims. That reference tracks the current `gpu_cases.py` / `testcase_configs.py`
-/ `accuracy_testcase_configs.py` / `run_suite.py` split and the component-accuracy
-decision rules.
+claims. That reference tracks the current `gpu_cases.py`,
+`DiffusionTestCase.run_component_accuracy_check`,
+`single_test_file/component_accuracy/`, and `run_suite.py` split.
