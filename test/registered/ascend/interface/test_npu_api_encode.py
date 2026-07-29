@@ -36,7 +36,8 @@ class TestNpuApi(CustomTestCase):
         other_args = [
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--cuda-graph-backend-decode=disabled",
+            "--cuda-graph-backend-prefill=disabled",
             "--tp-size",
             2,
             "--is-embedding",

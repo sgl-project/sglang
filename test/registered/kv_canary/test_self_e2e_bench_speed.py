@@ -43,7 +43,12 @@ def _make_server_args(
         "--disable-piecewise-cuda-graph",
     ]
     if disable_cuda_graph:
-        extra.append("--disable-cuda-graph")
+        extra.extend(
+            [
+                "--cuda-graph-backend-decode=disabled",
+                "--cuda-graph-backend-prefill=disabled",
+            ]
+        )
     if canary_on:
         extra += ["--kv-canary", "raise"]
     extra += ["--port", str(DEFAULT_PORT_FOR_SRT_TEST_RUNNER)]

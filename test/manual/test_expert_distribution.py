@@ -43,7 +43,8 @@ class TestExpertDistribution(CustomTestCase):
                     str(tp_size),
                     "--expert-distribution-recorder-mode",
                     mode,
-                    "--disable-cuda-graph",
+                    "--cuda-graph-backend-decode=disabled",
+                    "--cuda-graph-backend-prefill=disabled",
                     "--disable-overlap-schedule",
                 ],
             )

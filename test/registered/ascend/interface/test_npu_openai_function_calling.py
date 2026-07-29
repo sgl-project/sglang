@@ -60,7 +60,8 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                 # If your server needs extra parameters to test function calling, please add them here.
                 "--attention-backend",
                 "ascend",
-                "--disable-cuda-graph",
+                "--cuda-graph-backend-decode=disabled",
+                "--cuda-graph-backend-prefill=disabled",
                 "--tool-call-parser",
                 "llama3",
             ],
@@ -869,7 +870,8 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
             other_args=[
                 "--attention-backend",
                 "ascend",
-                "--disable-cuda-graph",
+                "--cuda-graph-backend-decode=disabled",
+                "--cuda-graph-backend-prefill=disabled",
                 "--tool-call-parser",
                 "pythonic",
             ],

@@ -318,7 +318,8 @@ def _run_server_and_generate(
         "128",
         "--mem-fraction-static",
         "0.5",
-        "--disable-cuda-graph",
+        "--cuda-graph-backend-decode=disabled",
+        "--cuda-graph-backend-prefill=disabled",
         "--cuda-graph-backend-prefill=disabled",
         "--disable-radix-cache",
     ]

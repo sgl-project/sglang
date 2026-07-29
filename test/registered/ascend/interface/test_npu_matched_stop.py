@@ -39,7 +39,8 @@ class TestMatchedStop(CustomTestCase):
             10,
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--cuda-graph-backend-decode=disabled",
+            "--cuda-graph-backend-prefill=disabled",
             "--mem-fraction-static",
             0.8,
         ]

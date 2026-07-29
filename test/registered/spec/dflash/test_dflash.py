@@ -161,7 +161,10 @@ class TestDFlashServerChunkedPrefill(TestDFlashServerBase):
 
 
 class TestDFlashServerNoCudaGraph(TestDFlashServerBase):
-    other_launch_args = ["--disable-cuda-graph"]
+    other_launch_args = [
+        "--cuda-graph-backend-decode=disabled",
+        "--cuda-graph-backend-prefill=disabled",
+    ]
 
 
 class TestDFlashServerSpecV2(TestDFlashServerBase):

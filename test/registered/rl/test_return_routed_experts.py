@@ -72,7 +72,8 @@ class TestReturnRoutedExperts(CustomTestCase):
         ]
         cls.baseline_args = common + [
             "--disable-overlap-schedule",
-            "--disable-cuda-graph",
+            "--cuda-graph-backend-decode=disabled",
+            "--cuda-graph-backend-prefill=disabled",
             "--disable-radix-cache",
         ]
         cls.reference_args = common
@@ -195,8 +196,8 @@ class TestReturnRoutedExperts(CustomTestCase):
                 "--tp",
                 2,
                 "--enable-return-routed-experts",
-                "--disable-cuda-graph",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-decode=disabled",
+                "--cuda-graph-backend-prefill=disabled",
                 *other_args,
             ],
         )

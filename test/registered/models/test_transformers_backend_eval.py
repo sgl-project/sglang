@@ -27,7 +27,8 @@ class TestTransformersBackendEval(DefaultServerBase):
         "--enable-torch-compile",
         "--torch-compile-max-bs",
         "4",
-        "--disable-cuda-graph",
+        "--cuda-graph-backend-decode=disabled",
+        "--cuda-graph-backend-prefill=disabled",
     ]
 
     def test_gsm8k(self):

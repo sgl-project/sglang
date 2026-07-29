@@ -31,7 +31,8 @@ class TestPenalty(CustomTestCase):
         other_args = [
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--cuda-graph-backend-decode=disabled",
+            "--cuda-graph-backend-prefill=disabled",
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(

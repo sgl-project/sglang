@@ -24,7 +24,8 @@ class TestLlama3211BVisionInstruct(TestVLMModels):
         "0.8",
         "--attention-backend",
         "ascend",
-        "--disable-cuda-graph",
+        "--cuda-graph-backend-decode=disabled",
+        "--cuda-graph-backend-prefill=disabled",
         "--disable-radix-cache",
     ]
 

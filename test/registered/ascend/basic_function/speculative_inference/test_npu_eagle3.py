@@ -44,7 +44,8 @@ class TestNpuEagle3(GSM8KAscendMixin, CustomTestCase):
         "1",
         "--mem-fraction-static",
         "0.7",
-        "--disable-cuda-graph",
+        "--cuda-graph-backend-decode=disabled",
+        "--cuda-graph-backend-prefill=disabled",
         "--dtype",
         "bfloat16",
     ]

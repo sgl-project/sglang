@@ -34,7 +34,10 @@ class TestAbortRequest(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--disable-cuda-graph"],
+            other_args=[
+                "--cuda-graph-backend-decode=disabled",
+                "--cuda-graph-backend-prefill=disabled",
+            ],
         )
 
         cls.completion_url = f"{cls.base_url}/generate"

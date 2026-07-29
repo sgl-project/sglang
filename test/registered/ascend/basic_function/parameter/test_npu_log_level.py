@@ -68,7 +68,8 @@ class TestLogLevel(CustomTestCase):
             "warning",
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--cuda-graph-backend-decode=disabled",
+            "--cuda-graph-backend-prefill=disabled",
         ]
         log_content = self._launch_server_and_run_infer(other_args)
         self.assertNotIn("POST /generate HTTP/1.1", log_content)
@@ -82,7 +83,8 @@ class TestLogLevel(CustomTestCase):
             "info",
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--cuda-graph-backend-decode=disabled",
+            "--cuda-graph-backend-prefill=disabled",
         ]
         log_content = self._launch_server_and_run_infer(other_args)
         self.assertIn("POST /generate HTTP/1.1", log_content)

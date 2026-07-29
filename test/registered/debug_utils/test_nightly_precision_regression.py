@@ -588,7 +588,8 @@ def _run_server_and_dump(
         "4096",
         "--mem-fraction-static",
         "0.9",
-        "--disable-cuda-graph",
+        "--cuda-graph-backend-decode=disabled",
+        "--cuda-graph-backend-prefill=disabled",
         "--disable-piecewise-cuda-graph",
         "--disable-radix-cache",
         # Explicit `trtllm`, not `auto` (which resolves to mnnvl on SM90).

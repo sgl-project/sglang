@@ -105,7 +105,11 @@ class TestSlidingWindowAttentionTriton(CustomTestCase):
             self.model,
             self.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=self.common_args + ["--disable-cuda-graph"],
+            other_args=self.common_args
+            + [
+                "--cuda-graph-backend-decode=disabled",
+                "--cuda-graph-backend-prefill=disabled",
+            ],
         )
 
         try:

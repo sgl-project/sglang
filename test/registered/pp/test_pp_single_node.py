@@ -252,7 +252,8 @@ class TestGemma4PLEPPAccuracy(unittest.TestCase):
                 "--trust-remote-code",
                 "--enable-multimodal",
                 # Required for PLE under PP — see Gemma4TextModel guard.
-                "--disable-cuda-graph",
+                "--cuda-graph-backend-decode=disabled",
+                "--cuda-graph-backend-prefill=disabled",
             ],
         )
 

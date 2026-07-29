@@ -22,7 +22,8 @@ class TestQwen306B(GSM8KAscendMixin, CustomTestCase):
         256,
         "--attention-backend",
         "ascend",
-        "--disable-cuda-graph",
+        "--cuda-graph-backend-decode=disabled",
+        "--cuda-graph-backend-prefill=disabled",
     ]
 
 

@@ -16,7 +16,8 @@ class TestDbrx(GSM8KAscendMixin, CustomTestCase):
         "0.8",
         "--attention-backend",
         "ascend",
-        "--disable-cuda-graph",
+        "--cuda-graph-backend-decode=disabled",
+        "--cuda-graph-backend-prefill=disabled",
         "--tp-size",
         "8",
     ]

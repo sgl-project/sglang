@@ -20,7 +20,8 @@ class TestGLM4Models(TestVLMModels):
         "info",
         "--attention-backend",
         "ascend",
-        "--disable-cuda-graph",
+        "--cuda-graph-backend-decode=disabled",
+        "--cuda-graph-backend-prefill=disabled",
         "--tp-size",
         8,
     ]

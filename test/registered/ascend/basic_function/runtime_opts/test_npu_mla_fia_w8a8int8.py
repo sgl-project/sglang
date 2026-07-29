@@ -34,7 +34,8 @@ class TestAscendMlaW8A8Int8(CustomTestCase):
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.common_args = [
             "--trust-remote-code",
-            "--disable-cuda-graph",
+            "--cuda-graph-backend-decode=disabled",
+            "--cuda-graph-backend-prefill=disabled",
             "--mem-fraction-static",
             0.8,
             "--attention-backend",
