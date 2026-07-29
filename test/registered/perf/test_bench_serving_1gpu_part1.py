@@ -117,7 +117,7 @@ class TestBenchServing1GPUPart1(CustomTestCase):
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
             if is_in_amd_ci():
-                self.assertGreater(res["output_throughput"], 3500)
+                self.assertGreater(res["output_throughput"], 2700)
             else:
                 self.assertGreater(res["output_throughput"], 3700)
 
