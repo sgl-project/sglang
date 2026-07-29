@@ -3,6 +3,7 @@
 
 import os
 
+os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 os.environ["SGLANG_OPT_DSV4_MXFP4_KVCACHE"] = "1"
 
 

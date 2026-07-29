@@ -1620,8 +1620,12 @@ class DeepseekV4AttnBackend(
 
             # --- MXFP4 path (before FP8-specific reshapes) ---
             if token_to_kv_pool.dsv4_kv_cache_store_mxfp4:
-                if forward_batch.forward_mode.is_extend():
-                    # MXFP4 extend: always use sparse prefill with MXFP4 dequant
+                # For multi-token batches (real prefill), use sparse prefill
+                # with MXFP4 dequant workspace. For single-token batches
+                # (decode, even when forward_mode is EXTEND due to disabled
+                # CUDA graphs), use the fused decode jit_kernel.
+                num_q_tokens = q.shape[0]
+                if num_q_tokens > 1:
                     return self._forward_prefill_sparse(
                         q=q,
                         layer_id=layer_id,
@@ -1631,7 +1635,7 @@ class DeepseekV4AttnBackend(
                         core_attn_metadata=core_attn_metadata,
                         attn_sink=attn_sink,
                     )
-                # Decode: fused MXFP4 jit_kernel
+                # Single-token (decode): fused MXFP4 jit_kernel
                 return self._forward_mxfp4_decode(
                     q=q,
                     forward_batch=forward_batch,
@@ -1825,19 +1829,22 @@ class DeepseekV4AttnBackend(
             swa_physical_page_size = self.token_to_kv_pool.swa_page_size
             swa_window = 128  # DSV4 SWA attention window
             k_cache_flat = swa_k_cache.view(-1, MXFP4_BYTES_PER_TOKEN)
-            page_ratio = swa_physical_page_size // swa_window
 
-            # Check if SWA window spans multiple pages. The fused kernel
-            # only handles one page per head; fall back to dequant+SDPA
-            # when two pages are needed (at page boundaries).
-            needs_multi_page = bool((swa_topk_lengths > 1).any().item())
-            # When seq_len > swa_window, the SWA window may not start at
-            # position 0 within the kernel page, or may span two kernel
-            # pages within the same physical page. Fall back to SDPA
-            # which dequants the full physical page and correctly slices.
-            swa_offset_within_page = seq_len > swa_window
-            if needs_multi_page or swa_offset_within_page:
-                # Fallback: dequant all needed pages → SDPA
+            # swa_page_indices is TOKEN-level: shape [N, swa_window],
+            # each entry is an absolute token position in the SWA pool.
+            # swa_topk_lengths[h] is the number of valid tokens for head h.
+            # The fused kernel reads page_size contiguous tokens from a
+            # kernel-page-aligned start; fall back to SDPA when spanning
+            # multiple kernel pages or when the window has a non-zero offset.
+            swa_start_token = swa_page_indices[:, 0]  # [N] first valid token pos
+            kernel_page_idx = (
+                (swa_start_token // swa_window).to(torch.int32).contiguous()
+            )
+            start_offset = swa_start_token % swa_window
+            needs_multi_kpage = bool(
+                (start_offset + num_valid > swa_window).any().item()
+            )
+            if needs_multi_kpage:
                 return self._mxfp4_decode_sdpa_fallback(
                     q=q,
                     q_orig_shape=q_orig_shape,
@@ -1849,13 +1856,10 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            swa_kernel_indices = (
-                (swa_page_indices[:, 0] * page_ratio).to(torch.int32).contiguous()
-            )
             out_flat = mxfp4_decode_attention(
                 q=q,
                 k_cache=k_cache_flat,
-                page_indices=swa_kernel_indices,
+                page_indices=kernel_page_idx,
                 sm_scale=self.softmax_scale,
                 page_size=swa_window,
                 num_valid=num_valid,
@@ -2050,8 +2054,6 @@ class DeepseekV4AttnBackend(
         if cache is None:
             seq_lens_cpu = forward_batch.seq_lens_cpu
             assert seq_lens_cpu is not None
-            # ``swa_window_size`` on the pool is its storage page size, not
-            # the model's SWA window — pass both explicitly.
             cache = SparsePrefillChunkCache.build(
                 seq_lens=forward_batch.seq_lens.to(torch.int32),
                 extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
