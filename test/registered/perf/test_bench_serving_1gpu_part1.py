@@ -9,7 +9,6 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -151,7 +150,7 @@ class TestBenchServing1GPUPart1(CustomTestCase):
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
                 f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
             )
-            if is_hip():
+            if is_in_amd_ci():
                 self.assertLess(res["median_e2e_latency_ms"], 3320)
             else:
                 self.assertLess(res["median_e2e_latency_ms"], 2400)
