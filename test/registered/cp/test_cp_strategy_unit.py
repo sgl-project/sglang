@@ -1,4 +1,5 @@
 import unittest
+from itertools import accumulate
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -218,6 +219,9 @@ class TestCPZigzagStrategy(CustomTestCase):
             actual_seq_q_prev_list.append(block_sizes[rank])
             actual_seq_q_next_list.append(block_sizes[cp_segment_num - rank - 1])
 
+        actual_seq_q_combined_list = actual_seq_q_prev_list + actual_seq_q_next_list
+        kv_len_combined_list = kv_len_prev_list + kv_len_next_list
+
         return {
             "bs": bs,
             "total_seq_lens": sum(extend_seq_lens),
@@ -231,6 +235,10 @@ class TestCPZigzagStrategy(CustomTestCase):
             "kv_len_next_list": kv_len_next_list,
             "actual_seq_q_prev_list": actual_seq_q_prev_list,
             "actual_seq_q_next_list": actual_seq_q_next_list,
+            "actual_seq_q_combined_list": actual_seq_q_combined_list,
+            "kv_len_combined_list": kv_len_combined_list,
+            "cu_seqlens_q_combined": [0] + list(accumulate(actual_seq_q_combined_list)),
+            "cu_seqlens_kv_combined": [0] + list(accumulate(kv_len_combined_list)),
         }
 
     def _assert_metadata_matches(self, metadata, expected):
@@ -265,6 +273,45 @@ class TestCPZigzagStrategy(CustomTestCase):
             + list(
                 torch.tensor(expected["actual_seq_q_next_list"]).cumsum(dim=0).tolist()
             ),
+        )
+        self.assertEqual(
+            metadata.actual_seq_q_combined_tensor.cpu().tolist(),
+            expected["actual_seq_q_combined_list"],
+        )
+        self.assertEqual(
+            metadata.kv_len_combined_tensor.cpu().tolist(),
+            expected["kv_len_combined_list"],
+        )
+        self.assertEqual(
+            metadata.cu_seqlens_q_combined_tensor.cpu().tolist(),
+            expected["cu_seqlens_q_combined"],
+        )
+        self.assertEqual(
+            metadata.cu_seqlens_kv_combined_tensor.cpu().tolist(),
+            expected["cu_seqlens_kv_combined"],
+        )
+        for tensor in (
+            metadata.actual_seq_q_combined_tensor,
+            metadata.kv_len_combined_tensor,
+            metadata.cu_seqlens_q_combined_tensor,
+            metadata.cu_seqlens_kv_combined_tensor,
+        ):
+            self.assertEqual(tensor.dtype, torch.int32)
+        self.assertEqual(metadata.actual_seq_q_combined_tensor.numel(), 2 * metadata.bs)
+        self.assertEqual(metadata.kv_len_combined_tensor.numel(), 2 * metadata.bs)
+        self.assertEqual(
+            metadata.cu_seqlens_q_combined_tensor.numel(), 2 * metadata.bs + 1
+        )
+        self.assertEqual(
+            metadata.cu_seqlens_kv_combined_tensor.numel(), 2 * metadata.bs + 1
+        )
+        self.assertEqual(
+            metadata.cu_seqlens_q_combined_tensor[-1].item(),
+            metadata.total_q_prev_tokens + metadata.total_q_next_tokens,
+        )
+        self.assertEqual(
+            metadata.max_seqlen_q_combined,
+            max(expected["actual_seq_q_combined_list"]),
         )
 
     def _padded_rank_tensors(self, x, *, cp_size, seq_lens, extend_seq_lens):
@@ -318,6 +365,35 @@ class TestCPZigzagStrategy(CustomTestCase):
                         extend_seq_lens=extend_seq_lens,
                     )
                     self._assert_metadata_matches(metadata, expected)
+
+    def test_zigzag_combined_metadata_preserves_nonzero_prefix_order(self):
+        cp_size = 4
+        seq_lens = [19, 27]
+        extend_seq_lens = [11, 13]
+
+        for rank in range(cp_size):
+            with self.subTest(rank=rank):
+                metadata = self._metadata_for_rank(
+                    rank,
+                    cp_size=cp_size,
+                    seq_lens=seq_lens,
+                    extend_seq_lens=extend_seq_lens,
+                )
+                expected = self._expected_metadata(
+                    rank=rank,
+                    cp_size=cp_size,
+                    seq_lens=seq_lens,
+                    extend_seq_lens=extend_seq_lens,
+                )
+                self._assert_metadata_matches(metadata, expected)
+                self.assertEqual(
+                    metadata.kv_len_combined_tensor[: metadata.bs].tolist(),
+                    expected["kv_len_prev_list"],
+                )
+                self.assertEqual(
+                    metadata.kv_len_combined_tensor[metadata.bs :].tolist(),
+                    expected["kv_len_next_list"],
+                )
 
     def test_zigzag_shards_hidden_states_and_position_ids(self):
         cp_size = 4
