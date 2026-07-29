@@ -23,14 +23,11 @@ pub(crate) fn node_has_component_data<K: ChildKeyType>(
     component_type: ComponentType,
     target: EvictLayer,
 ) -> bool {
-    // def node_has_component_data(
-    //         self, node: UnifiedTreeNode, target: EvictLayer = EvictLayer.DEVICE
-    //     ) -> bool:
-    //         cd = node.component_data[self.component_type]
-    //         if target is EvictLayer.DEVICE:
-    //             return cd.value is not None
-    //         return cd.host_value is not None
-    todo!()
+    match target {
+        EvictLayer::Device => arena.has_device_value(node_id, component_type),
+        EvictLayer::Host => arena.has_host_value(node_id, component_type),
+        EvictLayer::All => panic!("node_has_component_data: EvictLayer::All is not a single layer"),
+    }
 }
 
 /// Every device value of the component across all roots, concatenated.
@@ -38,7 +35,19 @@ pub(crate) fn all_values_flatten<K: ChildKeyType>(
     tree_core: &UnifiedTreeCore<K>,
     component_type: ComponentType,
 ) -> Tensor {
-    todo!()
+    let mut values: Vec<Tensor> = Vec::new();
+    let mut stack: Vec<NodeIdx_> = vec![tree_core.arena.root()];
+    while let Some(node_id) = stack.pop() {
+        let node = tree_core.arena.node(node_id);
+        if let Some(value) = node.try_device_value(component_type) {
+            values.push(value.shallow_clone());
+        }
+        stack.extend(node.children.values().copied());
+    }
+    if values.is_empty() {
+        return tree_core.empty_device_indices.shallow_clone();
+    }
+    Tensor::cat(&values, 0)
 }
 
 /// A per-component lock/value/eviction driver over the shared `UnifiedTreeCore`.
@@ -53,7 +62,8 @@ pub trait TreeComponent<K: ChildKeyType> {
         phase: LRURefreshPhase,
         node_id: NodeIdx_,
     ) {
-        // def refresh_lru(
+        // Python reference — tree_component.py::TreeComponent.refresh_lru:
+        //     def refresh_lru(
         //         self,
         //         phase: LRURefreshPhase,
         //         node: UnifiedTreeNode,
@@ -75,7 +85,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         //                 return
         //             case _:
         //                 raise ValueError(f"Unknown LRURefreshPhase: {phase}")
-        todo!()
+        unimplemented!("TreeComponent.refresh_lru")
     }
 
     /// Return a per-match stateful predicate deciding whether a node is a valid
@@ -110,16 +120,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         value_chunks: &[Tensor],
         best_value_len: usize,
     ) -> MatchResult {
-        // def finalize_match_result_in_tree_core(
-        //         self,
-        //         result: MatchResult,
-        //         params: MatchPrefixParams,
-        //         value_chunks: list[torch.Tensor],
-        //         best_value_len: int,
-        //     ) -> MatchResult:
-        //         """Tree-side post-processing inside the match walk (no cache access)."""
-        //         return result
-        todo!()
+        result
     }
 
     /// Called per-node when an insert's key overlaps an existing node.
@@ -138,23 +139,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         params: &InsertParams<'_, K>,
         cache_actions: &mut Vec<CacheAction>,
     ) -> usize {
-        // def update_component_on_insert_overlap(
-        //         self,
-        //         node: UnifiedTreeNode,
-        //         prefix_len: int,
-        //         total_prefix_len: int,
-        //         value_slice: torch.Tensor,
-        //         params: InsertParams,
-        //         cache_actions: list[CacheAction | ComponentAction],
-        //     ) -> int:
-        //         """Called per-node when an insert's key overlaps an existing node.
-        //         Returns the index within value_slice from which this component
-        //         consumed (took ownership of) the underlying KV pool slots.
-        //         Returns prefix_len if nothing was consumed (default).
-        //         _insert_helper uses this to free only the non-consumed duplicate
-        //         portion: value_slice[dup_start:consumed_from]."""
-        //         return prefix_len
-        todo!()
+        prefix_len
     }
 
     /// Called after `unevict_node_on_insert_` restores the base (Full) value
@@ -170,20 +155,6 @@ pub trait TreeComponent<K: ChildKeyType> {
         params: &InsertParams<'_, K>,
         cache_actions: &mut Vec<CacheAction>,
     ) {
-        // def recover_after_unevict(
-        //         self,
-        //         node: UnifiedTreeNode,
-        //         prefix_len: int,
-        //         total_prefix_len: int,
-        //         params: InsertParams,
-        //         cache_actions: list[CacheAction | ComponentAction],
-        //     ) -> None:
-        //         """Called after _unevict_node_on_insert restores the base (Full) value
-        //         on an evicted node. Aux components (e.g. SWA) override this to rebuild
-        //         their own data from the freshly assigned base value when their entry
-        //         is still tombstoned. Default no-op."""
-        //         return None
-        todo!()
     }
 
     /// Finalize component data on the target (leaf) node after the insert
@@ -207,28 +178,6 @@ pub trait TreeComponent<K: ChildKeyType> {
         result: &mut InsertResult,
         cache_actions: &mut Vec<CacheAction>,
     ) {
-        // def commit_insert_component_data(
-        //         self,
-        //         node: UnifiedTreeNode,
-        //         is_new_leaf: bool,
-        //         params: InsertParams,
-        //         result: InsertResult,
-        //         cache_actions: list[CacheAction | ComponentAction],
-        //     ) -> None:
-        //         """Finalize component data on the target (leaf) node after the insert
-        //         walk completes. Called once per insert.
-        //         - Full: no-op (full data is handled by _add_new_node).
-        //         - SWA: for new leaves, checks whether the node straddles the SWA
-        //           eviction boundary (swa_evicted_seqlen). If so, splits the node
-        //           via _split_node — the parent becomes a tombstone (no SWA) and the
-        //           child (the deeper portion) receives SWA data. If the entire node
-        //           is within the window, sets SWA directly. If entirely outside,
-        //           leaves SWA as None (tombstone).
-        //         - Mamba: sets the mamba component value from params, inserts into
-        //           mamba LRU list, and increments evictable size. If the node already
-        //           has mamba data, resets its LRU position instead."""
-        //         pass
-        todo!()
     }
 
     /// Evict shallow device checkpoints beyond the per-path state cap on the
@@ -240,7 +189,6 @@ pub trait TreeComponent<K: ChildKeyType> {
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
     ) {
-        todo!()
     }
 
     /// Redistribute component data between `new_parent` and `child` when a node is
@@ -301,33 +249,7 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// Eviction priority on this node type; higher = evicted later, and evicting a
     /// component cascade-evicts every component of equal or lower priority.
     fn eviction_priority(&self, is_leaf: bool) -> i64 {
-        // def eviction_priority(self, is_leaf: bool) -> int:
-        //         """Eviction priority on this node type. Higher = evicted later.
-        //         When a component is evicted, all other components with equal or
-        //         lower priority on the same node are also cascade-evicted.
-        //
-        //         Leaf: all components equal (0) — evicting any cascades to all,
-        //         because the node will be deleted.
-        //
-        //         Internal: full=2 > swa=1 > mamba=0.
-        //         Why swa > mamba: SWA data on internal nodes is *path data* —
-        //         the sliding window needs continuous SWA coverage along the path
-        //         from root to the match boundary. E.g. A->B->C->D->E where C
-        //         and E both have mamba and the window covers C->E: if C's mamba
-        //         is evicted, C's SWA must stay so E remains reachable.
-        //         Mamba data, by contrast, is only meaningful at the match
-        //         boundary node; on internal nodes it
-        //         contributes nothing to the path. So SWA is more valuable to
-        //         keep and should be evicted later.
-        //
-        //         Cascade consequences:
-        //         - Mamba evict internal: no cascade.
-        //         - SWA evict internal: cascades to Mamba. SWA gone -> SWA
-        //           validator fails -> mamba data is useless (match requires all
-        //           validators to pass).
-        //         - Full evict internal: cascades to SWA + Mamba."""
-        //         return 0
-        todo!()
+        0
     }
 
     /// Begin this component's device-eviction walk (build its cursor/heap).
@@ -415,7 +337,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
     ) {
-        todo!()
+        unimplemented!("release_window_lock is SWA-only")
     }
 
     /// Build transfer descriptors for this component in the given phase; None when
@@ -431,7 +353,8 @@ pub trait TreeComponent<K: ChildKeyType> {
         prefetch_tokens: usize,
         last_hash: Option<&str>,
     ) -> Option<Vec<PoolTransfer>> {
-        // def build_hicache_transfers(
+        // Python reference — tree_component.py::TreeComponent.build_hicache_transfers:
+        //     def build_hicache_transfers(
         //         self,
         //         node: UnifiedTreeNode,
         //         phase: CacheTransferPhase,
@@ -445,7 +368,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         //         """Build transfer descriptors for this component in the given phase.
         //         Returns None if the component has nothing to transfer."""
         //         return None
-        todo!()
+        unimplemented!("TreeComponent.build_hicache_transfers")
     }
 
     /// Post-transfer bookkeeping: store host indices, update LRU, etc.
@@ -459,7 +382,8 @@ pub trait TreeComponent<K: ChildKeyType> {
         insert_result: Option<&mut InsertResult>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) {
-        // def commit_hicache_transfer(
+        // Python reference — tree_component.py::TreeComponent.commit_hicache_transfer:
+        //     def commit_hicache_transfer(
         //         self,
         //         node: UnifiedTreeNode,
         //         phase: CacheTransferPhase,
@@ -471,7 +395,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         //     ) -> None:
         //         """Post-transfer bookkeeping: store host indices, update LRU, etc."""
         //         pass
-        todo!()
+        unimplemented!("TreeComponent.commit_hicache_transfer")
     }
 
     /// Evict from this component's host-side resources.
@@ -485,19 +409,6 @@ pub trait TreeComponent<K: ChildKeyType> {
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
     ) {
-        // def drive_host_eviction(
-        //         self,
-        //         num_tokens: int,
-        //         tracker: dict[ComponentType, int],
-        //         device_frees: dict[ComponentType, list[torch.Tensor]],
-        //         host_frees: dict[ComponentType, list[torch.Tensor]],
-        //     ) -> None:
-        //         """Evict from this component's host-side resources, collecting freed
-        //         values into *device_frees*/*host_frees* for the Controller to drain.
-        //         Called by HostPoolGroup when the host pool is full.
-        //         Default no-op for components without host storage."""
-        //         pass
-        todo!()
     }
 }
 
@@ -525,17 +436,26 @@ pub const NUM_COMPONENT_TYPES: usize = ComponentType::Mamba as usize + 1;
 impl ComponentType {
     /// Index into a per-component array.
     pub const fn idx(self) -> usize {
-        todo!()
+        self as usize
     }
 
     /// Whether the component stores one state slot per node (Mamba) instead of
     /// one row per key atom.
     pub fn single_value_per_node(self) -> bool {
-        todo!()
+        matches!(self, ComponentType::Mamba)
     }
 
     /// The component at a per-component array index; panics out of range.
     pub fn from_idx(idx: usize) -> ComponentType {
-        todo!()
+        match idx {
+            0 => ComponentType::Full,
+            1 => ComponentType::Swa,
+            2 => ComponentType::Mamba,
+            _ => panic!("from_idx: {idx} is not a component index"),
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/components/base.rs"]
+mod base_tests;

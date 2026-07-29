@@ -14,5 +14,10 @@
 
 mod components;
 mod node;
+#[cfg(feature = "python-extension")]
+mod python_bindings;
+#[cfg(test)]
+#[path = "tests/test_utils.rs"]
+pub(crate) mod test_utils;
 mod unified_lru_list;
 mod unified_tree_core;

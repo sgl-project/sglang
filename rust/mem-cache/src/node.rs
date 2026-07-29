@@ -55,104 +55,93 @@ pub struct Node<K: ChildKeyType> {
 impl<K: ChildKeyType> Node<K> {
     /// Whether this is the root (no parent).
     pub fn is_root(&self) -> bool {
-        // def is_root(self, node_id: NodeId) -> bool:
-        //         """Whether the node is the tree root."""
-        //         return self.node_by_id(node_id) is self.root_node
-        todo!()
+        self.parent.is_none()
     }
 
     /// The parent's id; panics on a root.
     #[track_caller]
     pub fn parent(&self) -> NodeIdx_ {
-        todo!()
+        self.parent
+            .unwrap_or_else(|| panic!("node {} is a root and has no parent", self.id))
     }
 
     /// The parent's id, or `None` on a root.
     pub fn try_parent(&self) -> Option<NodeIdx_> {
-        todo!()
+        self.parent
     }
 
     /// Whether this node has no children (a tree leaf).
     pub fn is_leaf(&self) -> bool {
-        todo!()
+        self.children.is_empty()
     }
 
     /// Tree-level: Full KV not on device (non-root with value=None).
     pub fn evicted(&self) -> bool {
-        // def evicted(self) -> bool:
-        //         """Tree-level: Full KV not on device (non-root with value=None)."""
-        //         return (
-        //             self.parent is not None
-        //             and self.component_data[ComponentType.FULL].value is None
-        //         )
-        todo!()
+        self.parent.is_some() && !self.has_device_value(FULL)
     }
 
     /// Tree-level: Full KV present on host.
     pub fn backuped(&self) -> bool {
-        // def backuped(self) -> bool:
-        //         """Tree-level: Full KV present on host."""
-        //         return self.component_data[ComponentType.FULL].host_value is not None
-        todo!()
+        self.has_host_value(FULL)
     }
 
     /// The last page's hash value, or None when the node was never hashed.
     pub fn get_last_hash_value(&self) -> Option<&str> {
-        // def get_last_hash_value(self) -> Optional[str]:
-        //         if self.hash_value is None or len(self.hash_value) == 0:
-        //             return None
-        //         return self.hash_value[-1]
-        todo!()
+        self.hash_value
+            .as_ref()
+            .and_then(|h| h.last())
+            .map(String::as_str)
     }
 
     /// The component's device value; panics if unset.
     pub fn device_value(&self, component_type: ComponentType) -> &Tensor {
-        todo!()
+        self.value_(ValueSlotIdx::device(component_type))
     }
 
     /// The component's device value, or None when unset.
     pub fn try_device_value(&self, component_type: ComponentType) -> Option<&Tensor> {
-        todo!()
+        self.try_value_(ValueSlotIdx::device(component_type))
     }
 
     /// Whether the component's device value is present.
     pub fn has_device_value(&self, component_type: ComponentType) -> bool {
-        todo!()
+        self.has_value_(ValueSlotIdx::device(component_type))
     }
 
     /// The component's device value length, or 0 when value-less.
     pub fn device_value_len(&self, component_type: ComponentType) -> usize {
-        todo!()
+        self.value_len_(ValueSlotIdx::device(component_type))
     }
 
     /// Set the component's device value; panics if already set.
     pub fn set_device_value(&mut self, component_type: ComponentType, value: Tensor) {
-        todo!()
+        self.set_value_(ValueSlotIdx::device(component_type), value);
     }
 
     /// Take the component's device value; panics if unset.
     pub fn take_device_value(&mut self, component_type: ComponentType) -> Tensor {
-        todo!()
+        self.take_value_(ValueSlotIdx::device(component_type))
     }
 
     /// The component's device lock refcount.
     pub fn device_lock_ref(&self, component_type: ComponentType) -> u32 {
-        todo!()
+        self.lock_ref_(ValueSlotIdx::device(component_type))
     }
 
     /// Bump the component's device lock refcount by one.
     pub fn inc_device_lock_ref(&mut self, component_type: ComponentType) {
-        todo!()
+        self.inc_lock_ref_(ValueSlotIdx::device(component_type));
     }
 
     /// Drop the component's device lock refcount by one; panics when unlocked.
     pub fn dec_device_lock_ref(&mut self, component_type: ComponentType) {
-        todo!()
+        self.dec_lock_ref_(ValueSlotIdx::device(component_type));
     }
 
     /// Copy the component's device lock refcount from `src_node`.
     pub fn copy_device_lock_ref(&mut self, component_type: ComponentType, src_node: &Node<K>) {
-        todo!()
+        let slot = ValueSlotIdx::device(component_type);
+        self.set_lock_ref_(slot, src_node.lock_ref_(slot));
     }
 
     /// Split the component's device value between a new parent and the child.
@@ -162,69 +151,57 @@ impl<K: ChildKeyType> Node<K> {
         component_type: ComponentType,
         split_len: i64,
     ) {
-        todo!()
+        Node::redistribute_child_value_(
+            parent_node,
+            child_node,
+            ValueSlotIdx::device(component_type),
+            split_len,
+        );
     }
 
     /// The component's host value; panics if unset.
     pub fn host_value(&self, component_type: ComponentType) -> &Tensor {
-        todo!()
+        self.value_(ValueSlotIdx::host(component_type))
     }
 
     /// The component's host value, or None when unset.
     pub fn try_host_value(&self, component_type: ComponentType) -> Option<&Tensor> {
-        todo!()
+        self.try_value_(ValueSlotIdx::host(component_type))
     }
 
     /// Whether the component's host value is present.
     pub fn has_host_value(&self, component_type: ComponentType) -> bool {
-        todo!()
+        self.has_value_(ValueSlotIdx::host(component_type))
     }
 
     /// The component's host value length, or 0 when value-less.
     pub fn host_value_len(&self, component_type: ComponentType) -> usize {
-        todo!()
+        self.value_len_(ValueSlotIdx::host(component_type))
     }
 
     /// Set the component's host value; panics if already set.
     pub fn set_host_value(&mut self, component_type: ComponentType, value: Tensor) {
-        todo!()
+        self.set_value_(ValueSlotIdx::host(component_type), value);
     }
 
     /// Take the component's host value; panics if unset.
     pub fn take_host_value(&mut self, component_type: ComponentType) -> Tensor {
-        todo!()
+        self.take_value_(ValueSlotIdx::host(component_type))
     }
 
     /// The component's host lock refcount (the host lock).
     pub fn host_lock_ref(&self, component_type: ComponentType) -> u32 {
-        todo!()
+        self.lock_ref_(ValueSlotIdx::host(component_type))
     }
 
     /// Bump the component's host lock refcount by one.
     pub fn inc_host_lock_ref(&mut self, component_type: ComponentType) {
-        // def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
-        //         node = self.node_by_id(node_id)
-        //         result = IncLockRefResult()
-        //         for component in self.components:
-        //             result = component.acquire_component_lock(
-        //                 node=node, result=result, lock_host=True
-        //             )
-        //         self._update_evictable_leaf_sets(node)
-        //         return result
-        todo!()
+        self.inc_lock_ref_(ValueSlotIdx::host(component_type));
     }
 
     /// Drop the component's host lock refcount by one; panics when unlocked.
     pub fn dec_host_lock_ref(&mut self, component_type: ComponentType) {
-        // def dec_host_lock_ref(
-        //         self, node_id: NodeId, params: Optional[DecLockRefParams] = None
-        //     ) -> DecLockRefResult:
-        //         node = self.node_by_id(node_id)
-        //         for component in self.components:
-        //             component.release_component_lock(node=node, params=params, lock_host=True)
-        //         self._update_evictable_leaf_sets(node)
-        //         return DecLockRefResult()
-        todo!()
+        self.dec_lock_ref_(ValueSlotIdx::host(component_type));
     }
 
     /// Split the component's host value between a new parent and the child.
@@ -234,34 +211,75 @@ impl<K: ChildKeyType> Node<K> {
         component_type: ComponentType,
         split_len: i64,
     ) {
-        todo!()
+        Node::redistribute_child_value_(
+            parent_node,
+            child_node,
+            ValueSlotIdx::host(component_type),
+            split_len,
+        );
     }
 
     /// Whether any component holds a device lock on this node.
     pub fn is_device_locked(&self) -> bool {
-        todo!()
+        self.values[..NUM_COMPONENT_TYPES]
+            .iter()
+            .any(|state| state.lock_ref > 0)
     }
 
     /// Whether any component holds a host lock on this node.
     pub fn is_host_locked(&self) -> bool {
-        todo!()
+        self.values[NUM_COMPONENT_TYPES..]
+            .iter()
+            .any(|state| state.lock_ref > 0)
     }
 
     // ==== Crate-internal tree wiring ====
 
     /// A fresh root: no parent, no value, lowest eviction priority.
     pub(crate) fn new_root(id: NodeId) -> Self {
-        todo!()
+        Node {
+            parent: None,
+            extra_key: None,
+            children: HashMap::new(),
+            key: K::default(),
+            values: Default::default(),
+            swa_uuid: None,
+            swa_host_uuid: None,
+            hash_value: Some(Vec::new()),
+            write_through_pending_id: None,
+            last_access_counter: 0,
+            creation_counter: 0,
+            hit_count: 0,
+            priority: i64::MIN,
+            id,
+            idx: NodeIdx_(id),
+        }
     }
 
     /// A detached child reached by edge `key`; `attach_child` sets the parent link.
     pub(crate) fn new_child(id: NodeId, key: K, priority: i64) -> Self {
-        todo!()
+        Node {
+            parent: None,
+            extra_key: None,
+            children: HashMap::new(),
+            key,
+            values: Default::default(),
+            swa_uuid: None,
+            swa_host_uuid: None,
+            hash_value: None,
+            write_through_pending_id: None,
+            last_access_counter: 0,
+            creation_counter: 0,
+            hit_count: 0,
+            priority,
+            id,
+            idx: NodeIdx_(id),
+        }
     }
 
     /// The namespaced edge key for this node's own edge from its parent.
     pub(crate) fn edge_key(&self, page_size: usize) -> (Option<Arc<str>>, K) {
-        todo!()
+        (self.extra_key.clone(), self.key.child_key(page_size))
     }
 
     /// Link `child` under this node, keyed by its namespaced page key; errors on
@@ -272,56 +290,125 @@ impl<K: ChildKeyType> Node<K> {
         child: &mut Node<K>,
         page_size: usize,
     ) -> Result<(), TreeCoreRuntimeError> {
-        todo!()
+        // Only fresh, detached nodes are ever attached.
+        assert!(
+            child.parent.is_none(),
+            "attach_child: node {} is already attached to parent {:?}",
+            child.id,
+            child.parent
+        );
+        let parent_idx = self.idx;
+        match self.children.entry(child.edge_key(page_size)) {
+            Entry::Occupied(_) => Err(TreeCoreRuntimeError::DuplicateChildKey {
+                parent: self.id,
+                key: format!("{:?}", child.key),
+            }),
+            Entry::Vacant(slot) => {
+                slot.insert(child.idx);
+                child.parent = Some(parent_idx);
+                Ok(())
+            }
+        }
     }
 
     /// Unlink this node from `parent`: drop it from `parent.children` and clear its own
     /// parent link; panics on a broken parent<->child link (an internal invariant).
     pub(crate) fn detach_from_parent(&mut self, parent: &mut Node<K>, page_size: usize) {
-        todo!()
+        // A live child is always registered under its namespaced page key.
+        match parent.children.remove(&self.edge_key(page_size)) {
+            Some(idx) if idx == self.idx => self.parent = None,
+            found => panic!(
+                "detach_from_parent: parent {} has no child {} under key {:?} (found {:?})",
+                parent.id, self.id, self.key, found
+            ),
+        }
     }
 
     // ==== Internal slot-keyed lookups ====
 
     /// The slot's value state (internal slot-keyed lookup).
     pub fn state_(&self, slot: ValueSlotIdx) -> &ValueState {
-        todo!()
+        &self.values[slot.idx()]
     }
 
     /// The slot's mutable value state (internal slot-keyed lookup).
     pub fn state_mut_(&mut self, slot: ValueSlotIdx) -> &mut ValueState {
-        todo!()
+        &mut self.values[slot.idx()]
     }
 
     /// The slot's value, or None when unset (internal slot-keyed lookup).
     pub fn try_value_(&self, slot: ValueSlotIdx) -> Option<&Tensor> {
-        todo!()
+        self.state_(slot).value.as_ref()
     }
 
     /// The slot's value; panics if no value is set (internal slot-keyed lookup).
     pub fn value_(&self, slot: ValueSlotIdx) -> &Tensor {
-        todo!()
+        self.try_value_(slot).unwrap_or_else(|| {
+            panic!(
+                "value: {:?}/{} slot has no value on node {}",
+                slot.component_type(),
+                slot.tier(),
+                self.id
+            )
+        })
     }
 
     /// Whether the slot's value is present (internal slot-keyed lookup).
     pub fn has_value_(&self, slot: ValueSlotIdx) -> bool {
-        todo!()
+        self.state_(slot).value.is_some()
     }
 
     /// The slot's value length, or 0 when value-less (internal slot-keyed lookup).
     pub fn value_len_(&self, slot: ValueSlotIdx) -> usize {
-        todo!()
+        self.state_(slot)
+            .value
+            .as_ref()
+            .map_or(0, |v| v.size()[0] as usize)
     }
 
     /// Set the slot's value; panics if a value is already set (internal slot-keyed lookup).
     pub fn set_value_(&mut self, slot: ValueSlotIdx, value: Tensor) {
-        todo!()
+        if slot.component_type().single_value_per_node() {
+            assert_eq!(
+                value.size()[0],
+                1,
+                "set_value: {:?}/{} expects a single state slot on node {}",
+                slot.component_type(),
+                slot.tier(),
+                self.id
+            );
+        } else {
+            assert_eq!(
+                value.size()[0] as usize,
+                self.key.atom_len(),
+                "set_value: {:?}/{} value length differs from the key on node {}",
+                slot.component_type(),
+                slot.tier(),
+                self.id
+            );
+        }
+        let node_id = self.id;
+        let state = self.state_mut_(slot);
+        assert!(
+            state.value.is_none(),
+            "set_value: {:?}/{} slot already set on node {node_id}",
+            slot.component_type(),
+            slot.tier()
+        );
+        state.value = Some(value);
     }
 
     /// Take the slot's value, leaving it value-less; panics if no value is set
     /// (internal slot-keyed lookup).
     pub fn take_value_(&mut self, slot: ValueSlotIdx) -> Tensor {
-        todo!()
+        let node_id = self.id;
+        self.state_mut_(slot).value.take().unwrap_or_else(|| {
+            panic!(
+                "take_value: {:?}/{} slot has no value on node {node_id}",
+                slot.component_type(),
+                slot.tier()
+            )
+        })
     }
 
     /// Split the slot's value on `child_node` at `split_len`: the deep-copied head
@@ -333,49 +420,47 @@ impl<K: ChildKeyType> Node<K> {
         slot: ValueSlotIdx,
         split_len: i64,
     ) {
-        todo!()
+        let child_node_id = child_node.id;
+        let value = child_node.take_value_(slot);
+        let len = value.size()[0];
+        // A boundary split would leave one side with a present-but-empty value.
+        assert!(
+            0 < split_len && split_len < len,
+            "redistribute_child_value: split_len {split_len} out of range (0, {len}) on node {child_node_id}"
+        );
+        let head = value.narrow(0, 0, split_len).copy();
+        let tail = value.narrow(0, split_len, len - split_len).copy();
+        child_node.set_value_(slot, tail);
+        parent_node.set_value_(slot, head);
     }
 
     /// The slot's lock refcount (internal slot-keyed lookup).
     pub fn lock_ref_(&self, slot: ValueSlotIdx) -> u32 {
-        todo!()
+        self.state_(slot).lock_ref
     }
 
     /// Set the slot's lock refcount (internal slot-keyed lookup).
     pub fn set_lock_ref_(&mut self, slot: ValueSlotIdx, lock_ref: u32) {
-        todo!()
+        self.state_mut_(slot).lock_ref = lock_ref;
     }
 
     /// Bump the slot's lock refcount by one (internal slot-keyed lookup).
     pub fn inc_lock_ref_(&mut self, slot: ValueSlotIdx) {
-        // def inc_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
-        //         node = self.node_by_id(node_id)
-        //         result = IncLockRefResult()
-        //         for component in self.components:
-        //             result = component.acquire_component_lock(node=node, result=result)
-        //         self._update_evictable_leaf_sets(node)
-        //         return result
-        todo!()
+        self.state_mut_(slot).lock_ref += 1;
     }
 
     /// Drop the slot's lock refcount by one; panics on an unlocked node
     /// (internal slot-keyed lookup).
     pub fn dec_lock_ref_(&mut self, slot: ValueSlotIdx) {
-        // def dec_lock_ref(
-        //         self,
-        //         node_id: NodeId,
-        //         params: Optional[DecLockRefParams] = None,
-        //         skip_swa: bool = False,
-        //     ) -> DecLockRefResult:
-        //         node = self.node_by_id(node_id)
-        //         for component in self.components:
-        //             if skip_swa and component.component_type == ComponentType.SWA:
-        //                 continue
-        //             component.release_component_lock(node=node, params=params)
-        //         self._update_evictable_leaf_sets(node)
-        //         # TODO: delta is not aggregated from components; no caller uses it yet.
-        //         return DecLockRefResult()
-        todo!()
+        let node_id = self.id;
+        let state = self.state_mut_(slot);
+        state.lock_ref = state.lock_ref.checked_sub(1).unwrap_or_else(|| {
+            panic!(
+                "dec_lock_ref: {:?}/{} lock_ref underflow on node {node_id}",
+                slot.component_type(),
+                slot.tier()
+            )
+        });
     }
 }
 
@@ -392,7 +477,7 @@ pub(crate) struct NodeIdx_(pub(crate) usize);
 
 impl std::fmt::Display for NodeIdx_ {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
+        write!(f, "{}", self.0)
     }
 }
 
@@ -407,39 +492,41 @@ pub struct ValueSlotIdx(usize);
 impl ValueSlotIdx {
     /// The component's device-tier slot.
     pub const fn device(component_type: ComponentType) -> Self {
-        // def device(self):
-        //         return self.tree_core.device
-        todo!()
+        Self(component_type.idx())
     }
 
     /// The component's host-tier slot.
     pub const fn host(component_type: ComponentType) -> Self {
-        todo!()
+        Self(NUM_COMPONENT_TYPES + component_type.idx())
     }
 
     /// Index into a node's `values` array.
     pub const fn idx(self) -> usize {
-        todo!()
+        self.0
     }
 
     /// The slot at a flat index; panics out of range.
     pub fn from_idx(idx: usize) -> Self {
-        todo!()
+        assert!(
+            idx < NUM_VALUE_SLOTS,
+            "from_idx: {idx} is not a value-slot index"
+        );
+        Self(idx)
     }
 
     /// Whether this is a host-tier slot.
     pub const fn is_host(self) -> bool {
-        todo!()
+        self.0 >= NUM_COMPONENT_TYPES
     }
 
     /// The component this slot belongs to.
     pub fn component_type(self) -> ComponentType {
-        todo!()
+        ComponentType::from_idx(self.0 % NUM_COMPONENT_TYPES)
     }
 
     /// The slot's tier name, for diagnostics.
     pub fn tier(self) -> &'static str {
-        todo!()
+        if self.is_host() { "host" } else { "device" }
     }
 }
 
@@ -512,81 +599,93 @@ pub trait ChildKeyType:
     /// Number of atoms in this key; an atom is one radix position — a token normally,
     /// a token pair for bigram/EAGLE keys.
     fn atom_len(&self) -> usize {
-        todo!()
+        self.as_ref().len()
     }
 
     /// The first radix page (`page_size` atoms) as an owned key — a node's
     /// child-map key under its parent; panics on a key shorter than a page.
     fn child_key(&self, page_size: usize) -> Self {
-        // def child_key(self, page_size: int = 1):
-        //         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
-        //         t = self.token_ids
-        //         if self.is_bigram:
-        //             if page_size == 1:
-        //                 plain = (t[0], t[1])
-        //             else:
-        //                 plain = tuple((t[j], t[j + 1]) for j in range(page_size))
-        //         else:
-        //             plain = t[0] if page_size == 1 else tuple(t[:page_size])
-        //         return plain if self.extra_key is None else (self.extra_key, plain)
-        todo!()
+        let atom_len = self.atom_len();
+        assert!(
+            atom_len >= page_size,
+            "child_key: key of {atom_len} atoms is shorter than a page ({page_size})"
+        );
+        self.as_ref()[..page_size].to_vec().into()
     }
 
     /// The single page starting at `start`, zero-copy.
     fn page_at(&self, start: usize, page_size: usize) -> &[Self::Atom] {
-        todo!()
+        let end = start + page_size;
+        let atom_len = self.atom_len();
+        assert!(
+            end <= atom_len,
+            "page_at: page [{start}, {end}) reaches beyond the key length {atom_len}"
+        );
+        &self.as_ref()[start..end]
     }
 
     /// Page-quantized common-prefix length of the tail from `start` with `other`.
     fn match_len(&self, start: usize, other: &Self, page_size: usize) -> usize {
-        todo!()
+        let atom_len = self.atom_len();
+        assert!(
+            start <= atom_len,
+            "match_len: start {start} beyond the key length {atom_len}"
+        );
+        let common = self.as_ref()[start..]
+            .iter()
+            .zip(other.as_ref())
+            .take_while(|(a, b)| a == b)
+            .count();
+        common / page_size * page_size
     }
 
     /// The owned suffix from `start`; empty when `start` equals the length.
     fn suffix(&self, start: usize) -> Self {
-        todo!()
+        let atom_len = self.atom_len();
+        assert!(
+            start <= atom_len,
+            "suffix: start {start} beyond the key length {atom_len}"
+        );
+        self.as_ref()[start..].to_vec().into()
     }
 
     /// The key truncated to a whole number of pages.
     fn page_aligned(&self, page_size: usize) -> Self {
-        // def page_aligned(self, page_size: int) -> RadixKey:
-        //         if page_size == 1:
-        //             return self
-        //         aligned_len = len(self) // page_size * page_size
-        //         return self[:aligned_len]
-        todo!()
+        let aligned_len = self.atom_len() / page_size * page_size;
+        self.as_ref()[..aligned_len].to_vec().into()
     }
 
     /// Split into (head, tail) owned keys at `split_idx`; panics on a boundary
     /// split, which would leave one side empty.
     fn split_at(&self, split_idx: usize) -> (Self, Self) {
-        todo!()
+        let atom_len = self.atom_len();
+        assert!(
+            0 < split_idx && split_idx < atom_len,
+            "split_at: split_idx {split_idx} out of range (0, {atom_len})"
+        );
+        let (head, tail) = self.as_ref().split_at(split_idx);
+        (head.to_vec().into(), tail.to_vec().into())
     }
 }
 
 /// A token id as a u32 storage-hash word; token ids beyond u32 are rejected.
 fn hash_word(token_id: i64) -> u32 {
-    todo!()
+    u32::try_from(token_id).expect("token id does not fit in uint32")
 }
 
 impl ChildKeyType for Vec<i64> {
     type Atom = i64;
 
     fn key_from(token_ids: Cow<'_, Vec<i64>>) -> Cow<'_, Self> {
-        todo!()
+        token_ids
     }
 
     fn hash_words(atom: &i64) -> impl Iterator<Item = u32> {
-        std::iter::empty()
+        std::iter::once(hash_word(*atom))
     }
 
     fn raw_token_ids(atoms: &[i64]) -> Cow<'_, [i64]> {
-        // def raw_token_ids(self) -> array:
-        //         """token_ids honoring `limit` (copies only when capped)."""
-        //         n = self._raw_len()
-        //         t = self.token_ids
-        //         return t if n == len(t) else t[:n]
-        todo!()
+        Cow::Borrowed(atoms)
     }
 }
 
@@ -595,20 +694,22 @@ impl ChildKeyType for Vec<(i64, i64)> {
 
     /// N+1 raw token ids become N overlapping (t_i, t_{i+1}) bigram atoms.
     fn key_from(token_ids: Cow<'_, Vec<i64>>) -> Cow<'_, Self> {
-        todo!()
+        Cow::Owned(token_ids.windows(2).map(|w| (w[0], w[1])).collect())
     }
 
     fn hash_words(atom: &(i64, i64)) -> impl Iterator<Item = u32> {
-        std::iter::empty()
+        [hash_word(atom.0), hash_word(atom.1)].into_iter()
     }
 
     fn raw_token_ids(atoms: &[(i64, i64)]) -> Cow<'_, [i64]> {
-        // def raw_token_ids(self) -> array:
-        //         """token_ids honoring `limit` (copies only when capped)."""
-        //         n = self._raw_len()
-        //         t = self.token_ids
-        //         return t if n == len(t) else t[:n]
-        todo!()
+        let Some(first) = atoms.first() else {
+            return Cow::Owned(Vec::new());
+        };
+        Cow::Owned(
+            std::iter::once(first.0)
+                .chain(atoms.iter().map(|atom| atom.1))
+                .collect(),
+        )
     }
 }
 
@@ -673,28 +774,23 @@ pub fn get_hash_str<K: ChildKeyType>(
     prior_hash: Option<&str>,
     page_size: usize,
 ) -> Vec<String> {
-    // def get_hash_str(
-    //     token_ids: List[int],
-    //     prior_hash: Optional[str] = None,
-    //     page_size: Optional[int] = None,
-    // ) -> str | List[str]:
-    //     prior_digest = bytes.fromhex(prior_hash) if prior_hash else None
-    //     return get_native_hash(token_ids, prior_digest, page_size)
-    todo!()
+    assert!(page_size > 0, "page_size must be positive");
+    // An empty prior chains nothing.
+    let mut prior = prior_hash
+        .filter(|prior| !prior.is_empty())
+        .map(parse_prior_hash);
+    let mut hash_values = Vec::with_capacity(atoms.len().div_ceil(page_size));
+    for page in atoms.chunks(page_size) {
+        let digest = hash_page::<K>(page, prior.as_ref());
+        hash_values.push(digest_to_hex(&digest));
+        prior = Some(digest);
+    }
+    hash_values
 }
 
 /// The hash's first 16 hex chars as a signed 64-bit block id for events.
 pub fn hash_str_to_int64(hash_str: &str) -> i64 {
-    // def hash_str_to_int64(hash_str: str) -> int:
-    //     """Convert SHA256 hex string to signed 64-bit integer for events.
-    //
-    //     Takes first 16 hex characters (64 bits) and converts to signed int64 range.
-    //     """
-    //     uint64_val = int(hash_str[:16], 16)
-    //     if uint64_val >= 2**63:
-    //         return uint64_val - 2**64
-    //     return uint64_val
-    todo!()
+    u64::from_str_radix(&hash_str[..16], 16).expect("hash must be a hex digest") as i64
 }
 
 /// Split a node's hash list at a page boundary; None-safe when never hashed.
@@ -703,32 +799,13 @@ pub fn split_node_hash_value(
     split_idx: usize,
     page_size: usize,
 ) -> (Option<Vec<String>>, Option<Vec<String>>) {
-    // def split_node_hash_value(
-    //     child_hash_value: Optional[List[str]], split_len: int, page_size: int
-    // ) -> tuple[Optional[List[str]], Optional[List[str]]]:
-    //     """Split hash_value between parent and child nodes during node splitting.
-    //
-    //     Args:
-    //         child_hash_value: The hash_value list from the child node being split
-    //         split_len: The length at which to split (in tokens)
-    //         page_size: The page size for calculating number of pages
-    //
-    //     Returns:
-    //         Tuple of (new_node_hash_value, updated_child_hash_value)
-    //     """
-    //     if child_hash_value is None:
-    //         return None, None
-    //
-    //     if page_size == 1:
-    //         split_pages = split_len
-    //     else:
-    //         split_pages = split_len // page_size
-    //
-    //     new_node_hash = child_hash_value[:split_pages]
-    //     child_hash = child_hash_value[split_pages:]
-    //
-    //     return new_node_hash, child_hash
-    todo!()
+    let Some(mut new_node_hash) = hash_values else {
+        return (None, None);
+    };
+    let child_hash = new_node_hash.split_off(split_idx / page_size);
+    // Progressive splits must not retain the pre-split capacity on the head.
+    new_node_hash.shrink_to_fit();
+    (Some(new_node_hash), Some(child_hash))
 }
 
 // ==== The node arena ====================================================
@@ -758,112 +835,118 @@ pub struct NodeArena<K: ChildKeyType> {
 impl<K: ChildKeyType> NodeArena<K> {
     /// Build an arena for the given component types and install a fresh root.
     pub fn new(component_types: Vec<ComponentType>, page_size: usize) -> Self {
-        todo!()
+        let mut arena = NodeArena {
+            nodes: Vec::new(),
+            free: Vec::new(),
+            id_map: HashMap::new(),
+            next_id: 0,
+            root: NodeIdx_(0),
+            access_counter: 0,
+            component_types,
+            page_size,
+        };
+        arena.reset();
+        arena
     }
 
     /// Drop all nodes, then reinstall the root.
     pub fn reset(&mut self) {
-        // def reset(self) -> None:
-        //         """Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
-        //         match result."""
-        //         # Maintains the NodeId -> active tree node mapping.
-        //         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
-        //
-        //         # The single in-flight resumable insert, if suspended at a barrier.
-        //         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
-        //
-        //         self.root_node = self._new_node()
-        //         self.root_node.priority = -sys.maxsize
-        //         self.root_node.key = RadixKey(array("q"), None)
-        //         self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
-        //         self.root_node.hash_value = []
-        //         for ct in self.component_types:
-        //             self.root_node.component_data[ct].lock_ref = 1
-        //
-        //         self.component_evictable_size_ = {ct: 0 for ct in self.component_types}
-        //         self.component_protected_size_ = {ct: 0 for ct in self.component_types}
-        //
-        //         self.lru_lists = {
-        //             ct: UnifiedLRUList(ct, self.component_types) for ct in self.component_types
-        //         }
-        //
-        //         self.evictable_device_leaves: set[UnifiedTreeNode] = set()
-        //         self.evictable_host_leaves: set[UnifiedTreeNode] = set()
-        //         self.host_lru_lists = {
-        //             ct: UnifiedLRUList(ct, self.component_types, use_host_ptr=True)
-        //             for ct in self.component_types
-        //         }
-        //
-        //         self._empty_match_result = MatchResult(
-        //             device_indices=torch.empty(
-        //                 (0,),
-        //                 dtype=torch.int64,
-        //                 device=self.device,
-        //             ),
-        //             last_device_node=self.root_node.id,
-        //             last_host_node=self.root_node.id,
-        //             best_match_node=self.root_node.id,
-        //             cache_actions=[],
-        //         )
-        todo!()
+        self.nodes.clear();
+        self.free.clear();
+        // next_id is NOT reset: pre-reset handles must miss, never alias.
+        self.id_map.clear();
+        self.access_counter = 0;
+        self.root = self.alloc_root();
     }
 
     /// The live slot for an external handle; panics on a freed or unknown id.
     #[track_caller]
     pub fn resolve(&self, id: NodeId) -> NodeIdx_ {
-        todo!()
+        *self
+            .id_map
+            .get(&id)
+            .unwrap_or_else(|| panic!("node {id} is not allocated"))
     }
 
     /// The live slot for an external handle, or None if freed/unknown.
     pub fn try_resolve(&self, id: NodeId) -> Option<NodeIdx_> {
-        todo!()
+        self.id_map.get(&id).copied()
     }
 
     /// Mint the next external handle for the slot and index it.
     fn mint_id_(&mut self, idx: NodeIdx_) -> NodeId {
-        todo!()
+        let id = self.next_id;
+        self.next_id += 1;
+        self.id_map.insert(id, idx);
+        id
     }
 
     /// Allocate a protected, value-less root: locked (`lock_ref = 1`) for each
     /// component type and never entering a leaf/LRU set.
     pub fn alloc_root(&mut self) -> NodeIdx_ {
-        todo!()
+        let idx = self.reserve();
+        let id = self.mint_id_(idx);
+        let tick = self.get_and_bump_access_counter();
+        let node = self.nodes[idx.0].insert(Node::new_root(id));
+        node.idx = idx;
+        node.last_access_counter = tick;
+        node.creation_counter = tick;
+        for ct in &self.component_types {
+            node.values[ct.idx()].lock_ref = 1;
+        }
+        idx
     }
 
     /// Every live node id, in slot order.
     pub fn live_ids(&self) -> impl Iterator<Item = NodeIdx_> + '_ {
-        std::iter::empty()
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| slot.as_ref().map(|_| NodeIdx_(idx)))
     }
 
     /// Per-page hash values for a node's key, chained from its parent's last hash.
     pub fn compute_node_hash_values(&self, node_id: NodeIdx_, page_size: usize) -> Vec<String> {
-        // def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
-        //     """Compute SHA256-based hash values for position-aware KV block IDs."""
-        //     parent_hash = None
-        //     if node.parent is not None and node.parent.hash_value is not None:
-        //         if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
-        //             parent_hash = node.parent.hash_value[-1]
-        //
-        //     hash_values = get_hash_str(node.key, parent_hash, page_size=page_size)
-        //     assert isinstance(hash_values, list)
-        //     return hash_values
-        todo!()
+        let node = self.node(node_id);
+        let parent_hash = node.parent.and_then(|parent_id| {
+            let parent = self.node(parent_id);
+            if parent.key.atom_len() > 0 {
+                parent.get_last_hash_value()
+            } else {
+                None
+            }
+        });
+        crate::node::get_hash_str::<K>(node.key.as_ref(), parent_hash, page_size)
     }
 
     /// The ancestor chain's hash values ending at `node_id`, in root-to-node
     /// order; the walk stops below the nearest never-hashed ancestor.
     pub fn prefix_hash_values(&self, node_id: Option<NodeIdx_>) -> Vec<String> {
-        todo!()
+        let mut chunks: Vec<&Vec<String>> = Vec::new();
+        let mut cursor = node_id;
+        while let Some(id) = cursor {
+            let node = self.node(id);
+            let Some(hash_value) = node.hash_value.as_ref() else {
+                break;
+            };
+            chunks.push(hash_value);
+            cursor = node.parent;
+        }
+        chunks
+            .iter()
+            .rev()
+            .flat_map(|chunk| chunk.iter().cloned())
+            .collect()
     }
 
     /// The node's namespace; None for the default.
     pub fn node_extra_key(&self, node_id: NodeIdx_) -> Option<&str> {
-        todo!()
+        self.node(node_id).extra_key.as_deref()
     }
 
     /// The tree's single root.
     pub fn root(&self) -> NodeIdx_ {
-        todo!()
+        self.root
     }
 
     /// The node's child on the page within the namespace, if any.
@@ -873,17 +956,22 @@ impl<K: ChildKeyType> NodeArena<K> {
         extra_key: Option<&str>,
         page: &[K::Atom],
     ) -> Option<NodeIdx_> {
-        todo!()
+        // Tuple keys cannot borrow-match a (str, slice) pair, so build an owned key.
+        let key = (extra_key.map(Arc::from), K::from(page.to_vec()));
+        self.node(id).children.get(&key).copied()
     }
 
     /// The root's child on the key's first page within the namespace, if any.
     pub fn root_child(&self, extra_key: Option<&str>, page: &[K::Atom]) -> Option<NodeIdx_> {
-        todo!()
+        self.child_on_page(self.root, extra_key, page)
     }
 
     /// Whether any root edge files under the namespace.
     pub fn namespace_exists(&self, extra_key: Option<&str>) -> bool {
-        todo!()
+        self.node(self.root)
+            .children
+            .keys()
+            .any(|(ns, _)| ns.as_deref() == extra_key)
     }
 
     /// Install `child` under `parent` on its namespaced `map_key`; returns the
@@ -894,7 +982,8 @@ impl<K: ChildKeyType> NodeArena<K> {
         map_key: K,
         child: NodeIdx_,
     ) -> Option<NodeIdx_> {
-        todo!()
+        let ns = self.node(child).extra_key.clone();
+        self.node_mut(parent).children.insert((ns, map_key), child)
     }
 
     /// Reserve a detached child and attach it under `parent`; `extra_key` names the
@@ -906,128 +995,211 @@ impl<K: ChildKeyType> NodeArena<K> {
         priority: i64,
         extra_key: Option<&str>,
     ) -> Result<NodeIdx_, TreeCoreRuntimeError> {
-        todo!()
+        // Validate the parent and attach the child before committing a slot, so a
+        // rejected add reserves nothing.
+        let size = self.nodes.len();
+        match self.nodes.get(parent.0) {
+            None => return Err(TreeCoreRuntimeError::NodeAccessOutOfBound { id: parent, size }),
+            Some(None) => return Err(TreeCoreRuntimeError::ParentNotAllocated { id: parent }),
+            Some(Some(_)) => {}
+        }
+        let idx = self
+            .free
+            .last()
+            .copied()
+            .unwrap_or(NodeIdx_(self.nodes.len()));
+        let mut child_node = Node::new_child(self.next_id, key, priority);
+        child_node.idx = idx;
+        let tick = self.get_and_bump_access_counter();
+        child_node.last_access_counter = tick;
+        child_node.creation_counter = tick;
+        let page_size = self.page_size;
+        // Root children adopt the op namespace; deeper nodes inherit the parent's.
+        child_node.extra_key = if parent == self.root {
+            extra_key.map(Arc::from)
+        } else {
+            self.node(parent).extra_key.clone()
+        };
+        self.node_mut(parent)
+            .attach_child(&mut child_node, page_size)?;
+        match self.free.pop() {
+            Some(popped) => {
+                // The freed slot we peeked is still the freelist head and still free.
+                assert_eq!(popped, idx, "freelist head changed between peek and pop");
+                assert!(
+                    self.nodes[idx.0].is_none(),
+                    "freelist popped a live slot {idx} (freelist corruption)"
+                );
+                self.nodes[idx.0] = Some(child_node);
+            }
+            None => self.nodes.push(Some(child_node)),
+        }
+        self.mint_id_(idx);
+        Ok(idx)
     }
 
     /// Allocate a detached node (empty key, no parent) for the tree to wire in.
     pub fn alloc_detached(&mut self, priority: i64) -> NodeIdx_ {
-        todo!()
+        let idx = self.reserve();
+        let id = self.mint_id_(idx);
+        let tick = self.get_and_bump_access_counter();
+        let node = self.nodes[idx.0].insert(Node::new_child(id, K::default(), priority));
+        node.idx = idx;
+        node.last_access_counter = tick;
+        node.creation_counter = tick;
+        idx
     }
 
     /// Reserve an empty slot (reusing a freed one when available), returning its id.
     fn reserve(&mut self) -> NodeIdx_ {
-        todo!()
+        match self.free.pop() {
+            Some(idx) => {
+                assert!(
+                    self.nodes[idx.0].is_none(),
+                    "freelist popped a live slot {idx} (freelist corruption)"
+                );
+                idx
+            }
+            None => {
+                self.nodes.push(None);
+                NodeIdx_(self.nodes.len() - 1)
+            }
+        }
     }
 
     /// Detach a leaf from its parent and return its slot to the freelist.
     pub fn free_leaf(&mut self, id: NodeIdx_) -> Result<(), TreeCoreRuntimeError> {
-        todo!()
+        let size = self.nodes.len();
+        // Validate and take the leaf out in one step.
+        let mut child_node = match self.nodes.get_mut(id.0) {
+            None => return Err(TreeCoreRuntimeError::NodeAccessOutOfBound { id, size }),
+            Some(None) => return Err(TreeCoreRuntimeError::NodeDoubleFree { id }),
+            Some(Some(node)) if node.is_root() => {
+                return Err(TreeCoreRuntimeError::RootNotFreeable { id });
+            }
+            Some(Some(node)) if !node.is_leaf() => {
+                return Err(TreeCoreRuntimeError::FreeNonLeafNode {
+                    id,
+                    num_children: node.children.len(),
+                });
+            }
+            Some(slot) => slot.take().expect("validated non-root leaf"),
+        };
+        // A validated non-root leaf always has a parent to unlink from.
+        let parent = child_node.parent();
+        let page_size = self.page_size;
+        let parent_node = self.node_mut(parent);
+        child_node.detach_from_parent(parent_node, page_size);
+        self.id_map.remove(&child_node.id);
+        self.free.push(id);
+        Ok(())
     }
 
     /// Number of live nodes.
     pub fn len(&self) -> usize {
-        todo!()
+        self.nodes.len() - self.free.len()
     }
 
     /// Shared access to a live node; panics on a dead or out-of-range id.
     #[track_caller]
     pub fn node(&self, id: NodeIdx_) -> &Node<K> {
-        todo!()
+        let size = self.nodes.len();
+        self.nodes
+            .get(id.0)
+            .unwrap_or_else(|| panic!("node access out of bounds: id {id} not in [0, {size})"))
+            .as_ref()
+            .unwrap_or_else(|| panic!("node {id} is not allocated"))
     }
 
     /// Mutable access to a live node; panics on a dead or out-of-range id.
     #[track_caller]
     pub fn node_mut(&mut self, id: NodeIdx_) -> &mut Node<K> {
-        todo!()
+        let size = self.nodes.len();
+        self.nodes
+            .get_mut(id.0)
+            .unwrap_or_else(|| panic!("node access out of bounds: id {id} not in [0, {size})"))
+            .as_mut()
+            .unwrap_or_else(|| panic!("node {id} is not allocated"))
     }
 
     /// The node's device value for the component; panics if unset.
     pub fn device_value(&self, id: NodeIdx_, component_type: ComponentType) -> &Tensor {
-        todo!()
+        self.node(id).device_value(component_type)
     }
 
     /// The node's device value for the component, or None when unset.
     pub fn try_device_value(&self, id: NodeIdx_, component_type: ComponentType) -> Option<&Tensor> {
-        todo!()
+        self.node(id).try_device_value(component_type)
     }
 
     /// Whether the node holds the component's device value.
     pub fn has_device_value(&self, id: NodeIdx_, component_type: ComponentType) -> bool {
-        todo!()
+        self.node(id).has_device_value(component_type)
     }
 
     /// The node's device value length for the component, or 0 when value-less.
     pub fn device_value_len(&self, id: NodeIdx_, component_type: ComponentType) -> usize {
-        todo!()
+        self.node(id).device_value_len(component_type)
     }
 
     /// Set the node's device value for the component; panics if already set.
     pub fn set_device_value(&mut self, id: NodeIdx_, component_type: ComponentType, value: Tensor) {
-        todo!()
+        self.node_mut(id).set_device_value(component_type, value);
     }
 
     /// Take the node's device value for the component; panics if unset.
     pub fn take_device_value(&mut self, id: NodeIdx_, component_type: ComponentType) -> Tensor {
-        todo!()
+        self.node_mut(id).take_device_value(component_type)
     }
 
     /// The node's device lock refcount for the component.
     pub fn device_lock_ref(&self, id: NodeIdx_, component_type: ComponentType) -> u32 {
-        todo!()
+        self.node(id).device_lock_ref(component_type)
     }
 
     /// The node's host value for the component; panics if unset.
     pub fn host_value(&self, id: NodeIdx_, component_type: ComponentType) -> &Tensor {
-        todo!()
+        self.node(id).host_value(component_type)
     }
 
     /// Whether the node holds the component's host value.
     pub fn has_host_value(&self, id: NodeIdx_, component_type: ComponentType) -> bool {
-        todo!()
+        self.node(id).has_host_value(component_type)
     }
 
     /// The node's host value length for the component, or 0 when value-less.
     pub fn host_value_len(&self, id: NodeIdx_, component_type: ComponentType) -> usize {
-        todo!()
+        self.node(id).host_value_len(component_type)
     }
 
     /// Set the node's host value for the component; panics if already set.
     pub fn set_host_value(&mut self, id: NodeIdx_, component_type: ComponentType, value: Tensor) {
-        todo!()
+        self.node_mut(id).set_host_value(component_type, value);
     }
 
     /// Take the node's host value for the component; panics if unset.
     pub fn take_host_value(&mut self, id: NodeIdx_, component_type: ComponentType) -> Tensor {
-        todo!()
+        self.node_mut(id).take_host_value(component_type)
     }
 
     /// The node's host lock refcount for the component.
     pub fn host_lock_ref(&self, id: NodeIdx_, component_type: ComponentType) -> u32 {
-        todo!()
+        self.node(id).host_lock_ref(component_type)
     }
 
     /// Bump the node's device lock refcount for the component.
     pub fn inc_device_lock_ref(&mut self, id: NodeIdx_, component_type: ComponentType) {
-        todo!()
+        self.node_mut(id).inc_device_lock_ref(component_type);
     }
 
     /// Drop the node's device lock refcount for the component; panics when unlocked.
     pub fn dec_device_lock_ref(&mut self, id: NodeIdx_, component_type: ComponentType) {
-        todo!()
+        self.node_mut(id).dec_device_lock_ref(component_type);
     }
 
     /// Bump the node's host lock refcount for the component.
     pub fn inc_host_lock_ref(&mut self, id: NodeIdx_, component_type: ComponentType) {
-        // def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
-        //         node = self.node_by_id(node_id)
-        //         result = IncLockRefResult()
-        //         for component in self.components:
-        //             result = component.acquire_component_lock(
-        //                 node=node, result=result, lock_host=True
-        //             )
-        //         self._update_evictable_leaf_sets(node)
-        //         return result
-        todo!()
+        self.node_mut(id).inc_host_lock_ref(component_type);
     }
 
     /// Mutable access to a live parent/child pair at once. Internal-only accessor:
@@ -1038,18 +1210,44 @@ impl<K: ChildKeyType> NodeArena<K> {
         parent_node_id: NodeIdx_,
         child_node_id: NodeIdx_,
     ) -> (&mut Node<K>, &mut Node<K>) {
-        todo!()
+        assert_ne!(
+            parent_node_id, child_node_id,
+            "node_pair_mut: distinct nodes required, got {parent_node_id} twice"
+        );
+        let size = self.nodes.len();
+        assert!(
+            parent_node_id.0 < size && child_node_id.0 < size,
+            "node_pair_mut: id out of bounds ({parent_node_id}, {child_node_id}) vs size {size}"
+        );
+        let [parent_slot, child_slot] = self
+            .nodes
+            .get_disjoint_mut([parent_node_id.0, child_node_id.0])
+            .expect("distinct in-bounds indices");
+        let parent_node = parent_slot.as_mut().expect("live node");
+        let child_node = child_slot.as_mut().expect("live node");
+        assert_eq!(
+            child_node.try_parent(),
+            Some(parent_node_id),
+            "node_pair_mut: node {child_node_id} is not a child of {parent_node_id}"
+        );
+        (parent_node, child_node)
     }
 
     /// Advance the access counter by `delta` ticks and return the newest one,
     /// reserving the whole range for the caller to assign.
     pub fn get_and_batch_bump_access_counter(&mut self, delta: i64) -> i64 {
-        todo!()
+        assert!(
+            delta > 0,
+            "get_and_batch_bump_access_counter: delta {delta} must be positive"
+        );
+        self.access_counter += delta;
+        self.access_counter
     }
 
     /// Bump the access counter and return the new tick (for stamping `last_access_counter`).
     pub fn get_and_bump_access_counter(&mut self) -> i64 {
-        todo!()
+        self.access_counter += 1;
+        self.access_counter
     }
 }
 
@@ -1066,37 +1264,56 @@ pub struct EvictableNodeSet {
 
 impl EvictableNodeSet {
     pub fn new() -> Self {
-        todo!()
+        Default::default()
     }
 
     /// Whether `node_id` is a member.
     pub fn contains(&self, node_id: NodeIdx_) -> bool {
-        todo!()
+        self.slots.get(node_id.0).copied().flatten().is_some()
     }
 
     /// Insert `node_id`; no-op when already a member.
     pub fn add(&mut self, node_id: NodeIdx_) {
-        todo!()
+        if node_id.0 >= self.slots.len() {
+            self.slots.resize(node_id.0 + 1, None);
+        }
+        if self.slots[node_id.0].is_some() {
+            return;
+        }
+        self.slots[node_id.0] = Some(self.nodes.len());
+        self.nodes.push(node_id);
     }
 
     /// Remove `node_id`; no-op when not a member.
     pub fn discard(&mut self, node_id: NodeIdx_) {
-        todo!()
+        let Some(slot) = self.slots.get(node_id.0).copied().flatten() else {
+            return;
+        };
+        self.slots[node_id.0] = None;
+        self.nodes.swap_remove(slot);
+        // The swapped-in tail member (if any) now lives at `slot`.
+        if let Some(&moved) = self.nodes.get(slot) {
+            self.slots[moved.0] = Some(slot);
+        }
     }
 
     /// The members, in unspecified order.
     pub fn iter(&self) -> impl Iterator<Item = NodeIdx_> + '_ {
-        std::iter::empty()
+        self.nodes.iter().copied()
     }
 
     // Test-only conveniences: production callers use add/discard/contains/iter.
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        todo!()
+        self.nodes.len()
     }
 
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        todo!()
+        self.nodes.is_empty()
     }
 }
+
+#[cfg(test)]
+#[path = "tests/node.rs"]
+mod tests;
