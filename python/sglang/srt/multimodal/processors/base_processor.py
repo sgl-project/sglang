@@ -44,8 +44,6 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
-_IPC_POOL_HANDLE_CACHE = envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
-
 
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
@@ -204,6 +202,9 @@ class BaseMultimodalProcessor(ABC):
             else "cpu"
         )
         self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
+        self.use_ipc_pool_handle_cache = (
+            self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
+        )
         self.disable_fast_image_processor = server_args.disable_fast_image_processor
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
 
@@ -1013,13 +1014,17 @@ class BaseMultimodalProcessor(ABC):
         for modality, idx, future in futures:
             try:
                 result = await asyncio.wrap_future(future)
-            except ValueError:
-                logger.exception(
-                    "[load_mm_data(simple)] error loading %s data at index=%d",
+            except ValueError as e:
+                logger.info(
+                    "[load_mm_data(simple)] invalid %s data at index=%d: %s",
                     modality.name,
                     idx,
+                    e,
                 )
-                raise
+                raise ValueError(
+                    f"An exception occurred while loading {modality.name} data "
+                    f"at index {idx}: {e}"
+                ) from e
             except Exception as e:
                 logger.exception(
                     "[load_mm_data(simple)] error loading %s data at index=%d",
@@ -1348,7 +1353,7 @@ class BaseMultimodalProcessor(ABC):
                 sync_buffer_meta=sync_flag,
                 pool_ipc_handle=(
                     self.cudaipc_mmfeature_pool._pool_ipc_handle
-                    if _IPC_POOL_HANDLE_CACHE
+                    if self.use_ipc_pool_handle_cache
                     else None
                 ),
                 pool_byte_offset=byte_offset,

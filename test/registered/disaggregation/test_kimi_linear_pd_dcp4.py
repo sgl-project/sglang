@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1200, suite="nightly-8-gpu-b200", nightly=True)
+register_cuda_ci(est_time=600, suite="nightly-8-gpu-b200", nightly=True)
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 PHYSICAL_PAGE_SIZE = 64
@@ -33,6 +33,7 @@ LONG_CONTEXT_DEPTHS = tuple(
 LOGPROB_ATOL = 0.20
 NIAH_KEY = "739391"
 KIMI_LINEAR_MAX_CONTEXT = 1_048_576
+CUDA_GRAPH_MAX_BS_DECODE = 256
 
 
 def _has_eight_blackwell_gpus() -> bool:
@@ -52,7 +53,9 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
     model = KIMI_LINEAR_MODEL
     gsm8k_score_threshold = 0.88
     gsm8k_num_examples = 200
-    gsm8k_num_threads = 4
+    # Keep accuracy evaluation within the captured decode batch sizes so its
+    # score is batch-invariant.
+    gsm8k_num_threads = 128
     gsm8k_num_shots = 5
 
     @classmethod
@@ -86,7 +89,7 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
             str(CHUNKED_PREFILL_SIZE),
             "--disable-radix-cache",
             "--cuda-graph-max-bs-decode",
-            "64",
+            str(CUDA_GRAPH_MAX_BS_DECODE),
             "--cuda-graph-backend-prefill",
             "disabled",
             "--mem-fraction-static",
@@ -332,7 +335,7 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
             "--page-size",
             str(PHYSICAL_PAGE_SIZE),
             "--cuda-graph-max-bs-decode",
-            "64",
+            str(CUDA_GRAPH_MAX_BS_DECODE),
             "--cuda-graph-backend-prefill",
             "disabled",
             "--mem-fraction-static",
@@ -457,10 +460,24 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
         self.assertEqual(len(outputs), batch_size)
         self.assertTrue(all(output["text"].strip() for output in outputs))
 
+    def _effective_max_running_requests(self) -> int:
+        response = requests.get(self.decode_url + "/server_info", timeout=30)
+        response.raise_for_status()
+        return min(
+            state["effective_max_running_requests_per_dp"]
+            for state in response.json()["internal_states"]
+        )
+
     def test_decode_cuda_graph_and_eager_batch(self):
         self._assert_batch_completes(2)
         self._assert_batch_completes(2)
-        self._assert_batch_completes(65)
+        self.assertGreater(
+            self._effective_max_running_requests(),
+            CUDA_GRAPH_MAX_BS_DECODE,
+            "eager DCP decode is unreachable: concurrency was capped at or "
+            "below the CUDA graph capture ceiling",
+        )
+        self._assert_batch_completes(CUDA_GRAPH_MAX_BS_DECODE + 1)
 
     def test_decode_physical_capacity_sanity(self):
         response = requests.get(self.decode_url + "/server_info", timeout=30)

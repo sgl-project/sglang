@@ -8,6 +8,11 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.activations import PytorchGELUTanh
 
+from sglang.kernels.ops.attention.vision_rope import (
+    PreparedInplaceComplexRoPE,
+    apply_fused_qk_complex_rope_inplace,
+    prepare_fused_qk_complex_rope_inplace,
+)
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.vision import (
@@ -44,24 +49,32 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_sharded_mrope_vision_model,
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_cuda = is_cuda()
 
 
 def apply_rope(
-    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor, x_shape=None
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor | PreparedInplaceComplexRoPE,
+    x_shape=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Args: (The leading dimensions of all inputs should be the same)
         xq: query, tensor of shape (..., num_heads, head_dim)
         xk: key, tensor of shape (..., num_heads, head_dim)
-        freqs_cis: tensor of shape (..., head_dim/2), dtype=torch.complex64. It contains the precomputed cis(freqs) for each position in the 2D grid.
+        freqs_cis: Complex frequencies for the portable path, or inputs
+            prepared once for the contiguous in-place CUDA kernel.
     Returns:
         xq_out, xk_out: tensors of shape (..., num_heads, head_dim)
     """
+
+    if isinstance(freqs_cis, tuple):
+        return apply_fused_qk_complex_rope_inplace(xq, xk, freqs_cis)
 
     freqs_cis = freqs_cis.unsqueeze(-2)  # ..., 1, head_dim/2
     # ..., num_heads, head_dim/2
@@ -427,6 +440,7 @@ class MoonViT3dEncoder(nn.Module):
         self.video_attn_type = video_attn_type
         qkv_hs = block_cfg.get("qkv_hidden_size") or block_cfg["hidden_dim"]
         self.rope_2d = Rope2DPosEmbRepeated(qkv_hs // block_cfg["num_heads"], 512, 512)
+        self.use_fused_rope = _is_cuda and get_server_args().rl_on_policy_target is None
         self.blocks = nn.ModuleList(
             [
                 MoonViTEncoderLayer(
@@ -447,8 +461,12 @@ class MoonViT3dEncoder(nn.Module):
         rope_freqs_cis = self.rope_2d.get_freqs_cis(
             grid_thws=grid_thws, device=hidden_states.device
         )
+        if self.use_fused_rope:
+            rope_freqs_cis = prepare_fused_qk_complex_rope_inplace(rope_freqs_cis)
 
-        sequence_lengths = (grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]).to(
+        sequence_lengths = grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]
+        max_seqlen = int(sequence_lengths.max().item())
+        sequence_lengths = sequence_lengths.to(
             device=hidden_states.device, dtype=torch.int32
         )
         lengths = torch.cat(
@@ -458,14 +476,12 @@ class MoonViT3dEncoder(nn.Module):
             )
         )
 
-        # FlashAttention needs a host integer.  Compute it once per MoonViT
-        # forward and pass it to every encoder block instead of synchronizing
-        # once per block inside the attention backend.
-        max_seqlen = int(lengths.max().item())
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
         forward_metadata = prepare_vision_attention_metadata(
-            cu_seqlens, device=hidden_states.device
+            cu_seqlens,
+            device=hidden_states.device,
+            max_seqlen=max_seqlen,
         )
 
         for block in self.blocks:
@@ -604,18 +620,29 @@ class K2VLMultiModalProjector(nn.Module):
 
 @torch.inference_mode()
 def mm_projection_auto(
-    mm_projector: torch.nn.Module | None, vt_output: list[torch.Tensor]
-):
-    """Apply MM projector to vision tower outputs."""
-    if mm_projector is None:
-        return vt_output
+    mm_projector: torch.nn.Module | None,
+    vt_output: torch.Tensor | Sequence[torch.Tensor],
+) -> torch.Tensor:
+    """Project vision outputs and return one flattened feature tensor.
 
-    num_embedding_list = [x.shape[0] for x in vt_output]
-    batched = concat_or_single(vt_output, dim=0)
-    proj_out = mm_projector(batched) if mm_projector else batched
-    proj_out = proj_out.reshape(-1, proj_out.shape[-1])
-    proj_out = torch.split(proj_out, num_embedding_list)
-    return proj_out
+    MoonViT may return one tensor per image because image resolutions vary, but
+    the language-model embedding path consumes the images as one contiguous
+    sequence.  The previous implementation split the projected tensor back
+    into per-image views and immediately concatenated those views at the call
+    site. Keeping the packed result avoids a redundant split/cat pair, and a
+    single-item sequence reuses its tensor directly. The returned feature is
+    always flattened to the 2D contract consumed by ``get_image_feature``.
+    """
+    batched = (
+        vt_output
+        if isinstance(vt_output, torch.Tensor)
+        else concat_or_single(vt_output, dim=0)
+    )
+    if mm_projector is None:
+        return batched.reshape(-1, batched.shape[-1])
+
+    projected = mm_projector(batched)
+    return projected.reshape(-1, projected.shape[-1])
 
 
 class KimiK25ForConditionalGeneration(nn.Module):
@@ -749,8 +776,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         pixel_values = materialize_item_features(list(range(len(items))))
         image_embeds = self.vision_tower(pixel_values, grid_thws.to(device))
-        proj_out = mm_projection_auto(self.mm_projector, image_embeds)
-        return torch.cat(proj_out, dim=0)
+        return mm_projection_auto(self.mm_projector, image_embeds)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()

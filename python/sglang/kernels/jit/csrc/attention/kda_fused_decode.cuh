@@ -915,9 +915,8 @@ struct KdaFusedDecodeKernel {
       // Full-state staging (4 stages, 64KB, sync-free) wins while the grid
       // is small enough that occupancy isn't the limiter; past that the
       // 48KB 3-stage variant (one sync for the single stage reuse) benches
-      // fastest. Mirrors the KDA_decode standalone-kernel dispatch on
-      // chunan/kda.
-      tma_stages = B * static_cast<int>(kH) >= 1024 ? 3 : 4;
+      // fastest.
+      tma_stages = B * static_cast<int>(kH) >= 512 ? 3 : 4;
       if (tma_stages == 3) {
         kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true, kUsePDL, true, 3>
                                  : kda_fused_decode_k3_kernel<false, kUsePDL, true, 3>;
