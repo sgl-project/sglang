@@ -18,7 +18,7 @@ from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
 logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
@@ -2989,32 +2989,123 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
 
         merge_query = q_rope is not None
+        query_backend = get_server_args().dcp_query_backend
+        use_query_vmm = False
+        if self.dcp_enabled and query_backend != "allgather":
+            from sglang.srt.layers.dcp.shared_query_direct import (
+                DCP_QUERY_DIRECT_VMM_MAX_ROWS,
+            )
+
+            use_query_vmm = (
+                forward_batch.forward_mode.is_decode()
+                and q.shape[0] <= DCP_QUERY_DIRECT_VMM_MAX_ROWS
+            )
+        if use_query_vmm and self.kv_cache_dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                "DCP Query VMM reached the attention backend without FP8 E4M3 "
+                f"KV cache (resolved dtype is {self.kv_cache_dtype})"
+            )
+        prequantized_direct_query = (
+            use_query_vmm
+            and query_backend == "vmm_direct"
+            and q_rope is None
+            and q.dtype == torch.float8_e4m3fn
+            and k is not None
+            and k.dtype == torch.float8_e4m3fn
+            and k_rope is not None
+            and k_rope.dtype == torch.float8_e4m3fn
+        )
         if self.kv_cache_dtype == torch.float8_e4m3fn:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
-            assert q_rope is not None, "For FP8 path q_rope should not be None."
-            assert k_rope is not None, "For FP8 path k_rope should not be None."
-            assert (
-                cos_sin_cache is not None
-            ), "For FP8 path cos_sin_cache should not be None."
-
-            rope_positions = forward_batch.positions
-            if dsa_use_prefill_cp(forward_batch):
-                rope_positions = cp_split_and_rebuild_position(
-                    forward_batch, rope_positions
+            if prequantized_direct_query:
+                # RadixAttention restores the singleton KV-head dimension at
+                # its module boundary. The regular FP8 path removes the same
+                # dimension immediately before quantization; normalize the
+                # already-quantized handoff here as a view.
+                if k.ndim == 3 and k.shape[1] == 1:
+                    k = k.squeeze(1)
+                if k_rope.ndim == 3 and k_rope.shape[1] == 1:
+                    k_rope = k_rope.squeeze(1)
+                expected_q_shape = (
+                    q.shape[0],
+                    layer.tp_q_head_num,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
                 )
+                if tuple(q.shape) != expected_q_shape:
+                    raise RuntimeError(
+                        "prequantized consumer-direct Query shape mismatch: "
+                        f"expected {expected_q_shape}, got {tuple(q.shape)}"
+                    )
+                if tuple(k.shape) != (q.shape[0], self.kv_lora_rank):
+                    raise RuntimeError(
+                        "prequantized consumer-direct K-nope shape mismatch: "
+                        f"got {tuple(k.shape)}"
+                    )
+                if tuple(k_rope.shape) != (
+                    q.shape[0],
+                    self.qk_rope_head_dim,
+                ):
+                    raise RuntimeError(
+                        "prequantized consumer-direct K-rope shape mismatch: "
+                        f"got {tuple(k_rope.shape)}"
+                    )
+            else:
+                assert q_rope is not None, "For FP8 path q_rope should not be None."
+                assert k_rope is not None, "For FP8 path k_rope should not be None."
+                assert (
+                    cos_sin_cache is not None
+                ), "For FP8 path cos_sin_cache should not be None."
 
-            q, k, k_rope = mla_quantize_and_rope_for_fp8(
-                q,
-                q_rope,
-                k.squeeze(1),
-                k_rope.squeeze(1),
-                rope_positions,
-                cos_sin_cache,
-                is_neox,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-            )
+                rope_positions = forward_batch.positions
+                if dsa_use_prefill_cp(forward_batch):
+                    rope_positions = cp_split_and_rebuild_position(
+                        forward_batch, rope_positions
+                    )
+
+                if use_query_vmm:
+                    workspace_args = (
+                        DCP_QUERY_DIRECT_VMM_MAX_ROWS,
+                        q.shape[1],
+                        self.kv_lora_rank,
+                        self.qk_rope_head_dim,
+                        get_parallel().dcp_group,
+                    )
+                    if query_backend == "vmm_direct":
+                        from sglang.srt.layers.dcp.shared_query_direct import (
+                            get_dcp_query_direct_vmm_workspace,
+                        )
+
+                        query_workspace = get_dcp_query_direct_vmm_workspace(
+                            *workspace_args,
+                            workspace_slot=layer.layer_id % 2,
+                        )
+                        q, k, k_rope = query_workspace.quantize_remote(
+                            q,
+                            q_rope,
+                            k.squeeze(1),
+                            k_rope.squeeze(1),
+                            rope_positions,
+                            cos_sin_cache,
+                            is_neox=bool(is_neox),
+                            pipelined=True,
+                        )
+                    else:
+                        raise AssertionError(
+                            f"unhandled DCP Query backend {query_backend!r}"
+                        )
+                else:
+                    q, k, k_rope = mla_quantize_and_rope_for_fp8(
+                        q,
+                        q_rope,
+                        k.squeeze(1),
+                        k_rope.squeeze(1),
+                        rope_positions,
+                        cos_sin_cache,
+                        is_neox,
+                        self.kv_lora_rank,
+                        self.qk_rope_head_dim,
+                    )
             if save_kv_cache and dsa_use_prefill_cp(forward_batch):
                 k, k_rope = _all_gather_dsa_trtllm_fp8_kv(forward_batch, k, k_rope)
             merge_query = False
@@ -3147,7 +3238,6 @@ class DeepseekSparseAttnBackend(
             lse=lse_buf,
             multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
         )
-
         if self.dcp_enabled:
             out, lse = out
             out = out.view(batch_size, num_heads, -1)

@@ -1062,6 +1062,18 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "ag_rs"
+    dcp_query_backend: A[
+        str,
+        Arg(
+            help="Query distribution policy for decode context parallelism: "
+            "'allgather' keeps the explicit BF16 Query AllGather; "
+            "'vmm_direct' publishes each producer-local BF16 shard once and "
+            "lets every consumer fuse peer reads with RoPE/FP8 conversion.",
+            choices=["allgather", "vmm_direct"],
+            resolvable=True,
+        ),
+        NS("parallel"),
+    ] = "allgather"
     dcp_replicate_q_proj: A[
         Optional[bool],
         Arg(
@@ -3738,6 +3750,12 @@ class ServerArgs:
                 "requires --dcp-size / --decode-context-parallel-size > 1, but "
                 f"got dcp_size={self.dcp_size}."
             )
+        if self.dcp_query_backend != "allgather" and self.dcp_size <= 1:
+            raise ValueError(
+                f"--dcp-query-backend {self.dcp_query_backend} requires "
+                "--dcp-size / --decode-context-parallel-size > 1, but got "
+                f"dcp_size={self.dcp_size}."
+            )
         if self.dcp_comm_backend == "fi_a2a" and not is_cuda():
             raise ValueError(
                 "--dcp-comm-backend fi_a2a delegates the exchange to FlashInfer's "
@@ -3759,9 +3777,29 @@ class ServerArgs:
                     "--dcp-comm-backend vmm currently supports only the "
                     "DeepSeek-V3.2/GLM-5.x DSA MLA path."
                 )
+        if self.dcp_query_backend != "allgather":
+            if not is_cuda():
+                raise ValueError(
+                    f"--dcp-query-backend {self.dcp_query_backend} requires a "
+                    "same-host NVIDIA CUDA DCP group with peer access and "
+                    "native peer atomics."
+                )
+            from sglang.srt.configs.model_config import is_deepseek_dsa
+
+            if not is_deepseek_dsa(self.get_model_config().hf_config):
+                raise ValueError(
+                    f"--dcp-query-backend {self.dcp_query_backend} currently "
+                    "supports only the DeepSeek-V3.2/GLM-5.x DSA MLA path."
+                )
         if self.dcp_replicate_q_proj:
             if self.dcp_size <= 1:
                 raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
+            if self.dcp_query_backend != "allgather":
+                raise ValueError(
+                    "--dcp-replicate-q-proj cannot be combined with "
+                    f"--dcp-query-backend={self.dcp_query_backend}; both "
+                    "replace Query AllGather using different ownership policies."
+                )
             if self.dcp_comm_backend not in ("a2a", "fi_a2a"):
                 raise ValueError(
                     "--dcp-replicate-q-proj only applies to the a2a/fi_a2a DCP "

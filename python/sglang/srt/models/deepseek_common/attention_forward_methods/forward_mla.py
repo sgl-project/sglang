@@ -22,6 +22,7 @@ from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
     DCP_OUTPUT_VMM_MAX_ROWS,
+    DCP_QUERY_DIRECT_VMM_MAX_ROWS,
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     alloc_dcp_q_combine_buf,
@@ -272,6 +273,33 @@ class DeepseekMLAForwardMixin:
             self.q_lora_rank is not None
             and self._can_fuse_bmm_into_attention(forward_batch)
         )
+        query_vmm_selected = (
+            _is_cuda
+            and get_parallel().dcp_enabled
+            and get_server_args().dcp_query_backend == "vmm_direct"
+            and forward_batch.forward_mode.is_decode()
+            and hidden_states.shape[0] <= DCP_QUERY_DIRECT_VMM_MAX_ROWS
+        )
+        use_bounded_query_vmm = (
+            query_vmm_selected
+            and self.use_dsa
+            and get_server_args().dsa_decode_backend == "trtllm"
+            and self._fuse_rope_for_trtllm_mla(forward_batch)
+            and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+            and not is_kv_b_lora_active(self)
+        )
+        if query_vmm_selected and not use_bounded_query_vmm:
+            raise RuntimeError(
+                f"--dcp-query-backend {get_server_args().dcp_query_backend} "
+                "selected a bounded decode "
+                "batch outside its supported TRTLLM DSA FP8 path; LoRA query "
+                "corrections are not supported"
+            )
+        if use_bounded_query_vmm:
+            # The Query transport now lives in the TRT-LLM DSA backend, where
+            # consumers fuse peer reads with RoPE/FP8 conversion. Keep the
+            # absorb BMM explicit so its local-head result can feed that path.
+            fuse_bmm_attention = False
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
         q_replicate_active = (
@@ -512,6 +540,7 @@ class DeepseekMLAForwardMixin:
             )
             use_fused_dcp_q_buf = (
                 defer_q_nope_transpose
+                and not use_bounded_query_vmm
                 and not self.use_deep_gemm_bmm
                 and not _is_hip
                 and self.w_kc.dtype != torch.float8_e4m3fn
@@ -674,11 +703,55 @@ class DeepseekMLAForwardMixin:
         if get_parallel().dcp_enabled:
             if _is_dcp_mla_decode_phase(forward_batch):
                 if not q_replicate_active:
-                    q_nope_out, q_pe = all_gather_q_for_mla_decode(
-                        q_nope_out=q_nope_out,
-                        q_pe=q_pe,
-                        combined_buf=combined_q_buf,
-                    )
+                    if use_bounded_query_vmm:
+                        # Preserve only this producer's heads. When the DSA
+                        # Indexer is already running on the side stream, launch
+                        # the consumer-direct Query exchange now so its
+                        # publish/wait/remote RoPE+FP8 work overlaps the
+                        # Indexer just like the stock Query AllGather does.
+                        # q_nope_out is [local_heads, rows, nope_dim] here.
+                        q_nope_out = q_nope_out.transpose(0, 1)
+                        if (
+                            dsa_dcp_indexer_sync_pending
+                            and get_server_args().dcp_query_backend == "vmm_direct"
+                        ):
+                            from sglang.srt.layers.dcp.shared_query_direct import (
+                                get_dcp_query_direct_vmm_workspace,
+                            )
+
+                            # The next layer's publish barrier proves that all
+                            # ranks consumed the previous slot. Alternating two
+                            # slots removes its reuse wait and acknowledgement.
+                            query_workspace = get_dcp_query_direct_vmm_workspace(
+                                DCP_QUERY_DIRECT_VMM_MAX_ROWS,
+                                q_nope_out.shape[1],
+                                self.kv_lora_rank,
+                                self.qk_rope_head_dim,
+                                get_parallel().dcp_group,
+                                workspace_slot=self.layer_id % 2,
+                            )
+                            q_nope_out, k_nope, k_pe = query_workspace.quantize_remote(
+                                q_nope_out,
+                                q_pe,
+                                k_nope.squeeze(1),
+                                k_pe.squeeze(1),
+                                forward_batch.positions,
+                                self.rotary_emb.cos_sin_cache,
+                                is_neox=bool(self.rotary_emb.is_neox_style),
+                                pipelined=True,
+                            )
+                            # q_nope_out is now the complete consumer-local
+                            # FP8 Query [rows, total_heads, nope+rope]. None is
+                            # an explicit handoff marker: the DSA backend must
+                            # consume this tensor directly instead of running
+                            # the Query transport a second time.
+                            q_pe = None
+                    else:
+                        q_nope_out, q_pe = all_gather_q_for_mla_decode(
+                            q_nope_out=q_nope_out,
+                            q_pe=q_pe,
+                            combined_buf=combined_q_buf,
+                        )
                 if dsa_dcp_indexer_sync_pending:
                     # The DSA indexer ran on the side stream, overlapped with
                     # the q pipeline and the all-gather above; join before the
