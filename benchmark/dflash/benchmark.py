@@ -1517,6 +1517,7 @@ def _server_env_for_job(job: BenchmarkJob) -> dict[str, str]:
     env = {
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
         "SGLANG_CUDA_COREDUMP_BEFORE_CRASH": "0",
+        "SGLANG_PYSPY_DUMP_BEFORE_CRASH": "0",
     }
     if isinstance(job.deployment.mode_config, DFlashConfig):
         env["SGLANG_ENABLE_OVERLAP_PLAN_STREAM"] = "1"

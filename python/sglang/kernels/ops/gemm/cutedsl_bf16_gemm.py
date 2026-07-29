@@ -490,6 +490,11 @@ class TgvGemmCuteExtKernel:
                 d_layout,
             )
 
+        if cutlass.const_expr(self.use_2cta):
+            # Keep both CTAs resident until neither can target its peer's SMEM.
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+
     # ====================================================================
     # DMA_A WARP — TMA-loads A tiles into sA[..., stage], one per K-iter.
     # 1-CTA: SM90_TMA_LOAD into local sA, arrives on local bar_full.
