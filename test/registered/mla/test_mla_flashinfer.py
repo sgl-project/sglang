@@ -27,7 +27,7 @@ class TestFlashinferMLAMTP(CustomTestCase):
         if torch.cuda.is_available() and torch.version.cuda:
             other_args.extend(
                 [
-                    "--cuda-graph-max-bs-decode",
+                    "--cuda-graph-max-bs",
                     "4",
                     "--enable-torch-compile",
                     "--torch-compile-max-bs",

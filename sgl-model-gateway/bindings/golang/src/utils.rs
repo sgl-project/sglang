@@ -18,7 +18,7 @@ pub fn generate_tool_call_id(
     }
 }
 
-/// Return an explicit error for tool-constraint generation through this FFI.
+/// Generate tool constraints (placeholder implementation)
 ///
 /// # Arguments
 /// * `tools_json` - JSON array of tools
@@ -37,6 +37,8 @@ pub unsafe extern "C" fn sgl_generate_tool_constraints(
     _constraint_schema_out: *mut *mut std::os::raw::c_char,
     error_out: *mut *mut std::os::raw::c_char,
 ) -> super::error::SglErrorCode {
+    // Implementation would parse JSON and call generate_tool_constraints
+    // This is a placeholder
     super::error::set_error_message(error_out, "Tool constraint generation not yet implemented in FFI");
     super::error::SglErrorCode::UnknownError
 }

@@ -1,7 +1,7 @@
-"""Publish SGLang-Diffusion nightly benchmark results to sgl-project/ci-data-diffusion repo.
+"""Publish diffusion comparison results to sgl-project/ci-data repo.
 
 Pushes comparison-results.json, dashboard.md, and chart PNG files to the
-ci-data-diffusion repository for historical tracking. Chart PNGs are stored under
+ci-data repository for historical tracking. Chart PNGs are stored under
 diffusion-comparisons/charts/ so they can be referenced via
 raw.githubusercontent URLs in the dashboard markdown (GitHub Step Summary
 blocks data: URIs).
@@ -50,7 +50,7 @@ else:
 
 # Repository configuration
 REPO_OWNER = "sgl-project"
-REPO_NAME = "ci-data-diffusion"
+REPO_NAME = "ci-data"
 BRANCH = "main"
 STORAGE_PREFIX = "diffusion-comparisons"
 
@@ -81,7 +81,7 @@ def publish_comparison(
     dashboard_path: str | None = None,
     charts_dir: str | None = None,
 ) -> None:
-    """Publish comparison results, dashboard, and charts to ci-data-diffusion repo."""
+    """Publish comparison results, dashboard, and charts to ci-data repo."""
     token = os.environ.get("GH_PAT_FOR_NIGHTLY_CI_DATA") or os.environ.get(
         "GITHUB_TOKEN"
     )
@@ -196,7 +196,7 @@ def publish_comparison(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Publish SGLang-Diffusion nightly benchmark results to ci-data-diffusion"
+        description="Publish diffusion comparison results to ci-data"
     )
     parser.add_argument(
         "--results",

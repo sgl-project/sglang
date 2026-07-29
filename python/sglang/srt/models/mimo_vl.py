@@ -14,15 +14,11 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 
-from sglang.srt.layers.attention.vision import (
-    VisionAttention,
-    VisionAttentionMetadata,
-    prepare_vision_attention_metadata,
-)
+from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionPatchMerger, Qwen2_5_VLMLP
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
 
@@ -198,7 +194,6 @@ class MiMoVisionBlock(nn.Module):
         max_seqlen: int,
         position_embeddings: torch.Tensor,
         full_attn: bool = True,
-        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
@@ -213,7 +208,6 @@ class MiMoVisionBlock(nn.Module):
             max_seqlen=max_seqlen,
             position_embeddings=position_embeddings,
             full_attn=full_attn,
-            forward_metadata=forward_metadata,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -238,7 +232,7 @@ class MiMoVisionTransformer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.server_args = get_server_args()
+        self.server_args = get_global_server_args()
         self.vit_window_attn_types = vision_config.vit_window_attn_types
         patch_size: int = vision_config.patch_size
         temporal_patch_size: int = vision_config.temporal_patch_size
@@ -285,7 +279,7 @@ class MiMoVisionTransformer(nn.Module):
                     num_heads=num_heads,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
-                    attn_implementation=None,
+                    attn_implementation="flash_attention_3",
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
                     use_sink=(
@@ -307,11 +301,6 @@ class MiMoVisionTransformer(nn.Module):
         self.merger = Qwen2_5_VisionPatchMerger(
             dim=vision_config.out_hidden_size,
             context_dim=hidden_size,
-            # MiMo-VL's merger MLP is square (intermediate == context_dim * merge**2),
-            # so no dim padding is needed. The Qwen2.5-VL formula num_heads * head_dim
-            # over-sizes it here because MiMo uses qk_channels (64) for head_dim rather
-            # than hidden_size // num_heads, which would mismatch the checkpoint.
-            padded_context_dim=hidden_size,
             spatial_merge_size=spatial_merge_size,
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
@@ -388,11 +377,8 @@ class MiMoVisionTransformer(nn.Module):
 
             pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
         pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = int(grid_thw[:, 1:].max())
-        # transformers 5.12's rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
-        rotary_pos_emb_full = self.rotary_pos_emb(
-            torch.arange(max_grid_size, device=self.device)
-        )
+        max_grid_size = grid_thw[:, 1:].max()
+        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
@@ -435,9 +421,6 @@ class MiMoVisionTransformer(nn.Module):
             ]
         )
         max_seqlen = seqlens.max().item()
-        forward_metadata = prepare_vision_attention_metadata(
-            cu_seqlens, device=x.device
-        )
 
         row_based_embeddings = get_position_embeddings(emb, x)
         col_based_embeddings = get_position_embeddings(
@@ -455,7 +438,6 @@ class MiMoVisionTransformer(nn.Module):
             reverse_window_index_1d_col,
             cu_seqlens,
             max_seqlen,
-            forward_metadata,
         )
 
     def run_blocks(
@@ -467,7 +449,6 @@ class MiMoVisionTransformer(nn.Module):
         reverse_window_index_1d_col: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
-        forward_metadata: VisionAttentionMetadata,
     ) -> torch.Tensor:
         for layer_num, blk in enumerate(self.blocks):
             window_attn_type = self.vit_window_attn_types[layer_num]
@@ -496,7 +477,6 @@ class MiMoVisionTransformer(nn.Module):
                 max_seqlen=max_seqlen,
                 position_embeddings=position_embeddings,
                 full_attn=full_attn,
-                forward_metadata=forward_metadata,
             )
         x = self.merger(x)
         return x
@@ -514,7 +494,6 @@ class MiMoVisionTransformer(nn.Module):
             reverse_window_index_1d_col,
             cu_seqlens,
             max_seqlen,
-            forward_metadata,
         ) = self._prepare_forward(x, grid_thw)
 
         return self.run_blocks(
@@ -525,5 +504,4 @@ class MiMoVisionTransformer(nn.Module):
             reverse_window_index_1d_col,
             cu_seqlens,
             max_seqlen,
-            forward_metadata,
         )

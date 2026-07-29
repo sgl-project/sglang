@@ -11,7 +11,6 @@ class KLDivergenceMixin:
     kl_div_max_samples: int = 32
     kl_div_prefill_max_new_tokens: int = 512
     kl_div_decode_max_new_tokens: int = 512
-    kl_div_trust_remote_code: bool = False
 
     @classmethod
     def _build_acc_thresholds(cls, threshold):
@@ -28,7 +27,6 @@ class KLDivergenceMixin:
             model_name=cls.model,
             max_samples=cls.kl_div_max_samples,
             max_new_tokens=cls.kl_div_prefill_max_new_tokens,
-            trust_remote_code=cls.kl_div_trust_remote_code,
         )
 
     @classmethod
@@ -41,5 +39,4 @@ class KLDivergenceMixin:
             model_name=cls.model,
             max_samples=cls.kl_div_max_samples,
             max_new_tokens=cls.kl_div_decode_max_new_tokens,
-            trust_remote_code=cls.kl_div_trust_remote_code,
         )

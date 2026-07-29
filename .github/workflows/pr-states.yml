@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Update CI states block in PR body
-        uses: actions/github-script@v8
+        uses: actions/github-script@v7
         with:
           script: |
             const RETRY_ATTEMPTS = 3;
@@ -198,8 +198,7 @@ jobs:
 
             const body = pr.body || '';
 
-            // \n* absorbs preceding blank lines so repeated PATCHes don't accumulate them.
-            const blockRe = new RegExp(`\\n*(?:---\\n+)?${outerStart}[\\s\\S]*?${outerEnd}`);
+            const blockRe = new RegExp(`(?:\\n+---\\n+)?${outerStart}[\\s\\S]*?${outerEnd}`);
             let newBody;
             if (blockRe.test(body)) {
               newBody = body.replace(blockRe, `\n\n${newBlock}`);

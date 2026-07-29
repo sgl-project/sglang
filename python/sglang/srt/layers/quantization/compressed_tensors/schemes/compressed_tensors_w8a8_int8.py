@@ -8,7 +8,6 @@ import torch
 from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn import Parameter
 
-from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUW8A8Int8DynamicLinearMethod,
 )
@@ -20,6 +19,7 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
+from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
 from sglang.srt.utils import is_cuda
 

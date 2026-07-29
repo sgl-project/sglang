@@ -25,20 +25,6 @@ class TboAttnBackend(AttentionBackend):
             children=[creator() for _ in range(2)],
         )
 
-    def _children_use_cuda_graph(self) -> bool:
-        """Whether the TBO child backends participate in CUDA-graph capture/replay.
-
-        Some models only run TBO in eager prefill and keep their graph-captured
-        modes (decode / target-verify) NON-TBO on the primary backend. For those,
-        the children must NOT be driven through the cuda-graph paths: doing so
-        rebuilds their per-step metadata on every replay even though the captured
-        graph never uses them. For DeepSeek-V4 that metadata build (compressor /
-        indexer) leaks ROCm HSA resources across the 2 children -> eventual
-        HSA_STATUS_ERROR_OUT_OF_RESOURCES. Eager prefill TBO (init_forward_metadata)
-        is unaffected; only the *_graph paths are gated.
-        """
-        return getattr(self.primary, "tbo_supports_cuda_graph", True)
-
     def init_forward_metadata_out_graph(
         self,
         forward_batch: "ForwardBatch",
@@ -47,8 +33,6 @@ class TboAttnBackend(AttentionBackend):
         self.primary.init_forward_metadata_out_graph(
             forward_batch=forward_batch, in_capture=in_capture
         )
-        if not self._children_use_cuda_graph():
-            return
         tbo_children = getattr(forward_batch, "tbo_children", None)
         if tbo_children is not None:
             for child, forward_batch_child in zip(
@@ -113,8 +97,6 @@ class TboAttnBackend(AttentionBackend):
 
     def init_forward_metadata_in_graph(self, forward_batch: "ForwardBatch"):
         self.primary.init_forward_metadata_in_graph(forward_batch=forward_batch)
-        if not self._children_use_cuda_graph():
-            return
         tbo_children = getattr(forward_batch, "tbo_children", None)
         if tbo_children is not None:
             for child, forward_batch_child in zip(
@@ -136,23 +118,17 @@ class TboAttnBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.primary.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
-        if not self._children_use_cuda_graph():
-            return
         for item in self.children:
             # TODO for children, maybe can provide *smaller* max_bs to optimize
             item.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
 
     def on_after_cuda_graph_warmup(self):
         self.primary.on_after_cuda_graph_warmup()
-        if not self._children_use_cuda_graph():
-            return
         for child in self.children:
             child.on_after_cuda_graph_warmup()
 
     def get_cuda_graph_seq_len_fill_value(self):
         ans = self.primary.get_cuda_graph_seq_len_fill_value()
-        if not self._children_use_cuda_graph():
-            return ans
         for child in self.children:
             assert ans == child.get_cuda_graph_seq_len_fill_value()
         return ans
@@ -168,19 +144,6 @@ class TboAttnBackend(AttentionBackend):
 
     def get_indexer_metadata(self, layer_id: int, forward_batch: "ForwardBatch"):
         return self.primary.get_indexer_metadata(layer_id, forward_batch)
-
-    def __getattr__(self, name):
-        # Delegate backend-specific attributes/methods not explicitly wrapped
-        # above (e.g. DSV4's get_unified_swa_loc / get_swa_out_cache_loc, which
-        # the model calls directly via get_attn_backend()) to the primary
-        # full-batch backend. Inside TBO the per-child backend is resolved
-        # directly from the forward context, so this path only serves the
-        # non-overlapped forward (warmup / decode / TBO-ineligible batches).
-        # NOTE: __getattr__ runs only when normal lookup fails; guard `primary`
-        # to avoid infinite recursion before __init__ sets it.
-        if name == "primary":
-            raise AttributeError(name)
-        return getattr(self.primary, name)
 
 
 def _build_tbo_child_replay_fb_view(

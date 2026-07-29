@@ -21,13 +21,7 @@ class TestDeepseekTP2(CustomTestCase):
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
             other_args.extend(
-                [
-                    "--tp",
-                    "2",
-                    "--enable-torch-compile",
-                    "--cuda-graph-max-bs-decode",
-                    "2",
-                ]
+                ["--tp", "2", "--enable-torch-compile", "--cuda-graph-max-bs", "2"]
             )
         cls.process = popen_launch_server(
             cls.model,

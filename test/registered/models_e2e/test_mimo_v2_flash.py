@@ -1,7 +1,5 @@
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import is_blackwell
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
@@ -24,10 +22,10 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
         "--enable-dp-attention",
         "--trust-remote-code",
         "--attention-backend",
-        "fa4" if is_blackwell() else "fa3",
+        "fa3",
         "--max-running-requests",
         "128",
-        "--cuda-graph-max-bs-decode",
+        "--cuda-graph-max-bs",
         "64",
         "--page-size",
         "64",
@@ -44,22 +42,10 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
         "--enable-multi-layer-eagle",
         "--model-loader-extra-config",
         '{"enable_multithread_load": true,"num_threads": 64}',
-        "--enable-hierarchical-cache",
-        "--hicache-ratio",
-        "1.5",
-        "--hicache-mem-layout",
-        "page_first_direct",
-        "--hicache-io-backend",
-        "direct",
     ]
 
     bs_1_speed_thres = 170
     accept_length_thres = 3.2
-
-    @classmethod
-    def setUpClass(cls):
-        with envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.override(True):
-            super().setUpClass()
 
 
 if __name__ == "__main__":

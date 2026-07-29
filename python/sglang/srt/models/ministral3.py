@@ -31,7 +31,6 @@ class Ministral3Attention(LlamaAttention):
         num_heads: int,
         num_kv_heads: int,
         layer_id: int = 0,
-        start_layer: int = 0,
         rope_theta: float = 1000000.0,
         rope_scaling: Optional[Dict[str, Any]] = {},
         rope_is_neox_style: bool = True,
@@ -41,19 +40,18 @@ class Ministral3Attention(LlamaAttention):
         bias: bool = False,
     ) -> None:
         super().__init__(
-            config=config,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            layer_id=layer_id,
-            start_layer=start_layer,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            rope_is_neox_style=rope_is_neox_style,
-            max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config,
-            prefix=prefix,
-            bias=bias,
+            config,
+            hidden_size,
+            num_heads,
+            num_kv_heads,
+            layer_id,
+            rope_theta,
+            rope_scaling,
+            rope_is_neox_style,
+            max_position_embeddings,
+            quant_config,
+            prefix,
+            bias,
         )
         # Ministral3 specific: llama 4 style scaling beta
         self.llama_4_scaling_beta = config.rope_parameters.get("llama_4_scaling_beta")
@@ -97,28 +95,14 @@ class Ministral3Attention(LlamaAttention):
 
 
 class Ministral3DecoderLayer(LlamaDecoderLayer):
-    def __init__(
-        self,
-        config,
-        layer_id=0,
-        start_layer=0,
-        quant_config=None,
-        prefix="",
-    ):
-        super().__init__(
-            config=config,
-            layer_id=layer_id,
-            start_layer=start_layer,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
+    def __init__(self, config, layer_id=0, quant_config=None, prefix=""):
+        super().__init__(config, layer_id, quant_config, prefix)
         self.self_attn = Ministral3Attention(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
-            start_layer=start_layer,
             rope_theta=config.rope_parameters["rope_theta"],
             rope_scaling=config.rope_parameters,  # rope_scaling is rope_parameters in Ministral3Config
             max_position_embeddings=getattr(
@@ -139,16 +123,12 @@ class Ministral3Model(LlamaModel):
         prefix: str = "",
     ) -> None:
         # Override layer creation to use Ministral3Attention
-        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        super().__init__(config, quant_config, prefix)
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Ministral3DecoderLayer(
-                config=config,
-                quant_config=quant_config,
-                layer_id=idx,
-                start_layer=self.start_layer,
-                prefix=prefix,
+                config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
@@ -163,7 +143,7 @@ class Ministral3ForCausalLM(LlamaForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        return Ministral3Model(config=config, quant_config=quant_config, prefix=prefix)
+        return Ministral3Model(config, quant_config, prefix=prefix)
 
 
 EntryClass = [Ministral3ForCausalLM]

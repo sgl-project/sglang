@@ -59,12 +59,13 @@ inline void copy_add_stub(
   constexpr int kVecSize = bVec::size();
 
   for (int64_t d = 0; d < N; d += kVecSize) {
-    auto [bias0, bias1] = load_float_vec2(bias + d);
+    fVec bias0, bias1;
+    bVec bias_vec = bVec::loadu(bias + d);
+    std::tie(bias0, bias1) = at::vec::convert_to_float(bias_vec);
 
     for (int64_t m = 0; m < M; ++m) {
-      auto [data0, data1] = load_float_vec2(Ctmp + m * N + d);
-      data0 = data0 + bias0;
-      data1 = data1 + bias1;
+      fVec data0 = fVec::loadu(Ctmp + m * N + d) + bias0;
+      fVec data1 = fVec::loadu(Ctmp + m * N + d + fVec::size()) + bias1;
       bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
       out_vec.store(C + m * ldc + d);
     }

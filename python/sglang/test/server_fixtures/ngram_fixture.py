@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
 
 DEFAULT_NGRAM_SERVER_ARGS = [
     "--trust-remote-code",
-    "--cuda-graph-max-bs-decode",
+    "--cuda-graph-max-bs",
     "8",
     "--speculative-algorithm",
     "NGRAM",

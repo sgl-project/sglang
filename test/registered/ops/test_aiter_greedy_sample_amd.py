@@ -23,24 +23,18 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
 def _mock_global_server_args(backend="pytorch"):
     from sglang.srt.layers import sampler as sampler_mod
-    from sglang.srt.server_args import (
-        ServerArgs,
-        set_global_server_args_for_scheduler,
-    )
+    from sglang.srt.server_args import ServerArgs
 
-    # Publish for real: the sampler reads the context slot through
-    # get_server_args(), which a module-attribute rebinding cannot intercept.
-    set_global_server_args_for_scheduler(
-        ServerArgs(model_path="dummy", sampling_backend=backend)
+    sampler_mod.get_global_server_args = lambda: ServerArgs(
+        model_path="dummy",
+        sampling_backend=backend,
     )
 
     class _DummyTPGroup:
         device_group = None
 
     sampler_mod.get_tp_group = lambda: _DummyTPGroup()
-    from sglang.srt.runtime_context import get_flags
-
-    get_flags().dp.enabled = False
+    sampler_mod.is_dp_attention_enabled = lambda: False
 
 
 def _make_sampling_info(batch_size, vocab_size, device="cuda"):
@@ -52,7 +46,6 @@ def _make_sampling_info(batch_size, vocab_size, device="cuda"):
         top_ks=torch.zeros(batch_size, device=device, dtype=torch.int32),
         min_ps=torch.zeros(batch_size, device=device),
         is_all_greedy=True,
-        is_any_greedy=True,
         need_top_p_sampling=False,
         need_top_k_sampling=False,
         need_min_p_sampling=False,

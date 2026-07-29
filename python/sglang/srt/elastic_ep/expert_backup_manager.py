@@ -9,12 +9,7 @@ import zmq
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import (
-    BackupDramReq,
-    ExpertWeightPointer,
-    sock_recv,
-    sock_send,
-)
+from sglang.srt.managers.io_struct import BackupDramReq
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.server_args import (
@@ -67,7 +62,7 @@ class ExpertBackupManager:
         num_ready_clients = 0
 
         while num_ready_clients < server_args.tp_size:
-            sock_recv(self.recv_from_expert_backup_client)
+            self.recv_from_expert_backup_client.recv_pyobj()
             num_ready_clients += 1
 
         back_req = BackupDramReq(
@@ -77,7 +72,7 @@ class ExpertBackupManager:
             buffer_size=self.continuous_buffer.numel()
             * self.continuous_buffer.element_size(),
         )
-        sock_send(self.send_to_expert_backup_client, back_req)
+        self.send_to_expert_backup_client.send_pyobj(back_req)
 
         # Keep the manager subprocess alive until signals
         signal.pause()
@@ -133,10 +128,15 @@ class ExpertBackupManager:
                 end_byte = current_byte_offset + byte_size
                 weight_ptr = buffer_base_ptr + current_byte_offset
                 self.continuous_buffer[start_byte:end_byte].copy_(weight_bytes)
-                self.weight_pointer_map[name] = ExpertWeightPointer(
-                    weight_ptr=weight_ptr,
-                    byte_size=byte_size,
-                )
+                self.weight_pointer_map[name] = {
+                    "name": name,
+                    "weight_ptr": weight_ptr,
+                    "shape": weight_info["shape"],
+                    "numel": weight_info["numel"],
+                    "dtype": weight_info["dtype"],
+                    "element_size": weight_info["element_size"],
+                    "byte_size": byte_size,
+                }
 
                 current_byte_offset = end_byte
 

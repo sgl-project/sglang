@@ -138,7 +138,7 @@ DEEPSEEK_R1_MODELS = [
             "131072",
             "--mem-fraction-static",
             "0.70",
-            "--cuda-graph-max-bs-decode",
+            "--cuda-graph-max-bs",
             "8",
             "--enable-torch-compile",
             "--disable-cuda-graph",

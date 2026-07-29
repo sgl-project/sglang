@@ -18,18 +18,14 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_server_args
-from sglang.srt.utils import is_mps, is_npu
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
-from sglang.srt.utils.profile_utils import ProfileManager
-from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 _is_npu = is_npu()
-_is_mps = is_mps()
 if _is_npu:
     import torch_npu
 
@@ -38,13 +34,12 @@ if _is_npu:
         ["profiler.ProfilerActivity.CUDA", torch_npu.profiler.ProfilerActivity.NPU],
         ["profiler.ProfilerActivity.CPU", torch_npu.profiler.ProfilerActivity.CPU],
     ]
-    apply_torch_npu_patches(torch_npu, patches)
-elif _is_mps:
-    from sglang.srt.hardware_backend.mlx.profiler import apply_metal_profiler_patches
-
-    apply_metal_profiler_patches()
+    torch_npu._apply_patches(patches)
 
 logger = logging.getLogger(__name__)
+
+
+from sglang.srt.utils.profile_utils import ProfileManager
 
 
 @dataclass(kw_only=True)
@@ -145,7 +140,7 @@ class SchedulerProfilerManager:
                     self.profiler_start_forward_ct + num_steps
                 )
             else:
-                self.profiler_target_forward_ct = self.get_forward_ct() + num_steps + 1
+                self.profiler_target_forward_ct = self.get_forward_ct() + num_steps
             # The caller will be notified when reaching profiler_target_forward_ct
         else:
             self.profiler_target_forward_ct = None
@@ -171,15 +166,6 @@ class SchedulerProfilerManager:
             "CPU": torch.profiler.ProfilerActivity.CPU,
             "GPU": torch.profiler.ProfilerActivity.CUDA,
         }
-
-        if current_platform.is_out_of_tree():
-            if hasattr(
-                torch.profiler.ProfilerActivity,
-                current_platform.get_torch_profiler_activity_str(),
-            ):
-                activity_map[current_platform.get_torch_profiler_activity_str()] = (
-                    current_platform.get_torch_profiler_activity()
-                )
         if hasattr(torch.profiler.ProfilerActivity, "XPU"):
             activity_map["XPU"] = torch.profiler.ProfilerActivity.XPU
         torchprof_activities = [
@@ -243,21 +229,15 @@ class SchedulerProfilerManager:
                     )
                 ),
             )
-            try:
-                self.torch_profiler.start()
-            except RuntimeError as e:
-                self.torch_profiler = None
-                return ProfileReqOutput(success=False, message=str(e))
+            self.torch_profiler.start()
             self.profile_in_progress = True
 
         if "MEM" in activities:
-            torch.cuda.memory._record_memory_history(
-                max_entries=envs.SGLANG_MEM_PROFILE_MAX_ENTRIES.get()
-            )
+            torch.cuda.memory._record_memory_history(max_entries=100000)
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
-            if self.ps.gpu_id == get_server_args().base_gpu_id:
+            if self.ps.gpu_id == get_global_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
@@ -358,8 +338,7 @@ class SchedulerProfilerManager:
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
-                stage_prefix
-                + str(time.time())
+                str(time.time())
                 + f"-TP-{self.ps.tp_rank}-memory"
                 + stage_suffix
                 + ".pickle",
@@ -368,7 +347,7 @@ class SchedulerProfilerManager:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
-            if self.ps.gpu_id == get_server_args().base_gpu_id:
+            if self.ps.gpu_id == get_global_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStop()
 
         merge_message = self._merge_profile_traces()
@@ -425,7 +404,7 @@ class SchedulerProfilerManager:
                 self._start_profile()
 
     def _profile(self, recv_req: ProfileReq):
-        if recv_req.req_type == ProfileReqType.START_PROFILE:
+        if recv_req.type == ProfileReqType.START_PROFILE:
             if recv_req.profile_by_stage or recv_req.start_step:
                 return self._init_profile(
                     recv_req.output_dir,

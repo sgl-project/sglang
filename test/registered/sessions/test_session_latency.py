@@ -271,7 +271,7 @@ class TestSessionLatency(CustomTestCase):
                 "--enable-streaming-session",
                 "--mem-fraction-static",
                 "0.70",
-                "--cuda-graph-backend-prefill=disabled",
+                "--disable-piecewise-cuda-graph",
                 "--page-size",
                 "4",
             ],

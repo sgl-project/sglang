@@ -22,36 +22,33 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
-    DispatcherOutputDtype,
+    DeepEPOutputDtype,
     get_deepep_config,
     get_deepep_output_dtype,
     is_tbo_enabled,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
-    get_cuda_version,
     is_blackwell,
-    is_flashinfer_available,
     is_hip,
     is_npu,
     load_json_config,
 )
 
 _is_npu = is_npu()
-_use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
 try:
-    if _use_zbal:
+    if _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
         from zbal.zbal.deepep_adaptor import Config
         from zbal.zbal_buffer import Buffer
     else:
         from deep_ep import Buffer, Config
 
     if not _is_npu:
-        from sglang.kernels.ops.quantization.fp8_kernel import (
+        from sglang.srt.layers.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
 
@@ -67,15 +64,6 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
-
-
-def _is_mnnvl_fabric_supported() -> bool:
-    if not is_flashinfer_available():
-        return False
-
-    from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
-
-    return is_mnnvl_fabric_supported(torch.cuda.current_device())
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -160,27 +148,11 @@ class DeepEPDispatchMode(IntEnum):
 
 
 class DeepEPBuffer:
-    """Managing facade for the process-wide DeepEP comm buffer; the state
-    itself lives on ``ctx.resources`` (one entry per process)."""
-
-    @classmethod
-    def _state(cls):
-        from types import SimpleNamespace
-
-        from sglang.srt.runtime_context import get_resources
-
-        buffers = get_resources().buffers
-        state = buffers.get("deepep_ep_state")
-        if state is None:
-            state = SimpleNamespace(
-                buffer=None,
-                dispatch_mode=None,
-                hidden_size=None,
-                num_max_dispatch_tokens_per_rank=None,
-                num_experts=None,
-            )
-            buffers["deepep_ep_state"] = state
-        return state
+    _buffer = None
+    _dispatch_mode: Optional[DeepEPDispatchMode] = None
+    _hidden_size: Optional[int] = None
+    _num_max_dispatch_tokens_per_rank: Optional[int] = None
+    _num_experts: Optional[int] = None
 
     @classmethod
     def get_deepep_buffer(
@@ -192,13 +164,12 @@ class DeepEPBuffer:
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
     ):
-        state = cls._state()
-        if state.buffer is not None:
-            return state.buffer
+        if cls._buffer is not None:
+            return cls._buffer
 
-        state.hidden_size = hidden_size
-        state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
-        state.num_experts = num_experts
+        cls._hidden_size = hidden_size
+        cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
+        cls._num_experts = num_experts
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
@@ -261,50 +232,36 @@ class DeepEPBuffer:
                     f"Consider using --deepep-config to change the behavior."
                 )
 
-        use_mnnvl_fabric = _is_mnnvl_fabric_supported()
-        buffer_kwargs = dict(
+        cls._buffer = Buffer(
+            group,
+            num_nvl_bytes,
+            num_rdma_bytes,
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
-            allow_mnnvl=use_mnnvl_fabric,
+            # TODO can be false when unneeded
+            allow_mnnvl=True,
         )
-        # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
-        # support, so cross-pod GB200/GB300 EP groups use
-        # cuMemImportFromShareableHandle instead of the intra-node-only
-        # cudaIpcOpenMemHandle. The DeepEP build we ship is keyed on the CUDA major
-        # version:
-        #   cu13x -> hybrid-ep, which gates fabric behind a use_fabric kwarg, so we
-        #            pass it when the device advertises fabric support.
-        #   cu12x -> fzyzcjy/DeepEP, which has no use_fabric kwarg but already
-        #            auto-enables fabric in C++ when supported, so we skip it:
-        #            https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
-        is_cu12 = get_cuda_version()[0] == 12
-        if not is_cu12 and use_mnnvl_fabric:
-            buffer_kwargs["use_fabric"] = True
-
-        state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
-        return state.buffer
+        return cls._buffer
 
     @classmethod
     def clean_buffer(cls):
-        state = cls._state()
-        if not state.buffer.low_latency_mode:
+        if not cls._buffer.low_latency_mode:
             return
-        state.buffer.clean_low_latency_buffer(
-            state.num_max_dispatch_tokens_per_rank,
-            state.hidden_size,
-            state.num_experts,
+        cls._buffer.clean_low_latency_buffer(
+            cls._num_max_dispatch_tokens_per_rank,
+            cls._hidden_size,
+            cls._num_experts,
         )
 
     @classmethod
     def set_dispatch_mode_as_normal(cls):
-        cls._state().dispatch_mode = DeepEPDispatchMode.NORMAL
+        cls._dispatch_mode = DeepEPDispatchMode.NORMAL
 
     @classmethod
     def set_dispatch_mode_as_low_latency(cls):
-        state = cls._state()
-        if state.dispatch_mode == DeepEPDispatchMode.NORMAL:
+        if cls._dispatch_mode == DeepEPDispatchMode.NORMAL:
             cls.clean_buffer()
-        state.dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
+        cls._dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
 
     @classmethod
     def set_dispatch_mode(cls, mode: DeepEPMode):
@@ -423,22 +380,22 @@ class _DeepEPDispatcherImplBase:
 
         # Configuration mapping for each dtype
         config_map = {
-            DispatcherOutputDtype.BF16: {
+            DeepEPOutputDtype.BF16: {
                 "use_fp8": False,
                 "use_nvfp4": False,
             },
-            DispatcherOutputDtype.FP8: {
+            DeepEPOutputDtype.FP8: {
                 "use_fp8": True,
                 "use_nvfp4": False,
             },
             # Needed for Ascend A2/A3 NPU case,
             # despite the use_fp8 flag,
             # quantization will be performed in int8
-            DispatcherOutputDtype.INT8: {
+            DeepEPOutputDtype.INT8: {
                 "use_fp8": True,
                 "use_nvfp4": False,
             },
-            DispatcherOutputDtype.NVFP4: {
+            DeepEPOutputDtype.NVFP4: {
                 "use_fp8": False,
                 "use_nvfp4": True,
             },
@@ -459,23 +416,23 @@ class _DeepEPDispatcherImplBase:
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
         if _is_npu:
-            if self.deepep_output_dtype == DispatcherOutputDtype.FP8:
+            if self.deepep_output_dtype == DeepEPOutputDtype.FP8:
                 logger.warning_once(
                     "Ascend A2/A3 NPU does not support fp8 "
                     "deepep_dispatcher_output_dtype, switching to int8..."
                 )
-                self.deepep_output_dtype = DispatcherOutputDtype.INT8
-            elif self.deepep_output_dtype == DispatcherOutputDtype.NVFP4:
+                self.deepep_output_dtype = DeepEPOutputDtype.INT8
+            elif self.deepep_output_dtype == DeepEPOutputDtype.NVFP4:
                 raise RuntimeError(
                     "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
                 )
         else:
-            if self.deepep_output_dtype == DispatcherOutputDtype.INT8:
+            if self.deepep_output_dtype == DeepEPOutputDtype.INT8:
                 logger.warning_once(
                     "GPU does not support int8 "
                     "deepep_dispatcher_output_dtype, switching to fp8..."
                 )
-                self.deepep_output_dtype = DispatcherOutputDtype.FP8
+                self.deepep_output_dtype = DeepEPOutputDtype.FP8
             # NVFP4 is supported on GPU, no adjustment needed
 
     def _update_int8_quant_env(self) -> None:
@@ -680,7 +637,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
-            topk_weights,
         )
         return (
             hidden_states,
@@ -727,7 +683,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
 
@@ -754,11 +709,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=self.use_fp8,
-                **(
-                    dict(topk_weights=topk_weights)
-                    if _is_npu and not _use_zbal
-                    else dict()
-                ),
                 **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
                 **(
                     dict(x_global_scale=input_global_scale)

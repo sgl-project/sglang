@@ -7,8 +7,7 @@ export const Nemotron3NanoDeployment = () => {
       title: 'Hardware Platform',
       items: [
         { id: 'h200', label: 'H200', default: false },
-        { id: 'b200', label: 'B200', default: true },
-        { id: 'b300', label: 'B300', default: false }
+        { id: 'b200', label: 'B200', default: true }
       ]
     },
     modelVariant: {
@@ -72,9 +71,6 @@ export const Nemotron3NanoDeployment = () => {
     cmd += `  --trust-remote-code \\\n`;
     cmd += `  --tp ${tp} \\\n`;
     cmd += `  --kv-cache-dtype ${kvcache} \\\n`;
-    if (hardware === 'b300') {
-      cmd += `  --attention-backend flashinfer \\\n`;
-    }
 
     // Add thinking parser and tool call parser if enabled
     for (const [key, option] of Object.entries(options)) {

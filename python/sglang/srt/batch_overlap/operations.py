@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+import os
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
@@ -14,16 +15,22 @@ from typing import (
     Union,
 )
 
+import torch
+
 from sglang.srt.layers.dp_attention import set_dp_buffer_len
 from sglang.srt.model_executor.forward_context import (
     forward_context,
     get_forward_context,
 )
-from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.forward_context import ForwardContext
+
+_ENABLE_PROFILE = bool(int(os.environ.get("SGLANG_OPERATIONS_ENABLE_PROFILE", "0")))
+
+if _ENABLE_PROFILE:
+    import nvtx
 
 
 def execute_operations(inputs, operations):
@@ -110,7 +117,7 @@ class _StageExecutor:
         debug_name: str,
         stages: List[Stage],
         inputs: dict,
-        child_ctx: Optional[ForwardContext] = None,
+        child_ctx: Optional["ForwardContext"] = None,
     ):
         self._debug_name = debug_name
         self._stages = stages
@@ -150,16 +157,9 @@ class _StageExecutor:
             if self._child_ctx is not None
             else nullcontext()
         )
-        stage_range = operations_nvtx_range(
-            debug_name=f"{self._debug_name}{self._index}",
-            color="orange",
-        )
-        with ctx_mgr, stage_range:
+        with ctx_mgr, _annotate_region(debug_name=f"{self._debug_name}{self._index}"):
             for op in stage:
-                with operations_nvtx_range(
-                    debug_name=op.debug_name,
-                    color="yellow",
-                ):
+                with _annotate_region(debug_name=op.debug_name):
                     self._stage_output = op.fn(
                         state=self._stage_state,
                         **(
@@ -181,6 +181,16 @@ class _StageExecutor:
     @property
     def num_stages(self):
         return len(self._stages)
+
+
+@contextmanager
+def _annotate_region(debug_name):
+    if _ENABLE_PROFILE:
+        with torch.autograd.profiler.record_function(debug_name):
+            with nvtx.annotate(debug_name):
+                yield
+    else:
+        yield
 
 
 class _StateDict:

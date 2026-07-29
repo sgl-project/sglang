@@ -12,7 +12,6 @@ from sglang.srt.distributed.naive_distributed import (
     set_naive_distributed,
 )
 from sglang.srt.layers.parameter import ModelWeightParameter
-from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, is_pin_memory_available
 from sglang.srt.utils.host_shared_memory import (
@@ -170,8 +169,11 @@ class OffloaderV2(BaseOffloader):
 
         # Temporarily init inside Offloader, can move if other modules also need this
         if self.mode in {"sharded_gpu", "shm_cpu"}:
+            from sglang.srt.distributed import get_tensor_model_parallel_world_size
 
-            assert get_parallel().tp_size == 1, "not yet support tp_size!=1"
+            assert (
+                get_tensor_model_parallel_world_size() == 1
+            ), "not yet support tp_size!=1"
             set_naive_distributed(
                 NaiveDistributed(
                     rank=dp_rank,
@@ -196,10 +198,7 @@ class OffloaderV2(BaseOffloader):
     ):
         assert len(self.offloaders) == 0, "should only call wrap_modules once"
 
-        # The offloader's async prefetch/offload copies run on their own
-        # stream — sharing the models' "alt" overlap stream would serialize
-        # unrelated copy and compute work.
-        alt_stream = get_stream("offload")
+        alt_stream = torch.cuda.Stream()
 
         all_modules = []
         offload_submodules = []
@@ -307,10 +306,6 @@ class _ModuleOffloader(ABC):
             param_offloader.post_init()
 
     def start_onload(self):
-        if torch.cuda.is_current_stream_capturing():
-            self._device_tensors = self._create_device_tensors()
-            self._load_event = None
-            return
         self.alt_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.alt_stream):
             self._device_tensors = self._create_device_tensors()
@@ -323,13 +318,7 @@ class _ModuleOffloader(ABC):
 
     def wait_and_get_device_tensors(self):
         assert self._device_tensors is not None
-        if torch.cuda.is_current_stream_capturing():
-            if self._load_event is not None:
-                self._device_tensors = self._create_device_tensors()
-                self._load_event = None
-            return self._device_tensors
-        if self._load_event is not None:
-            self._load_event.wait()
+        self._load_event.wait()
         return self._device_tensors
 
     def _create_device_tensors(self):
@@ -387,7 +376,9 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
         self._rank = get_naive_distributed().get_rank()
         self._world_size = get_naive_distributed().get_world_size()
 
-        assert get_parallel().tp_size == 1, "not yet support tp_size!=1"
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+        assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
         assert (
             self._param.data.is_contiguous()
         ), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"
@@ -492,7 +483,9 @@ class _ShardedGpuParamOffloader(_BaseParamOffloader):
         self._rank = get_naive_distributed().get_rank()
         self._world_size = get_naive_distributed().get_world_size()
 
-        assert get_parallel().tp_size == 1, "not yet support tp_size!=1"
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+        assert get_tensor_model_parallel_world_size() == 1, "not yet support tp_size!=1"
         assert (
             self._param.data.is_contiguous()
         ), f"not yet support non-contiguous tensor {self._param.shape=} {self._param.stride()=}"

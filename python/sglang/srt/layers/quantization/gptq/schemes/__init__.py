@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from .gptq_cpu import GPTQIntelAMXLinearScheme, GPTQIntelAMXMoEScheme
 from .gptq_linear import GPTQAscendLinearScheme, GPTQLinearScheme
 from .gptq_marlin import GPTQMarlinLinearScheme
 from .gptq_moe import GPTQMarlinMoEScheme, GPTQMoEAscendScheme
@@ -11,9 +10,7 @@ __all__ = [
     "GPTQMoESchemeBase",
     "GPTQLinearScheme",
     "GPTQAscendLinearScheme",
-    "GPTQIntelAMXLinearScheme",
     "GPTQMarlinLinearScheme",
     "GPTQMoEAscendScheme",
-    "GPTQIntelAMXMoEScheme",
     "GPTQMarlinMoEScheme",
 ]

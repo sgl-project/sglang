@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     run_bench_one_batch,
 )
 
-register_xpu_ci(est_time=600, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=600, suite="stage-a-test-1-gpu-xpu")
 
 
 def intel_xpu_benchmark(

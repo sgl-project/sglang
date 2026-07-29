@@ -1,6 +1,6 @@
 import itertools
 import sys
-from typing import Tuple
+from typing import Optional, Tuple
 
 import pytest
 import torch
@@ -35,16 +35,10 @@ def sglang_per_token_quant_fp8(
     return output, scale
 
 
-PER_TOKEN_QUANT_CASES = list(
-    itertools.product([128, 256, 512], [512, 1076, 1368, 2048, 4096])
-) + [
-    (39, 1536),
-    (1392, 1536),
-    (7807, 1536),
-]
-
-
-@pytest.mark.parametrize("num_tokens,hidden_dim", PER_TOKEN_QUANT_CASES)
+@pytest.mark.parametrize(
+    "num_tokens,hidden_dim",
+    list(itertools.product([128, 256, 512], [512, 1076, 1368, 2048, 4096])),
+)
 def test_per_token_quant_compare_implementations(
     num_tokens: int,
     hidden_dim: int,

@@ -3,6 +3,7 @@ import unittest
 
 import openai
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
@@ -50,12 +51,13 @@ class ServerWithGrammar(CustomTestCase):
             "--speculative-num-draft-tokens=8",
         ]
 
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=launch_args,
-        )
+        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=launch_args,
+            )
 
     @classmethod
     def tearDownClass(cls):

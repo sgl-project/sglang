@@ -25,5 +25,8 @@ jobs:
           args: >-
             --config .github/linters/lychee-ci.toml
             README.md
+            docs/**/*.md
+            docs/**/*.rst
+            docs/**/*.ipynb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

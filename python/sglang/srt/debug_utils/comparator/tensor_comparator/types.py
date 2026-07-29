@@ -29,7 +29,7 @@ class DiffInfo(_StrictBase):
     max_diff_coord: list[int]
     baseline_at_max: float
     target_at_max: float
-    predicate: str = ""
+    diff_threshold: float
     passed: bool
     per_token_rel_diff: Optional[list[float]] = None
 

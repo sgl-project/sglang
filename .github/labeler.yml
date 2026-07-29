@@ -14,7 +14,7 @@ sgl-kernel:
 # JIT kernel specific
 jit-kernel:
   - changed-files:
-    - any-glob-to-any-file: 'python/sglang/kernels/**/*'
+    - any-glob-to-any-file: 'python/sglang/jit_kernel/**/*'
 
 # Documentation
 documentation:
@@ -122,13 +122,3 @@ mthreads:
     - any-glob-to-any-file:
       - '**/*mthreads*'
       - '**/*musa*'
-      - '**/musa/**'
-
-# Apple Silicon specific
-apple-silicon:
-  - changed-files:
-    - any-glob-to-any-file:
-      - '**/*metal*'
-      - '**/*mlx*'
-      - '**/mlx/**'
-      - '**/*mps*'

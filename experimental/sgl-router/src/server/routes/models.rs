@@ -53,7 +53,6 @@ mod tests {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
-            sticky: None,
         };
         let app = crate::server::app::build_router(std::sync::Arc::new(ctx));
         let res = app

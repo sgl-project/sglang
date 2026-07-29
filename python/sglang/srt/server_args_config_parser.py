@@ -4,7 +4,6 @@ Handles merging of YAML configuration files with command-line arguments.
 """
 
 import argparse
-import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List
@@ -152,8 +151,6 @@ class ConfigArgumentMerger:
                 self._add_boolean_arg(args, key, value)
             elif isinstance(value, list):
                 self._add_list_arg(args, key, value)
-            elif isinstance(value, dict):
-                self._add_scalar_arg(args, key, json.dumps(value))
             else:
                 self._add_scalar_arg(args, key, value)
 

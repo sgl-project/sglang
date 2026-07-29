@@ -22,8 +22,6 @@ from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from .schemes import (
     GPTQAscendLinearScheme,
-    GPTQIntelAMXLinearScheme,
-    GPTQIntelAMXMoEScheme,
     GPTQLinearScheme,
     GPTQMarlinLinearScheme,
     GPTQMarlinMoEScheme,
@@ -211,10 +209,10 @@ class GPTQAscendConfig(GPTQConfig):
 
         if isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer)
-            return GPTQMoEMethod(self)
+            return GPTQMoEAscendMethod(self)
         if isinstance(layer, LinearBase):
             layer.scheme = self.get_linear_scheme(layer)
-            return GPTQLinearMethod(self)
+            return GPTQLinearAscendMethod(self)
         return None
 
     def get_linear_scheme(self, layer: torch.nn.Module):
@@ -225,40 +223,6 @@ class GPTQAscendConfig(GPTQConfig):
 
         assert isinstance(layer, FusedMoE)
         return GPTQMoEAscendScheme(self)
-
-
-class CPUGPTQConfig(GPTQConfig):
-    """CPU Config class for GPTQ on Intel CPU with AMX."""
-
-    @classmethod
-    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.half, torch.bfloat16]
-
-    def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[LinearMethodBase]:
-        from sglang.srt.layers.linear import LinearBase
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-
-        if isinstance(layer, LinearBase):
-            layer.scheme = self.get_linear_scheme(layer)
-            return GPTQLinearMethod(self)
-        if isinstance(layer, FusedMoE):
-            layer.scheme = self.get_moe_scheme(layer)
-            return GPTQMoEMethod(self)
-        return None
-
-    def get_linear_scheme(self, layer: torch.nn.Module):
-        from sglang.srt.layers.linear import LinearBase
-
-        assert isinstance(layer, LinearBase)
-        return GPTQIntelAMXLinearScheme(self)
-
-    def get_moe_scheme(self, layer: torch.nn.Module):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-
-        assert isinstance(layer, FusedMoE)
-        return GPTQIntelAMXMoEScheme(self)
 
 
 class GPTQMarlinConfig(QuantizationConfig):
@@ -496,7 +460,7 @@ class GPTQLinearMethod(LinearMethodBase):
         return layer.scheme.apply_weights(layer, x, bias)
 
 
-class GPTQMoEMethod(FusedMoEMethodBase):
+class GPTQMoEAscendMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: GPTQConfig):
         super().__init__()
@@ -586,6 +550,10 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return layer.scheme.apply_weights(layer, x, bias)
+
+
+class GPTQLinearAscendMethod(GPTQLinearMethod):
+    """Linear method for GPTQ on Ascend NPU."""
 
 
 class GPTQMarlinMoEMethod(FusedMoEMethodBase):

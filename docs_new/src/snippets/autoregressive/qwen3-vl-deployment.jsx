@@ -6,13 +6,11 @@ export const Qwen3VLDeployment = () => {
       title: 'Hardware Platform',
       items: [
         { id: 'b200', label: 'B200', default: true },
-        { id: 'b300', label: 'B300', default: false },
         { id: 'h100', label: 'H100', default: false },
         { id: 'h200', label: 'H200', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false },
-        { id: 'xeon', label: 'XEON', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false }
       ]
     },
     modelsize: {
@@ -61,11 +59,9 @@ export const Qwen3VLDeployment = () => {
       h100: { tp: 8, ep: 0, bf16: true, fp8: true },
       h200: { tp: 8, ep: 0, bf16: true, fp8: true },
       b200: { tp: 8, ep: 0, bf16: true, fp8: true },
-      b300: { tp: 8, ep: 0, bf16: true, fp8: true },
       mi300x: { tp: 8, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 8, ep: 0, bf16: true, fp8: true },
-      mi355x: { tp: 8, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 6, ep: 0, bf16: true, fp8: true }
+      mi355x: { tp: 8, ep: 0, bf16: true, fp8: true }
     },
     '30b': {
       baseName: '30B-A3B',
@@ -73,11 +69,9 @@ export const Qwen3VLDeployment = () => {
       h100: { tp: 1, ep: 0, bf16: true, fp8: true },
       h200: { tp: 1, ep: 0, bf16: true, fp8: true },
       b200: { tp: 1, ep: 0, bf16: true, fp8: true },
-      b300: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
+      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true }
     },
     '32b': {
       baseName: '32B',
@@ -85,11 +79,9 @@ export const Qwen3VLDeployment = () => {
       h100: { tp: 1, ep: 0, bf16: true, fp8: true },
       h200: { tp: 1, ep: 0, bf16: true, fp8: true },
       b200: { tp: 1, ep: 0, bf16: true, fp8: true },
-      b300: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 6, ep: 0, bf16: true, fp8: true }
+      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true }
     },
     '8b': {
       baseName: '8B',
@@ -97,11 +89,9 @@ export const Qwen3VLDeployment = () => {
       h100: { tp: 1, ep: 0, bf16: true, fp8: true },
       h200: { tp: 1, ep: 0, bf16: true, fp8: true },
       b200: { tp: 1, ep: 0, bf16: true, fp8: true },
-      b300: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
+      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true }
     },
     '4b': {
       baseName: '4B',
@@ -109,11 +99,9 @@ export const Qwen3VLDeployment = () => {
       h100: { tp: 1, ep: 0, bf16: true, fp8: true },
       h200: { tp: 1, ep: 0, bf16: true, fp8: true },
       b200: { tp: 1, ep: 0, bf16: true, fp8: true },
-      b300: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
+      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true }
     },
     '2b': {
       baseName: '2B',
@@ -121,11 +109,9 @@ export const Qwen3VLDeployment = () => {
       h100: { tp: 1, ep: 0, bf16: true, fp8: true },
       h200: { tp: 1, ep: 0, bf16: true, fp8: true },
       b200: { tp: 1, ep: 0, bf16: true, fp8: true },
-      b300: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
+      mi355x: { tp: 1, ep: 0, bf16: true, fp8: true }
     }
   };
 
@@ -166,7 +152,6 @@ export const Qwen3VLDeployment = () => {
   const generateCommand = () => {
     const { hardware, modelsize, quantization, thinking, toolcall } = values;
     const commandKey = `${hardware}-${modelsize}-${quantization}-${thinking}`;
-    const isXeon = hardware === 'xeon';
 
     // Special error handling
     if (commandKey === 'h100-235b-bf16-instruct' || commandKey === 'h100-235b-bf16-thinking') {
@@ -189,9 +174,6 @@ export const Qwen3VLDeployment = () => {
 
     let cmd = 'python -m sglang.launch_server \\\n';
     cmd += `  --model ${modelName}`;
-    if (isXeon) {
-      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
-    }
 
     if (hwConfig.tp > 1) {
       cmd += ` \\\n  --tp ${hwConfig.tp}`;
@@ -206,7 +188,7 @@ export const Qwen3VLDeployment = () => {
       cmd += ` \\\n  --ep ${ep}`;
     }
 
-    if (!isXeon && (hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x')) {
+    if (hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x') {
       if (modelsize === '32b' && quantization === 'bf16') {
         cmd += ` \\\n  --context-length 65536`;
       }
@@ -218,11 +200,6 @@ export const Qwen3VLDeployment = () => {
 
     if (toolcall === 'enabled') {
       cmd += ' \\\n  --tool-call-parser qwen';
-    }
-
-    if (hardware === 'b300') {
-      cmd += ' \\\n  --attention-backend flashinfer';
-      cmd += ' \\\n  --enforce-disable-flashinfer-allreduce-fusion';
     }
 
     return cmd;

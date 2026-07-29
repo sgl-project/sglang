@@ -80,7 +80,7 @@ related files
 [@BBuf](https://github.com/BBuf) (BBuf)
 
 related files
-- python/sglang/kernels
+- python/sglang/jit_kernel
 - sgl-kernel
 
 ### Speculative decoding

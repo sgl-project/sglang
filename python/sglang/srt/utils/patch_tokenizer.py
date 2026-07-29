@@ -33,10 +33,8 @@ def decode_without_hf_kwargs(tokenizer, token_ids, skip_special_tokens):
     if skip_special_tokens:
         special_ids = getattr(tokenizer, "all_special_ids_set", None)
         if special_ids is None:
-            special_ids = getattr(tokenizer, "all_special_ids", None)
-        if special_ids is not None:
-            special_ids_set = set(special_ids)
-            token_ids = [tid for tid in token_ids if tid not in special_ids_set]
+            special_ids = set(tokenizer.all_special_ids)
+        token_ids = [tid for tid in token_ids if tid not in special_ids]
     return tokenizer.decode(token_ids)
 
 

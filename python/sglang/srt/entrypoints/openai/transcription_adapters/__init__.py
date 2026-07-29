@@ -7,9 +7,6 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (  # noqa:
 )
 
 # Import built-in adapters so they self-register via @register_transcription_adapter.
-from sglang.srt.entrypoints.openai.transcription_adapters.mimo_v2_asr import (  # noqa: F401
-    MiMoV2ASRAdapter,
-)
 from sglang.srt.entrypoints.openai.transcription_adapters.qwen3_asr import (  # noqa: F401
     Qwen3ASRAdapter,
 )
@@ -23,5 +20,4 @@ __all__ = [
     "resolve_adapter",
     "WhisperAdapter",
     "Qwen3ASRAdapter",
-    "MiMoV2ASRAdapter",
 ]

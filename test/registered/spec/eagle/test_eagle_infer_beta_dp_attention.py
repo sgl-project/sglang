@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -64,12 +65,13 @@ class TestEagleDPAttnServerSmall(CustomTestCase):
             "--speculative-num-draft-tokens",
             "4",
         ]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-        )
+        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=other_args,
+            )
 
     @classmethod
     def tearDownClass(cls):

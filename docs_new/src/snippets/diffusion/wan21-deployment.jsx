@@ -39,15 +39,7 @@ export const Wan21Deployment = () => {
     hardware: {
       name: 'hardware',
       title: 'Hardware Platform',
-      items: [
-        { id: 'b200', label: 'B200', default: true },
-        { id: 'b300', label: 'B300', default: false },
-        { id: 'h200', label: 'H200', default: false },
-        { id: 'h100', label: 'H100', default: false },
-        { id: 'mi300x', label: 'MI300X', default: false },
-        { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false },
-      ],
+      items: [{ id: 'mi300x', label: 'MI300X/MI325X/MI355X', default: true }],
     },
     task: {
       name: 'task',
@@ -85,7 +77,7 @@ export const Wan21Deployment = () => {
     const configKey = `${task}-${modelsize}`;
     const supported = modelConfigs[configKey]?.supportedLoras || [];
     return {
-      hardware: 'b200',
+      hardware: 'mi300x',
       task,
       modelsize,
       bestPractice: 'off',

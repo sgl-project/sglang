@@ -1,7 +1,6 @@
 ---
 title: "TeaCache Acceleration"
 description: "Configure TeaCache for temporal similarity-based diffusion acceleration."
-tag: "approx"
 ---
 
 > **Note**: This is one of two caching strategies available in SGLang.
@@ -15,7 +14,7 @@ TeaCache works by:
 1. Tracking the L1 distance between modulated inputs across consecutive timesteps
 2. Accumulating the rescaled L1 distance over steps
 3. When accumulated distance is below a threshold, reusing the cached residual
-4. Using separate positive/negative caches for supported CFG model families
+4. Supporting CFG (Classifier-Free Guidance) with separate positive/negative caches
 
 ## How It Works
 
@@ -40,11 +39,11 @@ accumulated += poly(coefficients)(rel_l1)
 
 ### CFG Support
 
-For models that support CFG cache separation, TeaCache maintains separate caches for positive and negative branches:
+For models that support CFG cache separation (Wan, Hunyuan, Z-Image), TeaCache maintains separate caches for positive and negative branches:
 - `previous_modulated_input` / `previous_residual` for positive branch
 - `previous_modulated_input_negative` / `previous_residual_negative` for negative branch
 
-For models that do not support CFG separation, TeaCache is automatically disabled when CFG is enabled.
+For models that don't support CFG separation (Flux, Qwen), TeaCache is automatically disabled when CFG is enabled.
 
 ## Configuration
 
@@ -78,7 +77,7 @@ params = TeaCacheParams(
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`teacache_thresh`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>float</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Threshold for accumulated L1 distance. Higher = more caching, faster but potentially lower quality</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Threshold for accumulated L1 distance. Lower = more caching, faster but potentially lower quality</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`coefficients`</td>
@@ -94,7 +93,7 @@ Different models may have different optimal configurations. The coefficients are
 
 ## Supported Models
 
-TeaCache support status by model family:
+TeaCache is built into the following model families:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -111,24 +110,19 @@ TeaCache support status by model family:
   </thead>
   <tbody>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan2.1</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan (wan2.1, wan2.2)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Full support</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan2.2</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Hunyuan (HunyuanVideo)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Coefficients are not calibrated yet; enabling TeaCache is accepted but currently no-ops</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>To be supported</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Z-Image</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Full support</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HunyuanVideo</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not supported yet</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>To be supported</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Flux</td>

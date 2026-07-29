@@ -71,16 +71,20 @@ def get_processor(
         pretrained_model_name_or_path is not None
         and pretrained_model_name_or_path != ""
     )
+    if pretrained_model_name_or_path.endswith(
+        ".json"
+    ) or pretrained_model_name_or_path.endswith(".model"):
+        from sglang.srt.utils.hf_transformers_utils import get_processor
 
-    from sglang.srt.utils.hf_transformers_utils import (
-        get_processor as _srt_get_processor,
-    )
+        return get_processor(pretrained_model_name_or_path)
 
-    if not pretrained_model_name_or_path.endswith(
-        (".json", ".model")
-    ) and not os.path.exists(pretrained_model_name_or_path):
+    if pretrained_model_name_or_path is not None and not os.path.exists(
+        pretrained_model_name_or_path
+    ):
         pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
-    return _srt_get_processor(pretrained_model_name_or_path, trust_remote_code=True)
+    return AutoProcessor.from_pretrained(
+        pretrained_model_name_or_path, trust_remote_code=True
+    )
 
 
 def download_and_cache_hf_file(

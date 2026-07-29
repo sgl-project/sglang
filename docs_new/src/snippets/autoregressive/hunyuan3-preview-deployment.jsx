@@ -13,8 +13,7 @@ export const Hunyuan3PreviewDeployment = () => {
         { id: 'h200',  label: 'H200',  default: true  },
         { id: 'b200',  label: 'B200',  default: false },
         { id: 'b300',  label: 'B300',  default: false },
-        { id: 'gb300', label: 'GB300', default: false },
-        { id: 'xeon',  label: 'XEON',  default: false }
+        { id: 'gb300', label: 'GB300', default: false }
       ]
     },
     reasoning: {
@@ -36,13 +35,10 @@ export const Hunyuan3PreviewDeployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding (MTP)',
-      getDynamicItems: (values) => {
-        const isXeon = values && values.hardware === 'xeon';
-        return [
-          { id: 'disabled', label: 'Disabled', default: true  },
-          { id: 'enabled',  label: 'Enabled',  subtitle: 'Low Latency', default: false, disabled: isXeon, disabledReason: isXeon ? 'Speculative decoding (MTP) is not supported on Intel Xeon CPUs' : '' }
-        ];
-      }
+      items: [
+        { id: 'disabled', label: 'Disabled', default: true  },
+        { id: 'enabled',  label: 'Enabled',  subtitle: 'Low Latency', default: false }
+      ]
     }
   };
 
@@ -50,8 +46,7 @@ export const Hunyuan3PreviewDeployment = () => {
     h200:  { tp: 8, mem: 0.9 },
     b200:  { tp: 8, mem: 0.9 },
     b300:  { tp: 4, mem: 0.9 },
-    gb300: { tp: 4, mem: 0.9 },
-    xeon:  { tp: 6 }
+    gb300: { tp: 4, mem: 0.9 }
   };
 
   const resolveItems = (option, values) => {
@@ -87,36 +82,22 @@ export const Hunyuan3PreviewDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => {
-      const next = { ...prev, [optionName]: value };
-      if (optionName === 'hardware') {
-        for (const [key, option] of Object.entries(options)) {
-          if (key === 'hardware') continue;
-          const items = resolveItems(option, next);
-          const current = items.find(i => i.id === next[key]);
-          if (!current || current.disabled) {
-            const fallback = items.find(i => i.default && !i.disabled) || items.find(i => !i.disabled);
-            if (fallback) next[key] = fallback.id;
-          }
-        }
-      }
-      return next;
-    });
+    setValues(prev => ({ ...prev, [optionName]: value }));
   };
 
   const generateCommand = () => {
     const { hardware } = values;
     const isBlackwell = hardware === 'b200' || hardware === 'b300' || hardware === 'gb300';
-    const isXeon = hardware === 'xeon';
     const hwConfig = modelConfigs[hardware];
     if (!hwConfig) return '# Configuration not available for the selected hardware.';
 
     const modelName = 'tencent/Hy3-preview';
     const tpValue = hwConfig.tp;
     const memFraction = hwConfig.mem;
-    const enableSpec = values.speculative === 'enabled' && !isXeon;
+    const enableSpec = values.speculative === 'enabled';
 
     let cmd = '';
+    if (enableSpec) cmd += 'SGLANG_ENABLE_SPEC_V2=1 ';
     cmd += 'sglang serve \\\n';
     cmd += `  --model-path ${modelName}`;
     cmd += ` \\\n  --tp ${tpValue}`;
@@ -131,10 +112,9 @@ export const Hunyuan3PreviewDeployment = () => {
     }
 
     cmd += ' \\\n  --trust-remote-code';
-    if (memFraction !== undefined) cmd += ` \\\n  --mem-fraction-static ${memFraction}`;
+    cmd += ` \\\n  --mem-fraction-static ${memFraction}`;
 
-    if (isBlackwell && !isXeon) cmd += ' \\\n  --attention-backend trtllm_mha';
-    if (isXeon) cmd += ' \\\n  --device cpu \\\n  --disable-overlap-schedule';
+    if (isBlackwell) cmd += ' \\\n  --attention-backend trtllm_mha';
 
     return cmd;
   };

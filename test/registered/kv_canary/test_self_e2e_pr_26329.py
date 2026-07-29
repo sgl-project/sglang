@@ -8,11 +8,10 @@ import unittest
 from typing import ClassVar
 
 from sglang.srt.kv_canary.config import CanaryMode
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=99, stage="extra-a", runner_config="1-gpu-small-amd")
 
 
 _CHUNKED_PREFILL_SIZE = 2048
@@ -21,7 +20,7 @@ _EAGLE_CHUNKED_SERVER_ARGS = (
     "EAGLE",
     "--chunked-prefill-size",
     str(_CHUNKED_PREFILL_SIZE),
-    "--cuda-graph-max-bs-decode",
+    "--cuda-graph-max-bs",
     "1",
     "--max-running-requests",
     "4",

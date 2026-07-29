@@ -53,11 +53,13 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.utils import (
+    _use_aiter,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
@@ -65,7 +67,7 @@ from sglang.srt.utils import add_prefix
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
 
-if USE_AITER:
+if _use_aiter:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
 
 
@@ -553,7 +555,7 @@ class WanTransformerBlock(nn.Module):
             query, key = apply_flashinfer_rope_qk_inplace(
                 query, key, cos_sin_cache, is_neox=False
             )
-        elif USE_AITER:
+        elif _use_aiter:
             query_shape = query.shape
             key_shape = key.shape
             num_tokens = query.shape[:-2].numel()
@@ -800,7 +802,7 @@ class WanTransformerBlock_VSA(nn.Module):
             query, key = apply_flashinfer_rope_qk_inplace(
                 query, key, cos_sin_cache, is_neox=False
             )
-        elif USE_AITER:
+        elif _use_aiter:
             query_shape = query.shape
             key_shape = key.shape
             num_tokens = query.shape[:-2].numel()
@@ -937,7 +939,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             config.out_channels * math.prod(config.patch_size),
             bias=True,
             gather_output=True,
-            prefix="proj_out",
+            prefix=f"proj_out",
             quant_config=quant_config,
         )
         self.scale_shift_table = nn.Parameter(

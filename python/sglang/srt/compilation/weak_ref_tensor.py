@@ -2,16 +2,14 @@ from typing import Any, Union
 
 import torch
 
-from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, is_xpu
+from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu
 
-if is_cuda() or is_hip() or is_musa() or is_xpu():
+if is_cuda() or is_hip() or is_musa():
     from sgl_kernel import weak_ref_tensor
 elif is_npu():
     from torch_npu._C import _weak_ref_tensor as weak_ref_tensor
 else:
-    raise NotImplementedError(
-        "weak_ref_tensor is implemented only for CUDA, XPU, and NPU."
-    )
+    raise NotImplementedError("weak_ref_tensor is implemented only for CUDA and NPU.")
 
 
 def weak_ref_tensors(

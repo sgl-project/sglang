@@ -46,7 +46,7 @@ class TestKvEvents(CustomTestCase):
                 '{"publisher": "zmq", "topic": "kv-events"}',
                 "--max-total-tokens",
                 32,
-                "--cuda-graph-max-bs-decode",
+                "--cuda-graph-max-bs",
                 2,
                 "--enable-dp-attention",
                 "--dp-size",
@@ -140,12 +140,10 @@ class TestKvEvents(CustomTestCase):
                 elif isinstance(event, BlockRemoved):
                     # Validate BlockRemoved structure
                     self.assertIsInstance(event.block_hashes, list)
-                    self.assertGreater(
-                        len(event.block_hashes),
-                        0,
-                        "Should have at least one removed block hash",
+                    self.assertEqual(
+                        len(event.block_hashes), 1, "Should have one hash per block"
                     )
-                    removed_hashes.update(event.block_hashes)
+                    removed_hashes.add(event.block_hashes[0])
 
             # Verify we got both BlockStored and BlockRemoved events
             self.assertGreater(
@@ -190,7 +188,7 @@ class TestKvEvents(CustomTestCase):
                 '{"publisher": "zmq", "topic": "kv-events"}',
                 "--max-total-tokens",
                 64,
-                "--cuda-graph-max-bs-decode",
+                "--cuda-graph-max-bs",
                 4,
                 "--enable-dp-attention",
                 "--dp-size",
@@ -327,7 +325,7 @@ class TestKvEvents(CustomTestCase):
                 "--max-running-requests",
                 4,
                 "--disable-cuda-graph",
-                "--cuda-graph-max-bs-decode",
+                "--cuda-graph-max-bs",
                 4,
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',

@@ -33,7 +33,6 @@ def flashinfer_cutedsl_moe_masked(
     down_sm_count: Optional[int] = None,
     down_signals: Optional[torch.Tensor] = None,
     down_start_event: Optional[torch.cuda.Event] = None,
-    activation: str = "silu",
 ):
     """
     Perform masked Mixture-of-Experts computation with FlashInfer's CuteDSL
@@ -104,21 +103,7 @@ def flashinfer_cutedsl_moe_masked(
             input_global_scale,
         )
 
-    if activation == "silu":
-        gated = True
-    elif activation == "relu2":
-        gated = False
-    else:
-        raise ValueError(
-            f"CuteDSL masked MoE supports activation 'silu' (gated) or "
-            f"'relu2' (non-gated), got {activation!r}."
-        )
-    # Gated (silu_and_mul) GEMM1 emits [gate, up] so w1 has 2*n rows; non-gated
-    # relu2 emits a single projection of n rows.
-    gemm1_out_dim = 2 * n if gated else n
-    assert (
-        w1.shape[-2] == gemm1_out_dim
-    ), f"w1 last-2 dim must be {gemm1_out_dim} (gated={gated}), got {w1.shape}"
+    assert w1.shape[-2] == 2 * n, f"w1 last-2 dim must be 2*n, got {w1.shape}"
     assert (
         w1.shape[-1] * 2 == k
     ), f"w1 last dim * 2 must equal k, got {w1.shape[-1]} vs k={k}"
@@ -138,7 +123,7 @@ def flashinfer_cutedsl_moe_masked(
 
     # TODO(kaixih@nvidia): dtype should be based on inputs.
     gateup_output = torch.empty(
-        (num_experts, m, gemm1_out_dim), dtype=torch.bfloat16, device=a_q.device
+        (num_experts, m, n * 2), dtype=torch.bfloat16, device=a_q.device
     )
     gateup_output = gateup_output.permute(1, 2, 0)  # requirement of kernel
     sf_vec_size = 16
@@ -162,23 +147,12 @@ def flashinfer_cutedsl_moe_masked(
         alpha_dtype=get_cute_dtype(w1_alpha),
     )  # in logical [m, n, l]
 
-    # Activation + NVFP4 quantization of the GEMM2 input.
-    if gated:
-        # Fused silu(gate) * up + quantize; halves 2*n -> n.
-        diq, diq_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
-            gateup_output.permute(2, 0, 1),
-            masked_m,
-            a2_global_scale,
-        )
-    else:
-        # Non-gated relu^2: relu(x)^2 elementwise (no halving), then grouped
-        # NVFP4 quantize. scaled_fp4_grouped_quantize needs a per-expert (l,)
-        # global scale, so broadcast a scalar if one was supplied.
-        act = torch.relu(gateup_output.permute(2, 0, 1)).square().contiguous()
-        a2_gs = a2_global_scale
-        if a2_gs.numel() == 1:
-            a2_gs = a2_gs.expand(num_experts).contiguous()
-        diq, diq_sf = scaled_fp4_grouped_quantize(act, masked_m, a2_gs)
+    # SILU and quantization
+    diq, diq_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
+        gateup_output.permute(2, 0, 1),
+        masked_m,
+        a2_global_scale,
+    )
 
     if down_start_event is not None:
         down_start_event.record()

@@ -32,7 +32,7 @@ class TestMoEDeepEPEvalAccuracyLarge(CustomTestCase):
                 "8",
                 "--moe-a2a-backend",
                 "deepep",
-                "--cuda-graph-max-bs-decode",
+                "--cuda-graph-max-bs",
                 "128",
             ],
         )

@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
@@ -28,8 +29,11 @@ class TestLLaDA2Mini(GSM8KAscendMixin, CustomTestCase):
         "ascend",
         "--dllm-algorithm",
         "LowConfidence",  # TODO: Add dLLM configurations
-        "--no-dllm-fdfo",  # FDFO (PR #27551) halves single-batch speed on NPU; use sync mode
     ]
+    env = {
+        **os.environ,
+        "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT": "1",  # Need to avoid OOM issue
+    }
     accuracy = 0.88
     output_throughput = 70
 

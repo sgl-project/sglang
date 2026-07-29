@@ -1,3 +1,4 @@
+import ast
 import json
 import logging
 import re
@@ -10,7 +11,6 @@ from sglang.srt.function_call.core_types import (
     StructureInfo,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import safe_literal_eval
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ class Llama32Detector(BaseFormatDetector):
     def _convert_python_dict_to_json(self, text: str) -> str:
         """Convert Python dict strings to JSON format."""
         try:
-            parsed = safe_literal_eval(text.strip())
+            parsed = ast.literal_eval(text.strip())
             if isinstance(parsed, dict):
                 return json.dumps(parsed, ensure_ascii=False)
         except:

@@ -34,8 +34,8 @@ def build_triage_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="analyze_llm_torch_profile.py",
         description=(
-            "Compact LLM torch-profiler triage entrypoint for SGLang, vLLM, "
-            "TensorRT-LLM, and TokenSpeed. "
+            "Compact LLM torch-profiler triage entrypoint for SGLang, vLLM, and "
+            "TensorRT-LLM. "
             "This prints three tables: kernel mapping, overlap opportunities, "
             "and fuse opportunities. "
             "Use either a single trace/profile input or a mapping+formal two-trace pair."
@@ -45,17 +45,7 @@ def build_triage_parser() -> argparse.ArgumentParser:
         "--framework",
         type=str,
         default="auto",
-        choices=[
-            "auto",
-            "sglang",
-            "vllm",
-            "trtllm",
-            "tllm",
-            "tensorrt-llm",
-            "tokenspeed",
-            "token-speed",
-            "ts",
-        ],
+        choices=["auto", "sglang", "vllm", "trtllm", "tllm", "tensorrt-llm"],
         help=(
             "Serving framework. Use auto to detect from trace contents, path hints, "
             "or URL features."
@@ -74,9 +64,7 @@ def build_triage_parser() -> argparse.ArgumentParser:
         help=(
             "Running server URL for single-trace triage. SGLang supports direct "
             "capture via sglang.profiler. vLLM and TensorRT-LLM require a server-side "
-            "torch-profiler output path exposed via --output-dir. TokenSpeed live "
-            "capture uses the server's /start_profile and /stop_profile endpoints "
-            "when they are available."
+            "torch-profiler output path exposed via --output-dir."
         ),
     )
     parser.add_argument(
@@ -86,8 +74,7 @@ def build_triage_parser() -> argparse.ArgumentParser:
         help=(
             "Trace output dir when using --url. For vLLM this should match the "
             "server's torch_profiler_dir. For TensorRT-LLM it should match the "
-            "directory or file path configured by TLLM_TORCH_PROFILE_TRACE. "
-            "For TokenSpeed this is passed as start_profile.output_dir."
+            "directory or file path configured by TLLM_TORCH_PROFILE_TRACE."
         ),
     )
     parser.add_argument(
@@ -96,8 +83,7 @@ def build_triage_parser() -> argparse.ArgumentParser:
         default="triage-trace",
         help=(
             "Profile prefix when generating a trace from --url. SGLang uses it "
-            "directly; TokenSpeed maps it to profile_id; vLLM and TensorRT-LLM may "
-            "ignore it on the HTTP profiler path."
+            "directly; vLLM and TensorRT-LLM may ignore it on the HTTP profiler path."
         ),
     )
     parser.add_argument(

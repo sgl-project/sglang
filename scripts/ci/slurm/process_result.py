@@ -76,7 +76,7 @@ if recipe_file and Path(recipe_file).exists():
 total_gpus = prefill_gpus + decode_gpus
 
 data = {
-    "hw": os.environ.get("HW", "gb200"),
+    "hw": "gb200",
     "conc": int(raw["max_concurrency"]),
     "model": raw["model_id"],
     "infmax_model_prefix": model_prefix,

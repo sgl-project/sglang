@@ -385,11 +385,9 @@ class Qwen3ForCausalLM(TextEncoder):
         residual = None
 
         if position_ids is None:
-            position_ids = (
-                torch.arange(0, hidden_states.shape[1], device=hidden_states.device)
-                .unsqueeze(0)
-                .expand(hidden_states.shape[0], -1)
-            )
+            position_ids = torch.arange(
+                0, hidden_states.shape[1], device=hidden_states.device
+            ).unsqueeze(0)
 
         attention_lengths = None
         if attention_mask is not None:

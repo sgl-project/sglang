@@ -1,0 +1,76 @@
+# Qwen 3.5 Usage
+
+Qwen 3.5 is Alibaba's latest generation LLM featuring a hybrid attention architecture, advanced MoE with shared experts, and native multimodal capabilities.
+
+Key architecture features:
+- **Hybrid Attention**: Gated Delta Networks (linear, O(n) complexity) combined with full attention every 4th layer for high associative recall
+- **MoE with Shared Experts**: Top-8 active out of 64 routed experts plus a dedicated shared expert for universal features
+- **Multimodal**: DeepStack Vision Transformer with Conv3d for native image and video understanding
+
+## Launch Qwen 3.5 with SGLang
+
+### Dense Model
+
+To serve `Qwen/Qwen3.5-397B-A17B` on 8 GPUs:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3.5-397B-A17B \
+    --tp 8 \
+    --trust-remote-code
+```
+
+### AMD GPU (MI300X / MI325X / MI35X)
+
+On AMD Instinct GPUs, use the `triton` attention backend. Both the full attention layers and the Gated Delta Net (linear attention) layers use Triton-based kernels on ROCm:
+
+```bash
+SGLANG_USE_AITER=1 python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3.5-397B-A17B \
+    --tp 8 \
+    --attention-backend triton \
+    --trust-remote-code
+```
+
+```{tip}
+Set `SGLANG_USE_AITER=1` to enable AMD's optimized aiter kernels for MoE and GEMM operations.
+```
+
+### Configuration Tips
+
+- `--attention-backend`: Use `triton` on AMD GPUs for Qwen 3.5. The hybrid attention architecture (Gated Delta Networks + full attention) works best with the Triton backend on ROCm. The linear attention (GDN) layers always use Triton kernels internally via the `GDNAttnBackend`.
+- `--watchdog-timeout`: Increase to `1200` or higher for this large model, as weight loading takes significant time.
+- `--model-loader-extra-config '{"enable_multithread_load": true}'`: Enables parallel weight loading for faster startup.
+
+### Reasoning and Tool Calling
+
+Qwen 3.5 supports reasoning and tool calling via the Qwen3 parsers:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3.5-397B-A17B \
+    --tp 8 \
+    --trust-remote-code \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
+```
+
+## Accuracy Evaluation
+
+You can evaluate the model accuracy using `lm-eval`:
+
+```bash
+pip install lm-eval[api]
+
+lm_eval --model local-completions \
+    --model_args '{"base_url": "http://localhost:8000/v1/completions", "model": "Qwen/Qwen3.5-397B-A17B", "num_concurrent": 256, "max_retries": 10, "max_gen_toks": 2048}' \
+    --tasks gsm8k \
+    --batch_size auto \
+    --num_fewshot 5 \
+    --trust_remote_code
+```
+
+## Additional Resources
+
+- [AMD Day 0 Support for Qwen 3.5 on AMD Instinct GPUs](https://www.amd.com/en/developer/resources/technical-articles/2026/day-0-support-for-qwen-3-5-on-amd-instinct-gpus.html)
+- [HuggingFace Model Card](https://huggingface.co/Qwen/Qwen3.5-397B-A17B)

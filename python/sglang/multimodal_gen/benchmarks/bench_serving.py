@@ -567,7 +567,7 @@ async def benchmark(args):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
-    logger.info("Loading requests...")
+    logger.info(f"Loading requests...")
     requests_list = dataset.get_requests()
     logger.info(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
 

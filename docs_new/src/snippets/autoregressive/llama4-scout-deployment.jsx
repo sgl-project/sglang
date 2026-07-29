@@ -9,16 +9,15 @@ export const Llama4ScoutDeployment = () => {
         { id: 'h200', label: 'H200', default: false },
         { id: 'mi300x', label: 'MI300x', default: false },
         { id: 'mi325x', label: 'MI325x', default: false },
-        { id: 'mi355x', label: 'MI355x', default: false },
-        { id: 'xeon', label: 'XEON', default: false }
+        { id: 'mi355x', label: 'MI355x', default: false }
       ]
     },
     quantization: {
       name: 'quantization',
       title: 'Quantization',
-      getDynamicItems: (values) => [
+      items: [
         { id: 'bf16', label: 'BF16', default: true },
-        { id: 'fp8', label: 'FP8', default: false, disabled: values.hardware === 'xeon' }
+        { id: 'fp8', label: 'FP8', default: false }
       ]
     },
     toolcall: {
@@ -32,7 +31,6 @@ export const Llama4ScoutDeployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding (EAGLE3)',
-      condition: (values) => values.hardware !== 'xeon',
       items: [
         { id: 'disabled', label: 'Disabled', default: true },
         { id: 'enabled', label: 'Enable EAGLE3', default: false }
@@ -66,11 +64,9 @@ export const Llama4ScoutDeployment = () => {
       cmd += ` \\\n  --tp 8`;
     } else if (hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x') {
       cmd += ` \\\n  --tp 8`;
-    } else if (hardware === 'xeon') {
-      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule \\\n  --tp 6`;
     }
 
-    if (quantization === 'fp8' && hardware !== 'xeon') {
+    if (quantization === 'fp8') {
       cmd += ` \\\n  --quantization fp8`;
     }
 
@@ -78,14 +74,14 @@ export const Llama4ScoutDeployment = () => {
       cmd += ` \\\n  --tool-call-parser pythonic`;
     }
 
-    if (speculative === 'enabled' && hardware !== 'xeon') {
+    if (speculative === 'enabled') {
       cmd += ` \\\n  --speculative-algorithm EAGLE3 \\\n`;
       cmd += `  --speculative-draft-model-path lmsys/sglang-EAGLE3-Llama-4-Scout-17B-16E-Instruct-v1 \\\n`;
       cmd += `  --speculative-num-steps 3 \\\n`;
       cmd += `  --speculative-eagle-topk 1 \\\n`;
       cmd += `  --speculative-num-draft-tokens 4 \\\n`;
       cmd += `  --mem-fraction-static 0.75 \\\n`;
-      cmd += `  --cuda-graph-max-bs-decode 2`;
+      cmd += `  --cuda-graph-max-bs 2`;
     }
 
     cmd += ` \\\n  --enable-multimodal`;
@@ -156,14 +152,7 @@ export const Llama4ScoutDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => {
-      const next = { ...prev, [optionName]: value };
-      if (optionName === 'hardware' && value === 'xeon') {
-        next.quantization = 'bf16';
-        next.speculative = 'disabled';
-      }
-      return next;
-    });
+    setValues((prev) => ({ ...prev, [optionName]: value }));
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {

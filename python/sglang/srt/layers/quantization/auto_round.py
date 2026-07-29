@@ -309,8 +309,8 @@ class AutoRoundConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.gptq import (
             GPTQAscendConfig,
-            GPTQLinearMethod,
-            GPTQMoEMethod,
+            GPTQLinearAscendMethod,
+            GPTQMoEAscendMethod,
         )
         from sglang.srt.layers.quantization.marlin_utils import (
             check_marlin_supported,
@@ -345,12 +345,10 @@ class AutoRoundConfig(QuantizationConfig):
             quant_args.sym = sym
 
             if isinstance(layer, FusedMoE):
-                layer.scheme = quant_args.get_moe_scheme(layer)
-                return GPTQMoEMethod(quant_args)
+                return GPTQMoEAscendMethod(quant_args)
 
             if isinstance(layer, (LinearBase, ParallelLMHead)):
-                layer.scheme = quant_args.get_linear_scheme(layer)
-                return GPTQLinearMethod(quant_args)
+                return GPTQLinearAscendMethod(quant_args)
 
             return None
 

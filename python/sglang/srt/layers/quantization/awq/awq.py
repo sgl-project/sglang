@@ -194,8 +194,6 @@ class AWQCPUConfig(AWQConfig):
             layer.scheme = self.get_linear_scheme(layer)
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
-                return None
             layer.scheme = self.get_moe_scheme(layer)
             return AWQMoEMethod(self)
         return None

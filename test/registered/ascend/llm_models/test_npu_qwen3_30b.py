@@ -28,7 +28,7 @@ class TestQwen330B(GSM8KAscendMixin, CustomTestCase):
         "--attention-backend",
         "ascend",
         "--disable-cuda-graph",
-        "--cuda-graph-max-bs-decode",
+        "--cuda-graph-max-bs",
         32,
         "--tp-size",
         2,

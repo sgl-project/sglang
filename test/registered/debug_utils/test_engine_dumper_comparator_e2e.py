@@ -90,7 +90,10 @@ patches:
               hidden_states, residual, forward_batch
           )
         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"
-      - match: "hidden_states = self.mlp(hidden_states, forward_batch)"
+      - match: |
+          hidden_states = self.mlp(
+              hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+          )
         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
 
   # --- attention internals ---
@@ -147,7 +150,10 @@ patches:
               hidden_states, residual, forward_batch
           )
         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"
-      - match: "hidden_states = self.mlp(hidden_states, forward_batch)"
+      - match: |
+          hidden_states = self.mlp(
+              hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+          )
         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
 
   # --- attention internals ---
@@ -319,7 +325,7 @@ def _run_server_and_generate(
         "--mem-fraction-static",
         "0.5",
         "--disable-cuda-graph",
-        "--cuda-graph-backend-prefill=disabled",
+        "--disable-piecewise-cuda-graph",
         "--disable-radix-cache",
     ]
     if extra_server_args:

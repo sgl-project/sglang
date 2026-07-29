@@ -84,7 +84,7 @@ class KVCacheEventMixin:
                 page_index += 1
 
     def _record_remove_event(self, node: Any, medium=None):
-        # One BlockRemoved per radix node.
+        # One BlockRemoved per chunk.
         # ``medium`` defaults to StorageMedium.GPU but callers may override for
         # lower-tier removals (e.g. StorageMedium.CPU when evicting from host).
         if self.enable_kv_cache_events:
@@ -95,21 +95,20 @@ class KVCacheEventMixin:
             if node.hash_value is None:
                 node.hash_value = compute_node_hash_values(node, self.page_size)
 
-            block_hashes = []
-            logical_len = len(node.key)
             page_index = 0
+            logical_len = len(node.key)
             for start in range(0, logical_len, self.page_size):
                 end = min(start + self.page_size, logical_len)
                 if end <= start:
                     continue
 
-                block_hashes.append(hash_str_to_int64(node.hash_value[page_index]))
-                page_index += 1
+                block_hash = hash_str_to_int64(node.hash_value[page_index])
 
-            if block_hashes:
                 self.kv_event_queue.append(
-                    BlockRemoved(block_hashes=block_hashes, medium=medium)
+                    BlockRemoved(block_hashes=[block_hash], medium=medium)
                 )
+
+                page_index += 1
 
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:

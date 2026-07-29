@@ -132,7 +132,6 @@ async fn static_urls_pd_role_resolved_end_to_end() {
             policy: sgl_router::config::PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
-            sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![url.clone()],

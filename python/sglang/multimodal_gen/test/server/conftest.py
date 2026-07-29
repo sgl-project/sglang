@@ -1,4 +1,3 @@
-import json
 import os
 
 import pytest
@@ -42,6 +41,8 @@ def _write_github_step_summary(content: str):
 
 def _write_results_json(results: list, output_path: str = "diffusion-results.json"):
     """Write performance results to JSON file for CI artifact collection."""
+    import json
+
     try:
         with open(output_path, "w") as f:
             json.dump(results, f, indent=2)
@@ -106,8 +107,6 @@ def pytest_sessionfinish(session):
         print("[DEBUG] No results collected, skipping summary output")
         return
 
-    sorted_results = sorted(results, key=lambda x: (x["class_name"], x["test_name"]))
-
     # Print to stdout (existing behavior)
     print("\n\n" + "=" * 35 + " Performance Summary " + "=" * 35)
     print(
@@ -125,7 +124,7 @@ def pytest_sessionfinish(session):
         + "-" * 20
     )
 
-    for entry in sorted_results:
+    for entry in sorted(results, key=lambda x: x["class_name"]):
         print(
             f"{entry['class_name']:<30} | {entry['test_name']:<20} | {entry['e2e_ms']:>12.2f} | "
             f"{entry['avg_denoise_ms']:>18.2f} | {entry['median_denoise_ms']:>20.2f}"
@@ -134,7 +133,7 @@ def pytest_sessionfinish(session):
     print("=" * 91)
 
     print("\n\n" + "=" * 36 + " Detailed Reports " + "=" * 37)
-    for entry in sorted_results:
+    for entry in sorted(results, key=lambda x: x["class_name"]):
         print(f"\n--- Details for {entry['class_name']} / {entry['test_name']} ---")
         stage_report = ", ".join(
             f"{name}:{duration:.2f}ms"
@@ -152,14 +151,10 @@ def pytest_sessionfinish(session):
             print(f"    Sampled Steps: {step_report}")
     print("=" * 91)
 
-    print("\n\n" + "=" * 34 + " Performance Data JSON " + "=" * 34)
-    print(json.dumps(sorted_results, indent=2, sort_keys=True))
-    print("=" * 91)
-
     # Write to GitHub Step Summary (new behavior for CI monitoring)
-    markdown_report = _generate_diffusion_markdown_report(sorted_results)
+    markdown_report = _generate_diffusion_markdown_report(results)
     if markdown_report:
         _write_github_step_summary(markdown_report)
 
     # Write results to JSON file for CI artifact collection
-    _write_results_json(sorted_results)
+    _write_results_json(results)

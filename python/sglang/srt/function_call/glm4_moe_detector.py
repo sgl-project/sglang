@@ -1,3 +1,4 @@
+import ast
 import json
 import logging
 import re
@@ -11,10 +12,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import (
-    infer_type_from_json_schema,
-    safe_literal_eval,
-)
+from sglang.srt.function_call.utils import infer_type_from_json_schema
 
 logger = logging.getLogger(__name__)
 
@@ -118,21 +116,9 @@ def parse_arguments(
     except (json.JSONDecodeError, ValueError, KeyError):
         pass
 
-    # Strategy 2.5: string-typed values that are not valid JSON (S1/S2 failed) —
-    # strip the wrapping quotes and keep the raw bytes, backslashes included.
-    # Avoids ast.literal_eval so invalid escapes neither warn nor get reinterpreted.
-    if arg_type == "string":
-        if (
-            len(json_value) >= 2
-            and json_value[0] == json_value[-1]
-            and json_value[0] in {'"', "'"}
-        ):
-            return json_value[1:-1], True
-        return json_value, True
-
     # Strategy 3: ast.literal_eval
     try:
-        parsed_value = safe_literal_eval(json_value)
+        parsed_value = ast.literal_eval(json_value)
         return parsed_value, True
     except (ValueError, SyntaxError):
         pass

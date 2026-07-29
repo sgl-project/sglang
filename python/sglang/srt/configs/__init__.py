@@ -9,12 +9,6 @@ from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
-from sglang.srt.configs.inkling import (
-    InklingAudioConfig,
-    InklingMMConfig,
-    InklingModelConfig,
-    InklingVisionConfig,
-)
 from sglang.srt.configs.interns2preview import InternS2PreviewConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
@@ -27,22 +21,15 @@ from sglang.srt.configs.laguna import LagunaConfig
 from sglang.srt.configs.lfm2 import Lfm2Config
 from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
 from sglang.srt.configs.lfm2_vl import Lfm2VlConfig
-from sglang.srt.configs.locate_anything import LocateAnythingConfig
 from sglang.srt.configs.longcat_flash import LongcatFlashConfig
 from sglang.srt.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
-from sglang.srt.configs.minimax_vl import MiniMaxM3VLConfig
 from sglang.srt.configs.nano_nemotron_vl import (
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
 )
 from sglang.srt.configs.nemotron_h import NemotronHConfig, NemotronHPuzzleConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
-from sglang.srt.configs.qwen3_5 import (
-    Qwen3_5Config,
-    Qwen3_5MoeConfig,
-    Qwen3_5MoeTextConfig,
-    Qwen3_5TextConfig,
-)
+from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
 from sglang.srt.configs.qwen3_asr import Qwen3ASRConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.step3_vl import (
@@ -52,8 +39,6 @@ from sglang.srt.configs.step3_vl import (
 )
 from sglang.srt.configs.step3p5 import Step3p5Config
 from sglang.srt.configs.step3p7 import Step3p7Config
-from sglang.srt.configs.unlimited_ocr import UnlimitedVLConfig
-from sglang.srt.configs.zaya import ZayaConfig
 
 __all__ = [
     "AfmoeConfig",
@@ -76,8 +61,6 @@ __all__ = [
     "Qwen3NextConfig",
     "Qwen3_5Config",
     "Qwen3_5MoeConfig",
-    "Qwen3_5TextConfig",
-    "Qwen3_5MoeTextConfig",
     "InternS2PreviewConfig",
     "DotsVLMConfig",
     "DotsOCRConfig",
@@ -86,7 +69,6 @@ __all__ = [
     "Lfm2Config",
     "Lfm2MoeConfig",
     "Lfm2VlConfig",
-    "LocateAnythingConfig",
     "MiniCPMV4_6Config",
     "MiniCPMV4_6VisionConfig",
     "NemotronHConfig",
@@ -96,13 +78,6 @@ __all__ = [
     "JetNemotronConfig",
     "JetVLMConfig",
     "Step3p5Config",
-    "MiniMaxM3VLConfig",
     "Step3p7Config",
     "Qwen3ASRConfig",
-    "InklingAudioConfig",
-    "InklingMMConfig",
-    "InklingModelConfig",
-    "InklingVisionConfig",
-    "UnlimitedVLConfig",
-    "ZayaConfig",
 ]

@@ -5,17 +5,17 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels.ops.kv_canary.consts import (
+from sglang.jit_kernel.kv_canary.consts import (
     RealKvHashMode,
 )
-from sglang.kernels.ops.kv_canary.verify import (
+from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvSource,
     VerifyOrWriteContext,
     VerifyPlan,
     launch_canary_verify_kernel,
 )
-from sglang.kernels.ops.kv_canary.write import (
+from sglang.jit_kernel.kv_canary.write import (
     WritePlan,
     launch_canary_write_kernel,
 )

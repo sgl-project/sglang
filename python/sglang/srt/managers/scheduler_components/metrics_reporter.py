@@ -88,7 +88,7 @@ class PrefillStats:
 
 @dataclass(kw_only=True)
 class SchedulerMetricsReporter:
-    scheduler: Scheduler
+    scheduler: "Scheduler"
     tp_rank: int
     pp_rank: int
     dp_rank: Optional[int]
@@ -139,15 +139,12 @@ class SchedulerMetricsReporter:
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0  # lifetime
         self.spec_total_num_forward_ct = 0
-        self.spec_num_block_accept_tokens = 0
-        self.spec_num_cap_tokens = 0
 
         # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
 
         self.enable_mfu_metrics = False
-        self.decode_log_interval = self.scheduler.server_args.decode_log_interval
 
         if self.enable_metrics:
             self.enable_mfu_metrics = self.scheduler.server_args.enable_mfu_metrics
@@ -218,10 +215,7 @@ class SchedulerMetricsReporter:
             if base_endpoint is None:
                 ipc_path = tempfile.NamedTemporaryFile(delete=False).name
                 base_endpoint = f"ipc://{ipc_path}"
-                self.scheduler.server_args.override(
-                    "metrics_reporter.ipc_endpoint",
-                    forward_pass_metrics_ipc_name=base_endpoint,
-                )
+                self.scheduler.server_args.forward_pass_metrics_ipc_name = base_endpoint
             endpoint = f"{base_endpoint}.{self.scheduler._fpm_dp_rank}"
             self.scheduler._fpm_publisher = _FpmPublisherThread(
                 endpoint,
@@ -304,8 +298,6 @@ class SchedulerMetricsReporter:
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in self.scheduler.disagg_prefill_bootstrap_queue.queue:
                 prefill_q.add(len(req.origin_input_ids))
-            for req in self.scheduler.waiting_queue:
-                prefill_q.add(len(req.origin_input_ids))
         elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             for req in self.scheduler.disagg_decode_prealloc_queue.queue:
                 decode_q.add(req.seqlen)
@@ -352,17 +344,9 @@ class SchedulerMetricsReporter:
             "num_draft_tokens": num_draft_tokens or 0,
         }
 
-    def update_spec_metrics(
-        self,
-        bs: int,
-        num_correct_drafts: int,
-        num_block_accept_tokens: int = 0,
-        num_cap_tokens: int = 0,
-    ):
+    def update_spec_metrics(self, bs: int, num_correct_drafts: int):
         self.spec_num_accept_tokens += num_correct_drafts + bs
         self.spec_num_forward_ct += bs
-        self.spec_num_block_accept_tokens += num_block_accept_tokens
-        self.spec_num_cap_tokens += num_cap_tokens
 
         # Bonus tokens updated elsewhere
         self.num_generated_tokens += num_correct_drafts
@@ -451,10 +435,8 @@ class SchedulerMetricsReporter:
             num_attn_heads * head_dim * act_bytes * num_layers
         )
 
-    def _estimate_prefill_perf(self, batch) -> Tuple[float, float, float]:
-        if batch is None or batch.extend_lens is None:
-            return 0.0, 0.0, 0.0
-        tokens = max(0, int(sum(batch.extend_lens)))
+    def _estimate_prefill_perf(self, num_tokens: int) -> Tuple[float, float, float]:
+        tokens = max(0, int(num_tokens))
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
@@ -502,19 +484,6 @@ class SchedulerMetricsReporter:
         )
         return flops, read_bytes, write_bytes
 
-    def _prefill_sol_suffix(self, batch, elapsed_s: float) -> str:
-        """Hook: model-specific speed-of-light % suffix for the prefill log line.
-        ``batch`` carries the per-request extend/prefix lengths a subclass needs
-        for an exact attention pair-count. No model arch here, so returns "";
-        a subclass may override it."""
-        return ""
-
-    def _decode_sol_suffix(self, batch, elapsed_s: float) -> str:
-        """Hook: model-specific speed-of-light % suffix for the decode log line.
-        ``elapsed_s`` is per-iteration. No model arch here, so returns "";
-        a subclass may override it."""
-        return ""
-
     def reset_metrics(self):
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
@@ -522,8 +491,6 @@ class SchedulerMetricsReporter:
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0
         self.spec_total_num_forward_ct = 0
-        self.spec_num_block_accept_tokens = 0
-        self.spec_num_cap_tokens = 0
 
     def report_prefill_stats(
         self,
@@ -572,8 +539,6 @@ class SchedulerMetricsReporter:
             msg += (
                 f"#inflight-req: {len(self.scheduler.disagg_prefill_inflight_queue)}, "
             )
-            num_optimistic = sum(1 for r in batch.reqs if r.pending_bootstrap)
-            msg += f"#optimistic-req: {num_optimistic}, "
 
         if (
             self.scheduler.server_args.language_only
@@ -588,18 +553,9 @@ class SchedulerMetricsReporter:
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
         if self.enable_mfu_metrics and gap_latency > 0:
-            # Prefer the SoL suffix when it carries content: it scores FLOPs against
-            # each forward's actual GPU span (device timer). The wall-clock est.
-            # TFLOPS below divides FLOPs by gap_latency -- the inter-log interval on
-            # the async scheduler loop, which is decoupled from this forward's
-            # execution -- so it disagrees with the SoL. Omit it when SoL is present.
-            sol_suffix = self._prefill_sol_suffix(batch, gap_latency)
-            if sol_suffix:
-                msg += sol_suffix
-            else:
-                flops, _, _ = self._estimate_prefill_perf(batch)
-                tflops_per_s = flops / gap_latency / 1e12
-                msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
+            flops, _, _ = self._estimate_prefill_perf(prefill_stats.log_input_tokens)
+            tflops_per_s = flops / gap_latency / 1e12
+            msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
 
         if ENABLE_METRICS_DEVICE_TIMER:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
@@ -616,7 +572,9 @@ class SchedulerMetricsReporter:
                 dp_cooperation_info=dp_cooperation_info,
             )
             if self.enable_mfu_metrics:
-                flops, read_bytes, write_bytes = self._estimate_prefill_perf(batch)
+                flops, read_bytes, write_bytes = self._estimate_prefill_perf(
+                    prefill_stats.log_input_tokens
+                )
                 self.metrics_collector.increment_estimated_perf(
                     num_flops_per_gpu=flops,
                     num_read_bytes_per_gpu=read_bytes,
@@ -637,17 +595,7 @@ class SchedulerMetricsReporter:
             )
 
             # Basics
-            if (
-                self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL
-                and batch is not None
-            ):
-                # running_batch is never populated in PD prefill, so count the
-                # current forward batch instead.
-                self.stats.num_running_reqs = QueueCount.from_reqs(
-                    batch.reqs, priority_enabled
-                )
-            else:
-                self.stats.num_running_reqs = prefill_stats.num_running_reqs
+            self.stats.num_running_reqs = prefill_stats.num_running_reqs
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.waiting_queue, priority_enabled
             )
@@ -723,7 +671,7 @@ class SchedulerMetricsReporter:
                 x.maybe_dump(batch, self.scheduler.waiting_queue)
 
         # Periodic work: log + heavy metrics at decode_log_interval
-        if self.forward_ct_decode % self.decode_log_interval != 0:
+        if self.forward_ct_decode % self.scheduler.server_args.decode_log_interval != 0:
             return
         if (
             not self.is_stats_logging_rank
@@ -743,7 +691,7 @@ class SchedulerMetricsReporter:
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(
-                gap_latency / self.decode_log_interval
+                gap_latency / self.scheduler.server_args.decode_log_interval
             )
 
         batch_iter = (
@@ -759,8 +707,6 @@ class SchedulerMetricsReporter:
         if self.scheduler.spec_algorithm.is_none():
             spec_accept_length = 0
             spec_accept_rate = 0
-            spec_cap_length = 0
-            spec_block_accept_length = 0
         else:
             spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
             num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
@@ -774,38 +720,10 @@ class SchedulerMetricsReporter:
             spec_accept_rate = (
                 num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
             )
-            spec_cap_length = (
-                self.spec_num_cap_tokens / self.spec_num_forward_ct
-                if self.spec_num_forward_ct > 0
-                else 0
-            )
-            from sglang.srt.speculative.ragged_verify import (
-                RaggedVerifyMode,
-                read_ragged_verify_mode,
-            )
-
-            spec_block_accept_length = (
-                self.spec_num_block_accept_tokens / self.spec_num_forward_ct
-                if self.spec_num_forward_ct > 0
-                and read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT
-                else 0
-            )
             self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
-            self.spec_num_block_accept_tokens = 0
-            self.spec_num_cap_tokens = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
-            if spec_cap_length > 0:
-                msg += f"cap len: {spec_cap_length:.2f}, "
-            if spec_block_accept_length > 0:
-                msg += f"block accept len: {spec_block_accept_length:.2f}, "
-            if self.scheduler.spec_algorithm.is_dspark():
-                draft_worker = self.scheduler.draft_worker
-                if draft_worker is not None:
-                    estimate_suffix = draft_worker.block_accept_estimate_log_suffix()
-                    if estimate_suffix:
-                        msg += f"{estimate_suffix}, "
 
             if self.current_scheduler_metrics_enabled:
                 spec_snapshot = self._active_spec_config_snapshot()
@@ -847,10 +765,6 @@ class SchedulerMetricsReporter:
                 f"est. read BW (GB/s per GPU): {read_gb_per_s:.2f}, "
                 f"est. write BW (GB/s per GPU): {write_gb_per_s:.2f}"
             )
-            msg += self._decode_sol_suffix(
-                batch,
-                gap_latency / max(1, self.decode_log_interval),
-            )
             self._mfu_log_flops = 0.0
             self._mfu_log_read_bytes = 0.0
             self._mfu_log_write_bytes = 0.0
@@ -881,8 +795,6 @@ class SchedulerMetricsReporter:
             # Speculative decoding
             self.stats.spec_accept_length = spec_accept_length
             self.stats.spec_accept_rate = spec_accept_rate
-            self.stats.spec_cap_length = spec_cap_length
-            self.stats.spec_block_accept_length = spec_block_accept_length
             self.stats.spec_num_steps = spec_num_steps
             self.stats.spec_num_draft_tokens = spec_num_draft_tokens
 
@@ -1078,21 +990,22 @@ class SchedulerMetricsReporter:
         self.forward_pass_device_timer._report()
         now = time.perf_counter()
         if self._device_timer_window_batch_count == 0:
-            # Window start: keep the last published value instead of NaN-ing
-            # the gauge. Readers sample it asynchronously, and the window
-            # boundary can phase-lock with the decode-log cadence, turning a
-            # one-tick NaN into NaN on every log line. NaN is published only
-            # when truly stale (reset_device_timer_window after idle).
             self._device_timer_window_start = now
             self._device_timer_window_gpu_time = 0.0
+            cpu_time = 0
+            self.fwd_occupancy = float("nan")
         else:
             cpu_time = now - self._device_timer_window_start
-            if cpu_time > 0:
-                self.fwd_occupancy = min(
-                    self._device_timer_window_gpu_time / cpu_time * 100, 100
-                )
+            self.fwd_occupancy = min(
+                self._device_timer_window_gpu_time / cpu_time * 100, 100
+            )
+        # ratio = self._device_timer_window_gpu_time / cpu_time if cpu_time > 0 else float("nan")
+        # print(f"{self._device_timer_window_batch_count=} {self.fwd_occupancy=}, {self._device_timer_window_gpu_time=}, {cpu_time=}, {ratio=}")
         self._device_timer_window_batch_count += 1
-        if self._device_timer_window_batch_count >= self.decode_log_interval:
+        if (
+            self._device_timer_window_batch_count
+            >= self.scheduler.server_args.decode_log_interval
+        ):
             self._device_timer_window_batch_count = 0
 
     def reset_device_timer_window(self):
@@ -1102,18 +1015,9 @@ class SchedulerMetricsReporter:
 
     def _maybe_log_idle_metrics(self):
         """Collect and log metrics every 30 seconds during idle."""
-        if not self.current_scheduler_metrics_enabled:
-            return
-        # The running-reqs gauge holds the last batch report until the next
-        # one (on PD prefill that is the last forward-batch snapshot, which
-        # no later report zeroes). If it disagrees with running_batch -- the
-        # true idle value -- publish now instead of waiting out the window.
-        gauge_stale = self.stats.num_running_reqs.total != len(
-            self.scheduler.running_batch.reqs
-        )
         if (
-            not gauge_stale
-            and time.perf_counter() <= self.metrics_collector.last_log_time + 30
+            not self.current_scheduler_metrics_enabled
+            or time.perf_counter() <= self.metrics_collector.last_log_time + 30
         ):
             return
 

@@ -14,7 +14,10 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
+from sglang.multimodal_gen.runtime.entrypoints.openai import (
+    image_api,
+    video_api,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
 )
@@ -30,13 +33,12 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
-from sglang.multimodal_gen.runtime.entrypoints.vla import api as vla_api
-from sglang.multimodal_gen.runtime.entrypoints.vla import openpi
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.server_warmup import (
-    run_async_client_warmup,
-    should_run_synthetic_server_warmup,
+    build_warmup_reqs,
+    prepare_warmup_image_path,
+    should_include_warmup_image,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils.json_response import orjson_response
@@ -59,11 +61,7 @@ SERVER_WARMUP_BYPASS_PATHS = (
 async def _wait_until_http_ready(server_args: ServerArgs) -> None:
     """for server warmup"""
     health_url = f"{server_args.url()}/health"
-    # Probe the local server directly: a loopback readiness check must never be
-    # routed through an HTTP proxy. trust_env=False also avoids crashing startup
-    # on a malformed proxy env var, since httpx parses *_PROXY/NO_PROXY when the
-    # client is constructed (raising httpx.InvalidURL before any request). See #28493.
-    async with httpx.AsyncClient(trust_env=False) as client:
+    async with httpx.AsyncClient() as client:
         for _ in range(120):
             try:
                 response = await client.get(health_url, timeout=5.0)
@@ -79,17 +77,33 @@ async def _run_server_warmup_after_http_ready(
     server_args: ServerArgs, warmup_done: asyncio.Event
 ) -> None:
     try:
-        if not should_run_synthetic_server_warmup(server_args):
+        if (
+            not server_args.warmup
+            or not server_args.server_warmup
+            or server_args.warmup_resolutions is not None
+        ):
             warmup_done.set()
             return
 
         await _wait_until_http_ready(server_args)
 
-        await run_async_client_warmup(
+        warmup_input_path = None
+        if should_include_warmup_image(server_args, server_based_warmup=True):
+            warmup_input_path = await prepare_warmup_image_path(server_args)
+
+        warmup_reqs = build_warmup_reqs(
             server_args,
-            async_scheduler_client.forward,
-            fail_open=server_args.warmup_resolutions is None,
+            warmup_resolutions=None,
+            warmup_input_path=warmup_input_path,
+            return_warmup_result=True,
+            server_based_warmup=True,
+            use_model_sampling_defaults=True,
         )
+        for req in warmup_reqs:
+            response = await async_scheduler_client.forward(req)
+            if response.error is not None:
+                raise RuntimeError(response.error)
+
         logger.info("The server is fired up and ready to roll!")
         warmup_done.set()
     except asyncio.CancelledError:
@@ -402,9 +416,6 @@ def create_app(server_args: ServerArgs):
     app.include_router(image_api.router)
     app.include_router(video_api.router)
     app.include_router(realtime_video_api.router)
-    if server_args.pipeline_config.task_type.is_action_gen():
-        app.include_router(vla_api.router)
-        app.include_router(openpi.router)
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)

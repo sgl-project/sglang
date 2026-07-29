@@ -1,3 +1,4 @@
+import ast
 import json
 import logging
 import re
@@ -10,7 +11,6 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import safe_literal_eval
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ def parse_arguments(value: str) -> tuple[Any, bool]:
         try:
             parsed_value = json.loads(value)
         except:
-            parsed_value = safe_literal_eval(value)
+            parsed_value = ast.literal_eval(value)
         return parsed_value, True
     except:
         return value, False

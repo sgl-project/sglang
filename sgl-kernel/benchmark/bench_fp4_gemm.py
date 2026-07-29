@@ -6,13 +6,14 @@ from typing import List, Tuple
 
 import torch
 import triton
-from flashinfer import fp4_quantize, mm_fp4
+from flashinfer import mm_fp4
 from flashinfer.autotuner import autotune
 from flashinfer.jit.core import logger as flashinfer_logger
 from flashinfer.testing import bench_gpu_time
 
 flashinfer_logger.setLevel(logging.ERROR)
 
+from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm, scaled_fp4_quant
 from sglang.srt.utils import (
     get_device_capability,
     is_sm100_supported,
@@ -153,12 +154,13 @@ def _run_mm_fp4(a_fp4, b_fp4_T, a_sf, b_sf_T, alpha, dtype, res_fi, backend):
         x_log=False,
         line_arg="provider",
         line_vals=(
-            ["cutlass", "cudnn", "trtllm", "cute-dsl", "auto"]
+            ["sglang_cutlass", "cutlass", "cudnn", "trtllm", "cute-dsl", "auto"]
             if is_sm100_supported()
-            else ["cutlass", "cudnn", "cute-dsl", "auto"]
+            else ["sglang_cutlass", "cutlass", "cudnn", "cute-dsl", "auto"]
         ),
         line_names=(
             [
+                "sglang cutlass fp4",
                 "flashinfer cutlass fp4",
                 "cudnn fp4",
                 "trtllm fp4",
@@ -167,6 +169,7 @@ def _run_mm_fp4(a_fp4, b_fp4_T, a_sf, b_sf_T, alpha, dtype, res_fi, backend):
             ]
             if is_sm100_supported()
             else [
+                "sglang cutlass fp4",
                 "flashinfer cutlass fp4",
                 "cudnn fp4",
                 "cute-dsl fp4",
@@ -175,6 +178,7 @@ def _run_mm_fp4(a_fp4, b_fp4_T, a_sf, b_sf_T, alpha, dtype, res_fi, backend):
         ),
         styles=(
             [
+                ("red", "solid"),
                 ("orange", "solid"),
                 ("blue", "solid"),
                 ("green", "solid"),
@@ -183,6 +187,7 @@ def _run_mm_fp4(a_fp4, b_fp4_T, a_sf, b_sf_T, alpha, dtype, res_fi, backend):
             ]
             if is_sm100_supported()
             else [
+                ("red", "solid"),
                 ("orange", "solid"),
                 ("blue", "solid"),
                 ("brown", "solid"),
@@ -207,19 +212,26 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
         (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.amax(b_dtype.flatten(), dim=-1)
     ).to(torch.float32)
     alpha = 1.0 / (a_global_scale * b_global_scale)
-    a_fp4, a_scale_interleaved = fp4_quantize(a_dtype, a_global_scale)
-    b_fp4, b_scale_interleaved = fp4_quantize(b_dtype, b_global_scale)
-    # flashinfer.fp4_quantize returns scale factors as uint8 (e4m3fn bits stored
-    # in uint8 memory); the JIT cutlass kernel requires float8_e4m3fn dtype.
-    if a_scale_interleaved.dtype != torch.float8_e4m3fn:
-        a_scale_interleaved = a_scale_interleaved.view(torch.float8_e4m3fn)
-    if b_scale_interleaved.dtype != torch.float8_e4m3fn:
-        b_scale_interleaved = b_scale_interleaved.view(torch.float8_e4m3fn)
+    a_fp4, a_scale_interleaved = scaled_fp4_quant(a_dtype, a_global_scale)
+    b_fp4, b_scale_interleaved = scaled_fp4_quant(b_dtype, b_global_scale)
     b_fp4_T = b_fp4.T
     b_sf_T = b_scale_interleaved.T
     res_fi = torch.empty((M, N), dtype=dtype, device="cuda")
 
-    if provider == "cutlass":
+    if provider == "sglang_cutlass":
+        times_ms = bench_gpu_time(
+            fn=cutlass_scaled_fp4_mm,
+            input_args=(
+                a_fp4,
+                b_fp4,
+                a_scale_interleaved,
+                b_scale_interleaved,
+                alpha,
+                dtype,
+            ),
+            use_cuda_graph=True,
+        )
+    elif provider == "cutlass":
         with autotune():
             _run_mm_fp4(
                 a_fp4,
@@ -347,16 +359,8 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
     bandwidth_gbs = total_bytes / (ms * 1e-3) / 1e9
 
     if correctness:
-        res_cutlass = torch.empty((M, N), dtype=dtype, device="cuda")
-        mm_fp4(
-            a_fp4,
-            b_fp4_T,
-            a_scale_interleaved,
-            b_sf_T,
-            alpha,
-            dtype,
-            res_cutlass,
-            backend="cutlass",
+        res_cutlass = cutlass_scaled_fp4_mm(
+            a_fp4, b_fp4, a_scale_interleaved, b_scale_interleaved, alpha, dtype
         )
         mm_fp4(
             a_fp4,

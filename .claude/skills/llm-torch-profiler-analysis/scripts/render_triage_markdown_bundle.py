@@ -12,10 +12,9 @@ FRAMEWORK_LABELS = {
     "sglang": "SGLang",
     "vllm": "vLLM",
     "trtllm": "TensorRT-LLM",
-    "tokenspeed": "TokenSpeed",
 }
 
-FRAMEWORK_ORDER = {"sglang": 0, "vllm": 1, "trtllm": 2, "tokenspeed": 3}
+FRAMEWORK_ORDER = {"sglang": 0, "vllm": 1, "trtllm": 2}
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -76,8 +75,6 @@ def framework_key_from_path(path: Path) -> str:
         return "vllm"
     if "trtllm" in lowered or "tensorrt" in lowered:
         return "trtllm"
-    if "tokenspeed" in lowered or "token-speed" in lowered:
-        return "tokenspeed"
     return "other"
 
 

@@ -49,7 +49,6 @@ class MockModelRunner:
             },
         )
         self.kv_cache_dtype = self.server_args.kv_cache_dtype
-        self.kv_cache_dtype_str = "auto"
 
         batch_size = 160
         # Create a proper req_to_token_pool with the req_to_token attribute
@@ -191,11 +190,15 @@ class TestFlashAttentionMLABackend(CustomTestCase):
                 extend_prefix_lens=torch.tensor(
                     [prefix_len] * self.batch_size, device=self.device
                 ),
-                extend_prefix_lens_cpu=[prefix_len] * self.batch_size,
+                extend_prefix_lens_cpu=torch.tensor(
+                    [prefix_len] * self.batch_size, device="cpu"
+                ),
                 extend_seq_lens=torch.tensor(
                     [q_len] * self.batch_size, device=self.device
                 ),
-                extend_seq_lens_cpu=[q_len] * self.batch_size,
+                extend_seq_lens_cpu=torch.tensor(
+                    [q_len] * self.batch_size, device="cpu"
+                ),
             )
 
         else:  # ForwardMode.DECODE

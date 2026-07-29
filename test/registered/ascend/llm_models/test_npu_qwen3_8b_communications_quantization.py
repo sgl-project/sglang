@@ -25,7 +25,7 @@ class TestQwen38BCommQuantization(GSM8KAscendMixin, CustomTestCase):
         32,
         "--attention-backend",
         "ascend",
-        "--cuda-graph-max-bs-decode",
+        "--cuda-graph-max-bs",
         32,
         "--tp-size",
         2,

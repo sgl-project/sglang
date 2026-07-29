@@ -1,3 +1,4 @@
+import ast
 import json
 import logging
 import re
@@ -9,7 +10,6 @@ from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import safe_literal_eval
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ def parse_arguments(json_value):
         try:
             parsed_value = json.loads(json_value)
         except (json.JSONDecodeError, TypeError):
-            parsed_value = safe_literal_eval(json_value)
+            parsed_value = ast.literal_eval(json_value)
         return parsed_value, True
     except (ValueError, SyntaxError, TypeError):
         return json_value, False

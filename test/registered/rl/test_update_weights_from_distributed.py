@@ -315,7 +315,7 @@ def init_process_sgl(
             model_path=model_name,
             base_gpu_id=base_gpu_id,
             tp_size=tp_size,
-            cuda_graph_max_bs_decode=2,
+            cuda_graph_max_bs=2,
         )
     else:
         if rank == 1:
@@ -334,7 +334,7 @@ def init_process_sgl(
                 str(base_gpu_id),
                 "--tp-size",
                 str(tp_size),
-                "--cuda-graph-max-bs-decode",
+                "--cuda-graph-max-bs",
                 2,
             ),
         )
@@ -396,8 +396,7 @@ def init_process_sgl(
             return response.json()
 
         with ThreadPoolExecutor(32) as executor:
-            for _ in range(32):
-                executor.submit(run_decode, 1000)
+            futures = [executor.submit(run_decode, 1000) for _ in range(32)]
             time.sleep(2)
 
     # The last parameter is lm_head.weight, which is tied
@@ -574,7 +573,7 @@ def test_update_weights_from_distributed(
         try:
             key, value = param_queue.get(timeout=5)
             results[key] = value
-        except Exception:
+        except Exception as e:
             if all(not p.is_alive() for p in context.processes):
                 break
 

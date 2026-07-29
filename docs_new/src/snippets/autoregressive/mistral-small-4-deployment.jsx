@@ -82,10 +82,6 @@ export const MistralSmall4Deployment = () => {
       }
     });
 
-    if (hardware === 'b300') {
-      cmd += ` \\\n  --attention-backend flashinfer`;
-    }
-
     return cmd;
   };
 

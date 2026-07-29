@@ -45,7 +45,7 @@ class TestSessionControl(CustomTestCase):
                 "--attention-backend",
                 "triton",
                 "--disable-cuda-graph",
-                "--cuda-graph-backend-prefill=disabled",
+                "--disable-piecewise-cuda-graph",
             ],
         )
 

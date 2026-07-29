@@ -1,7 +1,6 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -70,13 +69,12 @@ class TestNvidiaNemotron3SuperNVFP4(CustomTestCase):
     def setUpClass(cls):
         cls.model = NEMOTRON_3_SUPER_NVFP4_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(0):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=NEMOTRON_3_SUPER_NVFP4_ARGS,
-            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=NEMOTRON_3_SUPER_NVFP4_ARGS,
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -91,13 +89,12 @@ class TestNvidiaNemotron3SuperNVFP4MTP(CustomTestCase):
     def setUpClass(cls):
         cls.model = NEMOTRON_3_SUPER_NVFP4_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(0):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=NEMOTRON_3_SUPER_NVFP4_ARGS + MTP_ARGS,
-            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=NEMOTRON_3_SUPER_NVFP4_ARGS + MTP_ARGS,
+        )
 
     @classmethod
     def tearDownClass(cls):

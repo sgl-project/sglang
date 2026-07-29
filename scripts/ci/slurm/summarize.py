@@ -113,13 +113,7 @@ def main():
         for r in results
     ]
 
-    hw_label = "/".join(sorted({r["hw"].upper() for r in results}))
-    if hw_label == "GB200":
-        # NVIDIA GB200 nightly: keep the original hardcoded title untouched.
-        print("## GB200 Nightly Benchmark Results\n")
-    else:
-        # AMD (e.g. MI355X) nightly: derive the title from the result hardware.
-        print(f"## {hw_label} Nightly Benchmark Results\n")
+    print("## GB200 Nightly Benchmark Results\n")
     print(tabulate(rows, headers=HEADERS, tablefmt="github"))
     print()
 

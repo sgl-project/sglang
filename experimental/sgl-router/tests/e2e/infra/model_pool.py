@@ -26,12 +26,23 @@ import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 
 from .model_specs import get_model_spec
 
 logger = logging.getLogger(__name__)
+
+# Passthrough Jinja chat template that emits ONLY `messages[*].content`
+# joined with `\n` — matching the router's cache_aware_zmq prompt
+# extraction. A worker launched with
+# ``--chat-template <PASSTHROUGH_CHAT_TEMPLATE_PATH>`` tokenizes the
+# raw content string, so its KV-block hashes align with what the
+# router computes from the same chat-completions request. Test-only.
+PASSTHROUGH_CHAT_TEMPLATE_PATH = str(
+    Path(__file__).parent / "passthrough_chat_template.jinja"
+)
 
 
 def _get_open_port() -> int:

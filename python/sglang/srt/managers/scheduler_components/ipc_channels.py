@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import Optional
 
 import zmq
 
@@ -7,15 +7,10 @@ from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.server_args import PortArgs
 from sglang.srt.utils.network import get_zmq_socket
 
-if TYPE_CHECKING:
-    from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
-        ScriptedTokenizerRecvProxy,
-    )
-
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SchedulerIpcChannels:
-    recv_from_tokenizer: Union[zmq.Socket, "ScriptedTokenizerRecvProxy"]
+    recv_from_tokenizer: Optional[zmq.Socket]
     recv_from_rpc: Optional[zmq.Socket]
     send_to_tokenizer: SenderWrapper
     send_to_detokenizer: SenderWrapper
@@ -29,7 +24,6 @@ class SchedulerIpcChannels:
         is_rank_zero: bool,
         skip_tokenizer_init: bool,
         metrics_enabled: bool,
-        enable_scripted_runtime: bool,
     ) -> "SchedulerIpcChannels":
         context = zmq.Context(2)
 
@@ -37,14 +31,6 @@ class SchedulerIpcChannels:
             recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
-            if enable_scripted_runtime:
-                from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
-                    ScriptedTokenizerRecvProxy,
-                )
-
-                recv_from_tokenizer = ScriptedTokenizerRecvProxy(
-                    underlying=recv_from_tokenizer
-                )
             recv_from_rpc = get_zmq_socket(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False
             )
@@ -53,8 +39,7 @@ class SchedulerIpcChannels:
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
             if skip_tokenizer_init:
-                # No decode work: send outputs straight to the tokenizer side
-                # (MultiTokenizerRouter fans out when tokenizer_worker_num > 1).
+                # Directly send to the TokenizerManager
                 send_to_detokenizer_raw = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                 )

@@ -8,7 +8,6 @@ Requires: torch, sglang (run in an environment with sglang installed)
 """
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -17,11 +16,9 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.kv_events import OffloadedState
-from sglang.srt.managers.cache_controller import HiCacheAck
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 
 
 def _make_mock_req(
@@ -36,9 +33,23 @@ def _make_mock_req(
     req.rid = rid
     req.req_pool_idx = req_pool_idx
     req.kv_committed_len = kv_committed_len
-    req.kv = SimpleNamespace(kv_allocated_len=kv_allocated_len)
+    req.kv_allocated_len = kv_allocated_len
+    req.kv_committed_freed = False
+    req.kv_overallocated_freed = False
     req.prefix_indices = list(range(prefix_indices_len))
-    req.effective_kv_committed_len = lambda: req.kv_committed_len
+
+    def pop_committed():
+        assert not req.kv_committed_freed
+        req.kv_committed_freed = True
+        return req.kv_committed_len
+
+    def pop_overallocated():
+        assert not req.kv_overallocated_freed
+        req.kv_overallocated_freed = True
+        return req.kv_committed_len, req.kv_allocated_len
+
+    req.pop_committed_kv_cache = pop_committed
+    req.pop_overallocated_kv_cache = pop_overallocated
     return req
 
 
@@ -281,9 +292,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             8,
         )
         manager.cache_controller = MagicMock()
-        manager.cache_controller.ack_write_queue = [
-            HiCacheAck(None, _FinishedEvent(), [7])
-        ]
+        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [7])]
         manager._trigger_backup = MagicMock(return_value="last_hash")
 
         manager._check_offload_progress(1)
@@ -317,9 +326,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
         self.assertEqual(manager.offloaded_state[req.rid].inc_len, 4)
         manager.cache_controller.write.assert_called_once()
 
-        manager.cache_controller.ack_write_queue = [
-            HiCacheAck(None, _FinishedEvent(), [1])
-        ]
+        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [1])]
         manager._trigger_backup = MagicMock(return_value="last_hash")
 
         manager._check_offload_progress(1)
@@ -362,9 +369,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             8,
         )
         manager.cache_controller = MagicMock()
-        manager.cache_controller.ack_write_queue = [
-            HiCacheAck(None, _FinishedEvent(), [8])
-        ]
+        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [8])]
         manager._trigger_backup = MagicMock(return_value="last_hash")
 
         manager._check_offload_progress(1)
@@ -394,9 +399,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             12,
         )
         manager.cache_controller = MagicMock()
-        manager.cache_controller.ack_write_queue = [
-            HiCacheAck(None, _FinishedEvent(), [9])
-        ]
+        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [9])]
         manager._trigger_backup = MagicMock(return_value="last_hash")
 
         manager._check_offload_progress(1)

@@ -40,7 +40,7 @@ type BridgeStateRef = Arc<Mutex<BridgeState>>;
 struct BridgeState {
     channels: HashMap<String, Sender<ResponseChunk>>,
     pending_sends: HashSet<String>,
-    ready_callbacks: HashMap<String, Py<PyAny>>,
+    ready_callbacks: HashMap<String, PyObject>,
     ready_signals: HashSet<String>,
     terminal_errors: HashMap<String, TerminalError>,
 }
@@ -66,10 +66,7 @@ impl TerminalError {
     }
 }
 
-// skip_from_py_object: this enum is only returned to Python, never received
-// from it, so it opts out of pyo3's (deprecated-by-default) FromPyObject
-// derive for Clone pyclasses.
-#[pyclass(eq, eq_int, skip_from_py_object)]
+#[pyclass(eq, eq_int)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChunkSendStatus {
     Ready,
@@ -86,7 +83,7 @@ fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard
 
 /// Holds a reference to the Python RuntimeHandle and manages per-request channels.
 pub struct PyBridge {
-    runtime_handle: Py<PyAny>,
+    runtime_handle: PyObject,
     state: BridgeStateRef,
     rust_tokenizer: Option<RustTokenizer>,
     context_len: i32,
@@ -96,7 +93,7 @@ pub struct PyBridge {
 
 impl PyBridge {
     pub fn new(
-        runtime_handle: Py<PyAny>,
+        runtime_handle: PyObject,
         rust_tokenizer: Option<RustTokenizer>,
         context_len: i32,
         response_channel_capacity: usize,
@@ -147,7 +144,7 @@ impl PyBridge {
         Ok(receiver)
     }
 
-    fn make_chunk_callback(&self, py: Python<'_>, rid: String) -> PyResult<Py<PyAny>> {
+    fn make_chunk_callback(&self, py: Python<'_>, rid: String) -> PyResult<PyObject> {
         let callback = ChunkCallback {
             rid,
             state: self.state.clone(),
@@ -158,7 +155,7 @@ impl PyBridge {
         Ok(py_callback.into_any())
     }
 
-    fn make_json_callback(&self, py: Python<'_>, rid: String) -> PyResult<Py<PyAny>> {
+    fn make_json_callback(&self, py: Python<'_>, rid: String) -> PyResult<PyObject> {
         let callback = JsonChunkCallback {
             rid,
             state: self.state.clone(),
@@ -186,7 +183,7 @@ impl PyBridge {
         let receiver = self.create_channel(rid)?;
         let rid_owned = rid.to_string();
 
-        let result = Python::attach(|py| -> PyResult<()> {
+        let result = Python::with_gil(|py| -> PyResult<()> {
             let py_req_dict = json_map_to_pydict(py, &req_dict)?;
             let callback = self.make_chunk_callback(py, rid_owned)?;
 
@@ -256,7 +253,7 @@ impl PyBridge {
             return Ok(());
         }
 
-        Python::attach(|py| {
+        Python::with_gil(|py| {
             self.runtime_handle
                 .call_method1(py, "abort", (rid, abort_all))?;
             Ok(())
@@ -268,21 +265,21 @@ impl PyBridge {
     // ------------------------------------------------------------------
 
     pub fn get_model_info(&self) -> PyResult<String> {
-        Python::attach(|py| {
+        Python::with_gil(|py| {
             let result = self.runtime_handle.call_method0(py, "get_model_info")?;
             result.extract::<String>(py)
         })
     }
 
     pub fn get_server_info(&self) -> PyResult<String> {
-        Python::attach(|py| {
+        Python::with_gil(|py| {
             let result = self.runtime_handle.call_method0(py, "get_server_info")?;
             result.extract::<String>(py)
         })
     }
 
     pub fn health_check(&self) -> PyResult<bool> {
-        Python::attach(|py| {
+        Python::with_gil(|py| {
             let result = self.runtime_handle.call_method0(py, "health_check")?;
             result.extract::<bool>(py)
         })
@@ -290,7 +287,7 @@ impl PyBridge {
 
     /// Tokenize via Python (fallback when Rust tokenizer unavailable).
     pub fn tokenize_py(&self, text: &str, add_special_tokens: bool) -> PyResult<String> {
-        Python::attach(|py| {
+        Python::with_gil(|py| {
             let result =
                 self.runtime_handle
                     .call_method1(py, "tokenize", (text, add_special_tokens))?;
@@ -300,7 +297,7 @@ impl PyBridge {
 
     /// Detokenize via Python (fallback when Rust tokenizer unavailable).
     pub fn detokenize_py(&self, tokens: Vec<i32>) -> PyResult<String> {
-        Python::attach(|py| {
+        Python::with_gil(|py| {
             let result = self
                 .runtime_handle
                 .call_method1(py, "detokenize", (tokens,))?;
@@ -309,7 +306,7 @@ impl PyBridge {
     }
 
     pub fn list_models(&self) -> PyResult<String> {
-        Python::attach(|py| {
+        Python::with_gil(|py| {
             let result = self.runtime_handle.call_method0(py, "list_models")?;
             result.extract::<String>(py)
         })
@@ -317,13 +314,13 @@ impl PyBridge {
 
     fn submit_json<F>(&self, rid: &str, call: F) -> PyResult<Receiver<ResponseChunk>>
     where
-        F: for<'py> FnOnce(Python<'py>, &Py<PyAny>, Py<PyAny>) -> PyResult<()>,
+        F: for<'py> FnOnce(Python<'py>, &PyObject, PyObject) -> PyResult<()>,
     {
         // Closure args are: current Python token, RuntimeHandle, and the JSON chunk callback.
         let receiver = self.create_channel(rid)?;
         let rid_owned = rid.to_string();
 
-        let result = Python::attach(|py| -> PyResult<()> {
+        let result = Python::with_gil(|py| -> PyResult<()> {
             let callback = self.make_json_callback(py, rid_owned)?;
             call(py, &self.runtime_handle, callback)
         });
@@ -453,7 +450,7 @@ fn close_channel_with_error(
     py: Python<'_>,
     rid: &str,
     state: &BridgeStateRef,
-    runtime_handle: &Py<PyAny>,
+    runtime_handle: &PyObject,
     error: TerminalError,
 ) {
     let mut state = lock_or_recover(state.as_ref(), "state");
@@ -481,7 +478,7 @@ fn register_pending_send(rid: &str, state: &BridgeStateRef) -> bool {
     state.pending_sends.insert(rid.to_string())
 }
 
-fn mark_send_ready(py: Python<'_>, rid: &str, state: &BridgeStateRef) -> Option<Py<PyAny>> {
+fn mark_send_ready(py: Python<'_>, rid: &str, state: &BridgeStateRef) -> Option<PyObject> {
     let mut state = lock_or_recover(state.as_ref(), "state");
     state.pending_sends.remove(rid);
     if let Some(callback) = state.ready_callbacks.get(rid) {
@@ -492,7 +489,7 @@ fn mark_send_ready(py: Python<'_>, rid: &str, state: &BridgeStateRef) -> Option<
     }
 }
 
-fn notify_ready(py: Python<'_>, rid: &str, callback: Py<PyAny>) {
+fn notify_ready(py: Python<'_>, rid: &str, callback: PyObject) {
     if let Err(err) = callback.call0(py) {
         tracing::warn!(rid, "gRPC on_ready callback failed: {}", err);
     }
@@ -502,7 +499,7 @@ fn set_on_ready_for_rid(
     py: Python<'_>,
     rid: &str,
     state: &BridgeStateRef,
-    on_ready: Py<PyAny>,
+    on_ready: PyObject,
 ) -> PyResult<()> {
     let should_notify = {
         let mut state = lock_or_recover(state.as_ref(), "state");
@@ -528,7 +525,7 @@ fn try_send_chunk(
     py: Python<'_>,
     rid: &str,
     state: &BridgeStateRef,
-    runtime_handle: &Py<PyAny>,
+    runtime_handle: &PyObject,
     tokio_handle: &Handle,
     sender: &Sender<ResponseChunk>,
     msg: ResponseChunk,
@@ -572,14 +569,14 @@ fn try_send_chunk(
                             return;
                         }
 
-                        Python::attach(|py| {
+                        Python::with_gil(|py| {
                             if let Some(callback) = mark_send_ready(py, &rid_owned, &state) {
                                 notify_ready(py, &rid_owned, callback);
                             }
                         });
                     }
                     Err(_) => {
-                        Python::attach(|py| {
+                        Python::with_gil(|py| {
                             close_channel_with_error(
                                 py,
                                 &rid_owned,
@@ -614,7 +611,7 @@ fn try_send_chunk(
 struct ChunkCallback {
     rid: String,
     state: BridgeStateRef,
-    runtime_handle: Py<PyAny>,
+    runtime_handle: PyObject,
     tokio_handle: Handle,
 }
 
@@ -622,7 +619,7 @@ struct ChunkCallback {
 impl ChunkCallback {
     /// Register before producing chunks. If a parked chunk drained before registration,
     /// Rust fires `on_ready` immediately so late registration cannot miss the edge.
-    fn set_on_ready(&self, py: Python<'_>, on_ready: Py<PyAny>) -> PyResult<()> {
+    fn set_on_ready(&self, py: Python<'_>, on_ready: PyObject) -> PyResult<()> {
         set_on_ready_for_rid(py, &self.rid, &self.state, on_ready)
     }
 
@@ -702,7 +699,7 @@ impl ChunkCallback {
 struct JsonChunkCallback {
     rid: String,
     state: BridgeStateRef,
-    runtime_handle: Py<PyAny>,
+    runtime_handle: PyObject,
     tokio_handle: Handle,
 }
 
@@ -710,7 +707,7 @@ struct JsonChunkCallback {
 impl JsonChunkCallback {
     /// Register before producing chunks. If a parked chunk drained before registration,
     /// Rust fires `on_ready` immediately so late registration cannot miss the edge.
-    fn set_on_ready(&self, py: Python<'_>, on_ready: Py<PyAny>) -> PyResult<()> {
+    fn set_on_ready(&self, py: Python<'_>, on_ready: PyObject) -> PyResult<()> {
         set_on_ready_for_rid(py, &self.rid, &self.state, on_ready)
     }
 
@@ -788,7 +785,7 @@ impl JsonChunkCallback {
 fn extract_meta_info(chunk: &Bound<'_, PyDict>) -> HashMap<String, String> {
     let mut meta = HashMap::new();
     if let Ok(Some(meta_obj)) = chunk.get_item("meta_info")
-        && let Ok(meta_dict) = meta_obj.cast::<PyDict>()
+        && let Ok(meta_dict) = meta_obj.downcast::<PyDict>()
     {
         for (k, v) in meta_dict.iter() {
             // The proto schema is map<string, string>; encode each Python value as JSON

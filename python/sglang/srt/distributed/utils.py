@@ -19,13 +19,19 @@ from torch.distributed import TCPStore
 
 logger = logging.getLogger(__name__)
 
+# Global TCPStore that is created during distributed initialization
+# This is the single shared store that all components should use
+_global_tcp_store: Optional[TCPStore] = None
+
 
 def set_global_tcp_store(store: TCPStore) -> None:
-    """Install the shared TCPStore created during distributed initialization;
-    the handle lives on ``ctx.resources``."""
-    from sglang.srt.runtime_context import get_resources
+    """Set the global TCPStore instance.
 
-    get_resources().tcp_store = store
+    This should be called during distributed initialization to make
+    the store available to all components that need it.
+    """
+    global _global_tcp_store
+    _global_tcp_store = store
     logger.info("Global TCPStore has been set")
 
 
@@ -39,15 +45,15 @@ def get_global_tcp_store() -> Optional[TCPStore]:
     Returns:
         The global TCPStore instance, or None if not initialized yet.
     """
-    from sglang.srt.runtime_context import get_resources
+    global _global_tcp_store
 
-    store = get_resources().tcp_store
-    if store is None:
+    if _global_tcp_store is None:
         logger.warning(
             "Global TCPStore not found. Make sure init_distributed_environment "
             "was called with a tcp:// init method."
         )
-    return store
+
+    return _global_tcp_store
 
 
 def ensure_divisibility(numerator, denominator):

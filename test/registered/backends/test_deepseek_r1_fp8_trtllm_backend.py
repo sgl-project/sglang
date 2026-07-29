@@ -31,7 +31,7 @@ class TestDeepseekR1Fp8Flashinfer(CustomTestCase):
             "8192",
             "--mem-fraction-static",
             "0.9",
-            "--cuda-graph-max-bs-decode",
+            "--cuda-graph-max-bs",
             "128",
             "--max-prefill-tokens",
             "8192",

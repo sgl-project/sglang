@@ -133,9 +133,9 @@ def _check_replicated_pair(
         diff_info = compute_diff(
             x_baseline=baseline,
             x_target=other_float,
-            predicate=f"max_abs <= {_REPLICATED_ATOL}",
+            diff_threshold=_REPLICATED_ATOL,
         )
-        passed = diff_info.passed
+        passed = diff_info.max_abs_diff <= _REPLICATED_ATOL
 
     return ReplicatedCheckResult(
         axis=axis.value,

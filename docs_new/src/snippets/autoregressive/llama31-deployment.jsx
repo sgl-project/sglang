@@ -10,8 +10,7 @@ export const Llama31Deployment = () => {
         { id: 'b200', label: 'B200', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false },
-        { id: 'xeon', label: 'XEON', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false }
       ]
     },
     modelsize: {
@@ -58,34 +57,6 @@ export const Llama31Deployment = () => {
     }
   };
 
-  const getDisplayOptions = (values) => {
-    const displayOptions = {
-      ...options,
-      modelsize: {
-        ...options.modelsize,
-        items: options.modelsize.items.map(item => ({
-          ...item,
-          disabled: values.hardware === 'xeon' && item.id !== '8b'
-        }))
-      },
-      quantization: {
-        ...options.quantization,
-        items: options.quantization.items.map(item => ({
-          ...item,
-          disabled: values.hardware === 'xeon' && item.id === 'fp8'
-        }))
-      },
-      optimization: {
-        ...options.optimization,
-        items: options.optimization.items.map(item => ({
-          ...item,
-          disabled: values.hardware === 'xeon' && item.id !== 'basic'
-        }))
-      }
-    };
-    return displayOptions;
-  };
-
   // Initialize state
   const getInitialState = () => {
     const initialState = {};
@@ -115,15 +86,7 @@ export const Llama31Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => {
-      const next = { ...prev, [optionName]: value };
-      if (optionName === 'hardware' && value === 'xeon') {
-        next.modelsize = '8b';
-        next.quantization = 'bf16';
-        next.optimization = 'basic';
-      }
-      return next;
-    });
+    setValues(prev => ({ ...prev, [optionName]: value }));
   };
 
   // Generate command
@@ -131,8 +94,6 @@ export const Llama31Deployment = () => {
     const { hardware, optimization, modelsize, category, toolcall, quantization } = values;
 
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
-    const isXeon = hardware === 'xeon';
-    const effectiveModelSize = isXeon ? '8b' : modelsize;
 
     // Model size mapping
     const sizeMap = {
@@ -140,13 +101,13 @@ export const Llama31Deployment = () => {
       '70b': '70B',
       '405b': '405B'
     };
-    const sizeToken = sizeMap[effectiveModelSize] || '70B';
+    const sizeToken = sizeMap[modelsize] || '70B';
     const categorySuffix = category === 'instruct' ? '-Instruct' : '';
 
     // Determine model path
     let modelPath;
-    if (quantization === 'fp8' && category === 'instruct' && !isXeon) {
-      if (effectiveModelSize === '405b') {
+    if (quantization === 'fp8' && category === 'instruct') {
+      if (modelsize === '405b') {
         // Meta official FP8 for 405B
         modelPath = `meta-llama/Llama-3.1-${sizeToken}${categorySuffix}-FP8`;
       } else if (isAMD) {
@@ -181,16 +142,13 @@ export const Llama31Deployment = () => {
         }
       };
       tpSize = quantization === 'fp8'
-        ? amdTpConfig[hardware][effectiveModelSize].fp8
-        : amdTpConfig[hardware][effectiveModelSize].bf16;
-    } else if (isXeon) {
-      // Intel Xeon CPU TP configuration
-      tpSize = 3;
+        ? amdTpConfig[hardware][modelsize].fp8
+        : amdTpConfig[hardware][modelsize].bf16;
     } else {
       // NVIDIA GPU TP configuration
-      if (effectiveModelSize === '405b') {
+      if (modelsize === '405b') {
         tpSize = 8;
-      } else if (effectiveModelSize === '70b' && (hardware === 'h100' || hardware === 'h200')) {
+      } else if (modelsize === '70b' && (hardware === 'h100' || hardware === 'h200')) {
         tpSize = 2;
       }
     }
@@ -199,22 +157,17 @@ export const Llama31Deployment = () => {
     const args = [];
     args.push(`--model-path ${modelPath}`);
 
-    if (isXeon) {
-      args.push(`--device cpu`);
-      args.push(`--disable-overlap-schedule`);
-    }
-
     if (tpSize) {
       args.push(`--tp ${tpSize}`);
     }
 
     // Add quantization flag only if not using FP8 variant model
-    if (quantization === 'fp8' && category !== 'instruct' && !isXeon) {
+    if (quantization === 'fp8' && category !== 'instruct') {
       args.push(`--quantization fp8`);
     }
 
     // NVIDIA-specific optimizations
-    if (!isAMD && !isXeon) {
+    if (!isAMD) {
       if (optimization === 'throughput') {
         args.push(`--enable-dp-attention`);
         args.push(`--mem-fraction-static 0.85`);
@@ -223,7 +176,7 @@ export const Llama31Deployment = () => {
         args.push(`--speculative-num-steps 3`);
         args.push(`--speculative-eagle-topk 1`);
         args.push(`--speculative-num-draft-tokens 4`);
-        if (effectiveModelSize === '8b' && category === 'instruct') {
+        if (modelsize === '8b' && category === 'instruct') {
           args.push(`--speculative-draft-model-path yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`);
         } else {
           args.push(`--speculative-draft-model-path \${EAGLE3_MODEL_PATH}`);
@@ -259,7 +212,7 @@ export const Llama31Deployment = () => {
 
   return (
     <div style={containerStyle} className="not-prose">
-      {Object.entries(getDisplayOptions(values)).map(([key, option]) => (
+      {Object.entries(options).map(([key, option]) => (
         <div key={key} style={cardStyle}>
           <div style={titleStyle}>{option.title}</div>
           <div style={itemsStyle}>
@@ -278,10 +231,9 @@ export const Llama31Deployment = () => {
             ) : (
               option.items.map(item => {
                 const isChecked = values[option.name] === item.id;
-                const isDisabled = Boolean(item.disabled);
                 return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
-                    <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={isDisabled} onChange={() => !isDisabled && handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
+                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
+                    <input type="radio" name={option.name} value={item.id} checked={isChecked} onChange={() => handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
                     {item.label}
                     {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                   </label>

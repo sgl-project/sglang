@@ -19,10 +19,8 @@ HW_MAPPING = {
     "cpu": HWBackend.CPU,
     "cuda": HWBackend.CUDA,
     "amd": HWBackend.AMD,
-    "musa": HWBackend.MUSA,
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
-    "mlx": HWBackend.MLX,
 }
 
 # Per-commit test suites (run on every PR).
@@ -30,12 +28,7 @@ HW_MAPPING = {
 # (label-gated; pr-test-extra.yml). Tests are tagged per-commit regardless;
 # pr-test-extra.yml's `run-ci-extra` PR label decides whether extra-* dispatches.
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: [
-        "base-a-test-cpu",
-        "base-b-test-cpu",
-        "base-c-test-cpu",
-        "base-b-test-cpu-arm64",
-    ],
+    HWBackend.CPU: ["base-a-test-cpu", "base-b-test-cpu"],
     HWBackend.AMD: [
         "stage-a-test-1-gpu-small-amd",
         "stage-b-test-1-gpu-small-amd",
@@ -45,40 +38,23 @@ PER_COMMIT_SUITES = {
         "stage-b-test-1-gpu-large-amd",
         "stage-b-test-2-gpu-large-amd",
         "jit-kernel-unit-test-amd",
-        "jit-kernel-benchmark-test-amd",
-        "sgl-kernel-unit-test-2-gpu-amd",
         "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
-        # extra-a: label-gated PR opt-in suites in pr-test-amd-extra.yml
-        # (mirror of CUDA extra-a; tests stay tagged per-commit but only
-        # dispatch when the PR carries the `run-ci-extra` label). 1-gpu-small
-        # carries the mock-model / kv_canary unit + single-GPU canary e2e
-        # tests; 1-gpu-large carries the subset of model e2e tests validated
-        # to pass on mi325 (quant fp8kv-triton, sessions streaming-session
-        # EAGLE3, spec standalone triton-backend variant); 2-gpu-large carries
-        # the multi-GPU (TP/PP/PD) mock-model + kv_canary e2e tests. The rest
-        # of CUDA extra-a tests fail on ROCm (missing flash_attn.cute/flash_ops
-        # kernels, OOM, or accuracy regressions — e.g. gemma4-mtp-31b dips
-        # below the gsm8k floor on the topk=3 leg) and stay CUDA-only for now.
-        "extra-a-test-1-gpu-small-amd",
-        "extra-a-test-1-gpu-large-amd",
-        "extra-a-test-2-gpu-large-amd",
     ],
-    HWBackend.MUSA: [],
     HWBackend.CUDA: [
         "base-a-test-1-gpu-small",
         "base-b-test-1-gpu-small",
         "base-b-test-1-gpu-large",
         "base-b-test-2-gpu-large",
         "base-b-test-4-gpu-b200",
-        "base-b-kernel-unit-test-1-gpu-large",
-        "base-b-kernel-unit-test-4-gpu-b200",
-        "base-b-kernel-unit-test-8-gpu-h200",
-        "base-b-kernel-benchmark-test-1-gpu-large",
+        "base-b-kernel-unit-1-gpu-large",
+        "base-b-kernel-unit-1-gpu-b200",
+        "base-b-kernel-unit-8-gpu-h200",
+        "base-b-kernel-benchmark-1-gpu-large",
         "base-c-test-4-gpu-h100",
         "base-c-test-4-gpu-b200",
-        "base-c-test-4-gpu-gb300",
+        "base-c-test-4-gpu-gb200",
         "base-c-test-8-gpu-h20",
         "base-c-test-8-gpu-h200",
         "base-c-test-8-gpu-b200",
@@ -93,13 +69,11 @@ PER_COMMIT_SUITES = {
         "extra-b-test-4-gpu-h100",
         "extra-b-test-4-gpu-b200",
         "extra-b-test-8-gpu-h200",
-        "extra-b-test-deepep-4-gpu-h100",
         "extra-b-test-deepep-4-gpu-b200",
         "extra-b-test-deepep-8-gpu-h200",
     ],
     HWBackend.NPU: [
         "base-a-test-1-gpu-small",
-        "stage-a-unit-test-npu",
         "stage-b-test-1-npu-a2",
         "stage-b-test-2-npu-a2",
         "stage-b-test-4-npu-a3",
@@ -108,10 +82,6 @@ PER_COMMIT_SUITES = {
     HWBackend.XPU: [
         "stage-a-test-1-gpu-xpu",
         "stage-b-test-1-gpu-xpu",
-    ],
-    HWBackend.MLX: [
-        "stage-a-unit-test-mlx",
-        "stage-b-e2e-mlx",
     ],
 }
 
@@ -136,21 +106,12 @@ NIGHTLY_SUITES = {
         "nightly-eval-vlm-2-gpu",
         "nightly-perf-text-2-gpu",
         "nightly-perf-vlm-2-gpu",
-        # GB300 (4x GB300 NVL4) nightly suites
+        # GB300 (4x B200 NVL4) nightly suite
         "nightly-4-gpu-gb300",
-        "nightly-4-gpu-gb300-deepseek-v4-pro-fp4",
-        "nightly-4-gpu-gb300-glm5-nvfp4",
-        "nightly-4-gpu-gb300-kimi-k25",
-        "nightly-4-gpu-gb300-kimi-k25-nvfp4",
-        "nightly-4-gpu-gb300-qwen35-fp8",
-        "nightly-4-gpu-gb300-qwen35-nvfp4",
-        # Nightly precision regression (per-layer hidden state comparison)
-        "nightly-precision-8-gpu-h200",
     ],
     HWBackend.AMD: [
         "nightly-amd",
         "nightly-amd-1-gpu",
-        "nightly-amd-kernel-1-gpu",
         "nightly-amd-1-gpu-mi35x",
         "nightly-amd-1-gpu-zimage-turbo",
         "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",
@@ -160,9 +121,6 @@ NIGHTLY_SUITES = {
         "nightly-amd-vlm",
         # MI35x 8-GPU suite (different model configs)
         "nightly-amd-8-gpu-mi35x",
-    ],
-    HWBackend.MUSA: [
-        "nightly-musa-1-gpu",
     ],
     HWBackend.CPU: [],
     HWBackend.NPU: [
@@ -177,11 +135,7 @@ NIGHTLY_SUITES = {
         "full-8-npu-a3",
         "full-16-npu-a3",
     ],
-    HWBackend.XPU: [
-        "nightly-xpu-1-gpu",
-        "nightly-xpu-2-gpu",
-        "nightly-xpu-4-gpu",
-    ],
+    HWBackend.XPU: [],
 }
 
 
@@ -196,13 +150,7 @@ OTHER_SUITES = {
 }
 
 
-_SUITE_CHECKED_BACKENDS = {
-    HWBackend.CUDA,
-    HWBackend.CPU,
-    HWBackend.MUSA,
-    HWBackend.XPU,
-    HWBackend.MLX,
-}
+_SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU, HWBackend.XPU}
 
 
 def _valid_suites_by_backend() -> dict:
@@ -338,8 +286,16 @@ def run_a_suite(args):
         if not f.endswith("/conftest.py")
         and not f.endswith("/__init__.py")
         and not f.endswith("/cpu/utils.py")
-        and not f.endswith("/run_tests.py")
     ]
+
+    # JIT kernel tests and benchmarks (live alongside kernel source)
+    jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
+    files += glob.glob(
+        os.path.join(jit_kernel_dir, "tests", "**", "test_*.py"), recursive=True
+    )
+    files += glob.glob(
+        os.path.join(jit_kernel_dir, "benchmark", "**", "bench_*.py"), recursive=True
+    )
 
     # Strict: all discovered files must have proper registration
     sanity_check = True

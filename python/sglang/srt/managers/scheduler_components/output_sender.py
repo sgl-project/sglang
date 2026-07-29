@@ -2,7 +2,7 @@ from typing import Optional, Union
 
 import zmq
 
-from sglang.srt.managers.io_struct import BaseBatchReq, BaseReq, sock_send
+from sglang.srt.managers.io_struct import BaseBatchReq, BaseReq
 
 
 class SenderWrapper:
@@ -25,4 +25,4 @@ class SenderWrapper:
             # handle communicator reqs for multi-http worker case
             output.http_worker_ipc = recv_obj.http_worker_ipc
 
-        sock_send(self.socket, output)
+        self.socket.send_pyobj(output)

@@ -55,6 +55,7 @@ class TestDeepseekR1FP4Unified(unittest.TestCase):
                 tp_size=4,
                 extra_args=base_args + mtp_args,
                 variant="TP4+MTP",
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
             ),
         ]
 

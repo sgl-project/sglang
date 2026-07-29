@@ -26,7 +26,6 @@ from sglang.srt.disaggregation.encode_server import (
     handle_scheduler_receive_url_request,
     launch_encoder,
 )
-from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import random_uuid
@@ -96,7 +95,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 "part_idx": request.part_idx,
             }
             for socket in self.send_sockets:
-                await async_sock_send(socket, wrap_as_pickle(request_dict))
+                await socket.send_pyobj(request_dict)
 
             # gRPC encode is image-only; encoder.encode() requires modality
             (

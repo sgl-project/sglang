@@ -21,6 +21,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
     InputValidationStage,
 )
 
+# Patch path for get_global_server_args used by Stage.__init__
+_GLOBAL_ARGS_PATCH = (
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args"
+)
+
 
 def _make_batch(condition_image: Image.Image, width=None, height=None) -> Req:
     """Create a minimal Req with a condition image and optional user dimensions."""
@@ -104,7 +109,8 @@ class TestPreprocessConditionImageResolution(unittest.TestCase):
     """
 
     def setUp(self):
-        self.stage = InputValidationStage()
+        with patch(_GLOBAL_ARGS_PATCH, return_value=MagicMock()):
+            self.stage = InputValidationStage()
 
     def _run(self, config, img_w, img_h, user_w=None, user_h=None):
         """Run preprocess_condition_image and return (batch.width, batch.height)."""
@@ -232,7 +238,8 @@ class TestFlux2ConditionImagePreprocess(unittest.TestCase):
 
 class TestFlux2TI2ISizeResolution(unittest.TestCase):
     def setUp(self):
-        self.stage = InputValidationStage()
+        with patch(_GLOBAL_ARGS_PATCH, return_value=MagicMock()):
+            self.stage = InputValidationStage()
         self.config = _DummyTI2IConfig()
 
     def test_uses_condition_image_size_when_width_height_not_explicit(self):

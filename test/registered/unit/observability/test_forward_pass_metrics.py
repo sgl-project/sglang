@@ -17,11 +17,26 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
 def _make_ps(**overrides) -> ParallelState:
     """Build a ParallelState with reasonable defaults for tests; override fields via kwargs."""
     defaults = dict(
+        tp_rank=0,
+        tp_size=1,
+        pp_rank=0,
+        pp_size=1,
         dp_rank=None,
+        dp_size=1,
+        attn_tp_rank=0,
+        attn_tp_size=1,
+        attn_cp_rank=0,
+        attn_cp_size=1,
+        attn_dp_rank=0,
+        attn_dp_size=1,
+        moe_ep_rank=0,
+        moe_ep_size=1,
         moe_dp_rank=None,
+        moe_dp_size=1,
+        gpu_id=0,
     )
     defaults.update(overrides)
-    return ParallelState.trivial(**defaults)
+    return ParallelState(**defaults)
 
 
 class _FakeReq:
@@ -70,22 +85,9 @@ class _DummyPublisherThread:
         pass
 
 
-def _fake_server_args(**fields):
-    """server_args stand-in: carries fields and the override() entry point."""
-    fields.setdefault("decode_log_interval", 40)
-    ns = types.SimpleNamespace(**fields)
-
-    def _override(source, **updates):
-        for key, value in updates.items():
-            setattr(ns, key, value)
-
-    ns.override = _override
-    return ns
-
-
 def _make_reporter(scheduler) -> SchedulerMetricsReporter:
     if not hasattr(scheduler, "server_args"):
-        scheduler.server_args = _fake_server_args(
+        scheduler.server_args = types.SimpleNamespace(
             enable_metrics=False,
             enable_metrics_for_all_schedulers=False,
             kv_events_config=None,
@@ -93,7 +95,7 @@ def _make_reporter(scheduler) -> SchedulerMetricsReporter:
             enable_forward_pass_metrics=False,
         )
     if not hasattr(scheduler, "ps"):
-        scheduler.ps = ParallelState.trivial()
+        scheduler.ps = types.SimpleNamespace(attn_tp_rank=0, attn_cp_rank=0)
     if not hasattr(scheduler, "kv_events_publisher"):
         scheduler.kv_events_publisher = types.SimpleNamespace(
             init_kv_events=lambda *a, **kw: None,
@@ -232,12 +234,11 @@ class TestForwardPassMetrics(unittest.TestCase):
             self.scheduler._fpm_publisher.metrics[0].wall_time, 0.035, places=4
         )
 
-    def test_disagg_prefill_queued_metrics_include_compute_waiting_queue(self):
+    def test_disagg_prefill_queued_metrics(self):
         self.scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         self.scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(
-            queue=[_FakeReq(100)],
+            queue=[_FakeReq(100), _FakeReq(200), _FakeReq(50)],
         )
-        self.scheduler.waiting_queue = [_FakeReq(200), _FakeReq(50)]
         batch = self._make_batch()
 
         with patch(
@@ -274,7 +275,7 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_init_metrics_uses_server_worker_id(self):
         scheduler = types.SimpleNamespace()
-        scheduler.server_args = _fake_server_args(
+        scheduler.server_args = types.SimpleNamespace(
             enable_metrics=False,
             enable_metrics_for_all_schedulers=False,
             extra_metric_labels=None,
@@ -302,7 +303,7 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_init_fpm_disabled_on_non_last_pp_rank(self):
         scheduler = types.SimpleNamespace()
-        scheduler.server_args = _fake_server_args(
+        scheduler.server_args = types.SimpleNamespace(
             enable_metrics=False,
             enable_metrics_for_all_schedulers=False,
             extra_metric_labels=None,

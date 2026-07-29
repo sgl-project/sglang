@@ -47,6 +47,7 @@ jobs:
         with:
           workspaces: sgl-model-gateway
           shared-key: "rust-cache"
+          save-if: true
           cache-all-crates: true
           cache-on-failure: true
 
@@ -110,6 +111,7 @@ jobs:
           shared-key: "rust-cache"
           cache-all-crates: true
           cache-on-failure: true
+          save-if: true
 
       - name: Run benchmark
         timeout-minutes: 30

@@ -33,7 +33,6 @@ def post_parallel_generate(
     prompts: list[str],
     max_new_tokens: int,
     timeout: float,
-    ignore_eos: bool = False,
 ) -> list[dict]:
     def _send(prompt: str) -> dict:
         try:
@@ -44,7 +43,6 @@ def post_parallel_generate(
                     "sampling_params": {
                         "max_new_tokens": max_new_tokens,
                         "temperature": 0.0,
-                        "ignore_eos": ignore_eos,
                     },
                 },
                 timeout=timeout,

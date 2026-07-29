@@ -43,16 +43,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # this pulls no openssl/native-tls (matching reqwest's rustls-tls above).
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 
-# Chat-template rendering for cache-aware routing: the engine caches tokens
-# AFTER applying the model's chat template, so the router renders the same
-# template (from tokenizer_config.json) before hashing — otherwise its query
-# token_ids diverge from the engine's stored blocks. `pycompat` supplies the
-# Python str/dict methods HF chat templates rely on (.startswith, .items, ...).
-minijinja = { version = "2", features = ["loop_controls", "json"] }
-minijinja-contrib = { version = "2", features = ["pycompat"] }
-# `strftime_now` chat-template helper (some templates inject the current date).
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-
 # Utilities
 anyhow = "1"
 thiserror = "2"

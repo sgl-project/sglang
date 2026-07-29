@@ -641,7 +641,7 @@ class SGLDiffusionServerSetLora:
 
         # Call API
         try:
-            sgld_client.set_lora(**request_params)
+            response = sgld_client.set_lora(**request_params)
             return (sgld_client,)
         except Exception as e:
             raise RuntimeError(f"Failed to set LoRA adapter: {str(e)}")
@@ -685,7 +685,7 @@ class SGLDiffusionServerUnsetLora:
     ):
         """Unset LoRA adapter using SGLang Diffusion API."""
         try:
-            sgld_client.unset_lora(target=target)
+            response = sgld_client.unset_lora(target=target)
             return (sgld_client,)
         except Exception as e:
             raise RuntimeError(f"Failed to unset LoRA adapter: {str(e)}")

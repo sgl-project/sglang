@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     DEFAULT_KV_LORA_RANK,
@@ -45,13 +46,9 @@ class _ChunkKVMLARunner(MockMLAModelRunner):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # The fixture's config is already published; adjust it through the
-        # audited entry point (bare writes raise under the strict guard).
-        self.server_args.override(
-            source="attention-unittest",
-            disable_chunked_prefix_cache=False,
-            flashinfer_mla_disable_ragged=False,
-        )
+        self.server_args.disable_chunked_prefix_cache = False
+        self.server_args.flashinfer_mla_disable_ragged = False
+        set_global_server_args_for_scheduler(self.server_args)
 
 
 def _make_case() -> MLAAttentionCase:

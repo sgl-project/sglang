@@ -23,10 +23,9 @@ from sglang.srt.compilation.compiler_interface import EagerAdapter, InductorAdap
 from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
 from sglang.srt.compilation.npu_piecewise_backend import NPUPiecewiseBackend
 from sglang.srt.compilation.pass_manager import PostGradPassManager
-from sglang.srt.compilation.xpu_piecewise_backend import XPUPiecewiseBackend
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils.common import is_npu, is_xpu
+from sglang.srt.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +53,6 @@ def make_backend(
 
     if current_platform.is_out_of_tree():
         backend_cls = current_platform.get_piecewise_backend_cls()
-    elif is_xpu():
-        backend_cls = XPUPiecewiseBackend
     elif is_npu():
         backend_cls = NPUPiecewiseBackend
     else:
@@ -267,6 +264,9 @@ def split_graph(
 
     return split_gm, outputs
 
+
+# we share the global graph pool among all the backends
+global_graph_pool = None
 
 compilation_start_time = 0.0
 
