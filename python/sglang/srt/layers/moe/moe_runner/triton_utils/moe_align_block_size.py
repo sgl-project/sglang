@@ -203,7 +203,12 @@ def moe_align_block_size(
     # PDL-chained on sm90+ (consumer of the router top-k, early trigger for
     # the fused_moe up-GEMM).
     num_buckets = num_experts + 1
-    if _is_cuda and topk_ids.numel() <= 64:
+    # Not for ignore_invalid_expert callers: this kernel reproduces the default
+    # "+1 offset" semantics, where expert -1 lands in bucket 0 and its blocks
+    # are emitted with expert_ids = -1 for the consumer to skip. Callers that
+    # ask for invalid routes to be dropped (the humming runner) have no such
+    # filter downstream, so they must keep the reference path.
+    if _is_cuda and not ignore_invalid_expert and topk_ids.numel() <= 64:
         pdl_kwargs = (
             {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
         )
