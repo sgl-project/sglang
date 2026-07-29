@@ -5,42 +5,42 @@ from transformers.configuration_utils import PretrainedConfig
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 
 
-def _apply_keep_num_layers_override(text_config: KimiLinearConfig) -> None:
-    raw = os.getenv("SGLANG_KIMI_K3_KEEP_NUM_LAYERS")
+def _apply_keep_num_experts_override(text_config: KimiLinearConfig) -> None:
+    raw = os.getenv("SGLANG_KIMI_K3_KEEP_NUM_EXPERTS")
     if raw is None or raw.strip() in ("", "0"):
         return
 
-    keep_num_layers = int(raw)
-    if keep_num_layers <= 0:
+    keep_num_experts = int(raw)
+    if keep_num_experts <= 0:
         raise ValueError(
-            "SGLANG_KIMI_K3_KEEP_NUM_LAYERS must be a positive integer, "
-            f"got {keep_num_layers}."
+            "SGLANG_KIMI_K3_KEEP_NUM_EXPERTS must be a positive integer, "
+            f"got {keep_num_experts}."
         )
 
-    original_num_layers = int(text_config.num_hidden_layers)
-    if keep_num_layers > original_num_layers:
+    original_num_experts = int(text_config.num_experts or 0)
+    if original_num_experts <= 0:
         raise ValueError(
-            "SGLANG_KIMI_K3_KEEP_NUM_LAYERS cannot exceed the checkpoint layer "
-            f"count ({original_num_layers}), got {keep_num_layers}."
+            "SGLANG_KIMI_K3_KEEP_NUM_EXPERTS requires a MoE config with "
+            f"num_experts > 0, got {text_config.num_experts!r}."
         )
-    if keep_num_layers == original_num_layers:
+    if keep_num_experts > original_num_experts:
+        raise ValueError(
+            "SGLANG_KIMI_K3_KEEP_NUM_EXPERTS cannot exceed the checkpoint "
+            f"expert count ({original_num_experts}), got {keep_num_experts}."
+        )
+    if keep_num_experts == original_num_experts:
         return
 
-    text_config.num_hidden_layers = keep_num_layers
-    if text_config.linear_attn_config is not None:
-        cfg = dict(text_config.linear_attn_config)
-        # Kimi configs store these layer ids as 1-based ids.
-        cfg["kda_layers"] = [
-            int(layer_id)
-            for layer_id in cfg["kda_layers"]
-            if int(layer_id) <= keep_num_layers
-        ]
-        cfg["full_attn_layers"] = [
-            int(layer_id)
-            for layer_id in cfg["full_attn_layers"]
-            if int(layer_id) <= keep_num_layers
-        ]
-        text_config.linear_attn_config = cfg
+    text_config.num_experts = keep_num_experts
+    text_config.n_routed_experts = keep_num_experts
+    if text_config.num_experts_per_token is not None:
+        text_config.num_experts_per_token = min(
+            int(text_config.num_experts_per_token), keep_num_experts
+        )
+    # Debug expert truncation keeps only a prefix of experts. Collapse grouped
+    # top-k to a single group so arbitrary small expert counts remain legal.
+    text_config.num_expert_group = 1
+    text_config.topk_group = 1
 
 
 class KimiK3VisionConfig(PretrainedConfig):
@@ -136,7 +136,7 @@ class KimiK3Config(PretrainedConfig):
         else:
             self.text_config = text_config
 
-        _apply_keep_num_layers_override(self.text_config)
+        _apply_keep_num_experts_override(self.text_config)
 
         if vision_config is None:
             self.vision_config = KimiK3VisionConfig()
