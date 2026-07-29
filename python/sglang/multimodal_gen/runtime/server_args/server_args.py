@@ -802,6 +802,8 @@ class ServerArgs(DisaggServerArgsMixin):
         normalized = backend.strip().lower()
         if normalized in ("fa3", "fa4"):
             normalized = "fa"
+        elif normalized == "cudnn_sdpa":
+            normalized = "torch_cudnn_sdpa"
         try:
             return AttentionBackendEnum[normalized.upper()].name.lower()
         except KeyError:
@@ -1131,8 +1133,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 or self.vae_cpu_offload
             ):
                 logger.warning(
-                    "Disabling component CPU offload on MPS because CPU-to-MPS "
-                    "module relocation can produce invalid diffusion outputs."
+                    "Disabling component CPU offload on MPS because the component "
+                    "residency offload strategy is only validated on CUDA."
                 )
             self.dit_cpu_offload = False
             self.text_encoder_cpu_offload = False
