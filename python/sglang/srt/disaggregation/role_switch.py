@@ -50,20 +50,26 @@ def handle_pd_role_switch(
 
     scheduler._pd_role_switch_in_progress = True
     try:
-        scheduler._teardown_disaggregation()
-        scheduler.server_args.disaggregation_mode = new_role
+        # Teardown + role flip + rebuild are one logical atomic step. If any of
+        # them raises, the instance is left half-torn-down (old role released,
+        # new role not up) and isn't safe to serve, so mark it unhealthy. There
+        # is no in-place rollback.
         try:
+            scheduler._teardown_disaggregation()
+            scheduler.server_args.disaggregation_mode = new_role
             scheduler.init_disaggregation()
         except Exception as e:
-            # No in-place rollback; a half-rebuilt instance isn't safe to serve.
             scheduler._pd_role_switch_unhealthy = True
             logger.critical(
-                "PD role switch rebuild (%s -> %s) failed; instance unhealthy: %s",
+                "PD role switch (%s -> %s) failed during teardown/rebuild; "
+                "instance unhealthy: %s",
                 old_role,
                 new_role,
                 e,
             )
-            return _fail(f"rebuild failed; instance unhealthy, restart required: {e}")
+            return _fail(
+                f"role switch failed; instance unhealthy, restart required: {e}"
+            )
 
         if new_role == "decode":
             # Best-effort deferred capture; a failure only degrades to eager.

@@ -175,6 +175,27 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertFalse(out2.success)
         self.assertIn("unhealthy", out2.message)
 
+    def test_teardown_failure_marks_unhealthy(self):
+        """Teardown, the role flip and rebuild are one atomic step: a failure
+        during teardown (not only rebuild) must also mark the instance unhealthy
+        and must not proceed to rebuild."""
+        s = self._scheduler(DisaggregationMode.PREFILL)
+        s._teardown_disaggregation = MagicMock(side_effect=RuntimeError("boom"))
+
+        out = Scheduler.handle_pd_role_switch(
+            s, PdRoleSwitchReqInput(new_role="decode")
+        )
+
+        self.assertFalse(out.success)
+        self.assertIn("unhealthy", out.message)
+        self.assertIn("restart", out.message)
+        self.assertTrue(s._pd_role_switch_unhealthy)
+        self.assertFalse(s._event_loop_should_restart)
+        self.assertFalse(s._pd_role_switch_in_progress)
+        # Teardown raised, so rebuild is never attempted.
+        self.assertEqual(s._teardown_disaggregation.call_count, 1)
+        s.init_disaggregation.assert_not_called()
+
 
 class TestPdRoleSwitchReqSerialization(unittest.TestCase):
     """Guard the wire contract of the /pd_role_switch req/resp structs.
@@ -202,6 +223,56 @@ class TestPdRoleSwitchReqSerialization(unittest.TestCase):
         self.assertEqual(d["old_role"], "prefill")
         self.assertEqual(d["new_role"], "decode")
         self.assertEqual(d["message"], "ok")
+
+
+class TestPdRoleSwitchStartupValidation(unittest.TestCase):
+    """--enable-pd-role-switch only rebuilds the small role-specific disagg
+    structures on a flip; the per-role buffers of DP attention / EP / MoE
+    all-to-all are sized at startup and not rebuilt, so a flip with those on
+    would silently deadlock. The PD arg hook must reject the combination
+    up-front instead of failing at flip time."""
+
+    def _sa(self, **kw):
+        base = dict(
+            disaggregation_transfer_backend="mori",
+            disaggregation_mode="prefill",
+            enable_pd_role_switch=True,
+            enable_dp_attention=False,
+            ep_size=1,
+            moe_a2a_backend="none",
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def _run(self, sa):
+        from sglang.srt.arg_groups.pd_disaggregation_hook import (
+            handle_pd_disaggregation,
+        )
+
+        handle_pd_disaggregation(sa)
+
+    def test_pure_tp_role_switch_accepted(self):
+        # No raise for the validated pure-TP configuration.
+        self._run(self._sa())
+
+    def test_reject_dp_attention(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._run(self._sa(enable_dp_attention=True))
+        self.assertIn("DP attention", str(ctx.exception))
+
+    def test_reject_expert_parallelism(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._run(self._sa(ep_size=8))
+        self.assertIn("expert parallelism", str(ctx.exception))
+
+    def test_reject_moe_a2a(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._run(self._sa(moe_a2a_backend="mori"))
+        self.assertIn("MoE all-to-all", str(ctx.exception))
+
+    def test_no_role_switch_is_unaffected(self):
+        # The same unsupported feature is fine when role switch is off.
+        self._run(self._sa(enable_pd_role_switch=False, moe_a2a_backend="mori"))
 
 
 # --- teardown: transfer-worker thread-leak fix + prefix-cache release (radix ON) ---

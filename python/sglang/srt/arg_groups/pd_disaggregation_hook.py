@@ -86,3 +86,29 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                 f"got '{server_args.disaggregation_transfer_backend}'."
             )
+
+        # Runtime role switch only rebuilds the small role-specific disagg
+        # structures on a flip; the per-role buffers of DP attention / expert
+        # parallelism / MoE all-to-all are sized at startup and not rebuilt, so
+        # a flip with those on would silently deadlock. Reject up-front instead.
+        if server_args.enable_pd_role_switch:
+            from sglang.srt.arg_groups.overrides import resolved_view
+
+            view = resolved_view(server_args)
+            unsupported = []
+            if view.enable_dp_attention:
+                unsupported.append("DP attention (--enable-dp-attention)")
+            if view.ep_size > 1:
+                unsupported.append(f"expert parallelism (--ep-size {view.ep_size})")
+            if view.moe_a2a_backend != "none":
+                unsupported.append(
+                    f"MoE all-to-all (--moe-a2a-backend {view.moe_a2a_backend})"
+                )
+            if unsupported:
+                raise ValueError(
+                    "--enable-pd-role-switch is only supported with pure tensor "
+                    "parallelism; per-role buffers for the following are not "
+                    "rebuilt on a flip and would deadlock at switch time: "
+                    + ", ".join(unsupported)
+                    + ". Remove these options or drop --enable-pd-role-switch."
+                )
