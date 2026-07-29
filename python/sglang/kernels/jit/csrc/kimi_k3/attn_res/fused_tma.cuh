@@ -8,12 +8,6 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
-#include <sgl_kernel/ptx/addr.cuh>
-#include <sgl_kernel/ptx/mbarrier.cuh>
-#include <sgl_kernel/ptx/sync.cuh>
-#include <sgl_kernel/ptx/tcgen05.cuh>
-#include <sgl_kernel/ptx/tma.cuh>
-
 #include <tvm/ffi/container/tensor.h>
 
 #include "../../distributed/custom_all_reduce.cuh"
@@ -22,6 +16,192 @@
 #include <cfloat>
 #include <cstdint>
 #include <utility>
+
+// ----------------------------------------------------------------------------
+// Local PTX primitives (mbarrier / bulk TMA / tcgen05 / warp-group sync)
+// ----------------------------------------------------------------------------
+
+namespace ptx {
+
+// Generic ptr -> 32-bit `.shared` address: inline-PTX `.shared` instructions
+// take a byte offset in the shared window, not a generic pointer.
+template <typename T>
+static SGL_DEVICE uint32_t to_shared(T* ptr) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+}
+
+// ---- bulk 1D TMA (PTX ISA §9.7.9.25) ---------------------------------------
+
+// global -> shared::cluster, completed by an smem mbarrier. Arm `bar` with
+// `mbar_arrive_expect_tx(bar, bytes)` before issuing; `bytes` and both
+// endpoints must be 16-byte aligned.
+static SGL_DEVICE void cp_async_bulk_1d_load(void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* bar) {
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+      " [%0], [%1], %2, [%3];" ::"r"(to_shared(smem_dst)),
+      "l"(gmem_src),
+      "r"(bytes),
+      "r"(to_shared(bar))
+      : "memory");
+}
+
+// ---- mbarrier (PTX ISA §9.7.13.15) -----------------------------------------
+//
+// Only the `try_wait.parity` waiter is wrapped; the caller owns the phase
+// counter and flips it at the stage wrap. After `mbar_init` the bar is at
+// parity 0 and each full cycle (count arrivals -> fire -> reset) flips it, so a
+// consumer-first waiter starts at 0 and a producer-first waiter (whose first
+// wait must be a no-op skip) starts at 1. Getting this backwards deadlocks on
+// the second wait.
+static SGL_DEVICE void mbar_init(uint64_t* bar, uint32_t count) {
+  asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(to_shared(bar)), "r"(count));
+}
+
+static SGL_DEVICE uint64_t mbar_arrive(uint64_t* bar) {
+  uint64_t state;
+  asm volatile("mbarrier.arrive.shared.b64 %0, [%1];" : "=l"(state) : "r"(to_shared(bar)));
+  return state;
+}
+
+// Combined arrive + set tx-count, for TMA-load completion.
+static SGL_DEVICE void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
+  asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" ::"r"(to_shared(bar)), "r"(bytes));
+}
+
+// Wait for phase `parity` to complete. Looped because the spec allows spurious
+// early wakeups. The default `.acquire` semantics make prior `cp.async.bulk`
+// writes tracked by this mbarrier visible to later generic-proxy reads on this
+// thread with no `fence.proxy.async` (spec §9.7.13.15.16 point 3).
+static SGL_DEVICE void mbar_wait_parity(uint64_t* bar, uint32_t parity) {
+  asm volatile(
+      "{\n\t.reg .pred p;\n\t"
+      "WAIT_%=: mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t"
+      "@!p bra WAIT_%=;\n\t}\n" ::"r"(to_shared(bar)),
+      "r"(parity));
+}
+
+// Publish mbarrier initialization from the generic proxy before an async engine
+// uses the barrier.
+static SGL_DEVICE void fence_mbarrier_init() {
+  asm volatile("fence.mbarrier_init.release.cluster;");
+}
+
+// ---- warp / warp-group sync (PTX ISA §9.7.4, §9.7.12.6, §9.7.13) -----------
+
+// Partial-CTA rendezvous. `id` must be in [1, 15]; barrier 0 is reserved for
+// the full-CTA barrier behind __syncthreads().
+static SGL_DEVICE void named_barrier_sync(uint32_t id, uint32_t num_threads) {
+  asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(num_threads) : "memory");
+}
+
+// True on exactly one lane of the issuing warp — guards single-issuer sites
+// (mbar init, TMA issue, MMA issue, TMEM alloc) without gating on lane_id.
+static SGL_DEVICE bool elect_one() {
+  uint32_t pred;
+  asm volatile(
+      "{\n\t.reg .pred p;\n\t"
+      "elect.sync _|p, 0xffffffff;\n\t"
+      "selp.b32 %0, 1, 0, p;\n\t}\n"
+      : "=r"(pred));
+  return pred != 0;
+}
+
+// Runtime warp-group register-budget reallocation: widen the epilogue's
+// per-thread budget (so it holds a larger primary array without spilling) by
+// narrowing the mainloop warps, which need few registers.
+//
+// Both forms are `.sync.aligned`: all 128 threads of the issuing warp-group
+// must execute the SAME instruction with the SAME N, from a warp-group
+// boundary (issuing from only one warp of the group hangs). N in [24, 256],
+// multiple of 8, per thread; the CTA total must satisfy
+// sum(warp_group_threads * N) <= 64512 (the safe allocatable cap on B100/B300
+// after ~1024 reserved regs). Caller owns the budgeting — there is no
+// compile-time check, since N per warp-group is orthogonal.
+//
+// This pays only for ASYMMETRIC budgets that ptxas cannot infer from the
+// source. For a symmetric cap, `__launch_bounds__(NUM_THREADS, 1)` is cleaner
+// and measured faster on B100/B300.
+template <int N>
+static SGL_DEVICE void setmaxnreg_dec() {
+  static_assert(N >= 24 && N <= 256, "setmaxnreg N must be in [24, 256]");
+  static_assert((N & 7) == 0, "setmaxnreg N must be a multiple of 8");
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(N));
+}
+
+template <int N>
+static SGL_DEVICE void setmaxnreg_inc() {
+  static_assert(N >= 24 && N <= 256, "setmaxnreg N must be in [24, 256]");
+  static_assert((N & 7) == 0, "setmaxnreg N must be a multiple of 8");
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(N));
+}
+
+// ---- tcgen05 (PTX ISA §9.7.16) ---------------------------------------------
+//
+// Lifecycle (mandatory order, §9.7.16.7.1): alloc (one warp, n_cols a power of
+// 2 in [32, 512], TMEM address written to smem) -> __syncthreads + read taddr
+// -> ld/st -> dealloc -> relinquish before kernel exit.
+//
+// Each warp can only touch its own 32-lane TMEM band (§9.7.16.8.1): warp 0 ->
+// lanes 0-31, warp 1 -> 32-63, and so on. Use `tcgen05_wait_st` /
+// `tcgen05_wait_ld` before consuming the other side of a store / drain.
+static SGL_DEVICE void tcgen05_alloc(uint32_t smem_addr_for_taddr, uint32_t n_cols) {
+  asm volatile(
+      "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(smem_addr_for_taddr), "r"(n_cols));
+}
+
+static SGL_DEVICE void tcgen05_dealloc(uint32_t taddr, uint32_t n_cols) {
+  asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(taddr), "r"(n_cols));
+}
+
+static SGL_DEVICE void tcgen05_relinquish() {
+  asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+}
+
+// .32x32b.x8: 8 b32 per lane = 8 TMEM columns. Per-lane 8 FP32 -> 4 bf16x2
+// packs = one int4, the natural fit for a BF16 epilogue moving a column band
+// with 16-byte smem accesses.
+static SGL_DEVICE void tcgen05_ld_32x32b_x8(
+    uint32_t taddr,
+    uint32_t& r0,
+    uint32_t& r1,
+    uint32_t& r2,
+    uint32_t& r3,
+    uint32_t& r4,
+    uint32_t& r5,
+    uint32_t& r6,
+    uint32_t& r7) {
+  asm volatile(
+      "tcgen05.ld.sync.aligned.32x32b.x8.b32 "
+      " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3), "=r"(r4), "=r"(r5), "=r"(r6), "=r"(r7)
+      : "r"(taddr));
+}
+
+static SGL_DEVICE void tcgen05_ld_32x32b_x8(uint32_t taddr, uint32_t* dst) {
+  tcgen05_ld_32x32b_x8(taddr, dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6], dst[7]);
+}
+
+static SGL_DEVICE void tcgen05_st_32x32b_x8(uint32_t taddr, const uint32_t* src) {
+  asm volatile(
+      "tcgen05.st.sync.aligned.32x32b.x8.b32 "
+      " [%8], {%0, %1, %2, %3, %4, %5, %6, %7};"
+      :
+      : "r"(src[0]),
+        "r"(src[1]),
+        "r"(src[2]),
+        "r"(src[3]),
+        "r"(src[4]),
+        "r"(src[5]),
+        "r"(src[6]),
+        "r"(src[7]),
+        "r"(taddr));
+}
+
+static SGL_DEVICE void tcgen05_wait_st() {
+  asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+}
+
+}  // namespace ptx
 
 namespace sglang {
 
