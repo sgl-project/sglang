@@ -598,6 +598,18 @@ class ServerArgs:
         "A dictionary in JSON string format used to override default model configurations.",
         NS("model"),
     ] = "{}"
+    output_token_map: A[
+        Optional[str],
+        (
+            "Path to a 1D torch tensor containing the global token IDs that may "
+            "be generated. Supported models replace the full LM head with the "
+            "selected rows and map sampled indices back to global token IDs. "
+            "The initial implementation supports tied-embedding Qwen2 models "
+            "with TP1, PP1, no quantization, no LoRA, no speculative decoding, "
+            "and no returned log probabilities."
+        ),
+        NS("model"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Quantization and data type

@@ -16,6 +16,7 @@
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 
+import copy
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -493,13 +494,30 @@ class Qwen2ForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+        output_token_ids = getattr(config, "output_token_ids", None)
+        self.output_token_ids = (
+            torch.as_tensor(output_token_ids, dtype=torch.int64, device="cpu")
+            if output_token_ids is not None
+            else None
+        )
+        if self.output_token_ids is not None and not config.tie_word_embeddings:
+            raise ValueError(
+                "Qwen2 output token mapping requires tied word embeddings."
+            )
         self.model = Qwen2Model(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
         # handle the lm head on different pp ranks
         if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+            if self.output_token_ids is not None:
+                self.lm_head = ParallelLMHead(
+                    self.output_token_ids.numel(),
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                )
+            elif self.pp_group.world_size == 1 and config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
                 self.lm_head = ParallelLMHead(
@@ -512,7 +530,10 @@ class Qwen2ForCausalLM(nn.Module):
             # ranks other than the last rank will have a placeholder layer
             self.lm_head = PPMissingLayer()
 
-        self.logits_processor = LogitsProcessor(config)
+        logits_config = copy.copy(config)
+        if self.output_token_ids is not None:
+            logits_config.vocab_size = self.output_token_ids.numel()
+        self.logits_processor = LogitsProcessor(logits_config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
@@ -533,6 +554,10 @@ class Qwen2ForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if self.output_token_ids is not None and forward_batch.return_logprob:
+            raise ValueError(
+                "Output token mapping does not support returning log probabilities."
+            )
         hidden_states = self.model(
             input_ids,
             positions,
@@ -567,6 +592,10 @@ class Qwen2ForCausalLM(nn.Module):
         split_interval: Tuple[int, int],  # [start, end) 0-based
         input_embeds: torch.Tensor = None,
     ):
+        if self.output_token_ids is not None and forward_batch.return_logprob:
+            raise ValueError(
+                "Output token mapping does not support returning log probabilities."
+            )
         start, end = split_interval
         # embed
         if start == 0:
@@ -646,7 +675,18 @@ class Qwen2ForCausalLM(nn.Module):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
-                        weight_loader(param, loaded_weight)
+                        lm_head_weight = loaded_weight
+                        if self.output_token_ids is not None:
+                            lm_head_weight = loaded_weight.index_select(
+                                0,
+                                self.output_token_ids.to(loaded_weight.device),
+                            )
+                        weight_loader(param, lm_head_weight)
+            elif name == "lm_head.weight" and self.output_token_ids is not None:
+                loaded_weight = loaded_weight.index_select(
+                    0,
+                    self.output_token_ids.to(loaded_weight.device),
+                )
 
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
@@ -725,7 +765,13 @@ class Qwen2ForCausalLM(nn.Module):
                 if embed is not None:
                     lm_head = params_dict["lm_head.weight"]
                     wl = getattr(lm_head, "weight_loader", default_weight_loader)
-                    wl(lm_head, embed.data)
+                    lm_head_weight = embed.data
+                    if self.output_token_ids is not None:
+                        lm_head_weight = embed.data.index_select(
+                            0,
+                            self.output_token_ids.to(embed.device),
+                        )
+                    wl(lm_head, lm_head_weight)
                     loaded.add("lm_head.weight")
 
         return loaded
@@ -734,6 +780,14 @@ class Qwen2ForCausalLM(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
+        if (
+            self.output_token_ids is not None
+            and head.shape[0] != self.output_token_ids.numel()
+        ):
+            head = head.index_select(
+                0,
+                self.output_token_ids.to(head.device),
+            )
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed

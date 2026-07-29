@@ -12,6 +12,10 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarMask,
     GrammarRow,
 )
+from sglang.srt.model_executor.output_token_map import (
+    apply_projected_vocab_mask,
+    project_vocab_tensor,
+)
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
@@ -281,24 +285,40 @@ class SamplingBatchInfo:
             self.acc_additive_penalties = None
             self.acc_scaling_penalties = None
 
-    def apply_logits_bias(self, logits: torch.Tensor):
+    def apply_logits_bias(
+        self,
+        logits: torch.Tensor,
+        output_token_ids: Optional[torch.Tensor] = None,
+    ):
         if self.acc_additive_penalties is not None:
             # Used in the overlap mode
-            logits.add_(self.acc_additive_penalties)
+            logits.add_(
+                project_vocab_tensor(self.acc_additive_penalties, output_token_ids)
+            )
 
         if self.acc_scaling_penalties is not None:
             # Used in the overlap mode
-            apply_scaling_penalties(logits, self.acc_scaling_penalties)
+            apply_scaling_penalties(
+                logits,
+                project_vocab_tensor(self.acc_scaling_penalties, output_token_ids),
+            )
 
         if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
             # Used in the non-overlap mode
-            self.penalizer_orchestrator.apply(logits)
+            self.penalizer_orchestrator.apply(logits, output_token_ids=output_token_ids)
 
         if self.grammar_mask is not None:
-            self.grammar_mask.apply(logits)
+            if output_token_ids is None:
+                self.grammar_mask.apply(logits)
+            else:
+                apply_projected_vocab_mask(
+                    logits,
+                    self.grammar_mask.vocab_mask,
+                    output_token_ids,
+                )
 
         if self.logit_bias is not None:
-            logits.add_(self.logit_bias)
+            logits.add_(project_vocab_tensor(self.logit_bias, output_token_ids))
 
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)

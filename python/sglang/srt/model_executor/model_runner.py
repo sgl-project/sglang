@@ -155,6 +155,10 @@ from sglang.srt.model_executor.model_runner_components.weight_exporter import (
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
 )
+from sglang.srt.model_executor.output_token_map import (
+    map_output_token_indices,
+    validate_output_token_ids,
+)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
     EagerRunner,
@@ -176,7 +180,10 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
+from sglang.srt.speculative.spec_utils import (
+    load_token_map,
+    resolve_num_tokens_per_req,
+)
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.state_capturer.indexer_topk import (
     create_indexer_capturer,
@@ -568,6 +575,7 @@ class ModelRunner:
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
         self.sampler = create_sampler()
+        self.init_output_token_map()
         self.load_model()
         prepare_moe_topk(
             model=self.model,
@@ -601,6 +609,30 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+
+    def init_output_token_map(self):
+        self.output_token_map = None
+        token_map_path = self.server_args.output_token_map
+        if token_map_path is None or self.is_draft_worker:
+            return
+        if self.ps.tp_size != 1 or self.ps.pp_size != 1:
+            raise ValueError("Output token mapping currently requires TP1 and PP1.")
+        if self.model_config.quantization is not None:
+            raise ValueError("Output token mapping does not support quantized models.")
+        if self.server_args.enable_lora:
+            raise ValueError("Output token mapping does not support LoRA.")
+        if self.server_args.enable_dp_lm_head:
+            raise ValueError("Output token mapping does not support DP LM head.")
+        if self.spec_algorithm.is_some():
+            raise ValueError(
+                "Output token mapping does not support speculative decoding."
+            )
+
+        self.output_token_map = validate_output_token_ids(
+            load_token_map(token_map_path),
+            self.model_config.vocab_size,
+        )
+        self.model_config.hf_config.output_token_ids = self.output_token_map.tolist()
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1026,6 +1058,18 @@ class ModelRunner:
         )
         self.loader = loaded.loader
         self.model = loaded.model
+        if self.output_token_map is not None:
+            model_output_token_ids = getattr(self.model, "output_token_ids", None)
+            if model_output_token_ids is None:
+                raise ValueError(
+                    f"{type(self.model).__name__} does not support output token mapping."
+                )
+            if not torch.equal(
+                torch.as_tensor(model_output_token_ids, device="cpu"),
+                self.output_token_map,
+            ):
+                raise ValueError("The model loaded a different output token map.")
+            self.output_token_map = self.output_token_map.to(self.device)
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
                 loaded.remote_instance_weight_info
@@ -1587,7 +1631,16 @@ class ModelRunner:
 
         # Calculate logits bias and apply it to next_token_logits.
         sampling_info.update_regex_vocab_mask()
-        sampling_info.apply_logits_bias(logits_output.next_token_logits)
+        if (
+            self.output_token_map is not None
+            and sampling_info.has_custom_logit_processor
+        ):
+            raise ValueError(
+                "Custom logit processors are not supported with output token mapping."
+            )
+        sampling_info.apply_logits_bias(
+            logits_output.next_token_logits, self.output_token_map
+        )
 
         # Release the vocab_mask GPU tensor immediately after it has been applied
         # to the logits. In overlap scheduling, the sampling_info (and its
@@ -1626,6 +1679,22 @@ class ModelRunner:
                 else forward_batch.seq_lens - 1
             ),
         )
+        if self.output_token_map is not None:
+            next_token_ids = map_output_token_indices(
+                next_token_ids, self.output_token_map
+            )
+            logits_output.next_token_top_logprobs_idx = map_output_token_indices(
+                logits_output.next_token_top_logprobs_idx,
+                self.output_token_map,
+            )
+            logits_output.next_token_token_ids_logprobs_idx = map_output_token_indices(
+                logits_output.next_token_token_ids_logprobs_idx,
+                self.output_token_map,
+            )
+            logits_output.next_token_sampling_mask_idx = map_output_token_indices(
+                logits_output.next_token_sampling_mask_idx,
+                self.output_token_map,
+            )
         self.ngram_embedding_manager.update_after_decode(
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,
