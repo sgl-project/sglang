@@ -5,7 +5,11 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
+from sglang.multimodal_gen.runtime.layers.attention.layer import (
+    UlyssesAttention,
+    UlyssesAttention_VSA,
+    USPAttention,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 _LAYER = "sglang.multimodal_gen.runtime.layers.attention.layer"
@@ -175,6 +179,93 @@ class TestUSPAttentionKVGather(unittest.TestCase):
         expected = _reference_attention(q, full_k, full_v, self.attn.softmax_scale)
 
         torch.testing.assert_close(out, expected)
+
+
+class TestUlyssesAttentionKVGather(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(1)
+        self.heads = 3
+        self.head_dim = 4
+        self.attn = UlyssesAttention.__new__(UlyssesAttention)
+        self.attn.causal = False
+        self.attn.backend = AttentionBackendEnum.TORCH_SDPA
+        self.attn.softmax_scale = self.head_dim**-0.5
+        self.attn.attn_impl = _SdpaAttention(self.attn.softmax_scale)
+        self.attn.sp_attention_mode = "kv_gather"
+
+    def _run(self, q, k, v, gathered, **kwargs):
+        with (
+            patch(
+                f"{_LAYER}.get_forward_context",
+                return_value=SimpleNamespace(attn_metadata=None),
+            ),
+            patch(f"{_LAYER}.get_ring_parallel_world_size", return_value=1),
+            patch(
+                f"{_LAYER}.sequence_model_parallel_all_gather",
+                side_effect=gathered,
+            ),
+        ):
+            return self.attn.forward(
+                q,
+                k,
+                v,
+                kwargs.get("replicated_q"),
+                kwargs.get("replicated_k"),
+                kwargs.get("replicated_v"),
+                kwargs.get("seq_lens"),
+            )
+
+    def test_local_queries_attend_gathered_kv(self):
+        q = torch.randn(1, 3, self.heads, self.head_dim)
+        k = torch.randn(1, 3, self.heads, self.head_dim)
+        v = torch.randn(1, 3, self.heads, self.head_dim)
+        full_k = torch.randn(1, 6, self.heads, self.head_dim)
+        full_v = torch.randn(1, 6, self.heads, self.head_dim)
+
+        out, replicated_out = self._run(q, k, v, [full_k, full_v])
+        expected = _reference_attention(q, full_k, full_v, self.attn.softmax_scale)
+
+        torch.testing.assert_close(out, expected)
+        self.assertIsNone(replicated_out)
+
+    def test_replicated_suffix_is_computed_without_head_sharding(self):
+        q = torch.randn(1, 3, self.heads, self.head_dim)
+        k = torch.randn(1, 3, self.heads, self.head_dim)
+        v = torch.randn(1, 3, self.heads, self.head_dim)
+        replicated_q = torch.randn(1, 2, self.heads, self.head_dim)
+        replicated_k = torch.randn(1, 2, self.heads, self.head_dim)
+        replicated_v = torch.randn(1, 2, self.heads, self.head_dim)
+        full_k = torch.randn(1, 6, self.heads, self.head_dim)
+        full_v = torch.randn(1, 6, self.heads, self.head_dim)
+
+        out, replicated_out = self._run(
+            q,
+            k,
+            v,
+            [full_k, full_v],
+            replicated_q=replicated_q,
+            replicated_k=replicated_k,
+            replicated_v=replicated_v,
+        )
+        full_q = torch.cat([q, replicated_q], dim=1)
+        full_k = torch.cat([full_k, replicated_k], dim=1)
+        full_v = torch.cat([full_v, replicated_v], dim=1)
+        expected = _reference_attention(full_q, full_k, full_v, self.attn.softmax_scale)
+
+        torch.testing.assert_close(out, expected[:, : q.shape[1]])
+        torch.testing.assert_close(replicated_out, expected[:, q.shape[1] :])
+
+    def test_varlen_is_rejected(self):
+        q = torch.randn(1, 3, self.heads, self.head_dim)
+        with self.assertRaisesRegex(NotImplementedError, "varlen"):
+            self._run(q, q, q, [], seq_lens=[3, 3])
+
+    def test_video_sparse_attention_is_rejected(self):
+        attn = UlyssesAttention_VSA.__new__(UlyssesAttention_VSA)
+        attn.sp_attention_mode = "kv_gather"
+        q = torch.randn(1, 3, self.heads, self.head_dim)
+        with self.assertRaisesRegex(NotImplementedError, "video sparse"):
+            attn.forward(q, q, q, gate_compress=q)
 
 
 if __name__ == "__main__":

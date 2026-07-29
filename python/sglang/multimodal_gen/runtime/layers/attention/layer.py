@@ -225,6 +225,7 @@ class UlyssesAttention(nn.Module):
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        sp_attention_mode: str | None = None,
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -265,6 +266,59 @@ class UlyssesAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.backend = attn_backend.get_enum()
         self.dtype = dtype
+        self.causal = causal
+        if sp_attention_mode is None:
+            from sglang.multimodal_gen.runtime.server_args import (
+                get_global_server_args,
+            )
+
+            sp_attention_mode = get_global_server_args().sp_attention_mode
+        if sp_attention_mode not in ("ulysses", "kv_gather"):
+            raise ValueError(
+                "sp_attention_mode must be either 'ulysses' or 'kv_gather'"
+            )
+        self.sp_attention_mode = sp_attention_mode
+
+    def _forward_with_kv_gather(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx_attn_metadata,
+        replicated_q: torch.Tensor | None,
+        replicated_k: torch.Tensor | None,
+        replicated_v: torch.Tensor | None,
+        seq_lens: list[int] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.causal:
+            raise ValueError("K/V-gather SP does not support causal attention.")
+        if get_ring_parallel_world_size() != 1:
+            raise ValueError("K/V-gather SP requires ring_degree=1.")
+        if seq_lens is not None:
+            raise NotImplementedError(
+                "K/V-gather SP does not support varlen UlyssesAttention."
+            )
+        if self.backend.is_sparse:
+            raise NotImplementedError(
+                "K/V-gather SP does not support sparse UlyssesAttention backends."
+            )
+        if any(x is not None for x in (replicated_q, replicated_k, replicated_v)):
+            if any(x is None for x in (replicated_q, replicated_k, replicated_v)):
+                raise ValueError("Replicated Q, K, and V must be provided together.")
+
+        k = sequence_model_parallel_all_gather(k, dim=1)
+        v = sequence_model_parallel_all_gather(v, dim=1)
+
+        local_query_len = q.shape[1]
+        if replicated_q is not None:
+            q = torch.cat([q, replicated_q], dim=1)
+            k = torch.cat([k, replicated_k], dim=1)
+            v = torch.cat([v, replicated_v], dim=1)
+
+        output = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+        if replicated_q is None:
+            return output, None
+        return output[:, :local_query_len], output[:, local_query_len:]
 
     def forward(
         self,
@@ -294,12 +348,24 @@ class UlyssesAttention(nn.Module):
         # Check input shapes
         assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4, "Expected 4D tensors"
         batch_size, seq_len, num_heads, head_dim = q.shape
-        local_rank = get_sp_parallel_rank()
-        world_size = get_sp_world_size()
 
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
 
+        if self.sp_attention_mode == "kv_gather":
+            return self._forward_with_kv_gather(
+                q,
+                k,
+                v,
+                ctx_attn_metadata,
+                replicated_q,
+                replicated_k,
+                replicated_v,
+                seq_lens,
+            )
+
+        local_rank = get_sp_parallel_rank()
+        world_size = get_sp_world_size()
         if seq_lens is not None:
             assert (
                 replicated_q is None and replicated_k is None and replicated_v is None
@@ -384,6 +450,10 @@ class UlyssesAttention_VSA(UlyssesAttention):
                 - o (torch.Tensor): Output tensor after attention for the main sequence
                 - replicated_o (Optional[torch.Tensor]): Output tensor for replicated tokens, if provided
         """
+        if self.sp_attention_mode == "kv_gather":
+            raise NotImplementedError(
+                "K/V-gather SP does not support video sparse attention."
+            )
         # Check text tokens are not supported for VSA now
         assert (
             replicated_q is None and replicated_k is None and replicated_v is None

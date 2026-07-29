@@ -22,7 +22,8 @@ The default `--sp-attention-mode ulysses` uses all-to-all to redistribute
 sequence shards over attention heads. `--sp-attention-mode kv_gather` keeps
 queries sequence-sharded and all-gathers keys and values, then computes each
 rank's local output directly. The K/V-gather mode currently supports
-non-causal attention with `--ring-degree 1`.
+non-causal attention with `--ring-degree 1`. Varlen calls through the legacy
+`UlyssesAttention` adapter and video sparse attention are not supported.
 
 Use SP when sequence length or video shape makes the DiT forward pass the bottleneck and the model supports sequence sharding. For latency-oriented multi-GPU Qwen/Wan deployments, also compare against CFG parallelism and FSDP; SP is not automatically the best multi-GPU setting for every model.
 
@@ -54,7 +55,7 @@ Use SP when sequence length or video shape makes the DiT forward pass the bottle
       <td style={{padding: "9px 12px"}}><code>kv_gather</code></td>
       <td style={{padding: "9px 12px"}}>All-gather K and V; Q and output remain sequence-sharded</td>
       <td style={{padding: "9px 12px"}}>Replicates full K and V within the SP group</td>
-      <td style={{padding: "9px 12px"}}>Non-causal attention and <code>ring_degree=1</code></td>
+      <td style={{padding: "9px 12px"}}>Non-causal attention and <code>ring_degree=1</code>; no legacy varlen or video sparse attention</td>
     </tr>
   </tbody>
 </table>
