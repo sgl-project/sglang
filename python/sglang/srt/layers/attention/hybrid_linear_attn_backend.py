@@ -178,9 +178,14 @@ class MambaAttnBackendBase(AttentionBackend):
                     new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
                     write_pos_buf[uniq_slots] = new_vals
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-            if forward_batch.forward_mode.is_draft_extend_v2():
-                # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model;
-                # skip mamba metadata.
+            has_extend_meta = (
+                forward_batch.extend_start_loc is not None
+                and forward_batch.extend_seq_lens is not None
+            )
+            if forward_batch.forward_mode.is_draft_extend_v2() and not has_extend_meta:
+                # HybridLinearAttnBackend.init_forward_metadata calls all sub-backends
+                # unconditionally, but DRAFT_EXTEND_V2 only runs full-attn layers in
+                # the draft model, so mamba metadata can be skipped.
                 query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
                 ragged_layout = forward_batch.spec_info.ragged_verify_layout
@@ -984,6 +989,17 @@ class HybridLinearAttnBackend(AttentionBackend):
             and self.linear_attn_backend.supports_ragged_verify_graph
         )
 
+    @property
+    def use_mha(self) -> bool:
+        return getattr(self.full_attn_backend, "use_mha", False)
+
+    @property
+    def kv_cache_dtype(self):
+        # DSA/NSA fused-rope path (forward_mla._fuse_rope_for_trtllm_mla) reads
+        # this off get_attn_backend(), which returns this wrapper; delegate to
+        # the wrapped full-attn (DSA) backend that actually owns it.
+        return getattr(self.full_attn_backend, "kv_cache_dtype", None)
+
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
     ) -> bool:
@@ -1043,6 +1059,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         init = getattr(self.full_attn_backend, "init_mha_chunk_metadata", None)
         if init is not None:
             init(forward_batch, disable_flashinfer_ragged)
+
+    def get_indexer_metadata(self, layer_id, forward_batch):
+        return self.full_attn_backend.get_indexer_metadata(layer_id, forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
