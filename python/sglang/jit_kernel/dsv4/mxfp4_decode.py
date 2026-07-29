@@ -38,6 +38,7 @@ def mxfp4_decode_attention(
     page_indices: torch.Tensor,
     sm_scale: float,
     page_size: int = 128,
+    num_valid: int = 0,
     attn_sink: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused MXFP4 decode attention.
@@ -48,6 +49,7 @@ def mxfp4_decode_attention(
         page_indices: [N] int32 — page numbers per query.
         sm_scale:     float — 1/sqrt(head_dim).
         page_size:    int — tokens per page (128 for DSV4 SWA).
+        num_valid:    int — actual valid tokens (0 = scan all page_size tokens).
         attn_sink:    [N] float32 or None — per-head sink values.
 
     Returns:
@@ -79,6 +81,7 @@ def mxfp4_decode_attention(
         o,
         sm_scale,
         page_size,
+        num_valid,
     )
     return o
 

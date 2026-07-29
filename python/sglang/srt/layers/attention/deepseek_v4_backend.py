@@ -1634,6 +1634,7 @@ class DeepseekV4AttnBackend(
                 # Decode: fused MXFP4 jit_kernel
                 return self._forward_mxfp4_decode(
                     q=q,
+                    forward_batch=forward_batch,
                     swa_k_cache=swa_k_cache,
                     swa_page_indices=core_attn_metadata.swa_page_indices,
                     swa_topk_lengths=core_attn_metadata.swa_topk_lengths,
@@ -1760,6 +1761,7 @@ class DeepseekV4AttnBackend(
     def _forward_mxfp4_decode(
         self,
         q: torch.Tensor,
+        forward_batch,  # ForwardBatch
         swa_k_cache: torch.Tensor,
         swa_page_indices: torch.Tensor,
         swa_topk_lengths: torch.Tensor,
@@ -1784,6 +1786,17 @@ class DeepseekV4AttnBackend(
             q = q.reshape(-1, q.shape[-1])
         assert q.ndim == 2 and q.shape[1] == MXFP4_TOTAL_DIM
         N_heads = q.shape[0]
+
+        # Compute valid token count for SWA window.
+        # For decode, the K cache contains seq_len tokens (prefill + decode so far).
+        # The SWA window is the last min(seq_len, swa_window) tokens.
+        swa_window = 128
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        if seq_lens is not None and seq_lens.numel() > 0:
+            seq_len = int(seq_lens[0].item())
+        else:
+            seq_len = swa_window  # conservative: scan full page
+        num_valid = min(seq_len, swa_window)
 
         # Pad indices/attn_sink to match q shape
         def _match(x, value):
@@ -1818,7 +1831,12 @@ class DeepseekV4AttnBackend(
             # only handles one page per head; fall back to dequant+SDPA
             # when two pages are needed (at page boundaries).
             needs_multi_page = bool((swa_topk_lengths > 1).any().item())
-            if needs_multi_page:
+            # When seq_len > swa_window, the SWA window may not start at
+            # position 0 within the kernel page, or may span two kernel
+            # pages within the same physical page. Fall back to SDPA
+            # which dequants the full physical page and correctly slices.
+            swa_offset_within_page = seq_len > swa_window
+            if needs_multi_page or swa_offset_within_page:
                 # Fallback: dequant all needed pages → SDPA
                 return self._mxfp4_decode_sdpa_fallback(
                     q=q,
@@ -1840,6 +1858,7 @@ class DeepseekV4AttnBackend(
                 page_indices=swa_kernel_indices,
                 sm_scale=self.softmax_scale,
                 page_size=swa_window,
+                num_valid=num_valid,
                 attn_sink=attn_sink if attn_sink is not None else None,
             )
             return out_flat.view(*q_orig_shape[:-1], -1)

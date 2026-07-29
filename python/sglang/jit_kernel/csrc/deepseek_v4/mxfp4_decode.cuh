@@ -74,6 +74,7 @@ struct Mxfp4DecodeParams {
   float sm_scale;
   uint32_t page_stride_bytes;
   uint32_t page_size;
+  uint32_t num_valid;  // actual valid tokens in page (0 = read all page_size)
   uint32_t num_queries;
 };
 
@@ -119,7 +120,9 @@ __global__ void mxfp4_decode_kernel(const __grid_constant__ Mxfp4DecodeParams pa
   float o_val[kValsPerLane] = {};
 
   // ---- scan tokens ----------------------------------------------------------
-  for (uint32_t tk = 0; tk < params.page_size; ++tk) {
+  const uint32_t tk_end =
+      (params.num_valid > 0 && params.num_valid < params.page_size) ? params.num_valid : params.page_size;
+  for (uint32_t tk = 0; tk < tk_end; ++tk) {
     const auto* row = page_base + static_cast<size_t>(tk) * kBytesPerToken;
     float k_val[kValsPerLane];
 
@@ -200,7 +203,8 @@ struct Mxfp4DecodeKernel {
       const tvm::ffi::Optional<tvm::ffi::TensorView> attn_sink,
       const tvm::ffi::TensorView o,
       float sm_scale,
-      int64_t page_size) {
+      int64_t page_size,
+      int64_t num_valid = 0) {
     using namespace host;
     auto B = SymbolicSize{"num_queries"};
     auto D = SymbolicDevice{};
@@ -229,6 +233,7 @@ struct Mxfp4DecodeKernel {
         .sm_scale = sm_scale,
         .page_stride_bytes = static_cast<uint32_t>(static_cast<uint32_t>(page_size) * kBytesPerToken),
         .page_size = static_cast<uint32_t>(page_size),
+        .num_valid = static_cast<uint32_t>(num_valid),
         .num_queries = nq,
     };
     LaunchKernel(div_ceil(nq, kNumWarps), kBlockSize, D.unwrap())
