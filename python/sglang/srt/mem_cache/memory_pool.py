@@ -507,7 +507,7 @@ class MambaPool:
                 # temporal are strided views into it (see mem_cache/layout/
                 # page_major.py). Only the standard CUDA Triton path is supported.
                 assert not _is_npu and not (
-                    _is_cpu and _cpu_has_amx_support
+                    _is_cpu and _is_cpu_amx_available
                 ), "envelope_layout mamba is only supported on the CUDA path"
                 max_slots = size + 1
                 entry_bytes = mamba_entry_bytes(
@@ -548,7 +548,7 @@ class MambaPool:
                         conv_state[0], conv_state_shape, speculative_num_draft_tokens
                     )
 
-                if _is_cpu and _cpu_has_amx_support:
+                if _is_cpu and _is_cpu_amx_available:
                     from sglang.srt.layers.amx_utils import _init_amx_conv_state
 
                     # CPU uses a different layout of conv_state for kernel optimization
@@ -641,18 +641,6 @@ class MambaPool:
                         dtype=torch.float32,
                         device=device,
                     )
-
-            if _is_cpu and _is_cpu_amx_available:
-                from sglang.srt.layers.amx_utils import _init_amx_conv_state
-
-                # CPU uses a different layout of conv_state for kernel optimization
-                conv_state = _init_amx_conv_state(conv_state)
-
-            temporal_state = torch.zeros(
-                size=(num_mamba_layers, size + 1) + temporal_state_shape,
-                dtype=ssm_dtype,
-                device=device,
-            )
             if speculative_num_draft_tokens is not None:
                 if _is_npu:
                     temporal_state = temporal_state.transpose(-1, -2)
