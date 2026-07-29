@@ -2,6 +2,7 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
@@ -51,6 +52,19 @@ def _get_float4_e2m1fn_x2_dtype():
         if npu_dtype is not None:
             return npu_dtype
     return getattr(torch, "float4_e2m1fn_x2", None)
+
+
+def _prepare_mxfp4_w4a8_bias(
+    bias: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Match the A8W4 ``npu_quant_matmul`` bias contract."""
+    if bias is None:
+        return None
+    if bias.dtype != torch.bfloat16:
+        bias = bias.to(torch.bfloat16)
+    if bias.dim() == 1:
+        bias = bias.unsqueeze(0)
+    return bias
 
 
 class _NPULinearMethodBase(LinearMethodBase):
@@ -203,10 +217,15 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         weight = layer.weight.data
         if weight.dtype == torch.float8_e4m3fn:
             # Offline (ModelSlim) path: weight is already MXFP8-quantised and
-            # layer.weight_scale holds the uint8 block scales [out, in/32]. Only
-            # re-layout to [in, out] / [in//64, out, 2] strided views below.
+            # layer.weight_scale holds one uint8 scale per 32 input elements.
+            # Pair the scales for the NPU kernel, padding an odd final count
+            # (e.g. K=4304 -> 135 scales -> 136 -> 68 pairs).
             n_dim, k_dim = layer.weight_scale.data.shape
-            scale = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
+            scale_data = layer.weight_scale.data
+            if k_dim % 2 != 0:
+                scale_data = F.pad(scale_data, (0, 1), mode="constant", value=0)
+                k_dim += 1
+            scale = scale_data.reshape(n_dim, k_dim // 2, 2)
             layer.weight = Parameter(weight.transpose(0, 1), requires_grad=False)
             layer.weight_scale_inv = Parameter(
                 scale.transpose(0, 1), requires_grad=False
@@ -448,17 +467,6 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
             w_scale = w_scale.reshape(n, k // 2, 2)
         layer.weight_scale = Parameter(w_scale.transpose(-3, -2), requires_grad=False)
 
-        # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
-        if (
-            getattr(layer, "bias", None) is not None
-            and layer.bias.dtype != torch.float32
-        ):
-            layer.bias_fp32 = Parameter(
-                layer.bias.data.to(torch.float32), requires_grad=False
-            )
-        else:
-            layer.bias_fp32 = None
-
     def apply(
         self,
         layer: torch.nn.Module,
@@ -482,17 +490,9 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        # Use the cached FP32 bias from process_weights_after_loading; fall back
-        # to per-call conversion if the cache was bypassed (e.g. dynamic bias).
-        if bias is None:
-            quant_bias = None
-        elif (
-            bias is getattr(layer, "bias", None)
-            and getattr(layer, "bias_fp32", None) is not None
-        ):
-            quant_bias = layer.bias_fp32
-        else:
-            quant_bias = bias.to(torch.float32)
+        # A8W4 requires BF16 bias with shape [1, out_features]. Qwen3 text
+        # layers normally have no bias; Qwen3.5 vision QKV projections do.
+        quant_bias = _prepare_mxfp4_w4a8_bias(bias)
 
         # True W4(weight)A8(activation) matmul, identical to the offline path.
         output = torch.ops.npu.npu_quant_matmul(
@@ -605,8 +605,8 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        if bias is not None and bias.dtype != torch.float32:
-            bias = bias.to(torch.float32)
+        # Keep the offline path on the same A8W4 bias contract as online.
+        quant_bias = _prepare_mxfp4_w4a8_bias(bias)
 
         # W4(weight)A8(activation) matmul, mirroring vllm-ascend exactly.
         output = torch.ops.npu.npu_quant_matmul(
@@ -616,7 +616,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
             scale_dtype=e8m0_dtype,
             pertoken_scale=dynamic_scale,
             pertoken_scale_dtype=e8m0_dtype,
-            bias=bias,
+            bias=quant_bias,
             output_dtype=original_dtype,
             x2_dtype=fp4_dtype,
             group_sizes=[0, 0, MXFP4_BLOCK_SIZE],
@@ -767,32 +767,24 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
 
 
 class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
-    """Ascend NPU offline W4A4 (ModelSlim ``W4A4_MXFP4``): fp8-container FP4 weights.
+    """Ascend NPU offline W4A4 (ModelSlim ``W4A4_MXFP4``): packed FP4 weights.
 
     Kernel for the offline ``ModelSlimMXFP4Scheme`` (delegated as ``self.kernel``).
-    The msmodelslim ``W4A4_MXFP4`` checkpoint stores weights as **fp4-in-fp8
-    container** (``float8_e4m3fn`` [out, in], one FP4 value per byte) plus UE8M0
-    block scales (``uint8`` [out, in//32]). The weight is re-packed to
-    ``float4_e2m1fn_x2`` (two FP4 per byte) and the scale reshaped to 3D; it then
+    The msmodelslim ``W4A4_MXFP4`` checkpoint stores weights as packed ``uint8``
+    [out, in//2] (two FP4 values per byte) plus UE8M0 block scales (``uint8``
+    [out, in//32]). The weight is transposed and the scale reshaped to 3D; it then
     shares the online :class:`NPUSingleLevelMXFP4LinearMethod` matmul (``apply``)
     exactly — only the weight source differs (msmodelslim checkpoint vs online RTN).
     Mirrors vllm-ascend's single-level W4A4 MXFP4 layout.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Re-pack fp8-container FP4 to float4_e2m1fn_x2 and pre-transpose to match
-        # the online path's layout. All NPU ops go through torch.ops.npu.* (no
-        # torch_npu); the fp4 dtype must be the torch_npu enum (helper).
-        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-
         weight = layer.weight.data
         if not weight.is_npu:
             weight = weight.to(f"npu:{torch.npu.current_device()}")
-        # fp8 container -> float4_e2m1fn_x2 (2 FP4 per byte): [out, in] -> [out, in//2].
-        weight_fp4 = torch.ops.npu.npu_dtype_cast(weight, fp4_dtype)
-        # Transpose to [in//2, out]; no .contiguous() (preserve the strided view so
-        # the block-scale mapping stays intact).
-        layer.weight = Parameter(weight_fp4.transpose(0, 1), requires_grad=False)
+        # The checkpoint is already packed two-FP4-per-byte. Preserve the strided
+        # transpose used by vllm-ascend and by the online path.
+        layer.weight = Parameter(weight.transpose(0, 1), requires_grad=False)
 
         weight_scale = layer.weight_scale.data
         if not weight_scale.is_npu:

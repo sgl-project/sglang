@@ -39,6 +39,27 @@ class NPUSwigluQuant(BaseActivation):
         return hidden_states, swiglu_out_scale
 
 
+class NPUSwigluMXFP8Quant(BaseActivation):
+    """SwiGLU then MXFP8 requantisation for W4A8 MXFP MoE.
+
+    gmm1 (fp4 weights) produces bf16 output; this activation step runs
+    ``npu_swiglu`` then ``npu_dynamic_mx_quant(dst_type=float8_e4m3fn)`` to
+    produce the e4m3 payload + e8m0 block scale that gmm2 expects.  Mirrors
+    vllm-ascend's separate swiglu + requant for W4A8MXFP (which uses
+    ``npu_swiglu_group_quant``; here we use the standard swiglu +
+    dynamic-mx-quant pair instead of a custom fused op).
+    """
+
+    def _apply_activation(self, hidden_states: torch.Tensor):
+        # hidden_states: gmm1 output [tokens, 2*inter] bf16
+        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+        # [tokens, inter] → FP8 e4m3 + e8m0 block scale
+        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            hidden_states, dst_type=torch.float8_e4m3fn
+        )
+        return hidden_states, swiglu_out_scale
+
+
 class NPUSwigluQuantWithScales(BaseActivation):
     def _apply_activation(
         self,
