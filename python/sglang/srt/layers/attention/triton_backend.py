@@ -46,10 +46,10 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
     get_int_env_var,
-    is_hcu,
     is_cuda,
     is_gfx95_supported,
     is_gfx942_supported,
+    is_hcu,
     is_xpu,
     next_power_of_2,
 )
@@ -57,6 +57,7 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_gfx942 = is_gfx942_supported()
 _is_xpu = is_xpu()
+_is_hcu = is_hcu()
 
 if _is_cuda:
     from sgl_kernel.utils import is_arch_support_pdl
@@ -989,7 +990,7 @@ class TritonAttnBackend(AttentionBackend):
             self.cuda_graph_kv_indices = kv_indices_buf
 
         custom_mask_numel = max_num_tokens * self.max_context_len
-        if is_hcu():
+        if _is_hcu:
             # EAGLE verify includes a per-request draft-token square in addition
             # to the context mask. Keep the extra capacity HCU-only for now.
             num_tokens_per_req = max_num_tokens // max_bs
