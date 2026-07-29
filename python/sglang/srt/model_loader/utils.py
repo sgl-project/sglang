@@ -20,6 +20,39 @@ from sglang.srt.layers import deep_gemm_wrapper
 logger = logging.getLogger(__name__)
 
 
+def configure_quant_config(quant_config: Any, model_class: Type[nn.Module]) -> None:
+    """Give the quantization config the model's fused-module mapping.
+
+    Quantized checkpoints name the *unfused* projections (``q_proj``, ``k_proj``,
+    ``v_proj``) while sglang builds fused modules (``qkv_proj``). Quantization
+    configs bridge that with ``packed_modules_mapping``, and
+    ``QuantizationConfig`` documents it as "updated by models as they
+    initialize" -- but only two of the 39 models that declare the attribute
+    actually assign it, so for the rest the mapping stays empty and a fused
+    module either silently misses its scheme or raises "Unable to find matching
+    target ...". Wiring it here covers every model and every loader.
+
+    Any mapping already on the config (e.g. supplied through
+    ``quantization_config.packed_modules_mapping`` in ``config.json``) wins, so
+    existing overrides keep working. Models that still assign the mapping in
+    their ``__init__`` are unaffected: they simply overwrite it with the same
+    value.
+    """
+    if quant_config is None:
+        return
+
+    packed_mapping = getattr(model_class, "packed_modules_mapping", None)
+    if not packed_mapping:
+        return
+
+    existing = getattr(quant_config, "packed_modules_mapping", None) or {}
+    merged = {**packed_mapping, **existing}
+    if hasattr(quant_config, "update_packed_modules_mapping"):
+        quant_config.update_packed_modules_mapping(merged)
+    else:
+        quant_config.packed_modules_mapping = merged
+
+
 @contextlib.contextmanager
 def set_default_torch_dtype(dtype: torch.dtype):
     """Sets the default torch dtype to the given dtype."""

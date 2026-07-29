@@ -83,6 +83,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
 from sglang.srt.model_loader.utils import (
+    configure_quant_config,
     get_model_architecture,
     set_default_torch_dtype,
 )
@@ -308,6 +309,9 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
+    # Must run before the model is built: layers resolve their quant method
+    # during __init__, so a fused module needs the mapping already in place.
+    configure_quant_config(quant_config, model_class)
     kwargs = {
         "config": model_config.hf_config,
         "quant_config": quant_config,
