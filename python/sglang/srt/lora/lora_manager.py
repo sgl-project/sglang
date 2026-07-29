@@ -415,6 +415,13 @@ class LoRAManager:
                     notify(slot_ids)
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
+        if forward_batch.forward_mode.is_idle():
+            # DP-attention idle forward: zero local tokens; clear per-batch
+            # state so the LoRA layers take the base path instead of reading
+            # the previous batch's stale metadata.
+            self.lora_backend.reset_batch_state()
+            return
+
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
