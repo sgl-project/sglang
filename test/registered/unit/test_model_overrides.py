@@ -891,7 +891,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _nemotron_h_overrides(_args("modelopt", hf_mixed_mxfp8), hf_mixed_mxfp8),
                 {
                     "quantization": "modelopt_mixed",
-                    "moe_runner_backend": "marlin",
+                    "moe_runner_backend": "flashinfer_trtllm",
                     "attention_backend": "flashinfer",
                 },
             )
