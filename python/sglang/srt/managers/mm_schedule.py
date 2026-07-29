@@ -213,6 +213,7 @@ def _acknowledge_deferred_cuda_ipc_cache_hits(
 
 
 def _embedding_token_count(embedding: torch.Tensor) -> int:
+    """Count encoder tokens so stale cache geometry is rejected pre-forward."""
     if embedding.ndim == 0 or embedding.shape[-1] == 0:
         return 0
     return embedding.numel() // embedding.shape[-1]

@@ -63,6 +63,8 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
         )
 
     def _process_audio_encoder_windows(self, base_output, window_config):
+        """Split one audio into per-window mm items; windowing requires exactly
+        one audio item so window offsets in the prompt stay unambiguous."""
         raw_items = base_output.audios
         if len(base_output.organize_results()) != 1 or len(raw_items) != 1:
             raise ValueError("audio windowing requires exactly one audio item")

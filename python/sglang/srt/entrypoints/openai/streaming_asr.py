@@ -199,6 +199,8 @@ class StreamingASRState:
     def commit_decoder_suffix(
         self, decision: DecoderSuffixDecision, *, is_last: bool
     ) -> str:
+        """Apply a previewed decision; preview and commit are split so a mode
+        fallback can discard the preview without touching emitted state."""
         self.chunk_index += 1
         if decision.pending_suffix is None:
             return ""
@@ -207,6 +209,7 @@ class StreamingASRState:
         return delta
 
     def finalize_decoder_suffix(self) -> str:
+        """Emit the pending suffix at item end: no further decode will confirm it."""
         delta = self._record_emit(self.pending_suffix)
         self._set_suffix_candidate("")
         return delta
@@ -424,6 +427,8 @@ def _join_words(prev: str, cur: str) -> str:
 
 
 def _dedupe_norm(word: str) -> str:
+    """Normalize a word so recasing and edge-punctuation drift between decodes
+    cannot break overlap matching."""
     word = unicodedata.normalize("NFKC", word)
     lo, hi = 0, len(word)
     while lo < hi and unicodedata.category(word[lo])[0] == "P":

@@ -82,6 +82,9 @@ class RealtimeASRState(msgspec.Struct):
 
 
 class _InferencePlan(msgspec.Struct, frozen=True):
+    """One request's mode and audio range, fixed before inference so a failed
+    request leaves no partial state and _commit can apply it atomically."""
+
     is_last: bool
     windowed: bool
     committed_text: str
@@ -91,6 +94,9 @@ class _InferencePlan(msgspec.Struct, frozen=True):
 
 
 class _InferenceResult(msgspec.Struct, frozen=True):
+    """Inference outcome; accept_audio=False defers the covered audio so the
+    next request decodes it again instead of losing it."""
+
     accept_audio: bool
     direct_delta: str = ""
     decoder_decision: Optional[DecoderSuffixDecision] = None
@@ -103,6 +109,9 @@ class _InferenceResult(msgspec.Struct, frozen=True):
 
 
 class _WindowedPolicy(msgspec.Struct, frozen=True):
+    """Windowed-mode knobs, resolved once per connection because every input
+    (adapter config, model window geometry) is fixed for its lifetime."""
+
     window_config: AudioEncoderWindowConfig
     decoder_prefix_max_tokens: int
     decoder_prefix_holdback_words: int
@@ -151,6 +160,8 @@ class RealtimeASRProcessor:
     def _resolve_windowed_policy(
         self, state: StreamingASRState
     ) -> Optional[_WindowedPolicy]:
+        """Resolve the windowed policy, or None to keep the cumulative path;
+        an invalid or missing config must degrade the connection, not fail it."""
         declared = self.adapter.realtime_long_audio_config
         if not isinstance(declared, dict):
             return None
@@ -196,6 +207,7 @@ class RealtimeASRProcessor:
         )
 
     def finalize(self, state: RealtimeASRState) -> str:
+        """Emit text still held back when the item commits without new audio."""
         if state.windowed_started:
             return state.transcript.finalize_decoder_suffix()
         return state.transcript.finalize()
@@ -207,6 +219,11 @@ class RealtimeASRProcessor:
         is_last: bool,
         sampling_params: Dict[str, Any],
     ) -> str:
+        """Run one inference round (plan -> infer -> commit) and return the delta.
+
+        Windowed inference previews without mutating transcript state, so when
+        its first decode reveals no-whitespace CJK the same audio is simply
+        redone on the cumulative path with nothing to roll back."""
         # No-whitespace CJK cannot use the word-based decoder-prefix path.
         if (
             self._windowed_policy is not None
@@ -257,10 +274,7 @@ class RealtimeASRProcessor:
             and not state.windowed_disabled
             and (
                 state.windowed_started
-                or (
-                    not is_last
-                    and audio.received_bytes > policy.activation_bytes
-                )
+                or (not is_last and audio.received_bytes > policy.activation_bytes)
             )
         ):
             return _InferencePlan(
@@ -284,6 +298,8 @@ class RealtimeASRProcessor:
         )
 
     def _windowed_start_offset(self, state: RealtimeASRState) -> int:
+        """Pick a window-aligned start so resent windows keep their cache
+        identity; never advances past unaccepted (deferred) audio."""
         policy = self._windowed_policy
         assert policy is not None
         audio = state.audio
@@ -318,6 +334,8 @@ class RealtimeASRProcessor:
         plan: _InferencePlan,
         sampling_params: Dict[str, Any],
     ) -> _InferenceResult:
+        """Re-transcribe the whole buffer and reconcile it against emitted
+        text -- main's behavior, kept byte-identical below the gate."""
         samples = await self._snapshot_samples(
             state.audio, plan.start_offset_bytes, plan.end_offset_bytes
         )
@@ -335,6 +353,13 @@ class RealtimeASRProcessor:
         plan: _InferencePlan,
         sampling_params: Dict[str, Any],
     ) -> _InferenceResult:
+        """Decode only the transcript continuation for the rolling window.
+
+        Flow: budget the intermediate decode by new-audio length (so one stuck
+        decode cannot spend the final-commit budget) -> generate with the
+        decoder prefix -> the first windowed decode adopts the cumulative
+        tail; a later voiced-but-empty decode is deferred at most one window
+        -> preview the suffix delta for _commit."""
         policy = self._windowed_policy
         assert policy is not None
         if plan.start_offset_bytes % policy.window_bytes:
@@ -423,6 +448,9 @@ class RealtimeASRProcessor:
         plan: _InferencePlan,
         result: _InferenceResult,
     ) -> None:
+        """Apply the result: `attempted` always advances so pacing waits for
+        new audio; `accepted` and PCM compaction advance only when the result
+        entered the transcript."""
         audio = state.audio
         audio.attempted_offset_bytes = plan.end_offset_bytes
         if result.decoder_decision is not None:

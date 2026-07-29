@@ -19,6 +19,9 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 
 
 class AudioEncoderWindowConfig(msgspec.Struct, frozen=True):
+    """Window geometry in samples and encoder tokens, resolved once from the
+    model config so every request splits audio identically."""
+
     min_input_samples: int
     window_samples: int
     window_tokens: int
