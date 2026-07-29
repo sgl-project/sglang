@@ -301,13 +301,14 @@ impl GenerateBody {
                 input_ids,
                 sampling_params,
                 stream,
-                return_logprob,
-                logprob_start_len,
-                top_logprobs_num,
+                // Python `GenerateReqInput` defaults.
+                return_logprob: return_logprob.unwrap_or(false),
+                logprob_start_len: logprob_start_len.unwrap_or(-1),
+                top_logprobs_num: top_logprobs_num.unwrap_or(0),
                 // `Some` here means "these ids were requested", so an empty list
                 // collapses to None.
                 token_ids_logprob: token_ids_logprob.filter(|ids| !ids.is_empty()),
-                return_hidden_states,
+                return_hidden_states: return_hidden_states.unwrap_or(false),
                 return_text_in_logprobs,
             },
         )
@@ -359,15 +360,18 @@ pub struct GenerateRequest {
     /// Whether the client asked for SSE streaming.
     pub stream: bool,
     /// Logprob / hidden-state options. This path bypasses the Python
-    /// `TokenizerManager`, so the ingress replicates its scalar normalization
-    /// (defaults applied in `to_header_msgpack`) before the scheduler sees them.
-    pub return_logprob: Option<bool>,
-    pub logprob_start_len: Option<i64>,
-    pub top_logprobs_num: Option<i64>,
+    /// `TokenizerManager`, so `into_requests` replicates its scalar
+    /// normalization. Resolved to concrete values THERE rather than at the wire
+    /// boundary: an `Option` surviving past construction invites two call sites
+    /// to disagree about what absent means, and only the wire knew the answer.
+    /// The defaults are `GenerateReqInput`'s own.
+    pub return_logprob: bool,
+    pub logprob_start_len: i64,
+    pub top_logprobs_num: i64,
     /// This request's `token_ids_logprob` ids, fanned out by `into_requests` and
     /// collapsed to `None` when empty (the scheduler branches on `is not None`).
     pub token_ids_logprob: Option<TokenIds>,
-    pub return_hidden_states: Option<bool>,
+    pub return_hidden_states: bool,
     /// Decode logprob token ids to text in each `[logprob, token_id, text]` tuple
     /// (default leaves the text slot null). Deliberately NOT in the scheduler
     /// header — Python's `TokenizedGenerateReqInput` has no such field either;
@@ -741,19 +745,19 @@ mod tests {
         let (ps, _) =
             requests(r#"{"text": ["a", "b"], "return_logprob": true, "top_logprobs_num": 3}"#)
                 .unwrap();
-        assert_eq!(ps[0].return_logprob, Some(true));
-        assert_eq!(ps[1].top_logprobs_num, Some(3));
+        assert!(ps[0].return_logprob);
+        assert_eq!(ps[1].top_logprobs_num, 3);
 
         let (ps, _) = requests(
             r#"{"text": ["a", "b"], "return_logprob": [true, false],
                 "logprob_start_len": [0, 2], "return_hidden_states": [false, true]}"#,
         )
         .unwrap();
-        assert_eq!(ps[0].return_logprob, Some(true));
-        assert_eq!(ps[1].return_logprob, Some(false));
-        assert_eq!(ps[0].logprob_start_len, Some(0));
-        assert_eq!(ps[1].logprob_start_len, Some(2));
-        assert_eq!(ps[1].return_hidden_states, Some(true));
+        assert!(ps[0].return_logprob);
+        assert!(!ps[1].return_logprob);
+        assert_eq!(ps[0].logprob_start_len, 0);
+        assert_eq!(ps[1].logprob_start_len, 2);
+        assert!(ps[1].return_hidden_states);
 
         let err = requests(r#"{"text": ["a", "b"], "return_logprob": [true]}"#).unwrap_err();
         assert!(
