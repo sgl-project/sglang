@@ -26,6 +26,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
@@ -164,7 +165,7 @@ def _aiter_fp8_paged_mqa_logits(
         page_table.to(torch.int32),
         max_seq_len,
         KVBlockSize=kv_block_size,
-        Preshuffle=True,
+        Preshuffle=aiter_can_use_preshuffle_paged_mqa(),
     )
     return logits
 

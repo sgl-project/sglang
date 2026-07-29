@@ -104,7 +104,7 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 # Workaround: Pull latest (up to 0722) for gfx1250 support
-ENV AITER_COMMIT_DEFAULT="604e41158eefa4317a1d3aa9945c410c239a9f58"
+ENV AITER_COMMIT_DEFAULT="v0.1.19"
 ENV TRITON_COMMIT_DEFAULT="c57bbbd8c1d83a8388baa508cf1286bfdad1695d"
 ENV MORI_COMMIT_DEFAULT="e31d426a13e96e1cbff96a1c904d291aefe8c46a"
 
@@ -116,7 +116,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV AITER_COMMIT_DEFAULT="v0.1.19"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -126,7 +126,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV AITER_COMMIT_DEFAULT="v0.1.19"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # ===============================
@@ -137,7 +137,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV AITER_COMMIT_DEFAULT="v0.1.19"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -147,7 +147,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV AITER_COMMIT_DEFAULT="v0.1.19"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # Local source stage: with BRANCH_TYPE=local the build context is copied here and
@@ -434,7 +434,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
        fi \
     && rm -rf /tmp/local_src \
     && cd sglang \
-    && cd sgl-kernel \
+    && cd python/sglang/kernels/aot \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
     && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install
