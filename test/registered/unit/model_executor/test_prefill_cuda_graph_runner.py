@@ -8,6 +8,7 @@ import torch
 
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -212,7 +213,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._capture_req_slots = 4
         runner.enable_lora = False
-        runner.capture_hidden_mode = None
+        runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.max_num_tokens = 32
         runner.capture_num_tokens = [4]
         runner.backend = SimpleNamespace()
@@ -227,7 +228,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             input_embeds=None,
             replace_embeds=None,
             forward_mode=SimpleNamespace(is_target_verify=lambda: False),
-            capture_hidden_mode=None,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens_cpu=None,
             return_logprob=False,
             extend_prefix_lens_cpu=[8],
