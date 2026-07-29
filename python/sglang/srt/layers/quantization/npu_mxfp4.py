@@ -2,10 +2,9 @@
 
 Triggered by ``--quantization mxfp_w4a8``.
 
-Online mode: FP16/BF16 weights are quantised to MXFP4 in
-``process_weights_after_loading``; activations are dynamically quantised to
-MXFP8 (``float8_e4m3fn`` + UE8M0 block scale) at inference time and the matmul
-runs via ``npu_quant_matmul`` with FP4 weights.
+Online mode currently quantises only MoE expert weights to MXFP4. Other Linear
+layers stay in BF16 so the online accuracy experiment matches the expert-only
+W4A8 scope used by the offline recipe more closely.
 
 The config is device-agnostic and dispatches per device in
 ``get_quant_method``; only the Ascend NPU backend (Ascend 950 / A5) is
@@ -14,7 +13,6 @@ implemented today.
 
 from __future__ import annotations
 
-import logging
 from typing import Dict, List, Optional
 
 import torch
@@ -30,15 +28,12 @@ from sglang.srt.layers.quantization.unquant import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import is_npu
 
-logger = logging.getLogger(__name__)
-
-
 class Mxfp4W4A8Config(QuantizationConfig):
-    """MXFP4 W4A8 online quantization config; dispatches per device.
+    """Expert-only MXFP4 W4A8 online quantization config.
 
-    True W4(weight) A8(activation): weights are quantised online to MXFP4 and
-    activations to MXFP8 at inference time. The device-specific linear method
-    is selected in ``get_quant_method``; only Ascend NPU is wired up today.
+    MoE expert weights are quantised online to MXFP4 and their activations to
+    MXFP8 at inference time. Non-expert Linear layers stay unquantized while
+    isolating the accuracy impact of the online MoE path.
     """
 
     def __init__(
@@ -93,33 +88,26 @@ class Mxfp4W4A8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
+            return UnquantizedLinearMethod()
+        elif isinstance(layer, FusedMoE):
             if is_layer_skipped(
                 prefix,
                 self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
             ):
-                return UnquantizedLinearMethod()
+                return UnquantizedFusedMoEMethod(
+                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                )
             if is_npu():
-                from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-                    NPUMXFP4W4A8LinearMethod,
+                from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
+                    NPUMXFP4W4A8FusedMoEMethod,
                 )
 
-                return NPUMXFP4W4A8LinearMethod(self)
+                return NPUMXFP4W4A8FusedMoEMethod(self)
             raise NotImplementedError(
-                "mxfp_w4a8 (MXFP4 weights + MXFP8 activations, W4A8) is currently "
-                "only implemented for the Ascend NPU backend; no CUDA/other-device "
-                "kernel exists yet. Add a device branch here when one lands."
-            )
-        elif isinstance(layer, FusedMoE):
-            # MoE MXFP4 not yet implemented; fall back to unquantised
-            logger.warning(
-                "MXFP4 W4A8 quantization is not yet supported for FusedMoE layers "
-                "(prefix=%s). Falling back to unquantized MoE — MoE weights will "
-                "run in full precision (BF16/FP16).",
-                prefix,
-            )
-            return UnquantizedFusedMoEMethod(
-                layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                "mxfp_w4a8 (MXFP4 weights + MXFP8 activations, W4A8) FusedMoE is "
+                "currently only implemented for the Ascend NPU backend; no "
+                "CUDA/other-device kernel exists yet."
             )
         return None
 

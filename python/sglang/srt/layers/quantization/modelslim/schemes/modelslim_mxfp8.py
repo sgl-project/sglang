@@ -61,11 +61,15 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
         )
         layer.register_parameter("weight", weight)
 
-        # msmodelslim exports weight_scale as uint8, shape [out, in/32].
+        # msmodelslim exports one uint8 scale per 32 input elements. Keep the
+        # final partial block: Qwen3-VL has visual projections such as K=4304,
+        # whose checkpoint scale shape is [out, ceil(4304/32)] = [out, 135].
         # NOTE: Named "weight_scale" (not "weight_scale_inv") to match the
         # checkpoint key exported by msmodelslim; the kernel re-layouts it into
         # weight_scale_inv during process_weights_after_loading.
-        scale_dim = input_size_per_partition // MXFP8_BLOCK_SIZE
+        scale_dim = (
+            input_size_per_partition + MXFP8_BLOCK_SIZE - 1
+        ) // MXFP8_BLOCK_SIZE
         weight_scale = GroupQuantScaleParameter(
             data=torch.empty(
                 (output_size_per_partition, scale_dim),
