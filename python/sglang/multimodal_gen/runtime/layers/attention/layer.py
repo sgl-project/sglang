@@ -5,7 +5,7 @@ import functools
 import os
 from collections.abc import Sequence
 from contextlib import nullcontext
-from typing import Type
+from typing import TYPE_CHECKING, Type, cast
 
 import torch
 import torch.nn as nn
@@ -60,6 +60,11 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (
+        VideoSparseAttentionImpl,
+    )
 
 _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.CUDNN_ATTENTION,
@@ -358,49 +363,35 @@ class UlyssesAttention_VSA(UlyssesAttention):
         replicated_v: torch.Tensor | None = None,
         gate_compress: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass for distributed attention.
-
-        Args:
-            q (torch.Tensor): Query tensor [batch_size, seq_len, num_heads, head_dim]
-            k (torch.Tensor): Key tensor [batch_size, seq_len, num_heads, head_dim]
-            v (torch.Tensor): Value tensor [batch_size, seq_len, num_heads, head_dim]
-            gate_compress (torch.Tensor): Gate compress tensor [batch_size, seq_len, num_heads, head_dim]
-            replicated_q (Optional[torch.Tensor]): Replicated query tensor, typically for text tokens
-            replicated_k (Optional[torch.Tensor]): Replicated key tensor
-            replicated_v (Optional[torch.Tensor]): Replicated value tensor
-
-        Returns:
-            Tuple[torch.Tensor, Optional[torch.Tensor]]: A tuple containing:
-                - o (torch.Tensor): Output tensor after attention for the main sequence
-                - replicated_o (Optional[torch.Tensor]): Output tensor for replicated tokens, if provided
-        """
+        """Run distributed VSA without replicated text tokens."""
         # Check text tokens are not supported for VSA now
         assert (
             replicated_q is None and replicated_k is None and replicated_v is None
         ), "Replicated QKV is not supported for VSA now"
         # Check input shapes
         assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4, "Expected 4D tensors"
+        assert gate_compress is not None, "VSA requires gate_compress"
 
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
+        attn_impl = cast("VideoSparseAttentionImpl", self.attn_impl)
 
-        # Stack QKV
-        qkvg = torch.cat(
-            [q, k, v, gate_compress], dim=0
-        )  # [3, seq_len, num_heads, head_dim]
-
-        # Redistribute heads across sequence dimension
-        qkvg = sequence_model_parallel_all_to_all_4D(qkvg, scatter_dim=2, gather_dim=1)
-
-        qkvg = self.attn_impl.preprocess_qkv(qkvg, ctx_attn_metadata)
+        if get_sp_world_size() == 1:
+            qkvg = attn_impl.preprocess_qkvg(q, k, v, gate_compress, ctx_attn_metadata)
+        else:
+            qkvg = torch.cat([q, k, v, gate_compress], dim=0)
+            qkvg = sequence_model_parallel_all_to_all_4D(
+                qkvg, scatter_dim=2, gather_dim=1
+            )
+            qkvg = attn_impl.preprocess_qkv(qkvg, ctx_attn_metadata)
 
         q, k, v, gate_compress = qkvg.chunk(4, dim=0)
-        output = self.attn_impl.forward(
+        output = attn_impl.forward(
             q, k, v, gate_compress=gate_compress, attn_metadata=ctx_attn_metadata
-        )  # type: ignore[call-arg]
+        )
 
         # Apply backend-specific postprocess_output
-        output = self.attn_impl.postprocess_output(output, ctx_attn_metadata)
+        output = attn_impl.postprocess_output(output, ctx_attn_metadata)
 
         output = sequence_model_parallel_all_to_all_4D(
             output, scatter_dim=1, gather_dim=2
