@@ -145,12 +145,14 @@ def _prepare_flashinfer_trtllm_bf16_weights(
     hidden_size: int,
     intermediate_size: int,
     gemm1_alpha: Optional[float],
+    gate_up_interleaved: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Pad canonical BF16 MoE weights and fold static biases into them.
 
-    FlashInfer's TRT-LLM kernel consumes [up, gate] W13 rows and has no bias
-    arguments. The first padded hidden and intermediate channels therefore
-    provide constant-one features for the two bias terms respectively.
+    FlashInfer's TRT-LLM kernel consumes split [up, gate] W13 rows and has no
+    bias arguments. GPT-OSS checkpoints instead store [gate0, up0, ...], so
+    deinterleave those rows before padding. The first padded hidden and
+    intermediate channels provide constant-one features for the two bias terms.
     """
     kernel_hidden_size = ((hidden_size + 127) // 128) * 128
     kernel_intermediate_size = w2.shape[-1]
@@ -194,16 +196,24 @@ def _prepare_flashinfer_trtllm_bf16_weights(
         compact_rows = 2 * intermediate_size
         padded_rows = 2 * kernel_intermediate_size
         row_dim = -2 if tensor.dim() == 3 else -1
-        if tensor.shape[row_dim] == compact_rows:
-            gate_start = intermediate_size
-        elif tensor.shape[row_dim] == padded_rows:
-            gate_start = kernel_intermediate_size
-        else:
+        if tensor.shape[row_dim] not in {compact_rows, padded_rows}:
             raise ValueError(
                 "W13 must have either logical or kernel-padded rows, got "
                 f"{tensor.shape[row_dim]} rows for logical={intermediate_size} and "
                 f"kernel={kernel_intermediate_size}"
             )
+        if gate_up_interleaved:
+            compact = tensor.narrow(row_dim, 0, compact_rows)
+            row_indices = torch.arange(
+                compact_rows, device=tensor.device, dtype=torch.long
+            )
+            gate = compact.index_select(row_dim, row_indices[0::2])
+            up = compact.index_select(row_dim, row_indices[1::2])
+            return up, gate
+        if tensor.shape[row_dim] == compact_rows:
+            gate_start = intermediate_size
+        else:
+            gate_start = kernel_intermediate_size
         return (
             tensor.narrow(row_dim, 0, intermediate_size),
             tensor.narrow(row_dim, gate_start, intermediate_size),
@@ -532,6 +542,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                         hidden_size=hidden_size,
                         intermediate_size=intermediate_size,
                         gemm1_alpha=layer.moe_runner_config.gemm1_alpha,
+                        gate_up_interleaved=(
+                            layer.moe_runner_config.gate_up_interleaved
+                        ),
                     )
                 )
                 copy_or_rebind_param(layer, "w13_weight", prepared_w13)

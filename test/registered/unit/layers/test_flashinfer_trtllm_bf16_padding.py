@@ -161,6 +161,13 @@ class TestFlashInferTrtllmBf16Padding(CustomTestCase):
             dtype=torch.bfloat16,
         )
         runtime_padded[:, : 2 * intermediate_size] = interleaved.to(torch.bfloat16)
+        gate_bias = torch.arange(intermediate_size, dtype=torch.float32)
+        up_bias = gate_bias + 100
+        interleaved_bias = torch.stack((gate_bias, up_bias), dim=1).reshape(1, -1)
+        runtime_padded_bias = torch.zeros(
+            1, 2 * kernel_intermediate_size, dtype=torch.float32
+        )
+        runtime_padded_bias[:, : 2 * intermediate_size] = interleaved_bias
 
         prepared_w13, _, _ = _prepare_flashinfer_trtllm_bf16_weights(
             runtime_padded,
@@ -170,7 +177,7 @@ class TestFlashInferTrtllmBf16Padding(CustomTestCase):
                 kernel_intermediate_size,
                 dtype=torch.bfloat16,
             ),
-            None,
+            runtime_padded_bias,
             None,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -189,6 +196,18 @@ class TestFlashInferTrtllmBf16Padding(CustomTestCase):
                 :hidden_size,
             ],
             gate.unsqueeze(0).to(torch.bfloat16),
+        )
+        torch.testing.assert_close(
+            prepared_w13[:, :intermediate_size, hidden_size],
+            up_bias.unsqueeze(0).to(torch.bfloat16),
+        )
+        torch.testing.assert_close(
+            prepared_w13[
+                :,
+                kernel_intermediate_size : kernel_intermediate_size + intermediate_size,
+                hidden_size,
+            ],
+            gate_bias.unsqueeze(0).to(torch.bfloat16),
         )
 
     def test_preparation_reads_runtime_padded_w13_layout(self):
