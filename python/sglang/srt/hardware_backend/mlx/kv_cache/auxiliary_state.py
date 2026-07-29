@@ -260,19 +260,31 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         )
 
     def alloc(self, reqs):
-        select_index = super().alloc(reqs)
+        # Reserve all newly needed auxiliary slots before mutating request-row
+        # ownership. This makes the two-resource allocation atomic when the
+        # scheduler's admission budget cannot recover enough radix states.
+        reqs_needing_auxiliary_state = [
+            req for req in reqs if getattr(req, "mamba_pool_idx", None) is None
+        ]
+        allocated = self.auxiliary_state_pool.alloc(len(reqs_needing_auxiliary_state))
+        if allocated is None:
+            raise RuntimeError("Not enough MLX auxiliary state slots")
+
+        try:
+            select_index = super().alloc(reqs)
+        except Exception:
+            self.auxiliary_state_pool.free(allocated)
+            raise
         if select_index is None:
+            self.auxiliary_state_pool.free(allocated)
             return None
+
+        for req, mid in zip(reqs_needing_auxiliary_state, allocated):
+            req.mamba_pool_idx = mid
 
         auxiliary_state_indices = []
         for req in reqs:
-            if getattr(req, "mamba_pool_idx", None) is not None:
-                mid = req.mamba_pool_idx
-            else:
-                allocated = self.auxiliary_state_pool.alloc(1)
-                assert allocated is not None, "Not enough MLX auxiliary state slots"
-                mid = allocated[0]
-                req.mamba_pool_idx = mid
+            mid = req.mamba_pool_idx
             auxiliary_state_indices.append(mid.to(dtype=torch.int32))
         self.req_index_to_auxiliary_state_index_mapping[select_index] = torch.stack(
             auxiliary_state_indices

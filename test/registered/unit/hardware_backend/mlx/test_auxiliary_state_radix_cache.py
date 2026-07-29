@@ -39,6 +39,7 @@ if _IS_APPLE_SILICON and _HAS_MLX:
         MlxAuxiliaryStateComponent,
         MlxAuxiliaryStateReqToTokenPool,
     )
+    from sglang.srt.mem_cache.allocation import alloc_req_slots
     from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import (
         EvictParams,
@@ -48,7 +49,7 @@ if _IS_APPLE_SILICON and _HAS_MLX:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
     from sglang.srt.mem_cache.radix_cache import RadixKey
-    from sglang.srt.mem_cache.unified_cache_components import ComponentType
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
     from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
@@ -134,6 +135,15 @@ def _cow_req():
         mamba_cow_src_index=None,
         mamba_needs_clear=True,
         session=None,
+    )
+
+
+def _admission_req():
+    return SimpleNamespace(
+        req_pool_idx=None,
+        inflight_middle_chunks=0,
+        kv_committed_len=0,
+        mamba_pool_idx=None,
     )
 
 
@@ -248,6 +258,45 @@ class TestMlxAuxiliaryStateRealRadixCache(unittest.TestCase):
         restored = [FakeNativeCache()]
         self.assertTrue(pool.restore_cache(req.mamba_pool_idx, restored, [0]))
         self.assertEqual(restored[0].state.tolist(), [2.0])
+
+    def test_cache_miss_admission_evicts_auxiliary_states(self):
+        # A no-prefix request reaches alloc_req_slots without the match-time
+        # CoW path. The MLX pool is not a HybridReqToTokenPool, so a concrete
+        # type gate used to skip this preflight, consume the request row, and
+        # then assert while its auxiliary pool was exhausted.
+        cache, allocator, req_to_token_pool = _build_cache(auxiliary_state_size=2)
+        pool = req_to_token_pool.auxiliary_state_pool
+        chain_a = list(range(CHUNK_SIZE))
+        chain_ab = chain_a + list(range(100, 100 + CHUNK_SIZE))
+        _insert_with_aux_state(cache, allocator, req_to_token_pool, chain_a, 1.0)
+        _insert_with_aux_state(cache, allocator, req_to_token_pool, chain_ab, 2.0)
+        self.assertEqual(pool.available_size(), 0)
+        self.assertEqual(cache.mamba_evictable_size(), 2)
+
+        req = _admission_req()
+        req_pool_indices = alloc_req_slots(req_to_token_pool, [req], cache)
+
+        self.assertEqual(req_pool_indices, [1])
+        self.assertEqual(req.req_pool_idx, 1)
+        self.assertIsNotNone(req.mamba_pool_idx)
+        self.assertEqual(pool.available_size(), 1)
+
+    def test_auxiliary_allocation_failure_does_not_consume_request_row(self):
+        _, _, req_to_token_pool = _build_cache(auxiliary_state_size=1)
+        pool = req_to_token_pool.auxiliary_state_pool
+        occupied = pool.alloc(1)
+        req = _admission_req()
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Not enough MLX auxiliary state slots"
+        ):
+            req_to_token_pool.alloc([req])
+
+        self.assertIsNone(req.req_pool_idx)
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertEqual(req_to_token_pool.available_size(), 4)
+        self.assertEqual(pool.available_size(), 0)
+        pool.free(occupied)
 
 
 if __name__ == "__main__":
