@@ -189,13 +189,17 @@ class MlxModelRunnerStub(ModelRunner):
             ratio = self._aux_state_slots_per_request()
             resolved = min(resolved, aux_state_size // ratio)
             if resolved <= 0:
+                global_aux_state_size = self.server_args.max_mamba_cache_size
+                min_global_aux_state_size = ratio * self.ps.attn_dp_size
                 raise RuntimeError(
                     f"MLX auxiliary-state cache is too small to serve any "
-                    f"requests: max_mamba_cache_size={aux_state_size} backs "
-                    f"only {aux_state_size // ratio} concurrent requests "
-                    f"({ratio} slots per request). Increase "
-                    f"--max-mamba-cache-size to at least {ratio}, or leave it "
-                    f"unset to size the pool from the concurrency cap."
+                    f"requests: max_mamba_cache_size={global_aux_state_size} "
+                    f"backs only {aux_state_size // ratio} concurrent requests "
+                    f"per attention-DP worker (per-worker auxiliary-state "
+                    f"cap={aux_state_size}, {ratio} slots per request). "
+                    f"Increase --max-mamba-cache-size to at least "
+                    f"{min_global_aux_state_size}, or leave it unset to size "
+                    f"the pool from the concurrency cap."
                 )
 
         if requested_per_worker is not None and resolved < requested_per_worker:

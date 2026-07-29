@@ -107,6 +107,20 @@ class TestAttentionDpRequestCapacity(CustomTestCase):
         self.assertEqual(stub.req_to_token_pool.size, 1)
         self.assertEqual(stub.req_to_token_pool.auxiliary_state_pool.size, RATIO)
 
+    def test_attention_dp_auxiliary_error_reports_global_cli_units(self):
+        stub = _stub_for_initialize(
+            dp_size=4,
+            attn_dp_size=4,
+            max_running_requests=8,
+            max_mamba_cache_size=4 * RATIO - 1,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "max_mamba_cache_size=15.*per-worker auxiliary-state cap=3.*" "at least 16",
+        ):
+            _initialize_stub(stub, hybrid=True)
+
 
 if __name__ == "__main__":
     unittest.main()
