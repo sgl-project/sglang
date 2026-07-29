@@ -25,6 +25,7 @@ struct StoreKVCacheParams {
   int64_t stride_indices;
   uint32_t batch_size;
   int64_t size_limit;
+  int64_t reserved_skip_index;
 };
 
 constexpr uint32_t kNumWarps = 4;
@@ -97,7 +98,7 @@ __global__ void store_kvcache(const __grid_constant__ StoreKVCacheParams params)
   const auto& [
     k_input, v_input, k_cache, v_cache, indices, // ptr
     stride_k, stride_v, stride_cache, stride_indices, batch_size, // size
-    size_limit // bound
+    size_limit, reserved_skip_index // bounds and reserved sink
   ] = params;
   if (item_id >= batch_size) return;
 
@@ -113,7 +114,9 @@ __global__ void store_kvcache(const __grid_constant__ StoreKVCacheParams params)
   const auto k_dst = pointer::offset(k_cache, index * stride_cache, split_id * kSplitSize);
   const auto v_dst = pointer::offset(v_cache, index * stride_cache, split_id * kSplitSize);
 
-  copy_kv_warp<kSplitSize>(k_src, v_src, k_dst, v_dst);
+  if (index != reserved_skip_index) {
+    copy_kv_warp<kSplitSize>(k_src, v_src, k_dst, v_dst);
+  }
   PDLTriggerSecondary<kUsePDL>();
 }
 
@@ -145,7 +148,8 @@ struct StoreKVCacheKernel {
       const tvm::ffi::TensorView v_cache,
       const tvm::ffi::TensorView indices,
       const int num_split,
-      const int64_t size_limit) {
+      const int64_t size_limit,
+      const int64_t reserved_skip_index) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto D = SymbolicSize{"element_size"};
@@ -196,6 +200,7 @@ struct StoreKVCacheKernel {
         .stride_indices = I.unwrap(),
         .batch_size = static_cast<uint32_t>(B.unwrap()),
         .size_limit = size_limit,
+        .reserved_skip_index = reserved_skip_index,
     };
     // select kernel and update num_split if needed
     const auto use_int32 = indice_dtype.is_type<int32_t>();
