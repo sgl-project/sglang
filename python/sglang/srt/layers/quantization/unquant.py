@@ -29,6 +29,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.utils import MultiPlatformOp, copy_or_rebind_param
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -467,6 +468,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             and layer.moe_runner_config.gemm1_alpha is None
             and layer.moe_runner_config.gemm1_clamp_limit is None
             and layer.moe_runner_config.swiglu_limit is None
+            # Input-weighted routing (Llama4) scales the hidden states instead
+            # of the expert outputs, which the fused epilogue does not handle;
+            # fused_moe asserts against it. The interleaving below is permanent,
+            # so it has to be refused here rather than per call.
+            and not layer.moe_runner_config.apply_router_weight_on_input
+            # LoRA on the experts runs through FusedMoEWithLoRA, which reuses
+            # this method's quant info (so it inherits the interleaved flag)
+            # but drives its own MoeRunner with lora_enabled=True. That runner
+            # passes per-call LoRA hooks, which fused_moe also refuses. Whether
+            # hooks appear is a per-call property, so gate on the server flag
+            # here -- this is the load-time decision point and the interleaving
+            # is permanent.
+            and not get_server_args().enable_lora
         ):
             w13 = layer.w13_weight.data
             inter = w13.shape[1] // 2
