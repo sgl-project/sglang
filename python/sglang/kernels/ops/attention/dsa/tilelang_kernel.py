@@ -272,12 +272,13 @@ def sparse_attention_fwd_kernel_v1(
     num_stages=2,
     threads=256,
 ):
-    assert dim == tilelang.math.next_power_of_2(
-        dim
-    ), f"haven't check padding correctness yet, dim={dim}"
-    assert tail_dim == tilelang.math.next_power_of_2(
+    assert (
+        dim == tilelang.math.next_power_of_2(dim) or dim % 64 == 0
+    ), f"dim={dim} must be a power of 2 or a multiple of 64"
+    assert tail_dim == 0 or tail_dim == tilelang.math.next_power_of_2(
         tail_dim
-    ), f"haven't check padding correctness yet, dim={tail_dim}"
+    ), f"tail_dim={tail_dim} must be 0 or a power of 2"
+    has_tail = tail_dim > 0
     assert is_causal == True, "non-casual is not supported"
     assert (
         topk % block_I == 0
@@ -330,9 +331,11 @@ def sparse_attention_fwd_kernel_v1(
             bz,
         ):
             Q_shared = T.alloc_shared([H_per_block, D], dtype)
-            Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
+            if has_tail:
+                Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
             KV_shared = T.alloc_shared([BI, D], dtype)
-            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            if has_tail:
+                K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
             O_shared = T.alloc_shared([H_per_block, D], dtype)
             mask = T.alloc_fragment([BI], "bool")
 
@@ -358,7 +361,8 @@ def sparse_attention_fwd_kernel_v1(
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
-            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+            if has_tail:
+                T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
 
             for i_i in T.Pipelined(NI, num_stages=num_stages):
 
@@ -369,10 +373,14 @@ def sparse_attention_fwd_kernel_v1(
                     KV_shared[bi_i, d_i] = KV[
                         b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
                     ]
-                for bi_i, d_i in T.Parallel(BI, D_tail):
-                    K_tail_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i
-                    ]
+                if has_tail:
+                    for bi_i, d_i in T.Parallel(BI, D_tail):
+                        K_tail_shared[bi_i, d_i] = KV[
+                            b_i,
+                            Indices[b_i, s_i, g_i, i_i * BI + bi_i],
+                            g_i,
+                            D + d_i,
+                        ]
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
@@ -385,13 +393,14 @@ def sparse_attention_fwd_kernel_v1(
                     transpose_B=True,
                     policy=T.GemmWarpPolicy.FullCol,
                 )
-                T.gemm(
-                    Q_tail_shared,
-                    K_tail_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullCol,
-                )
+                if has_tail:
+                    T.gemm(
+                        Q_tail_shared,
+                        K_tail_shared,
+                        acc_s,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
                 for h_i in T.Parallel(H_per_block):
@@ -1326,7 +1335,7 @@ def tilelang_sparse_fwd(
     dim = q.shape[2]
     tail_dim = dim - d_v
     topk = indices.shape[-1]
-    assert topk == 2048
+    assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
     if _is_hip:
         is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
@@ -1380,9 +1389,12 @@ def tilelang_sparse_fwd(
         )
         out = kernel_combine(partial_o_batched, partial_lse_batched)
     else:
-        kernel = sparse_attention_fwd_kernel_v2(
-            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
+        kernel_factory = (
+            sparse_attention_fwd_kernel_v1
+            if tail_dim == 0
+            else sparse_attention_fwd_kernel_v2
         )
+        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 
