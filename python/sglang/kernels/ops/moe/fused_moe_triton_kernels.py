@@ -655,7 +655,9 @@ def fused_moe_kernel(
         offs_half = pid_n * (BLOCK_SIZE_N // 2) + tl.arange(0, BLOCK_SIZE_N // 2)
         if c_sorted:
             c_ptrs = (
-                c_ptr + stride_cm * offs_token_id[:, None] + stride_cn * offs_half[None, :]
+                c_ptr
+                + stride_cm * offs_token_id[:, None]
+                + stride_cn * offs_half[None, :]
             )
         else:
             c_ptrs = (

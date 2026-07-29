@@ -550,6 +550,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         for e in range(w13.shape[0]):
             w13[e] = w13[e][idx]
         self.w13_swiglu_interleaved = True
+        logger.info_once(
+            "Interleaved w13 gate/up: the SwiGLU is applied by the MoE up-GEMM epilogue."
+        )
 
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
         self,
