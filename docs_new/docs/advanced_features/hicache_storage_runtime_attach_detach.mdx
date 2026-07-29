@@ -26,7 +26,7 @@ The control path is:
 3. **Scheduler** (`python/sglang/srt/managers/scheduler.py`)
    - Performs a **strict idle check**
    - Calls `tree_cache.attach_storage_backend(...)` / `detach_storage_backend(...)`
-4. **HiRadixCache** (`python/sglang/srt/mem_cache/hiradix_cache.py`)
+4. **Tree cache** (`HiRadixCache` in `python/sglang/srt/mem_cache/hiradix_cache.py`, `UnifiedRadixCache` in `python/sglang/srt/mem_cache/unified_radix_cache.py`)
    - Parses `hicache_storage_backend_extra_config_json` (supports both backend config and prefetch knobs)
    - Calls `cache_controller.attach_storage_backend(...)` / `detach_storage_backend(...)`
 5. **HiCacheController** (`python/sglang/srt/managers/cache_controller.py`)
