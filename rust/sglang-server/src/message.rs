@@ -8,6 +8,8 @@
 //! `SamplingParams` port), [`io_struct`] (the scheduler wire structs), [`types`]
 //! (the shared wire-shape adapters both directions use).
 
+mod egress;
+mod finish_reason;
 mod io_struct;
 mod request;
 mod sampling;
