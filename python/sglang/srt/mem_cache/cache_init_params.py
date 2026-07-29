@@ -27,6 +27,10 @@ class CacheInitParams:
     attn_tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     pp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     eviction_policy: str = "lru"
+    # Tail-Optimized LRU parameters, in tokens. Only read when eviction_policy is
+    # "tlru"; see TLRUStrategy for the meaning.
+    tlru_threshold: int = 0
+    tlru_next_prompt_estimate: int = 0
     disable_finished_insert: bool = False
 
     enable_metrics: bool = False

@@ -214,6 +214,8 @@ def build_kv_cache(
         attn_tp_cache_group=attn_tp_cpu_group,
         pp_cache_group=pp_group.cpu_group,
         eviction_policy=server_args.radix_eviction_policy,
+        tlru_threshold=server_args.tlru_threshold,
+        tlru_next_prompt_estimate=server_args.tlru_next_prompt_estimate,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         enable_session_radix_cache=server_args.enable_session_radix_cache,

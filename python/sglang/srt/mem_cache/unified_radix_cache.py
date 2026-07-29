@@ -91,6 +91,13 @@ class UnifiedTreeNode:
         self.creation_time = get_and_increase_time_counter()
         self.hash_value = None
         self.hit_count = 0
+        # T-LRU bookkeeping. depth is the token count on the path root -> self,
+        # i.e. how much of the conversation is cached up to this node.
+        # convo_length is the high-water depth of the whole branch below self and
+        # only ever grows, so a trimmed conversation is still measured against its
+        # full history length. Both are ignored by every other eviction policy.
+        self.depth = 0
+        self.convo_length = 0
         self.priority = priority
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
             _NUM_COMPONENT_TYPES * 2
@@ -131,6 +138,23 @@ class UnifiedTreeNode:
             return []
 
         return node.get_prefix_hash_values(node.parent) + node.hash_value
+
+
+def _set_depth_and_raise_convo_length(
+    node: UnifiedTreeNode, parent: UnifiedTreeNode
+) -> None:
+    """Record a new node's path depth and raise the branch high-water mark.
+
+    Walks up only until an ancestor is already at least this deep, so extending a
+    conversation by one turn costs O(new nodes) rather than O(conversation).
+    """
+    node.depth = parent.depth + len(node.key)
+    if node.convo_length < node.depth:
+        node.convo_length = node.depth
+    cur = parent
+    while cur is not None and cur.convo_length < node.depth:
+        cur.convo_length = node.depth
+        cur = cur.parent
 
 
 class UnifiedLRUList:
@@ -315,7 +339,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.kv_event_queue = []
         self.eviction_policy = params.eviction_policy.lower()
-        self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
+        self.eviction_strategy = get_eviction_strategy(
+            self.eviction_policy,
+            tlru_threshold=params.tlru_threshold,
+            tlru_next_prompt_estimate=params.tlru_next_prompt_estimate,
+        )
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -1021,6 +1049,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
         new_node.creation_time = child.creation_time
+        # A split adds no depth to the branch: the new parent sits at split_len
+        # tokens and inherits the branch's high-water mark, while child keeps its
+        # own depth because its path length is unchanged.
+        new_node.depth = new_node.parent.depth + split_len
+        new_node.convo_length = child.convo_length
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
@@ -1067,6 +1100,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node = UnifiedTreeNode(self.tree_components, priority=priority)
         new_node.parent = parent
         new_node.key = key
+        _set_depth_and_raise_convo_length(new_node, parent)
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
@@ -1236,6 +1270,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node = UnifiedTreeNode(self.tree_components, priority=node.priority)
         new_node.parent = node
         new_node.key = key
+        _set_depth_and_raise_convo_length(new_node, node)
         new_node.hash_value = hash_value
         new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
         node.children[child_key] = new_node
