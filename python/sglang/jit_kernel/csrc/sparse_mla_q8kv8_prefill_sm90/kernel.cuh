@@ -137,15 +137,28 @@ struct SparseMlaQ8Kv8PrefillKernel {
       array_aligned<fp8_t, cosize_v<SmemLayoutQ>> q;  // B_H * D_Q fp8
       array_aligned<bf16, cosize_v<SmemLayoutO>> o;   // B_H * D_V/2 bf16
     } q_o;
-    array_aligned<fp8_t, cosize_v<SmemLayoutK>> k[2];    // 2x K double-buffer, fp8
-    array_aligned<fp8_t, cosize_v<SmemLayoutVt>> vt[2];  // 2x Vt transposed buffer, fp8
+        array_aligned<fp8_t, cosize_v<SmemLayoutK>> k[2];  // 2x K double-buffer, fp8
+
+    // Vt is split into four half-buffers (256x64 each) so each half can be
+    // handed to its consumer warpgroup as soon as it is transposed:
+    //   vt_loc[i]: i=0 block0-left (WG0 local), i=1 block1-right (WG1 local)
+    //   vt_rem[i]: i=0 block1-left (WG0 remote), i=1 block0-right (WG1 remote)
+    array_aligned<fp8_t, cosize_v<SmemLayoutHalfVt>> vt_loc[2];
+    array_aligned<fp8_t, cosize_v<SmemLayoutHalfVt>> vt_rem[2];
+
     array_aligned<fp8_t, 128 * 36> s[2];  // 2x S buffer, padded to a 36B row stride to avoid bank conflicts.
 
-    bool is_kv_valid[2][B_TOPK];
-    float2 sM[32];
+    // Double-buffer validity data by iteration-pair parity. This prevents the
+    // producer from overwriting pair N validity bits while a lagging consumer is
+    // still masking pair N.
+    bool is_kv_valid[2][2][B_TOPK];
+
+    // Double-buffer the WG0<->WG1 running-max exchange by iteration-pair parity.
+    float2 sM[2][32];
+
     float2 sL[64];
     float final_max_logits[64], final_lse[64];
-    transac_bar_t bar_q, bar_k0_ready[2], bar_k1_ready[2], bar_is_kv_valid_ready;
+    transac_bar_t bar_q, bar_k0_ready[2], bar_k1_ready[2], bar_is_kv_valid_ready[2];
     transac_bar_t bar_k0_free, bar_k1_free;
     // Consumers arrive after PV drains; the producer waits before reusing the Vt buffer.
     // These barriers are separate from K-free so K buffers can be released earlier.
@@ -187,7 +200,10 @@ struct SparseMlaQ8Kv8PrefillKernel {
         plan.bar_k0_ready[i].init(128);
         plan.bar_k1_ready[i].init(128);
       }
-      plan.bar_is_kv_valid_ready.init(16);
+      CUTE_UNROLL
+      for (int i = 0; i < 2; ++i) {
+        plan.bar_is_kv_valid_ready[i].init(16);
+      }
       CUTE_UNROLL
       for (int i = 0; i < 2; ++i) {
         // Transaction barriers for Vt buffer safety: 128 arrivals from each consumer WG.
@@ -216,7 +232,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
                           q_h_idx * B_H * (int64_t)params.stride_q_h_q;
 
         // Vectorized Q loading via cp.async.cg (16 bytes per op)
-        constexpr int Q_GROUP_SIZE = 8;
+        constexpr int Q_GROUP_SIZE = 4;
         constexpr int Q_NUM_GROUPS = 128 / Q_GROUP_SIZE;
         constexpr int Q_ROWS_PER_GROUP = B_H / Q_NUM_GROUPS;
         int q_ig = idx_in_warpgroup % Q_GROUP_SIZE;
@@ -248,6 +264,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
       // --------------------------------------------------------
       float rM[2] = {MAX_INIT_VAL, MAX_INIT_VAL};
       float rL[2] = {0.0f, 0.0f};
+      float peer_scale[2] = {1.0f, 1.0f};
       Tensor rO = partition_fragment_C(TiledMMA_PV_LocalP{}, Shape<Int<B_H>, Int<D_V / 2>>{});
       Tensor rP = partition_fragment_C(TiledMMA_QK{}, Shape<Int<B_H>, Int<B_TOPK>>{});
       cute::fill(rO, 0.0f);
@@ -259,6 +276,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
       Tensor rP_fp8_local = make_tensor<fp8_t>(rP_fp8_layout_t{});
 
       bool cur_bar_wait_phase = 0;
+      bool kv_valid_phase[2] = {false, false};
       struct Warpgroup0 {};
       struct Warpgroup1 {};
 
@@ -272,28 +290,35 @@ struct SparseMlaQ8Kv8PrefillKernel {
         gemm_ss(clear_accum, tiled_mma_QK, sQ_tile, sK_tile, rP, idx_in_warpgroup);
       };
 
-      auto mask_rP = [&](auto wg_tag) {
+      auto mask_rP = [&](auto wg_tag, int block_idx) {
         constexpr bool IS_WG1 = std::is_same_v<decltype(wg_tag), Warpgroup1>;
-        plan.bar_is_kv_valid_ready.wait(cur_bar_wait_phase);
+
+        // Use a separate barrier and validity slot for each iteration-pair
+        // parity. The producer can run one pair ahead, so a single barrier/slot
+        // can alias and deadlock under high CTA count.
+        int kv_buf = (block_idx >> 1) & 1;
+        plan.bar_is_kv_valid_ready[kv_buf].wait(kv_valid_phase[kv_buf]);
+        kv_valid_phase[kv_buf] ^= 1;
+
         CUTE_UNROLL
         for (int row_idx = 0; row_idx < 2; ++row_idx) {
           CUTE_UNROLL
           for (int i = row_idx * 2; i < size(rP); i += 4) {
             int col = 8 * (i / 4) + (idx_in_warpgroup % 4) * 2;
-            if (!plan.is_kv_valid[IS_WG1][col]) rP(i) = -INFINITY;
-            if (!plan.is_kv_valid[IS_WG1][col + 1]) rP(i + 1) = -INFINITY;
+            if (!plan.is_kv_valid[IS_WG1][kv_buf][col]) rP(i) = -INFINITY;
+            if (!plan.is_kv_valid[IS_WG1][kv_buf][col + 1]) rP(i + 1) = -INFINITY;
           }
         }
       };
 
       // online_softmax: compute softmax on rP (f32), then convert to fp8
-      auto online_softmax_and_rescale_o = [&](auto wg_tag) {
+      auto online_softmax_and_rescale_o = [&](auto wg_tag, int par) {
         // mask_rP already waits for the validity mask.
         constexpr bool IS_WG1 = std::is_same_v<decltype(wg_tag), Warpgroup1>;
         const float scale = qk_combined_scale_div_log2;
         float r_sM[2];
         if constexpr (IS_WG1) {
-          *(float2*)r_sM = plan.sM[idx_in_warpgroup / 4];
+          *(float2*)r_sM = plan.sM[par][idx_in_warpgroup / 4];
         }
         float new_maxs[2];
         CUTE_UNROLL
@@ -307,6 +332,9 @@ struct SparseMlaQ8Kv8PrefillKernel {
           cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
           cur_max *= scale;
           new_maxs[row_idx] = max(IS_WG1 ? r_sM[row_idx] : rM[row_idx], cur_max);
+          if constexpr (IS_WG1) {
+            peer_scale[row_idx] = fmaxf(exp2f(r_sM[row_idx] - new_maxs[row_idx]), exp2f(-30.0f));
+          }
           float scale_for_o = exp2f(rM[row_idx] - new_maxs[row_idx]);
           CUTE_UNROLL
           for (int i = row_idx * 2; i < size(rO); i += 4) {
@@ -326,7 +354,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
         }
         __syncwarp();
         if (idx_in_warpgroup % 4 == 0) {
-          plan.sM[idx_in_warpgroup / 4] = *(float2*)new_maxs;
+          plan.sM[par][idx_in_warpgroup / 4] = *(float2*)new_maxs;
         }
         rM[0] = new_maxs[0];
         rM[1] = new_maxs[1];
@@ -441,33 +469,6 @@ struct SparseMlaQ8Kv8PrefillKernel {
         }
       };
 
-      auto undo_v_transpose_col_permutation = [&]() {
-        // Undo the column permutation from the fp8 V transpose before writing O.
-        // CLayout_64x256: col bit0 = t1_bit0 (thread), col bit3 = v1 (register).
-        // V transpose introduces bit0<->bit3 swap. Fix by cross-thread exchange:
-        //   thread with t1_bit0=0, v1=1 <-> thread with t1_bit0=1, v1=0
-        // Within each 4-element group (same v2=row): idx%4 in {0,1} are v1=0, {2,3} are v1=1.
-        int t1_bit0 = (threadIdx.x >> 2) & 1;
-#pragma unroll
-        for (int g = 0; g < 32; g++) {
-          float a = rO(4 * g + 0);
-          float b = rO(4 * g + 1);
-          float c = rO(4 * g + 2);
-          float d = rO(4 * g + 3);
-          float send0 = t1_bit0 ? a : c;
-          float send1 = t1_bit0 ? b : d;
-          float recv0 = __shfl_xor_sync(0xFFFFFFFF, send0, 4);
-          float recv1 = __shfl_xor_sync(0xFFFFFFFF, send1, 4);
-          if (t1_bit0 == 0) {
-            rO(4 * g + 2) = recv0;
-            rO(4 * g + 3) = recv1;
-          } else {
-            rO(4 * g + 0) = recv0;
-            rO(4 * g + 1) = recv1;
-          }
-        }
-      };
-
       // ============================================================
       // WG0 Pipeline -- native fp8
       // ============================================================
@@ -508,7 +509,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
         CUTE_NO_UNROLL
         for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
           // Vt[0] left half: (256, 64) fp8 -- only half we transpose & use
-          Tensor sVt0l = make_tensor(make_smem_ptr(plan.vt[0].data()), SmemLayoutHalfVt{});
+          Tensor sVt0l = make_tensor(make_smem_ptr(plan.vt_loc[0].data()), SmemLayoutHalfVt{});
 
           if (block_idx == 0) {
             pipelined_wait_and_qkt_gemm_l();
@@ -518,11 +519,11 @@ struct SparseMlaQ8Kv8PrefillKernel {
             plan.bar_k0_free.arrive();
           }
 
-          mask_rP(Warpgroup0{});
-          online_softmax_and_rescale_o(Warpgroup0{});
+          mask_rP(Warpgroup0{}, block_idx);
+          online_softmax_and_rescale_o(Warpgroup0{}, (block_idx >> 1) & 1);
 
           save_rP_fp8_to_sS(plan.s[0].data());
-          NamedBarrier::arrive(256, NamedBarriers::wg0_bunch_0_ready);
+          NamedBarrier::arrive_and_wait(256, NamedBarriers::wg0_bunch_0_ready);
 
           // Wait for Vt[0] left half only (producer + WG0 arrivals).
           // V[0]-RIGHT may still be transposing; WG0 doesn't need it.
@@ -535,7 +536,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
           // Overlap PV-local GMMA drain with barrier waits, sM read, and peer P load.
           NamedBarrier::arrive_and_wait(256, NamedBarriers::wg1_bunch_0_ready);
           float new_rM[2], scale_factors_arr[2];
-          *(float2*)new_rM = plan.sM[idx_in_warpgroup / 4];
+          *(float2*)new_rM = plan.sM[(block_idx >> 1) & 1][idx_in_warpgroup / 4];
           CUTE_UNROLL
           for (int i = 0; i < 2; ++i) {
             scale_factors_arr[i] = exp2f(rM[i] - new_rM[i]);
@@ -556,7 +557,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
           // Rescale rO: must be after wait<0> since rO is PV-local accumulator
           rescale_rO(scale_factors_arr);
 
-          Tensor sVt1l = make_tensor(make_smem_ptr(plan.vt[1].data()), SmemLayoutHalfVt{});
+          Tensor sVt1l = make_tensor(make_smem_ptr(plan.vt_rem[0].data()), SmemLayoutHalfVt{});
           gemm_rs(false, TiledMMA_PV_LocalP{}, rP_fp8_local, sVt1l, rO, idx_in_warpgroup);
           warpgroup_commit_batch();
 
@@ -578,8 +579,6 @@ struct SparseMlaQ8Kv8PrefillKernel {
             plan.bar_vt_free[1].arrive();
           }
         }
-
-        undo_v_transpose_col_permutation();
 
         reduce_L();
         store_O();
@@ -614,7 +613,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
         CUTE_NO_UNROLL
         for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
           // Vt[1] right half: (256, 64) fp8 -- only half we transpose & use
-          Tensor sVt1r = make_tensor(make_smem_ptr(plan.vt[1].data() + 256 * B_TOPK), SmemLayoutHalfVt{});
+          Tensor sVt1r = make_tensor(make_smem_ptr(plan.vt_loc[1].data()), SmemLayoutHalfVt{});
 
           if (block_idx == 0) {
             pipelined_wait_and_qkt_gemm_r_wg1();
@@ -624,10 +623,10 @@ struct SparseMlaQ8Kv8PrefillKernel {
             plan.bar_k1_free.arrive();
           }
 
-          mask_rP(Warpgroup1{});
+          mask_rP(Warpgroup1{}, block_idx);
 
           NamedBarrier::arrive_and_wait(256, NamedBarriers::wg0_bunch_0_ready);
-          online_softmax_and_rescale_o(Warpgroup1{});
+          online_softmax_and_rescale_o(Warpgroup1{}, (block_idx >> 1) & 1);
 
           save_rP_fp8_to_sS(plan.s[1].data());
           NamedBarrier::arrive(256, NamedBarriers::wg1_bunch_0_ready);
@@ -650,7 +649,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
           // V[0]-LEFT was signaled earlier; WG1 doesn't need it.
           NamedBarrier::arrive_and_wait(256, vt0_right_ready);
 
-          Tensor sVt0r = make_tensor(make_smem_ptr(plan.vt[0].data() + 256 * B_TOPK), SmemLayoutHalfVt{});
+          Tensor sVt0r = make_tensor(make_smem_ptr(plan.vt_rem[1].data()), SmemLayoutHalfVt{});
           gemm_rs(false, TiledMMA_PV_LocalP{}, rP_fp8_local, sVt0r, rO, idx_in_warpgroup);
           warpgroup_commit_batch();
 
@@ -672,8 +671,6 @@ struct SparseMlaQ8Kv8PrefillKernel {
             plan.bar_vt_free[0].arrive();
           }
         }
-
-        undo_v_transpose_col_permutation();
 
         reduce_L();
         store_O();
@@ -731,7 +728,9 @@ struct SparseMlaQ8Kv8PrefillKernel {
             if constexpr (HAVE_TOPK_LENGTH) {
               is_cur_token_valid &= offs < topk_length;
             }
-            token_indices[buf_idx][local_row] = (int64_t)t * (int64_t)params.stride_kv_s_kv;
+            int safe_t = is_cur_token_valid ? t : 0;
+            token_indices[buf_idx][local_row] =
+                (int64_t)safe_t * (int64_t)params.stride_kv_s_kv;
             is_token_valid[buf_idx][local_row] = is_cur_token_valid;
           }
         }
@@ -769,20 +768,20 @@ struct SparseMlaQ8Kv8PrefillKernel {
 
       // Use the FA3-style STSM thread layout for the fp8 V transpose.
       // but same composition-based framework as before.
-      auto transpose_v_half = [&](int smem_k_buf, int vt_buf, int tile_start, int tile_end) {
+      auto transpose_v_half = [&](int smem_k_buf, fp8_t* vt_data, int src_tile_start, int src_tile_end) {
         Tensor sV_src = as_position_independent_swizzle_tensor(
             make_tensor(make_smem_ptr(plan.k[smem_k_buf].data()), SmemLayoutTransposeV_t{}));
         Tensor sVt_dst = as_position_independent_swizzle_tensor(
-            make_tensor(make_smem_ptr(plan.vt[vt_buf].data()), SmemLayoutTransposeVt_t{}));
-
+            make_tensor(make_smem_ptr(vt_data), SmemLayoutTransposeVt_t{}));
         static_assert((D_V / 64 / 2) % 2 == 0, "half tile count must be even for pair transpose");
         CUTE_UNROLL
-        for (int j = tile_start; j < tile_end; j += 2) {
+        for (int j = src_tile_start; j < src_tile_end; j += 2) {
+          int dst_j = j - src_tile_start;
           smem_transpose_v.transpose_pair(
               flatten(sV_src(_, 0, j)),
-              flatten(sVt_dst(_, 0, j)),
+              flatten(sVt_dst(_, 0, dst_j)),
               flatten(sV_src(_, 0, j + 1)),
-              flatten(sVt_dst(_, 0, j + 1)));
+              flatten(sVt_dst(_, 0, dst_j + 1)));
         }
         asm volatile("" ::: "memory");
       };
@@ -805,13 +804,18 @@ struct SparseMlaQ8Kv8PrefillKernel {
         // Consumers may still be reading prior iteration's is_kv_valid during
         // mask_rP until they signal k_free. Writing before waits could overwrite
         // values consumers are still reading.
+        int kv_buf = (block_idx >> 1) & 1;
+
         if (idx_in_group == 0) {
           CUTE_UNROLL
-          for (int buf_idx = 0; buf_idx < 2; ++buf_idx)
+          for (int buf_idx = 0; buf_idx < 2; ++buf_idx) {
             CUTE_UNROLL
-          for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row)
-            plan.is_kv_valid[buf_idx][local_row * NUM_GROUPS + group_idx] = is_token_valid[buf_idx][local_row];
-          plan.bar_is_kv_valid_ready.arrive();
+            for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row) {
+              plan.is_kv_valid[buf_idx][kv_buf][local_row * NUM_GROUPS + group_idx] =
+                  is_token_valid[buf_idx][local_row];
+            }
+          }
+          plan.bar_is_kv_valid_ready[kv_buf].arrive();
         }
 
         copy_tiles(0, 0, 0, 4);
@@ -847,7 +851,8 @@ struct SparseMlaQ8Kv8PrefillKernel {
           load_token_indices(block_idx + 2);
         }
 
-        transpose_v_half(0, 0, 0, 4);
+        transpose_v_half(0, plan.vt_loc[0].data(), 0, 4);
+        fence_view_async_shared();
         NamedBarrier::arrive(256, vt0_left_ready);
 
         // Transpose V[1] left before V[0] right to match the consumer handoff order.
@@ -875,15 +880,18 @@ struct SparseMlaQ8Kv8PrefillKernel {
         if (block_idx > 0) {
           plan.bar_vt_free[1].wait(cur_bar_wait_phase_prod);
         }
-        transpose_v_half(1, 1, 0, 4);
+        transpose_v_half(1, plan.vt_rem[0].data(), 0, 4);
+        fence_view_async_shared();
         NamedBarrier::arrive(256, vt1_for_wg0);
 
         // V[0]-RIGHT: tiles 4-7 from K[0]
-        transpose_v_half(0, 0, 4, 8);
+        transpose_v_half(0, plan.vt_rem[1].data(), 4, 8);
+        fence_view_async_shared();
         NamedBarrier::arrive(256, vt0_right_ready);
 
         // V[1]-RIGHT: tiles 4-7 from K[1]
-        transpose_v_half(1, 1, 4, 8);
+        transpose_v_half(1, plan.vt_loc[1].data(), 4, 8);
+        fence_view_async_shared();
         NamedBarrier::arrive(256, vt1_for_wg1);
 
         asm volatile("bar.sync 7, 128;\n" ::: "memory");
