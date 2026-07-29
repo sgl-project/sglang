@@ -3840,6 +3840,41 @@ class ServerArgs:
                     f"got --dcp-comm-backend={self.dcp_comm_backend}."
                 )
 
+        # Only the aiter MLA backend goes through the round-robin CP (cprr)
+        # kernels; the triton HIP DCP path has no such head-count constraint, so
+        # don't reject it here. (Backends are resolved later, so gate on the
+        # explicit request.)
+        if (
+            self.dcp_size > 1
+            and is_hip()
+            and self.attention_backend == "aiter"
+        ):
+            self._validate_aiter_mla_dcp()
+
+    def _validate_aiter_mla_dcp(self):
+        """Validate aiter MLA decode-context-parallel (DCP).
+
+        The decode path runs aiter's gluon MLA kernel over each rank's
+        round-robin KV shard (see AiterAttnBackend._mla_decode_fwd_gluon_dcp).
+        gluon tiles the query heads, so unlike the cprr kernels there is no
+        power-of-2 gathered-head-count constraint (Kimi-K3's 96 heads work).
+        """
+        from sglang.srt.configs.model_config import AttentionArch
+
+        model_config = self.get_model_config()
+        if model_config.attention_arch != AttentionArch.MLA:
+            return
+
+        # bf16 kv-cache is what the gluon DCP decode path is validated on; fp8
+        # kv-cache under DCP is not yet exercised, so reject it early.
+        if "fp8" in (self.kv_cache_dtype or ""):
+            raise ValueError(
+                "aiter MLA decode context parallel (--dcp-size > 1) currently "
+                "requires bf16 kv-cache; fp8 kv-cache under DCP is not yet "
+                "validated. Use bf16 kv-cache with --dcp-size, or drop --dcp-size "
+                "for fp8 kv-cache."
+            )
+
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
             raise ValueError(

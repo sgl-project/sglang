@@ -274,21 +274,28 @@ def all_gather_kv_cache_for_mla_extend(
     k_nope,
     k_pe,
 ):
-    cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa,
-        dcp_local_prefix_kv_indices,
-    )
-    extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
-    # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
-    gathered_kv = all_gather_kv_cache_for_dcp(
-        cache_k_nope,
-        cache_k_rope,
-        extend_prefix_lens_cpu,
-        prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
-    )
-    dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
+    # Gather the cached prefix shard across dcp ranks into the front of
+    # dcp_kv_buffer. Skip the collective entirely when there is no cached prefix
+    # (dcp_extend_prefix_lens_sum == 0, batch-consistent across ranks): an empty
+    # all-gather launches a 0-sized kernel (HIP invalid configuration), and there
+    # is nothing to gather. The new-token copy below still runs so dcp_kv_buffer
+    # holds the full sequence even in the no-prefix case.
+    if dcp_extend_prefix_lens_sum > 0:
+        cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
+            attn_mqa,
+            dcp_local_prefix_kv_indices,
+        )
+        extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
+        # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+        gathered_kv = all_gather_kv_cache_for_dcp(
+            cache_k_nope,
+            cache_k_rope,
+            extend_prefix_lens_cpu,
+            prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
+        )
+        dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
-    # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+    # copy local (in-hand) new-token kv cache into dcp_kv_buffer
     dcp_kv_buffer[
         dcp_extend_prefix_lens_sum:,
         ...,

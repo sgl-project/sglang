@@ -394,6 +394,34 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["speculative_attention_mode"] = "decode"
 
         prefill_backend, decode_backend = attention_backends_of(server_args)
+        if decode_backend == "aiter":
+            # aiter DCP decode uses the gluon MLA kernel (tiles query heads, so it
+            # serves K3's non-pow2 gathered head count) and merges partials with
+            # the aiter-native AllGather+ReduceScatter reduction
+            # (cp_lse_ag_out_rs_mla), NOT the CUDA a2a/fi_a2a exchange. The head-dim
+            # Q all-gather is required, so replicated Q projection stays off.
+            #
+            # Prefill defaults to aiter (gluon absorb-prefill), but may be set to
+            # triton via --prefill-attention-backend triton: triton has an
+            # efficient native DCP MLA extend (_forward_extend_dcp via the MHA
+            # path, K3's proven-correct path) that avoids the slow gluon absorb
+            # prefill at long inputs. Both write the same latent KV that the aiter
+            # gluon DCP decode reads (K3 MLA is NoPE, so no rope mismatch), so the
+            # mixed backend is KV-compatible.
+            prefill_ab = "triton" if prefill_backend == "triton" else "aiter"
+            logger.info(
+                "Kimi-K3 DCP uses aiter gluon MLA decode: "
+                f"prefill={prefill_backend!r} -> {prefill_ab!r}, "
+                f"decode={decode_backend!r} -> 'aiter' (dcp_comm_backend -> 'ag_rs')."
+            )
+            overrides.update(
+                prefill_attention_backend=prefill_ab,
+                decode_attention_backend="aiter",
+                dcp_comm_backend="ag_rs",
+            )
+            if server_args.dcp_replicate_q_proj is None:
+                overrides["dcp_replicate_q_proj"] = False
+            return overrides
         if decode_backend == "cutedsl_mla" or decode_backend is None:
             _require_kimi_k3_cutedsl_dcp_support()
             logger.info(
