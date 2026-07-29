@@ -211,7 +211,13 @@ def tail_attn_meta(
         return cached
     seq = shard.sp_size * (shard.local_len + image_seq_len)
     valid = seq - shard.num_pad
-    row = torch.tensor([valid, shard.num_pad], dtype=torch.int32, device=device)
+    # Pinned staging keeps a cache-miss build legal inside CUDA graph capture
+    # (a plain list->CUDA tensor is an unpinned H2D copy, which aborts capture).
+    row_cpu = torch.tensor([valid, shard.num_pad], dtype=torch.int32)
+    if device.type == "cuda":
+        row = row_cpu.pin_memory().to(device, non_blocking=True)
+    else:
+        row = row_cpu.to(device)
     seglens = row.repeat(batch_size)
     cu_seqlens = torch.zeros(2 * batch_size + 1, dtype=torch.int32, device=device)
     cu_seqlens[1:] = torch.cumsum(seglens, dim=0)

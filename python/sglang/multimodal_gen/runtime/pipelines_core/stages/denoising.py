@@ -302,6 +302,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._torch_compile_registry = CompiledModuleRegistry()
         # Breakable CUDA graph runners, one per transformer module (lazy).
         self._bcg_runners: dict[int, Any] = {}
+        # Full-forward CUDA graph runners, one per transformer module (lazy).
+        self._fcg_runners: dict[int, Any] = {}
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -2168,14 +2170,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         runner = self._maybe_get_bcg_runner(current_model)
         if runner is not None:
             model_output = self._bcg_run(runner, call_kwargs, current_model)
-        elif (
-            getattr(self.server_args, "dit_cuda_graph", "off") == "full"
-            and not self._bcg_is_warmup()
-        ):
-            fcg = getattr(current_model, "_full_graph_runner", None)
+        elif self.server_args.dit_cuda_graph == "full" and not self._bcg_is_warmup():
+            fcg = self._fcg_runners.get(id(current_model))
             if fcg is None:
                 fcg = _FullGraphRunner(current_model)
-                current_model._full_graph_runner = fcg
+                self._fcg_runners[id(current_model)] = fcg
             model_output = fcg.run(call_kwargs)
         else:
             model_output = current_model(**call_kwargs)
