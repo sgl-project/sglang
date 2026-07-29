@@ -14,6 +14,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
+from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -345,6 +346,30 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        if (
+            memory_pool_config is not None
+            and self._is_pd_prefill
+            and not self._draft_is_moe
+            and self.ps.pp_rank < self.ps.pp_size - 1
+        ):
+            page_size = int(self.page_size)
+
+            def _minimal_capacity(capacity):
+                if capacity is None or capacity == 0:
+                    return capacity
+                return page_size
+
+            memory_pool_config = MemoryPoolConfig(
+                max_total_num_tokens=page_size,
+                max_running_requests=memory_pool_config.max_running_requests,
+                full_max_total_num_tokens=_minimal_capacity(
+                    memory_pool_config.full_max_total_num_tokens
+                ),
+                swa_max_total_num_tokens=_minimal_capacity(
+                    memory_pool_config.swa_max_total_num_tokens
+                ),
+                mem_fraction_static=memory_pool_config.mem_fraction_static,
+            )
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
