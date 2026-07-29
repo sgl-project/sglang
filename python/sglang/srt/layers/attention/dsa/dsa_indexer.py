@@ -1005,11 +1005,14 @@ class Indexer(MultiPlatformOp):
                 get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
             )
         elif use_dg_native:
+            q_fp8_padded, weights_padded, _ = self._pad_heads_for_deep_gemm(
+                q_fp8, weights
+            )
             logits = deepgemm_paged_mqa_logits_native(
                 deep_gemm.fp8_paged_mqa_logits,
-                q_fp8,
+                q_fp8_padded,
                 kv_cache_fp8,
-                weights,
+                weights_padded,
                 seqlens_32_2d,
                 block_tables,
                 schedule_metadata,
@@ -1019,11 +1022,14 @@ class Indexer(MultiPlatformOp):
                 next_n=next_n,
             )
         else:
+            q_fp8_padded, weights_padded, _ = self._pad_heads_for_deep_gemm(
+                q_fp8, weights
+            )
             logits = deepgemm_paged_mqa_logits_split(
                 deep_gemm.fp8_paged_mqa_logits,
-                q_fp8,
+                q_fp8_padded,
                 kv_cache_fp8,
-                weights,
+                weights_padded,
                 seqlens_32_2d,
                 block_tables,
                 schedule_metadata,
