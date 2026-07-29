@@ -323,23 +323,72 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
-ROW_PARALLELISM_LINEAR_LORA_NAMES = [
-    "o_proj",
-    "out_proj",
-    "down_proj",
-    "down_proj_moe",
-    "down_proj_shared_moe",
-    "wo_ud",
-]
 DSA_INDEXER_LORA_NAMES = frozenset(
     {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
 )
-REPLICATED_LINEAR_LORA_NAMES = [
-    "fused_qkv_a_proj_with_mqa",
-    "fc1_latent_proj",
-    "fc2_latent_proj",
-    *DSA_INDEXER_LORA_NAMES,
-]
+
+
+class LoRAParallelism(Enum):
+    COLUMN = "column"
+    ROW = "row"
+    REPLICATED = "replicated"
+
+
+class LoRAShardGroup(Enum):
+    """Which TP group shards a module's weights. Under
+    `--enable-dp-attention`, ATTN_TP means `attn_tp_size = tp_size // dp_size`
+    rather than the outer `tp_size`; MOE_TP is the routed-expert TP width."""
+
+    GLOBAL_TP = "global_tp"
+    ATTN_TP = "attn_tp"
+    MOE_TP = "moe_tp"
+
+
+# One row per linear LoRA module name: (parallelism, shard group). A module's
+# buffer shapes and slicing both follow this table, so adding a module states
+# both sharding decisions in one place instead of across parallel name lists.
+LORA_LINEAR_SHARD_SPECS: dict[str, Tuple[LoRAParallelism, LoRAShardGroup]] = {
+    # Attention projections: sharded on the attention TP group.
+    "qkv_proj": (LoRAParallelism.COLUMN, LoRAShardGroup.ATTN_TP),
+    "qkvr": (LoRAParallelism.COLUMN, LoRAShardGroup.ATTN_TP),
+    "q_b_proj": (LoRAParallelism.COLUMN, LoRAShardGroup.ATTN_TP),
+    "kv_b_proj": (LoRAParallelism.COLUMN, LoRAShardGroup.ATTN_TP),
+    "o_proj": (LoRAParallelism.ROW, LoRAShardGroup.ATTN_TP),
+    "out_proj": (LoRAParallelism.ROW, LoRAShardGroup.ATTN_TP),
+    "wo_ud": (LoRAParallelism.ROW, LoRAShardGroup.ATTN_TP),
+    # Linear-attention input projections: their layers switch to the attn-TP
+    # group under `--enable-dp-attention` (mamba.py sets tp_size/tp_rank from
+    # attn_tp when dp-attention is enabled; qwen3_5.py builds in_proj_qkvz
+    # with tp_rank=attn_tp_rank), so their LoRA buffers must too.
+    "in_proj": (LoRAParallelism.COLUMN, LoRAShardGroup.ATTN_TP),
+    "in_proj_qkvz": (LoRAParallelism.COLUMN, LoRAShardGroup.ATTN_TP),
+    # Dense MLP: sharded on the outer TP group.
+    "up_proj": (LoRAParallelism.COLUMN, LoRAShardGroup.GLOBAL_TP),
+    "gate_up_proj": (LoRAParallelism.COLUMN, LoRAShardGroup.GLOBAL_TP),
+    "down_proj": (LoRAParallelism.ROW, LoRAShardGroup.GLOBAL_TP),
+    # Routed MoE experts shard by moe_tp; shared experts by the outer TP.
+    "gate_up_proj_moe": (LoRAParallelism.COLUMN, LoRAShardGroup.MOE_TP),
+    "down_proj_moe": (LoRAParallelism.ROW, LoRAShardGroup.MOE_TP),
+    "gate_up_proj_shared_moe": (LoRAParallelism.COLUMN, LoRAShardGroup.GLOBAL_TP),
+    "down_proj_shared_moe": (LoRAParallelism.ROW, LoRAShardGroup.GLOBAL_TP),
+    # Replicated projections: never sharded.
+    "fused_qkv_a_proj_with_mqa": (LoRAParallelism.REPLICATED, LoRAShardGroup.GLOBAL_TP),
+    "fc1_latent_proj": (LoRAParallelism.REPLICATED, LoRAShardGroup.GLOBAL_TP),
+    "fc2_latent_proj": (LoRAParallelism.REPLICATED, LoRAShardGroup.GLOBAL_TP),
+    "indexer.wq_b": (LoRAParallelism.REPLICATED, LoRAShardGroup.GLOBAL_TP),
+    "indexer.wk": (LoRAParallelism.REPLICATED, LoRAShardGroup.GLOBAL_TP),
+    "indexer.weights_proj": (LoRAParallelism.REPLICATED, LoRAShardGroup.GLOBAL_TP),
+}
+
+
+def get_lora_shard_spec(module_name: str) -> Tuple[LoRAParallelism, LoRAShardGroup]:
+    """Sharding spec for a linear LoRA module. Non-linear modules (embedding,
+    lm_head) default to column / outer-TP, matching the legacy list-based
+    membership checks."""
+    return LORA_LINEAR_SHARD_SPECS.get(
+        module_name, (LoRAParallelism.COLUMN, LoRAShardGroup.GLOBAL_TP)
+    )
+
 
 # Normalized module names that the LoRA system fully supports
 # (i.e. get_hidden_dim, init_buffers, and init_lora_modules can handle them).
