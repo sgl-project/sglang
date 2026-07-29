@@ -252,6 +252,13 @@ class KDAKernelDispatcher:
 class KDAAttnBackend(MambaAttnBackendBase):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
+    # Same GPU-only contract as GDNAttnBackend / Mamba2AttnBackend: KDA metadata
+    # never reads the spec-v2 seq_lens_cpu mirror (replay padding comes from
+    # forward_batch.num_padding, and the replayssm track-flush mask paths are
+    # gated `not is_kda`), so don't force FutureMap's blocking per-step
+    # seq_lens D2H (~0.5 ms/step host stall in bs=1 MTP decode).
+    needs_cpu_seq_lens: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         # mamba_cache.conv is [..., kernel-1, dim] while conv_states_shape expects the window length (kernel-1) at shape[-1], hence the transpose.

@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, TypeVar
+from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
 import torch
 
@@ -41,17 +41,10 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     ReplaceWriteThroughOnNodeSplit,
 )
-from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
-    NodeId,
-    UnifiedLRUList,
-    UnifiedTreeCore,
-    UnifiedTreeNode,
-)
 
 # UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
 # because other modules and tests import them from this module.
-from sglang.srt.mem_cache.unified_cache_components import (
+from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
@@ -60,6 +53,13 @@ from sglang.srt.mem_cache.unified_cache_components import (
     PrepareLoadBackResult,
     SWAComponent,
     TreeComponent,
+)
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
+    NodeId,
+    UnifiedLRUList,
+    UnifiedTreeCore,
+    UnifiedTreeNode,
 )
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
@@ -535,13 +535,15 @@ class UnifiedRadixCache(BasePrefixCache):
             finally:
                 self.tree_core.evict_device_end(ct)
 
-    def inc_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
+    def inc_lock_ref(
+        self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
+    ) -> IncLockRefResult:
         result = self.session.try_inc_lock_ref(node_id)
         if result is not None:
             return result
         if self.disable:
             return IncLockRefResult()
-        return self.tree_core.inc_lock_ref(node_id)
+        return self.tree_core.inc_lock_ref(node_id, skip_lock_components)
 
     def dec_lock_ref(
         self,
@@ -556,14 +558,29 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_lock_ref(node_id, params, skip_swa)
 
+    def _dec_req_lock(self, req: Req, *, skip_swa: bool = False) -> None:
+        """Release the tree lock a request holds on its last_node, honoring the
+        components it skipped locking so it never drops a lock it never took."""
+        self.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                skip_lock_node_ids=req.skip_lock_node_ids,
+            ),
+            skip_swa=skip_swa,
+        )
+
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
         swa_uuid_for_lock: Optional[int] = None,
+        skip_lock_node_ids: Optional[dict] = None,
     ) -> None:
         if self.disable:
             return
-        result = self.tree_core.dec_swa_lock_only(node_id, swa_uuid_for_lock)
+        result = self.tree_core.dec_swa_lock_only(
+            node_id, swa_uuid_for_lock, skip_lock_node_ids
+        )
         self._free_values(result.device_frees, result.host_frees)
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
@@ -588,7 +605,7 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_len_to_handle
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
@@ -619,10 +636,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
 
-            # Truncate if needed
+            # Truncate if needed; the tail free is deferred and batched with
+            # the unaligned tail below so a shared boundary page is emitted once.
+            kv_indices_full = kv_indices
+            tail_free_start = None
             if effective_cache_len < len(token_ids):
-                free_start = max(effective_cache_len, req.cache_protected_len)
-                self.token_to_kv_pool_allocator.free(kv_indices[free_start:])
+                tail_free_start = max(effective_cache_len, req.cache_protected_len)
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
 
@@ -636,16 +655,18 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
-            # Free unaligned tail
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            # Free unaligned tail (+ deferred truncation tail)
+            segments = [(kv_indices[page_aligned_len:], page_aligned_len)]
+            if tail_free_start is not None:
+                segments.append((kv_indices_full[tail_free_start:], tail_free_start))
+            self.token_to_kv_pool_allocator.free_segments(segments)
         else:
-            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
+            self.token_to_kv_pool_allocator.free_segment(
+                kv_indices[req.cache_protected_len :],
+                start_pos=req.cache_protected_len,
+            )
 
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
-            skip_swa=getattr(req, "swa_prefix_lock_released", False),
-        )
+        self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
 
         # cleanup
         for comp in self._components_tuple:
@@ -731,11 +752,21 @@ class UnifiedRadixCache(BasePrefixCache):
             new_indices[req.cache_protected_len :],
         )
 
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        self._dec_req_lock(req)
+        # Opt-in: leave the matched-prefix mamba evictable during decode (it is
+        # already COW'd to the request's own slot, never read from this node again).
+        # Safe only because any future COW source is the COWing request's own
+        # admission-locked last_node (recorded only if still present, locked before
+        # the next alloc) -- not this evictable node. A scheduler that matched a
+        # whole batch before locking would break that. Off = original full lock.
+        skip_lock_components = (
+            (ComponentType.MAMBA,)
+            if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+            else ()
         )
-        lock_result = self.inc_lock_ref(new_last_node)
+        lock_result = self.inc_lock_ref(
+            new_last_node, skip_lock_components=skip_lock_components
+        )
 
         # Update req fields
         if len(new_indices) < len(kv_indices_orig):
@@ -747,6 +778,8 @@ class UnifiedRadixCache(BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        # carry the skip set so this node's dec releases only what we locked
+        req.skip_lock_node_ids = lock_result.skip_lock_node_ids
         # The rematch acquired a new SWA prefix lock.
         req.swa_prefix_lock_released = False
 
@@ -784,8 +817,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 [action.new_node_id, action.new_child_node_id],
             )
         elif isinstance(action, FreeDeviceKV):
+            # tree values are page-aligned copies of a kv row: page-exact segments
             for indices in action.indices:
-                self.token_to_kv_pool_allocator.free(indices)
+                self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             self._execute_and_commit_kv_backup(action)
         else:
