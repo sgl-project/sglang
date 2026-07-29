@@ -597,14 +597,22 @@ def _resident_manager(model, *, num_layers, prefetch_size=1, resident_layers=0):
     )
 
 
-def test_resident_layers_retained_until_force_released(monkeypatch):
+def _arm_residency(manager):
+    """Mimic the first-layer pre-hook: arm the resident set, then pin it."""
+    manager._activate_residency()
+    manager.prepare_for_next_req(non_blocking=False)
+
+
+def test_resident_layers_stay_pinned_until_stage_teardown(monkeypatch):
     _patch_fake_device(monkeypatch)
     manager = _resident_manager(
         _MultiBlockModel(4), num_layers=4, prefetch_size=1, resident_layers=2
     )
-    manager._maybe_init_residency()
+    # The resident set is armed on the first forward, not at construction.
+    assert manager._retained_layers == 0
 
-    assert manager._num_resident_layers == 2
+    _arm_residency(manager)
+    assert manager._retained_layers == 2
     assert {0, 1} <= manager._gpu_layers
 
     # A non-force release keeps the leading resident layers pinned across steps.
@@ -615,7 +623,7 @@ def test_resident_layers_retained_until_force_released(monkeypatch):
     # force=True (teardown) overrides the retention.
     manager.release_layer(0, force=True)
     assert 0 not in manager._gpu_layers
-    manager.release_all()  # force=True by default
+    manager.release_all()  # ends the denoise stage: residents go too
     assert not manager._gpu_layers
 
 
@@ -624,9 +632,9 @@ def test_resident_layers_off_by_default_streams_everything(monkeypatch):
     manager = _resident_manager(
         _MultiBlockModel(4), num_layers=4, prefetch_size=1, resident_layers=0
     )
-    manager._maybe_init_residency()
+    _arm_residency(manager)
 
-    assert manager._num_resident_layers == 0
+    assert manager._retained_layers == 0
     assert manager.holds_residents is False
 
     manager.prefetch_layer(2, non_blocking=False)
@@ -639,8 +647,8 @@ def test_prepare_for_next_req_repins_residents(monkeypatch):
     manager = _resident_manager(
         _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=3
     )
-    manager._maybe_init_residency()
-    manager.release_all(force=True)
+    _arm_residency(manager)
+    manager.release_all()
     assert not manager._gpu_layers
 
     # The next denoise re-pins the resident set (union of prefetch window + residents).
@@ -672,7 +680,7 @@ def test_configure_resolves_resident_layers_absolute(monkeypatch):
     _patch_fake_device(monkeypatch)
     comp = _ResidentComponent(8)
     comp.configure_layerwise_offload(_server_args(dit_layerwise_resident_layers=3))
-    assert comp.layerwise_offload_managers[0]._configured_resident_layers == 3
+    assert comp.layerwise_offload_managers[0].resident_layers == 3
 
 
 def test_configure_resolves_resident_layers_ratio(monkeypatch):
@@ -680,4 +688,4 @@ def test_configure_resolves_resident_layers_ratio(monkeypatch):
     comp = _ResidentComponent(8)
     comp.configure_layerwise_offload(_server_args(dit_layerwise_resident_layers=0.5))
     # 0.5 * 8 = 4 leading layers resident
-    assert comp.layerwise_offload_managers[0]._configured_resident_layers == 4
+    assert comp.layerwise_offload_managers[0].resident_layers == 4

@@ -49,12 +49,12 @@ class LayerwiseOffloadManager:
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
         self.prefetch_size = min(max(1, prefetch_size), self.num_layers)
-
-        # Keep the leading ``resident_layers`` layers resident on GPU across denoise steps.
-        self._configured_resident_layers = max(0, int(resident_layers))
-        # Stay 0 until the first denoise forward, so load-time prefetch does not pin the whole set before the DiT is the active component.
-        self._num_resident_layers = 0
-        self._residency_initialized = False
+        # Leading layers held on GPU across denoise steps, instead of being
+        # re-streamed every step like the tail.
+        self.resident_layers = min(max(0, int(resident_layers)), self.num_layers)
+        # Armed on the first denoise forward, so that the load-time prefetch below
+        # does not pin the whole resident set before the DiT is the active component.
+        self._residency_active = False
 
         self.enabled = bool(enabled and torch.get_device_module().is_available())
         if not self.enabled:
@@ -255,14 +255,14 @@ class LayerwiseOffloadManager:
 
         self.register_forward_hooks()
         logger.info(
-            f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, total num layers: {self.num_layers}"
+            f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, num resident layers: {self.resident_layers}, total num layers: {self.num_layers}"
         )
 
     def prepare_for_next_req(self, non_blocking=True):
         """
         Prepare for the next round of denoising loop with prefetching the necessary layers
         """
-        num_prefetch_layers = max(self.prefetch_size, self._num_resident_layers)
+        num_prefetch_layers = max(self.prefetch_size, self._retained_layers)
         for i in range(num_prefetch_layers):
             self.prefetch_layer(i, non_blocking=non_blocking)
         if not non_blocking and self.copy_stream is not None:
@@ -272,31 +272,18 @@ class LayerwiseOffloadManager:
     def holds_residents(self) -> bool:
         """True if this manager keeps a resident leading-layer set beyond the
         streaming prefetch window, so it must be denoise-stage-scoped."""
-        return self.enabled and self._configured_resident_layers > 0
+        return self.enabled and self.resident_layers > 0
+
+    @property
+    def _retained_layers(self) -> int:
+        """Leading layers currently held across denoise steps; 0 until armed."""
+        return self.resident_layers if self._residency_active else 0
 
     @torch.compiler.disable
-    def _maybe_init_residency(self) -> None:
-        """Size and pin the leading resident layer set once, on the first forward."""
-        if self._residency_initialized:
-            return
-        self._residency_initialized = True
-        if self._configured_resident_layers <= 0:
-            return
-        self._num_resident_layers = min(
-            self.num_layers, self._configured_resident_layers
-        )
-
-        logger.info(
-            "Layerwise residency: keeping %d/%d leading layers resident; the "
-            "prefetch window (%d) streams the tail",
-            self._num_resident_layers,
-            self.num_layers,
-            self.prefetch_size,
-        )
-        for i in range(self._num_resident_layers):
-            self.prefetch_layer(i, non_blocking=False)
-        if self.copy_stream is not None:
-            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+    def _activate_residency(self) -> None:
+        """Arm the resident set on the first denoise forward. The pinning itself is
+        done by the ``prepare_for_next_req`` that follows in the same hook."""
+        self._residency_active = True
 
     def get_target_with_name(self, name: str) -> torch.Tensor:
         """get the target model weight/buffer to be replaced"""
@@ -382,7 +369,7 @@ class LayerwiseOffloadManager:
         if not self.enabled or self.device is None:
             return
 
-        if not force and layer_idx < self._num_resident_layers:
+        if not force and layer_idx < self._retained_layers:
             return
 
         # clear prefetch event, since it's useless and needs to be reset
@@ -402,14 +389,16 @@ class LayerwiseOffloadManager:
         self._gpu_layers.discard(layer_idx)
 
     @torch.compiler.disable
-    def release_all(self, force: bool = True) -> None:
+    def release_all(self) -> None:
+        """Release every layer, including the resident ones: this ends the
+        denoise stage that the resident set is scoped to."""
         if not self.enabled or self.device is None:
             return
         if self.copy_stream is not None:
             torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
         for layer_idx in list(self._gpu_layers):
-            self.release_layer(layer_idx, force=force)
+            self.release_layer(layer_idx, force=True)
 
     @torch.compiler.disable
     def load_all_layers(self) -> None:
@@ -565,7 +554,7 @@ class LayerwiseOffloadManager:
         def make_pre_hook(i):
             def hook(module, input):
                 if i == 0:
-                    self._maybe_init_residency()
+                    self._activate_residency()
                     self.prepare_for_next_req(non_blocking=False)
                 if i not in self._gpu_layers:
                     # LTX audio VAE traverses decoder.up in reverse order
