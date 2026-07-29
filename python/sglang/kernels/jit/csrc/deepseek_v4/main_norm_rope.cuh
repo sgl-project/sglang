@@ -719,18 +719,29 @@ struct FusedQIndexerRopeHadamardQuantKernel {
         .num_heads = num_heads,
     };
     const auto total_works = batch_size * num_heads;
-    // Cap the grid at one wave (num_sm * blocks/SM) and grid-stride over the
-    // rest: collapses the partial-wave tail on large batch without over-
-    // subscribing. When the problem already fits one wave, launch the non-
-    // strided instantiation (straight-line body, no loop overhead).
+    // Cap the grid at one wave; the grid-stride loop mops up the rest,
+    // collapsing the large-batch tail. Blocks/SM comes from the driver per
+    // kernel instance (cudaOccupancyMaxActiveBlocksPerMultiprocessor), not a
+    // hard-coded value; the two instances may occupy differently, so query
+    // each -- straight-line defines "one wave" for the branch, the chosen one
+    // sizes the grid.
+    const bool is_i32 = pos_dtype.is_type<int32_t>();
     int num_sm = 0;
     cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device_.unwrap().device_id);
+
+    int occ_straight = 0, occ_stride = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occ_straight, is_i32 ? kernel<int32_t, false> : kernel<int64_t, false>, kBlockSize, 0);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occ_stride, is_i32 ? kernel<int32_t, true> : kernel<int64_t, true>, kBlockSize, 0);
+    if (occ_straight <= 0) occ_straight = static_cast<int>(kBlocksPerSM);  // query-failed fallback
+    if (occ_stride <= 0) occ_stride = static_cast<int>(kBlocksPerSM);
+    const uint32_t sm = static_cast<uint32_t>(num_sm > 0 ? num_sm : 1);
+
     const uint32_t rows_blocks = div_ceil(total_works, kNumWarps);
-    const uint32_t wave_blocks = static_cast<uint32_t>(num_sm > 0 ? num_sm : 148) * kBlocksPerSM;
+    const uint32_t wave_blocks = sm * static_cast<uint32_t>(occ_straight);
     const bool grid_stride = rows_blocks > wave_blocks;
-    const auto num_blocks = grid_stride ? wave_blocks : rows_blocks;
-    // Pick PosT dtype and whether the grid-stride backedge is compiled in.
-    const bool is_i32 = pos_dtype.is_type<int32_t>();
+    const auto num_blocks = grid_stride ? sm * static_cast<uint32_t>(occ_stride) : rows_blocks;
     const auto k = grid_stride ? (is_i32 ? kernel<int32_t, true> : kernel<int64_t, true>)
                                : (is_i32 ? kernel<int32_t, false> : kernel<int64_t, false>);
     LaunchKernel(num_blocks, kBlockSize, device_.unwrap())  //
