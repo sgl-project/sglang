@@ -1009,10 +1009,8 @@ class AscendAttnBackend(AttentionBackend):
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
-        q_nope, q_pe = q, q_rope
-        k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-        num_token_padding = q_nope.shape[0]
+        num_token_padding = q.shape[0]
         num_token_non_padded = forward_batch.num_token_non_padded_cpu
         trim_eager_padding = (
             not is_prefill
@@ -1022,8 +1020,11 @@ class AscendAttnBackend(AttentionBackend):
             and num_token_padding > num_token_non_padded
         )
         if trim_eager_padding:
-            q_nope = q_nope[:num_token_non_padded]
-            q_pe = q_pe[:num_token_non_padded]
+            q = q[:num_token_non_padded]
+            q_rope = q_rope[:num_token_non_padded]
+
+        q_nope, q_pe = q, q_rope
+        k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
         if is_prefill:
             if self.forward_metadata.actual_seq_lengths_q is not None:
@@ -1039,17 +1040,17 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_qlen = (
                         torch.arange(
                             self.speculative_num_draft_tokens,
-                            self.speculative_num_draft_tokens + q_nope.shape[0],
+                            self.speculative_num_draft_tokens + q.shape[0],
                             self.speculative_num_draft_tokens,
                             dtype=torch.int32,
                         )
-                        .to(q_nope.device)
+                        .to(q.device)
                         .to(torch.int32)
                     )
                 else:
                     actual_seq_qlen = (
-                        torch.arange(1, q_nope.shape[0] + 1)
-                        .to(q_nope.device)
+                        torch.arange(1, q.shape[0] + 1)
+                        .to(q.device)
                         .to(torch.int32)
                     )
             else:
