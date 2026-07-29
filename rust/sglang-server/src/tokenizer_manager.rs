@@ -13,6 +13,8 @@
 mod egress;
 mod ingress;
 
+pub use egress::ActivityCounter;
+
 use crate::ids::Rid;
 use crate::message::{DetokMsg, Request};
 
