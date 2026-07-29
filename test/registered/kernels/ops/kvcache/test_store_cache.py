@@ -33,7 +33,7 @@ def test_store_cache(batch_size: int, element_dim: int) -> None:
     v = torch.randn((batch_size, element_dim), dtype=DTYPE, device=DEVICE)
     k_cache = torch.randn((CACHE_SIZE, element_dim), dtype=DTYPE, device=DEVICE)
     v_cache = torch.randn((CACHE_SIZE, element_dim), dtype=DTYPE, device=DEVICE)
-    indices = torch.randperm(CACHE_SIZE, device=DEVICE)[:batch_size]
+    indices = torch.randperm(CACHE_SIZE - 1, device=DEVICE)[:batch_size] + 1
 
     # AOT store cache
     store_cache(k, v, k_cache, v_cache, indices)
@@ -60,7 +60,7 @@ def test_store_cache_dtypes(
     v = torch.randn((batch_size, element_dim), dtype=dtype, device=DEVICE)
     k_cache = torch.randn((SMALL_CACHE, element_dim), dtype=dtype, device=DEVICE)
     v_cache = torch.randn((SMALL_CACHE, element_dim), dtype=dtype, device=DEVICE)
-    indices = torch.randperm(SMALL_CACHE, device=DEVICE)[:batch_size]
+    indices = torch.randperm(SMALL_CACHE - 1, device=DEVICE)[:batch_size] + 1
 
     store_cache(k, v, k_cache, v_cache, indices)
 
@@ -78,12 +78,63 @@ def test_store_cache_int32_indices(batch_size: int, element_dim: int) -> None:
     k_cache = torch.randn((SMALL_CACHE, element_dim), dtype=DTYPE, device=DEVICE)
     v_cache = torch.randn((SMALL_CACHE, element_dim), dtype=DTYPE, device=DEVICE)
     # int32 indices exercise a different CUDA template instantiation than default int64
-    indices = torch.randperm(SMALL_CACHE, device=DEVICE)[:batch_size].to(torch.int32)
+    indices = (torch.randperm(SMALL_CACHE - 1, device=DEVICE)[:batch_size] + 1).to(
+        torch.int32
+    )
 
     store_cache(k, v, k_cache, v_cache, indices)
 
     assert torch.all(k_cache[indices.long()] == k)
     assert torch.all(v_cache[indices.long()] == v)
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("num_split", [1, 2, 4])
+def test_store_cache_reserved_skip_index(
+    index_dtype: torch.dtype, num_split: int
+) -> None:
+    element_dim = 1024
+    k = torch.randn((4, element_dim), dtype=DTYPE, device=DEVICE)
+    v = torch.randn((4, element_dim), dtype=DTYPE, device=DEVICE)
+    # Model kernels may leave CUDA-graph padding rows undefined. Reproduce the
+    # dangerous case directly instead of requiring a full model checkpoint.
+    k[[0, 2]] = torch.nan
+    v[[0, 2]] = torch.nan
+    k_cache = torch.randn((SMALL_CACHE, element_dim), dtype=DTYPE, device=DEVICE)
+    v_cache = torch.randn((SMALL_CACHE, element_dim), dtype=DTYPE, device=DEVICE)
+    reserved_k_before = k_cache[0].clone()
+    reserved_v_before = v_cache[0].clone()
+    indices = torch.tensor([0, 7, 0, 9], dtype=index_dtype, device=DEVICE)
+
+    store_cache(
+        k,
+        v,
+        k_cache,
+        v_cache,
+        indices,
+        num_split=num_split,
+    )
+
+    torch.testing.assert_close(k_cache[0], reserved_k_before, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(v_cache[0], reserved_v_before, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(k_cache[indices[1].long()], k[1], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(v_cache[indices[1].long()], v[1], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(k_cache[indices[3].long()], k[3], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(v_cache[indices[3].long()], v[3], rtol=0.0, atol=0.0)
+
+
+def test_store_cache_zero_index_can_be_written_when_skip_disabled() -> None:
+    element_dim = 64
+    k = torch.randn((1, element_dim), dtype=DTYPE, device=DEVICE)
+    v = torch.randn((1, element_dim), dtype=DTYPE, device=DEVICE)
+    k_cache = torch.randn((SMALL_CACHE, element_dim), dtype=DTYPE, device=DEVICE)
+    v_cache = torch.randn((SMALL_CACHE, element_dim), dtype=DTYPE, device=DEVICE)
+    indices = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+
+    store_cache(k, v, k_cache, v_cache, indices, reserved_skip_index=-1)
+
+    torch.testing.assert_close(k_cache[0], k[0], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(v_cache[0], v[0], rtol=0.0, atol=0.0)
 
 
 def _valid_num_splits(element_dim: int, dtype: torch.dtype) -> list:
@@ -114,7 +165,7 @@ def test_store_cache_num_split(
     v = torch.randn((batch_size, element_dim), dtype=dtype, device=DEVICE)
     k_cache = torch.randn((SMALL_CACHE, element_dim), dtype=dtype, device=DEVICE)
     v_cache = torch.randn((SMALL_CACHE, element_dim), dtype=dtype, device=DEVICE)
-    indices = torch.randperm(SMALL_CACHE, device=DEVICE)[:batch_size]
+    indices = torch.randperm(SMALL_CACHE - 1, device=DEVICE)[:batch_size] + 1
 
     # Verify each num_split kernel path (1, 2, 4) produces correct results
     store_cache(k, v, k_cache, v_cache, indices, num_split=num_split)

@@ -98,7 +98,7 @@ jobs:
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
@@ -164,7 +164,7 @@ jobs:
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
@@ -227,7 +227,7 @@ jobs:
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
@@ -289,7 +289,7 @@ jobs:
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
@@ -356,7 +356,7 @@ jobs:
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
@@ -401,7 +401,7 @@ jobs:
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
@@ -455,7 +455,7 @@ jobs:
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 

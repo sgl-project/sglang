@@ -1,6 +1,7 @@
 """GPU-free import / registry / selector tests for ``sglang.kernels`` (RFC #29630)."""
 
 import importlib
+import importlib.util
 import subprocess
 import sys
 
@@ -45,6 +46,7 @@ EXPECTED = {
     "moe.moe_align_block_size": {"aot", "jit"},
     "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
     "kvcache.reshape_and_cache_flash": {"triton"},
+    "diffusion.apply_group_norm_silu": {"triton"},
 }
 
 _CPU = PlatformInfo(device_type="cpu")
@@ -82,6 +84,20 @@ def test_specs_well_formed():
         assert spec.op == f"{spec.group}.{spec.name}"
         mod, sep, attr = spec.target.partition(":")
         assert sep == ":" and mod and attr, spec.target
+
+
+def test_internal_registry_target_modules_exist():
+    for spec in K.registry.all_specs():
+        module, _, _ = spec.target.partition(":")
+        if module.startswith("sglang.kernels."):
+            assert importlib.util.find_spec(module) is not None, spec.target
+
+
+def test_sparse_linear_attention_registry_targets_forward_kernel():
+    spec = K.registry.get_backend(
+        "diffusion.sparse_linear_attn_fwd", KernelBackend.TRITON
+    )
+    assert spec.target.endswith(":_attn_fwd")
 
 
 def test_single_backend_resolves_without_backend():
