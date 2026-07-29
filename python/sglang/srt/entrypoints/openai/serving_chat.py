@@ -508,7 +508,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if not self.tokenizer_manager.server_args.enable_cache_report:
             return None
         return UsageProcessor._details_if_cached(
-            content["meta_info"].get("cached_tokens", 0)
+            self._reported_cached_tokens(content["meta_info"])
         )
 
     def _reported_prompt_tokens(self, meta_info: Dict[str, Any]) -> int:
@@ -518,6 +518,12 @@ class OpenAIServingChat(OpenAIServingBase):
             # reference API excludes it from billed/reported prompt tokens.
             prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
         return prompt_tokens
+
+    def _reported_cached_tokens(self, meta_info: Dict[str, Any]) -> int:
+        cached_tokens = meta_info.get("cached_tokens", 0)
+        if self.chat_encoding_spec == "kimi_k3":
+            cached_tokens = max(0, cached_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
+        return cached_tokens
 
     async def _generate_stream_content(
         self,
@@ -1399,7 +1405,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 reasoning_tokens[index] = content["meta_info"].get(
                     "reasoning_tokens", 0
                 )
-                cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                cached_tokens[index] = self._reported_cached_tokens(content["meta_info"])
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
                 cached_tokens_details[index] = content["meta_info"].get(
@@ -1628,6 +1634,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     "meta_info": {
                         **item["meta_info"],
                         "prompt_tokens": self._reported_prompt_tokens(
+                            item["meta_info"]
+                        ),
+                        "cached_tokens": self._reported_cached_tokens(
                             item["meta_info"]
                         ),
                     },
