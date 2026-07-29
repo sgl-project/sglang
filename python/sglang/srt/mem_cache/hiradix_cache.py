@@ -1450,6 +1450,7 @@ class HiRadixCache(RadixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
+            self.check_ready_prefetch_progress()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
@@ -1540,6 +1541,49 @@ class HiRadixCache(RadixCache):
         cc.prefetch_tokens_occupied = max(
             0, cc.prefetch_tokens_occupied - len(prefetch_key)
         )
+
+    def _can_check_prefetch_progress_proactively(
+        self, operation: PrefetchOperation
+    ) -> bool:
+        if operation.host_indices is None or operation.is_terminated():
+            return True
+
+        if (
+            len(operation.hash_value) > 0
+            and operation.completed_tokens
+            == len(operation.hash_value) * self.page_size
+        ):
+            return True
+
+        return self.prefetch_stop_policy == "timeout" and self.is_prefetch_timeout(
+            operation
+        )
+
+    def check_ready_prefetch_progress(self):
+        """
+        Finalize prefetches that have already finished IO at the scheduler safe point.
+
+        The normal waiting-queue scan still checks each request before admission. This
+        proactive path only decouples scheduler_ready confirmation from FCFS
+        waiting-queue position; admission into the prefill batch is unchanged.
+        """
+        if not self.ongoing_prefetch:
+            return
+
+        # Sort by req_id so every rank evaluates candidates in the same order.
+        candidates = sorted(self.ongoing_prefetch.items(), key=lambda item: item[0])
+        local_ready = torch.tensor(
+            [
+                int(self._can_check_prefetch_progress_proactively(operation))
+                for _, (_, _, operation) in candidates
+            ],
+            dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(local_ready, torch.distributed.ReduceOp.MIN)
+
+        for (req_id, _), ready in zip(candidates, local_ready.tolist()):
+            if ready and req_id in self.ongoing_prefetch:
+                self.check_prefetch_progress(req_id)
 
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
