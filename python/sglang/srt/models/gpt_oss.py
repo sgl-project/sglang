@@ -167,6 +167,9 @@ class TinyGemmLinear(ReplicatedLinear):
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if x.ndim == 2 and x.shape[0] == 0:
+            return x.new_empty((0, self.output_size)), None
+
         if (
             self._use_tinygemm
             and x.ndim == 2

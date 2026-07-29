@@ -9,7 +9,7 @@ import torch
 from sglang.srt.layers.moe import MoeRunnerBackend
 from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.models.gpt_oss import _narrow_fused_moe_ep_weight
+from sglang.srt.models.gpt_oss import TinyGemmLinear, _narrow_fused_moe_ep_weight
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -83,6 +83,20 @@ class TestGptOssEpWeightLoading(CustomTestCase):
         )
 
         torch.testing.assert_close(expert_data, loaded_weight)
+
+    def test_tinygemm_linear_accepts_empty_idle_batch(self):
+        """DP ranks without work must not launch tinygemm with zero M."""
+        layer = TinyGemmLinear.__new__(TinyGemmLinear)
+        torch.nn.Module.__init__(layer)
+        layer.output_size = 128
+        layer._use_tinygemm = True
+        x = torch.empty((0, 64), dtype=torch.bfloat16)
+
+        output, output_bias = layer(x)
+
+        self.assertEqual(output.shape, (0, 128))
+        self.assertEqual(output.dtype, torch.bfloat16)
+        self.assertIsNone(output_bias)
 
     @patch.object(fused_moe_layer.UnquantizedFusedMoEMethod, "create_moe_runner")
     @patch.object(fused_moe_layer.UnquantizedFusedMoEMethod, "create_weights")
