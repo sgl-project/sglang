@@ -510,24 +510,40 @@ class FutureMap:
             self._lazy_init_forward_buf(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(
-            self.output_tokens_buf.dtype
+            device=self.output_tokens_buf.device,
+            dtype=self.output_tokens_buf.dtype,
+            non_blocking=True,
         )
 
         if self.need_topk:
-            self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
+            self.topk_p_buf[indices] = payload.topk_p.to(
+                device=self.topk_p_buf.device,
+                dtype=self.topk_p_buf.dtype,
+                non_blocking=True,
+            )
             self.topk_index_buf[indices] = payload.topk_index.to(
-                self.topk_index_buf.dtype
+                device=self.topk_index_buf.device,
+                dtype=self.topk_index_buf.dtype,
+                non_blocking=True,
             )
         if self.need_hidden_states:
             self.hidden_states_buf[indices] = payload.hidden_states.to(
-                self.hidden_states_buf.dtype
+                device=self.hidden_states_buf.device,
+                dtype=self.hidden_states_buf.dtype,
+                non_blocking=True,
             )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
-            self.draft_probs_buf[indices] = payload.draft_probs
+            self.draft_probs_buf[indices] = payload.draft_probs.to(
+                device=self.draft_probs_buf.device,
+                dtype=self.draft_probs_buf.dtype,
+                non_blocking=True,
+            )
         if (
             self.dsa_topk_indices_buf is not None
             and payload.dsa_topk_indices is not None
         ):
             self.dsa_topk_indices_buf[indices] = payload.dsa_topk_indices.to(
-                self.dsa_topk_indices_buf.dtype
+                device=self.dsa_topk_indices_buf.device,
+                dtype=self.dsa_topk_indices_buf.dtype,
+                non_blocking=True,
             )
