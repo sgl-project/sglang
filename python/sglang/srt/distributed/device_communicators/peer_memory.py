@@ -33,10 +33,8 @@ import torch
 import torch.distributed as dist
 from sglang.srt.distributed.device_communicators.vmm_utils import (
     _get_cuda_driver,
-    all_ranks_ok,
     check_drv,
     exchange_posix_fds,
-    export_shareable_handles,
     import_peer_handle,
     make_rw_access_desc,
 )
@@ -307,9 +305,11 @@ def create_rank_major_peer_buffer(
     driver = _get_cuda_driver()
     handle_types = driver.CUmemAllocationHandleType
     posix = handle_types.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-    fabric = handle_types.CU_MEM_HANDLE_TYPE_FABRIC
 
-    prop = _make_allocation_property(driver, device_id, posix | fabric)
+    # This allocator is intentionally same-host, so POSIX file descriptors are
+    # sufficient. CUDA Python 13 models requestedHandleTypes as a strict enum
+    # and rejects combined bitmasks such as POSIX_FD | FABRIC.
+    prop = _make_allocation_property(driver, device_id, posix)
     granularity_flag = (
         driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
     )
@@ -333,19 +333,12 @@ def create_rank_major_peer_buffer(
         raise RuntimeError(f"CUDA VMM allocation plans differ across ranks: {plans}")
 
     err, local_handle = driver.cuMemCreate(bytes_per_rank, prop, 0)
-    if not all_ranks_ok(group, err == driver.CUresult.CUDA_SUCCESS):
-        if err == driver.CUresult.CUDA_SUCCESS:
-            driver.cuMemRelease(local_handle)
-        prop = _make_allocation_property(driver, device_id, posix)
-        err, local_handle = driver.cuMemCreate(bytes_per_rank, prop, 0)
-        allocation_error = (
-            None
-            if err == driver.CUresult.CUDA_SUCCESS
-            else RuntimeError(f"cuMemCreate(POSIX_FD): {err}")
-        )
-        _synchronize_stage(group, rank, "allocation", allocation_error)
-    elif err != driver.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"cuMemCreate(FABRIC): {err}")
+    allocation_error = (
+        None
+        if err == driver.CUresult.CUDA_SUCCESS
+        else RuntimeError(f"cuMemCreate(POSIX_FD): {err}")
+    )
+    _synchronize_stage(group, rank, "allocation", allocation_error)
 
     local_fds: list[int] = []
     peer_fds: dict[tuple[int, int], int] = {}
@@ -354,16 +347,19 @@ def create_rank_major_peer_buffer(
     base_va: int | None = None
     total_bytes = bytes_per_rank * world_size
     try:
-        fabric_handles, local_fds, use_fabric = export_shareable_handles(
-            [local_handle], group, rank
-        )
-        gathered_handles: list[bytes | None] = [None] * world_size
-        if use_fabric:
-            dist.all_gather_object(gathered_handles, fabric_handles[0], group=group)
-        else:
-            peer_fds = exchange_posix_fds(
-                group, rank, world_size, local_fds, [1] * world_size
+        export_error = None
+        try:
+            fd = check_drv(
+                driver.cuMemExportToShareableHandle(local_handle, posix, 0),
+                "cuMemExportToShareableHandle(POSIX_FD)",
             )
+            local_fds = [int(fd)]
+        except BaseException as error:  # noqa: BLE001 - synchronize failures cross-rank
+            export_error = error
+        _synchronize_stage(group, rank, "POSIX handle export", export_error)
+        peer_fds = exchange_posix_fds(
+            group, rank, world_size, local_fds, [1] * world_size
+        )
 
         mapping_error = None
         try:
@@ -377,9 +373,9 @@ def create_rank_major_peer_buffer(
                 handle = local_handle
                 if peer_rank != rank:
                     handle = import_peer_handle(
-                        gathered_handles[peer_rank],
-                        None if use_fabric else peer_fds[(peer_rank, 0)],
-                        use_fabric=use_fabric,
+                        None,
+                        peer_fds[(peer_rank, 0)],
+                        use_fabric=False,
                         peer_rank=peer_rank,
                     )
                     imported_handles.append(handle)
