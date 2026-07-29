@@ -53,6 +53,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
     cp_split_before_forward,
     enable_cp_v2,
     prepare_cp_forward,
@@ -672,6 +673,47 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.input_embeds = input_embeds
         forward_batch.positions = positions
         return live_local_tokens
+
+    def _validate_cp_flashinfer_dispatch_capacity(
+        self,
+        *,
+        global_bucket_tokens: int,
+        required_local_tokens: int,
+    ) -> None:
+        """Validate FlashInfer's fixed A2A workspace before graph capture."""
+        from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+            FlashinferDispatcher,
+        )
+
+        capacities = []
+        seen_dispatchers = set()
+        for layer in self.moe_layers:
+            dispatcher = getattr(layer, "dispatcher", None)
+            if not isinstance(dispatcher, FlashinferDispatcher):
+                continue
+            dispatcher_id = id(dispatcher)
+            if dispatcher_id in seen_dispatchers:
+                continue
+            seen_dispatchers.add(dispatcher_id)
+            capacity = int(dispatcher.max_num_tokens)
+            capacities.append(capacity)
+            if capacity < required_local_tokens:
+                raise ValueError(
+                    f"Breakable prefill CP global bucket {global_bucket_tokens} "
+                    f"has required local rows {required_local_tokens}, but "
+                    f"FlashInfer A2A configured capacity {capacity} is smaller. "
+                    "Increase "
+                    "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK."
+                )
+
+        if capacities:
+            logger.info(
+                "Breakable prefill CP capture capacity: global_bucket=%d, "
+                "required_local_rows=%d, flashinfer_dispatch_capacities=%s",
+                global_bucket_tokens,
+                required_local_tokens,
+                sorted(set(capacities)),
+            )
 
     @contextmanager
     def _prefill_forward_context(
@@ -1336,6 +1378,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        if self.enable_cp_v2_body_capture:
+            required_local_tokens = self._prepare_cp_static_inputs(
+                forward_batch,
+                static_num_tokens=num_tokens,
+                capture=True,
+            )
+            self._validate_cp_flashinfer_dispatch_capacity(
+                global_bucket_tokens=num_tokens,
+                required_local_tokens=required_local_tokens,
+            )
         if forward_batch.lora_ids is not None:
             # Fill the static prefill LoRA batch info the captured kernels
             # will read (all-None ids: ranks stay 0, kernels no-op).
@@ -1572,11 +1624,66 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch.spec_info.hidden_states
             )
 
+        metadata_forward_batch = forward_batch
+        if self.enable_cp_v2_body_capture:
+            self._cp_live_local_tokens = self._prepare_cp_static_inputs(
+                static_forward_batch,
+                static_num_tokens=static_num_tokens,
+                capture=False,
+            )
+            metadata_forward_batch = static_forward_batch
+
         self._prepare_forward_metadata_for_replay(
-            forward_batch, static_forward_batch, static_num_tokens
+            metadata_forward_batch, static_forward_batch, static_num_tokens
         )
 
         return static_forward_batch
+
+    def _execute_cp_body_capture(
+        self,
+        forward_batch: ForwardBatch,
+        static_forward_batch: ForwardBatch,
+        static_num_tokens: int,
+        **kwargs,
+    ):
+        """Replay a CP-local body and run the global gather/logits tail eagerly."""
+        model = self.model_runner.model
+        local_output = self.backend.replay(
+            ShapeKey(size=static_num_tokens),
+            static_forward_batch,
+            **kwargs,
+        )
+        local_output = _slice_output_rows(
+            local_output,
+            self._cp_live_local_tokens,
+        )
+
+        capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
+        aux_hidden_states = None
+        if capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = local_output
+        else:
+            hidden_states = local_output
+
+        if not model.pp_group.is_last_rank:
+            return (
+                (hidden_states, aux_hidden_states)
+                if capture_aux_hidden_states
+                else hidden_states
+            )
+
+        hidden_states = cp_gather_after_forward(
+            hidden_states,
+            static_forward_batch,
+            torch.cuda.current_stream(),
+        )
+        return model.logits_processor(
+            forward_batch.input_ids,
+            hidden_states,
+            model.lm_head,
+            forward_batch,
+            aux_hidden_states,
+        )
 
     def _execute_body_capture(
         self,
@@ -1705,7 +1812,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if shape_key.variant_label is not None:
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
 
-            if self._uses_eager_prefill_tail():
+            if self.enable_cp_v2_body_capture:
+                output = self._execute_cp_body_capture(
+                    forward_batch,
+                    static_forward_batch,
+                    static_num_tokens,
+                    **kwargs,
+                )
+            elif self._uses_eager_prefill_tail():
                 output = self._execute_body_capture(
                     forward_batch,
                     static_forward_batch,
