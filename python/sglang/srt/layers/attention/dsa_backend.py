@@ -337,6 +337,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
+    "aiter",
     "trtllm",
 ]
 
