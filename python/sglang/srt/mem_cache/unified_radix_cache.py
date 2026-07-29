@@ -1712,8 +1712,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Async Event Management ----
 
-    @staticmethod
-    def _count_ready_acks(ack_queue) -> int:
+    def _count_ready_acks(self, ack_queue) -> int:
         ready_count = 0
         for ack in ack_queue:
             if not ack.finish_event.query():
@@ -1731,8 +1730,8 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_queue_sizes = ()
             extra_pool_names = ()
         else:
-            write_acks = UnifiedRadixCache._count_ready_acks(cc.ack_write_queue)
-            load_acks = UnifiedRadixCache._count_ready_acks(cc.ack_load_queue)
+            write_acks = self._count_ready_acks(cc.ack_write_queue)
+            load_acks = self._count_ready_acks(cc.ack_load_queue)
             extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
             extra_pool_names = (
                 tuple(extra_release_queues) if self.enable_storage else ()
@@ -1793,7 +1792,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # diverge across ranks (e.g. write_backup returning 0 on a subset).
             finish_count = 0
             if self.pp_rank == 0:
-                finish_count = UnifiedRadixCache._count_ready_acks(cc.ack_write_queue)
+                finish_count = self._count_ready_acks(cc.ack_write_queue)
             finish_count_tensor = torch.tensor(
                 finish_count, dtype=torch.int, device="cpu"
             )
@@ -1818,7 +1817,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # diverge across ranks.
             finish_count = 0
             if self.pp_rank == 0:
-                finish_count = UnifiedRadixCache._count_ready_acks(cc.ack_load_queue)
+                finish_count = self._count_ready_acks(cc.ack_load_queue)
             finish_count_tensor = torch.tensor(
                 finish_count, dtype=torch.int, device="cpu"
             )
