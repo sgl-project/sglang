@@ -329,7 +329,10 @@ def gemm_ag_up_fits(num_tokens: int) -> bool:
         0 < num_tokens <= mod.MAX_TOKENS
         and state.world_size == 8
         and num_tokens * (2 * NORM_DIM // 8) * 2 <= comm.max_push_size
-        and comm.config.num_push_blocks >= 112  # GEMV grid (896 / 8)
+        # The GEMV producer reads a single phase counter, so its grid is not
+        # bound to the counter array; the spin consumer still needs one block
+        # per counter slot plus the cleanup block.
+        and comm.config.num_push_blocks >= 2
     )
 
 
