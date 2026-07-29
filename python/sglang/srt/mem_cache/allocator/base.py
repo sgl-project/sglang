@@ -115,7 +115,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free(self, free_index: torch.Tensor):
         raise NotImplementedError()
 
-    def free_segment(self, free_index: torch.Tensor, *, start_pos: int = 0):
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """Free ``kv_row[start_pos : start_pos + n]`` of one request (or a
         page-aligned copy); subclasses may use ``start_pos`` to skip the
         data-dependent dedup. Default: plain free()."""
@@ -123,6 +123,20 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def free_segments(self, segments):
         """Free disjoint ascending ``(free_index, start_pos)`` segments of one
-        request's kv row; consecutive segments may share a boundary page."""
+        request's kv row; a boundary page shared by consecutive segments is
+        emitted once (the later segment's head is trimmed)."""
+        prev_end = None
         for free_index, start_pos in segments:
+            n = free_index.numel()
+            if n == 0:
+                continue
+            seg_end = start_pos + n
+            if (
+                prev_end is not None
+                and start_pos // self.page_size == (prev_end - 1) // self.page_size
+            ):
+                trim = (start_pos // self.page_size + 1) * self.page_size - start_pos
+                free_index = free_index[trim:]
+                start_pos = start_pos + trim
+            prev_end = seg_end
             self.free_segment(free_index, start_pos=start_pos)

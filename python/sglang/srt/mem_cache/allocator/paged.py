@@ -270,7 +270,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
 
-    def free_segment(self, free_index: torch.Tensor, *, start_pos: int = 0):
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """Free a contiguous token-position segment [start_pos, start_pos + n).
 
         Fixed-shape counterpart of free(): tokens [k*ps, (k+1)*ps) of a request
@@ -295,9 +295,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             pieces = (head, rest) if rest.numel() else (head,)
 
         if self.debug_mode:
+            # unique on CPU: the NPU subclass's free() deliberately avoids
+            # device-side unique, keep the debug reference off-device too.
             page_ids = torch.cat([p // self.page_size for p in pieces])
             assert torch.equal(
-                torch.sort(page_ids)[0], torch.unique(free_index // self.page_size)
+                torch.sort(page_ids.cpu())[0],
+                torch.unique(free_index.cpu() // self.page_size),
             )
 
         if self.is_not_in_free_group:
@@ -306,29 +309,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 assert len(torch.unique(self.free_pages)) == len(self.free_pages)
         else:
             self.free_page_reps_group.extend(pieces)
-
-    def free_segments(self, segments):
-        """Free disjoint ascending segments of one request's kv row.
-
-        When consecutive segments share a boundary page (neither end is
-        page-aligned), the later segment's head is trimmed so the shared page
-        is emitted exactly once.
-        """
-        prev_end = None
-        for free_index, start_pos in segments:
-            n = free_index.numel()
-            if n == 0:
-                continue
-            seg_end = start_pos + n
-            if (
-                prev_end is not None
-                and start_pos // self.page_size == (prev_end - 1) // self.page_size
-            ):
-                trim = (start_pos // self.page_size + 1) * self.page_size - start_pos
-                free_index = free_index[trim:]
-                start_pos = start_pos + trim
-            prev_end = seg_end
-            self.free_segment(free_index, start_pos=start_pos)
 
     def _release_page_ids(self, *page_ids: torch.Tensor):
         if self.need_sort:
@@ -347,6 +327,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 torch.cat(self.free_page_reps_group) // self.page_size
             )
             self.free_page_reps_group = []
+        if self.debug_mode:
+            # The no-double-free contract can only be violated across the
+            # calls a group aggregates; check it where they merge.
+            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.

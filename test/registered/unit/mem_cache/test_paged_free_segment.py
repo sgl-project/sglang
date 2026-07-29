@@ -2,7 +2,7 @@
 extraction over all segment alignments, plus boundary-page dedup and free-group
 deferral. See PagedTokenToKVPoolAllocator.free_segment for why unique is avoided.
 
-    python -m pytest test/registered/mem_cache/test_paged_free_segment.py -v
+    python -m pytest test/registered/unit/mem_cache/test_paged_free_segment.py -v
 """
 
 import unittest
@@ -81,6 +81,19 @@ class TestFreeSegment(unittest.TestCase):
         self.assertEqual(len(alloc.free_pages), before)
         alloc.free_group_end()
         self.assertEqual(len(alloc.free_pages), before + 2)
+
+    def test_group_end_debug_assert_catches_cross_call_double_free(self):
+        # The no-double-free contract can only break across the calls a group
+        # aggregates (e.g. legacy free() and free_segment() covering the same
+        # page); free_group_end's debug assert must catch it.
+        alloc = _make_allocator()
+        alloc.debug_mode = True
+        row = _make_kv_row(alloc, PAGE_SIZE)
+        alloc.free_group_begin()
+        alloc.free(row)
+        alloc.free_segment(row, start_pos=0)
+        with self.assertRaises(AssertionError):
+            alloc.free_group_end()
 
 
 class TestFreeSegments(unittest.TestCase):

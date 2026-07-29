@@ -546,7 +546,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_len_to_handle
             ]
-            self.token_to_kv_pool_allocator.free_segment(kv_indices)
+            self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
             self.req_to_token_pool.free_mamba_cache(req)
             return
 
@@ -803,7 +803,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # 1. a leaf node, free full tokens and mamba
         self._record_remove_event(x)
         # Tree values are page-aligned copies of a kv row: page-exact segment.
-        self.token_to_kv_pool_allocator.free_segment(x.value)
+        self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
         full_num_evicted = len(x.value)
         self._free_mamba_value(x.mamba_value)
         mamba_num_evicted = len(x.mamba_value)
@@ -1311,7 +1311,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             ), f"tombstone mamba_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.mamba_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
             self._record_remove_event(node.parent)
-            self.token_to_kv_pool_allocator.free_segment(node.parent.value)
+            self.token_to_kv_pool_allocator.free_segment(node.parent.value, start_pos=0)
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)
             self._delete_tombstone_leaf(node.parent)

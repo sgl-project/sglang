@@ -586,7 +586,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             _priority, x = heapq.heappop(eviction_heap)
 
             # Tree values are page-aligned copies of a kv row: page-exact segment.
-            self.token_to_kv_pool_allocator.free_segment(x.value)
+            self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
             num_evicted += len(x.value)
             self._delete_leaf(x)
 

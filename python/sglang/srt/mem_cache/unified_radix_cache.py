@@ -588,7 +588,7 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_len_to_handle
             ]
-            self.token_to_kv_pool_allocator.free_segment(kv_indices)
+            self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
@@ -796,7 +796,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # Tree values are page-aligned (RadixKey.match rounds down to
             # page_size), so each tensor is a page-exact segment.
             for indices in action.indices:
-                self.token_to_kv_pool_allocator.free_segment(indices)
+                self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             self._execute_and_commit_kv_backup(action)
         else:
