@@ -452,7 +452,6 @@ class ModelRunner:
             state.active_ranks.zero_()
             state.active_ranks[:join_effective_ep_size] = 1
             state.snapshot_active_to_last()
-            state.sync_active_to_cpu()
             state.scale_phase = "syncing_new_world"
         self._elastic_scale_ready_barrier(
             target_size=join_effective_ep_size,
@@ -1744,7 +1743,6 @@ class ModelRunner:
         for rank in ranks_to_join:
             state.active_ranks[rank] = 1
         state.snapshot_active_to_last()
-        state.sync_active_to_cpu()
         if self.eplb_manager is not None:
             self.eplb_manager.reset_generator()
 

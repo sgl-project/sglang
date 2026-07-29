@@ -61,8 +61,26 @@ class ElasticEPState:
             self.active_ranks_cpu = self.active_ranks.detach().cpu().clone()
 
     def snapshot_active_to_last(self):
+        """Publish the current ``active_ranks`` as the new baseline.
+
+        This is the ONLY sanctioned way to conclude a mutation of
+        ``active_ranks``. It performs two coupled operations that must
+        always happen together:
+
+        1. Records the current state into ``last_active_ranks`` so that
+           ``is_active_equal_last`` can detect the next change.
+        2. Refreshes ``active_ranks_cpu`` so that the forward-path fast
+           check in ``maybe_recover_ep_ranks`` sees the freshest mirror
+           without incurring a host-device synchronization.
+
+        Skipping this call after a write to ``active_ranks`` will leave
+        the CPU mirror stale and cause the fast path to mask real
+        faults. New mutation sites of ``active_ranks`` MUST end with a
+        call to this method.
+        """
         if self.active_ranks is not None:
             self.last_active_ranks = self.active_ranks.clone()
+            self.sync_active_to_cpu()
 
     def reset(self):
         if self.active_ranks is not None:
@@ -70,7 +88,6 @@ class ElasticEPState:
             self.active_ranks.zero_()
             self.active_ranks[: self.effective_ep_size] = 1
             self.snapshot_active_to_last()
-            self.sync_active_to_cpu()
 
 
 class ElasticEPStateManager:
@@ -100,7 +117,6 @@ class ElasticEPStateManager:
             if active_rank_capacity > world_size:
                 inst.active_ranks[world_size:].zero_()
                 inst.snapshot_active_to_last()
-                inst.sync_active_to_cpu()
 
             if server_args.moe_a2a_backend == "nixl":
                 cls._on_scale = cls._on_scale_nixl
@@ -119,7 +135,6 @@ class ElasticEPStateManager:
         inst.active_ranks.zero_()
         inst.active_ranks[global_rank] = 1
         inst.snapshot_active_to_last()
-        inst.sync_active_to_cpu()
 
         if server_args.ep_join_mode == "scale":
             inst.effective_ep_size = (
@@ -466,12 +481,15 @@ def maybe_recover_ep_ranks(
     model_config: ModelConfig,
     moe_ep_rank: int,
 ) -> bool:
-    # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
-    # synchronization, and this function is on the forward-path.
-    # This check only runs when `--elastic-ep-backend` is enabled, so the
-    # synchronization overhead does not propagate to other configs.
-    # Leave for future optimization of the elastic EP path.
-    if tp_group.active_ranks.all() and tp_group.active_ranks_cpu.all():
+    # `active_ranks_cpu` is a lock-step CPU mirror of `active_ranks`.
+    # Every write to `active_ranks` is required to be concluded with a
+    # call to `ElasticEPState.snapshot_active_to_last()`, which is the
+    # ONLY sanctioned publish path and internally refreshes the CPU
+    # mirror. See its docstring for the contract. Consulting the CPU
+    # mirror alone therefore preserves semantics while avoiding a
+    # host-device synchronization on the forward path (`active_ranks.all()`
+    # on a CUDA tensor would force a `cudaStreamSynchronize`).
+    if tp_group.active_ranks_cpu.all():
         return False
 
     tp_active_ranks = tp_group.active_ranks.detach().cpu().numpy()
@@ -509,7 +527,6 @@ def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
     if elastic_ep_state is None or elastic_ep_state.is_active_equal_last():
         return False
     elastic_ep_state.snapshot_active_to_last()
-    elastic_ep_state.sync_active_to_cpu()
     logger.info("EPLB due to rank faults")
     gen = eplb_manager.rebalance()
     while True:
