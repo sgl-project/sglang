@@ -98,6 +98,13 @@ IN_BATCH_PREFIX_CACHING_CACHE_AGNOSTIC_MAX_QUEUE_SCAN = int(
 IGNORE_EOS_RESERVE_TOKENS = 1
 
 
+def _is_disaggregation_decode() -> bool:
+    try:
+        return get_server_args().disaggregation_mode == "decode"
+    except ValueError:
+        return False
+
+
 def match_prefix_for_req(
     tree_cache: BasePrefixCache,
     req: Req,
@@ -202,7 +209,7 @@ class SchedulePolicy:
         if (
             not isinstance(policy, CacheAwarePolicy)
             and self.tree_cache.supports_fast_match_prefix()
-            and get_server_args().disaggregation_mode != "decode"
+            and not _is_disaggregation_decode()
         ):
             for r in waiting_queue:
                 match_prefix_for_req(self.tree_cache, r, include_req=True)
@@ -342,7 +349,7 @@ class SchedulePolicy:
             not ENABLE_CACHE_AGNOSTIC_IN_BATCH_PREFIX_CACHING
             or getattr(self.tree_cache, "disable", True)
             or not self.tree_cache.supports_fast_match_prefix()
-            or get_server_args().disaggregation_mode == "decode"
+            or _is_disaggregation_decode()
         ):
             return
 
