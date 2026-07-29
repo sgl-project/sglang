@@ -131,7 +131,9 @@ def _hardware_available() -> bool:
     try:
         import torch
 
-        if not (torch.cuda.is_available() and deepseek_v4_fused_mhc.is_gfx95_supported()):
+        if not (
+            torch.cuda.is_available() and deepseek_v4_fused_mhc.is_gfx95_supported()
+        ):
             return False
         from aiter.ops.mhc import mhc_fused_post_pre  # noqa: F401
 
@@ -187,9 +189,7 @@ class TestAmdFusedMhcNumerical(unittest.TestCase):
         ref_post, _ref_comb, ref_li = mhc.mhc_pre(ref_next, fn, scl, base, **kw)
 
         torch.testing.assert_close(next_res, ref_next, rtol=0, atol=0)
-        torch.testing.assert_close(
-            li_out.float(), ref_li.float(), rtol=3e-2, atol=3e-2
-        )
+        torch.testing.assert_close(li_out.float(), ref_li.float(), rtol=3e-2, atol=3e-2)
         torch.testing.assert_close(
             post_mix.float(), ref_post.float(), rtol=3e-2, atol=3e-2
         )

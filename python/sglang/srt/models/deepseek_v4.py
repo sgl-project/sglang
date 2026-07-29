@@ -126,7 +126,6 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     _is_fused_mhc_post_pre_enabled,
     is_cross_layer_mhc_fusion_enabled,
-    try_fused_hc_post_pre,
     try_mhc_fused_post_pre_boundary,
 )
 from sglang.srt.models.deepseek_common.utils import (
@@ -1429,9 +1428,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         norm_eps: Optional[float],
         *,
         fn_transpose: bool,
-    ) -> Optional[
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]
-    ]:
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
         # Try the aiter/Triton fused post+pre kernels first; if neither fires,
         # fall back to the TileLang fused kernel, else return None so the caller
         # runs the unfused hc_post + hc_pre sequence.
@@ -1460,7 +1457,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             return None
 
         post_in = post.unsqueeze(-1) if post.ndim == 2 else post
-        residual, post_out, comb_out, layer_input_out = _get_mhc_ops().mhc_fused_post_pre(
+        (
+            residual,
+            post_out,
+            comb_out,
+            layer_input_out,
+        ) = _get_mhc_ops().mhc_fused_post_pre(
             layer_input,
             residual,
             post_in,
