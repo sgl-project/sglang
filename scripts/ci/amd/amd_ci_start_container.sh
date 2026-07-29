@@ -57,7 +57,7 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Environment:"
       echo "  ENABLE_CACHE_HOST=1|0"
-      echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 350, otherwise 0. Missing host cache falls back to container-local /sgl-data."
+      echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -291,7 +291,7 @@ CACHE_HOST=/home/runner/sglang-data
 if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
   RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
   RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"
-  if [[ "${RUNNER_NAME_LOWER}" == *300* || "${RUNNER_NAME_LOWER}" == *350* ]]; then
+  if [[ "${RUNNER_NAME_LOWER}" == *300* || "${RUNNER_NAME_LOWER}" == *35x* ]]; then
     ENABLE_CACHE_HOST="1"
   else
     ENABLE_CACHE_HOST="0"
