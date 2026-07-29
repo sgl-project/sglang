@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=240, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=240, stage="extra-b", runner_config="4-gpu-b200")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 CUDA_GRAPH_MAX_BS_DECODE = 256
@@ -46,8 +46,7 @@ class TestKimiLinearDCP4(GSM8KMixin, CustomTestCase):
     gsm8k_score_threshold = 0.88
     gsm8k_num_examples = 200
     # Keep accuracy evaluation within the captured decode batch sizes so its
-    # score is batch-invariant. The separate smoke test still exercises the
-    # eager path.
+    # score is batch-invariant.
     gsm8k_num_threads = 128
     gsm8k_num_shots = 5
 
@@ -123,9 +122,6 @@ class TestKimiLinearDCP4(GSM8KMixin, CustomTestCase):
         )
 
     def test_decode_cuda_graph_and_eager_batch(self):
-        # Batch two replays a captured shape; EAGER_BATCH_SIZE is above the
-        # configured regular CUDA graph maximum and therefore exercises eager
-        # decode, which only happens while concurrency clears that ceiling.
         self._assert_batch_completes(2)
         self._assert_batch_completes(2)
         self.assertGreater(

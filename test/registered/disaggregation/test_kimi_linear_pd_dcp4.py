@@ -470,8 +470,6 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
         )
 
     def test_decode_cuda_graph_and_eager_batch(self):
-        # EAGER_BATCH_SIZE only reaches eager decode while the decode server
-        # admits more concurrent requests than its capture ceiling.
         self._assert_batch_completes(2)
         self._assert_batch_completes(2)
         self.assertGreater(
