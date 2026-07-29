@@ -18,6 +18,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.models.apertus_mm import Apertus1p5ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
 
@@ -274,6 +275,80 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
             mm_items[:] = [item for item in mm_items if item.modality != modality]
             mm_items.extend(expanded_items)
 
+    @staticmethod
+    def _has_special_format(image_data, audio_data) -> bool:
+        return any(
+            SGLangBaseProcessor._is_preprocessed_input(item)
+            for item in list(image_data or []) + list(audio_data or [])
+        )
+
+    @staticmethod
+    def _split_raw_and_preprocessed(data):
+        raw_items = []
+        preprocessed_items = []
+        for item in data or []:
+            if SGLangBaseProcessor._is_preprocessed_input(item):
+                preprocessed_items.append(item)
+            else:
+                raw_items.append(item)
+        return raw_items, preprocessed_items
+
+    def _get_raw_only_prompt(self, raw_images, raw_audios) -> str:
+        return " ".join(
+            [self.mm_tokens.image_token] * len(raw_images)
+            + [self.mm_tokens.audio_token] * len(raw_audios)
+        )
+
+    async def _prepare_special_format(self, image_data, audio_data, input_text):
+        """Prepare precomputed/processor-output requests with canonical IDs.
+
+        Assumptions:
+        - One canonical, fully expanded Apertus ``input_ids`` sequence is
+          supplied directly, or ``input_text`` is its expanded token text. It
+          describes the complete prompt, including any raw media.
+        - Formatted payloads are already in Apertus processor output or
+          embedding form and must not be sent back through the HF processor.
+        - Raw and formatted payloads are not mixed within one modality; the
+          shared multimodal validation below enforces that existing contract.
+
+        Raw media is loaded and processed against a synthetic raw-only prompt.
+        Its resulting IDs are temporary: final IDs and offsets always come
+        from the canonical expanded sequence returned with the base output.
+        """
+        self.validate_mm_data(image_data, audio_data)
+
+        if isinstance(input_text, list):
+            canonical_input_ids = torch.tensor(input_text, dtype=torch.long)
+        else:
+            canonical_input_ids = self._tokenizer(
+                input_text,
+                return_tensors="pt",
+                add_special_tokens=False,
+            ).input_ids.flatten()
+
+        raw_images, formatted_images = self._split_raw_and_preprocessed(image_data)
+        raw_audios, formatted_audios = self._split_raw_and_preprocessed(audio_data)
+        if raw_images or raw_audios:
+            raw_prompt = self._get_raw_only_prompt(raw_images, raw_audios)
+            base_output = await self.load_mm_data(
+                prompt=raw_prompt,
+                image_data=raw_images or None,
+                audio_data=raw_audios or None,
+                multimodal_tokens=self.mm_tokens,
+                audio_sample_rate=self.audio_sample_rate,
+            )
+            base_output.images.extend(formatted_images)
+            base_output.audios.extend(formatted_audios)
+        else:
+            base_output = BaseMultiModalProcessorOutput(
+                input_text="",
+                input_ids=canonical_input_ids,
+                images=formatted_images,
+                audios=formatted_audios,
+            )
+
+        return base_output, canonical_input_ids
+
     async def process_mm_data_async(
         self,
         image_data: Optional[List[Union[str, bytes, Dict]]] = None,
@@ -283,16 +358,27 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        base_output = await self.load_mm_data(
-            prompt=input_text,
-            image_data=image_data,
-            audio_data=audio_data,
-            multimodal_tokens=self.mm_tokens,
-            audio_sample_rate=self.audio_sample_rate,
-        )
+        canonical_input_ids = None
+        if isinstance(input_text, list) or self._has_special_format(
+            image_data, audio_data
+        ):
+            base_output, canonical_input_ids = await self._prepare_special_format(
+                image_data, audio_data, input_text
+            )
+        else:
+            base_output = await self.load_mm_data(
+                prompt=input_text,
+                image_data=image_data,
+                audio_data=audio_data,
+                multimodal_tokens=self.mm_tokens,
+                audio_sample_rate=self.audio_sample_rate,
+            )
+
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
+        if canonical_input_ids is not None:
+            input_ids = canonical_input_ids
         self._expand_mm_items_with_apertus_offsets(mm_items, input_ids)
 
         return MultimodalProcessorOutput(
