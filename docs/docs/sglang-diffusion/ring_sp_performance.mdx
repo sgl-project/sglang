@@ -65,6 +65,13 @@ all-to-all and can help when its local attention shape or collective is more
 efficient, while Ulysses can use less attention activation memory. Benchmark
 both on the target model, resolution, accelerator, and interconnect.
 
+For SP degree `P`, the approximate per-rank network payload of K/V gather
+relative to Ulysses is `P / 2`, excluding each rank's local shard. The payloads
+are therefore similar at SP2, while K/V gather moves about 2x as much data at
+SP4 and 4x at SP8. K/V gather may still be faster when all-gather and its local
+attention layout are more efficient, especially at low SP degrees, but this
+scaling makes the interconnect and input shape part of the selection policy.
+
 ## Recommended Commands
 
 ### Ulysses Sequence Parallelism
