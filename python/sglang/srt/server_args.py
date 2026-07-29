@@ -3722,19 +3722,16 @@ class ServerArgs:
         handle_pd_disaggregation(self)
 
     def _handle_dcp_validation(self):
-        # Decode context parallel (DCP) is currently implemented and validated
-        # only on AMD HIP/ROCm. Reject invalid or unverified configurations
-        # early instead of letting them fail deeper in model initialization.
+        # Decode context parallel (DCP) backends have different platform
+        # requirements. Reject invalid or unverified configurations early
+        # instead of letting them fail deeper in model initialization.
         if self.dcp_size < 1:
             raise ValueError(
                 "Decode context parallel size (--dcp-size / "
                 "--decode-context-parallel-size) must be >= 1, but got "
                 f"dcp_size={self.dcp_size}."
             )
-        if (
-            self.dcp_comm_backend in ("a2a", "fi_a2a", "vmm")
-            and self.dcp_size <= 1
-        ):
+        if self.dcp_comm_backend in ("a2a", "fi_a2a", "vmm") and self.dcp_size <= 1:
             raise ValueError(
                 f"--dcp-comm-backend {self.dcp_comm_backend} only affects the "
                 "decode context-parallel attention reduction and therefore "
