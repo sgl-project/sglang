@@ -372,12 +372,38 @@ class TestCausalConv3dCache(unittest.TestCase):
         )
 
     def test_interleave_time_matches_legacy_reshape(self):
-        x = torch.randn((2, 8, 3, 4, 5), dtype=torch.float64, generator=self.generator)
-        b, c2, t, h, w = x.shape
-        c = c2 // 2
-        legacy = x.reshape(b, 2, c, t, h, w)
-        legacy = torch.stack((legacy[:, 0], legacy[:, 1]), 3).reshape(b, c, t * 2, h, w)
-        torch.testing.assert_close(interleave_time(x), legacy, rtol=0, atol=0)
+        """Both layouts must produce the same values, and keep their layout."""
+        for t in (1, 2, 3):
+            base = torch.randn(
+                (2, 8, t, 4, 5), dtype=torch.float64, generator=self.generator
+            )
+            b, c2, _, h, w = base.shape
+            c = c2 // 2
+            legacy = base.reshape(b, 2, c, t, h, w)
+            legacy = torch.stack((legacy[:, 0], legacy[:, 1]), 3).reshape(
+                b, c, t * 2, h, w
+            )
+
+            contiguous_out = interleave_time(base)
+            torch.testing.assert_close(contiguous_out, legacy, rtol=0, atol=0)
+            # A contiguous t == 1 input gets a free view from rearrange; an
+            # explicit buffer would turn that into a copy.
+            self.assertEqual(
+                contiguous_out.stride(),
+                torch.reshape(
+                    base.reshape(b, 2, c, t, h, w).permute(0, 2, 3, 1, 4, 5),
+                    (b, c, t * 2, h, w),
+                ).stride(),
+                msg=f"contiguous path changed its strides at t={t}",
+            )
+
+            channels_last = base.contiguous(memory_format=torch.channels_last_3d)
+            cl_out = interleave_time(channels_last)
+            torch.testing.assert_close(cl_out, legacy, rtol=0, atol=0)
+            self.assertTrue(
+                cl_out.is_contiguous(memory_format=torch.channels_last_3d),
+                msg=f"channels_last path lost the layout at t={t}",
+            )
 
     def test_cache_scope_is_restored_after_exception(self):
         conv = CausalConv3d(4, 4, 3, padding=1).double().eval()

@@ -282,12 +282,32 @@ def causal_cache_frames(
 def interleave_time(x: torch.Tensor) -> torch.Tensor:
     """``(b, 2c, t, h, w) -> (b, c, 2t, h, w)``, interleaving the halves in time.
 
-    Only ever called with t <= 2, because the decoder streams one latent frame
-    at a time. The permute-copy this does loses to an explicit stack once t grows
-    past roughly 8, so a VAE that decodes in temporal blocks would want to
-    measure before reusing this.
+    Under channels_last_3d the bytes are ordered ``[b][t][h][w][r][c]`` while the
+    result needs ``[b][t][r][h][w][c]``, which no view can express: ``rearrange``
+    copies anyway, and hands back a contiguous tensor that the upsample, the 2D
+    conv and the next causal conv all then follow into NCDHW. Writing the same
+    bytes into a channels_last_3d buffer is the copy it was already paying, and
+    it happens before the 2x temporal upsample rather than after it.
+
+    The contiguous path keeps ``rearrange``: there it returns a free view when
+    t == 1, which an explicit buffer would turn into a real copy.
     """
-    return rearrange(x, "b (r c) t h w -> b c (t r) h w", r=2)
+    if not is_channels_last_3d(x):
+        return rearrange(x, "b (r c) t h w -> b c (t r) h w", r=2)
+
+    b, c2, t, h, w = x.shape
+    c = c2 // 2
+    out = torch.empty(
+        (b, c, 2 * t, h, w),
+        dtype=x.dtype,
+        device=x.device,
+        memory_format=torch.channels_last_3d,
+    )
+    # r is the fast channel index: the first half of the channels feeds the even
+    # output frames.
+    out[:, :, 0::2] = x[:, :c]
+    out[:, :, 1::2] = x[:, c:]
+    return out
 
 
 class CausalConv3d(nn.Conv3d):
