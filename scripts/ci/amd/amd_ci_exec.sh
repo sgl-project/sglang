@@ -1,17 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-# Detect GPU family from the runner identity (e.g., linux-mi300-1gpu-sglang-...)
-RUNNER_ID="${RUNNER_NAME:-$(hostname)}"
+# Detect GPU family from hostname (e.g., linux-mi35x-gpu-1-xxxxx-runner-zzzzz)
+HOSTNAME_VALUE=$(hostname)
 GPU_FAMILY=""
 
-# Both legacy linux-mi35x-gpu-1-* and current linux-mi300-1gpu-sglang-* names
-# share this prefix.
-if [[ "${RUNNER_ID}" =~ ^linux-(mi[0-9]+[a-z]*)- ]]; then
+# Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
+if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
   GPU_FAMILY="${BASH_REMATCH[1]}"
-  echo "Detected GPU family from runner identity: ${GPU_FAMILY}"
+  echo "Detected GPU family from hostname: ${GPU_FAMILY}"
 else
-  echo "Warning: could not parse GPU family from '${RUNNER_ID}'"
+  echo "Warning: could not parse GPU family from '${HOSTNAME_VALUE}'"
 fi
 
 WORKDIR="/sglang-checkout/test"
@@ -24,10 +23,6 @@ declare -A ENV_MAP=(
   [SGLANG_ENABLE_ASYNC_ASSERT]=0
   [SGLANG_USE_AITER]=1
 )
-
-if [[ -n "${GPU_FAMILY}" ]]; then
-  ENV_MAP[SGLANG_AMD_GPU_FAMILY]="${GPU_FAMILY}"
-fi
 
 # Conditionally add GPU_ARCHS only for mi35x
 if [[ "${GPU_FAMILY}" == "mi35x" ]]; then
