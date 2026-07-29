@@ -1295,6 +1295,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
             # which can theoretically improve performance
             origin_hidden_states_dim = x.shape[-1]
+            # Filled by the staged K3 route+pack+quant fusion below; the pack
+            # site further down falls back to PackTopkIds when it is None.
+            prepared_packed_topk = None
             if self.flashinfer_mxfp4_moe_precision == "bf16":
                 assert x.dtype == torch.bfloat16
                 x_quant = x
@@ -1310,16 +1313,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
             elif self.flashinfer_mxfp4_moe_precision == "default":
                 if x.shape[-1] == self.hidden_size:
-                    from sglang.kernels.ops.quantization.per_token_group_quant import (
-                        per_token_group_quant,
-                    )
-
                     if x.dim() > 2:
                         x = x.view(-1, x.shape[-1])
-                    x_quant, x_scale = per_token_group_quant(
-                        x, group_size=32, scale_ue8m0=True
-                    )
-                    x_scale = x_scale.view(torch.float8_e4m3fn)
+                    # K3 staged fusion (route_quant_handoff): the routing
+                    # dispatch already quantized these rows and packed the
+                    # topk ids in the fused route launch — consume both and
+                    # skip the two standalone kernels. Identity-verified;
+                    # a miss runs the unfused chain below.
+                    from sglang.srt.layers.moe import route_quant_handoff
+
+                    prepared = route_quant_handoff.take(x)
+                    if prepared is not None:
+                        prepared_packed_topk, x_quant, x_scale = prepared
+                        x_scale = x_scale.view(torch.float8_e4m3fn)
+                    else:
+                        from sglang.kernels.ops.quantization.per_token_group_quant import (
+                            per_token_group_quant,
+                        )
+
+                        x_quant, x_scale = per_token_group_quant(
+                            x, group_size=32, scale_ue8m0=True
+                        )
+                        x_scale = x_scale.view(torch.float8_e4m3fn)
                 else:
                     x_quant, x_scale = mxfp8_quantize(
                         x, False, alignment=self.hidden_size
@@ -1393,11 +1408,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     # in-op routing kernels entirely. At small T the in-op
                     # single-CTA routing costs ~22 us/layer vs ~6 us for the
                     # external radix router.
-                    from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
+                    if prepared_packed_topk is not None:
+                        packed_topk = prepared_packed_topk
+                    else:
+                        from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
 
-                    packed_topk = PackTopkIds.execute(
-                        topk_output.topk_ids, topk_output.topk_weights
-                    )
+                        packed_topk = PackTopkIds.execute(
+                            topk_output.topk_ids, topk_output.topk_weights
+                        )
                     # Deferred finalize (K3 forward_deferred_finalize): return
                     # the finalize inputs instead of the finalized output.
                     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
