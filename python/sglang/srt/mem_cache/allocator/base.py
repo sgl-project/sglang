@@ -60,12 +60,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def get_kvcache(self):
         return self._kvcache
 
-    def restore_state(self, state):
-        self.free_pages, self.release_pages = state
-
-    def backup_state(self):
-        return (self.free_pages, self.release_pages)
-
     def free_group_begin(self):
         self.is_not_in_free_group = False
         self.free_group = []

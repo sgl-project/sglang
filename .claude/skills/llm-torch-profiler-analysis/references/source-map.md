@@ -32,7 +32,7 @@ Use these upstream files when the workflow or behavior needs to be justified fro
 
 ## Documentation and tests
 
-- `docs/developer_guide/benchmark_and_profiling.md`
+- `docs_new/docs/developer_guide/benchmark_and_profiling.mdx`
   - canonical profiling docs
 
 - `test/registered/profiling/test_start_profile.py`

@@ -7,8 +7,12 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
+    ScheduleVerifyLensTopk,
+    compute_sort_survival,
+)
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.environ import envs
+from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import (
     CONFIDENCE_RELAY_RING_LAG,
@@ -31,23 +35,30 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
 from sglang.srt.speculative.dspark_components.dspark_sts import (
     load_sts_calibration_from_path,
 )
-from sglang.srt.speculative.dspark_components.kernels.dspark_schedule import (
-    ScheduleVerifyLensTopk,
-    compute_sort_survival,
-)
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     RaggedVerifyMode,
     read_ragged_verify_mode,
     round_up_grid,
 )
-from sglang.srt.utils.async_probe import (
-    maybe_assert_async,
-    maybe_detect_in_closed_range,
-)
 from sglang.srt.utils.common import require_mlp_tp_gather
+from sglang.srt.utils.invariants import (
+    Bucket,
+    InClosedRange,
+    Invariant,
+    IsTrue,
+    expect,
+    resolve_level,
+)
 
 logger = logging.getLogger(__name__)
+
+# DSpark confidence is a per-token score that must stay in [0, 1].
+_CONFIDENCE = Invariant(
+    "dspark.planner.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
+)
+# Scheduled verify lengths must not exceed the per-step token budget.
+_VERIFY_LEN_BUDGET = Invariant("dspark.verify_len_budget", Bucket.GUARD, IsTrue())
 
 
 class VerifyWindow(msgspec.Struct, frozen=True):
@@ -124,6 +135,7 @@ class DSparkVerifyPlanner:
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
+        self._uniform_layout_cache: dict = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
             if self._confidence_head is None:
                 raise ValueError(
@@ -417,6 +429,21 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
+        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+            # Verify-all: the uniform layout (or None, past the captured grid)
+            # is constant per (bs, tier); serve it from cache instead of paying
+            # the per-step schedule and its host<->device round-trips.
+            key = (int(req_pool_indices.shape[0]), global_num_reqs)
+            if key not in self._uniform_layout_cache:
+                self._uniform_layout_cache[key] = uniform_ragged_layout(
+                    bs=key[0],
+                    device=device,
+                    verify_num_draft_tokens=self.verify_num_draft_tokens,
+                    ragged_verify_mode=self._ragged_verify_mode,
+                    model_runner=self.model_runner,
+                    tier_num_reqs=global_num_reqs,
+                )
+            return self._uniform_layout_cache[key]
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
@@ -564,12 +591,13 @@ class DSparkVerifyPlanner:
             cfg=self._schedule_cfg,
         ).to(device=device, dtype=torch.int32)
 
-        if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+        if resolve_level() >= InvariantCheckLevel.WARN:
             verify_lens_64 = verify_lens.to(torch.int64)
             effective_floor = max(self._schedule_cfg.min_verify_len, 1)
-            maybe_assert_async(
+            expect(
+                _VERIFY_LEN_BUDGET,
                 (verify_lens_64 - effective_floor).sum() <= budget,
-                f"DSpark verify-len budget violated (budget={budget})",
+                msg=f"budget={budget}",
             )
 
         if envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get():
@@ -891,7 +919,7 @@ def compute_confidence(
         markov_embed_stack = None
     confidence_raw = confidence_head(draft_hidden, markov_embed_stack)
     confidence = confidence_head.apply_sts(confidence_raw)
-    maybe_detect_in_closed_range(confidence, 0.0, 1.0, "DSpark confidence")
+    expect(_CONFIDENCE, confidence)
     return confidence
 
 

@@ -150,6 +150,11 @@ ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
+# Local source stage: with BRANCH_TYPE=local the build context is copied here and
+# used instead of git clone (mirrors docker/Dockerfile's local_src stage).
+FROM scratch AS local_src
+COPY . /src
+
 # ===============================
 # Chosen arch and args
 FROM ${GPU_ARCH}
@@ -167,6 +172,7 @@ ENV PYTORCH_ROCM_ARCH=${GPU_ARCH_LIST_ARG}
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
+ARG BRANCH_TYPE=remote
 
 # Version override for setuptools_scm (used in nightly builds)
 ARG SGLANG_VERSION=""
@@ -196,7 +202,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="e31d426a13e96e1cbff96a1c904d291aefe8c46a"
+ARG MORI_COMMIT="f7e6ac6863c53821bc7afb91a578cc6ce38fcad0"
 
 # NIXL (upstream ai-dynamo/nixl) — KV transfer backend for prefill/decode disaggregation.
 # Built from source for ROCm; needs UCX built --with-rocm (built here from openucx).
@@ -399,18 +405,35 @@ RUN pip install IPython \
     && pip install torchao==0.9.0 \
     && pip install pybind11 typing_extensions
 
+# Rust toolchain — needed by setuptools-rust to build the sglang-mm extension
+# (sglang.srt.multimodal._core) during the sglang pip install below, and later by
+# sgl-model-gateway. Must precede the sglang install.
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && rustc --version && cargo --version
+ENV CARGO_BUILD_JOBS=4
+
 RUN pip uninstall -y sgl_kernel sglang
-# RUN git clone ${SGL_REPO} \
-#     && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
-#          echo "Using ${SGL_DEFAULT}, default branch."; \
-#          git checkout ${SGL_DEFAULT}; \
-#        else \
-#          echo "Using ${SGL_BRANCH} branch."; \
-#          git checkout ${SGL_BRANCH}; \
-#        fi \
-RUN git clone ${SGL_REPO} \
+
+# Obtain sglang source: copied from the build context (BRANCH_TYPE=local) or git clone.
+COPY --from=local_src /src /tmp/local_src
+RUN if [ "$BRANCH_TYPE" = "local" ]; then \
+         echo "Using local source (BRANCH_TYPE=local)."; \
+         cp -r /tmp/local_src sglang; \
+       else \
+         git clone ${SGL_REPO} sglang \
+         && cd sglang \
+         && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
+              echo "Using ${SGL_DEFAULT}, default branch."; \
+              git checkout ${SGL_DEFAULT}; \
+            else \
+              echo "Using ${SGL_BRANCH} branch."; \
+              git checkout ${SGL_BRANCH}; \
+            fi \
+         && cd ..; \
+       fi \
+    && rm -rf /tmp/local_src \
     && cd sglang \
-    && git checkout ${SGL_BRANCH} \
     && cd sgl-kernel \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
@@ -432,11 +455,7 @@ RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
          /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs/ \
          -type f -name '*MI300X*' | xargs -I {} sh -c 'vf_config=$(echo "$1" | sed "s/MI300X/MI300X_VF/"); cp "$1" "$vf_config"' -- {}
 
-# Install Rust toolchain for sgl-model-gateway
-ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && rustc --version && cargo --version
-ENV CARGO_BUILD_JOBS=4
+# Rust toolchain already installed above (before the sglang install).
 
 # Build and install sgl-model-gateway
 RUN python3 -m pip install --no-cache-dir "maturin<1.14" \
