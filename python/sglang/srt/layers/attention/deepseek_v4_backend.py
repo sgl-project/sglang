@@ -1620,6 +1620,18 @@ class DeepseekV4AttnBackend(
 
             # --- MXFP4 path (before FP8-specific reshapes) ---
             if token_to_kv_pool.dsv4_kv_cache_store_mxfp4:
+                if forward_batch.forward_mode.is_extend():
+                    # MXFP4 extend: always use sparse prefill with MXFP4 dequant
+                    return self._forward_prefill_sparse(
+                        q=q,
+                        layer_id=layer_id,
+                        compress_ratio=compress_ratio,
+                        forward_batch=forward_batch,
+                        token_to_kv_pool=token_to_kv_pool,
+                        core_attn_metadata=core_attn_metadata,
+                        attn_sink=attn_sink,
+                    )
+                # Decode: fused MXFP4 jit_kernel
                 return self._forward_mxfp4_decode(
                     q=q,
                     swa_k_cache=swa_k_cache,
@@ -1765,11 +1777,13 @@ class DeepseekV4AttnBackend(
             dequantize_dsv4_mxfp4_k_cache_paged,
         )
 
-        N_heads = q.shape[0]
         dev = q.device
+        # q is [bs, n_heads, 512] (decode: bs=1) → flatten to [bs*n_heads, 512]
+        q_orig_shape = q.shape
         if q.ndim >= 3:
-            q = q.squeeze(1)  # [N, 1, 512] → [N, 512]
+            q = q.reshape(-1, q.shape[-1])
         assert q.ndim == 2 and q.shape[1] == MXFP4_TOTAL_DIM
+        N_heads = q.shape[0]
 
         # Pad indices/attn_sink to match q shape
         def _match(x, value):
@@ -1799,10 +1813,28 @@ class DeepseekV4AttnBackend(
             swa_window = 128  # DSV4 SWA attention window
             k_cache_flat = swa_k_cache.view(-1, MXFP4_BYTES_PER_TOKEN)
             page_ratio = swa_physical_page_size // swa_window
+
+            # Check if SWA window spans multiple pages. The fused kernel
+            # only handles one page per head; fall back to dequant+SDPA
+            # when two pages are needed (at page boundaries).
+            needs_multi_page = bool((swa_topk_lengths > 1).any().item())
+            if needs_multi_page:
+                # Fallback: dequant all needed pages → SDPA
+                return self._mxfp4_decode_sdpa_fallback(
+                    q=q,
+                    q_orig_shape=q_orig_shape,
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=swa_page_indices,
+                    swa_topk_lengths=swa_topk_lengths,
+                    page_size=swa_physical_page_size,
+                    sm_scale=self.softmax_scale,
+                    attn_sink=attn_sink,
+                )
+
             swa_kernel_indices = (
                 (swa_page_indices[:, 0] * page_ratio).to(torch.int32).contiguous()
             )
-            return mxfp4_decode_attention(
+            out_flat = mxfp4_decode_attention(
                 q=q,
                 k_cache=k_cache_flat,
                 page_indices=swa_kernel_indices,
@@ -1810,6 +1842,7 @@ class DeepseekV4AttnBackend(
                 page_size=swa_window,
                 attn_sink=attn_sink if attn_sink is not None else None,
             )
+            return out_flat.view(*q_orig_shape[:-1], -1)
 
         # ── C4/C128: batch-dequant unique pages, then SDPA per head ──────
         swa_phys_page_size = self.token_to_kv_pool.swa_page_size
@@ -1835,8 +1868,8 @@ class DeepseekV4AttnBackend(
             unique_extra.update(extra_pids)
 
         # --- batch-dequant unique pages → flat row-indexed BF16 ---
-        def _dequant_pages(cache, page_ids, page_sz):
-            """Dequant multiple pages into a flat [total_tokens, 512] tensor."""
+        def _dequant_swa_pages(cache, page_ids, page_sz):
+            """SWA pool: MXFP4 dequant → flat [total_tokens, 512] tensor."""
             if not page_ids:
                 return None, {}
             flat_indices = []
@@ -1848,11 +1881,28 @@ class DeepseekV4AttnBackend(
             deq = dequantize_dsv4_mxfp4_k_cache_paged(cache, indices_t, page_sz)
             return deq[:, 0, :], page_to_start  # [total_tokens, 512], dict
 
-        swa_deq, swa_lookup = _dequant_pages(
+        def _dequant_extra_pages(cache, page_ids, page_sz):
+            """C4/C128 pool: FP8 dequant → flat [total_tokens, 512] tensor."""
+            if not page_ids:
+                return None, {}
+            flat_indices = []
+            page_to_start = {}
+            for pid in sorted(page_ids):
+                page_to_start[pid] = len(flat_indices)
+                flat_indices.extend(range(pid * page_sz, (pid + 1) * page_sz))
+            indices_t = torch.tensor(flat_indices, dtype=torch.int32, device=dev)
+            from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+                dequantize_k_cache_paged as dequantize_fp8_k_cache_paged,
+            )
+
+            deq = dequantize_fp8_k_cache_paged(cache, indices_t, page_sz)
+            return deq[:, 0, :], page_to_start  # [total_tokens, 512], dict
+
+        swa_deq, swa_lookup = _dequant_swa_pages(
             swa_k_cache, unique_swa, swa_phys_page_size
         )
         extra_deq, extra_lookup = (
-            _dequant_pages(extra_k_cache, unique_extra, extra_page_size)
+            _dequant_extra_pages(extra_k_cache, unique_extra, extra_page_size)
             if extra_k_cache is not None
             else (None, {})
         )
@@ -1883,7 +1933,76 @@ class DeepseekV4AttnBackend(
             weights = torch.softmax(scores_aug, dim=0)[: scores.numel()]
             out[h] = (weights.unsqueeze(0) @ k_all).squeeze(0)
 
-        return out.to(torch.bfloat16)
+        return out.view(*q_orig_shape[:-1], -1).to(torch.bfloat16)
+
+    def _mxfp4_decode_sdpa_fallback(
+        self,
+        *,
+        q: torch.Tensor,
+        q_orig_shape: torch.Size,
+        swa_k_cache: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        page_size: int,
+        sm_scale: float,
+        attn_sink: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """SDPA fallback when the SWA window spans multiple MXFP4 pages."""
+        from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
+            MXFP4_TOTAL_DIM,
+            dequantize_dsv4_mxfp4_k_cache_paged,
+        )
+
+        N = q.shape[0]
+        dev = q.device
+        swa_page_size = page_size
+
+        unique_pages = set()
+        for h in range(min(N, swa_page_indices.shape[0])):
+            topk = int(swa_topk_lengths[h].item())
+            for pid in swa_page_indices[h, :topk].tolist():
+                if pid >= 0:
+                    unique_pages.add(pid)
+
+        sorted_pages = sorted(unique_pages)
+        page_to_start = {}
+        flat_indices = []
+        for pid in sorted_pages:
+            page_to_start[pid] = len(flat_indices)
+            flat_indices.extend(range(pid * swa_page_size, (pid + 1) * swa_page_size))
+
+        indices_t = torch.tensor(flat_indices, dtype=torch.int32, device=dev)
+        k_dq = dequantize_dsv4_mxfp4_k_cache_paged(
+            swa_k_cache, indices_t, page_size=swa_page_size
+        )[
+            :, 0, :
+        ]  # [Tkv, 512]
+        k_f32 = k_dq.float()
+
+        out = torch.zeros(N, MXFP4_TOTAL_DIM, dtype=torch.float32, device=dev)
+        for h in range(N):
+            qi = q[h : h + 1].float()
+            topk = int(swa_topk_lengths[h].item())
+            rows = []
+            for pi in range(topk):
+                pid = int(swa_page_indices[h, pi].item())
+                if pid < 0:
+                    continue
+                start = page_to_start[pid]
+                rows.append(k_f32[start : start + swa_page_size])
+            if not rows:
+                continue
+            k_all = torch.cat(rows, dim=0)
+            scores = (qi @ k_all.T).squeeze(0) * sm_scale
+            if attn_sink is not None:
+                sv = float(attn_sink[h])
+                scores_aug = torch.cat([scores, torch.tensor([sv], device=dev)])
+                weights = torch.softmax(scores_aug, dim=0)[: scores.numel()]
+            else:
+                weights = torch.softmax(scores, dim=0)
+            out[h] = (weights.unsqueeze(0) @ k_all).squeeze(0)
+
+        return out.view(*q_orig_shape[:-1], -1).to(torch.bfloat16)
 
     def _forward_prefill_sparse(
         self,
@@ -1966,19 +2085,43 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
-        if compressed_slice is not None:
-            dequantize_k_cache_paged(
-                extra_k_cache,
-                flat_token_ids,
-                page_size=extra_page_size,
-                out=compressed_slice,
+        is_mxfp4 = token_to_kv_pool.dsv4_kv_cache_store_mxfp4
+        if is_mxfp4:
+            from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
+                dequantize_dsv4_mxfp4_k_cache_paged,
             )
-        dequantize_k_cache_paged(
-            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
-            cache.swa_token_ids,
-            page_size=cache.swa_page_size,
-            out=swa_slice,
-        )
+
+            if compressed_slice is not None:
+                # C4/C128 extra pool is FP8 (not MXFP4) — the compressor
+                # currently stores FP8 for compressed caches even when
+                # the SWA pool uses MXFP4.
+                dequantize_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                )
+            dequantize_dsv4_mxfp4_k_cache_paged(
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+                cache.swa_token_ids,
+                page_size=cache.swa_page_size,
+                out=swa_slice,
+            )
+
+        else:
+            if compressed_slice is not None:
+                dequantize_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                )
+            dequantize_k_cache_paged(
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+                cache.swa_token_ids,
+                page_size=cache.swa_page_size,
+                out=swa_slice,
+            )
         kv = workspace
 
         o, _, _ = flash_mla_sparse_fwd(

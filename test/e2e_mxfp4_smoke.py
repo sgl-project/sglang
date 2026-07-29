@@ -10,7 +10,7 @@ os.environ["SGLANG_OPT_DSV4_MXFP4_KVCACHE"] = "1"
 from sglang.srt.entrypoints.engine import Engine
 
 MODEL_PATH = "/data/models/DeepSeek-V4-Flash"
-TP_SIZE = 4  # Use 4/8 GPUs to fit the 600GB model
+TP_SIZE = 8  # Use all 8 GPUs to fit the 600GB model
 
 
 def main():
@@ -26,8 +26,9 @@ def main():
         mem_fraction_static=0.85,
         disable_radix_cache=True,
         max_running_requests=1,
+        moe_runner_backend="marlin",
         log_level="info",
-        cuda_graph_max_bs=1,
+        disable_cuda_graph=True,
         trust_remote_code=True,
     )
 

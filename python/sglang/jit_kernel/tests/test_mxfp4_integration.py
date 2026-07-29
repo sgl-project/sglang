@@ -35,6 +35,7 @@ def test_pool_store_readback():
         layer_num=1,
         device="cuda",
         enable_memory_saver=False,
+        use_mxfp4=True,
     )
 
     assert pool.get_bytes_per_token() == 368
@@ -77,6 +78,7 @@ def test_mxfp4_decode_pipeline():
         layer_num=1,
         device="cuda",
         enable_memory_saver=False,
+        use_mxfp4=True,
     )
 
     # Store one page of K
@@ -129,6 +131,7 @@ def test_c4c128_dequant_fallback():
         layer_num=1,
         device="cuda",
         enable_memory_saver=False,
+        use_mxfp4=True,
     )
 
     k = torch.randn(32, MXFP4_TOTAL_DIM, dtype=torch.bfloat16, device=dev)
@@ -169,6 +172,7 @@ def test_swa_page_ratio():
         layer_num=1,
         device="cuda",
         enable_memory_saver=False,
+        use_mxfp4=True,
     )
 
     # Store 2 physical pages of data

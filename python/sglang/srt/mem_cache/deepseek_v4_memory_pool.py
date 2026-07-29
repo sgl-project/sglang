@@ -63,6 +63,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        use_mxfp4: bool = False,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
@@ -78,7 +79,8 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
-        self.dsv4_kv_cache_store_mxfp4 = envs.SGLANG_OPT_DSV4_MXFP4_KVCACHE.get()
+        # Only SWA pool uses MXFP4; C4/C128 compressor writes FP8 data.
+        self.dsv4_kv_cache_store_mxfp4 = use_mxfp4
 
         self.scale_pad = 1
         self.quantize_block_size = 64
@@ -647,6 +649,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
+                use_mxfp4=self.dsv4_kv_cache_store_mxfp4,
             )
 
             c4_kv_pool_type = DeepSeekV4SingleKVPool
@@ -874,6 +877,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         device: str,
         enable_memory_saver: bool,
         global_page_size: int,
+        use_mxfp4: bool = False,
         cls: type = DeepSeekV4SingleKVPool,
     ) -> DeepSeekV4SingleKVPool:
         """Build a full / SWA / c4 / c128 single-KV pool. ``global_page_size``
@@ -891,6 +895,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             layer_num,
             device,
             enable_memory_saver,
+            use_mxfp4=use_mxfp4,
         )
 
     def _make_indexer_pool(
