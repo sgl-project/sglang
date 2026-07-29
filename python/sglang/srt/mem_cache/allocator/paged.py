@@ -273,16 +273,14 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int = 0):
         """Free a contiguous token-position segment [start_pos, start_pos + n).
 
-        Token positions [k * page_size, (k+1) * page_size) of a request share a
-        page, so one representative index per page is taken by host-side stride
-        slicing -- no torch.unique, whose data-dependent output shape forces a
-        device-to-host sync that stalls the scheduler behind the in-flight
-        forward. The representatives stay views; a free group converts them to
-        page ids with one cat + floor_divide at free_group_end, so a free
-        launches no kernel here.
+        Fixed-shape counterpart of free(): tokens [k*ps, (k+1)*ps) of a request
+        share a page, so page representatives are a host-computed stride slice
+        instead of torch.unique (data-dependent shape -> device sync). The
+        views are batched; free_group_end turns them into page ids with one
+        cat + floor_divide.
 
-        Caller contract (see base): a slice of one request's kv row (or a
-        page-aligned copy), whose pages no other call in the same group frees.
+        Caller contract (see base): slice of one request's kv row (or a
+        page-aligned copy) whose pages no other call in the same group frees.
         """
         n = free_index.numel()
         if n == 0:
