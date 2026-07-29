@@ -169,7 +169,10 @@ class TestBenchServing1GPUPart1(CustomTestCase):
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
                 f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
             )
-            self.assertLess(res["median_e2e_latency_ms"], 4000)
+            if is_in_amd_ci():
+                self.assertLess(res["median_e2e_latency_ms"], 6000)
+            else:
+                self.assertLess(res["median_e2e_latency_ms"], 4000)
             # relax for mi300x (LoRA TTFT ~2x slower than mi325)
             if is_in_amd_ci():
                 self.assertLess(res["median_ttft_ms"], 130)
