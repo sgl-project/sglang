@@ -390,27 +390,6 @@ class AscendAttnBackend(AttentionBackend):
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
 
-    def _pad_topk_indices(
-        self, topk_indices: torch.Tensor, num_tokens: int
-    ) -> torch.Tensor:
-        current_tokens = topk_indices.shape[0]
-        if current_tokens == num_tokens:
-            return topk_indices
-
-        assert current_tokens <= num_tokens, (
-            f"topk_indices rows ({current_tokens}) > num_tokens ({num_tokens}); "
-            "this indicates a mismatch between indexer output and q layout."
-        )
-
-        pad_size = num_tokens - current_tokens
-        padding = torch.full(
-            (pad_size, topk_indices.shape[1]),
-            -1,
-            dtype=topk_indices.dtype,
-            device=topk_indices.device,
-        )
-        return torch.cat([topk_indices, padding], dim=0)
-
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers for verify attention kernels that needs to be filled after draft.
@@ -1033,6 +1012,24 @@ class AscendAttnBackend(AttentionBackend):
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
+        num_token_padding = q_nope.shape[0]
+        num_token_non_padded = forward_batch.num_token_non_padded_cpu
+        trim_eager_padding = (
+            not is_prefill
+            and not self.graph_mode
+            and num_token_non_padded is not None
+            and num_token_padding > num_token_non_padded
+        )
+        if trim_eager_padding:
+            q_nope = q_nope[:num_token_non_padded]
+            q_pe = q_pe[:num_token_non_padded]
+            if topk_indices is not None:
+                assert topk_indices.shape[0] >= num_token_non_padded, (
+                    "NPU DSA topk_indices has fewer rows than the unpadded query: "
+                    f"{topk_indices.shape[0]} < {num_token_non_padded}"
+                )
+                topk_indices = topk_indices[:num_token_non_padded]
+
         if is_prefill:
             if self.forward_metadata.actual_seq_lengths_q is not None:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
@@ -1047,16 +1044,18 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_qlen = (
                         torch.arange(
                             self.speculative_num_draft_tokens,
-                            self.speculative_num_draft_tokens + q.shape[0],
+                            self.speculative_num_draft_tokens + q_nope.shape[0],
                             self.speculative_num_draft_tokens,
                             dtype=torch.int32,
                         )
-                        .to(q.device)
+                        .to(q_nope.device)
                         .to(torch.int32)
                     )
                 else:
                     actual_seq_qlen = (
-                        torch.arange(1, q.shape[0] + 1).to(q.device).to(torch.int32)
+                        torch.arange(1, q_nope.shape[0] + 1)
+                        .to(q_nope.device)
+                        .to(torch.int32)
                     )
             else:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
@@ -1084,11 +1083,11 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
-            if topk_indices is not None:
-                topk_indices = self._pad_topk_indices(
-                    topk_indices, q_nope.shape[0]
-                )
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
+            assert topk_indices.shape[0] == q_nope.shape[0], (
+                "NPU DSA sparse indices must match the unpadded query rows: "
+                f"{topk_indices.shape[0]} != {q_nope.shape[0]}"
+            )
             attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,
                 key=k_nope,
@@ -1110,6 +1109,22 @@ class AscendAttnBackend(AttentionBackend):
                 sparse_mode=3,
                 attention_mode=2,
                 return_softmax_lse=False,
+            )
+
+        if trim_eager_padding:
+            assert attn_out.shape[0] == num_token_non_padded, (
+                "NPU DSA attention output must match the unpadded query rows: "
+                f"{attn_out.shape[0]} != {num_token_non_padded}"
+            )
+            attn_out = torch.cat(
+                [
+                    attn_out,
+                    attn_out.new_zeros(
+                        num_token_padding - attn_out.shape[0],
+                        *attn_out.shape[1:],
+                    ),
+                ],
+                dim=0,
             )
 
         return attn_out
