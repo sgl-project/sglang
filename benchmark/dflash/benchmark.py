@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import json
 import math
@@ -241,6 +242,7 @@ class BenchmarkMethodologyConfig:
     min_generation_turns_per_config: int
     min_warmup_generation_turns: int
     runs_per_config: int
+    request_trace_dir: Optional[str] = None
     timeout_s: int = DEFAULT_TIMEOUT_S
     server_shutdown_drain_timeout_s: float = SERVER_SHUTDOWN_DRAIN_TIMEOUT_S
     server_shutdown_timeout_s: float = SERVER_SHUTDOWN_TIMEOUT_S
@@ -462,6 +464,7 @@ def _methodology_to_payload(config: BenchmarkMethodologyConfig) -> dict[str, Any
         "min_generation_turns_per_config": config.min_generation_turns_per_config,
         "min_warmup_generation_turns": config.min_warmup_generation_turns,
         "runs_per_config": config.runs_per_config,
+        "request_trace_dir": config.request_trace_dir,
         "timeout_s": config.timeout_s,
         "server_shutdown_drain_timeout_s": config.server_shutdown_drain_timeout_s,
         "server_shutdown_timeout_s": config.server_shutdown_timeout_s,
@@ -476,6 +479,7 @@ def _methodology_from_payload(
         min_generation_turns_per_config=int(payload["min_generation_turns_per_config"]),
         min_warmup_generation_turns=int(payload["min_warmup_generation_turns"]),
         runs_per_config=int(payload["runs_per_config"]),
+        request_trace_dir=payload.get("request_trace_dir"),
         timeout_s=int(payload["timeout_s"]),
         server_shutdown_drain_timeout_s=float(
             payload["server_shutdown_drain_timeout_s"]
@@ -940,6 +944,22 @@ class SampleMetrics:
     peak_request_decode_output_toks_per_s: Optional[float]
     spec_verify_ct_sum: int
     spec_accept_lengths_per_request: tuple[float, ...]
+    request_traces: tuple[RequestTrace, ...]
+
+
+@dataclass(frozen=True)
+class RequestTrace:
+    measured_sample_index: int
+    turn_index: int
+    prompt_token_ids: tuple[int, ...]
+    output_token_ids: tuple[int, ...]
+    completion_tokens: int
+    spec_verify_ct: int
+    spec_num_correct_drafts: Optional[int]
+    spec_num_proposed_drafts: Optional[int]
+    spec_correct_drafts_histogram: tuple[int, ...]
+    decode_interval: Optional[tuple[float, float]]
+    finish_reason: Any
 
 
 def _extract_generated_text(out: dict) -> str:
@@ -1024,6 +1044,8 @@ def _run_sample(
     tokenizer,
     sampling: SamplingConfig,
     timeout_s: int,
+    measured_sample_index: int = -1,
+    capture_request_trace: bool = False,
 ) -> SampleMetrics:
     from sglang.srt.parser.reasoning_parser import KimiK3Detector
 
@@ -1034,6 +1056,7 @@ def _run_sample(
     peak_request_decode_output_toks_per_s = None
     spec_verify_ct_sum = 0
     accept_lengths_per_request: list[float] = []
+    request_traces: list[RequestTrace] = []
 
     for turn_idx, user_content in enumerate(turns):
         messages.append({"role": "user", "content": user_content})
@@ -1076,6 +1099,48 @@ def _run_sample(
             accept_lengths_per_request.append(
                 float(output_tokens) / float(spec_verify_ct)
             )
+        if capture_request_trace:
+            output_token_ids = out.get("output_ids")
+            if not isinstance(output_token_ids, list):
+                raise RuntimeError(
+                    "Expected /generate response to include list-valued `output_ids` "
+                    "while request tracing is enabled."
+                )
+            if len(output_token_ids) != output_tokens:
+                raise RuntimeError(
+                    "/generate output token count mismatch while request tracing is "
+                    f"enabled: len(output_ids)={len(output_token_ids)}, "
+                    f"completion_tokens={output_tokens}."
+                )
+            meta = out.get("meta_info", {}) or {}
+            request_traces.append(
+                RequestTrace(
+                    measured_sample_index=int(measured_sample_index),
+                    turn_index=int(turn_idx),
+                    prompt_token_ids=tuple(int(token_id) for token_id in prompt_ids),
+                    output_token_ids=tuple(
+                        int(token_id) for token_id in output_token_ids
+                    ),
+                    completion_tokens=int(output_tokens),
+                    spec_verify_ct=int(spec_verify_ct),
+                    spec_num_correct_drafts=(
+                        None
+                        if meta.get("spec_num_correct_drafts") is None
+                        else int(meta["spec_num_correct_drafts"])
+                    ),
+                    spec_num_proposed_drafts=(
+                        None
+                        if meta.get("spec_num_proposed_drafts") is None
+                        else int(meta["spec_num_proposed_drafts"])
+                    ),
+                    spec_correct_drafts_histogram=tuple(
+                        int(count)
+                        for count in meta.get("spec_correct_drafts_histogram", [])
+                    ),
+                    decode_interval=decode_interval,
+                    finish_reason=meta.get("finish_reason"),
+                )
+            )
 
         if turn_idx + 1 < len(turns):
             parsed = KimiK3Detector(
@@ -1097,6 +1162,7 @@ def _run_sample(
         peak_request_decode_output_toks_per_s=peak_request_decode_output_toks_per_s,
         spec_verify_ct_sum=int(spec_verify_ct_sum),
         spec_accept_lengths_per_request=tuple(accept_lengths_per_request),
+        request_traces=tuple(request_traces),
     )
 
 
@@ -1233,7 +1299,8 @@ def _run_requests(
     concurrency: int,
     timeout_s: int,
     expect_spec: bool,
-) -> BenchMetrics:
+    capture_request_traces: bool = False,
+) -> tuple[BenchMetrics, tuple[RequestTrace, ...]]:
     start = time.perf_counter()
     total_tokens = 0
     decode_output_tokens = 0
@@ -1242,9 +1309,12 @@ def _run_requests(
     spec_verify_ct_sum = 0
     accept_lengths_per_request: list[float] = []
     generation_turn_count = 0
+    request_traces_by_sample: list[tuple[RequestTrace, ...]] = [
+        tuple() for _ in samples
+    ]
 
     with ThreadPoolExecutor(max_workers=int(concurrency)) as pool:
-        measured_futures = [
+        measured_futures = {
             pool.submit(
                 _run_sample,
                 base_url=base_url,
@@ -1252,11 +1322,15 @@ def _run_requests(
                 tokenizer=tokenizer,
                 sampling=sampling,
                 timeout_s=timeout_s,
-            )
-            for turns in samples
-        ]
+                measured_sample_index=sample_index,
+                capture_request_trace=capture_request_traces,
+            ): sample_index
+            for sample_index, turns in enumerate(samples)
+        }
         for fut in as_completed(measured_futures):
             sample_metrics = fut.result()
+            sample_index = measured_futures[fut]
+            request_traces_by_sample[sample_index] = sample_metrics.request_traces
             total_tokens += sample_metrics.output_tokens
             decode_output_tokens += sample_metrics.decode_output_tokens
             decode_intervals.extend(sample_metrics.decode_intervals)
@@ -1298,7 +1372,7 @@ def _run_requests(
         else None
     )
 
-    return BenchMetrics(
+    metrics = BenchMetrics(
         sample_count=len(samples),
         generation_turn_count=int(generation_turn_count),
         latency_s=float(latency),
@@ -1313,6 +1387,122 @@ def _run_requests(
         spec_accept_length_request_count=len(accept_lengths_per_request),
         spec_verify_ct_sum=int(spec_verify_ct_sum),
     )
+    request_traces = tuple(
+        trace for sample_traces in request_traces_by_sample for trace in sample_traces
+    )
+    return metrics, request_traces
+
+
+def _token_ids_sha256(token_ids: tuple[int, ...]) -> str:
+    payload = json.dumps(token_ids, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _trace_file_component(value: object) -> str:
+    return "".join(
+        character if character.isalnum() or character in ("-", "_") else "-"
+        for character in str(value)
+    )
+
+
+def _request_trace_path(job: BenchmarkJob) -> Path:
+    trace_dir = job.methodology.request_trace_dir
+    if trace_dir is None:
+        raise RuntimeError("Request trace path requested without a trace directory.")
+    key = job.key
+    mode_config = job.deployment.mode_config
+    draft_backend = (
+        mode_config.draft_attention_backend
+        if isinstance(mode_config, DFlashConfig)
+        else "none"
+    )
+    filename = "__".join(
+        [
+            f"workload-{_trace_file_component(key.workload)}",
+            f"target-attn-{_trace_file_component(key.backend)}",
+            f"draft-attn-{_trace_file_component(draft_backend)}",
+            f"tp-{key.tp}",
+            f"mode-{_trace_file_component(key.mode)}",
+            f"conc-{key.concurrency}",
+            f"run-{job.run_index + 1:02d}",
+        ]
+    )
+    return Path(trace_dir).expanduser() / f"{filename}.jsonl"
+
+
+def _write_request_traces(
+    job: BenchmarkJob,
+    *,
+    traces: tuple[RequestTrace, ...],
+    source_sample_count: int,
+) -> Path:
+    out_path = _request_trace_path(job)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_name(f".{out_path.name}.{os.getpid()}.tmp")
+    key = job.key
+    mode_config = job.deployment.mode_config
+    draft_backend = (
+        mode_config.draft_attention_backend
+        if isinstance(mode_config, DFlashConfig)
+        else None
+    )
+
+    with tmp_path.open("w", encoding="utf-8") as file:
+        for trace in traces:
+            source_sample_index = trace.measured_sample_index % source_sample_count
+            sample_id = (
+                f"HumanEval/{source_sample_index}"
+                if key.workload == "humaneval"
+                else f"{key.workload}/{source_sample_index}"
+            )
+            decode_duration_s = (
+                None
+                if trace.decode_interval is None
+                else trace.decode_interval[1] - trace.decode_interval[0]
+            )
+            record = {
+                "schema_version": 1,
+                "workload": key.workload,
+                "sample_id": sample_id,
+                "source_sample_index": source_sample_index,
+                "measured_sample_index": trace.measured_sample_index,
+                "sample_occurrence": (
+                    trace.measured_sample_index // source_sample_count
+                ),
+                "turn_index": trace.turn_index,
+                "target_attention_backend": key.backend,
+                "draft_attention_backend": draft_backend,
+                "tp": key.tp,
+                "mode": key.mode,
+                "concurrency": key.concurrency,
+                "run_index": job.run_index,
+                "run_number": job.run_index + 1,
+                "prompt_tokens": len(trace.prompt_token_ids),
+                "prompt_token_ids_sha256": _token_ids_sha256(trace.prompt_token_ids),
+                "completion_tokens": trace.completion_tokens,
+                "output_token_ids_sha256": _token_ids_sha256(trace.output_token_ids),
+                "output_token_ids": trace.output_token_ids,
+                "spec_verify_ct": trace.spec_verify_ct,
+                "spec_accept_length": (
+                    None
+                    if trace.spec_verify_ct <= 0
+                    else trace.completion_tokens / trace.spec_verify_ct
+                ),
+                "spec_num_correct_drafts": trace.spec_num_correct_drafts,
+                "spec_num_proposed_drafts": trace.spec_num_proposed_drafts,
+                "spec_correct_drafts_histogram": (trace.spec_correct_drafts_histogram),
+                "decode_duration_s": decode_duration_s,
+                "decode_output_toks_per_s": (
+                    None
+                    if decode_duration_s is None or decode_duration_s <= 0.0
+                    else max(trace.completion_tokens - 1, 0) / decode_duration_s
+                ),
+                "finish_reason": trace.finish_reason,
+            }
+            file.write(json.dumps(record, separators=(",", ":")) + "\n")
+    os.replace(tmp_path, out_path)
+    print(f"[request-trace] wrote {len(traces)} rows to {out_path}", flush=True)
+    return out_path
 
 
 def _format_table(
@@ -1623,7 +1813,7 @@ def _run_benchmark_job(job: BenchmarkJob) -> JobResult:
             f"[warmup {job.run_label}] flushed cache after warmup; "
             "starting measured workload."
         )
-        metrics = _run_requests(
+        metrics, request_traces = _run_requests(
             base_url,
             samples=plan.measured_samples,
             tokenizer=tokenizer,
@@ -1631,7 +1821,14 @@ def _run_benchmark_job(job: BenchmarkJob) -> JobResult:
             concurrency=job.concurrency,
             timeout_s=job.methodology.timeout_s,
             expect_spec=job.deployment.expect_spec,
+            capture_request_traces=job.methodology.request_trace_dir is not None,
         )
+        if job.methodology.request_trace_dir is not None:
+            _write_request_traces(
+                job,
+                traces=request_traces,
+                source_sample_count=source_sample_count,
+            )
         decode_toks_per_s = (
             "N/A"
             if metrics.decode_output_toks_per_s is None
@@ -1778,6 +1975,7 @@ def _print_summary(
             ("concurrencies", ",".join(str(x) for x in concurrencies)),
             ("num_samples", config.methodology.num_samples),
             ("runs_per_config", config.methodology.runs_per_config),
+            ("request_trace_dir", config.methodology.request_trace_dir),
             (
                 "decode_output_tps_definition",
                 "sum(max(completion_tokens - 1, 0)) / "
@@ -2348,6 +2546,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=None,
         help="Optional path to write the final CSV summary.",
     )
+    parser.add_argument(
+        "--request-trace-dir",
+        default=None,
+        help=(
+            "Optional directory for one per-request JSONL trace per benchmark "
+            "run. Traces include exact output token IDs and speculative counters."
+        ),
+    )
     parser.add_argument("--target-model", default=DEFAULT_TARGET_MODEL)
     parser.add_argument(
         "--load-format",
@@ -2529,6 +2735,7 @@ def build_sweep_config_from_args(args: argparse.Namespace) -> SweepConfig:
         min_generation_turns_per_config=int(args.min_generation_turns_per_config),
         min_warmup_generation_turns=int(args.min_warmup_generation_turns),
         runs_per_config=int(args.runs_per_config),
+        request_trace_dir=(args.request_trace_dir or None),
     )
     deployment_sweep = DeploymentSweep(
         include_baseline=not args.skip_baseline,
