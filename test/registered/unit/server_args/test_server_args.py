@@ -66,6 +66,26 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
+class TestMaxConsecutivePrefillBatchesArgs(CustomTestCase):
+    def test_accepts_non_negative_budget(self):
+        for budget in (0, 2):
+            with self.subTest(budget=budget):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    max_consecutive_prefill_batches=budget,
+                )
+                server_args._validate_max_consecutive_prefill_batches()
+
+    def test_rejects_negative_budget(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            max_consecutive_prefill_batches=-1,
+        )
+
+        with self.assertRaisesRegex(AssertionError, "must be non-negative"):
+            server_args._validate_max_consecutive_prefill_batches()
+
+
 class TestMultimodalFeatureTransport(CustomTestCase):
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):
