@@ -15,6 +15,16 @@ impl Config {
         if self.model.id.is_empty() {
             return Err(anyhow!("model id must be non-empty"));
         }
+        if let Some(api_key) = &self.admin.api_key {
+            if api_key.trim().is_empty() {
+                return Err(anyhow!("admin.api_key must be non-empty"));
+            }
+            if api_key.trim() != api_key {
+                return Err(anyhow!(
+                    "admin.api_key must not contain leading or trailing whitespace"
+                ));
+            }
+        }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
                 if s.urls.is_empty() {
@@ -94,6 +104,7 @@ mod tests {
             }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
+            admin: AdminConfig::default(),
         }
     }
 
@@ -109,6 +120,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("model id"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_admin_api_key() {
+        let mut cfg = cfg("qwen3", &["http://10.0.0.1:30000"]);
+        cfg.admin.api_key = Some("router-secret".to_string());
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_admin_api_key() {
+        let mut cfg = cfg("qwen3", &["http://10.0.0.1:30000"]);
+        cfg.admin.api_key = Some("".to_string());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("admin.api_key must be non-empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_admin_api_key_with_surrounding_whitespace() {
+        let mut cfg = cfg("qwen3", &["http://10.0.0.1:30000"]);
+        cfg.admin.api_key = Some(" router-secret ".to_string());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("admin.api_key must not contain leading or trailing whitespace"),
+            "got: {err}"
+        );
     }
 
     #[test]

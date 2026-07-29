@@ -60,6 +60,7 @@ fn config() -> Config {
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        admin: sgl_router::config::AdminConfig::default(),
     }
 }
 

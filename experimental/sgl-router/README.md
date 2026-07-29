@@ -50,6 +50,28 @@ Omit `--service-discovery-namespace` to watch all namespaces (requires
 cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
 with `--prefill-selector` and `--decode-selector`.
 
+## Admin Endpoints
+
+`POST /flush_cache` fans out SGLang's cache flush to every registered worker.
+For backward compatibility it is unauthenticated by default. To protect router
+admin calls, set `--admin-api-key` and send the key as a bearer token:
+
+```bash
+sgl-router \
+  --host 0.0.0.0 --port 30000 \
+  --model-id qwen3 \
+  --tokenizer-path /models/qwen3/tokenizer.json \
+  --worker-urls http://10.0.0.1:30000 \
+  --admin-api-key router-admin-secret
+
+curl -X POST \
+  -H 'Authorization: Bearer router-admin-secret' \
+  http://127.0.0.1:30000/flush_cache
+```
+
+This protects inbound requests to the router's admin endpoint. It is separate
+from any credentials the router may use for outbound requests to workers.
+
 ## License
 
 Apache-2.0.

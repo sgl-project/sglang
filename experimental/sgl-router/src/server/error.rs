@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::http::{header::WWW_AUTHENTICATE, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
@@ -11,6 +11,9 @@ pub const X_ROUTER_ERROR_CODE: HeaderName = HeaderName::from_static("x-router-er
 
 #[derive(Debug, Error)]
 pub enum ApiError {
+    #[error("unauthorized")]
+    Unauthorized,
+
     #[error("bad request: {0}")]
     BadRequest(String),
 
@@ -113,6 +116,7 @@ pub enum ApiError {
 impl ApiError {
     fn status_and_code(&self) -> (StatusCode, &'static str) {
         match self {
+            ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             ApiError::ModelNotFound(_) => (StatusCode::NOT_FOUND, "model_not_found"),
             ApiError::UpstreamUnreachable { .. } => {
@@ -245,6 +249,7 @@ impl IntoResponse for ApiError {
                 );
                 "service unavailable".to_string()
             }
+            ApiError::Unauthorized => "unauthorized".to_string(),
             ApiError::BadRequest(_) | ApiError::ModelNotFound(_) => self.to_string(),
         };
         let mut resp = (
@@ -256,6 +261,10 @@ impl IntoResponse for ApiError {
             .into_response();
         resp.headers_mut()
             .insert(X_ROUTER_ERROR_CODE, HeaderValue::from_static(code));
+        if status == StatusCode::UNAUTHORIZED {
+            resp.headers_mut()
+                .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
         resp
     }
 }
@@ -388,6 +397,24 @@ mod tests {
         );
         assert_ne!(env.error.code, "internal_error");
         assert_ne!(env.error.code, "model_not_found");
+    }
+
+    #[test]
+    fn unauthorized_envelope_has_expected_shape_and_challenge() {
+        let resp = ApiError::Unauthorized.into_response();
+        assert_eq!(
+            resp.headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer"),
+        );
+        let (status, code_header, env) = parse_envelope(resp);
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(code_header.as_deref(), Some("unauthorized"));
+        assert_eq!(env.error.code, "unauthorized");
+        assert_eq!(env.error.typ, "invalid_request_error");
+        assert_eq!(env.error.message, "unauthorized");
     }
 
     #[test]

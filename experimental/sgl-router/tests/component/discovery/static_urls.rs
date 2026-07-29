@@ -139,6 +139,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        admin: sgl_router::config::AdminConfig::default(),
     };
 
     let registry = Arc::new(WorkerRegistry::default());
