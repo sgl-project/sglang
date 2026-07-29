@@ -136,9 +136,7 @@ class AiterAttnBackend(AttentionBackend):
     ):
         super().__init__()
         # Lazy import to avoid the initialization of cuda context
-        from sglang.kernels.ops.attention.extend_attention import (
-            extend_attention_fwd,
-        )
+        from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
 
         self.input_dtype = model_runner.model_config.dtype
 
@@ -857,6 +855,11 @@ class AiterAttnBackend(AttentionBackend):
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
+        verify_tokens_per_req = (
+            forward_batch.input_ids.shape[0] // forward_batch.batch_size
+            if forward_batch.forward_mode.is_target_verify()
+            else None
+        )
         self._apply_cuda_graph_metadata(
             bs=forward_batch.batch_size,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -866,6 +869,7 @@ class AiterAttnBackend(AttentionBackend):
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             seq_lens_cpu=seq_lens_cpu,
+            verify_tokens_per_req=verify_tokens_per_req,
         )
 
         # Refill the SWA write-target buffer from the live out_cache_loc and
@@ -1118,8 +1122,8 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.max_kv_len,
                 )
         elif forward_batch.forward_mode.is_target_verify():
+            draft_num = forward_batch.input_ids.shape[0] // bs
             if self.use_mla:
-                draft_num = spec_info.draft_token_num
                 kv_lens = forward_batch.seq_lens + draft_num
                 kv_lens_sum = forward_batch.seq_lens_sum + draft_num * bs
                 device = forward_batch.seq_lens.device
@@ -1197,7 +1201,6 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 bs = len(forward_batch.req_pool_indices)
-                draft_num = spec_info.draft_token_num
 
                 if self._use_unified_verify:
                     page_table, qo_indptr, max_q_len, swa_page_table = (
@@ -1500,6 +1503,7 @@ class AiterAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        verify_tokens_per_req: Optional[int],
     ):
 
         num_kv_splits = None
@@ -1652,16 +1656,17 @@ class AiterAttnBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
+            assert verify_tokens_per_req is not None
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
                 0,
-                (1 + bs) * self.num_draft_tokens,
-                step=self.num_draft_tokens,
+                (1 + bs) * verify_tokens_per_req,
+                step=verify_tokens_per_req,
                 dtype=torch.int32,
                 device=self.device,
             )
             if self.use_mla:
-                kv_lens = seq_lens + self.num_draft_tokens
+                kv_lens = seq_lens + verify_tokens_per_req
             else:
                 kv_lens = seq_lens
             kv_indptr = self.kv_indptr[: bs + 1]
@@ -1670,7 +1675,7 @@ class AiterAttnBackend(AttentionBackend):
             # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
             if seq_lens_sum is not None:
                 kv_indices_used = seq_lens_sum + (
-                    self.num_draft_tokens * bs if self.use_mla else 0
+                    verify_tokens_per_req * bs if self.use_mla else 0
                 )
                 assert_buffer_fits(
                     kv_indices_used,
@@ -1689,7 +1694,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.req_to_token.stride(0),
             )
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
-            max_q_len = self.num_draft_tokens
+            max_q_len = verify_tokens_per_req
 
             if self.use_mla:
                 if _use_mla_ps_kernel:
@@ -1753,7 +1758,7 @@ class AiterAttnBackend(AttentionBackend):
                             bs,
                             seq_lens,
                             req_pool_indices,
-                            self.num_draft_tokens,
+                            verify_tokens_per_req,
                             page_table_dest=page_table,
                             swa_page_table_dest=swa_page_table,
                         )
@@ -2278,7 +2283,9 @@ class AiterAttnBackend(AttentionBackend):
                         v=v_unified,
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         cu_seqlens_q=self.forward_metadata.qo_indptr,
-                        seqused_k=forward_batch.seq_lens + self.num_draft_tokens,
+                        seqused_k=(
+                            forward_batch.seq_lens + self.forward_metadata.max_q_len
+                        ),
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
