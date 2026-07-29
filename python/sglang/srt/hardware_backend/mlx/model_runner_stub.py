@@ -14,6 +14,13 @@ from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
     MlxAuxiliaryStateReqToTokenPool,
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.concurrency_limit import (
+    ConcurrencyLimit,
+    format_concurrency_report,
+    kv_capacity_limit,
+    resolve_concurrency_limit,
+    user_request_limit,
+)
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
@@ -30,6 +37,8 @@ logger = logging.getLogger(__name__)
 # _resolve_max_running_requests so the two cannot drift apart. See
 # _aux_state_slots_per_request for the radix-disabled case.
 MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 4
+# Concurrency cap when --max-running-requests is unset.
+MLX_DEFAULT_MAX_RUNNING_REQUESTS = 4096
 
 
 class _DummyKVCache(KVCache):
@@ -151,53 +160,77 @@ class MlxModelRunnerStub(ModelRunner):
     def _resolve_max_running_requests(self) -> int:
         """Concurrency cap handed to the scheduler.
 
-        Honors ``--max-running-requests``, mirroring the base runner's clamp
-        (``model_runner_kv_cache_mixin._resolve_max_num_reqs``): the requested
-        value is split per dp worker and capped by the KV pool capacity. When
-        the flag is unset, fall back to a capacity-based default.
+        Honors ``--max-running-requests``: the requested value is split per dp
+        worker and capped by the KV pool capacity. When the flag is unset, fall
+        back to a flat default rather than the base resolver's context-length
+        heuristic -- the bounds here are deliberately simpler than
+        ``KVCacheConfigurator.resolve_max_num_reqs``, only the reporting is
+        shared.
 
         On hybrid / linear-attention models the concurrency is additionally
         bounded by the auxiliary-state pool: each running request allocates one
         slot out of ``max_mamba_cache_size`` (asserting when exhausted), so a
         cap the pool cannot back would crash mid-serving instead of failing
-        at startup. Mirrors the base resolver's mamba bound and zero-reject.
+        at startup.
 
         Requires ``self.max_total_num_tokens`` to already be set.
         """
-        capacity_cap = self.max_total_num_tokens // 2
         requested = self.server_args.max_running_requests
+        limits = []
+        requested_limit = None
+        if requested is not None:
+            requested_limit = user_request_limit(requested, self.dp_size)
+            limits.append(requested_limit)
+        limits.append(kv_capacity_limit(self.max_total_num_tokens))
         if requested is None:
-            requested_per_worker = None
-            resolved = min(capacity_cap, 4096)
-        else:
-            requested_per_worker = requested // self.dp_size
-            resolved = min(requested_per_worker, capacity_cap)
+            limits.append(
+                ConcurrencyLimit(
+                    source="default_cap",
+                    value=MLX_DEFAULT_MAX_RUNNING_REQUESTS,
+                    detail="MLX default when --max-running-requests is unset",
+                    remedy="set --max-running-requests explicitly",
+                )
+            )
 
         aux_state_size = self.server_args.max_mamba_cache_size
-        if (
+        has_aux_state = (
             mambaish_config(self.model_config) is not None
             and aux_state_size is not None
-        ):
+        )
+        if has_aux_state:
             ratio = self._aux_state_slots_per_request()
-            resolved = min(resolved, aux_state_size // ratio)
-            if resolved <= 0:
-                raise RuntimeError(
-                    f"MLX auxiliary-state cache is too small to serve any "
-                    f"requests: max_mamba_cache_size={aux_state_size} backs "
-                    f"only {aux_state_size // ratio} concurrent requests "
-                    f"({ratio} slots per request). Increase "
-                    f"--max-mamba-cache-size to at least {ratio}, or leave it "
-                    f"unset to size the pool from the concurrency cap."
+            limits.append(
+                # Same bound as the base resolver's mamba_state_pool, but sized
+                # from the unsharded flag value, so it keeps its own remedy.
+                ConcurrencyLimit(
+                    source="mamba_state_pool",
+                    value=aux_state_size // ratio,
+                    detail=f"max_mamba_cache_size={aux_state_size} / {ratio} "
+                    f"slots per request",
+                    remedy="raise --max-mamba-cache-size, or leave it unset to "
+                    "size the pool from the concurrency cap",
                 )
-
-        if requested_per_worker is not None and resolved < requested_per_worker:
-            logger.warning(
-                "max_running_requests was reduced from the requested %d to %d "
-                "(per dp worker) due to the available KV cache or "
-                "auxiliary-state capacity.",
-                requested_per_worker,
-                resolved,
             )
+
+        binding = resolve_concurrency_limit(limits)
+        resolved = binding.value
+        if has_aux_state and resolved <= 0:
+            raise RuntimeError(
+                f"MLX auxiliary-state cache is too small to serve any "
+                f"requests: max_mamba_cache_size={aux_state_size} backs "
+                f"only {aux_state_size // ratio} concurrent requests "
+                f"({ratio} slots per request). Increase "
+                f"--max-mamba-cache-size to at least {ratio}, or leave it "
+                f"unset to size the pool from the concurrency cap."
+            )
+
+        is_downgrade, message = format_concurrency_report(
+            binding, limits, requested_limit
+        )
+        if is_downgrade:
+            logger.warning(message)
+        else:
+            logger.info(message)
         return resolved
 
     def initialize(self):

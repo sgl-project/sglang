@@ -92,7 +92,7 @@ def compute_post_capture_kv_resize(
         capped_reqs = min(
             model_runner.max_running_requests,
             model_runner.kv_cache_configurator.resolve_max_num_reqs(
-                config.max_total_num_tokens
+                config.max_total_num_tokens, report=False
             ),
         )
         if capped_reqs < model_runner.max_running_requests:

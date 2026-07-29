@@ -31,6 +31,11 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.concurrency_limit import (
+    heuristic_limit,
+    kv_capacity_limit,
+    resolve_concurrency_limit,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import get_model, get_parallel
@@ -791,10 +796,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 self.requested_max_running_requests_per_worker
             )
 
-        estimated = int(token_capacity / self.context_len * 512)
-        estimated = max(min(estimated, 4096), 2048)
-        max_running_requests = min(estimated, token_capacity // 2)
-        return self._get_c128_state_fixed_bytes(max_running_requests)
+        # Mirrors the no-request branch of resolve_max_num_reqs; token_capacity
+        # is still provisional here.
+        binding = resolve_concurrency_limit(
+            [
+                kv_capacity_limit(token_capacity),
+                heuristic_limit(token_capacity, self.context_len),
+            ]
+        )
+        return self._get_c128_state_fixed_bytes(binding.value)
 
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
         full = sizes.full_max_total_num_tokens
