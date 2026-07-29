@@ -7,7 +7,7 @@ use bytes::Bytes;
 use serde::Serialize;
 use serde::ser::{SerializeMap, SerializeStruct}; // codespell:ignore ser
 
-use super::types::{StructTag, Tagged, control_messages, wire_struct};
+use super::types::{Tagged, control_messages, wire_struct};
 use super::{GenerateRequest, SamplingParams, TokenIds};
 use crate::error::Error;
 
@@ -22,8 +22,7 @@ wire_struct! {
         input_embeds: (),
         mm_inputs: (),
         token_type_ids: (),
-        #[serde(serialize_with = "sampling_params_as_map")]
-        sampling_params: &'a SamplingParams,
+        sampling_params: SamplingParamsMap<'a>,
         return_logprob: bool,
         logprob_start_len: i64,
         top_logprobs_num: i64,
@@ -52,25 +51,28 @@ control_messages! {
     GetInternalStateReq {}
 }
 
+/// `SamplingParams` in its header slot, serialized as a msgspec **map**.
+///
 /// Python's `SamplingParams` is a plain msgspec Struct (not `array_like`), so it
-/// must be a **map** inside the positional header — but `rmp_serde` writes every
-/// struct positionally.
+/// must be a map inside the otherwise-positional header — but `rmp_serde` writes
+/// every struct positionally. Carrying that as a NEWTYPE rather than a
+/// `#[serde(serialize_with = ...)]` attribute keeps the requirement in the type,
+/// where the wire generator can see it: the macro emits the `BaseReq` preamble by
+/// hand, and a derive-only field attribute would be silently ignored there.
 ///
-/// This used to route through `serde_json::Value`, whose `Serialize` emits a map.
+/// It used to route through `serde_json::Value`, whose `Serialize` emits a map.
 /// That kept the field list in one place but cost 897 ns and 22 allocations per
-/// request — 84% of the whole header encode — to build a tree that was walked once
-/// and dropped. Worse, it deep-cloned `custom_params`, which is arbitrary client
-/// JSON: a 256 KB one measured +596 µs per request, on top of the clone the batch
-/// fan-out already makes.
-///
-/// [`StructAsMap`] gets the same result by intercepting the one call the derive
-/// makes, so the derive stays the single source of field names and nothing is
-/// materialized in between.
-fn sampling_params_as_map<S: serde::Serializer>(
-    params: &&SamplingParams,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    params.serialize(StructAsMap(serializer))
+/// request — 84% of the whole header encode — to build a tree walked once and
+/// dropped, and it deep-cloned `custom_params` (arbitrary client JSON) on top of
+/// the clone the batch fan-out already makes. [`StructAsMap`] gets the same result
+/// by intercepting the one call the derive makes.
+#[derive(Debug)]
+pub(super) struct SamplingParamsMap<'a>(pub(super) &'a SamplingParams);
+
+impl Serialize for SamplingParamsMap<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(StructAsMap(serializer))
+    }
 }
 
 /// A `Serializer` that writes a struct as a MAP and forwards everything else
@@ -256,15 +258,13 @@ impl<M: SerializeMap> SerializeStruct for MapAsStruct<M> {
 impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
     fn from(req: &'a GenerateRequest) -> Self {
         Self {
-            tag: StructTag::default(),
             rid: &req.rid,
-            http_worker_ipc: (),
             input_text: req.text.as_deref(),
             input_ids: (),
             input_embeds: (),
             mm_inputs: (),
             token_type_ids: (),
-            sampling_params: &req.sampling_params,
+            sampling_params: SamplingParamsMap(&req.sampling_params),
             return_logprob: req.return_logprob.unwrap_or(false),
             logprob_start_len: req.logprob_start_len.unwrap_or(-1),
             top_logprobs_num: req.top_logprobs_num.unwrap_or(0),
@@ -278,20 +278,14 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
 
 impl GetInternalStateReq {
     pub fn new(rid: String) -> Self {
-        Self {
-            tag: StructTag::default(),
-            rid,
-            http_worker_ipc: (),
-        }
+        Self { rid }
     }
 }
 
 impl AbortReq {
     pub fn new(rid: String, abort_all: bool) -> Self {
         Self {
-            tag: StructTag::default(),
             rid,
-            http_worker_ipc: (),
             abort_all,
             finished_reason: (),
             abort_message: (),

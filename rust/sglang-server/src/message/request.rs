@@ -4,6 +4,7 @@
 //! control/abort, `IngressMsg`).
 
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 use bytes::Bytes;
 use itertools::izip;
@@ -11,12 +12,23 @@ use serde::Deserialize;
 
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::{OneOrMany, OneOrManyItem, SamplingParams, SamplingParamsInput, TokenIds};
+use crate::environ::env_u64;
 use crate::error::Error;
 use crate::ids::Rid;
 
-/// Hard cap on prompts per `/generate` body. Every column below is allocated per
-/// item, so this bounds the work a single request can ask for.
-const MAX_BATCH_SIZE: usize = 4096;
+/// Hard cap on how many scheduler requests one `/generate` HTTP call may expand
+/// into. Every column below is allocated per item before anything is dispatched,
+/// so this bounds the work — and the resident memory — a single call can ask for.
+///
+/// NOT a concurrency limit: it is a pure function of the body being parsed, so
+/// separate HTTP calls never interact with it.
+///
+/// Read once from `SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ` (registered in
+/// `python/sglang/srt/environ.py`, which owns the default). Memoized because the
+/// value is process-static — Python sets it before launching this server — and a
+/// per-request `env::var` would take a lock on the hot path for a constant.
+static MAX_BATCH_REQS_PER_HTTP_REQ: LazyLock<usize> =
+    LazyLock::new(|| env_u64("SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ", 4096) as usize);
 
 /// Hard cap on the total bytes a broadcast value may clone into the batch (see
 /// the `One` arms of the fan-out).
@@ -29,9 +41,17 @@ const JSON_TO_HEAP_FACTOR: usize = 8;
 
 /// The `/generate` wire body before batch splitting: `text`/`input_ids`/`sampling_params`
 /// each scalar-or-list, fanned into per-request [`GenerateRequest`]s by
-/// [`into_requests`](GenerateBody::into_requests). `deny_unknown_fields` rejects (4xx) unknowns.
+/// [`into_requests`](GenerateBody::into_requests).
+///
+/// Unknown keys are IGNORED, matching Python: FastAPI builds `GenerateReqInput`
+/// as a pydantic dataclass, which drops extras. `deny_unknown_fields` here turned
+/// every `GenerateReqInput` field this server has not ported — `priority`,
+/// `extra_key`, `session_id`, `session_params`, `return_sampling_mask`,
+/// `custom_logit_processor`, and ~40 more — into a 400, so a client that worked
+/// against the Python server broke against this one. The cost of dropping it is
+/// that a typo (`temperature`) is silently ignored rather than reported; that is
+/// the same trade Python already makes.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GenerateBody {
     /// Optional client-supplied request id(s): a single string (a batch fans it
     /// out as `{rid}_{i}`, mirroring Python `_normalize_batch`) or one per item.
@@ -65,21 +85,6 @@ pub struct GenerateBody {
     /// Scalar-only in Python too (`return_text_in_logprobs: bool`).
     #[serde(default)]
     pub return_text_in_logprobs: Option<bool>,
-    // Accepted for wire-compat with the native `bench_serving` payload (a full
-    // `GenerateReqInput`) but NOT yet wired into the scheduler — parsed and
-    // dropped in `into_requests`. Declaring them keeps `deny_unknown_fields` (typos still
-    // 400) while letting a benchmark request through. Permissive `Value` types so
-    // any valid shape (str / list / list-of-lists) parses. `dead_code`-allowed:
-    // deserialized then intentionally ignored.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub lora_path: Option<rmpv::Value>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub return_routed_experts: Option<bool>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub image_data: Option<rmpv::Value>,
 }
 
 impl GenerateBody {
@@ -102,7 +107,8 @@ impl GenerateBody {
             token_ids_logprob,
             return_hidden_states,
             return_text_in_logprobs,
-            // Accepted for bench_serving compat, not wired through — see the struct.
+            // Unported `GenerateReqInput` fields land here and are dropped, as they
+            // are on the Python path.
             ..
         } = self;
 
@@ -115,9 +121,10 @@ impl GenerateBody {
             (None, Some(OneOrMany::Many(v))) => v.len(),
             _ => 1,
         };
-        if declared_n > MAX_BATCH_SIZE {
+        if declared_n > *MAX_BATCH_REQS_PER_HTTP_REQ {
             return Err(Error::Validation(format!(
-                "batch size {declared_n} exceeds the maximum of {MAX_BATCH_SIZE}"
+                "batch size {declared_n} exceeds the maximum of {}",
+                *MAX_BATCH_REQS_PER_HTTP_REQ
             )));
         }
 
@@ -537,25 +544,49 @@ mod tests {
         assert_eq!(ps[1].input_ids, Some(vec![3]));
     }
 
-    /// Both / neither of text+input_ids is a 400; the wire still rejects unknowns.
+    /// Both / neither of text+input_ids is a 400.
     #[test]
     fn split_validates_inputs() {
         assert!(requests(r#"{"text": "a", "input_ids": [1]}"#).is_err());
         assert!(requests(r#"{"stream": true}"#).is_err());
-        assert!(
-            serde_json::from_str::<GenerateBody>(r#"{"text": "hi", "bogus": 1}"#).is_err(),
-            "GenerateBody must deny unknown fields"
-        );
-        // Python's `GenerateReqInput` has no top-level `n` either (parallel
-        // sampling reads `sampling_params.n`) — but FastAPI builds it from a
-        // pydantic dataclass, which *ignores* the extra key, where
-        // `deny_unknown_fields` makes it a 400. Deliberately stricter: a
-        // top-level `n` is a client bug that Python swallows silently.
-        assert!(serde_json::from_str::<GenerateBody>(r#"{"text": "a", "n": 1}"#).is_err());
         // Parallel sampling is rejected where Python reads it — in the params,
         // at normalization (the ingress step), not here.
         let (mut ps, _) = requests(r#"{"text": "a", "sampling_params": {"n": 2}}"#).unwrap();
         assert!(ps[0].sampling_params.normalize(false, None).is_err());
+    }
+
+    /// Unported `GenerateReqInput` fields are IGNORED, not rejected.
+    ///
+    /// These are all real fields on Python's `GenerateReqInput` that this server
+    /// has not ported. `deny_unknown_fields` turned every one of them into a 400,
+    /// so a client that worked against the Python server broke here — and the
+    /// wire-compat fields (`lora_path`, `image_data`, `return_routed_experts`) had
+    /// to be declared and dropped by hand just to let `bench_serving` through.
+    /// FastAPI's pydantic dataclass drops extras, so ignoring them is the parity
+    /// behavior; a typo being silently ignored is the same trade Python makes.
+    #[test]
+    fn unported_generate_req_input_fields_are_ignored() {
+        for field in [
+            r#""priority": 3"#,
+            r#""extra_key": "k""#,
+            r#""session_id": "s""#,
+            r#""session_params": {"a": 1}"#,
+            r#""return_sampling_mask": true"#,
+            r#""custom_logit_processor": "cls""#,
+            r#""lora_path": "adapter""#,
+            r#""image_data": "base64""#,
+            r#""return_routed_experts": true"#,
+            r#""bootstrap_host": "h""#,
+            // Python has no top-level `n` either, and ignores it just the same.
+            r#""n": 1"#,
+            r#""totally_made_up": 1"#,
+        ] {
+            let body = format!(r#"{{"text": "hi", {field}}}"#);
+            let (ps, _) = requests(&body)
+                .unwrap_or_else(|e| panic!("{field} must be ignored, not rejected: {e}"));
+            assert_eq!(ps.len(), 1, "{field}");
+            assert_eq!(ps[0].text.as_deref(), Some("hi"), "{field}");
+        }
     }
 
     /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a
@@ -620,18 +651,25 @@ mod tests {
     /// capped before any column is built.
     #[test]
     fn oversized_batches_are_rejected_before_allocating() {
-        let texts: Vec<String> = (0..MAX_BATCH_SIZE + 1).map(|i| i.to_string()).collect();
+        let texts: Vec<String> = (0..*MAX_BATCH_REQS_PER_HTTP_REQ + 1)
+            .map(|i| i.to_string())
+            .collect();
         let body = serde_json::json!({ "text": texts }).to_string();
         let err = requests(&body).unwrap_err().to_string();
         assert!(err.contains("exceeds the maximum"), "{err}");
 
         // At the cap it is accepted.
-        let texts: Vec<String> = (0..MAX_BATCH_SIZE).map(|i| i.to_string()).collect();
+        let texts: Vec<String> = (0..*MAX_BATCH_REQS_PER_HTTP_REQ)
+            .map(|i| i.to_string())
+            .collect();
         let (reqs, _) = requests(&serde_json::json!({ "text": texts }).to_string()).unwrap();
-        assert_eq!(reqs.len(), MAX_BATCH_SIZE);
+        assert_eq!(reqs.len(), *MAX_BATCH_REQS_PER_HTTP_REQ);
 
         // A small batch with a huge broadcast `custom_params` is the quadratic case:
-        // few items, but each clone carries the whole blob.
+        // few items, but each clone carries the whole blob. The item count is a
+        // literal because this half asserts the BYTE budget, not the item cap —
+        // it therefore assumes the default `SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ`, since
+        // a cap below 200 would trip the item check first and report that instead.
         let blob = "x".repeat(1 << 20); // 1 MiB
         let body = serde_json::json!({
             "text": vec!["hi"; 200],
