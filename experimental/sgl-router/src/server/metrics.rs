@@ -127,10 +127,11 @@ impl WorkerModeLabel {
 }
 
 /// Decode-affinity outcome — see `select_decode_with_affinity` for the
-/// three reasons the affinity may not be honored.
-#[derive(Debug, Clone, Copy)]
+/// reasons the affinity may not be honored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeAffinityOutcome {
     SameHostPicked,
+    FallbackNoSameHost,
     FallbackBreaker,
     FallbackLoadImbalance,
 }
@@ -139,6 +140,7 @@ impl DecodeAffinityOutcome {
     fn as_str(self) -> &'static str {
         match self {
             Self::SameHostPicked => "same_host_picked",
+            Self::FallbackNoSameHost => "fallback_no_same_host",
             Self::FallbackBreaker => "fallback_breaker",
             Self::FallbackLoadImbalance => "fallback_load_imbalance",
         }
@@ -1144,14 +1146,18 @@ mod tests {
     }
 
     #[test]
-    fn decode_affinity_counter_emits_three_outcomes() {
+    fn decode_affinity_counter_emits_all_outcomes() {
         let reg = MetricsRegistry::new();
         reg.record_decode_affinity(DecodeAffinityOutcome::SameHostPicked);
         reg.record_decode_affinity(DecodeAffinityOutcome::SameHostPicked);
+        reg.record_decode_affinity(DecodeAffinityOutcome::FallbackNoSameHost);
         reg.record_decode_affinity(DecodeAffinityOutcome::FallbackBreaker);
         reg.record_decode_affinity(DecodeAffinityOutcome::FallbackLoadImbalance);
         let out = reg.render();
         assert!(out.contains(r#"sgl_router_decode_affinity_total{outcome="same_host_picked"} 2"#));
+        assert!(
+            out.contains(r#"sgl_router_decode_affinity_total{outcome="fallback_no_same_host"} 1"#)
+        );
         assert!(out.contains(r#"sgl_router_decode_affinity_total{outcome="fallback_breaker"} 1"#));
         assert!(out
             .contains(r#"sgl_router_decode_affinity_total{outcome="fallback_load_imbalance"} 1"#,));

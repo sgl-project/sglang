@@ -1819,7 +1819,7 @@
     {
       "type": "timeseries",
       "title": "Decode-affinity outcomes",
-      "description": "same_host_picked / fallback_breaker / fallback_load_imbalance.",
+      "description": "same_host_picked / fallback_no_same_host / fallback_breaker / fallback_load_imbalance.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
