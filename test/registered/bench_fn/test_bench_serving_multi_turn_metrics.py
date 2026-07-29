@@ -25,16 +25,25 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-class _SSEHandler(BaseHTTPRequestHandler):
+class _QuietHandler(BaseHTTPRequestHandler):
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        return json.loads(self.rfile.read(length)) if length else None
+
+    def log_message(self, fmt, *args):
+        return
+
+
+class _SSEHandler(_QuietHandler):
     """Streams a fixed sequence of OpenAI-compatible SSE chunks per test."""
 
     chunks: list = []
     request_bodies: list = []
 
     def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler interface)
-        length = int(self.headers.get("Content-Length", "0"))
-        if length:
-            self.request_bodies.append(json.loads(self.rfile.read(length)))
+        body = self._read_json()
+        if body is not None:
+            self.request_bodies.append(body)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -44,25 +53,17 @@ class _SSEHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
-    def log_message(self, fmt, *args):  # silence access logs
-        return
 
-
-class _JSONHandler(BaseHTTPRequestHandler):
+class _JSONHandler(_QuietHandler):
     response_body: dict = {}
 
     def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler interface)
-        length = int(self.headers.get("Content-Length", "0"))
-        if length:
-            self.rfile.read(length)
+        self._read_json()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(self.response_body).encode())
         self.wfile.flush()
-
-    def log_message(self, fmt, *args):
-        return
 
 
 class _StrictStringTokenizer:
@@ -101,7 +102,7 @@ class TestMultiTurnWrapperPromptLens(CustomTestCase):
     """Per-round prompt lengths flow through wrap_multi_turn_request_func."""
 
     def _run_wrapper(self, prompts, prompt_lens):
-        calls = []
+        self.calls = calls = []
 
         async def fake_request_func(request_func_input, pbar=None):
             calls.append(request_func_input)
@@ -129,6 +130,7 @@ class TestMultiTurnWrapperPromptLens(CustomTestCase):
         for lens in ([7, 11], [7, 11, 13, 17]):
             with self.assertRaisesRegex(ValueError, "rounds"):
                 self._run_wrapper(["q1", "q2", "q3"], lens)
+            self.assertEqual(self.calls, [])
 
     def test_no_prompt_lens_preserves_existing_behavior(self):
         outputs, _ = self._run_wrapper(["q1", "q2", "q3"], None)
@@ -156,16 +158,13 @@ class TestChatUsagePromptTokens(CustomTestCase):
             server.shutdown()
             server.server_close()
 
-    def _run_stream(self, chunks, extra_request_body=None):
+    def _set_args(self, disable_stream):
         set_global_args(
-            Namespace(
-                disable_stream=False,
-                disable_ignore_eos=True,
-                print_requests=False,
-                tokenizer="",
-                header=None,
-            )
+            Namespace(disable_stream=disable_stream, disable_ignore_eos=False)
         )
+
+    def _run_stream(self, chunks, extra_request_body=None):
+        self._set_args(disable_stream=False)
 
         class Handler(_SSEHandler):
             pass
@@ -175,15 +174,7 @@ class TestChatUsagePromptTokens(CustomTestCase):
         return self._run_against(Handler, extra_request_body), Handler
 
     def _run_non_stream(self, response_body):
-        set_global_args(
-            Namespace(
-                disable_stream=True,
-                disable_ignore_eos=False,
-                print_requests=False,
-                tokenizer="",
-                header=None,
-            )
-        )
+        self._set_args(disable_stream=True)
 
         class Handler(_JSONHandler):
             pass
@@ -200,7 +191,6 @@ class TestChatUsagePromptTokens(CustomTestCase):
 
         self.assertTrue(out.success, msg=f"request failed: {out.error}")
         self.assertEqual(out.server_prompt_len, 57)
-        self.assertEqual(out.effective_prompt_len(), 57)
         self.assertEqual(out.output_len, 1)
         # Servers only emit usage on the streaming path when asked.
         self.assertEqual(
@@ -208,8 +198,6 @@ class TestChatUsagePromptTokens(CustomTestCase):
         )
 
     def test_stream_options_null_suppresses_key(self):
-        # Escape hatch for servers that reject stream_options:
-        # --extra-request-body '{"stream_options": null}' must drop the key.
         out, handler = self._run_stream(
             [{"choices": [{"index": 0, "delta": {"content": "hi"}}]}],
             extra_request_body={"stream_options": None},

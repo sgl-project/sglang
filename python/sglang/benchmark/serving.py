@@ -94,7 +94,7 @@ class RequestFuncInput:
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
-    # Per-round prompt lengths for multi-turn conversations (one per round).
+    # Per-round prompt lengths for multi-turn conversations.
     prompt_lens: Optional[List[int]] = None
 
 
@@ -1596,7 +1596,6 @@ async def benchmark(
     total_conversations = None
     completed_conversations = None
     if is_multi_turn:
-        # Each task returns one conversation (a list of per-round outputs).
         total_conversations = len(outputs)
         completed_conversations = sum(
             1 for conversation in outputs if all(o.success for o in conversation)
@@ -1774,20 +1773,19 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     if args.cache_report:
         cache_agg = aggregate_cache_report(outputs)
+        total_prompt_tokens = cache_agg["total_prompt_tokens"]
         total_cached = cache_agg["total_cached"]
         total_device = cache_agg["total_device"]
         total_host = cache_agg["total_host"]
         total_storage = cache_agg["total_storage"]
         storage_backend_name = cache_agg["storage_backend_name"]
+        has_details = cache_agg["has_details"]
+        hit_rate = cache_agg["hit_rate"]
 
         print("{s:{c}^{n}}".format(s="Cache Hit Details", n=50, c="-"))
-        print(
-            "{:<40} {:<10}".format(
-                "Total prompt tokens:", cache_agg["total_prompt_tokens"]
-            )
-        )
+        print("{:<40} {:<10}".format("Total prompt tokens:", total_prompt_tokens))
         print("{:<40} {:<10}".format("Total cached tokens:", total_cached))
-        if cache_agg["has_details"] and total_cached > 0:
+        if has_details and total_cached > 0:
             print("{:<40} {:<10}".format("  Device:", total_device))
             print("{:<40} {:<10}".format("  Host:", total_host))
             if total_storage > 0:
@@ -1797,8 +1795,8 @@ async def benchmark(
                     else "  Storage:"
                 )
                 print("{:<40} {:<10}".format(label, total_storage))
-        print("{:<40} {:.1f}%".format("Cache hit rate:", cache_agg["hit_rate"]))
-        if cache_agg["has_details"] and total_cached > 0:
+        print("{:<40} {:.1f}%".format("Cache hit rate:", hit_rate))
+        if has_details and total_cached > 0:
             device_pct = total_device / total_cached * 100
             host_pct = total_host / total_cached * 100
             print("{:<40} {:.1f}%".format("  Device:", device_pct))
@@ -1881,18 +1879,14 @@ async def benchmark(
             result["total_conversations"] = total_conversations
 
         if args.cache_report:
-            has_details = cache_agg["has_details"]
-            total_storage = cache_agg["total_storage"]
             result["cache_report"] = {
-                "total_prompt_tokens": cache_agg["total_prompt_tokens"],
-                "total_cached_tokens": cache_agg["total_cached"],
-                "cache_hit_rate_pct": round(cache_agg["hit_rate"], 2),
-                "device_cached_tokens": (
-                    cache_agg["total_device"] if has_details else None
-                ),
-                "host_cached_tokens": cache_agg["total_host"] if has_details else None,
+                "total_prompt_tokens": total_prompt_tokens,
+                "total_cached_tokens": total_cached,
+                "cache_hit_rate_pct": round(hit_rate, 2),
+                "device_cached_tokens": total_device if has_details else None,
+                "host_cached_tokens": total_host if has_details else None,
                 "storage_cached_tokens": (total_storage if total_storage > 0 else None),
-                "storage_backend": cache_agg["storage_backend_name"],
+                "storage_backend": storage_backend_name,
             }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
@@ -2306,9 +2300,10 @@ def cli_main():
         "--dataset-offset",
         type=int,
         default=0,
-        help="Start consuming conversations at this index (agentic and "
-        "agentic-trace datasets), so successive sweep steps start on fresh "
-        "conversations.",
+        help="Start conversations at this index so successive sweep steps "
+        "start on fresh ones. agentic consumes the slice [offset, "
+        "offset + num-prompts) and errors when the dataset is too small; "
+        "agentic-trace rotates (wraps around and recycles).",
     )
     parser.add_argument(
         "--agentic-max-turns",

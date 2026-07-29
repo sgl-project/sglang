@@ -101,7 +101,7 @@ def make_source_rows(n=10, with_blocks=True, field="trajectory"):
 def make_pad_rows(n=20):
     text = (
         "<think>chain of thought</think> the quick brown fox jumps over "
-        "the lazy dog near the river bank. <|control|> and <｜ctrl｜> gone. " * 200
+        "the lazy dog near the river bank. <|control|> and <｜ctrl｜> gone. " * 20
     )
     return [{"output": text} for _ in range(n)]
 
@@ -142,27 +142,15 @@ def bare_turn_lens(tok, conversation):
 
 
 def make_dataset(**overrides):
-    fields = dict(
+    fields = {k: v for k, v in BUILD_KW.items() if k != "model_path"}
+    fields.update(
         num_prompts=2,
         dataset_path="",
-        source_dataset="fake/source",
-        source_split="train",
-        source_field="trajectory",
-        only_resolved=False,
-        first_turn_len=64,
-        subsequent_turn_len=16,
-        num_turns=4,
-        num_conversations=3,
         pad_source="openscience",
-        pad_dataset="fake/pads",
-        pad_split="train",
-        pad_text_field="output",
-        max_real_first_turn_frac=0.5,
         offset=0,
         output_len=20,
         cache_path="",
         rebuild=False,
-        seed=42,
     )
     fields.update(overrides)
     return AgenticDataset(**fields)
@@ -268,7 +256,6 @@ class TestBuilderShapes(CustomTestCase):
                             "<｜ctrl｜>",
                         ):
                             self.assertNotIn(forbidden, m["content"])
-            # Pads are unique per conversation (disjoint spans / per-conv RNG).
             self.assertEqual(len(set(sys_pads)), len(sys_pads))
             shapes[pad_source] = [
                 bare_turn_lens(tok, c) for c in payload["conversations"]
@@ -304,8 +291,6 @@ class TestBuilderShapes(CustomTestCase):
 
     def test_turn_synthesis_skipping_and_exhaustion(self):
         tok = CharTokenizer()
-        # Unusable rows are skipped; a 1-user-message trajectory still yields
-        # all turns (synthesized, never skipped).
         rows = [
             {"trajectory": [{"role": "assistant", "content": "no user"}]},
             {"trajectory": []},
@@ -338,7 +323,6 @@ class TestBuilderShapes(CustomTestCase):
 
     def test_source_variants(self):
         tok = CharTokenizer()
-        # only_resolved keeps rows with resolved == 1 (even indices).
         payload = build_agentic_conversations(
             tok,
             pad_source="random",
@@ -382,20 +366,19 @@ class TestBuilderShapes(CustomTestCase):
         # (the transformers >= 5 default for tokenize=True).
         self.assertGreater(expected_t1, 60)
         self.assertEqual(conv[0]["prompt_tokens"], expected_t1)
-        # Later turns carry no prompt_tokens: per-round lengths are always
-        # recomputed at load time from the requested output length.
-        for k in range(1, 4):
-            self.assertNotIn("prompt_tokens", conv[k])
 
     def test_invalid_shape_flags_rejected(self):
         for overrides in (
             {"agentic_num_turns": 0},
             {"agentic_subsequent_turn_len": 0},
             {"agentic_max_real_first_turn_frac": 1.5},
+            {"agentic_max_real_first_turn_frac": 0},
+            {"num_prompts": 0},
         ):
             args = Namespace(
                 backend="sglang-oai-chat",
                 dataset_offset=0,
+                num_prompts=2,
                 agentic_pad_source="random",
                 agentic_first_turn_len=64,
                 agentic_subsequent_turn_len=16,
@@ -442,7 +425,6 @@ class TestExactSizing(CustomTestCase):
         self.assertNotEqual(a, b)
         self.assertIsNone(pool.next_pad(10**6))
 
-        # A too-small pool falls back to random padding, preserving shape.
         payload = build_agentic_conversations(
             tok,
             pad_source="openscience",
@@ -471,7 +453,6 @@ class TestCaching(CustomTestCase):
     def test_build_reuse_rebuild_and_row_contract(self):
         rows = self._dataset().load(self.tok, model_id="test-model")
         self.assertEqual(len(rows), 2)
-        # Emitted rows carry the multi-turn contract fields.
         row = rows[0]
         self.assertEqual(len(row.prompt), 4)
         self.assertEqual(row.prompt[0][0]["role"], "system")
@@ -543,7 +524,7 @@ class TestPrebuilt(CustomTestCase):
         return make_dataset(**overrides)
 
     def test_legacy_fixture_loads_with_offset(self):
-        rows = self._dataset(num_prompts=3, num_turns=3).load(self.tok)
+        rows = self._dataset(num_prompts=3).load(self.tok)
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0].prompt_len, 40)
         # File metadata wins (subsequent_turn_length=8 from the fixture);

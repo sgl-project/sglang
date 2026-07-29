@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-# Chat backends whose request function supports multi-turn conversation replay.
 MULTI_TURN_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
 
 ASSISTANT_SUFFIX = "Assistant:"

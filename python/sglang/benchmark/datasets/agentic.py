@@ -12,6 +12,7 @@ and reload unchanged via ``--dataset-path``; the same files are replayable by
 the ``agentic-trace`` dataset.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -98,8 +99,6 @@ class AgenticDataset(BaseDataset):
 
     @classmethod
     def from_args(cls, args: Namespace) -> "AgenticDataset":
-        # The CLI hook in serving.py runs the same validator at parse time;
-        # revalidate here for in-process callers.
         error = validate_agentic_args(args)
         if error:
             raise ValueError(error)
@@ -235,20 +234,20 @@ class AgenticDataset(BaseDataset):
         ):
             if (
                 not conversation
-                or not isinstance(conversation[0], dict)
-                or "prompt_tokens" not in conversation[0]
-                or any(not turn.get("messages") for turn in conversation)
+                or any(
+                    not isinstance(turn, dict) or not turn.get("messages")
+                    for turn in conversation
+                )
+                or not isinstance(conversation[0].get("prompt_tokens"), int)
             ):
                 raise ValueError(
                     f"Conversation {idx} is malformed: every turn needs "
-                    'non-empty "messages" and the first turn needs '
-                    '"prompt_tokens".'
+                    'non-empty "messages" and the first turn needs an '
+                    'integer "prompt_tokens".'
                 )
             turn_messages = [turn["messages"] for turn in conversation]
-            # Per-round prompt lengths grow by the configured per-turn shape.
-            # This is an estimate (it ignores per-round chat-template
-            # overhead); server-reported usage.prompt_tokens overrides it in
-            # the metrics whenever the server returns usage.
+            # Estimates: per-round chat-template overhead is ignored, and
+            # server-reported usage.prompt_tokens overrides them in metrics.
             first_turn_prompt_tokens = conversation[0]["prompt_tokens"]
             prompt_lens = [first_turn_prompt_tokens]
             for _ in range(1, len(conversation)):
@@ -289,6 +288,7 @@ def validate_agentic_args(args: Namespace) -> Optional[str]:
     if args.dataset_offset < 0:
         return f"--dataset-offset must be >= 0, got {args.dataset_offset}"
     for flag, minimum in (
+        ("num_prompts", 1),
         ("agentic_first_turn_len", 1),
         ("agentic_subsequent_turn_len", 1),
         ("agentic_num_turns", 1),
@@ -299,9 +299,124 @@ def validate_agentic_args(args: Namespace) -> Optional[str]:
         if value < minimum:
             return f"--{flag.replace('_', '-')} must be >= {minimum}, got {value}"
     frac = args.agentic_max_real_first_turn_frac
-    if not 0 <= frac <= 1:
-        return f"--agentic-max-real-first-turn-frac must be in [0, 1], got {frac}"
+    if not 0 < frac <= 1:
+        return f"--agentic-max-real-first-turn-frac must be in (0, 1], got {frac}"
     return None
+
+
+class SciencePadPool:
+    """A special-token-free pool of natural-language pad tokens.
+
+    Streams the pad dataset, strips control markup and token ids, and vends
+    disjoint contiguous spans so every conversation gets unique filler.
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        dataset_name: str,
+        split: str,
+        text_field: str,
+        needed_tokens: int,
+        rows: Optional[Iterable[Dict]] = None,
+    ) -> None:
+        self._tokenizer = tokenizer
+        self._cursor = 0
+        control_ids = _control_token_ids(tokenizer)
+
+        print(
+            f"Building pad pool from {dataset_name} (split={split}, "
+            f"field={text_field}); collecting ~{needed_tokens} tokens..."
+        )
+        if rows is None:
+            rows = _stream_hf_rows(dataset_name, split)
+
+        chunks: List[np.ndarray] = []
+        collected = 0
+        num_rows = 0
+        control_arr = (
+            np.array(sorted(control_ids), dtype=np.int32) if control_ids else None
+        )
+        pbar = tqdm(total=needed_tokens, desc="Collecting pad tokens", unit="tok")
+        for row in rows:
+            num_rows += 1
+            text = row.get(text_field, "") if isinstance(row, dict) else ""
+            if not text:
+                continue
+            text = _sanitize_r1(text)
+            # int32 halves the pool footprint; token ids always fit.
+            ids = np.asarray(
+                tokenizer.encode(text, add_special_tokens=False), dtype=np.int32
+            )
+            if control_arr is not None and ids.size:
+                ids = ids[~np.isin(ids, control_arr)]
+            if not ids.size:
+                continue
+            chunks.append(ids)
+            collected += ids.size
+            pbar.update(min(ids.size, max(0, needed_tokens - pbar.n)))
+            if collected >= needed_tokens:
+                break
+        pbar.close()
+
+        self._ids = np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int32)
+        print(
+            f"  Pad pool ready: {self._ids.size} tokens from {num_rows} rows "
+            f"(needed ~{needed_tokens})."
+        )
+        if self._ids.size < needed_tokens:
+            print(
+                f"  WARNING: pad pool ({self._ids.size} tok) is smaller than "
+                f"needed (~{needed_tokens} tok); slots that outrun it fall "
+                f"back to random padding."
+            )
+
+    def next_pad(self, target_bare_tokens: int) -> Optional[str]:
+        """Vend a disjoint span of ~``target_bare_tokens`` tokens, or
+        ``None`` once the pool is exhausted."""
+        if self._ids.size - self._cursor < target_bare_tokens:
+            return None
+        span = self._ids[self._cursor : self._cursor + target_bare_tokens]
+        self._cursor += target_bare_tokens
+        return self._tokenizer.decode(span.tolist(), skip_special_tokens=True)
+
+
+class _PadProvider:
+    """Produces pad text of controlled bare-token sizes from the selected
+    source. ``used_fallback`` records whether the openscience pool ran dry and
+    random padding filled in (surfaced in the built metadata)."""
+
+    def __init__(self, tokenizer, pad_source: str, pool: Optional[SciencePadPool]):
+        self._tokenizer = tokenizer
+        self._pad_source = pad_source
+        self._pool = pool
+        self.used_fallback = False
+
+    def make_pad(self, target_bare_tokens: int, conv_rng: np.random.RandomState) -> str:
+        if target_bare_tokens <= 0:
+            return ""
+        text = None
+        if self._pad_source == "openscience" and self._pool is not None:
+            text = self._pool.next_pad(target_bare_tokens)
+            if text is None and not self.used_fallback:
+                print(
+                    "WARNING: pad pool exhausted; remaining pad slots fall "
+                    "back to random padding."
+                )
+                self.used_fallback = True
+        if text is None:
+            text = _generate_random_text(target_bare_tokens, conv_rng)
+        # Enforce the never-over contract even when decode -> re-encode drifts.
+        pad, realized = _truncate_to_bare_tokens(
+            text, target_bare_tokens, self._tokenizer
+        )
+        if target_bare_tokens - realized > PAD_SIZING_MAX_DEFICIT_TOKENS:
+            print(
+                f"WARNING: pad realized {realized} bare tokens for target "
+                f"{target_bare_tokens} (deficit exceeds the "
+                f"{PAD_SIZING_MAX_DEFICIT_TOKENS}-token tolerance)."
+            )
+        return pad
 
 
 def build_agentic_conversations(
@@ -348,98 +463,38 @@ def build_agentic_conversations(
         source_rows = _stream_hf_rows(source_dataset, source_split)
 
     conversations: List[List[Dict]] = []
-    skipped_empty = 0
+    skipped_unusable = 0
 
     pbar = tqdm(total=num_conversations, desc="Building padded conversations")
     for row in source_rows:
         if len(conversations) >= num_conversations:
             break
-        if not isinstance(row, dict):
-            skipped_empty += 1
+        if isinstance(row, dict) and only_resolved and row.get("resolved") != 1:
             continue
-        if only_resolved and row.get("resolved") != 1:
+        user_msgs = _extract_user_msgs(row, source_field)
+        if user_msgs is None:
+            skipped_unusable += 1
             continue
-        traj = row.get(source_field)
-        if isinstance(traj, str):
-            # Some sources (e.g. SWE-smith) store the trajectory as JSON text.
-            try:
-                traj = json.loads(traj)
-            except json.JSONDecodeError:
-                skipped_empty += 1
-                continue
-        if not traj or not isinstance(traj, list):
-            skipped_empty += 1
-            continue
-        msgs = _extract_messages(traj)
-        user_msgs = [m for m in msgs if m["role"] == "user"]
-        if not user_msgs:
-            skipped_empty += 1
-            continue
-
         # Per-conversation RNG: synthetic content unique but reproducible.
         conv_rng = np.random.RandomState(seed + len(conversations))
-
-        first_user_real = user_msgs[0]["content"]
-        first_user_real_bare = _encode_len(first_user_real, tokenizer)
-        max_real_in_turn1 = max(1, int(first_turn_len * max_real_first_turn_frac))
-        real_in_turn1 = min(first_user_real_bare, max_real_in_turn1)
-        if first_user_real_bare > real_in_turn1:
-            first_user_msg_content, real_in_turn1 = _truncate_to_bare_tokens(
-                first_user_real, real_in_turn1, tokenizer
-            )
-        else:
-            first_user_msg_content = first_user_real
-        system_target = max(0, first_turn_len - real_in_turn1)
-        system_content = provider.make_pad(system_target, conv_rng)
-
-        turn_1_messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": first_user_msg_content},
-        ]
-        # Render the chat template only for turn 1: its measured length seeds
-        # the per-round prompt-length estimates in _to_rows (and keeps the
-        # file replayable by the agentic-trace dataset).
-        turn_1_prompt_tokens = len(
-            tokenizer.apply_chat_template(
-                turn_1_messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=False,
+        conversations.append(
+            _build_conversation(
+                user_msgs,
+                tokenizer,
+                provider,
+                conv_rng,
+                first_turn_len=first_turn_len,
+                subsequent_turn_len=subsequent_turn_len,
+                num_turns=num_turns,
+                max_real_first_turn_frac=max_real_first_turn_frac,
             )
         )
-        turns: List[Dict] = [
-            {"messages": turn_1_messages, "prompt_tokens": turn_1_prompt_tokens}
-        ]
-
-        # One user message per later turn, synthesized from pad text alone
-        # when the trajectory runs dry — turns are never skipped.
-        msg_idx = 1
-        for _ in range(1, num_turns):
-            real_part = ""
-            if msg_idx < len(user_msgs):
-                real_part = user_msgs[msg_idx]["content"]
-                msg_idx += 1
-            real_bare = _encode_len(real_part, tokenizer)
-            if real_bare > subsequent_turn_len:
-                content, _ = _truncate_to_bare_tokens(
-                    real_part, subsequent_turn_len, tokenizer
-                )
-            else:
-                # make_pad(0) returns "" (no pool/RNG use), so the exact-fit
-                # case appends nothing and keeps the real content unchanged.
-                synth_part = provider.make_pad(
-                    subsequent_turn_len - real_bare, conv_rng
-                )
-                content = real_part + synth_part
-            turns.append({"messages": [{"role": "user", "content": content}]})
-
-        conversations.append(turns)
         pbar.update(1)
     pbar.close()
 
     print(
         f"Built {len(conversations)} conversations "
-        f"(skipped {skipped_empty} empty trajectories)"
+        f"(skipped {skipped_unusable} unusable trajectories)"
     )
     if len(conversations) < num_conversations:
         raise ValueError(
@@ -471,120 +526,89 @@ def build_agentic_conversations(
     return {"metadata": metadata, "conversations": conversations}
 
 
-class SciencePadPool:
-    """A special-token-free pool of natural-language pad tokens.
-
-    Streams the pad dataset, strips control markup and token ids, and vends
-    disjoint contiguous spans so every conversation gets unique filler.
-    """
-
-    def __init__(
-        self,
-        tokenizer,
-        dataset_name: str,
-        split: str,
-        text_field: str,
-        needed_tokens: int,
-        rows: Optional[Iterable[Dict]] = None,
-    ) -> None:
-        self._tokenizer = tokenizer
-        self._cursor = 0
-        control_ids = _control_token_ids(tokenizer)
-
-        print(
-            f"Building pad pool from {dataset_name} (split={split}, "
-            f"field={text_field}); collecting ~{needed_tokens} tokens..."
-        )
-        if rows is None:
-            rows = _stream_hf_rows(dataset_name, split)
-
-        chunks: List[np.ndarray] = []
-        collected = 0
-        num_rows = 0
-        control_arr = (
-            np.array(sorted(control_ids), dtype=np.int64) if control_ids else None
-        )
-        pbar = tqdm(total=needed_tokens, desc="Collecting pad tokens", unit="tok")
-        for row in rows:
-            num_rows += 1
-            text = row.get(text_field, "") if isinstance(row, dict) else ""
-            if not text:
-                continue
-            text = _sanitize_r1(text)
-            ids = np.asarray(
-                tokenizer.encode(text, add_special_tokens=False), dtype=np.int64
-            )
-            if control_arr is not None and ids.size:
-                ids = ids[~np.isin(ids, control_arr)]
-            if not ids.size:
-                continue
-            chunks.append(ids)
-            collected += ids.size
-            pbar.update(min(ids.size, max(0, needed_tokens - pbar.n)))
-            if collected >= needed_tokens:
-                break
-        pbar.close()
-
-        self._ids = np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int64)
-        print(
-            f"  Pad pool ready: {self._ids.size} tokens from {num_rows} rows "
-            f"(needed ~{needed_tokens})."
-        )
-        if self._ids.size < needed_tokens:
-            print(
-                f"  WARNING: pad pool ({self._ids.size} tok) is smaller than "
-                f"needed (~{needed_tokens} tok); slots that outrun it fall "
-                f"back to random padding."
-            )
-
-    def next_pad(self, target_bare_tokens: int) -> Optional[str]:
-        """Vend a disjoint span of ~``target_bare_tokens`` tokens, or
-        ``None`` once the pool is exhausted."""
-        if target_bare_tokens <= 0:
-            return ""
-        if self._ids.size - self._cursor < target_bare_tokens:
+def _extract_user_msgs(row: Any, source_field: str) -> Optional[List[Dict[str, str]]]:
+    """User messages of a usable trajectory row, or ``None`` for an unusable
+    one (non-dict row, unparseable/empty trajectory, no user messages)."""
+    if not isinstance(row, dict):
+        return None
+    traj = row.get(source_field)
+    if isinstance(traj, str):
+        # Some sources (e.g. SWE-smith) store the trajectory as JSON text.
+        try:
+            traj = json.loads(traj)
+        except json.JSONDecodeError:
             return None
-        span = self._ids[self._cursor : self._cursor + target_bare_tokens]
-        self._cursor += target_bare_tokens
-        return self._tokenizer.decode(span.tolist(), skip_special_tokens=True)
+    if not traj or not isinstance(traj, list):
+        return None
+    user_msgs = [m for m in _extract_messages(traj) if m["role"] == "user"]
+    return user_msgs or None
 
 
-class _PadProvider:
-    """Produces pad text of controlled bare-token sizes from the selected
-    source. ``used_fallback`` records whether the openscience pool ran dry and
-    random padding filled in (surfaced in the built metadata)."""
-
-    def __init__(self, tokenizer, pad_source: str, pool: Optional[SciencePadPool]):
-        self._tokenizer = tokenizer
-        self._pad_source = pad_source
-        self._pool = pool
-        self.used_fallback = False
-
-    def make_pad(self, target_bare_tokens: int, conv_rng: np.random.RandomState) -> str:
-        if target_bare_tokens <= 0:
-            return ""
-        text = None
-        if self._pad_source == "openscience" and self._pool is not None:
-            text = self._pool.next_pad(target_bare_tokens)
-            if text is None and not self.used_fallback:
-                print(
-                    "WARNING: pad pool exhausted; remaining pad slots fall "
-                    "back to random padding."
-                )
-                self.used_fallback = True
-        if text is None:
-            text = _generate_random_text(target_bare_tokens, conv_rng)
-        # Enforce the never-over contract even when decode -> re-encode drifts.
-        pad, realized = _truncate_to_bare_tokens(
-            text, target_bare_tokens, self._tokenizer
+def _build_conversation(
+    user_msgs: List[Dict[str, str]],
+    tokenizer,
+    provider: "_PadProvider",
+    conv_rng: np.random.RandomState,
+    *,
+    first_turn_len: int,
+    subsequent_turn_len: int,
+    num_turns: int,
+    max_real_first_turn_frac: float,
+) -> List[Dict]:
+    """Build one conversation: a padded turn 1 (synthetic system prompt plus
+    capped real first user message) followed by fixed-size user turns."""
+    first_user_real = user_msgs[0]["content"]
+    first_user_real_bare = _encode_len(first_user_real, tokenizer)
+    max_real_in_turn1 = max(1, int(first_turn_len * max_real_first_turn_frac))
+    real_in_turn1 = min(first_user_real_bare, max_real_in_turn1)
+    if first_user_real_bare > real_in_turn1:
+        first_user_msg_content, real_in_turn1 = _truncate_to_bare_tokens(
+            first_user_real, real_in_turn1, tokenizer
         )
-        if target_bare_tokens - realized > PAD_SIZING_MAX_DEFICIT_TOKENS:
-            print(
-                f"WARNING: pad realized {realized} bare tokens for target "
-                f"{target_bare_tokens} (deficit exceeds the "
-                f"{PAD_SIZING_MAX_DEFICIT_TOKENS}-token tolerance)."
+    else:
+        first_user_msg_content = first_user_real
+    system_content = provider.make_pad(first_turn_len - real_in_turn1, conv_rng)
+
+    turn_1_messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": first_user_msg_content},
+    ]
+    # Render the chat template only for turn 1: its measured length seeds
+    # the per-round prompt-length estimates in _to_rows (and keeps the
+    # file replayable by the agentic-trace dataset).
+    turn_1_prompt_tokens = len(
+        tokenizer.apply_chat_template(
+            turn_1_messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=False,
+        )
+    )
+    turns: List[Dict] = [
+        {"messages": turn_1_messages, "prompt_tokens": turn_1_prompt_tokens}
+    ]
+
+    # One user message per later turn, synthesized from pad text alone
+    # when the trajectory runs dry — turns are never skipped.
+    for turn_idx in range(1, num_turns):
+        real_part = user_msgs[turn_idx]["content"] if turn_idx < len(user_msgs) else ""
+        real_bare = _encode_len(real_part, tokenizer)
+        if real_bare > subsequent_turn_len:
+            content, _ = _truncate_to_bare_tokens(
+                real_part, subsequent_turn_len, tokenizer
             )
-        return pad
+        else:
+            # make_pad(0) returns "" without consuming the RNG, so an exact
+            # fit keeps the real content unchanged.
+            content = real_part + provider.make_pad(
+                subsequent_turn_len - real_bare, conv_rng
+            )
+            # The concat seam can re-tokenize; re-verify never-over.
+            content, _ = _truncate_to_bare_tokens(
+                content, subsequent_turn_len, tokenizer
+            )
+        turns.append({"messages": [{"role": "user", "content": content}]})
+    return turns
 
 
 def _sanitize_r1(text: str) -> str:
@@ -653,16 +677,12 @@ def _truncate_to_bare_tokens(
     return "", 0
 
 
-def _generate_random_text(
-    target_bare_tokens: int,
-    rng: np.random.RandomState,
-    chars_per_token: float = 1.7,
-) -> str:
+def _generate_random_text(target_bare_tokens: int, rng: np.random.RandomState) -> str:
     """Random-ASCII candidate encoding to at least ``target_bare_tokens``
     tokens; the caller trims it to the exact target."""
     if target_bare_tokens <= 0:
         return ""
-    n_chars = int(target_bare_tokens * chars_per_token) + 8
+    n_chars = int(target_bare_tokens * 1.7) + 8
     idx = rng.randint(0, len(_PAD_ALPHABET), size=n_chars)
     return "".join(_PAD_ALPHABET[idx].tolist())
 
@@ -721,7 +741,6 @@ def _dataset_metadata(
         "first_turn_length": first_turn_len,
         "subsequent_turn_length": subsequent_turn_len,
         "num_turns": num_turns,
-        # Absent in files built by earlier tooling; compared only when present.
         "tokenizer_path": tokenizer_path,
         "seed": seed,
         "source_field": source_field,
@@ -742,8 +761,6 @@ def get_agentic_cache_path(expected_metadata: Dict) -> Path:
     """Configuration-keyed cache path under ~/.cache/sglang/benchmark. The
     conversation count is deliberately not part of the key: growing a cache
     (auto-expand) rewrites the same file."""
-    import hashlib
-
     compat = {k: expected_metadata[k] for k in _CACHE_COMPAT_FIELDS}
     digest = hashlib.sha1(
         json.dumps(compat, sort_keys=True).encode("utf-8")
