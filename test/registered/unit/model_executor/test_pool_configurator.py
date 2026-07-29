@@ -137,6 +137,7 @@ def _make_model_runner(
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
     sa.enable_hisparse = False
     sa.enable_dsa_cache_layer_split = False
+    sa.enable_dsa_shared_kv_cache = False
     sa.kv_cache_dtype = "auto"
     mr.server_args = sa
 

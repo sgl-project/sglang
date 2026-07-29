@@ -336,6 +336,22 @@ class BaseIndexerMetadata(ABC):
         """
 
 
+def _prepare_paged_index_page_table(pool, page_table: torch.Tensor) -> torch.Tensor:
+    prepare = getattr(pool, "prepare_paged_index_page_table", None)
+    return prepare(page_table) if prepare is not None else page_table
+
+
+def _get_index_cache_write_owner(pool) -> tuple[int, int]:
+    get_owner = getattr(pool, "get_index_k_write_owner", None)
+    return get_owner() if get_owner is not None else (0, 1)
+
+
+def _synchronize_shared_cache_writes(pool) -> None:
+    synchronize = getattr(pool, "synchronize_shared_writes", None)
+    if synchronize is not None:
+        synchronize()
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
     if _is_hip:
@@ -694,6 +710,7 @@ class Indexer(MultiPlatformOp):
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
+            owner_rank, owner_size = _get_index_cache_write_owner(pool)
             fused_k_indexer_norm_rope_store(
                 key_raw,
                 pool.get_index_k_with_scale_buffer(layer_id=layer_id),
@@ -704,6 +721,8 @@ class Indexer(MultiPlatformOp):
                 self._indexer_cos_sin_cache,
                 positions,
                 page_size,
+                owner_rank=owner_rank,
+                owner_size=owner_size,
             )
             return
 
@@ -819,6 +838,8 @@ class Indexer(MultiPlatformOp):
 
     @staticmethod
     def _get_index_k_read_buffer(pool, layer_id: int) -> torch.Tensor:
+        if hasattr(pool, "get_paged_index_k_with_scale_buffer"):
+            return pool.get_paged_index_k_with_scale_buffer(layer_id)
         # Read path: prefer the owner-broadcast scratch buffer under DSA cache
         # layer split; fall back to the owned buffer for plain pools. Stores go
         # through get_index_k_with_scale_buffer() (owned buffer) instead.
@@ -900,7 +921,9 @@ class Indexer(MultiPlatformOp):
         if _is_hip and not _use_aiter_preshuffle:
             block_tables = metadata.get_page_table_1()
         else:
-            block_tables = metadata.get_page_table_64()
+            block_tables = _prepare_paged_index_page_table(
+                get_token_to_kv_pool(), metadata.get_page_table_64()
+            )
 
         max_seq_len = block_tables.shape[1] * page_size
         kv_cache_fp8 = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
@@ -1667,11 +1690,14 @@ class Indexer(MultiPlatformOp):
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            owner_rank, owner_size = _get_index_cache_write_owner(pool)
             fused_store_index_k_cache(
                 key,
                 buf,
                 out_cache_loc,
                 pool.page_size,
+                owner_rank=owner_rank,
+                owner_size=owner_size,
             )
             return
 
@@ -1967,6 +1993,8 @@ class Indexer(MultiPlatformOp):
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
+
+        _synchronize_shared_cache_writes(get_token_to_kv_pool())
 
         if _is_cuda or _is_hip:
             # In piecewise/breakable CUDA graph, any access to seq_lens_cpu

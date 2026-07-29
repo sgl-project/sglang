@@ -72,11 +72,15 @@ def fused_k_indexer_norm_rope_store(
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
     page_size: int,
+    *,
+    owner_rank: int = 0,
+    owner_size: int = 1,
 ) -> None:
     """V3.2 indexer K + fused store: LayerNorm + RoPE on leading dims + fp8
     act-quant + paged index-k cache write, in one launch. CUDA only."""
     if not out_cache_loc.is_contiguous():
         out_cache_loc = out_cache_loc.contiguous()
+    assert 0 <= owner_rank < owner_size
     module = _jit_k_indexer_norm_rope_store_module(k_input.dtype, page_size)
     module.forward(
         k_input,
@@ -87,4 +91,6 @@ def fused_k_indexer_norm_rope_store(
         cos_sin_cache,
         positions,
         float(eps),
+        owner_rank,
+        owner_size,
     )

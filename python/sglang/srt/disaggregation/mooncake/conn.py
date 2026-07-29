@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    prepare_dsa_shared_state_indices,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -179,6 +180,7 @@ class MooncakeKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.dsa_shared_buffer_tensors = None
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -215,6 +217,14 @@ class MooncakeKVManager(CommonKVManager):
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
+            self._dsa_shared_staging_buffers = (
+                self._init_dsa_shared_staging_buffers(len(self.transfer_queues))
+                if self._uses_dsa_shared_source_staging()
+                else []
+            )
+            transfer_staging_buffers = self._dsa_shared_staging_buffers or (
+                self._staging_ctx.buffers if self.enable_staging else []
+            )
             for i, (queue, executor) in enumerate(
                 zip(self.transfer_queues, self.executors)
             ):
@@ -224,8 +234,8 @@ class MooncakeKVManager(CommonKVManager):
                         queue,
                         executor,
                         (
-                            self._staging_ctx.buffers[i]
-                            if self.enable_staging and self._staging_ctx.buffers
+                            transfer_staging_buffers[i]
+                            if transfer_staging_buffers
                             else None
                         ),
                         i,
@@ -257,8 +267,13 @@ class MooncakeKVManager(CommonKVManager):
         self.engine = get_mooncake_transfer_engine()
 
     def register_buffer_to_engine(self):
+        register_cache_buffers = not self._uses_dsa_shared_source_staging()
         # Batch register KV data buffers
-        if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
+        if (
+            register_cache_buffers
+            and self.kv_args.kv_data_ptrs
+            and self.kv_args.kv_data_lens
+        ):
             self.engine.batch_register(
                 self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
             )
@@ -269,22 +284,25 @@ class MooncakeKVManager(CommonKVManager):
                 self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
             )
 
-        for ptrs, lens in zip(
-            self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
-        ):
-            if ptrs and lens:
-                self.engine.batch_register(ptrs, lens)
+        if register_cache_buffers:
+            for ptrs, lens in zip(
+                self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+            ):
+                if ptrs and lens:
+                    self.engine.batch_register(ptrs, lens)
 
     def deregister_buffer_to_engine(self):
-        if self.kv_args.kv_data_ptrs:
+        deregister_cache_buffers = not self._uses_dsa_shared_source_staging()
+        if deregister_cache_buffers and self.kv_args.kv_data_ptrs:
             self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
 
         if self.kv_args.aux_data_ptrs:
             self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
 
-        for ptrs in self.kv_args.state_data_ptrs or []:
-            if ptrs:
-                self.engine.batch_deregister(ptrs)
+        if deregister_cache_buffers:
+            for ptrs in self.kv_args.state_data_ptrs or []:
+                if ptrs:
+                    self.engine.batch_deregister(ptrs)
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
@@ -304,6 +322,30 @@ class MooncakeKVManager(CommonKVManager):
             "v_buffers": v_buffers,
             "page_size": page_size,
         }
+
+    def _uses_dsa_shared_source_staging(self) -> bool:
+        return self.disaggregation_mode == DisaggregationMode.PREFILL and getattr(
+            self.server_args, "enable_dsa_shared_kv_cache", False
+        )
+
+    def set_dsa_shared_buffer_tensors(
+        self, kv_buffers: list, state_buffers: list[list]
+    ) -> None:
+        self.dsa_shared_buffer_tensors = {
+            "kv": kv_buffers,
+            "state": state_buffers,
+        }
+
+    def _init_dsa_shared_staging_buffers(self, count: int):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            init_staging_buffers,
+        )
+
+        return init_staging_buffers(
+            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self.kv_args,
+            count,
+        )
 
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -728,6 +770,31 @@ class MooncakeKVManager(CommonKVManager):
             # compared to using multiple threads
             return process_layers(layers_params)
 
+    def _send_dsa_shared_staged(
+        self,
+        mooncake_session_id: str,
+        src_buffers: list,
+        item_lens: list[int],
+        src_indices: npt.NDArray[np.int32],
+        dst_ptrs: list[int],
+        dst_indices: npt.NDArray[np.int32],
+        staging_buffer,
+    ) -> int:
+        from sglang.srt.disaggregation.common.dsa_shared_staging import (
+            send_dsa_shared_staged,
+        )
+
+        return send_dsa_shared_staged(
+            self._transfer_data,
+            mooncake_session_id,
+            src_buffers,
+            item_lens,
+            src_indices,
+            dst_ptrs,
+            dst_indices,
+            staging_buffer,
+        )
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -990,6 +1057,7 @@ class MooncakeKVManager(CommonKVManager):
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not self.server_args.enable_dsa_cache_layer_split
+            and not getattr(self.server_args, "enable_dsa_shared_kv_cache", False)
         ):
             skip_state = True
 
@@ -1015,6 +1083,7 @@ class MooncakeKVManager(CommonKVManager):
         prefill_state_indices: List,
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+        staging_buffer=None,
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
@@ -1125,6 +1194,15 @@ class MooncakeKVManager(CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                if st == StateType.DSA and getattr(
+                    self.server_args, "enable_dsa_shared_kv_cache", False
+                ):
+                    src_indices, dst_indices_local = prepare_dsa_shared_state_indices(
+                        src_indices,
+                        dst_indices_local,
+                        cp_rank=self.attn_cp_rank,
+                        cp_size=self.attn_cp_size,
+                    )
                 if (
                     st == StateType.C128_STATE
                     and len(src_indices) == 0
@@ -1148,6 +1226,24 @@ class MooncakeKVManager(CommonKVManager):
                         src_indices = src_indices[: len(dst_indices_local)]
                     else:
                         dst_indices_local = dst_indices_local[: len(src_indices)]
+                if st == StateType.DSA and self._uses_dsa_shared_source_staging():
+                    if self.dsa_shared_buffer_tensors is None:
+                        raise RuntimeError(
+                            "DSA shared PD transfer buffers are unavailable"
+                        )
+                    rc = (
+                        self._send_dsa_shared_staged(
+                            req.mooncake_session_id,
+                            self.dsa_shared_buffer_tensors["state"][i],
+                            src_item_lens,
+                            np.array(src_indices, dtype=np.int32),
+                            dst_data_ptrs,
+                            np.array(dst_indices_local, dtype=np.int32),
+                            staging_buffer,
+                        )
+                        or rc
+                    )
+                    continue
                 rc = (
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,
@@ -1455,6 +1551,20 @@ class MooncakeKVManager(CommonKVManager):
                             or skip_kv
                         ):
                             ret = 0
+                        elif self._uses_dsa_shared_source_staging():
+                            if self.dsa_shared_buffer_tensors is None:
+                                raise RuntimeError(
+                                    "DSA shared PD transfer buffers are unavailable"
+                                )
+                            ret = self._send_dsa_shared_staged(
+                                req.mooncake_session_id,
+                                self.dsa_shared_buffer_tensors["kv"],
+                                self.kv_args.kv_item_lens,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                staging_buffer,
+                            )
                         elif (
                             self.is_mla_backend
                             or self.is_hybrid_mla_backend
@@ -1530,6 +1640,7 @@ class MooncakeKVManager(CommonKVManager):
                                     kv_chunk.state_indices,
                                     executor,
                                     target_rank_registration_info,
+                                    staging_buffer,
                                 )
 
                             # Only the last chunk we need to send the aux data
@@ -1774,7 +1885,7 @@ class MooncakeKVManager(CommonKVManager):
         self,
         bootstrap_room: int,
         kv_indices: npt.NDArray[np.int32],
-        index_slice: slice,
+        index_slice: Union[slice, npt.NDArray[np.int64]],
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,

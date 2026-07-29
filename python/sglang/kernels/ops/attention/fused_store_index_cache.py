@@ -71,6 +71,9 @@ def fused_store_index_k_cache(
     index_k_with_scale: torch.Tensor,
     out_cache_loc: torch.Tensor,
     page_size: int = 64,
+    *,
+    owner_rank: int = 0,
+    owner_size: int = 1,
 ) -> None:
     """
     Fused: quantize bf16 key (N,128) -> fp8 + fp32 scale and write into DSATokenToKVPool.index_k_with_scale_buffer.
@@ -82,6 +85,7 @@ def fused_store_index_k_cache(
     assert key.is_cuda
     assert index_k_with_scale.is_cuda
     assert out_cache_loc.is_cuda
+    assert 0 <= owner_rank < owner_size
 
     # 1) normalize shapes
     if key.dim() != 2:
@@ -102,4 +106,6 @@ def fused_store_index_k_cache(
         index_k_with_scale = index_k_with_scale.contiguous()
 
     module = _jit_dsa_fused_store_module(key.dtype, out_cache_loc.dtype, page_size)
-    module.fused_store_index_k_cache(key, index_k_with_scale, out_cache_loc)
+    module.fused_store_index_k_cache(
+        key, index_k_with_scale, out_cache_loc, owner_rank, owner_size
+    )

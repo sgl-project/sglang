@@ -174,7 +174,14 @@ def _recv_fd(sock):
     return int(src_rank), int(base_idx), int(fds[0])
 
 
-def export_shareable_handles(retained_handles, group: ProcessGroup, rank: int):
+def export_shareable_handles(
+    retained_handles,
+    group: ProcessGroup,
+    rank: int,
+    *,
+    try_fabric: bool = True,
+    log_fallback: bool = True,
+):
     """Export retained VMM handles, preferring FABRIC and falling back to POSIX fds.
 
     FABRIC is used only if every rank can export it; otherwise all ranks use POSIX
@@ -187,27 +194,29 @@ def export_shareable_handles(retained_handles, group: ProcessGroup, rank: int):
 
     fabric_handles: List[bytes] = []
     fabric_error: Optional[Exception] = None
-    try:
-        for alloc_h in retained_handles:
-            fabric_h = check_drv(
-                drv.cuMemExportToShareableHandle(alloc_h, FABRIC, 0),
-                "cuMemExportToShareableHandle(FABRIC)",
-            )
-            fabric_handles.append(bytes(fabric_h.data))
-        fabric_ok = True
-    except Exception as e:
-        fabric_error = e
-        fabric_ok = False
-        fabric_handles = []
-        logger.info(
-            "FABRIC handle export failed on rank %s; falling back to "
-            "POSIX fd transport: %s",
-            rank,
-            e,
-        )
+    if try_fabric:
+        try:
+            for alloc_h in retained_handles:
+                fabric_h = check_drv(
+                    drv.cuMemExportToShareableHandle(alloc_h, FABRIC, 0),
+                    "cuMemExportToShareableHandle(FABRIC)",
+                )
+                fabric_handles.append(bytes(fabric_h.data))
+            fabric_ok = True
+        except Exception as e:
+            fabric_error = e
+            fabric_ok = False
+            fabric_handles = []
+            if log_fallback:
+                logger.info(
+                    "FABRIC handle export failed on rank %s; falling back to "
+                    "POSIX fd transport: %s",
+                    rank,
+                    e,
+                )
 
-    if all_ranks_ok(group, fabric_ok):
-        return fabric_handles, [], True
+        if all_ranks_ok(group, fabric_ok):
+            return fabric_handles, [], True
 
     posix_fds: List[int] = []
     posix_error: Optional[Exception] = None
@@ -258,10 +267,9 @@ def exchange_posix_fds(
     import threading
 
     sock_kind = getattr(socket, "SOCK_SEQPACKET", socket.SOCK_STREAM)
-    sock_dir = tempfile.mkdtemp(prefix="sgl_ar_fd_")
-    sock_path = os.path.join(sock_dir, f"rank_{rank}.sock")
-    server = socket.socket(socket.AF_UNIX, sock_kind)
-    server.settimeout(_FD_SEND_TIMEOUT_S)
+    sock_dir = None
+    sock_path = None
+    server = None
     received_fds = {}
     errors = []
 
@@ -285,13 +293,38 @@ def exchange_posix_fds(
             errors.append(e)
 
     try:
-        server.bind(sock_path)
-        server.listen(world_size)
+        setup_error = None
+        try:
+            sock_dir = tempfile.mkdtemp(prefix="sgl_ar_fd_")
+            sock_path = os.path.join(sock_dir, f"rank_{rank}.sock")
+            server = socket.socket(socket.AF_UNIX, sock_kind)
+            server.settimeout(_FD_SEND_TIMEOUT_S)
+            server.bind(sock_path)
+            server.listen(world_size)
+        except BaseException as e:
+            setup_error = e
+
+        setup_errors = [None] * world_size
+        dist.all_gather_object(
+            setup_errors,
+            None if setup_error is None else str(setup_error),
+            group=group,
+        )
+        for failed_rank, error in enumerate(setup_errors):
+            if error is not None:
+                message = (
+                    f"POSIX fd exchange setup failed on rank {failed_rank}: {error}"
+                )
+                if failed_rank == rank:
+                    raise RuntimeError(message) from setup_error
+                raise RuntimeError(message)
+
         paths = [None] * world_size
         dist.all_gather_object(paths, sock_path, group=group)
 
         thread = threading.Thread(target=recv_loop, daemon=True)
         thread.start()
+        transfer_error = None
         try:
             for peer_rank, peer_path in enumerate(paths):
                 if peer_rank == rank:
@@ -301,13 +334,15 @@ def exchange_posix_fds(
                     sock.connect(peer_path)
                     for base_idx, fd in enumerate(local_fds):
                         _send_fd(sock, fd, rank, base_idx)
+        except BaseException as e:
+            transfer_error = e
         finally:
             thread.join(_FD_SEND_TIMEOUT_S)
 
-        if thread.is_alive():
-            raise RuntimeError("timed out waiting for POSIX fd exchange")
-        if errors:
-            raise RuntimeError("POSIX fd exchange receive failed") from errors[0]
+        if transfer_error is None and thread.is_alive():
+            transfer_error = RuntimeError("timed out waiting for POSIX fd exchange")
+        if transfer_error is None and errors:
+            transfer_error = RuntimeError("POSIX fd exchange receive failed")
 
         expected = {
             (src_rank, base_idx)
@@ -317,24 +352,47 @@ def exchange_posix_fds(
         }
         missing = expected.difference(received_fds)
         extra = set(received_fds).difference(expected)
-        if missing or extra:
-            for fd in received_fds.values():
-                os.close(fd)
-            raise RuntimeError(
+        if transfer_error is None and (missing or extra):
+            transfer_error = RuntimeError(
                 "POSIX fd exchange mismatch: "
                 f"missing={sorted(missing)[:8]}, extra={sorted(extra)[:8]}"
             )
+
+        transfer_errors = [None] * world_size
+        dist.all_gather_object(
+            transfer_errors,
+            None if transfer_error is None else str(transfer_error),
+            group=group,
+        )
+        for failed_rank, error in enumerate(transfer_errors):
+            if error is None:
+                continue
+            for fd in received_fds.values():
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            received_fds.clear()
+            message = (
+                f"POSIX fd exchange transfer failed on rank {failed_rank}: {error}"
+            )
+            if failed_rank == rank:
+                raise RuntimeError(message) from transfer_error
+            raise RuntimeError(message)
         return received_fds
     finally:
-        server.close()
-        try:
-            os.unlink(sock_path)
-        except FileNotFoundError:
-            pass
-        try:
-            os.rmdir(sock_dir)
-        except OSError:
-            pass
+        if server is not None:
+            server.close()
+        if sock_path is not None:
+            try:
+                os.unlink(sock_path)
+            except FileNotFoundError:
+                pass
+        if sock_dir is not None:
+            try:
+                os.rmdir(sock_dir)
+            except OSError:
+                pass
 
 
 def import_peer_handle(fabric_handle, fd, *, use_fabric: bool, peer_rank: int):

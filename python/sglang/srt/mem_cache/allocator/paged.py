@@ -169,6 +169,31 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         return out_indices
 
+    def alloc_for_page_owners(
+        self, page_owners: torch.Tensor, owner_count: int
+    ) -> torch.Tensor | None:
+        if page_owners.numel() == 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+        if self.need_sort and self.release_pages.numel() > 0:
+            self.merge_and_sort_free()
+
+        owners = page_owners.to(device=self.device, dtype=torch.int64)
+        free_owners = self.free_pages % owner_count
+        selected_pages = torch.empty_like(owners)
+        selected_mask = torch.zeros_like(self.free_pages, dtype=torch.bool)
+        for owner in range(owner_count):
+            request_pos = torch.nonzero(owners == owner, as_tuple=True)[0]
+            free_pos = torch.nonzero(free_owners == owner, as_tuple=True)[0]
+            if request_pos.numel() > free_pos.numel():
+                return None
+            chosen_pos = free_pos[: request_pos.numel()]
+            selected_pages[request_pos] = self.free_pages[chosen_pos]
+            selected_mask[chosen_pos] = True
+
+        self.free_pages = self.free_pages[~selected_mask]
+        offsets = torch.arange(self.page_size, device=self.device)
+        return (selected_pages[:, None] * self.page_size + offsets).reshape(-1)
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import atexit
 import os
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -39,6 +40,133 @@ _FABRIC = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
 _POSIX_FD = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
 _RECOMMENDED = drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
 _ALLOC_BYTES = 2 * 1024 * 1024
+
+
+def _gather_values(values):
+    def gather(output, _value, group):
+        assert group == "group"
+        output[:] = values
+
+    return gather
+
+
+def _assert_fd_exchange_setup_failure(setup_errors, bind_error=None) -> None:
+    server = MagicMock()
+    server.bind.side_effect = bind_error
+    failed_rank = next(i for i, error in enumerate(setup_errors) if error is not None)
+
+    with (
+        patch("socket.socket", return_value=server),
+        patch("tempfile.mkdtemp", return_value="/tmp/sgl_ar_fd_test"),
+        patch(
+            "sglang.srt.distributed.device_communicators.vmm_utils.dist.all_gather_object",
+            side_effect=_gather_values(setup_errors),
+        ) as gather,
+        patch("os.unlink"),
+        patch("os.rmdir"),
+        pytest.raises(
+            RuntimeError,
+            match=(
+                f"POSIX fd exchange setup failed on rank {failed_rank}: "
+                f"{setup_errors[failed_rank]}"
+            ),
+        ),
+    ):
+        exchange_posix_fds("group", 0, 2, [7], [1, 1])
+
+    gather.assert_called_once()
+    server.close.assert_called_once()
+
+
+def test_fd_exchange_reports_local_socket_setup_failure_before_path_gather() -> None:
+    _assert_fd_exchange_setup_failure(
+        ["address already in use", None], OSError("address already in use")
+    )
+
+
+def test_fd_exchange_stops_before_path_gather_on_remote_setup_failure() -> None:
+    _assert_fd_exchange_setup_failure([None, "permission denied"])
+
+
+class _ImmediateThread:
+    def __init__(self, *, target, daemon):
+        self.target = target
+
+    def start(self):
+        self.target()
+
+    def join(self, _timeout):
+        pass
+
+    def is_alive(self):
+        return False
+
+
+def _assert_fd_exchange_transfer_failure(
+    transfer_errors, *, connect_error=None, send_error=None
+) -> None:
+    server = MagicMock()
+    connections = [MagicMock(), MagicMock()]
+    server.accept.side_effect = [(conn, None) for conn in connections]
+    outbound = [MagicMock(), MagicMock()]
+    for sock in outbound:
+        sock.__enter__.return_value = sock
+    if connect_error is not None:
+        outbound[0].connect.side_effect = connect_error
+
+    gather_values = [
+        [None, None, None],
+        ["/tmp/rank_0.sock", "/tmp/rank_1.sock", "/tmp/rank_2.sock"],
+        transfer_errors,
+    ]
+
+    def gather(output, _value, group):
+        assert group == "group"
+        output[:] = gather_values.pop(0)
+
+    with (
+        patch("socket.socket", side_effect=[server, *outbound]),
+        patch("tempfile.mkdtemp", return_value="/tmp/sgl_ar_fd_test"),
+        patch("threading.Thread", _ImmediateThread),
+        patch(
+            "sglang.srt.distributed.device_communicators.vmm_utils._recv_fd",
+            side_effect=[(1, 0, 101), None, (2, 0, 102), None],
+        ),
+        patch(
+            "sglang.srt.distributed.device_communicators.vmm_utils._send_fd",
+            side_effect=send_error,
+        ),
+        patch(
+            "sglang.srt.distributed.device_communicators.vmm_utils.dist.all_gather_object",
+            side_effect=gather,
+        ) as all_gather,
+        patch("os.close") as close,
+        patch("os.unlink"),
+        patch("os.rmdir"),
+        pytest.raises(RuntimeError, match="POSIX fd exchange transfer failed"),
+    ):
+        exchange_posix_fds("group", 0, 3, [7], [1, 1, 1])
+
+    assert all_gather.call_count == 3
+    close.assert_any_call(101)
+    close.assert_any_call(102)
+
+
+def test_fd_exchange_agrees_on_connect_failure() -> None:
+    _assert_fd_exchange_transfer_failure(
+        ["connect failed", None, None],
+        connect_error=ConnectionRefusedError("connect failed"),
+    )
+
+
+def test_fd_exchange_agrees_on_send_failure() -> None:
+    _assert_fd_exchange_transfer_failure(
+        ["send failed", None, None], send_error=RuntimeError("send failed")
+    )
+
+
+def test_fd_exchange_reports_remote_transfer_failure_before_returning() -> None:
+    _assert_fd_exchange_transfer_failure([None, "send failed", None])
 
 
 @cache_once
