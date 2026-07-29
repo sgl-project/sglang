@@ -404,6 +404,9 @@ class PrefillBootstrapQueue:
                 for i, local_poll in zip(uncovered, local_polls):
                     if local_poll == KVPoll.Failed:
                         polls[i] = KVPoll.Failed
+            for i, req in enumerate(self.queue):
+                if isinstance(req.finished_reason, FINISH_ABORT):
+                    polls[i] = KVPoll.Failed
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
                 [req.disagg_kv_sender for req in self.queue],
