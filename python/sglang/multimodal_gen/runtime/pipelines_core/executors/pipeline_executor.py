@@ -152,7 +152,7 @@ class PipelineExecutor(ABC):
                 batches = self.execute_group(stages, batches, server_args)
         return batches
 
-    def execute_group_iter_with_profiling(
+    def execute_group_sequentially_with_profiling(
         self,
         stages: List["PipelineStage"],
         batches: list[Req],
