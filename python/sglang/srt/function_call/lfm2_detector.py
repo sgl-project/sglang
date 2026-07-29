@@ -32,6 +32,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import safe_ast_parse
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +173,7 @@ class Lfm2Detector(BaseFormatDetector):
         tool_indices = self._get_tool_indices(tools)
 
         try:
-            module = ast.parse(content)
+            module = safe_ast_parse(content)
             parsed = getattr(module.body[0], "value", None) if module.body else None
 
             if parsed is None:
