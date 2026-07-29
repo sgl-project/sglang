@@ -1100,6 +1100,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.deepep_adapter.replay()
 
+        if getattr(forward_batch, "_dllm_inner_replay", False):
+            # A synchronous denoising loop keeps its shape, positions, and
+            # attention metadata. Only token IDs change between iterations.
+            assert forward_batch.input_ids.numel() == self.raw_num_token
+            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+            return
+
         if not forward_batch.needs_forward_metadata_init():
             # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
