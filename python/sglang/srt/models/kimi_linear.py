@@ -334,6 +334,8 @@ class KimiDeltaAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.f_b_proj",
+                tp_rank=self.shard_tp_rank,
+                tp_size=self.shard_tp_size,
             )
 
             self.b_proj = ColumnParallelLinear(
@@ -342,6 +344,8 @@ class KimiDeltaAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.b_proj",
+                tp_rank=self.shard_tp_rank,
+                tp_size=self.shard_tp_size,
             )
 
             self.g_a_proj = ReplicatedLinear(
@@ -357,6 +361,8 @@ class KimiDeltaAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.g_b_proj",
+                tp_rank=self.shard_tp_rank,
+                tp_size=self.shard_tp_size,
             )
 
         self.dt_bias = nn.Parameter(
@@ -371,6 +377,8 @@ class KimiDeltaAttention(nn.Module):
             bias=False,
             params_dtype=torch.float32,
             prefix=f"{prefix}.qkv_conv1d",
+            tp_rank=self.shard_tp_rank,
+            tp_size=self.shard_tp_size,
         )
         # unsqueeze to fit conv1d weights shape into the linear weights shape.
         # Can't do this in `weight_loader` since it already exists in
