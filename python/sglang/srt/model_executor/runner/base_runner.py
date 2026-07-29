@@ -221,6 +221,7 @@ class BaseRunner(ABC):
         self._pre_initialize_fi_a2a_workspace()
         self._pre_initialize_dcp_query_vmm_workspace()
         self._pre_initialize_dcp_output_vmm_workspaces()
+        self._pre_initialize_dcp_topk_vmm_workspace()
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
@@ -327,6 +328,24 @@ class BaseRunner(ABC):
             raise AssertionError(
                 "unhandled DCP Query backend " f"{mr.server_args.dcp_query_backend!r}"
             )
+
+    def _pre_initialize_dcp_topk_vmm_workspace(self):
+        """Create the owner-local candidate workspace before graph capture."""
+        mr = self.model_runner
+        if (
+            mr.server_args.dcp_size <= 1
+            or mr.server_args.dcp_indexer_backend != "owner_sharded"
+            or mr.server_args.dcp_topk_backend != "vmm"
+        ):
+            return
+
+        from sglang.srt.configs.model_config import get_dsa_index_topk
+        from sglang.srt.layers.dcp import init_dcp_topk_vmm_workspace
+
+        init_dcp_topk_vmm_workspace(
+            get_parallel().dcp_group,
+            local_candidates=get_dsa_index_topk(mr.model_config.hf_text_config),
+        )
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.

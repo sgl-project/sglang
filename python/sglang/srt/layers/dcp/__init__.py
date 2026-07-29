@@ -63,6 +63,10 @@ from sglang.srt.layers.dcp.shared_query_direct import (
     get_dcp_query_direct_vmm_workspace,
     init_dcp_query_direct_vmm_workspace,
 )
+from sglang.srt.layers.dcp.shared_topk_vmm import (
+    DCP_TOPK_VMM_MAX_ROWS,
+    init_dcp_topk_vmm_workspace,
+)
 
 # NOTE: planner.py is intentionally NOT imported here. It depends on server_args
 # (get_server_args), whereas this package-init executes at module-load time
@@ -75,6 +79,7 @@ from sglang.srt.layers.dcp.shared_query_direct import (
 __all__ = [
     "DCP_OUTPUT_VMM_MAX_ROWS",
     "DCP_QUERY_DIRECT_VMM_MAX_ROWS",
+    "DCP_TOPK_VMM_MAX_ROWS",
     "DecodeContextParallelMetadata",
     "all_gather_kv_cache_for_dcp",
     "all_gather_kv_cache_for_mha_chunk_extend",
@@ -95,6 +100,7 @@ __all__ = [
     "get_dcp_lens",
     "init_dcp_output_vmm_workspaces",
     "init_dcp_query_direct_vmm_workspace",
+    "init_dcp_topk_vmm_workspace",
     "init_fi_a2a_workspace",
     "update_local_kv_lens_for_dcp",
 ]

@@ -418,10 +418,29 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             if kv_cache.shape[0] == 0:
                 continue
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
+        if self.index_dcp_owner_sharded:
+            if not torch.equal(
+                src_loc_flat % self.index_dcp_size,
+                tgt_loc_flat % self.index_dcp_size,
+            ):
+                raise RuntimeError(
+                    "owner-sharded DCP Indexer move changed token ownership"
+                )
+            owned = tgt_loc_flat % self.index_dcp_size == self.index_dcp_rank
+            index_tgt_loc = tgt_loc_flat[owned] // self.index_dcp_size
+            index_src_loc = src_loc_flat[owned] // self.index_dcp_size
+        else:
+            index_tgt_loc = tgt_loc_flat
+            index_src_loc = src_loc_flat
         for index_k in self.index_k_with_scale_buffer:
             if index_k.shape[0] == 0:
                 continue
-            index_k[tgt_loc_flat] = index_k[src_loc_flat]
+            index_buf_accessor.MoveKAndS.execute(
+                self,
+                index_k,
+                index_tgt_loc,
+                index_src_loc,
+            )
 
     # ---- DSA indexer buffer: owned-only writes, owner-broadcast reads -----
 

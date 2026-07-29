@@ -1074,6 +1074,30 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "allgather"
+    dcp_indexer_backend: A[
+        str,
+        Arg(
+            help="DSA Indexer ownership policy under decode context "
+            "parallelism: 'replicated' keeps a full Indexer K cache and full "
+            "logit scan on every rank; 'owner_sharded' stores and scores only "
+            "the rank-owned token shard, then merges local Top-K candidates.",
+            choices=["replicated", "owner_sharded"],
+            resolvable=True,
+        ),
+        NS("parallel"),
+    ] = "replicated"
+    dcp_topk_backend: A[
+        str,
+        Arg(
+            help="Candidate exchange for owner-sharded DCP Indexer Top-K: "
+            "'allgather' explicitly gathers packed local candidates; 'vmm' "
+            "lets the stable Top-K consumer read rank-major owner mappings "
+            "directly.",
+            choices=["allgather", "vmm"],
+            resolvable=True,
+        ),
+        NS("parallel"),
+    ] = "allgather"
     dcp_replicate_q_proj: A[
         Optional[bool],
         Arg(
@@ -3756,6 +3780,25 @@ class ServerArgs:
                 "--dcp-size / --decode-context-parallel-size > 1, but got "
                 f"dcp_size={self.dcp_size}."
             )
+        if self.dcp_indexer_backend != "replicated" and self.dcp_size <= 1:
+            raise ValueError(
+                f"--dcp-indexer-backend {self.dcp_indexer_backend} requires "
+                "--dcp-size / --decode-context-parallel-size > 1, but got "
+                f"dcp_size={self.dcp_size}."
+            )
+        if self.dcp_topk_backend != "allgather" and self.dcp_size <= 1:
+            raise ValueError(
+                f"--dcp-topk-backend {self.dcp_topk_backend} requires "
+                "--dcp-size / --decode-context-parallel-size > 1, but got "
+                f"dcp_size={self.dcp_size}."
+            )
+        if (
+            self.dcp_topk_backend == "vmm"
+            and self.dcp_indexer_backend != "owner_sharded"
+        ):
+            raise ValueError(
+                "--dcp-topk-backend vmm requires " "--dcp-indexer-backend owner_sharded"
+            )
         if self.dcp_comm_backend == "fi_a2a" and not is_cuda():
             raise ValueError(
                 "--dcp-comm-backend fi_a2a delegates the exchange to FlashInfer's "
@@ -3790,6 +3833,38 @@ class ServerArgs:
                 raise ValueError(
                     f"--dcp-query-backend {self.dcp_query_backend} currently "
                     "supports only the DeepSeek-V3.2/GLM-5.x DSA MLA path."
+                )
+        if self.dcp_indexer_backend != "replicated":
+            if not is_cuda():
+                raise ValueError("--dcp-indexer-backend owner_sharded requires CUDA")
+            from sglang.srt.configs.model_config import is_deepseek_dsa
+
+            if not is_deepseek_dsa(self.get_model_config().hf_config):
+                raise ValueError(
+                    "--dcp-indexer-backend owner_sharded currently supports "
+                    "only the DeepSeek-V3.2/GLM-5.x DSA path."
+                )
+        if self.dcp_topk_backend == "vmm" and not is_cuda():
+            raise ValueError(
+                "--dcp-topk-backend vmm requires a same-host NVIDIA CUDA DCP "
+                "group with peer access and native peer atomics."
+            )
+        if self.dcp_topk_backend == "vmm":
+            hf_config = self.get_model_config().hf_config
+            index_topk = (
+                hf_config.get("index_topk")
+                if isinstance(hf_config, dict)
+                else getattr(hf_config, "index_topk", None)
+            )
+            if index_topk not in (512, 1024, 2048):
+                raise ValueError(
+                    "--dcp-topk-backend vmm currently requires model "
+                    f"index_topk in (512, 1024, 2048), got {index_topk}"
+                )
+            if (self.dcp_size * index_topk) % 512:
+                raise ValueError(
+                    "--dcp-topk-backend vmm requires dcp_size * index_topk "
+                    "to be divisible by 512"
                 )
         if self.dcp_replicate_q_proj:
             if self.dcp_size <= 1:

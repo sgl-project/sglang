@@ -60,6 +60,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     pad_dsa_cache_seqlens,
     should_use_dsa_fused_topk,
 )
+from sglang.srt.layers.dcp.layout import (
+    build_dcp_indexer_local_page_table,
+    get_dcp_lens,
+)
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
@@ -230,6 +234,16 @@ class DSAMetadata:
     indexer_seq_lens: Optional[torch.Tensor] = None
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
+    # Owner-sharded DCP Indexer metadata. These remain None for the replicated
+    # baseline and are precomputed once per forward for reuse across layers.
+    dcp_indexer_local_seqlens_int32: Optional[torch.Tensor] = None
+    dcp_indexer_local_seqlens_expanded: Optional[torch.Tensor] = None
+    dcp_indexer_local_page_table: Optional[torch.Tensor] = None
+    dcp_indexer_local_schedule_metadata: Optional[torch.Tensor] = None
+    dcp_indexer_local_ctx_lens_2d: Optional[torch.Tensor] = None
+    dcp_indexer_local_k_start_end: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    dcp_indexer_local_seq_lens: Optional[torch.Tensor] = None
+    dcp_indexer_local_seq_lens_cpu: Optional[torch.Tensor] = None
 
 
 @torch.compile
@@ -291,6 +305,53 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
     def get_token_to_batch_idx(self) -> torch.Tensor:
         return self.attn_metadata.token_to_batch_idx
+
+    def is_dcp_owner_sharded(self) -> bool:
+        return self.attn_metadata.dcp_indexer_local_seqlens_int32 is not None
+
+    def get_dcp_local_seqlens_int32(self) -> torch.Tensor:
+        assert self.attn_metadata.dcp_indexer_local_seqlens_int32 is not None
+        return self.attn_metadata.dcp_indexer_local_seqlens_int32
+
+    def get_dcp_local_seqlens_expanded(self) -> torch.Tensor:
+        assert self.attn_metadata.dcp_indexer_local_seqlens_expanded is not None
+        return self.attn_metadata.dcp_indexer_local_seqlens_expanded
+
+    def get_dcp_local_page_table(self) -> torch.Tensor:
+        assert self.attn_metadata.dcp_indexer_local_page_table is not None
+        return self.attn_metadata.dcp_indexer_local_page_table
+
+    def get_dcp_local_schedule_metadata(self) -> Optional[torch.Tensor]:
+        return self.attn_metadata.dcp_indexer_local_schedule_metadata
+
+    def get_dcp_local_ctx_lens_2d(self) -> Optional[torch.Tensor]:
+        return self.attn_metadata.dcp_indexer_local_ctx_lens_2d
+
+    def get_dcp_local_kvcache_range(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert self.attn_metadata.dcp_indexer_local_k_start_end is not None
+        return self.attn_metadata.dcp_indexer_local_k_start_end
+
+    def get_dcp_local_indexer_seq_len(self) -> torch.Tensor:
+        assert self.attn_metadata.dcp_indexer_local_seq_lens is not None
+        return self.attn_metadata.dcp_indexer_local_seq_lens
+
+    def get_dcp_local_indexer_seq_len_cpu(self) -> torch.Tensor:
+        assert self.attn_metadata.dcp_indexer_local_seq_lens_cpu is not None
+        return self.attn_metadata.dcp_indexer_local_seq_lens_cpu
+
+    def select_topk(
+        self,
+        logits: torch.Tensor,
+        lengths: torch.Tensor,
+        topk: int,
+        row_starts: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.topk_backend.topk_func(
+            logits,
+            lengths,
+            topk,
+            row_starts=row_starts,
+        )
 
     def topk_transform(
         self,
@@ -765,6 +826,114 @@ class DeepseekSparseAttnBackend(
         else:
             metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
 
+    def _owner_sharded_indexer_enabled(self) -> bool:
+        return (
+            self.dcp_enabled
+            and get_server_args().dcp_indexer_backend == "owner_sharded"
+        )
+
+    def _build_owner_sharded_indexer_metadata(
+        self,
+        *,
+        page_table_1: Optional[torch.Tensor],
+        cache_seqlens_int32: torch.Tensor,
+        seqlens_expanded: torch.Tensor,
+        paged_mqa_ctx_lens_2d: Optional[torch.Tensor],
+        indexer_seq_lens: Optional[torch.Tensor] = None,
+        indexer_seq_lens_cpu: Optional[torch.Tensor] = None,
+        token_to_batch_idx: Optional[torch.Tensor] = None,
+    ) -> dict:
+        if not self._owner_sharded_indexer_enabled():
+            return {}
+        if page_table_1 is None:
+            raise RuntimeError(
+                "owner-sharded DCP Indexer requires the page_size=1 table"
+            )
+
+        local_seqlens = get_dcp_lens(
+            cache_seqlens_int32, self.dcp_size, self.dcp_rank
+        ).to(torch.int32)
+        local_expanded = get_dcp_lens(
+            seqlens_expanded, self.dcp_size, self.dcp_rank
+        ).to(torch.int32)
+
+        # The DCP allocator uses logical pages of page_size * dcp_size.
+        # Sampling this rank's first token in every logical page and dividing
+        # by that width gives page ids in the owner-local Indexer cache.
+        local_page_table = build_dcp_indexer_local_page_table(
+            page_table_1,
+            self.real_page_size,
+            self.dcp_size,
+            self.dcp_rank,
+        )
+
+        local_ctx_lens_2d = None
+        local_schedule = None
+        if paged_mqa_ctx_lens_2d is not None:
+            local_ctx_lens_2d = get_dcp_lens(
+                paged_mqa_ctx_lens_2d, self.dcp_size, self.dcp_rank
+            ).to(torch.int32)
+            local_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                local_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+            )
+
+        local_indexer_seq_lens = None
+        local_indexer_seq_lens_cpu = None
+        local_k_start_end = None
+        if indexer_seq_lens is not None:
+            local_indexer_seq_lens = get_dcp_lens(
+                indexer_seq_lens, self.dcp_size, self.dcp_rank
+            ).to(torch.int32)
+        if indexer_seq_lens_cpu is not None:
+            local_indexer_seq_lens_cpu = get_dcp_lens(
+                indexer_seq_lens_cpu, self.dcp_size, self.dcp_rank
+            )
+        if local_indexer_seq_lens is not None and token_to_batch_idx is not None:
+            local_starts = torch.zeros(
+                local_indexer_seq_lens.shape[0] + 1,
+                dtype=torch.int32,
+                device=local_indexer_seq_lens.device,
+            )
+            local_starts[1:] = torch.cumsum(local_indexer_seq_lens, dim=0)
+            local_ks = local_starts[token_to_batch_idx]
+            local_k_start_end = (local_ks, local_ks + local_expanded)
+
+        return {
+            "dcp_indexer_local_seqlens_int32": local_seqlens,
+            "dcp_indexer_local_seqlens_expanded": local_expanded,
+            "dcp_indexer_local_page_table": local_page_table,
+            "dcp_indexer_local_schedule_metadata": local_schedule,
+            "dcp_indexer_local_ctx_lens_2d": local_ctx_lens_2d,
+            "dcp_indexer_local_k_start_end": local_k_start_end,
+            "dcp_indexer_local_seq_lens": local_indexer_seq_lens,
+            "dcp_indexer_local_seq_lens_cpu": local_indexer_seq_lens_cpu,
+        }
+
+    def _refresh_owner_sharded_indexer_metadata(
+        self,
+        metadata: DSAMetadata,
+        paged_mqa_ctx_lens_2d: Optional[torch.Tensor],
+    ) -> None:
+        if not self._owner_sharded_indexer_enabled():
+            return
+        refreshed = self._build_owner_sharded_indexer_metadata(
+            page_table_1=metadata.page_table_1,
+            cache_seqlens_int32=metadata.cache_seqlens_int32,
+            seqlens_expanded=metadata.dsa_seqlens_expanded,
+            paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+        )
+        for name, value in refreshed.items():
+            if value is None:
+                continue
+            current = getattr(metadata, name)
+            if current is None:
+                object.__setattr__(metadata, name, value)
+            elif isinstance(value, tuple):
+                for current_tensor, new_tensor in zip(current, value, strict=True):
+                    current_tensor.copy_(new_tensor)
+            else:
+                current.copy_(value)
+
     def _build_topk_v2_plan(
         self, seqlens_expanded: torch.Tensor
     ) -> Optional[torch.Tensor]:
@@ -1118,6 +1287,15 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        owner_sharded_indexer_metadata = self._build_owner_sharded_indexer_metadata(
+            page_table_1=page_table,
+            cache_seqlens_int32=cache_seqlens_int32,
+            seqlens_expanded=seqlens_expanded,
+            paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+            indexer_seq_lens=indexer_seq_lens,
+            indexer_seq_lens_cpu=indexer_seq_lens_cpu,
+            token_to_batch_idx=token_to_batch_idx,
+        )
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1151,6 +1329,7 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+            **owner_sharded_indexer_metadata,
         )
         self.forward_metadata = metadata
 
@@ -1456,6 +1635,12 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        owner_sharded_indexer_metadata = self._build_owner_sharded_indexer_metadata(
+            page_table_1=page_table_1,
+            cache_seqlens_int32=cache_seqlens_int32,
+            seqlens_expanded=seqlens_expanded,
+            paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+        )
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1474,6 +1659,7 @@ class DeepseekSparseAttnBackend(
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+            **owner_sharded_indexer_metadata,
         )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
@@ -1741,6 +1927,7 @@ class DeepseekSparseAttnBackend(
                     bs,
                 )
             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
+            self._refresh_owner_sharded_indexer_metadata(metadata, seqlens_32_2d)
             self._refresh_topk_v2_plan(metadata)
             # `copy_` preserves the buffer's data_ptr that the captured graph captured.
             if not target_verify_ctx_lens_written:
@@ -3385,14 +3572,23 @@ class DeepseekSparseAttnBackend(
             # carries the DCP owner filter itself.
             or (self.dcp_enabled and not forward_batch.forward_mode.is_decode_or_idle())
         )
+        owner_sharded = self._owner_sharded_indexer_enabled()
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(
                 forward_batch.forward_mode
             ),
             topk_backend=self.dsa_topk_backend,
-            paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
-            paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
+            paged_mqa_schedule_metadata=(
+                self.forward_metadata.dcp_indexer_local_schedule_metadata
+                if owner_sharded
+                else self.forward_metadata.paged_mqa_schedule_metadata
+            ),
+            paged_mqa_ctx_lens_2d=(
+                self.forward_metadata.dcp_indexer_local_ctx_lens_2d
+                if owner_sharded
+                else self.forward_metadata.paged_mqa_ctx_lens_2d
+            ),
             force_unfused_topk=force_unfused,
         )
 

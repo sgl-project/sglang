@@ -335,6 +335,16 @@ class BaseIndexerMetadata(ABC):
                 Don't assume it is the topk indices of the input logits.
         """
 
+    def select_topk(
+        self,
+        logits: torch.Tensor,
+        lengths: torch.Tensor,
+        topk: int,
+        row_starts: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Select logical indices without an attention-backend transform."""
+        raise NotImplementedError
+
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
@@ -396,6 +406,13 @@ class Indexer(MultiPlatformOp):
             and not is_neox_style
         )
         self.alt_stream = alt_stream
+        parallel = get_parallel()
+        self.dcp_owner_sharded = (
+            parallel.dcp_enabled
+            and get_server_args().dcp_indexer_backend == "owner_sharded"
+        )
+        self.dcp_size = parallel.attn_dcp_size if self.dcp_owner_sharded else 1
+        self.dcp_rank = parallel.attn_dcp_rank if self.dcp_owner_sharded else 0
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
@@ -690,7 +707,8 @@ class Indexer(MultiPlatformOp):
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
             return
         if (
-            not _is_fp8_fnuz
+            not self.dcp_owner_sharded
+            and not _is_fp8_fnuz
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
@@ -872,6 +890,77 @@ class Indexer(MultiPlatformOp):
             logits.scatter_(dim=1, index=local_idxs, value=float("inf"))
         return logits
 
+    def _select_and_merge_owner_topk(
+        self,
+        logits: torch.Tensor,
+        local_lengths: torch.Tensor,
+        global_lengths: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        *,
+        row_starts: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.dcp.shared_topk import (
+            mask_owner_mandatory_tokens,
+            merge_owner_topk_allgather,
+        )
+
+        mask_owner_mandatory_tokens(
+            logits,
+            global_lengths,
+            dcp_rank=self.dcp_rank,
+            dcp_size=self.dcp_size,
+            num_init_tokens=self.num_init_tokens,
+            num_local_tokens=self.num_local_tokens,
+            row_starts=row_starts,
+        )
+        local_topk = metadata.select_topk(
+            logits,
+            local_lengths,
+            self.index_topk,
+            row_starts=row_starts,
+        )
+        backend = get_server_args().dcp_topk_backend
+        if backend == "allgather":
+            return merge_owner_topk_allgather(
+                logits,
+                local_topk,
+                self.index_topk,
+                dcp_rank=self.dcp_rank,
+                dcp_size=self.dcp_size,
+                row_starts=row_starts,
+            )
+        if backend == "vmm":
+            # The direct peer selector targets bounded decode-shaped rows.
+            # Prefill/chunked ragged rows deliberately retain the explicit
+            # candidate exchange as the transport control.
+            from sglang.srt.layers.dcp.shared_topk_vmm import (
+                DCP_TOPK_VMM_MAX_ROWS,
+                merge_owner_topk_vmm,
+            )
+
+            if row_starts is None and local_topk.shape[0] <= DCP_TOPK_VMM_MAX_ROWS:
+                # The intervening layer's publish barrier proves that every
+                # rank has finished reading the prior slot. Alternating two
+                # slots therefore removes the per-layer reuse wait and ack.
+                return merge_owner_topk_vmm(
+                    logits,
+                    local_topk,
+                    self.index_topk,
+                    dcp_rank=self.dcp_rank,
+                    dcp_size=self.dcp_size,
+                    workspace_slot=self.layer_id % 2,
+                    pipelined=True,
+                )
+            return merge_owner_topk_allgather(
+                logits,
+                local_topk,
+                self.index_topk,
+                dcp_rank=self.dcp_rank,
+                dcp_size=self.dcp_size,
+                row_starts=row_starts,
+            )
+        raise RuntimeError(f"Unsupported DCP Top-K backend: {backend}")
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -897,7 +986,10 @@ class Indexer(MultiPlatformOp):
         else:
             assert page_size == 64, "only support page size 64"
         # NOTE(dark): this support extend/decode/decode+graph
-        if _is_hip and not _use_aiter_preshuffle:
+        owner_sharded = metadata.is_dcp_owner_sharded()
+        if owner_sharded:
+            block_tables = metadata.get_dcp_local_page_table()
+        elif _is_hip and not _use_aiter_preshuffle:
             block_tables = metadata.get_page_table_1()
         else:
             block_tables = metadata.get_page_table_64()
@@ -910,9 +1002,19 @@ class Indexer(MultiPlatformOp):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            seqlens_32 = metadata.get_seqlens_expanded()
+            global_seqlens_32 = metadata.get_seqlens_expanded()
+            seqlens_32 = (
+                metadata.get_dcp_local_seqlens_expanded()
+                if owner_sharded
+                else global_seqlens_32
+            )
         else:
-            seqlens_32 = metadata.get_seqlens_int32()
+            global_seqlens_32 = metadata.get_seqlens_int32()
+            seqlens_32 = (
+                metadata.get_dcp_local_seqlens_int32()
+                if owner_sharded
+                else global_seqlens_32
+            )
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
@@ -990,7 +1092,11 @@ class Indexer(MultiPlatformOp):
                 q_fp8,
                 kv_cache_fp8,
                 weights,
-                metadata.get_seqlens_int32(),
+                (
+                    metadata.get_dcp_local_seqlens_int32()
+                    if owner_sharded
+                    else metadata.get_seqlens_int32()
+                ),
                 block_tables,
                 schedule_metadata,
                 max_seq_len,
@@ -1032,8 +1138,16 @@ class Indexer(MultiPlatformOp):
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        self._mask_init_and_local_tokens(logits, seqlens_32)
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        if owner_sharded:
+            topk_result = self._select_and_merge_owner_topk(
+                logits,
+                seqlens_32,
+                global_seqlens_32,
+                metadata,
+            )
+        else:
+            self._mask_init_and_local_tokens(logits, seqlens_32)
+            topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
@@ -1134,7 +1248,10 @@ class Indexer(MultiPlatformOp):
         )
         weights = weights.squeeze(-1)
 
-        if _is_hip and not _use_aiter_preshuffle:
+        owner_sharded = metadata.is_dcp_owner_sharded()
+        if owner_sharded:
+            block_tables = metadata.get_dcp_local_page_table()
+        elif _is_hip and not _use_aiter_preshuffle:
             block_tables = metadata.get_page_table_1()
         else:
             block_tables = metadata.get_page_table_64()
@@ -1157,14 +1274,25 @@ class Indexer(MultiPlatformOp):
         if batch_size == 0:
             return topk_result
 
-        ks, ke = metadata.get_indexer_kvcache_range()
+        if owner_sharded:
+            ks, ke = metadata.get_dcp_local_kvcache_range()
+        else:
+            ks, ke = metadata.get_indexer_kvcache_range()
 
-        indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+        indexer_seq_lens_cpu = (
+            metadata.get_dcp_local_indexer_seq_len_cpu()
+            if owner_sharded
+            else metadata.get_indexer_seq_len_cpu()
+        )
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
         k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
             layer_id,
-            metadata.get_indexer_seq_len(),
+            (
+                metadata.get_dcp_local_indexer_seq_len()
+                if owner_sharded
+                else metadata.get_indexer_seq_len()
+            ),
             block_tables,
             seq_len_sum,
             max_seq_len,
@@ -1178,7 +1306,12 @@ class Indexer(MultiPlatformOp):
         kv_fp8 = (k_fp8, k_scale)
 
         # Check if we need to chunk to avoid OOM
-        seq_lens_expanded = metadata.get_seqlens_expanded()
+        global_seq_lens_expanded = metadata.get_seqlens_expanded()
+        seq_lens_expanded = (
+            metadata.get_dcp_local_seqlens_expanded()
+            if owner_sharded
+            else global_seq_lens_expanded
+        )
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
@@ -1221,8 +1354,19 @@ class Indexer(MultiPlatformOp):
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
-            self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
-            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+            if owner_sharded:
+                raw_topk_result = self._select_and_merge_owner_topk(
+                    logits,
+                    seq_lens_expanded,
+                    global_seq_lens_expanded,
+                    metadata,
+                    row_starts=ks,
+                )
+            else:
+                self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
+                raw_topk_result = metadata.topk_transform(
+                    logits, self.index_topk, ks=ks
+                )
             topk_result[:q_offset] = raw_topk_result
             return topk_result
 
@@ -1276,6 +1420,18 @@ class Indexer(MultiPlatformOp):
                     )
 
             lengths_chunk = seq_lens_expanded[start:end]
+            if owner_sharded:
+                raw_topk_chunk = self._select_and_merge_owner_topk(
+                    logits_chunk,
+                    lengths_chunk,
+                    global_seq_lens_expanded[start:end],
+                    metadata,
+                    row_starts=ks[start:end],
+                )
+                topk_result[start:end] = raw_topk_chunk
+                start = end
+                continue
+
             self._mask_init_and_local_tokens(logits_chunk, lengths_chunk, ks[start:end])
 
             # RAGGED: use global offset; PAGED: construct local cu_seqlens_q per chunk
@@ -1658,6 +1814,7 @@ class Indexer(MultiPlatformOp):
 
         if (
             _is_cuda
+            and not self.dcp_owner_sharded
             and (not _is_fp8_fnuz)
             and can_use_dsa_fused_store(
                 key.dtype,

@@ -45,6 +45,14 @@ class TestDCPFieldDefaults(CustomTestCase):
         fields = {f.name for f in dataclasses.fields(ServerArgs)}
         self.assertIn("dcp_query_backend", fields)
 
+    def test_dcp_indexer_backend_field_exists(self):
+        fields = {f.name for f in dataclasses.fields(ServerArgs)}
+        self.assertIn("dcp_indexer_backend", fields)
+
+    def test_dcp_topk_backend_field_exists(self):
+        fields = {f.name for f in dataclasses.fields(ServerArgs)}
+        self.assertIn("dcp_topk_backend", fields)
+
     def test_dcp_size_default(self):
         self.assertEqual(ServerArgs.dcp_size, 1)
 
@@ -53,6 +61,12 @@ class TestDCPFieldDefaults(CustomTestCase):
 
     def test_dcp_query_backend_default(self):
         self.assertEqual(ServerArgs.dcp_query_backend, "allgather")
+
+    def test_dcp_indexer_backend_default(self):
+        self.assertEqual(ServerArgs.dcp_indexer_backend, "replicated")
+
+    def test_dcp_topk_backend_default(self):
+        self.assertEqual(ServerArgs.dcp_topk_backend, "allgather")
 
 
 class TestDCPCommBackendValidation(CustomTestCase):
@@ -85,6 +99,18 @@ class TestDCPCommBackendValidation(CustomTestCase):
     def test_query_direct_requires_dcp_size_gt_1(self):
         args = self._make_args(dcp_size=1, dcp_comm_backend="ag_rs")
         args.dcp_query_backend = "vmm_direct"
+        with self.assertRaises(ValueError):
+            args._handle_dcp_validation()
+
+    def test_owner_sharded_indexer_requires_dcp_size_gt_1(self):
+        args = self._make_args(dcp_size=1, dcp_comm_backend="ag_rs")
+        args.dcp_indexer_backend = "owner_sharded"
+        with self.assertRaises(ValueError):
+            args._handle_dcp_validation()
+
+    def test_topk_vmm_requires_owner_sharded_indexer(self):
+        args = self._make_args(dcp_size=4, dcp_comm_backend="ag_rs")
+        args.dcp_topk_backend = "vmm"
         with self.assertRaises(ValueError):
             args._handle_dcp_validation()
 
@@ -170,6 +196,41 @@ class TestDCPCommBackendValidation(CustomTestCase):
         with patch.object(args, "get_model_config", return_value=model_config):
             args._handle_dcp_validation()
         self.assertEqual(args.dcp_query_backend, "vmm_direct")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_owner_sharded_indexer_with_topk_vmm_passes(self, *_):
+        args = self._make_args(dcp_size=4, dcp_comm_backend="ag_rs")
+        args.dcp_indexer_backend = "owner_sharded"
+        args.dcp_topk_backend = "vmm"
+        model_config = SimpleNamespace(
+            hf_config={
+                "architectures": ["GlmMoeDsaForCausalLM"],
+                "index_topk": 2048,
+            }
+        )
+        with patch.object(args, "get_model_config", return_value=model_config):
+            args._handle_dcp_validation()
+        self.assertEqual(args.dcp_indexer_backend, "owner_sharded")
+        self.assertEqual(args.dcp_topk_backend, "vmm")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_topk_vmm_rejects_unsupported_index_topk(self, *_):
+        args = self._make_args(dcp_size=4, dcp_comm_backend="ag_rs")
+        args.dcp_indexer_backend = "owner_sharded"
+        args.dcp_topk_backend = "vmm"
+        model_config = SimpleNamespace(
+            hf_config={
+                "architectures": ["GlmMoeDsaForCausalLM"],
+                "index_topk": 256,
+            }
+        )
+        with (
+            patch.object(args, "get_model_config", return_value=model_config),
+            self.assertRaises(ValueError),
+        ):
+            args._handle_dcp_validation()
 
     def test_query_direct_conflicts_with_replicated_q_projection(self, *_):
         args = self._make_args(dcp_size=4, dcp_comm_backend="a2a")
