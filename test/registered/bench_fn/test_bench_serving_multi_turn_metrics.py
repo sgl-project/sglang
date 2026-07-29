@@ -4,9 +4,7 @@ fallback, multi-turn input accounting, and the cache-report denominator."""
 
 import asyncio
 import json
-import socket
 import threading
-import time
 import unittest
 from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -27,12 +25,6 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 class _SSEHandler(BaseHTTPRequestHandler):
     """Streams a fixed sequence of OpenAI-compatible SSE chunks per test."""
 
@@ -49,7 +41,6 @@ class _SSEHandler(BaseHTTPRequestHandler):
         for chunk in self.chunks:
             self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
             self.wfile.flush()
-            time.sleep(0.01)
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
@@ -147,10 +138,10 @@ class TestMultiTurnWrapperPromptLens(CustomTestCase):
 class TestChatUsagePromptTokens(CustomTestCase):
     """usage.prompt_tokens parsing on the OpenAI chat path."""
 
-    def _run_against(self, handler_cls):
+    def _run_against(self, handler_cls, extra_request_body=None):
         """Serve one chat request against ``handler_cls`` and return the output."""
-        port = _free_port()
-        server = HTTPServer(("127.0.0.1", port), handler_cls)
+        server = HTTPServer(("127.0.0.1", 0), handler_cls)
+        port = server.server_address[1]
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             req = _make_request_input(
@@ -158,12 +149,14 @@ class TestChatUsagePromptTokens(CustomTestCase):
                 prompt_len=9,
                 api_url=f"http://127.0.0.1:{port}/v1/chat/completions",
             )
+            if extra_request_body is not None:
+                req.extra_request_body = extra_request_body
             return asyncio.run(async_request_openai_chat_completions(req))
         finally:
             server.shutdown()
             server.server_close()
 
-    def _run_stream(self, chunks):
+    def _run_stream(self, chunks, extra_request_body=None):
         set_global_args(
             Namespace(
                 disable_stream=False,
@@ -179,7 +172,7 @@ class TestChatUsagePromptTokens(CustomTestCase):
 
         Handler.chunks = list(chunks)
         Handler.request_bodies = []
-        return self._run_against(Handler), Handler
+        return self._run_against(Handler, extra_request_body), Handler
 
     def _run_non_stream(self, response_body):
         set_global_args(
@@ -213,6 +206,17 @@ class TestChatUsagePromptTokens(CustomTestCase):
         self.assertEqual(
             handler.request_bodies[0]["stream_options"], {"include_usage": True}
         )
+
+    def test_stream_options_null_suppresses_key(self):
+        # Escape hatch for servers that reject stream_options:
+        # --extra-request-body '{"stream_options": null}' must drop the key.
+        out, handler = self._run_stream(
+            [{"choices": [{"index": 0, "delta": {"content": "hi"}}]}],
+            extra_request_body={"stream_options": None},
+        )
+
+        self.assertTrue(out.success, msg=f"request failed: {out.error}")
+        self.assertNotIn("stream_options", handler.request_bodies[0])
 
     def test_streaming_without_usage_falls_back_to_client_len(self):
         out, _ = self._run_stream(

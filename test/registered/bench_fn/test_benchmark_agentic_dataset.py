@@ -4,6 +4,7 @@ tokenizer, and prebuilt mode uses the checked-in fixture."""
 
 import argparse
 import json
+import shutil
 import tempfile
 import unittest
 from argparse import Namespace
@@ -119,7 +120,6 @@ BUILD_KW = dict(
     pad_split="train",
     pad_text_field="output",
     max_real_first_turn_frac=0.5,
-    output_len=20,
     seed=42,
 )
 
@@ -202,7 +202,7 @@ class TestRegistration(CustomTestCase):
             agentic_pad_split="train",
             agentic_pad_text_field="output",
             agentic_max_real_first_turn_frac=0.25,
-            agentic_offset=2,
+            dataset_offset=2,
             agentic_output_len=64,
             agentic_cache_path="/tmp/x.json",
             agentic_rebuild=True,
@@ -223,7 +223,7 @@ class TestRegistration(CustomTestCase):
         with self.assertRaises(SystemExit):
             _validate_parsed_agentic_args(
                 parser,
-                Namespace(dataset_name="agentic", backend="sglang", agentic_offset=0),
+                Namespace(dataset_name="agentic", backend="sglang", dataset_offset=0),
             )
         # Other datasets are not affected by the agentic validator.
         _validate_parsed_agentic_args(
@@ -382,8 +382,32 @@ class TestBuilderShapes(CustomTestCase):
         # (the transformers >= 5 default for tokenize=True).
         self.assertGreater(expected_t1, 60)
         self.assertEqual(conv[0]["prompt_tokens"], expected_t1)
+        # Later turns carry no prompt_tokens: per-round lengths are always
+        # recomputed at load time from the requested output length.
         for k in range(1, 4):
-            self.assertEqual(conv[k]["prompt_tokens"], expected_t1 + k * (16 + 20))
+            self.assertNotIn("prompt_tokens", conv[k])
+
+    def test_invalid_shape_flags_rejected(self):
+        for overrides in (
+            {"agentic_num_turns": 0},
+            {"agentic_subsequent_turn_len": 0},
+            {"agentic_max_real_first_turn_frac": 1.5},
+        ):
+            args = Namespace(
+                backend="sglang-oai-chat",
+                dataset_offset=0,
+                agentic_pad_source="random",
+                agentic_first_turn_len=64,
+                agentic_subsequent_turn_len=16,
+                agentic_num_turns=4,
+                agentic_output_len=20,
+                agentic_num_conversations=0,
+                agentic_max_real_first_turn_frac=0.5,
+            )
+            vars(args).update(overrides)
+            flag = next(iter(overrides)).replace("_", "-")
+            with self.assertRaisesRegex(ValueError, flag):
+                AgenticDataset.from_args(args)
 
 
 class TestExactSizing(CustomTestCase):
@@ -433,7 +457,9 @@ class TestExactSizing(CustomTestCase):
 class TestCaching(CustomTestCase):
     def setUp(self):
         self.tok = CharTokenizer()
-        self.cache_file = Path(tempfile.mkdtemp()) / "agentic-cache.json"
+        tmp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
+        self.cache_file = tmp_dir / "agentic-cache.json"
         self.streams = FakeStreams()
         patcher = patch.object(agentic_mod, "_stream_hf_rows", self.streams)
         patcher.start()
@@ -532,15 +558,18 @@ class TestPrebuilt(CustomTestCase):
             self._dataset(offset=2, num_prompts=2).load(self.tok)
 
     def test_invalid_files_rejected(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-            f.write("{corrupt")
-        with self.assertRaises(json.JSONDecodeError):
-            self._dataset(dataset_path=f.name).load(self.tok)
+        tmp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp_dir, ignore_errors=True)
 
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-            json.dump({"something": "else"}, f)
+        corrupt = tmp_dir / "corrupt.json"
+        corrupt.write_text("{corrupt")
+        with self.assertRaises(json.JSONDecodeError):
+            self._dataset(dataset_path=str(corrupt)).load(self.tok)
+
+        wrong_shape = tmp_dir / "wrong_shape.json"
+        wrong_shape.write_text(json.dumps({"something": "else"}))
         with self.assertRaisesRegex(ValueError, "metadata"):
-            self._dataset(dataset_path=f.name).load(self.tok)
+            self._dataset(dataset_path=str(wrong_shape)).load(self.tok)
 
 
 if __name__ == "__main__":

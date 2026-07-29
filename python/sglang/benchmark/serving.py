@@ -40,6 +40,7 @@ from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
+from sglang.benchmark.datasets.agentic import validate_agentic_args
 from sglang.benchmark.datasets.common import MULTI_TURN_BACKENDS
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.utils import (
@@ -492,6 +493,11 @@ async def async_request_openai_chat_completions(
         # Merge in extra parameters (tools, temperature, top_p, etc.)
         # These will override defaults if present
         payload.update(request_func_input.extra_request_body)
+
+        # Escape hatch for servers that reject stream_options:
+        # --extra-request-body '{"stream_options": null}' drops the key.
+        if payload.get("stream_options") is None:
+            payload.pop("stream_options", None)
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
@@ -1740,19 +1746,20 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     if args.cache_report:
         cache_agg = aggregate_cache_report(outputs)
-        total_prompt_tokens = cache_agg["total_prompt_tokens"]
         total_cached = cache_agg["total_cached"]
         total_device = cache_agg["total_device"]
         total_host = cache_agg["total_host"]
         total_storage = cache_agg["total_storage"]
         storage_backend_name = cache_agg["storage_backend_name"]
-        has_details = cache_agg["has_details"]
-        hit_rate = cache_agg["hit_rate"]
 
         print("{s:{c}^{n}}".format(s="Cache Hit Details", n=50, c="-"))
-        print("{:<40} {:<10}".format("Total prompt tokens:", total_prompt_tokens))
+        print(
+            "{:<40} {:<10}".format(
+                "Total prompt tokens:", cache_agg["total_prompt_tokens"]
+            )
+        )
         print("{:<40} {:<10}".format("Total cached tokens:", total_cached))
-        if has_details and total_cached > 0:
+        if cache_agg["has_details"] and total_cached > 0:
             print("{:<40} {:<10}".format("  Device:", total_device))
             print("{:<40} {:<10}".format("  Host:", total_host))
             if total_storage > 0:
@@ -1762,8 +1769,8 @@ async def benchmark(
                     else "  Storage:"
                 )
                 print("{:<40} {:<10}".format(label, total_storage))
-        print("{:<40} {:.1f}%".format("Cache hit rate:", hit_rate))
-        if has_details and total_cached > 0:
+        print("{:<40} {:.1f}%".format("Cache hit rate:", cache_agg["hit_rate"]))
+        if cache_agg["has_details"] and total_cached > 0:
             device_pct = total_device / total_cached * 100
             host_pct = total_host / total_cached * 100
             print("{:<40} {:.1f}%".format("  Device:", device_pct))
@@ -1802,8 +1809,6 @@ async def benchmark(
             # Results
             "duration": benchmark_duration,
             "completed": metrics.completed,
-            "completed_conversations": completed_conversations,
-            "total_conversations": total_conversations,
             "total_input_tokens": metrics.total_input,
             "total_input_text_tokens": metrics.total_input_text,
             "total_input_vision_tokens": metrics.total_input_vision,
@@ -1843,15 +1848,23 @@ async def benchmark(
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
 
+        if is_multi_turn:
+            result["completed_conversations"] = completed_conversations
+            result["total_conversations"] = total_conversations
+
         if args.cache_report:
+            has_details = cache_agg["has_details"]
+            total_storage = cache_agg["total_storage"]
             result["cache_report"] = {
-                "total_prompt_tokens": total_prompt_tokens,
-                "total_cached_tokens": total_cached,
-                "cache_hit_rate_pct": round(hit_rate, 2),
-                "device_cached_tokens": total_device if has_details else None,
-                "host_cached_tokens": total_host if has_details else None,
+                "total_prompt_tokens": cache_agg["total_prompt_tokens"],
+                "total_cached_tokens": cache_agg["total_cached"],
+                "cache_hit_rate_pct": round(cache_agg["hit_rate"], 2),
+                "device_cached_tokens": (
+                    cache_agg["total_device"] if has_details else None
+                ),
+                "host_cached_tokens": cache_agg["total_host"] if has_details else None,
                 "storage_cached_tokens": (total_storage if total_storage > 0 else None),
-                "storage_backend": storage_backend_name,
+                "storage_backend": cache_agg["storage_backend_name"],
             }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
@@ -2171,14 +2184,9 @@ def _validate_parsed_agentic_args(
     readiness checks or a multi-minute dataset build."""
     if args.dataset_name != "agentic":
         return
-    if args.backend not in MULTI_TURN_BACKENDS:
-        parser.error(
-            f"--dataset-name agentic requires a multi-turn chat backend "
-            f"({', '.join(sorted(MULTI_TURN_BACKENDS))}); got --backend "
-            f"{args.backend}"
-        )
-    if args.agentic_offset < 0:
-        parser.error(f"--agentic-offset must be >= 0, got {args.agentic_offset}")
+    error = validate_agentic_args(args)
+    if error:
+        parser.error(error)
 
 
 def _validate_parsed_gsp_args(
@@ -2271,8 +2279,8 @@ def cli_main():
         "--dataset-offset",
         type=int,
         default=0,
-        help="Rotate the conversation list by this many entries before sampling "
-        "(agentic-trace dataset), so successive sweep steps start on fresh "
+        help="Start consuming conversations at this index (agentic and "
+        "agentic-trace datasets), so successive sweep steps start on fresh "
         "conversations.",
     )
     parser.add_argument(
@@ -2785,9 +2793,10 @@ def cli_main():
     agentic_group.add_argument(
         "--agentic-num-conversations",
         type=int,
-        default=128,
-        help="Number of conversations to build into the cached dataset; "
-        "decoupled from --num-prompts so one build covers a whole sweep.",
+        default=0,
+        help="Minimum number of conversations to build into the cached "
+        "dataset; set it to the sweep's total so one build covers every "
+        "step. Default: build exactly offset + num-prompts.",
     )
     agentic_group.add_argument(
         "--agentic-pad-source",
@@ -2822,14 +2831,6 @@ def cli_main():
         help="Upper bound on the fraction of the turn-1 budget that real "
         "user content can occupy; the rest is the unique synthetic system "
         "prompt.",
-    )
-    agentic_group.add_argument(
-        "--agentic-offset",
-        type=int,
-        default=0,
-        help="First conversation to consume; a run uses the slice "
-        "[offset, offset + num-prompts) with no recycling, so advancing the "
-        "offset across sweep steps replays fresh conversations.",
     )
     agentic_group.add_argument(
         "--agentic-output-len",
