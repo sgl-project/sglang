@@ -1113,6 +1113,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 port_args,
                 scheduler_init_result,
                 subprocess_watchdog,
+                None,
             )
 
         # Launch detokenizer process(es) — optionally fronted by a router when
