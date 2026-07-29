@@ -145,7 +145,7 @@ def apply_dflash_verify_logits_adjustments(
 
     acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
-    vocab_mask = getattr(sampling_info, "vocab_mask", None)
+    grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
     logits_3d: Optional[torch.Tensor] = None
@@ -161,7 +161,7 @@ def apply_dflash_verify_logits_adjustments(
     # broadcast over the verify block without materializing a repeated buffer.
     if (
         penalizer is not None and penalizer.is_required and acc_linear_penalties is None
-    ) or vocab_mask is not None:
+    ) or grammar_mask is not None:
         linear_penalty = torch.zeros(
             (bs, next_token_logits.shape[1]),
             dtype=torch.float32,
