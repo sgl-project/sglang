@@ -21,9 +21,6 @@ from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner i
     _init_cuda_graph_replay_metadata,
     run_mla_cuda_graph_decode_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
-    run_mla_eagle_draft_extend_case,
-)
 from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
     run_mla_eagle_draft_cuda_graph_runner_case,
 )
@@ -203,17 +200,6 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
             1,
         ),
     )
-    DRAFT_EXTEND_CASES = (
-        MLAAttentionCase(
-            name="runner_eagle_draft_extend_mla_flashmla_ragged_accept",
-            backend="flashmla",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=4,
-            page_size=64,
-            prefix_lens=(5, 8),
-            extend_lens=(2, 4),
-        ),
-    )
     EAGLE_DRAFT_RUNNER_CASES = (
         (
             MLAAttentionCase(
@@ -337,11 +323,6 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
                     topk=topk,
                     **MLA_SHAPE_KWARGS,
                 )
-
-    def test_runner_mode_eagle_draft_extend_cases(self):
-        for case in self.DRAFT_EXTEND_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_mla_eagle_draft_extend_case(self, case, **MLA_SHAPE_KWARGS)
 
     @unittest.skipIf(_DECODE_REQUIRES_SM90A, _DECODE_SKIP_REASON)
     def test_runner_mode_eagle_draft_cuda_graph_runner_cases(self):

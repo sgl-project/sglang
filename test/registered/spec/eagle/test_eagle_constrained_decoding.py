@@ -1,6 +1,5 @@
 import unittest
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
@@ -31,7 +30,8 @@ class TestEagleConstrainedDecoding(
     model = DEFAULT_TARGET_MODEL_EAGLE
     draft_model = DEFAULT_DRAFT_MODEL_EAGLE
     grammar_backend = "xgrammar"
-    spec_v2 = False
+    # Run the synchronous (non-overlap) scheduling path.
+    disable_overlap = True
 
     @classmethod
     def setUpClass(cls):
@@ -59,17 +59,15 @@ class TestEagleConstrainedDecoding(
             "--grammar-backend",
             cls.grammar_backend,
         ]
+        if cls.disable_overlap:
+            launch_args.append("--disable-overlap-schedule")
         launch_args.extend(cls.other_launch_args)
-        with (
-            envs.SGLANG_ENABLE_SPEC_V2.override(cls.spec_v2),
-            envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True),
-        ):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=launch_args,
-            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=launch_args,
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -77,7 +75,7 @@ class TestEagleConstrainedDecoding(
 
 
 class TestEagleConstrainedDecodingV2(TestEagleConstrainedDecoding):
-    spec_v2 = True
+    disable_overlap = False
 
 
 if __name__ == "__main__":

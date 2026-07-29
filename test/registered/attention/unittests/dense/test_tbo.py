@@ -170,8 +170,8 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
         )
 
         capture_bs = case.batch_size
-        num_tokens_per_bs = sum(case.extend_lens) // capture_bs
-        num_tokens = capture_bs * num_tokens_per_bs
+        num_tokens_per_req = sum(case.extend_lens) // capture_bs
+        num_tokens = capture_bs * num_tokens_per_req
         split_seq_index, split_token_index = (
             compute_split_indices_for_cuda_graph_replay(
                 forward_mode=batch.forward_mode,

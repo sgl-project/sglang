@@ -24,6 +24,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 )
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.configs.sample.wan import (
+    FastWanT2V480PConfig,
     WanI2V_14B_480P_SamplingParam,
     WanI2V_14B_720P_SamplingParam,
     WanT2V_1_3B_SamplingParams,
@@ -101,6 +102,12 @@ class TestSamplingParamsSubclass(unittest.TestCase):
     def test_diffusers_generic_calls_base_post_init(self):
         with self.assertRaises(AssertionError):
             DiffusersGenericSamplingParams(num_frames=0)
+
+    def test_fastwan_480p_default_resolution_is_supported(self):
+        params = FastWanT2V480PConfig()
+
+        self.assertEqual((params.width, params.height), (832, 480))
+        self.assertIn((params.width, params.height), params.supported_resolutions)
 
     def test_output_file_name_supports_callable_teacache_params(self):
         def coefficients_callback(_: TeaCacheParams) -> list[float]:
@@ -278,6 +285,32 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertNotIn("height", implicit_fields)
         self.assertIn("width", explicit_fields)
         self.assertIn("height", explicit_fields)
+
+    def test_cli_path_preserves_diffusers_kwargs_in_request_extra(self):
+        server_args = MagicMock()
+        server_args.backend = "sglang"
+        server_args.model_id = None
+        server_args.pipeline_config = MagicMock()
+        diffusers_kwargs = {"camera_to_world_path": "/tmp/camera.npy"}
+
+        with patch.object(
+            SamplingParams,
+            "from_pretrained",
+            side_effect=lambda *args, **kwargs: Flux2SamplingParams(),
+        ):
+            params = SamplingParams.from_user_sampling_params_args(
+                "dummy-model",
+                server_args=server_args,
+                prompt="p",
+                image_path="/tmp/in.png",
+                diffusers_kwargs=diffusers_kwargs,
+            )
+
+        self.assertEqual(params.diffusers_kwargs, diffusers_kwargs)
+        self.assertEqual(
+            params.build_request_extra()["diffusers_kwargs"],
+            diffusers_kwargs,
+        )
 
     def test_dataclasses_replace_preserves_explicit_fields(self):
         """`dataclasses.replace` drops `_explicit_fields`; DiffGenerator must restore it."""

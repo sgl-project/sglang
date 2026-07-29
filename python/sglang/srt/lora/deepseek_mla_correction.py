@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from sglang.srt.lora.triton_ops import (
+from sglang.kernels.ops.gemm.kv_b_lora_absorbed import (
     step_a_q_fwd,
     step_a_v_fwd,
     step_b_q_fwd,
@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 
-def is_kv_b_lora_active(attn_module: "DeepseekV2AttentionMLA") -> bool:
+def is_kv_b_lora_active(attn_module: DeepseekV2AttentionMLA) -> bool:
     """Cheap precondition check used at call sites in the attention forward
     to skip the entire LoRA-correction path when no ``kv_b_proj`` adapter is
     wrapped on this module (the common case)."""
@@ -39,8 +39,8 @@ def is_kv_b_lora_active(attn_module: "DeepseekV2AttentionMLA") -> bool:
 
 
 def _get_state(
-    attn_module: "DeepseekV2AttentionMLA",
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, "LoRABatchInfo"]]:
+    attn_module: DeepseekV2AttentionMLA,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, LoRABatchInfo]]:
     if not is_kv_b_lora_active(attn_module):
         return None
     if not hasattr(attn_module.kv_b_proj, "A_buffer"):
@@ -61,7 +61,7 @@ def _get_state(
 
 
 def apply_q_correction(
-    attn_module: "DeepseekV2AttentionMLA",
+    attn_module: DeepseekV2AttentionMLA,
     q_nope: torch.Tensor,
     q_nope_out: torch.Tensor,
 ) -> torch.Tensor:
@@ -86,7 +86,7 @@ def apply_q_correction(
 
 
 def apply_v_correction(
-    attn_module: "DeepseekV2AttentionMLA",
+    attn_module: DeepseekV2AttentionMLA,
     attn_output: torch.Tensor,
     attn_bmm_flat: torch.Tensor,
 ) -> torch.Tensor:

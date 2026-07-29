@@ -32,8 +32,18 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
+    "lerobot/pi05": "Pi05Pipeline",
+    "lerobot--pi05": "Pi05Pipeline",
+    "pi05": "Pi05Pipeline",
+    "pi0.5": "Pi05Pipeline",
     "hunyuan3d": "Hunyuan3D2Pipeline",
     "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
+    "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
+    "fal--ideogram-v4-fast": "Ideogram4FastPipeline",
+    "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
+    "fal--ideogram-v4-instant": "Ideogram4InstantPipeline",
+    "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+    "comfy-org--ideogram-4": "Ideogram4Nvfp4Pipeline",
 }
 
 

@@ -112,9 +112,12 @@ class ContiguousAttentionKVCache:
 
     def write_token(self, k: mx.array, v: mx.array) -> None:
         """Write one token. k, v shape: (1, n_kv_heads, 1, head_dim)."""
-        self.keys[:, :, self.offset : self.offset + 1, :] = k
-        self.values[:, :, self.offset : self.offset + 1, :] = v
-        self.offset += 1
+        end = self.offset + 1
+        if end > self.max_seq_len:
+            self._grow(end)
+        self.keys[:, :, self.offset : end, :] = k
+        self.values[:, :, self.offset : end, :] = v
+        self.offset = end
 
     def get_kv(self) -> tuple[mx.array, mx.array]:
         """Return valid K/V: (1, n_kv_heads, offset, head_dim)."""

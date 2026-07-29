@@ -431,10 +431,7 @@ async function decodeFrameBatch(header, data) {
 }
 
 function isWorkerDecodableContentType(contentType) {
-  return (
-    isWorkerDecodableRawContentType(contentType) ||
-    isEncodedPreviewContentType(contentType)
-  );
+  return isWorkerDecodableRawContentType(contentType);
 }
 
 function isWorkerDecodableRawContentType(contentType) {
@@ -1238,7 +1235,7 @@ async function payloadToArrayBuffer(data) {
   return data.arrayBuffer();
 }
 
-function drawFrame(image) {
+function drawFrame(image, { close = true, markRendered = true } = {}) {
   const sourceWidth = image.width;
   const sourceHeight = image.height;
   let drawSource = image;
@@ -1258,9 +1255,9 @@ function drawFrame(image) {
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
   ctx.drawImage(drawSource, 0, 0, sourceWidth, sourceHeight);
-  renderedPreviewFrames += 1;
+  if (markRendered) renderedPreviewFrames += 1;
   setPreviewState("live");
-  if (!(image instanceof ImageData)) image.close?.();
+  if (close && !(image instanceof ImageData)) image.close?.();
 }
 
 function renderLoop(now) {
@@ -1528,11 +1525,11 @@ function receive(data, epoch) {
       const payload = message.payload;
       delete message.payload;
       enqueueDecodeBatch(message, payload, epoch);
-      setStatus("Live", "live");
+      if (!renderedPreviewFrames) setStatus("Receiving", "live");
       return;
     }
     pendingHeader = message;
-    if (pendingHeader) setStatus("Live", "live");
+    if (pendingHeader && !renderedPreviewFrames) setStatus("Receiving", "live");
     return;
   }
   const header = pendingHeader;
@@ -1557,6 +1554,9 @@ async function decodeAndEnqueueFrameBatch(header, data, epoch) {
     return;
   }
   const now = performance.now();
+  if (!renderedPreviewFrames && decodedFrames.length) {
+    drawFrame(decodedFrames[0].image, { close: false, markRendered: false });
+  }
   // record source frames before preview playback can hold or drop for latency
   recordDecodedFrameBatch(decodedFrames);
   const enqueueResult = playbackController.enqueueDecodedFrames(header, decodedFrames, now);

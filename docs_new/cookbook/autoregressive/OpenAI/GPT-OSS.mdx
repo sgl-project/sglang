@@ -25,6 +25,8 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3.Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
@@ -41,12 +43,13 @@ import { GPTOSSDeployment } from "/src/snippets/autoregressive/gpt-oss-deploymen
 
 ### 3.2 Configuration Tips
 
-- **Demo tool server:** Launch with `--tool-server demo` to enable the built-in web-search (Exa) and Python interpreter tools.
-- **Web search tool:** Requires an Exa API key — set `EXA_API_KEY` in your environment.
-- **Python tool:** Runs in a Docker sandbox by default. Set `PYTHON_EXECUTION_BACKEND=UV` to run on the host (model-generated code executes locally — use with care).
+- **Native web search:** Set `EXA_API_KEY` in the SGLang server environment to enable built-in web search (Exa). No `--tool-server` is required, and requests are tagged with `x-exa-integration: sglang`.
+- **Web search defaults:** `numResults=10`, search `type="auto"`, and `contents.highlights=true`. Override with `SGLANG_EXA_NUM_RESULTS`, `SGLANG_EXA_SEARCH_TYPE`, and `SGLANG_EXA_INCLUDE_HIGHLIGHTS`.
+- **Python tool:** Add `--tool-server demo` to enable the Python interpreter. Runs in a Docker sandbox by default; set `PYTHON_EXECUTION_BACKEND=UV` to run on the host (model-generated code executes locally — use with care).
 - **MCP tool servers:** For production, point SGLang at external MCP SSE servers with `--tool-server ip-1:port-1,ip-2:port-2`.
-- **Responses API:** GPT-OSS supports OpenAI's Responses API (`client.responses.create`) in addition to the standard Chat Completions API (see section 4.2.3).
-- **Use Python 3.12** when running the demo tools.
+- **Responses API:** GPT-OSS supports OpenAI's Responses API (`client.responses.create`) in addition to the standard Chat Completions API (see section 4.2.4).
+- **Use Python 3.12** when running the demo Python tool.
+- **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4.Model Invocation
 
@@ -428,21 +431,24 @@ python3 -m sglang.launch_server \
 ```
 
 <Tip>
-The spec-v2 overlap scheduler is enabled by default (`SGLANG_ENABLE_SPEC_V2=True`). It improves performance by overlapping draft and verification stages. Set `SGLANG_ENABLE_SPEC_V2=0` to disable.
+The spec-v2 overlap scheduler is enabled by default. It improves performance by overlapping draft and verification stages. Pass `--disable-overlap-schedule` to disable.
 </Tip>
 
 #### 4.2.4 Responses API and Built-in Tools
 
-GPT-OSS supports the OpenAI Responses API with built-in tool use (web search and Python interpreter). Set up your environment and launch with `--tool-server demo`:
+GPT-OSS supports the OpenAI Responses API with built-in tool use (web search and Python interpreter). Set `EXA_API_KEY` to enable native web search; add `--tool-server demo` only when you also want the Python tool:
 
 ```shell Command
 export EXA_API_KEY=YOUR_EXA_KEY
+# Optional: server-side Exa tuning (defaults shown)
+export SGLANG_EXA_NUM_RESULTS=10
+export SGLANG_EXA_SEARCH_TYPE=auto
+export SGLANG_EXA_INCLUDE_HIGHLIGHTS=true
 # Optional: run Python tool on host instead of Docker (model code executes locally)
 export PYTHON_EXECUTION_BACKEND=UV
 
 python3 -m sglang.launch_server \
   --model-path openai/gpt-oss-120b \
-  --tool-server demo \
   --tp 2
 ```
 
@@ -464,10 +470,8 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="sk-123456")
 
-tools = [
-    {"type": "code_interpreter"},
-    {"type": "web_search_preview"},
-]
+search_tools = [{"type": "web_search"}]
+python_tools = [{"type": "code_interpreter"}]
 
 # Configurable reasoning effort: "high", "medium", or "low"
 response = client.responses.create(
@@ -478,24 +482,24 @@ response = client.responses.create(
 )
 print(response.output_text)
 
-# Python tool usage
+# Web search (requires EXA_API_KEY on the SGLang server)
 response = client.responses.create(
     model="openai/gpt-oss-120b",
-    instructions="You are a helpful assistant.",
+    instructions="You are a helpful assistant, you can search the web when needed.",
+    input="Search the web for the latest news about Nvidia stock price",
+    tools=search_tools,
+)
+print(response.output_text)
+
+# Python tool (requires launching SGLang with --tool-server demo)
+response = client.responses.create(
+    model="openai/gpt-oss-120b",
+    instructions="You are a helpful assistant, you could use python tool to execute code.",
     input="Use python tool to calculate the sum of 29138749187 and 29138749187",
-    tools=tools,
+    tools=python_tools,
 )
 print(response.output_text)
 # Output: The sum is 58,277,498,374.
-
-# Web search usage
-response = client.responses.create(
-    model="openai/gpt-oss-120b",
-    instructions="You are a helpful assistant.",
-    input="Search the web for the latest news about Nvidia stock price",
-    tools=tools,
-)
-print(response.output_text)
 ```
 
 ## 5.Benchmark

@@ -11,6 +11,7 @@ from torch.distributed import ProcessGroup
 from sglang.srt.distributed.device_communicators.all_reduce_utils import (
     TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip
 
 try:
@@ -48,7 +49,7 @@ class TorchSymmMemCommunicator:
     # to the two-shot path.
     _WORLD_SIZES_MULTIMEM = {
         9: [4, 6, 8],
-        10: [6, 8],
+        10: [4, 6, 8],
     }
 
     def __init__(self, group: ProcessGroup, device: Union[int, str, torch.device]):
@@ -59,6 +60,8 @@ class TorchSymmMemCommunicator:
         """
 
         self.disabled = True
+        self.buffer = None
+        self.max_size = 0
 
         if not torch_symm_mem_available:
             return
@@ -73,26 +76,37 @@ class TorchSymmMemCommunicator:
         self.group = group
         self.world_size = dist.get_world_size(self.group)
         self.device_capability = torch.cuda.get_device_capability(device)[0]
-        if self.device_capability < 9:
+        supported_max_sizes = TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES.get(
+            self.device_capability
+        )
+        if supported_max_sizes is None:
             logger.warning(
                 "TorchSymmMemCommunicator: Device capability %s not supported, "
                 "communicator is not available.",
                 self.device_capability,
             )
             return
-        if (
-            self.world_size
-            not in TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES[self.device_capability]
-        ):
+        if self.world_size not in supported_max_sizes:
             logger.warning(
                 "TorchSymmMemCommunicator: World size %d not supported, "
                 "communicator is not available.",
                 self.world_size,
             )
             return
-        self.max_size = TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES[self.device_capability][
-            self.world_size
-        ]
+        self.max_size = supported_max_sizes[self.world_size]
+        # Keep the JIT all-reduce buffer above the largest prefill payload
+        # ([16384, 6144] bf16 = 192 MiB), including room for tail regions.
+        if envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get():
+            self.max_size = max(self.max_size, 256 * 1024 * 1024)
+            from sglang.srt.runtime_context import get_server_args
+
+            if (
+                get_server_args().enable_scattered_sconv
+                or envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV.get()
+            ):
+                # Fused extend kernels are out-of-place, so OUT must hold the
+                # same maximum prefill payload as IN, including tail regions.
+                self.max_size = max(self.max_size, 512 * 1024 * 1024)
         self.buffer = torch_symm_mem.empty(
             self.max_size // self.dtype.itemsize,
             device=self.device,
@@ -124,6 +138,8 @@ class TorchSymmMemCommunicator:
         """
         if self.disabled:
             return False
+        if inp.device != self.device:
+            return False
         if inp.dtype != self.dtype:
             return False
         inp_size = inp.numel() * inp.element_size()
@@ -150,10 +166,14 @@ class TorchSymmMemCommunicator:
             - Selects 'multimem' or 'two_shot' kernel based on topology.
             - Writes the result into 'out' and returns it.
         """
+        if not self.should_torch_symm_mem_allreduce(inp):
+            return None
         if out is None:
             out = torch.empty_like(inp)
         self.buffer[: inp.numel()].copy_(inp.view(-1))
-        if self.world_size in self._WORLD_SIZES_MULTIMEM[self.device_capability]:
+        if self.world_size in self._WORLD_SIZES_MULTIMEM.get(
+            self.device_capability, ()
+        ):
             torch.ops.symm_mem.multimem_all_reduce_(
                 self.buffer[: inp.numel()], "sum", self.group.group_name
             )

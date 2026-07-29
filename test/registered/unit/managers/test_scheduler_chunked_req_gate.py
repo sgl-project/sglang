@@ -12,9 +12,10 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import NextBatchPlan, Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.utils.common import Range
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -25,15 +26,16 @@ def _make_req(
     fill_ids: list,
     prefix_indices: torch.Tensor,
     extend_input_len: int,
+    fill_len: int,
 ) -> Req:
     req = Req.__new__(Req)
     req.rid = "test-req"
     req.origin_input_ids = array("q", fill_ids)
     req.output_ids = array("q")
-    req.fill_ids = array("q", fill_ids)
+    req.full_untruncated_fill_ids = array("q", fill_ids)
     req.prefix_indices = prefix_indices
     req.req_pool_idx = req_pool_idx
-    req.extend_input_len = extend_input_len
+    req.extend_range = Range(fill_len - extend_input_len, fill_len)
     req.inflight_middle_chunks = 0
     req.host_hit_length = 0
     req.cache_protected_len = 0
@@ -88,30 +90,38 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.running_batch.is_prefill_only = False
     s.running_batch.batch_is_full = False
     s.running_batch.reqs = []
-    s.get_new_batch_prefill = MagicMock(return_value=None)
+    s.get_new_batch_prefill = MagicMock(
+        return_value=NextBatchPlan(batch_to_run=None, running_batch=s.running_batch)
+    )
     s.dp_attn_adapter = MagicMock()
     s.dp_attn_adapter.maybe_prepare_mlp_sync_batch = MagicMock(
         side_effect=lambda batch, **_: batch
     )
-    s._maybe_prepare_ngram_embedding = MagicMock(side_effect=lambda batch: batch)
+    s.ngram_embedding_manager = MagicMock()
+    s.ngram_embedding_manager.prepare_for_forward = MagicMock(
+        side_effect=lambda batch, **_: batch
+    )
     s.update_running_batch = MagicMock(side_effect=lambda batch: batch)
     s.tree_cache = tree_cache
     s.chunked_req = chunked_req
+    s._pending_chunked_abort_req = None
     return s
 
 
 class TestStashGatePreservesPrefixIndices(CustomTestCase):
     """Consumer side: real ChunkCache.cache_unfinished_req mutates
     req.prefix_indices iff stash actually runs, so prefix_indices content
-    is the bug-detection signal."""
+    is the bug-detection signal. The stash gate is content-based:
+    `fill_len > len(prefix_indices)` means there is freshly computed KV to
+    cache; otherwise the chunk was parked and stashing must be skipped."""
 
     POOL_IDX = 4
     INITIAL_PREFIX_LEN = 8  # what was really cached last iter
-    POST_RESET_FILL_LEN = 32  # length after init_next_round_input
+    POST_RESET_FILL_LEN = 32  # length after init_next_round_input rebuilds
     NUM_SLOTS = 8
     MAX_CONTEXT = 64
 
-    def _build(self, flag: bool):
+    def _build(self, *, fill_len: int):
         pool = _make_req_to_token_pool(self.NUM_SLOTS, self.MAX_CONTEXT)
         cache = _make_chunk_cache(pool)
         initial_prefix = pool.req_to_token[self.POOL_IDX, : self.INITIAL_PREFIX_LEN].to(
@@ -121,28 +131,32 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
             req_pool_idx=self.POOL_IDX,
             fill_ids=list(range(self.POST_RESET_FILL_LEN)),
             prefix_indices=initial_prefix,
-            extend_input_len=0,
+            extend_input_len=fill_len - self.INITIAL_PREFIX_LEN,
+            fill_len=fill_len,
         )
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=req)
-        s._chunked_req_scheduled_last_iter = flag
         return s, req, initial_prefix, pool
 
-    def test_deferred_chunked_req_keeps_real_prefix_indices(self):
-        # The bug case: a spurious stash on a deferred chunked_req
-        # would extend prefix_indices to len(fill_ids).
-        s, req, initial_prefix, _ = self._build(flag=False)
+    def test_parked_chunked_req_keeps_real_prefix_indices(self):
+        # A parked chunk has fill_len == len(prefix_indices): no new KV was
+        # computed, so the gate must skip stash and leave prefix_indices intact.
+        s, req, initial_prefix, _ = self._build(fill_len=self.INITIAL_PREFIX_LEN)
 
-        Scheduler.get_next_batch_to_run(s)
+        Scheduler.get_next_batch_to_run(
+            s, running_batch=s.running_batch, last_batch=s.last_batch
+        )
 
         self.assertEqual(req.prefix_indices.shape[0], self.INITIAL_PREFIX_LEN)
         self.assertTrue(torch.equal(req.prefix_indices, initial_prefix))
 
     def test_scheduled_chunked_req_advances_prefix_indices_via_real_stash(self):
-        # Symmetric guard against over-gating: when the chunked_req was
-        # actually scheduled, stash must run and advance prefix_indices.
-        s, req, _, pool = self._build(flag=True)
+        # Symmetric guard against over-gating: when fill_len has advanced past
+        # the cached prefix, stash must run and advance prefix_indices.
+        s, req, _, pool = self._build(fill_len=self.POST_RESET_FILL_LEN)
 
-        Scheduler.get_next_batch_to_run(s)
+        Scheduler.get_next_batch_to_run(
+            s, running_batch=s.running_batch, last_batch=s.last_batch
+        )
 
         expected = pool.req_to_token[self.POOL_IDX, : self.POST_RESET_FILL_LEN].to(
             dtype=torch.int64
@@ -150,15 +164,16 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         self.assertEqual(req.prefix_indices.shape[0], self.POST_RESET_FILL_LEN)
         self.assertTrue(torch.equal(req.prefix_indices, expected))
 
-    def test_no_chunked_req_never_mutates_state_even_with_stale_flag(self):
-        # Retract path clears chunked_req without resetting the flag;
-        # the outer `if chunked_req is not None` guard must hold.
+    def test_no_chunked_req_never_mutates_state(self):
+        # The outer `if chunked_req is not None` guard must hold on the retract
+        # path that clears chunked_req.
         pool = _make_req_to_token_pool(self.NUM_SLOTS, self.MAX_CONTEXT)
         cache = _make_chunk_cache(pool)
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=None)
-        s._chunked_req_scheduled_last_iter = True
 
-        Scheduler.get_next_batch_to_run(s)
+        Scheduler.get_next_batch_to_run(
+            s, running_batch=s.running_batch, last_batch=s.last_batch
+        )
         self.assertIsNone(s.chunked_req)
 
 

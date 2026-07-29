@@ -5,17 +5,18 @@ import unittest
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
+from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patcher.buffer_alloc import (
     make_packed_source,
     make_row_source,
     resolve_real_kv_read_bytes,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=10, suite="extra-a-test-1-gpu-small-amd")
 
 
 def _config(mode: RealKvHashMode) -> CanaryConfig:

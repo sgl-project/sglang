@@ -3,13 +3,32 @@
 
 use crate::server::app_context::AppContext;
 use crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
-use axum::extract::{DefaultBodyLimit, Request};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
 use std::sync::Arc;
+
+/// Edge counters: `requests_total{route,method}` at entry (true intake, incl.
+/// requests parked/shed/cancelled before dispatch), `responses_total{...,
+/// status_code}` on exit (incl. early-exit 400/413/503). Their difference =
+/// received-but-not-answered, invisible to post-dispatch `worker_requests_total`.
+/// `route` is the matched template (not raw URI) to bound label cardinality.
+async fn count_requests(State(ctx): State<Arc<AppContext>>, req: Request, next: Next) -> Response {
+    let method = req.method().as_str().to_owned();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched".to_owned());
+    ctx.metrics.record_ingress(&route, &method);
+    let resp = next.run(req).await;
+    ctx.metrics
+        .record_response(&route, &method, resp.status().as_u16());
+    resp
+}
 
 /// Middleware: log 413 PAYLOAD_TOO_LARGE responses with the request method
 /// and URI so an operator investigating "client X gets 413s" has a
@@ -53,5 +72,11 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
                 .layer(middleware::from_fn(log_413)),
         )
+        .route(
+            "/flush_cache",
+            post(crate::server::routes::cache::flush_cache),
+        )
+        // After routing, so MatchedPath is set for every route.
+        .layer(middleware::from_fn_with_state(ctx.clone(), count_requests))
         .with_state(ctx)
 }

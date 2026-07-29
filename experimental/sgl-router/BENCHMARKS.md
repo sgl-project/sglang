@@ -32,12 +32,12 @@ cargo bench --bench radix_tree_benchmark -- --sample-size 30 --measurement-time 
 cargo bench --bench manual_policy_benchmark
 ```
 
-For the quick smoke runs whose numbers are reproduced below: drop
+For the quick runs whose numbers are reproduced below: drop
 `--sample-size` to 10 and `--measurement-time` to 2 (Criterion will
 warn about reduced statistical confidence but the order-of-magnitude
 comparison stands).
 
-## Smoke-run data points (M1 MacBook, release profile)
+## Quick-run Data Points (M1 MacBook, release profile)
 
 These are NOT the real acceptance numbers — they're a sanity check
 that the sgl-router routing primitives are in the same ballpark as the
@@ -62,12 +62,13 @@ latency p50 ≤ 1.10× SMG` acceptance criterion targets.
 | Policy | n=4 workers | n=16 | n=64 | n=256 | SMG equivalent |
 |---|---|---|---|---|---|
 | `round_robin`     | 2.5 ns | 2.5 ns | 2.5 ns | 2.5 ns | SMG round-robin is O(1) — same shape. |
-| `random`          | 16 ns | 36 ns | 137 ns | 471 ns | SMG random is also O(1) per `rand::random()` call; sgl-router's variant grows with n because it `Vec::iter().nth(idx)`. **Action item:** drop sgl-router to O(1) by indexing the slice directly. |
-| `power_of_two`    | … | … | … | 1.75 µs at n=256 | SMG power-of-two-choices is identical in shape (2× rand + 2× load read). |
+| `random`          | — | — | — | — | `SliceRandom::choose` call — O(1), matching SMG's O(1) `rand::random()` call. |
+| `power_of_two`    | — | — | — | — | Two distinct indices sampled directly - O(1), matching SMG's shape (2× rand + 2× load read). |
 
-The `random` finding (linear in worker count) is a real follow-up — file
-an issue and pair it with a Criterion regression-guard in the same
-bench.
+Both `random` and `power_of_two` are now O(1), ensuring consistent
+performance regardless of worker count.
+TODO: Add a regression guard for the O(n) shape. Although `policy_select`
+measures the metric, nothing currently runs or gates on these results.
 
 ## Pre-deprecation calibration runbook
 

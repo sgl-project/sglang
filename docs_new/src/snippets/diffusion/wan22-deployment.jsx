@@ -6,6 +6,7 @@
           title: 'Hardware Platform',
           items: [
             { id: 'b200', label: 'B200', default: true },
+            { id: 'b300', label: 'B300', default: false },
             { id: 'h200', label: 'H200', default: false },
             { id: 'mi300x', label: 'MI300X', default: false },
             { id: 'mi325x', label: 'MI325X', default: false },
@@ -109,7 +110,7 @@
       };
 
       const generateCommand = () => {
-        const { task, modelsize, selectedLoraPath, bestPractice } = values;
+        const { hardware, task, modelsize, selectedLoraPath, bestPractice } = values;
         const configKey = `${task}-${modelsize}`;
         const config = modelConfigs[configKey];
         if (!config) {
@@ -118,7 +119,11 @@
 
         let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;
         if (bestPractice === 'on') {
-          command += ` \\\n  --num-gpus 4 \\\n  --ulysses-degree 2 \\\n  --enable-cfg-parallel`;
+          if (hardware === 'b300') {
+            command += ` \\\n  --tp-size 2 \\\n  --num-gpus 8 \\\n  --sp-degree 2 \\\n  --ulysses-degree 2 \\\n  --enable-cfg-parallel`;
+          } else {
+            command += ` \\\n  --num-gpus 4 \\\n  --ulysses-degree 2 \\\n  --enable-cfg-parallel`;
+          }
         }
         if (selectedLoraPath && selectedLoraPath !== 'none') {
           command += ` \\\n  --lora-path ${selectedLoraPath}`;

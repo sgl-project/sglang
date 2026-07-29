@@ -143,7 +143,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_sandbox_image() -> "modal.Image":
+def build_sandbox_image() -> modal.Image:
     if modal is None:
         raise RuntimeError(
             "The 'modal' package is required. Run this script with "
@@ -213,7 +213,7 @@ Do not skip issue filing. The whole point of this system is automated triage.
 """
 
 
-def upload_tree(sandbox: "modal.Sandbox", log_dir: Path) -> None:
+def upload_tree(sandbox: modal.Sandbox, log_dir: Path) -> None:
     log_files = [path for path in log_dir.rglob("*") if path.is_file()]
     logger.info("Uploading %d log files into the sandbox", len(log_files))
     for index, log_file in enumerate(log_files, start=1):
@@ -225,7 +225,7 @@ def upload_tree(sandbox: "modal.Sandbox", log_dir: Path) -> None:
             logger.info("Uploaded %d/%d files", index, len(log_files))
 
 
-def clone_context_repos(sandbox: "modal.Sandbox", repo_urls: list[str]) -> None:
+def clone_context_repos(sandbox: modal.Sandbox, repo_urls: list[str]) -> None:
     if not repo_urls:
         return
 
@@ -244,7 +244,7 @@ def clone_context_repos(sandbox: "modal.Sandbox", repo_urls: list[str]) -> None:
         ).wait()
 
 
-def read_optional_file(sandbox: "modal.Sandbox", path: str) -> str | None:
+def read_optional_file(sandbox: modal.Sandbox, path: str) -> str | None:
     try:
         return sandbox.filesystem.read_text(path)
     except Exception:

@@ -17,13 +17,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          path: sglang-nightly-build
           fetch-depth: 0
 
       - name: Set date and commit hash
         id: image_meta
         run: |
+          cd sglang-nightly-build
           date_tag=$(date +%Y%m%d)
-          commit_hash=$(git rev-parse --short=9 HEAD)
+          commit_hash=$(git rev-parse --short=7 HEAD)
           if [ -z "${commit_hash}" ]; then
             echo "::error::Could not resolve commit hash"
             exit 1
@@ -43,13 +45,15 @@ jobs:
       - name: Build intel/sglang-dev
         run: |
           echo "Building intel/sglang-dev:${{ env.IMAGE_TAG }}"
-          docker build . \
-            -f docker/xpu.Dockerfile \
+          docker build sglang-nightly-build \
+            -f sglang-nightly-build/docker/xpu.Dockerfile \
             --build-arg SG_LANG_REPO=https://github.com/sgl-project/sglang.git \
             --build-arg SG_LANG_BRANCH=main \
             --no-cache --progress=plain \
-            -t "intel/sglang-dev:${{ env.IMAGE_TAG }}"
+            -t "intel/sglang-dev:${{ env.IMAGE_TAG }}" \
+            -t "intel/sglang-dev:latest"
 
       - name: Push intel/sglang-dev
         run: |
           docker push "intel/sglang-dev:${{ env.IMAGE_TAG }}"
+          docker push "intel/sglang-dev:latest"

@@ -76,7 +76,7 @@ MI35X_GPT_OSS_MODELS = [
         # to INTERLEAVE, so opt out explicitly here.
         env_vars={
             "SGLANG_USE_AITER": "1",
-            "SGLANG_USE_AITER_MOE_GU_ITLV": "0",
+            "SGLANG_USE_AITER_MOE_GU_ITLV": "1",
         },
     ),
     ModelConfig(
@@ -97,7 +97,7 @@ MI35X_GPT_OSS_MODELS = [
         ],
         env_vars={
             "SGLANG_USE_AITER": "1",
-            "SGLANG_USE_AITER_MOE_GU_ITLV": "0",
+            "SGLANG_USE_AITER_MOE_GU_ITLV": "1",
         },
     ),
 ]
