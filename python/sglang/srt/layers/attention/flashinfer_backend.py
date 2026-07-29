@@ -49,11 +49,11 @@ from sglang.srt.speculative.spec_utils import (
     generate_draft_decode_kv_indices,
 )
 from sglang.srt.utils import (
+    get_cuda_graph_max_batch_size,
     get_int_env_var,
     is_flashinfer_available,
     is_sm100_supported,
     next_power_of_2,
-    require_gathered_buffer,
 )
 
 if TYPE_CHECKING:
@@ -61,18 +61,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-
-
-def _cuda_graph_capture_max_bs(server_args, max_bs: int) -> int:
-    """Pad max_bs to the alignment cuda-graph capture uses (see get_batch_sizes_to_capture)."""
-    mul_base = 1
-    if server_args.enable_two_batch_overlap:
-        mul_base *= 2
-    if require_gathered_buffer(server_args):
-        mul_base *= get_parallel().attn_tp_size
-    if mul_base % get_parallel().attn_cp_size != 0:
-        mul_base *= get_parallel().attn_cp_size
-    return (max_bs + mul_base - 1) // mul_base * mul_base
 
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
@@ -447,7 +435,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             self.workspace_buffer = global_workspace_buffer
-        max_bs = _cuda_graph_capture_max_bs(
+        max_bs = get_cuda_graph_max_batch_size(
             model_runner.server_args, model_runner.req_to_token_pool.size
         )
         if kv_indptr_buf is None:
@@ -2230,7 +2218,7 @@ class FlashInferMultiStepDraftBackend:
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
         self.page_size = model_runner.page_size
 
-        max_bs = _cuda_graph_capture_max_bs(
+        max_bs = get_cuda_graph_max_batch_size(
             model_runner.server_args, model_runner.req_to_token_pool.size * self.topk
         )
         self.kv_indptr = torch.zeros(
