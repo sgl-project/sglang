@@ -687,8 +687,11 @@ struct brgemm2<at::BFloat16, at::Float8_e4m3fn, has_bias> {
       int ldb,
       int ldc) {
     constexpr int BLOCK_N = block_size_n();
+
+    // [BLOCK_K, BLOCK_N] -> [BLOCK_K / 2, BLOCK_N * 2]
     const int ldb_tmp = block_size_n();
 
+    // accumulate across K per BLOCK_K
     for (int k = 0; k < K; k += BLOCK_K) {
       int kb_size = std::min(BLOCK_K, K - k);
       unpack_B(Btmp, B + k * ldb, N, kb_size, ldb, ldb_tmp);
@@ -697,6 +700,7 @@ struct brgemm2<at::BFloat16, at::Float8_e4m3fn, has_bias> {
       at::native::cpublas::brgemm(M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, A + k, Btmp, Ctmp);
     }
 
+    // copy from Ctmp to C and mul scale
     for (int m = 0; m < M; ++m) {
       if constexpr (has_bias) {
         copy_mul_add_stub(C + m * ldc, Ctmp + m * BLOCK_N, bias, N, scale);
