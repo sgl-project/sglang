@@ -31,9 +31,7 @@ def _jit_kvcache_module(k_row_bytes: int, v_row_bytes: int) -> Module:
 @cache_once
 def can_use_store_cache(k_row_bytes: int, v_row_bytes: int = 0) -> bool:
     """Whether the JIT store_cache kernel can serve these row widths.
-
-    v_row_bytes defaults to k_row_bytes, i.e. the symmetric K/V case.
-    """
+    v_row_bytes=0 means symmetric, i.e. it defaults to k_row_bytes."""
     logger = logging.getLogger(__name__)
     v_row_bytes = v_row_bytes or k_row_bytes
     for name, size in (("k_row_bytes", k_row_bytes), ("v_row_bytes", v_row_bytes)):
@@ -77,8 +75,8 @@ def store_cache(
         v_cache (torch.Tensor): Value cache tensor of shape (num_pages, H * Dv).
         indices (torch.Tensor): Indices tensor of shape (batch_size,).
         row_bytes (int): Key row width in bytes. Inferred from k when 0.
-        v_row_bytes (int): Value row width in bytes, which differs from row_bytes
-            for asymmetric KV (head_dim != v_head_dim). Defaults to row_bytes.
+        v_row_bytes (int): Value row width in bytes; differs from row_bytes for
+            asymmetric KV (head_dim != v_head_dim). Inferred from v when 0.
         size_limit (int): Valid slot bound (cache row count = real slots + the
             reserved padding slot); an index outside [0, size_limit) fails fast
             (device assert) instead of an illegal memory access. Defaults to the

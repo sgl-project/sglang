@@ -1,12 +1,9 @@
 """Device-side tests for MHATokenToKVPool with asymmetric KV (head_dim != v_head_dim).
 
 Covers the wiring the kernel-level tests cannot see: that the pool derives
-``v_row_dim`` from ``v_head_dim`` and threads it all the way into the fused
-store_cache kernel, so K and V are each written at their own width and stride.
-
-A mis-wired ``v_row_dim`` (e.g. reusing ``row_dim`` for both) still writes the
-right bytes into the right K slots, so the target-slot assertions alone cannot
-catch it -- the untouched-slot assertions are what pin the V stride down.
+``v_row_dim`` from ``v_head_dim`` and threads it into the fused store_cache kernel.
+A mis-wired ``v_row_dim`` still writes the right bytes into the right K slots, so
+the untouched-slot assertions are what pin the V width and stride down.
 
 Skipped on CPU -- the fused path is CUDA/HIP only.
 
@@ -32,8 +29,7 @@ POOL_SIZE = 63  # buffers get POOL_SIZE + page_size rows
 NUM_WRITES = 16
 
 # (head_dim, v_head_dim). Both orderings, since nothing may assume K is wider.
-# The last pair reaches row widths where the split heuristic picks num_split=2,
-# which the narrower pairs do not exercise.
+# The last pair is wide enough for the split heuristic to pick num_split=2.
 ASYM_DIM_PAIRS = [(192, 128), (128, 192), (512, 256)]
 
 
@@ -76,23 +72,19 @@ class TestAsymmetricMHAPoolSetKVBuffer(unittest.TestCase):
         self.assertEqual(tuple(k_buf.shape[1:]), (HEAD_NUM, head_dim))
         self.assertEqual(tuple(v_buf.shape[1:]), (HEAD_NUM, v_head_dim))
 
-        # Without this, an unavailable JIT kernel would silently fall back to the
-        # naive path -- which is also correct, so the test would pass while
-        # covering nothing.
         itemsize = pool.store_dtype.itemsize
         self.assertTrue(
             can_use_store_cache(pool.row_dim * itemsize, pool.v_row_dim * itemsize),
-            "fused store_cache unavailable, so this test would not cover it",
+            "fused store_cache unavailable; the naive fallback is also correct, so "
+            "this test would pass without covering anything",
         )
 
-        # Seed every slot so an over-wide V write shows up as a diff on a slot
-        # that was never targeted.
+        # Seed every slot so an over-wide V write shows up on a slot never targeted.
         k_buf.copy_(torch.randn_like(k_buf))
         v_buf.copy_(torch.randn_like(v_buf))
         k_before, v_before = k_buf.clone(), v_buf.clone()
 
-        # Slot 0 is the reserved padding slot that store_cache skips, so target
-        # only [1, num_slots).
+        # Slot 0 is the reserved padding slot store_cache skips; target [1, num_slots).
         num_slots = k_buf.shape[0]
         loc = torch.randperm(num_slots - 1, device="cuda")[:NUM_WRITES] + 1
         cache_k = torch.randn(

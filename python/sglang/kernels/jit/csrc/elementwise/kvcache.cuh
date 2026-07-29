@@ -21,8 +21,7 @@ struct StoreKVCacheParams {
   const void* __restrict__ indices;
   int64_t stride_k_bytes;
   int64_t stride_v_bytes;
-  // K and V caches may have different row widths (head_dim != v_head_dim), so
-  // they carry independent slot strides.
+  // Independent slot strides: head_dim != v_head_dim gives K and V different row widths.
   int64_t stride_k_cache_bytes;
   int64_t stride_v_cache_bytes;
   int64_t stride_indices;
@@ -85,9 +84,8 @@ SGL_DEVICE void copy_kv_warp(
 
 /**
  * \brief Use a single warp to copy one row from source to destination.
- * Split out of copy_kv_warp for asymmetric K/V (head_dim != v_head_dim), where
- * the two rows differ in width and each needs its own vector alignment, so they
- * cannot share one loop.
+ * Separate from copy_kv_warp because asymmetric K/V rows differ in width, so each
+ * needs its own vector alignment and they cannot share one loop.
  * \tparam kElementBytes The size of the row in bytes.
  * \param src Pointer to the source data.
  * \param dst Pointer to the destination data.

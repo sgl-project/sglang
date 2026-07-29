@@ -174,19 +174,17 @@ def test_store_cache_num_split(
     assert torch.all(v_cache[indices] == v)
 
 
-# Asymmetric K/V: head_dim != v_head_dim, so the two rows have different widths
-# and different cache strides. MiMoV2 is 192/128. Both orderings are covered
-# because nothing may assume K is the wider one.
+# Asymmetric K/V (head_dim != v_head_dim): different row widths AND cache strides.
+# MiMoV2 is 192/128. Both orderings, since nothing may assume K is the wider one.
 ASYM_DIM_PAIRS = get_ci_test_range(
     [(192, 128), (128, 192), (1024, 512), (512, 1024), (96, 64), (2048, 1024)],
     [(192, 128), (512, 1024)],
 )
 
 
-# The kernel is a byte copier specialized on (k_row_bytes, v_row_bytes) only --
-# no dtype appears in its template args -- so dtypes of equal itemsize share one
-# instantiation. bf16 and fp32 cover the two distinct itemsizes; adding fp16
-# would re-run the bf16 instantiation.
+# The kernel is a byte copier specialized on (k_row_bytes, v_row_bytes) -- no dtype
+# in its template args -- so equal-itemsize dtypes share one instantiation. bf16 and
+# fp32 are the two distinct itemsizes; fp16 would just re-run the bf16 one.
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("k_dim,v_dim", ASYM_DIM_PAIRS)
 def test_store_cache_asymmetric(k_dim: int, v_dim: int, dtype: torch.dtype) -> None:
@@ -232,9 +230,8 @@ def _default_num_split(k_dim: int, v_dim: int, dtype: torch.dtype) -> int:
     return 1
 
 
-# Only the splits the default heuristic would NOT pick -- this change made the
-# kernel's split gate a two-sided condition (K and V must both align), so the
-# off-default branches are what needs pinning.
+# Only splits the default heuristic would NOT pick: the split gate is two-sided
+# (K and V must both align), so the off-default branches are what needs pinning.
 _ASYM_NUM_SPLIT_CASES = [
     (_k, _v, _ns)
     for _k, _v in ASYM_DIM_PAIRS

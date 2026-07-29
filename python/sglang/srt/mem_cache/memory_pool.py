@@ -2715,10 +2715,9 @@ class MHATokenToKVPool(KVCache):
             )
             return
 
-        # The tiled kernel takes one ROW_BYTES for both tensors, so an asymmetric
-        # V row would be written at K's width and bleed into the next slot. The
-        # non-CUDA branch above routes through set_kv_buffer, which handles both
-        # widths, so gate this path only.
+        # The tiled kernel takes one ROW_BYTES for both tensors, so an asymmetric V
+        # row would be written at K's width and bleed into the next slot. Only this
+        # path needs the gate; the non-CUDA branch above handles both widths.
         if self.v_row_dim != self.row_dim:
             raise NotImplementedError(
                 "prefix-valid commit requires equal-width K/V rows, got "
