@@ -98,6 +98,8 @@ def _ipc_varlen_fast(x, seq_lens, head_dim, direction):
         out = x.new_empty(b, seq_lens[0] + seq_lens[1], half, d)
         out.narrow(1, off[r], s_local).copy_(x[:, :, r * half : (r + 1) * half])
         theirs = IPC_A2A.exchange(group, send, (b, peer_len, half, d))
+        if theirs is None:
+            return None
         out.narrow(1, off[1 - r], peer_len).copy_(theirs)
         return out
     # output: [b, s_global, h_local, d] -> [b, seq_lens[r], 2*h_local, d].
@@ -108,7 +110,10 @@ def _ipc_varlen_fast(x, seq_lens, head_dim, direction):
     peer_len = seq_lens[1 - r]
     n_out = b * my_len * 2 * h_local * d
     n_peer_out = b * peer_len * 2 * h_local * d
-    local, peer = IPC_A2A.get_staging(n_out, n_peer_out, x.dtype, group)
+    pair = IPC_A2A.get_staging(n_out, n_peer_out, x.dtype, group)
+    if pair is None:
+        return None
+    local, peer = pair
     slot = IPC_A2A.next_slot()
     pst = peer[slot].narrow(0, 0, n_peer_out).view(b, peer_len, 2 * h_local, d)
     pst[:, :, r * h_local : (r + 1) * h_local].copy_(
@@ -137,7 +142,10 @@ def _ipc_input_a2a_qkv(q, k, v):
     half = h_global // 2
     r = IPC_A2A.rank
     n = b * s_local * half * d
-    local, peer = IPC_A2A.get_staging(3 * n, 3 * n, q.dtype, group)
+    pair = IPC_A2A.get_staging(3 * n, 3 * n, q.dtype, group)
+    if pair is None:
+        return None
+    local, peer = pair
     slot = IPC_A2A.next_slot()
     outs = []
     for i, t in enumerate((q, k, v)):
@@ -175,7 +183,10 @@ def _ipc_input_a2a_qkv_segmented(txt_q, img_q, txt_k, img_k, txt_v, img_v, local
     L = txt_len + img_len
     real = txt_len - local_pad
     n = b * 2 * L * half * d
-    local, peer = IPC_A2A.get_staging(3 * n, 3 * n, txt_q.dtype, group)
+    pair = IPC_A2A.get_staging(3 * n, 3 * n, txt_q.dtype, group)
+    if pair is None:
+        return None
+    local, peer = pair
     slot = IPC_A2A.next_slot()
     ph = slice((1 - r) * half, (2 - r) * half)
     lh = slice(r * half, (r + 1) * half)

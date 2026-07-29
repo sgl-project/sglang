@@ -125,10 +125,16 @@ class IpcA2AState:
         """Local buffer of `n_local` elements (the peer writes into it) paired
         with the peer's mapped buffer of `n_peer` elements (we write into it).
         Creation is a paired collective, so both ranks must reach a new key at
-        the same call site."""
+        the same call site. Returns None on a miss during CUDA graph capture:
+        the IPC handle exchange allocates and broadcasts, which is illegal
+        inside capture, so callers fall back to NCCL and the graph bakes that
+        path; pre-warmed keys keep the IPC fast path (its copies and
+        spin/bump kernels are capture-safe)."""
         key = (n_local, n_peer, dtype)
         pair = self.staging.get(key)
         if pair is None:
+            if torch.cuda.is_current_stream_capturing():
+                return None
             local = torch.zeros(2, n_local, dtype=dtype, device="cuda")
             peer = self._share(local, group)
             pair = (local, peer)
@@ -142,7 +148,10 @@ class IpcA2AState:
         n_recv = 1
         for v in recv_shape:
             n_recv *= v
-        local, peer = self.get_staging(n_recv, n_send, send.dtype, group)
+        pair = self.get_staging(n_recv, n_send, send.dtype, group)
+        if pair is None:
+            return None
+        local, peer = pair
         slot = self.next_slot()
         peer[slot].narrow(0, 0, n_send).copy_(send.view(-1), non_blocking=True)
         self.signal_and_wait()
