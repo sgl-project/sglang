@@ -23,11 +23,12 @@ from sglang.srt.entrypoints.openai.serving_responses import (
 )
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
-class InputMessageConstructionTestCase(unittest.TestCase):
+class InputMessageConstructionTestCase(CustomTestCase):
     def test_previous_response_replays_assistant_text_not_instructions(self):
         serving = make_serving()
         prev_response = Mock(id="resp_prev")
@@ -149,7 +150,7 @@ class InputMessageConstructionTestCase(unittest.TestCase):
             pass
 
 
-class ChatToolForwardingTestCase(unittest.TestCase):
+class ChatToolForwardingTestCase(CustomTestCase):
     def test_make_request_passes_function_tools_to_chat_processing(self):
         serving = make_serving()
         seen = {}
@@ -210,7 +211,7 @@ class ChatToolForwardingTestCase(unittest.TestCase):
         self.assertEqual(getattr(result, "status_code", None), 400)
 
 
-class InputItemNormalizationTestCase(unittest.TestCase):
+class InputItemNormalizationTestCase(CustomTestCase):
     def test_function_call_becomes_assistant_tool_call(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(
             {
@@ -265,7 +266,7 @@ class InputItemNormalizationTestCase(unittest.TestCase):
             )
 
 
-class FullResponseUsageTestCase(unittest.TestCase):
+class FullResponseUsageTestCase(CustomTestCase):
     def test_full_response_uses_dict_meta_info_for_usage(self):
         serving = make_serving()
         context = SimpleContext()
@@ -306,7 +307,7 @@ class FullResponseUsageTestCase(unittest.TestCase):
         self.assertEqual(metadata.final_usage_info, response.usage)
 
 
-class MultimodalRequestTestCase(unittest.TestCase):
+class MultimodalRequestTestCase(CustomTestCase):
     def test_multimodal_create_responses_sends_text_and_media_to_engine(self):
         serving = make_serving(is_multimodal=True)
         captured = {}
@@ -376,7 +377,13 @@ class MultimodalRequestTestCase(unittest.TestCase):
         self.assertEqual(captured["adapted_request"].modalities, ["image"])
 
 
-class OutputItemsTestCase(unittest.TestCase):
+class OutputItemsTestCase(CustomTestCase):
+    def setUp(self):
+        # qwen3_coder is the default for this class; the one no-native-parser
+        # case overrides it.
+        self.serving = make_serving()
+        self.serving.tool_call_parser = "qwen3_coder"
+
     def _function_tool_request(self):
         return ResponsesRequest(
             model="x",
@@ -393,8 +400,7 @@ class OutputItemsTestCase(unittest.TestCase):
         )
 
     def test_function_tool_call_extracted_via_parser(self):
-        serving = make_serving()
-        serving.tool_call_parser = "qwen3_coder"
+        serving = self.serving
         fake_call = ToolCallItem(
             tool_index=0, name="get_weather", parameters='{"city": "Beijing"}'
         )
@@ -425,8 +431,7 @@ class OutputItemsTestCase(unittest.TestCase):
         self.assertEqual(message_items[0].content[0].text, "trailing text")
 
     def test_prose_emitted_before_tool_call_item(self):
-        serving = make_serving()
-        serving.tool_call_parser = "qwen3_coder"
+        serving = self.serving
         fake_call = ToolCallItem(
             tool_index=0, name="get_weather", parameters='{"city": "Beijing"}'
         )
@@ -448,7 +453,7 @@ class OutputItemsTestCase(unittest.TestCase):
         self.assertEqual(types, ["ResponseOutputMessage", "ResponseFunctionToolCall"])
 
     def test_required_tool_choice_parses_json_array_without_native_parser(self):
-        serving = make_serving()
+        serving = self.serving
         serving.tool_call_parser = None
         request = ResponsesRequest(
             model="x",
@@ -481,8 +486,7 @@ class OutputItemsTestCase(unittest.TestCase):
         )
 
     def test_no_tool_call_extraction_when_tool_choice_none(self):
-        serving = make_serving()
-        serving.tool_call_parser = "qwen3_coder"
+        serving = self.serving
         request = ResponsesRequest(
             model="x",
             input="hi",
@@ -509,7 +513,7 @@ class OutputItemsTestCase(unittest.TestCase):
         self.assertIsInstance(output_items[0], ResponseOutputMessage)
 
 
-class HarmonyResponsesTestCase(unittest.TestCase):
+class HarmonyResponsesTestCase(CustomTestCase):
     def test_developer_message_skips_unsupported_tool_types(self):
         from sglang.srt.entrypoints.harmony_utils import get_developer_message
         from sglang.srt.entrypoints.openai.protocol import ResponseTool
@@ -529,7 +533,7 @@ class HarmonyResponsesTestCase(unittest.TestCase):
         self.assertIsNotNone(msg)
 
 
-class StatusFromFinishReasonTestCase(unittest.TestCase):
+class StatusFromFinishReasonTestCase(CustomTestCase):
     def test_only_length_maps_to_incomplete(self):
         fn = OpenAIServingResponses._status_from_finish_reason
         self.assertEqual(fn({"type": "length"}), "incomplete")
@@ -538,7 +542,7 @@ class StatusFromFinishReasonTestCase(unittest.TestCase):
             self.assertEqual(fn(other), "completed", other)
 
 
-class BuildOutputTextLogprobsTestCase(unittest.TestCase):
+class BuildOutputTextLogprobsTestCase(CustomTestCase):
     def test_tokens_and_top_logprobs_are_converted(self):
         meta_info = {
             "output_token_logprobs": [(-0.1, 10, "Hello"), (-0.2, 11, " world")],
@@ -566,7 +570,7 @@ class BuildOutputTextLogprobsTestCase(unittest.TestCase):
         self.assertEqual(out[0].top_logprobs, [])
 
 
-class ChatToolChoiceConversionTestCase(unittest.TestCase):
+class ChatToolChoiceConversionTestCase(CustomTestCase):
     def test_conversion(self):
         fn = OpenAIServingResponses._chat_tool_choice
         for s in ("auto", "required", "none"):
@@ -578,7 +582,7 @@ class ChatToolChoiceConversionTestCase(unittest.TestCase):
         self.assertEqual(fn({"type": "web_search"}), "auto")  # non-function -> auto
 
 
-class ShouldEmitNormalTextTestCase(unittest.TestCase):
+class ShouldEmitNormalTextTestCase(CustomTestCase):
     def test_whitespace_suppressed_only_while_a_tool_is_open(self):
         emit = _should_emit_normal_text_as_message
         self.assertFalse(emit("", any_tool_call_in_progress=False))
@@ -588,7 +592,95 @@ class ShouldEmitNormalTextTestCase(unittest.TestCase):
         self.assertTrue(emit("hello", any_tool_call_in_progress=True))
 
 
-class CancelIdempotencyTestCase(unittest.TestCase):
+class EnginePassthroughTestCase(CustomTestCase):
+    """``require_reasoning`` and ``skip_special_tokens`` reach the engine through
+    multi-hop plumbing with no type contract binding the hops, so a refactor can
+    silently drop either one. Both failures are quiet: reasoning stops being
+    deferred past ``</think>``, or tool-call markers get detokenized away and
+    every tool parse fails. These pin the wire values."""
+
+    def _capture(self, serving, request):
+        # Let the real _process_messages run: it is the hop that turns
+        # skip_special_tokens off, so mocking it would make that assertion vacuous.
+        # chat_template_name=None routes it through the tokenizer's template
+        # (mocked) instead of the conversation registry, which has no fixture entry.
+        serving.default_chat_template_kwargs = {}
+        serving.template_manager.chat_template_name = None
+        captured = {}
+
+        async def fake_generate(
+            request_id,
+            request_prompt,
+            adapted_request,
+            sampling_params,
+            context,
+            **kwargs,
+        ):
+            captured["adapted_request"] = adapted_request
+            captured["sampling_params"] = sampling_params
+            context.append_output(
+                {
+                    "text": "ok",
+                    "meta_info": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                    },
+                }
+            )
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        asyncio.run(serving.create_responses(request))
+        return captured
+
+    def test_require_reasoning_forwarded_when_reasoning_parser_configured(self):
+        serving = make_serving()
+        serving.reasoning_parser = "deepseek-r1"
+        serving.template_manager.force_reasoning = True
+
+        captured = self._capture(
+            serving, ResponsesRequest(model="x", input="hi", store=False)
+        )
+
+        self.assertTrue(captured["adapted_request"].require_reasoning)
+
+    def test_require_reasoning_false_without_reasoning_parser(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+
+        captured = self._capture(
+            serving, ResponsesRequest(model="x", input="hi", store=False)
+        )
+
+        self.assertFalse(captured["adapted_request"].require_reasoning)
+
+    def test_skip_special_tokens_disabled_for_tool_requests(self):
+        # _process_messages turns it off so tool-call markers survive detokenize;
+        # create_responses must re-apply it to the engine sampling dict.
+        serving = make_serving()
+        serving.tool_call_parser = "qwen25"
+
+        captured = self._capture(
+            serving,
+            ResponsesRequest(
+                model="x",
+                input="weather",
+                store=False,
+                tools=[
+                    {
+                        "type": "function",
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+            ),
+        )
+
+        self.assertFalse(captured["sampling_params"]["skip_special_tokens"])
+
+
+class CancelIdempotencyTestCase(CustomTestCase):
     def test_cancel_terminal_response_returns_it_not_error(self):
         from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
 
@@ -607,8 +699,31 @@ class CancelIdempotencyTestCase(unittest.TestCase):
         self.assertIs(out, resp)
         self.assertEqual(out.status, "cancelled")
 
+    def test_cancel_completed_response_returns_it_not_error(self):
+        """Pins the behavior change: cancelling an already-completed (never
+        background) response returns 200 with the response instead of the former
+        400 "Cannot cancel a synchronous response"."""
+        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
 
-class StreamingLogprobsRejectionTestCase(unittest.TestCase):
+        serving = make_serving()
+        resp = ResponsesResponse.from_request(
+            ResponsesRequest(model="x", input="hi", store=False),
+            sampling_params={},
+            model_name="x",
+            created_time=0,
+            output=[],
+            status="completed",
+            usage=None,
+        )
+        serving.response_store[resp.id] = resp
+
+        out = asyncio.run(serving.cancel_responses(resp.id))
+
+        self.assertIs(out, resp)
+        self.assertEqual(out.status, "completed")
+
+
+class StreamingLogprobsRejectionTestCase(CustomTestCase):
     def test_stream_with_logprobs_include_rejected(self):
         import orjson
 
@@ -626,13 +741,16 @@ class StreamingLogprobsRejectionTestCase(unittest.TestCase):
         self.assertIn("streaming mode", body["error"]["message"])
 
 
-class MultiToolCallStreamingOrderTestCase(unittest.TestCase):
+class MultiToolCallStreamingOrderTestCase(CustomTestCase):
+    def setUp(self):
+        self.serving = make_serving()
+        self.serving.tool_call_parser = "qwen3_coder"
+        self.serving.reasoning_parser = None
+
     def test_prior_tool_call_done_before_next_added(self):
         from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 
-        serving = make_serving()
-        serving.tool_call_parser = "qwen3_coder"
-        serving.reasoning_parser = None
+        serving = self.serving
 
         det = Qwen3CoderDetector()
         s, e = det.tool_call_start_token, det.tool_call_end_token
@@ -714,9 +832,7 @@ class MultiToolCallStreamingOrderTestCase(unittest.TestCase):
         prose textually preceded the call."""
         from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 
-        serving = make_serving()
-        serving.tool_call_parser = "qwen3_coder"
-        serving.reasoning_parser = None
+        serving = self.serving
 
         det = Qwen3CoderDetector()
         s, e = det.tool_call_start_token, det.tool_call_end_token

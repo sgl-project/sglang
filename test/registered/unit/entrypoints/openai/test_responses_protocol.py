@@ -5,11 +5,12 @@ from utils import make_serving  # noqa: F401 — bootstrap import
 
 from sglang.srt.entrypoints.openai.protocol import ResponsesRequest, UsageInfo
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
-class ResponsesRequestTestCase(unittest.TestCase):
+class ResponsesRequestTestCase(CustomTestCase):
     def test_function_tool_accepted(self):
         request = ResponsesRequest(
             model="x",
@@ -89,7 +90,7 @@ class ResponsesRequestTestCase(unittest.TestCase):
         self.assertEqual(request.tools[0].tools[0]["name"], "apply_patch")
 
 
-class ResponsesSamplingParamsTestCase(unittest.TestCase):
+class ResponsesSamplingParamsTestCase(CustomTestCase):
     def test_processed_stop_and_tool_constraint_propagate(self):
         request = ResponsesRequest(model="x", input="call the tool", store=False)
         params = request.to_sampling_params(
@@ -160,7 +161,7 @@ class ResponsesSamplingParamsTestCase(unittest.TestCase):
             )
 
 
-class IncludeOutputLogprobsTestCase(unittest.TestCase):
+class IncludeOutputLogprobsTestCase(CustomTestCase):
     def test_detected_only_for_logprobs_include(self):
         def has(include):
             return ResponsesRequest(
@@ -172,7 +173,7 @@ class IncludeOutputLogprobsTestCase(unittest.TestCase):
         self.assertFalse(has(["reasoning.encrypted_content"]))
 
 
-class ThinkingControlTestCase(unittest.TestCase):
+class ThinkingControlTestCase(CustomTestCase):
     def test_effort_values_accepted(self):
         for effort in ("none", "minimal", "low", "medium", "high"):
             req = ResponsesRequest(
@@ -219,7 +220,7 @@ class ThinkingControlTestCase(unittest.TestCase):
         self.assertTrue(req.chat_template_kwargs["enable_thinking"])
 
 
-class ResponsesResponseFromRequestTestCase(unittest.TestCase):
+class ResponsesResponseFromRequestTestCase(CustomTestCase):
     def test_requested_text_format_is_echoed(self):
         from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
 
@@ -343,7 +344,7 @@ class ResponsesResponseFromRequestTestCase(unittest.TestCase):
         )
 
 
-class InputItemStringIdTestCase(unittest.TestCase):
+class InputItemStringIdTestCase(CustomTestCase):
     """A response.output item replayed into input (string id + content) must
     keep its content rather than collapse to an item-reference."""
 
@@ -378,7 +379,7 @@ class InputItemStringIdTestCase(unittest.TestCase):
         )
 
 
-class ToolChoiceObjectFormTestCase(unittest.TestCase):
+class ToolChoiceObjectFormTestCase(CustomTestCase):
     def test_named_function_object_accepted(self):
         req = ResponsesRequest(
             model="x",
