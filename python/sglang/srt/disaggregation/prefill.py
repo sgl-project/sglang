@@ -186,7 +186,8 @@ class PrefillBootstrapQueue:
         layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
         layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
         transfer_draft_cache = (
-            not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1
+            (self.pp_size <= 1 or self.pp_rank == self.pp_size - 1)
+            and (not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1)
         )
         kv_args.prefill_start_layer = (
             getattr(
