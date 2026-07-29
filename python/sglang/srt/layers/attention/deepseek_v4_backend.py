@@ -1757,14 +1757,16 @@ class DeepseekV4AttnBackend(
         compress_ratio: int,
         attn_sink: torch.Tensor,
     ) -> torch.Tensor:
-        """MXFP4 decode: dequant + attention for SWA (fused kernel) and extras (SDPA)."""
+        """MXFP4 decode: fused kernel for SWA, dequant+SDPA for C4/C128 extras."""
         from sglang.jit_kernel.dsv4.mxfp4_decode import mxfp4_decode_attention
         from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
             MXFP4_BYTES_PER_TOKEN,
             MXFP4_TOTAL_DIM,
+            dequantize_dsv4_mxfp4_k_cache_paged,
         )
 
         N_heads = q.shape[0]
+        dev = q.device
         if q.ndim >= 3:
             q = q.squeeze(1)  # [N, 1, 512] → [N, 512]
         assert q.ndim == 2 and q.shape[1] == MXFP4_TOTAL_DIM
@@ -1782,41 +1784,80 @@ class DeepseekV4AttnBackend(
         swa_page_indices = _match(swa_page_indices, 0)
         swa_topk_lengths = _match(swa_topk_lengths, 1)
         extra_indices = _match(extra_indices, -1)
+        extra_topk_lengths = _match(extra_topk_lengths, 1)
         attn_sink = _match(attn_sink, 0.0)
 
-        swa_physical_page_size = self.token_to_kv_pool.swa_page_size
-        swa_window = 128  # DSV4 SWA attention window (tokens per page)
-
-        # SWA: use fused decode kernel (one page per head for standard SWA)
-        k_cache_flat = swa_k_cache.view(-1, MXFP4_BYTES_PER_TOKEN)
-        page_ratio = swa_physical_page_size // swa_window
-        swa_kernel_indices = (
-            (swa_page_indices[:, 0] * page_ratio).to(torch.int32).contiguous()
+        has_extras = (
+            extra_k_cache is not None
+            and extra_indices is not None
+            and bool((extra_topk_lengths > 0).any().item())
         )
 
-        out = mxfp4_decode_attention(
-            q=q,
-            k_cache=k_cache_flat,
-            page_indices=swa_kernel_indices,
-            sm_scale=self.softmax_scale,
-            page_size=swa_window,
-            attn_sink=attn_sink if attn_sink is not None else None,
-        )
+        if not has_extras:
+            # ── SWA-only (compress_ratio=0): use fused decode kernel ────
+            swa_physical_page_size = self.token_to_kv_pool.swa_page_size
+            swa_window = 128  # DSV4 SWA attention window
+            k_cache_flat = swa_k_cache.view(-1, MXFP4_BYTES_PER_TOKEN)
+            page_ratio = swa_physical_page_size // swa_window
+            swa_kernel_indices = (
+                (swa_page_indices[:, 0] * page_ratio).to(torch.int32).contiguous()
+            )
+            return mxfp4_decode_attention(
+                q=q,
+                k_cache=k_cache_flat,
+                page_indices=swa_kernel_indices,
+                sm_scale=self.softmax_scale,
+                page_size=swa_window,
+                attn_sink=attn_sink if attn_sink is not None else None,
+            )
 
-        # C4/C128 extra pages: not yet supported with fused MXFP4 kernel.
-        # The fused kernel computes SWA-only attention; adding extra attention
-        # scores would require access to the kernel's internal softmax state.
-        # For now, raise so the unsupported case is explicit.
-        if extra_k_cache is not None and extra_indices is not None:
-            has_extras = bool((extra_topk_lengths > 0).any().item())
-            if has_extras:
-                raise NotImplementedError(
-                    "MXFP4 decode does not yet support C4/C128 compressed "
-                    "attention.  Use SWA-only layers (compress_ratio=0) or "
-                    "disable MXFP4 KV cache."
-                )
+        # ── C4/C128: dequant SWA + extra pages → SDPA per head ──────────
+        q_f32 = q.float()  # [N_heads, 512]
+        out = torch.zeros(N_heads, MXFP4_TOTAL_DIM, dtype=torch.float32, device=dev)
 
-        return out
+        for h in range(N_heads):
+            qi = q_f32[h]  # [512]
+
+            swa_topk = int(swa_topk_lengths[h].item())
+            extra_topk = int(extra_topk_lengths[h].item())
+
+            swa_pids = swa_page_indices[h, :swa_topk].long()
+            swa_pids = swa_pids[swa_pids >= 0]
+            extra_pids = extra_indices[h, :extra_topk].long()
+            extra_pids = extra_pids[extra_pids >= 0]
+
+            # Dequant each page and concatenate K rows
+            k_parts = []
+            for pid in swa_pids:
+                kp = dequantize_dsv4_mxfp4_k_cache_paged(
+                    swa_k_cache,
+                    pid.unsqueeze(0),
+                    self.token_to_kv_pool.swa_page_size,
+                )  # [1, 1, 512]
+                k_parts.append(kp[0, 0, :])
+            if extra_k_cache is not None:
+                extra_page_size = self.token_to_kv_pool.page_size // compress_ratio
+                for pid in extra_pids:
+                    kp = dequantize_dsv4_mxfp4_k_cache_paged(
+                        extra_k_cache,
+                        pid.unsqueeze(0),
+                        extra_page_size,
+                    )  # [1, 1, 512]
+                    k_parts.append(kp[0, 0, :])
+
+            if not k_parts:
+                continue
+
+            k_all = torch.stack(k_parts).float()  # [T, 512]
+            scores = (qi.unsqueeze(0) @ k_all.T).squeeze(0) * self.softmax_scale  # [T]
+
+            # Attn_sink: virtual token with V=0
+            sink_val = float(attn_sink[h])
+            scores_full = torch.cat([scores, torch.tensor([sink_val], device=dev)])
+            weights = torch.softmax(scores_full, dim=0)[: scores.numel()]
+            out[h] = (weights.unsqueeze(0) @ k_all).squeeze(0)
+
+        return out.to(torch.bfloat16)
 
     def _forward_prefill_sparse(
         self,
