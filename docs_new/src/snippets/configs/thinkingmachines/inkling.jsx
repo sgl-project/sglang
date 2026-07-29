@@ -26,11 +26,26 @@ export const config = {
   strategies: [
     { id: "balanced",     label: "Balanced"                  },
     { id: "mtp",          label: "MTP"                        },
+    { id: "dspark",       label: "DSpark"                     },
     { id: "long_context", label: "Long Context (MXFP8 KV)"    },
   ],
   nodesOptions: [
     { id: "single",  label: "Single Node" },
     { id: "multi-2", label: "Multi-Nodes" },
+  ],
+
+  // Eval set rendered in the benchmark card, keyed to per-cell `accuracy` in
+  // inkling-benchmarks.jsx. All measured at reasoning_effort `max` (0.99).
+  // AIME25 = pass@1 averaged over 8 repeats; NIAH = single-needle retrieval at
+  // that context length; HLE = self-judged on the text-only subset.
+  accuracyLabels: [
+    ["bfcl_pct",      "BFCL (EXACT)",    "%"],
+    ["mmau_pct",      "MMAU",            "%"],
+    ["mmmu_pro_pct",  "MMMU-Pro",        "%"],
+    ["aime25_pct",    "AIME25 (pass@1)", "%"],
+    ["niah_512k_pct", "NIAH @512K",      "%"],
+    ["niah_1m_pct",   "NIAH @1M",        "%"],
+    ["hle_pct",       "HLE",             "%"],
   ],
 
   // HF repos under the thinkingmachines org.
@@ -59,7 +74,10 @@ export const config = {
 
   // NVIDIA: two multi-arch CUDA builds (inkling-cu12 / inkling-cu13) — pick by your
   // CUDA version, not by GPU. AMD: inkling-rocm700-mi35x. Panel defaults to cu13.
+  // The DSpark tier needs its own preview build (DSpark isn't in the inkling-cu1x
+  // images yet), so it takes a `hw|quant|strategy` key.
   dockerImages: {
+    "b200|nvfp4|dspark": "lmsysorg/sglang:dev-cu13-inkling-dspark",
     h200:  "lmsysorg/sglang:inkling-cu13",
     b200:  "lmsysorg/sglang:inkling-cu13",
     b300:  "lmsysorg/sglang:inkling-cu13",
@@ -669,6 +687,49 @@ export const config = {
       ],
     },
     // ====================================================================
+    // DSpark (speculative decoding) — separate draft checkpoint
+    // (RadixArk/Inkling-DSpark-Preview, served unquantized) instead of Inkling's
+    // own MTP head, so it needs a build carrying DSpark support: the
+    // `dev-cu13-inkling-dspark` image (see the dockerImages key above).
+    // The draft weights sit outside the FP4 target, hence mem-fraction 0.68.
+    // B200 verified end-to-end.
+    // ====================================================================
+    {
+      match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
+      verified: true,
+      env: [
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--quantization modelopt_fp4",
+        "--attention-backend fa4",
+        "--page-size 128",
+        "--fp4-gemm-backend flashinfer_trtllm",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--enable-torch-symm-mem",
+        "--mamba-radix-cache-strategy extra_buffer",
+        "--mem-fraction-static 0.68",
+        "--swa-full-tokens-ratio 0.1",
+        "--mamba-full-memory-ratio 0.1",
+        "--max-running-requests 68",
+        "--reasoning-parser inkling",
+        "--tool-call-parser inkling",
+        "--skip-server-warmup",
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path RadixArk/Inkling-DSpark-Preview",
+        "--speculative-draft-model-quantization unquant",
+        "--chunked-prefill-size 8192",
+        "--cuda-graph-max-bs-prefill 8192",
+        "--disable-flashinfer-autotune",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
     // GB300 BF16 — 2x GB300 nodes (4 GPUs each) over MNNVL. The NCCL_MNNVL /
     // NVLS / CUMEM envs are required: 2-node NCCL init hangs without them.
     // MTP on BF16 requires the v3 MTP checkpoint + an SGLang revision with
@@ -755,7 +816,9 @@ export const config = {
         "--moe-runner-backend flashinfer_trtllm_routed",
         "--enable-torch-symm-mem",
         "--mamba-radix-cache-strategy extra_buffer",
-        "--mem-fraction-static 0.85",
+        // BF16 weights are large on B300 — 0.85 caps the token pool near ~315k
+        // and rejects longer requests; 0.93 fits the full 1M context.
+        "--mem-fraction-static 0.93",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
         "--enable-multimodal",
@@ -780,7 +843,9 @@ export const config = {
         "--moe-runner-backend flashinfer_trtllm_routed",
         "--enable-torch-symm-mem",
         "--mamba-radix-cache-strategy extra_buffer",
-        "--mem-fraction-static 0.87",
+        // BF16 + MTP is tight on B300: 0.87 boots but caps the token pool near
+        // ~185k; 0.93 fits the full 1M context (matches the Balanced cell).
+        "--mem-fraction-static 0.93",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
         "--enable-multimodal",

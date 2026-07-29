@@ -708,7 +708,9 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             self._draft_worker.draft_attn_backend,
         )
 
-    def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+    def forward_batch_generation(
+        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+    ):
         # Mirrors EAGLEWorkerV2.forward_batch_generation; the only frozen-specific
         # change is the idle draft-input (FrozenKVMTPDraftInput + recurrent hidden
         # size). The draft / seed-based draft-extend hooks are FrozenKVMTPDraftWorker's.
@@ -758,7 +760,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 verify_input = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
-            batch_output = self.verify(batch)
+            batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
             # Publish before draft-extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
