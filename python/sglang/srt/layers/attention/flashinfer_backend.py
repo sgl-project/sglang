@@ -1480,6 +1480,9 @@ class FlashInferAttnBackend(AttentionBackend):
 class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
+        # Plan with the max per-layer head count: FlashInfer bakes num_qo_heads
+        # into the plan, and layers running more heads than planned are
+        # silently corrupted. Over-planning is safe.
         self.num_qo_heads = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
@@ -1749,6 +1752,9 @@ class FlashInferIndicesUpdaterDecode:
 class FlashInferIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
+        # Plan with the max per-layer head count: FlashInfer bakes num_qo_heads
+        # into the plan, and layers running more heads than planned are
+        # silently corrupted. Over-planning is safe.
         self.num_qo_heads = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
