@@ -583,6 +583,8 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
+        if self._hisparse_v2_try_cache_finished_req(req, is_insert, kv_len_to_handle):
+            return
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -604,7 +606,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if is_insert:
             insert_params = InsertParams(
                 prev_prefix_len=req.cache_protected_len,
-                priority=getattr(req, "priority", 0) or 0,
+                priority=req.priority or 0,
             )
 
             # components prepare insert data + return effective cache_len
@@ -649,16 +651,184 @@ class UnifiedRadixCache(BasePrefixCache):
                 start_pos=req.cache_protected_len,
             )
 
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
-            skip_swa=getattr(req, "swa_prefix_lock_released", False),
-        )
+        if not req._hisparse_v2_unlocked:
+            # HiSparse V2 fall-through: the device lock was already released at
+            # admission — releasing again would corrupt lock_ref.
+            self.dec_lock_ref(
+                req.last_node,
+                DecLockRefParams(
+                    swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)
+                ),
+                skip_swa=getattr(req, "swa_prefix_lock_released", False),
+            )
 
         # cleanup
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
+            )
+
+    def _hisparse_v2_try_cache_finished_req(
+        self, req: Req, is_insert: bool, kv_len_to_handle: int
+    ) -> bool:
+        """HiSparse V2 arm of cache_finished_req; True = fully handled here.
+
+        The page-aligned prefix [0, cache_protected_len) is owned by the
+        radix tree and managed by HiCache eviction (its lock was released
+        at admission — cache_finished_req must never dec_lock_ref again;
+        see the `_hisparse_v2_unlocked` guard there).
+
+        If the prefix is still fully device-resident (no eviction
+        sentinel), return False so the standard insert path runs and the
+        decode output becomes a reusable prefix (multi-turn). This is safe
+        only without sentinels: _insert_helper's dedup-free and
+        _unevict_node_on_insert would otherwise consume -1 values.
+
+        If any prefix page was evicted (sentinel present), the standard
+        insert cannot run — but the request-owned tail is still valid
+        device KV, so salvage it as a HOST node under the demoted prefix
+        (see _hisparse_v2_cache_decode_output).
+        """
+        if not req._hisparse_v2_unlocked:
+            return False
+        kv_indices_full = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_len_to_handle
+        ]
+        prefix_intact = is_insert and not bool(
+            (kv_indices_full[: req.cache_protected_len] < 0).any().item()
+        )
+        if prefix_intact:
+            return False
+        if is_insert:
+            self._hisparse_v2_cache_decode_output(
+                req, kv_indices_full, kv_len_to_handle
+            )
+        else:
+            # clone() because allocator.free may defer into a free-group
+            # holding a reference while this req_to_token row is reused
+            # by a new request.
+            to_free = kv_indices_full[req.cache_protected_len :].clone()
+            if len(to_free) > 0:
+                self.token_to_kv_pool_allocator.free(to_free)
+        for comp in self._components_tuple:
+            comp.cleanup_after_caching_req(req, is_finished=True)
+        return True
+
+    def _descend_by_keys(self, key: RadixKey) -> tuple[UnifiedTreeNode, int]:
+        """Descend from root matching *key* against node keys only — never
+        reads or writes KV values (safe across evicted nodes, unlike
+        _insert_helper's walk). Splits partial matches. Returns the deepest
+        node covering the matched span and the matched token length."""
+        node = self.tree_core.root_node
+        matched = 0
+        if len(key) == 0:
+            return node, 0
+        child_key = key.child_key(self.page_size)
+        while len(key) > 0 and child_key in node.children:
+            node = node.children[child_key]
+            prefix_len = node.key.match(key, page_size=self.page_size)
+            key = key[prefix_len:]
+            matched += prefix_len
+            if prefix_len < len(node.key):
+                node, action = self.tree_core._split_node(node.key, node, prefix_len)
+                if action is not None:
+                    self._apply_cache_action(action)
+                break
+            if len(key):
+                child_key = key.child_key(self.page_size)
+        return node, matched
+
+    def _hisparse_v2_cache_decode_output(
+        self, req: Req, kv_indices_full: torch.Tensor, kv_len_to_handle: int
+    ) -> None:
+        """Salvage decode-output reuse when the HiSparse V2 protected prefix has
+        eviction holes (sentinel -1 in req_to_token).
+
+        The request-owned tail [cache_protected_len, kv_len) is still valid
+        device KV even though the standard insert cannot run (it would
+        consume the -1 sentinels). Attach it under the (host-backed) prefix
+        chain as a HOST node: create a device child and hand it to
+        _evict_device_leaf, which write_backups and demotes it (or, on host
+        saturation, deletes it via the wb-drop path — sharing its
+        divergence-probe fold, vetoes, and KV-event bookkeeping). The
+        transient device-under-host state would mis-splice match_prefix's
+        device_indices, but it is unobservable: the scheduler thread runs
+        this to completion before any match. Falls back to plain free when
+        the walk comes up short — behavior then matches the old skip path.
+        """
+        protected = req.cache_protected_len
+
+        def _free_from(start: int) -> None:
+            # clone(): allocator.free may defer into a free-group holding a
+            # reference while this req_to_token row is reused.
+            t = kv_indices_full[start:kv_len_to_handle].clone()
+            if len(t) > 0:
+                self.token_to_kv_pool_allocator.free(t)
+
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.tree_core.is_eagle
+        ).page_aligned(self.page_size)
+        aligned_len = len(radix_key)
+        if aligned_len <= protected:
+            _free_from(protected)
+            return
+        # The request-owned span must be hole-free (decode tokens are never
+        # evicted); anything else means unexpected state — conservative free.
+        own = kv_indices_full[protected:aligned_len]
+        if bool((own < 0).any().item()):
+            _free_from(protected)
+            return
+
+        node, matched = self._descend_by_keys(radix_key)
+        if matched < protected:
+            # Our own protected prefix is (partially) gone from the tree —
+            # cannot attach a suffix without its prefix chain.
+            _free_from(protected)
+            return
+
+        # Unaligned tail is never cacheable.
+        if kv_len_to_handle > aligned_len:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices_full[aligned_len:kv_len_to_handle].clone()
+            )
+        # Dedup: [protected, matched) already lives in the tree — free ours.
+        if matched > protected:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices_full[protected:matched].clone()
+            )
+        if matched >= aligned_len:
+            return
+
+        suffix_key = radix_key[matched:]
+        suffix_vals = kv_indices_full[matched:aligned_len].to(
+            dtype=torch.int64, copy=True
+        )
+        new_node = self.tree_core._add_new_node(
+            node, suffix_key, suffix_vals, priority=req.priority or 0
+        )
+
+        # Reuse the eviction path wholesale via the controller orchestration:
+        # evict_device_leaf defers a BackupKV for this fresh unbacked leaf;
+        # execute the D->H backup, then demote on success (host-cached) or
+        # drop on host saturation (the drop vetoes are vacuously true for this
+        # fresh, request-private leaf, so it deletes cleanly).
+        tracker = {ct: 0 for ct in self.tree_components}
+        node_id = new_node.id
+        backup_kv = self._evict_device_leaf(node_id, tracker)
+        if backup_kv is not None:
+            written = self._execute_and_commit_kv_backup(backup_kv, write_back=True)
+            if written > 0:
+                self.writing_check(write_back=True)
+                self._demote(node_id, tracker)
+            else:
+                self._drop_subtree_no_host(node_id, tracker)
+        if new_node.backuped and new_node.evicted:
+            logger.info(
+                "HiSparse V2 finish: host-cached %d decode-output tokens under a "
+                "demoted prefix (req %s)",
+                len(suffix_vals),
+                req.rid,
             )
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
@@ -682,7 +852,7 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params = InsertParams(
             prev_prefix_len=req.cache_protected_len,
             chunked=chunked,
-            priority=getattr(req, "priority", 0) or 0,
+            priority=req.priority or 0,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -1748,9 +1918,31 @@ class UnifiedRadixCache(BasePrefixCache):
                     break
                 finish_count += 1
 
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        # Piggyback a divergence probe on the existing collective (same
+        # tensor, 3 elements instead of 1, zero extra collectives):
+        # write_backup outcomes must be SPMD-deterministic, so the
+        # order-sensitive signature of wb-drop events must be identical
+        # on all ranks; min != max ⇒ the radix trees have forked — fail
+        # loud before the desync surfaces as a collective hang.
+        # TODO(upstream): upstream's MIN-reduce only absorbs ack TIMING
+        # divergence and assumes write-DECISION symmetry unchecked; this
+        # probe is upstream-worthy hardening independent of HiSparse.
+        wb_sig = self.tree_core._wb_fallback_sig
+        probe = torch.tensor(
+            [finish_count, wb_sig, -wb_sig],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self._all_reduce(probe, torch.distributed.ReduceOp.MIN)
+        finish_count = int(probe[0].item())
+        if self.pp_rank == 0:
+            lo, hi = int(probe[1].item()), -int(probe[2].item())
+            if lo != hi:
+                raise RuntimeError(
+                    f"write-back fallback divergence across TP ranks: "
+                    f"local_sig={wb_sig} min={lo} max={hi}; "
+                    f"radix trees have forked — aborting."
+                )
 
         # Process completed acks
         while finish_count > 0:

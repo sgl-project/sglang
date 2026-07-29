@@ -2636,6 +2636,11 @@ class ServerArgs:
     enable_hisparse: A[bool, "Enable hierarchical sparse attention", NS("memory")] = (
         False
     )
+    enable_hisparse_v2: A[
+        bool,
+        "Enable HiSparse V2 (uses HiCache as logical pool, compatible with radix cache)",
+        NS("memory"),
+    ] = False
     hisparse_config: A[
         Optional[str],
         Arg(
@@ -6915,9 +6920,10 @@ class ServerArgs:
 
         # HiSparse selects a different pool class (HiSparseDSATokenToKVPool /
         # HiSparseTokenToKVPoolAllocator) that is not the no-op pool.
-        if self.enable_hisparse:
+        if self.enable_hisparse or self.enable_hisparse_v2:
             raise ValueError(
-                "--prefill-only-disable-kv-cache is incompatible with --enable-hisparse: "
+                "--prefill-only-disable-kv-cache is incompatible with "
+                "--enable-hisparse / --enable-hisparse-v2: "
                 "HiSparse uses a dedicated pool family that is not the no-op MHA pool."
             )
 

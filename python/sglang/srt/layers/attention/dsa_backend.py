@@ -189,6 +189,13 @@ class DSAMetadata:
     # NOTE(dark): This will property be used in:
     # 1. dense decode/prefill, we use paged flash attention, need real_page_table
     # 2. sparse decode/prefill, indexer need real_page_table to compute the score
+    # HiSparse V2 (sparse decode only): holds the HYBRID indexer table —
+    # evicted prefix pages point at expanded-region indexer pages whose ids
+    # exceed kv_buffer's range. Valid only against
+    # index_k_with_scale_buffer; safe because in sparse decode the indexer
+    # is the sole reader (attention consumes the swap-in token-level table,
+    # and the dense/MHA path is disabled whenever a hisparse coordinator
+    # exists — see set_dsa_prefill_impl).
     real_page_table: torch.Tensor
 
     # DSA metadata (dsa prefill are expanded)
@@ -385,6 +392,7 @@ class DeepseekSparseAttnBackend(
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.hisparse_coordinator = model_runner.hisparse_coordinator
+        self.enable_hisparse_v2 = model_runner.enable_hisparse_v2
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
@@ -778,6 +786,40 @@ class DeepseekSparseAttnBackend(
         )
         return page_table[:, strided_indices] // page_size
 
+    def _hisparse_v2_indexer_table(
+        self, req_pool_indices: torch.Tensor, num_pages: int
+    ) -> Optional[torch.Tensor]:
+        """HiSparse V2 hybrid indexer page table (replaces real_page_table).
+
+        Semantics per page slot (derived from req_to_token's first token):
+        - index >= 0 (non-evicted page, decode page, or any page of a
+          non-V2 request): keep the ORIGINAL page id. Base-region page
+          ids are shared between kv_buffer and index_k_with_scale_buffer,
+          so it is valid in both.
+        - index == -1 (evicted prefix page of a V2-admitted request): the
+          attention KV left the device and the physical page may already
+          be reused, so substitute the request's PRIVATE expanded-region
+          indexer page (copied at admission, GPU-resident for the request
+          lifetime). Expanded ids lie BEYOND kv_buffer's range — the
+          hybrid table must only ever be consumed by the indexer
+          (index_k_with_scale_buffer covers the expanded region); in
+          sparse decode the indexer is real_page_table's only reader
+          (attention reads swap_in_selected_pages' token-level output).
+
+        Non-V2 rows are bit-identical to the standard table, so the whole
+        table can be substituted unconditionally in a mixed batch.
+        Returns None when V2 is off, no V2-admitted request is active, or
+        the table is empty — callers then keep the standard table."""
+        if (
+            self.hisparse_coordinator is None
+            or not self.enable_hisparse_v2
+            or num_pages <= 0
+        ):
+            return None
+        return self.hisparse_coordinator.get_indexer_page_table(
+            req_pool_indices, num_pages
+        )
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -1054,6 +1096,14 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        real_page_table = self._transform_table_1_to_real(page_table)
+        if forward_batch.forward_mode.is_decode_or_idle():
+            hisparse_v2_table = self._hisparse_v2_indexer_table(
+                forward_batch.req_pool_indices, real_page_table.shape[1]
+            )
+            if hisparse_v2_table is not None:
+                real_page_table = hisparse_v2_table
+
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1079,7 +1129,7 @@ class DeepseekSparseAttnBackend(
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
             dsa_extend_seq_lens_list=extend_seq_lens_cpu,
-            real_page_table=self._transform_table_1_to_real(page_table),
+            real_page_table=real_page_table,
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
             indexer_k_start_end=indexer_k_start_end,
@@ -1377,6 +1427,11 @@ class DeepseekSparseAttnBackend(
             ]
         else:
             real_page_table = self._transform_table_1_to_real(page_table_1)
+            hisparse_v2_table = self._hisparse_v2_indexer_table(
+                req_pool_indices, real_page_table.shape[1]
+            )
+            if hisparse_v2_table is not None:
+                real_page_table = hisparse_v2_table
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
@@ -1483,6 +1538,22 @@ class DeepseekSparseAttnBackend(
                 seqlens_expanded = cache_seqlens
                 page_indices = None
                 used_fused_metadata_generation = True
+
+            # HiSparse V2: override the fused kernel's real_page_table with
+            # the hybrid table (the fused kernel reads req_to_token, which
+            # holds sentinel -1 for evicted positions).
+            if used_fused_metadata_generation:
+                hisparse_v2_table = self._hisparse_v2_indexer_table(
+                    req_pool_indices,
+                    min(
+                        metadata.real_page_table.shape[1],
+                        (max_len + self.real_page_size - 1) // self.real_page_size,
+                    ),
+                )
+                if hisparse_v2_table is not None:
+                    metadata.real_page_table[
+                        : hisparse_v2_table.shape[0], : hisparse_v2_table.shape[1]
+                    ].copy_(hisparse_v2_table)
 
             if not used_fused_metadata_generation:
                 cache_seqlens = seq_lens.to(torch.int32)
@@ -1701,6 +1772,11 @@ class DeepseekSparseAttnBackend(
         if self.real_page_size > 1:
             if not used_fused_metadata_generation:
                 real_table = self._transform_table_1_to_real(page_indices)
+                hisparse_v2_table = self._hisparse_v2_indexer_table(
+                    req_pool_indices, real_table.shape[1]
+                )
+                if hisparse_v2_table is not None:
+                    real_table = hisparse_v2_table
                 new_rows = real_table.shape[0]
                 new_cols = real_table.shape[1]
                 metadata.real_page_table[:new_rows, :new_cols].copy_(real_table)
@@ -2016,8 +2092,8 @@ class DeepseekSparseAttnBackend(
                 )
 
         # todo hisparse: to cover more backends
-        if self.hisparse_coordinator is not None:
-            # flash_mla_sparse_fwd / tilelang require int32 page indices.
+        if self.hisparse_coordinator is not None and not self.enable_hisparse_v2:
+            # V1: flash_mla_sparse_fwd / tilelang require int32 page indices.
             page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                 page_table_1
             ).to(torch.int32)
@@ -2248,6 +2324,11 @@ class DeepseekSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
         if self.hisparse_coordinator is not None:
+            # V1 and V2 both implement swap_in_selected_pages (same
+            # signature). V2 note: static gate — the kernel must be captured
+            # into CUDA graphs even when no request is V2-active at capture
+            # time; for non-evicted positions it passes req_to_token through,
+            # so it is correct for every request in a mixed batch.
             page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,

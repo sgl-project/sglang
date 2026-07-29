@@ -135,3 +135,92 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         ("dsa_decode_backend", "decode"),
     ]:
         validate_hisparse_dsa_backend(server_args, attr, label)
+
+
+def validate_hisparse_v2(server_args: ServerArgs) -> None:
+    """Validate --enable-hisparse-v2 constraints."""
+    if not server_args.enable_hisparse_v2:
+        return
+
+    if server_args.enable_hisparse:
+        raise ValueError(
+            "--enable-hisparse and --enable-hisparse-v2 are mutually exclusive."
+        )
+
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    hf_config = server_args.get_model_config().hf_config
+    if not is_deepseek_dsa(hf_config):
+        raise ValueError(
+            "--enable-hisparse-v2 only supports DSA models "
+            "(e.g., DeepSeek V3.2, GLM-5)."
+        )
+
+    if not server_args.enable_hierarchical_cache:
+        raise ValueError(
+            "--enable-hisparse-v2 requires --enable-hierarchical-cache "
+            "(HiCache backs the evicted attention KV)."
+        )
+
+    if server_args.disable_radix_cache:
+        raise ValueError(
+            "--enable-hisparse-v2 is incompatible with --disable-radix-cache "
+            "(V2 manages KV lifecycle through the radix tree)."
+        )
+
+    if server_args.hicache_write_policy != "write_back":
+        raise ValueError(
+            "--enable-hisparse-v2 requires --hicache-write-policy write_back "
+            f"(got '{server_args.hicache_write_policy}')."
+        )
+
+    if server_args.speculative_algorithm is not None:
+        raise ValueError(
+            "--enable-hisparse-v2 does not support speculative decoding yet "
+            "(verify/draft page tables are not V2-aware)."
+        )
+
+    if server_args.enable_mixed_chunk:
+        raise ValueError(
+            "--enable-hisparse-v2 does not support --enable-mixed-chunk "
+            "(mixed batches route decode through forward_extend, which "
+            "lacks the dual-source swap-in)."
+        )
+
+    if server_args.enable_streaming_session or server_args.enable_session_radix_cache:
+        raise ValueError(
+            "--enable-hisparse-v2 does not support streaming sessions "
+            "(session lock ownership conflicts with V2's admission-time "
+            "lock release)."
+        )
+
+    if server_args.disaggregation_mode != "null":
+        raise ValueError(
+            "--enable-hisparse-v2 does not support PD disaggregation "
+            "(the decode path bypasses V2 admission)."
+        )
+
+    if server_args.pp_size > 1:
+        raise ValueError(
+            "--enable-hisparse-v2 does not support pipeline parallelism "
+            "(pp_size > 1) yet."
+        )
+
+    if server_args.hicache_mem_layout not in ("page_first", "layer_first"):
+        raise ValueError(
+            "--enable-hisparse-v2 requires --hicache-mem-layout page_first "
+            f"or layer_first (got '{server_args.hicache_mem_layout}'; "
+            "page_first_direct breaks the swap-in host addressing)."
+        )
+
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    kv_cache_dtype = resolved_view(server_args).kv_cache_dtype
+    if kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3"):
+        validate_hisparse_kv_cache_dtype(server_args)
+
+    for attr, label in [
+        ("dsa_prefill_backend", "prefill"),
+        ("dsa_decode_backend", "decode"),
+    ]:
+        validate_hisparse_dsa_backend(server_args, attr, label)

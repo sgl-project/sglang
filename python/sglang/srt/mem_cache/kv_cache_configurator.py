@@ -1124,6 +1124,17 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = DSATokenToKVPool
+
+        # HiSparse V2: expand the indexer buffer by ratio × pool tokens so
+        # decode indexer KV stays on GPU while attention KV is evicted to
+        # host (ratio = hisparse_v2_expansion_ratio, default 1+hicache_ratio;
+        # must stay in lockstep with DefaultPoolConfigurator's cell term).
+        if self.server_args.enable_hisparse_v2:
+            from sglang.srt.mem_cache.sparsity import hisparse_v2_expansion_ratio
+
+            ratio = hisparse_v2_expansion_ratio(self.server_args)
+            pool_kwargs["index_buf_size"] = int(max_total_num_tokens * (1 + ratio))
+
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.server_args.page_size,
@@ -1529,6 +1540,64 @@ class KVCacheConfigurator:
                     )
         return token_to_kv_pool_allocator
 
+    def _estimate_hisparse_v2_overhead(self, max_reqs: int) -> int:
+        """Estimate GPU bytes for HiSparse V2 coordinator auxiliary tensors.
+
+        These tensors are allocated in HiSparseV2Coordinator.__init__ and
+        compete with the KV pool for GPU memory. We deduct this estimate
+        from the KV pool budget so the capacity model accounts for them.
+        ``max_reqs`` must be an upper bound on the final
+        max_running_requests (see the two-pass sizing at the call site).
+        """
+        from sglang.srt.mem_cache.sparsity import (
+            hisparse_v2_device_buffer_tokens,
+            hisparse_v2_top_k,
+        )
+
+        # +1: ReqToTokenPool allocates size + 1 rows (padding row 0), and
+        # the coordinator tensors are sized to that row count.
+        max_reqs = max_reqs + 1
+        max_ctx = self.model_config.context_len
+        top_k = hisparse_v2_top_k(self.server_args, self.model_config)
+        device_buffer = hisparse_v2_device_buffer_tokens(
+            self.server_args, self.model_config
+        )
+        page_size = self.server_args.page_size
+        max_pages_per_req = (max_ctx + page_size - 1) // page_size
+        num_layers = self.model_config.num_hidden_layers
+
+        # _host_locs:            (max_reqs, max_ctx) int64
+        # temp_slots:            (max_reqs, device_buffer) int64
+        # top_k_device_locs_buf: (max_reqs, top_k)   int32
+        # req_to_indexer_page:   (max_reqs, max_pages_per_req) int32
+        # hit cache:             _slot_pos (max_reqs, layers, device_buffer) int32
+        #                        + _plan (max_reqs, top_k) int32
+        #                        + _pos2slot (max_reqs, max_ctx) int32
+        #                        + _plan_scratch (max_reqs, 2*device_buffer+top_k) int32
+        # num_real_reqs:         (1,) int32
+        overhead = (
+            max_reqs * max_ctx * 8  # _host_locs
+            + max_reqs * device_buffer * 8  # temp_slots
+            + max_reqs * top_k * 4  # top_k_device_locs_buffer
+            + max_reqs * max_pages_per_req * 4  # req_to_indexer_page
+            + max_reqs * num_layers * device_buffer * 4  # _slot_pos
+            + max_reqs * top_k * 4  # _plan
+            + max_reqs * max_ctx * 4  # _pos2slot
+            + max_reqs * (2 * device_buffer + top_k) * 4  # _plan_scratch
+            + 4  # num_real_reqs
+        )
+        overhead_mb = overhead / (1 << 20)
+        logger.info(
+            "HiSparse V2 coordinator overhead: %.1f MB "
+            "(max_reqs=%d, max_ctx=%d, top_k=%d, device_buffer=%d)",
+            overhead_mb,
+            max_reqs,
+            max_ctx,
+            top_k,
+            device_buffer,
+        )
+        return overhead
+
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
@@ -1627,6 +1696,32 @@ class KVCacheConfigurator:
     def resolve_max_num_reqs(self, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
+        # HiSparse V2: an admitted request's lifetime device floor is its
+        # temp device-buffer allocation, so at most capacity/device_buffer
+        # concurrent decodes are servable — much tighter than the //2
+        # default, and it bounds the coordinator aux tensors sized by
+        # max_reqs (_host_locs alone is max_reqs × max_ctx × 8 B). The
+        # evictable prefix costs no device floor (V2's concurrency win).
+        if self.server_args.enable_hisparse_v2:
+            from sglang.srt.mem_cache.sparsity import (
+                hisparse_v2_device_buffer_tokens,
+            )
+
+            per_req_gpu_cost = hisparse_v2_device_buffer_tokens(
+                self.server_args, self.model_config
+            )
+            capacity_limit = token_capacity // per_req_gpu_cost
+            if capacity_limit <= 0:
+                raise RuntimeError(
+                    f"HiSparse V2: KV pool capacity ({token_capacity} tokens) "
+                    f"is smaller than one per-request device buffer "
+                    f"({per_req_gpu_cost} tokens); no request could ever run. "
+                    "Increase --max-total-tokens / --mem-fraction-static or "
+                    "reduce hisparse_config device_buffer_size."
+                )
+        else:
+            capacity_limit = token_capacity // 2
+
         # Estimate pool size (used as upper bound when user specifies max_running_requests)
         estimated = int(token_capacity / self.model_config.context_len * 512)
         estimated = max(min(estimated, 4096), 2048)
@@ -1634,10 +1729,10 @@ class KVCacheConfigurator:
         max_num_reqs = self.server_args.max_running_requests
         if max_num_reqs is not None:
             requested_per_worker = max_num_reqs // self.ps.attn_dp_size
-            max_num_reqs = min(requested_per_worker, token_capacity // 2)
+            max_num_reqs = min(requested_per_worker, capacity_limit)
         else:
             requested_per_worker = None
-            max_num_reqs = min(estimated, token_capacity // 2)
+            max_num_reqs = min(estimated, capacity_limit)
 
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
@@ -1672,6 +1767,20 @@ class KVCacheConfigurator:
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
+
+        # HiSparse V2: deduct the coordinator's auxiliary tensors (allocated
+        # in HiSparseV2Coordinator.__init__, outside the KV pool but on the
+        # same GPU) from the KV pool budget.
+        if self.server_args.enable_hisparse_v2:
+            # Two-pass sizing: pass 1 derives a request-count UPPER BOUND
+            # from the undeducted budget (the tensors scale with max_reqs),
+            # pass 2 recomputes from the reduced budget. The final request
+            # count can only shrink, so the estimate never undershoots.
+            probe = self.config_from_budget(available_bytes)
+            reqs_upper = self.resolve_max_num_reqs(probe.max_total_num_tokens)
+            hisparse_v2_overhead = self._estimate_hisparse_v2_overhead(reqs_upper)
+            available_bytes -= hisparse_v2_overhead
+
         config = self.config_from_budget(available_bytes)
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens

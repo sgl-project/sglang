@@ -9,6 +9,9 @@ from sglang.srt.mem_cache.sparsity.core import SparseConfig, SparseCoordinator
 from sglang.srt.mem_cache.sparsity.factory import (
     create_sparse_coordinator,
     get_sparse_coordinator,
+    hisparse_v2_device_buffer_tokens,
+    hisparse_v2_expansion_ratio,
+    hisparse_v2_top_k,
     parse_hisparse_config,
     register_sparse_coordinator,
 )
@@ -24,6 +27,9 @@ __all__ = [
     "SparseCoordinator",
     "create_sparse_coordinator",
     "get_sparse_coordinator",
+    "hisparse_v2_device_buffer_tokens",
+    "hisparse_v2_expansion_ratio",
+    "hisparse_v2_top_k",
     "parse_hisparse_config",
     "register_sparse_coordinator",
 ]

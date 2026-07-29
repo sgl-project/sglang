@@ -398,6 +398,7 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         self.enable_hisparse = server_args.enable_hisparse
+        self.enable_hisparse_v2 = server_args.enable_hisparse_v2
         self.enable_dp_attention = server_args.enable_dp_attention
         self.enable_unified_memory = server_args.enable_unified_memory
 
@@ -1014,6 +1015,17 @@ class Scheduler(
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        if self.enable_hisparse_v2:
+            from sglang.srt.managers.hisparse_v2_coordinator import (
+                HiSparseV2Coordinator,
+            )
+
+            coordinator = self.tp_worker.model_runner.hisparse_coordinator
+            assert isinstance(coordinator, HiSparseV2Coordinator)
+            coordinator.set_tree_cache(self.tree_cache)
+            coordinator.set_decode_producer_stream(self.forward_stream)
+            self.hisparse_coordinator = coordinator
+            return
         if not self.enable_hisparse:
             return
 
@@ -2842,6 +2854,8 @@ class Scheduler(
                 else:
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
+                if self.enable_hisparse_v2:
+                    running_batch.hisparse_coordinator = self.hisparse_coordinator
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -2941,8 +2955,16 @@ class Scheduler(
         if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
             self.tree_cache.check_hicache_events()
 
-        if self.enable_priority_preemption or self.is_hybrid_swa:
+        if (
+            self.enable_priority_preemption
+            or self.is_hybrid_swa
+            or self.enable_hisparse
+            or self.enable_hisparse_v2
+        ):
             # Reset batch_is_full to try preemption with a prefill adder.
+            # HiSparse V1/V2: admitted prefixes are backed up to host and
+            # freed from device DURING decode, so device capacity grows
+            # after a NO_TOKEN latch — admission must be retried every pass.
             running_batch.batch_is_full = False
 
         if (
@@ -3009,6 +3031,11 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            hisparse_v2_budget=(
+                self.hisparse_coordinator.make_admit_budget(self.max_total_num_tokens)
+                if self.enable_hisparse_v2 and self.hisparse_coordinator is not None
+                else None
+            ),
         )
 
         if self.chunked_req is not None:
@@ -3774,7 +3801,7 @@ class Scheduler(
 
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
-        if not self.enable_hisparse:
+        if not self.enable_hisparse and not self.enable_hisparse_v2:
             has_leak, messages = self.invariant_checker._check_all_pools(
                 self.pool_stats_observer.get_pool_stats(),
             )

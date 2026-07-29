@@ -1083,6 +1083,7 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        self._hisparse_v2_unlocked = False
 
     @property
     def seqlen(self) -> int:
@@ -1539,6 +1540,7 @@ class Req(ReqDllmMixin):
         self.mamba_branching_seqlen = None
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
+        self._hisparse_v2_unlocked = False
         self.already_computed = 0
         assert self.kv is None, "expect it is already released"
         self.kv_committed_len = 0
@@ -2686,6 +2688,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         The retraction loop pops from the end of this list, so the least-preferred
         request is retracted first.
+
+        HiSparse V2 admitted requests are placed at the front (most-preferred)
+        because their decode does not need GPU attention KV — retracting them
+        would waste the already-completed prefill + admission work.
         """
         sorted_indices = list(range(len(reqs)))
 
@@ -2694,10 +2700,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         def length_key(req: Req) -> Tuple[int, int]:
             return (len(req.output_ids), -len(req.origin_input_ids))
 
+        def hisparse_v2_protected(req: Req) -> bool:
+            return req._hisparse_v2_unlocked
+
         if server_args.retraction_policy == "priority":
             priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
 
-            def retraction_key(req: Req) -> Tuple[int, int, int]:
+            def retraction_key(req: Req) -> Tuple[int, int, int, int]:
                 priority = req.priority
                 if priority is None:
                     priority = (
@@ -2705,7 +2714,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         if server_args.schedule_low_priority_values_first
                         else -sys.maxsize - 1
                     )
-                return (priority * (-priority_sign), *length_key(req))
+                return (
+                    hisparse_v2_protected(req),
+                    priority * (-priority_sign),
+                    *length_key(req),
+                )
 
             sorted_indices.sort(
                 key=lambda i: retraction_key(reqs[i]),
@@ -2714,7 +2727,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return sorted_indices
 
         sorted_indices.sort(
-            key=lambda i: length_key(reqs[i]),
+            key=lambda i: (hisparse_v2_protected(reqs[i]), *length_key(reqs[i])),
             reverse=True,
         )
         return sorted_indices

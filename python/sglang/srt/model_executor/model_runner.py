@@ -293,6 +293,7 @@ class ModelRunner:
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
+        self.enable_hisparse_v2 = server_args.enable_hisparse_v2
 
         self.init_remote_instance_weight_transporter()
 
@@ -778,6 +779,9 @@ class ModelRunner:
         self.graph_shared_output = None
 
     def maybe_init_hisparse_coordinator(self):
+        if self.enable_hisparse_v2:
+            self._init_hisparse_v2_coordinator()
+            return
         if not self.enable_hisparse:
             return
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -800,6 +804,29 @@ class ModelRunner:
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
+        )
+
+    def _init_hisparse_v2_coordinator(self):
+        from sglang.srt.managers.hisparse_v2_coordinator import HiSparseV2Coordinator
+        from sglang.srt.mem_cache.sparsity import (
+            hisparse_v2_device_buffer_tokens,
+            hisparse_v2_top_k,
+        )
+
+        self.hisparse_coordinator = HiSparseV2Coordinator(
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            top_k=hisparse_v2_top_k(self.server_args, self.model_config),
+            device_buffer_tokens=hisparse_v2_device_buffer_tokens(
+                self.server_args, self.model_config
+            ),
+            device=self.device,
+            tp_group=(
+                self.attention_tp_group.cpu_group
+                if self.server_args.enable_dp_attention
+                else self.tp_group.cpu_group
+            ),
         )
 
     def post_capture_resize_kv_pool(self):

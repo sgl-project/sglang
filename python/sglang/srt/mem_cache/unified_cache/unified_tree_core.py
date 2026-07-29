@@ -392,6 +392,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             for ct in self.component_types
         }
 
+        # HiSparse V2: order-sensitive rolling signature of rank-local
+        # write-back drop decisions (folded in drop_subtree_no_host),
+        # cross-checked across ranks in UnifiedRadixCache.writing_check.
+        # Detects same-count-different-node radix forks that a plain
+        # ack-count MIN-reduce would miss.
+        self._wb_fallback_sig = 0
+
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
                 (0,),
@@ -1093,7 +1100,30 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # A failed backup never issues the D->H copy, so the subtree root has
         # no host state and no in-flight DMA reading its device slots.
         assert not node.backuped and node.write_through_pending_id is None
+
+        # HiSparse V2: fold every drop decision AND its outcome into the
+        # order-sensitive cross-rank signature (checked in
+        # UnifiedRadixCache.writing_check). A rank that vetoes while another
+        # drops forks the tree immediately, so the branch taken must be part
+        # of the signature.
+        def _wb_fold(outcome: int) -> None:
+            base = node.component_data[BASE_COMPONENT_TYPE].value
+            n_tokens = len(base) if base is not None else 0
+            self._wb_fallback_sig = (
+                self._wb_fallback_sig * 1000003
+                + (node.id * 31 + n_tokens) * 4
+                + outcome
+            ) % (1 << 31)
+
+        # HiSparse V2 veto (a): node backs an active request's prefix. V2
+        # releases the prefix lock at admission, so such a node has
+        # lock_ref == 0; a copy-less drop would mask live attention positions.
+        guard = getattr(self, "_hisparse_v2_node_active", None)
+        if guard is not None and guard(node):
+            _wb_fold(1)
+            return result
         if any(cd.host_lock_ref > 0 for cd in node.component_data):
+            _wb_fold(2)
             return result
         descendants: list[UnifiedTreeNode] = []
         stack = list(node.children.values())
@@ -1102,9 +1132,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if any(
                 cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
             ):
+                _wb_fold(2)
                 return result
             descendants.append(cur)
             stack.extend(cur.children.values())
+        _wb_fold(0)
         for desc in reversed(descendants):
             # Host-only by construction: a device descendant would contradict
             # this node being a D-leaf, and D-leaves evict before ancestors.
@@ -1158,6 +1190,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
         """Delete a device leaf that has no host backup, freeing all layers."""
+        # HiSparse V2: notify the coordinator before the device KV is freed.
+        # host_value is None here (unbacked), so the recorded eviction has no
+        # host fallback — _sync_evictions marks those active positions dropped.
+        cb = getattr(self, "_hisparse_v2_on_evict", None)
+        if cb is not None:
+            cb(node)
         self._release_all_component_layers(
             node, StorageMedium.GPU, tracker, device_frees, host_frees
         )
@@ -1230,6 +1268,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
         assert not node.evicted and node.backuped
+        # HiSparse V2: notify the coordinator before the device KV is freed,
+        # while both device value and host_value are present, so it can
+        # snapshot (device_idx, host_idx) and later sentinel active requests'
+        # indexer rows to fetch from host.
+        cb = getattr(self, "_hisparse_v2_on_evict", None)
+        if cb is not None:
+            cb(node)
         trigger = self.components_by_type[BASE_COMPONENT_TYPE]
         self._evict_component_and_detach_lru(
             node,
