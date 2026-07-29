@@ -17,9 +17,16 @@ from transformers import (
     AutoModel,
 )
 
-from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsMetadata,
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
 from sglang.srt.layers.utils import PPMissingLayer
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -36,6 +43,10 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import add_prefix, flatten_nested_list
 
 
+_DEFAULT_IMAGE_TOKEN_OFFSET = 131272
+_DEFAULT_AUDIO_TOKEN_OFFSET = 262344
+
+
 def _init_component_model(
     component_config: Any,
     model_cls: type[nn.Module] | None = None,
@@ -43,6 +54,37 @@ def _init_component_model(
     config_dict = component_config.to_dict()
     config = AutoConfig.for_model(config_dict.pop("model_type"), **config_dict)
     return AutoModel.from_config(config) if model_cls is None else model_cls(config)
+
+
+class _ApertusLogitsProcessor(LogitsProcessor):
+    """Expose impossible input-only Apertus IDs to every logits consumer."""
+
+    def __init__(self, config, input_vocab_size: int) -> None:
+        super().__init__(config)
+        self.input_vocab_size = input_vocab_size
+
+    def _get_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+        embedding_bias: Optional[torch.Tensor] = None,
+        use_logits_buffer: bool = True,
+    ) -> torch.Tensor:
+        logits = super()._get_logits(
+            hidden_states,
+            lm_head,
+            logits_metadata,
+            embedding_bias=embedding_bias,
+            use_logits_buffer=use_logits_buffer,
+        )
+        if logits.shape[-1] < self.input_vocab_size:
+            logits = F.pad(
+                logits,
+                (0, self.input_vocab_size - logits.shape[-1]),
+                value=torch.finfo(logits.dtype).min,
+            )
+        return logits
 
 
 class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
@@ -71,8 +113,12 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
                 )
                 self.audio_tower = _init_component_model(config.audio_tokenizer_config)
 
-        self.image_token_offset = config.image_token_offset
-        self.audio_token_offset = config.audio_token_offset
+        self.image_token_offset = getattr(
+            config, "image_token_offset", _DEFAULT_IMAGE_TOKEN_OFFSET
+        )
+        self.audio_token_offset = getattr(
+            config, "audio_token_offset", _DEFAULT_AUDIO_TOKEN_OFFSET
+        )
         self._input_vocab_size = config.text_config.vocab_size
         self._output_vocab_size = getattr(
             config.text_config,
@@ -100,7 +146,9 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
                 )
             logits_config = copy.copy(self.config)
             logits_config.vocab_size = self._output_vocab_size
-            self.logits_processor = LogitsProcessor(logits_config)
+            self.logits_processor = _ApertusLogitsProcessor(
+                logits_config, self._input_vocab_size
+            )
 
         if not self.pp_group.is_last_rank:
             self.lm_head = PPMissingLayer()
@@ -111,41 +159,9 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
         return self.pattern.pad_input_tokens(input_ids, mm_inputs)
 
     @staticmethod
-    def _item_features(items: List[MultimodalDataItem]) -> List[torch.Tensor]:
-        values = flatten_nested_list([item.feature for item in items])
-        return [value for value in values if isinstance(value, torch.Tensor)]
-
-    @staticmethod
     def _module_device_dtype(module: nn.Module) -> Tuple[torch.device, torch.dtype]:
         parameter = next(module.parameters())
         return parameter.device, parameter.dtype
-
-    def _encode_image_to_llm_ids(self, image: torch.Tensor) -> torch.Tensor:
-        assert self.vision_tower is not None
-        device, dtype = self._module_device_dtype(self.vision_tower)
-        if image.dim() == 3:
-            image = image.unsqueeze(0)
-        with torch.inference_mode():
-            codes = self.vision_tower.encode(image.to(device=device, dtype=dtype))
-        return codes.flatten().to(torch.long) + self.image_token_offset
-
-    def _encode_audio_to_llm_ids(self, audio: torch.Tensor) -> torch.Tensor:
-        assert self.audio_tower is not None
-        device, dtype = self._module_device_dtype(self.audio_tower)
-        if audio.dim() == 2 and audio.shape[0] == 1:
-            audio = audio.squeeze(0)
-        if audio.dim() != 1:
-            raise ValueError(
-                f"Expected one mono audio waveform, got shape {tuple(audio.shape)}"
-            )
-        with torch.inference_mode():
-            output = self.audio_tower.encode(
-                audio.unsqueeze(0).unsqueeze(0).to(device=device, dtype=dtype)
-            )
-        return (
-            output.audio_codes.squeeze(0).squeeze(0).to(torch.long)
-            + self.audio_token_offset
-        )
 
     def _embed_code_ids(self, ids_per_item: List[torch.Tensor]) -> torch.Tensor:
         if not ids_per_item:
@@ -155,45 +171,43 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
                 device=self.model.embed_tokens.weight.device,
                 dtype=self.model.embed_tokens.weight.dtype,
             )
-        lengths = [ids.numel() for ids in ids_per_item]
         all_ids = torch.cat(ids_per_item).to(self.model.embed_tokens.weight.device)
         embeddings = self.model.embed_tokens(all_ids)
-        if embeddings.shape[0] != sum(lengths):
-            raise RuntimeError(
-                "Apertus code embedding lookup returned an unexpected length."
-            )
+
         return embeddings
 
-    def _embed_items(
-        self,
-        items: List[MultimodalDataItem],
-        encode_item,
-    ) -> torch.Tensor:
-        """Embed raw image or audio items in source order."""
-        embeddings = []
-        for item in items:
-            ids_per_item = [
-                encode_item(feature) for feature in self._item_features([item])
-            ]
-            embeddings.append(self._embed_code_ids(ids_per_item))
-        return torch.cat(embeddings, dim=0)
-
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        return self._embed_items(items, self._encode_image_to_llm_ids)
+        assert self.vision_tower is not None
+        device, dtype = self._module_device_dtype(self.vision_tower)
+        image_ids = []
+        for image in flatten_nested_list([item.feature for item in items]):
+            if not isinstance(image, torch.Tensor):
+                continue
+            if image.dim() == 3:
+                image = image.unsqueeze(0)
+            with torch.inference_mode():
+                codes = self.vision_tower.encode(image.to(device=device, dtype=dtype))
+            image_ids.append(
+                codes.flatten().to(torch.long) + self.image_token_offset
+            )
+        return self._embed_code_ids(image_ids)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        return self._embed_items(items, self._encode_audio_to_llm_ids)
-
-    def _pad_output_logits(
-        self, output: LogitsProcessorOutput
-    ) -> LogitsProcessorOutput:
-        if self._pad_logits_to_input_vocab and output.next_token_logits is not None:
-            output.next_token_logits = F.pad(
-                output.next_token_logits,
-                (0, self._input_vocab_size - self._output_vocab_size),
-                value=torch.finfo(output.next_token_logits.dtype).min,
+        assert self.audio_tower is not None
+        device, dtype = self._module_device_dtype(self.audio_tower)
+        audio_ids = []
+        for audio in flatten_nested_list([item.feature for item in items]):
+            if not isinstance(audio, torch.Tensor):
+                continue
+            with torch.inference_mode():
+                output = self.audio_tower.encode(
+                    audio.unsqueeze(0).unsqueeze(0).to(device=device, dtype=dtype)
+                )
+            audio_ids.append(
+                output.audio_codes.squeeze(0).squeeze(0).to(torch.long)
+                + self.audio_token_offset
             )
-        return output
+        return self._embed_code_ids(audio_ids)
 
     @torch.no_grad()
     def forward(
@@ -205,21 +219,6 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> LogitsProcessorOutput:
-        if input_embeds is not None:
-            # The common multimodal path owns input embedding construction. Keep
-            # Apertus's existing external-embedding behavior unchanged.
-            output = super().forward(
-                input_ids,
-                positions,
-                forward_batch,
-                input_embeds=input_embeds,
-                get_embedding=get_embedding,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-            if self.pp_group.is_last_rank and not get_embedding:
-                return self._pad_output_logits(output)
-            return output
-
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -233,18 +232,19 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        if not self.pp_group.is_last_rank:
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                    aux_hidden_states,
+                )
+            else:
+                return self.pooler(hidden_states, forward_batch)
+        else:
             return hidden_states
-        if get_embedding:
-            return self.pooler(hidden_states, forward_batch)
-        output = self.logits_processor(
-            input_ids,
-            hidden_states,
-            self.lm_head,
-            forward_batch,
-            aux_hidden_states,
-        )
-        return self._pad_output_logits(output)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         component_tensors = {}
