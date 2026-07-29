@@ -57,6 +57,19 @@ def _partial_suffix_len(text: str, markers: List[str]) -> int:
     return best
 
 
+# the model sometimes hand-writes a section marker out of ordinary text tokens
+# instead of emitting the atomic special token, e.g. "<|open|>think<|sep|" with no
+# closing ">", so exact-match stripping misses it and it reaches the client
+_SECTION_MARKER_RE = re.compile(
+    r"<\|(?:open|close)\|>(?:think|response|message|tools)(?:<\|sep(?:\|>?)?)?"
+)
+
+
+def strip_section_markers(text: str) -> str:
+    """Drop well-formed and hand-written section markers from a content string."""
+    return _SECTION_MARKER_RE.sub("", text)
+
+
 def _strip_response_wrappers(text: str) -> str:
     open_idx = text.find(RESPONSE_OPEN)
     if open_idx != -1:
@@ -65,10 +78,7 @@ def _strip_response_wrappers(text: str) -> str:
             text = text[open_idx + len(RESPONSE_OPEN) : close_idx]
         else:
             text = text[open_idx + len(RESPONSE_OPEN) :]
-    else:
-        text = text.replace(RESPONSE_CLOSE, "")
-    # a tools close with no matching open is never content
-    return text.replace(MESSAGE_CLOSE, "").replace(TOOLS_CLOSE, "")
+    return strip_section_markers(text)
 
 
 class KimiK3Detector(BaseFormatDetector):

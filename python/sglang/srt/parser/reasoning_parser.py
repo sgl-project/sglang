@@ -7,6 +7,7 @@ from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.function_call.kimik3_detector import (
     _partial_suffix_len,
     _strip_response_wrappers,
+    strip_section_markers,
 )
 from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
@@ -572,8 +573,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
         return StreamingParseResult(normal_text=self._drain_content())
 
-    # think markers included: when the template does not pre-open a think section
-    # the model may still emit a stray close, which lands in the content channel
+    # holdback set: canonical markers whose partial suffix must not be emitted
     _CONTENT_STRIP = (
         THINK_CLOSE,
         THINK_OPEN,
@@ -584,9 +584,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
     )
 
     def _strip_markers(self, text: str) -> str:
-        for marker in self._CONTENT_STRIP:
-            text = text.replace(marker, "")
-        return text
+        return strip_section_markers(text)
 
     def _drain_content(self) -> str:
         buf = self._buffer

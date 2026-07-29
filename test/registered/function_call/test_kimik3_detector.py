@@ -362,6 +362,58 @@ class TestKimiK3ReasoningDetector(unittest.TestCase):
         self.assertEqual(reasoning, "thinking...")
         self.assertNotIn("<|close|>", reasoning + content)
 
+    # the model can hand-write a reopen from plain text tokens: <|open|>think
+    # plus <|sep| with no closing >, reported on #32567 from a b300 deployment
+    HANDWRITTEN_REOPEN = "<|open|>think<|sep|"
+
+    def test_non_stream_handwritten_reopen_before_prose(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        result = detector.detect_and_parse(
+            f"{THINK_CLOSE}{self.HANDWRITTEN_REOPEN}the answer is 4"
+        )
+        self.assertEqual(result.normal_text, "the answer is 4")
+
+    def test_non_stream_handwritten_reopen_before_tools(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        tools_channel = (
+            f"{TOOLS_OPEN}"
+            + _call_block("python", 1, {"code": ("string", "1")})
+            + f"{TOOLS_CLOSE}"
+        )
+        result = detector.detect_and_parse(
+            f"{THINK_CLOSE}{self.HANDWRITTEN_REOPEN}{tools_channel}"
+        )
+        self.assertEqual(result.normal_text, tools_channel)
+
+    def test_streaming_handwritten_reopen_before_tools(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        tools_channel = (
+            f"{TOOLS_OPEN}"
+            + _call_block("python", 1, {"code": ("string", "1")})
+            + f"{TOOLS_CLOSE}"
+        )
+        reasoning, content = self._stream(
+            detector,
+            [THINK_CLOSE, "<|open|>think", "<|sep", "|", tools_channel],
+        )
+        self.assertEqual(content, tools_channel)
+
+    def test_streaming_handwritten_reopen_before_prose(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        reasoning, content = self._stream(
+            detector, [THINK_CLOSE, "<|open|>think<|sep", "|", "plain prose"]
+        )
+        self.assertEqual(content, "plain prose")
+
+    def test_tool_detector_strips_handwritten_marker(self):
+        # the tool detector also owns a content channel when the reasoning
+        # parser is not in the chain
+        from sglang.srt.function_call.kimik3_detector import _strip_response_wrappers
+
+        self.assertEqual(
+            _strip_response_wrappers(f"{self.HANDWRITTEN_REOPEN}hello"), "hello"
+        )
+
     def test_non_stream_stray_tools_close(self):
         # tools close with no matching open, seen leading claude code replies
         detector = KimiK3ReasoningDetector(force_reasoning=False)
