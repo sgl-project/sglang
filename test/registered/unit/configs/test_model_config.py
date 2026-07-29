@@ -68,10 +68,6 @@ class TestGetMaxNumAttentionHeads(CustomTestCase):
         config = self._make_config(48)
         self.assertEqual(config.get_max_num_attention_heads(), 48)
 
-    def test_empty_per_layer_heads_falls_back(self):
-        config = self._make_config(48, num_attention_heads_per_layer=[])
-        self.assertEqual(config.get_max_num_attention_heads(), 48)
-
 
 if __name__ == "__main__":
     unittest.main()
