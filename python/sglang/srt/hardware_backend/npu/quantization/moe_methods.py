@@ -211,17 +211,12 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
         weight.data = npu_format_cast(weight.data).transpose(-1, -2)
 
         weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
-        scale = weight_scale.data.transpose(1, 2)
-        scale = (
-            scale.transpose(-1, -2)
-            .reshape(
-                scale.shape[0],
-                scale.shape[2],
-                scale.shape[1] // 2,
-                2,
-            )
-            .transpose(1, 2)
-        )
+        scale = weight_scale.data.reshape(
+            weight_scale.shape[0],
+            weight_scale.shape[1],
+            weight_scale.shape[2] // 2,
+            2,
+        ).transpose(1, 2)
         weight_scale.data = scale
 
         # The refactored Ascend dispatchers currently support BF16 and INT8.
