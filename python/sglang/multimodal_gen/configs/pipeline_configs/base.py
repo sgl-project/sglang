@@ -7,7 +7,7 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import PIL
@@ -396,6 +396,9 @@ class PipelineConfig:
     def supports_native_grouped_requests(self):
         """Return whether dynamic batches should run as grouped Req lists."""
         return False
+
+    # Leading stages run as a group before per-request outputs are yielded.
+    num_grouped_prefix_stages: ClassVar[int] = 0
 
     def estimate_request_cost(self, batch) -> float:
         """Return the relative cost used for batching admission caps.

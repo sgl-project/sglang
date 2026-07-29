@@ -72,6 +72,11 @@ _MAX_RECV_REQS_PER_POLL = 1024
 _BATCH_METRICS_LOG_INTERVAL = 5
 
 
+@dataclasses.dataclass(frozen=True)
+class _SequentiallyReturnedOutputs:
+    outputs: Iterator[OutputBatch]
+
+
 class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisaggMixin):
     """
     Runs the main event loop for the rank 0 worker.
@@ -249,7 +254,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
     def _dispatch_items(
         self, items: list[tuple[bytes | None, Any]]
-    ) -> OutputBatch | list[OutputBatch]:
+    ) -> OutputBatch | list[OutputBatch] | _SequentiallyReturnedOutputs:
         """Dispatch ready queue items; several plain `Req`s form one dynamic batch."""
         reqs = [item[1] for item in items]
         if len(reqs) > 1 and all(isinstance(req, Req) for req in reqs):
@@ -330,8 +335,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     error_msg=f"Dynamic batching failed: {e}",
                 )
 
-    def _execute_generation_grouped(self, reqs: List[Req]) -> List[OutputBatch]:
+    def _execute_generation_grouped(
+        self, reqs: List[Req]
+    ) -> List[OutputBatch] | _SequentiallyReturnedOutputs:
         batch_size = len(reqs)
+        if self.server_args.pipeline_config.num_grouped_prefix_stages:
+            return _SequentiallyReturnedOutputs(
+                self._iter_grouped_outputs_sequentially(reqs)
+            )
+
         try:
             output_batch = self.worker.execute_forward(reqs)
             if output_batch.error:
@@ -371,6 +383,18 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 reqs=reqs,
                 error_msg=f"Native grouped execution failed: {e}",
             )
+
+    def _iter_grouped_outputs_sequentially(
+        self, reqs: List[Req]
+    ) -> Iterator[OutputBatch]:
+        yield from self.worker.execute_forward_sequentially(reqs)
+        logger.info(
+            "Processed native grouped batch sequentially: %d/%d request(s) "
+            "with max_delay=%.2fms",
+            len(reqs),
+            self._batching_max_size,
+            self._batching_delay_s * 1000.0,
+        )
 
     def _execute_generation_sequential(self, reqs: List[Req]) -> List[OutputBatch]:
         return [self.worker.execute_forward([req]) for req in reqs]
@@ -658,6 +682,52 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 output_batch, "Scheduler.return_result.send"
             ):
                 self.receiver.send_multipart([identity, b"", payload])
+
+    def _return_item_result(
+        self,
+        item: tuple[bytes | None, Any],
+        output_batch: OutputBatch,
+    ) -> None:
+        identity, processed_req = item
+        is_warmup = is_warmup_req(processed_req)
+        self._log_warmup_result(output_batch, processed_req, is_warmup)
+
+        if self._should_return_lightweight_warmup_result(processed_req):
+            output_batch.drop_payload_for_warmup()
+            self.return_result(output_batch, identity, should_not_return=False)
+        else:
+            self.return_result(output_batch, identity, should_not_return=is_warmup)
+
+    def _return_results_sequentially(
+        self,
+        items: list[tuple[bytes | None, Any]],
+        outputs: Iterator[OutputBatch],
+    ) -> None:
+        output_iter = iter(outputs)
+        for index, item in enumerate(items):
+            try:
+                output_batch = next(output_iter)
+            except StopIteration:
+                error = (
+                    "Grouped execution returned fewer outputs than requests "
+                    "while processing sequentially."
+                )
+                logger.error(error)
+                for remaining_item in items[index:]:
+                    self._return_item_result(remaining_item, OutputBatch(error=error))
+                return
+            except Exception as e:
+                logger.error(
+                    "Failed to execute grouped requests sequentially: %s",
+                    e,
+                    exc_info=True,
+                )
+                error = f"Failed to execute grouped requests sequentially: {e}"
+                for remaining_item in items[index:]:
+                    self._return_item_result(remaining_item, OutputBatch(error=error))
+                return
+
+            self._return_item_result(item, output_batch)
 
     @contextmanager
     def _record_return_stage(
@@ -1086,6 +1156,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 )
                 handler_result = OutputBatch(error=str(e))
 
+            if isinstance(handler_result, _SequentiallyReturnedOutputs):
+                try:
+                    self._return_results_sequentially(items, handler_result.outputs)
+                except zmq.ZMQError as e:
+                    logger.error(f"ZMQ error sending replies sequentially: {e}")
+                continue
+
             if isinstance(handler_result, list):
                 output_batches = handler_result
             else:
@@ -1109,25 +1186,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
             # 3. return results
             try:
-                for (identity, processed_req), output_batch in zip(
-                    items, output_batches, strict=True
-                ):
-                    is_warmup = is_warmup_req(processed_req)
-                    self._log_warmup_result(output_batch, processed_req, is_warmup)
-
-                    should_return_lightweight_warmup_result = (
-                        self._should_return_lightweight_warmup_result(processed_req)
-                    )
-                    if should_return_lightweight_warmup_result:
-                        # internal prewarm is a real-path request; reply but drop payloads
-                        output_batch.drop_payload_for_warmup()
-                        self.return_result(
-                            output_batch, identity, should_not_return=False
-                        )
-                    else:
-                        self.return_result(
-                            output_batch, identity, should_not_return=is_warmup
-                        )
+                for item, output_batch in zip(items, output_batches, strict=True):
+                    self._return_item_result(item, output_batch)
             except zmq.ZMQError as e:
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")

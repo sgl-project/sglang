@@ -9,7 +9,7 @@ import tempfile
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Union
+from typing import Any, Callable, Iterator, List, Union
 
 import numpy as np
 import torch
@@ -347,6 +347,27 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             error_context=f"request {req.request_id}",
         )
 
+    def execute_forward_sequentially(self, batch: list[Req]) -> Iterator[OutputBatch]:
+        """Yield grouped results after each request finishes its terminal stage."""
+        assert self.pipeline is not None
+        results = self.pipeline.forward_batch_sequentially(batch, self.server_args)
+        group_start_time = time.monotonic()
+
+        for req in batch:
+            output_batch = self._execute_forward_common(
+                req,
+                forward_fn=lambda results=results: next(results),
+                log_reqs=[req],
+                return_req=False,
+                save_output_paths=lambda output_batch, req=req: self._save_output_paths(
+                    req, output_batch
+                ),
+                error_context=f"grouped request {req.request_id}",
+                execution_start_time=group_start_time,
+            )
+            assert isinstance(output_batch, OutputBatch)
+            yield output_batch
+
     def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch | Req:
         """Execute expanded multi-output requests as one grouped forward."""
         # TODO: support early return or mix-stage execution for reqs in a group
@@ -372,6 +393,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return_req: bool,
         save_output_paths: Callable[[OutputBatch], None],
         error_context: str,
+        execution_start_time: float | None = None,
     ) -> OutputBatch | Req:
         """
         Args:
@@ -382,7 +404,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if self.rank == 0 and not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
 
-            start_time = time.monotonic()
+            start_time = (
+                execution_start_time
+                if execution_start_time is not None
+                else time.monotonic()
+            )
             self._realtime_sessions.attach(req)
 
             # capture memory baseline for each req in grouped forward on rank-0

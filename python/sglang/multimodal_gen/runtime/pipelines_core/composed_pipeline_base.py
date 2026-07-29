@@ -9,7 +9,7 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Literal, cast
+from typing import Any, Callable, Iterator, Literal, cast
 
 import torch
 from tqdm import tqdm
@@ -1026,4 +1026,27 @@ class ComposedPipelineBase(ABC):
 
         return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
+        )
+
+    @torch.no_grad()
+    def forward_batch_sequentially(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> Iterator[OutputBatch]:
+        """Yield grouped outputs as each terminal-stage invocation completes."""
+        if len(batches) == 1:
+            yield self.forward(batches[0], server_args)
+            return
+
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+        grouped_stage_count = server_args.pipeline_config.num_grouped_prefix_stages
+        yield from self.executor.execute_group_sequentially_with_profiling(
+            self.stages,
+            batches,
+            server_args,
+            grouped_stage_count=grouped_stage_count,
         )

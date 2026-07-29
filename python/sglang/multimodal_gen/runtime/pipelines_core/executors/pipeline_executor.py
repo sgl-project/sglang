@@ -152,6 +152,23 @@ class PipelineExecutor(ABC):
                 batches = self.execute_group(stages, batches, server_args)
         return batches
 
+    def execute_group_sequentially_with_profiling(
+        self,
+        stages: List["PipelineStage"],
+        batches: list[Req],
+        server_args: ServerArgs,
+        grouped_stage_count: int,
+    ):
+        """Run a grouped prefix, then yield each request after its tail completes."""
+        with self.profile_execution(batches[0], dump_rank=0):
+            with current_platform.inference_mode():
+                yield from self.execute_group_sequentially(
+                    stages,
+                    batches,
+                    server_args,
+                    grouped_stage_count=grouped_stage_count,
+                )
+
     @staticmethod
     @contextlib.contextmanager
     def _stage_execution_context(stage: "PipelineStage", server_args: ServerArgs):
@@ -244,6 +261,35 @@ class PipelineExecutor(ABC):
         for stage in stages:
             batches = stage.run_grouped_requests(batches, server_args)
         return batches
+
+    def execute_group_sequentially(
+        self,
+        stages: List["PipelineStage"],
+        batches: list[Req],
+        server_args: ServerArgs,
+        grouped_stage_count: int,
+    ):
+        """Yield outputs after a shared grouped prefix and per-request tails."""
+        if grouped_stage_count:
+            batches = self.execute_group(
+                stages[:grouped_stage_count], batches, server_args
+            )
+
+        remaining_stages = stages[grouped_stage_count:]
+        for batch in batches:
+            try:
+                yield self.execute(remaining_stages, batch, server_args)
+            except Exception as e:
+                logger.error(
+                    "Independent grouped tail failed for request %s: %s",
+                    batch.request_id,
+                    e,
+                    exc_info=True,
+                )
+                yield OutputBatch(
+                    error=f"Error executing grouped request {batch.request_id}: {e}",
+                    metrics=batch.metrics,
+                )
 
     @contextlib.contextmanager
     def profile_execution(self, batch: Req, dump_rank: int = 0):
