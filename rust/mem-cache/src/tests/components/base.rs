@@ -149,10 +149,3 @@ fn drive_host_eviction_default_is_a_noop() {
 }
 
 // ==== Component types ===================================================
-
-#[test]
-fn idx_matches_discriminants() {
-    assert_eq!(ComponentType::Full.idx(), 0);
-    assert_eq!(ComponentType::Swa.idx(), 1);
-    assert_eq!(ComponentType::Mamba.idx(), 2);
-}

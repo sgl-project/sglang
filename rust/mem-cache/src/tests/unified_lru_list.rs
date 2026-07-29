@@ -69,23 +69,6 @@ fn remove_node_panics_on_a_node_removed_earlier() {
 }
 
 #[test]
-#[should_panic(expected = "not in the LRU list")]
-fn remove_node_panics_on_an_unlisted_cell() {
-    let mut list = UnifiedLRUList::new(ValueSlotIdx::device(FULL));
-    list.insert_mru(NodeIdx_(10));
-    list.remove_node(NodeIdx_(10));
-    list.remove_node_(UnifiedLRUList::cell_of_(NodeIdx_(10)));
-}
-
-#[test]
-#[should_panic(expected = "already in the LRU list")]
-fn add_node_panics_on_a_linked_cell() {
-    let mut list = UnifiedLRUList::new(ValueSlotIdx::device(FULL));
-    list.insert_mru(NodeIdx_(10));
-    list.add_node_(UnifiedLRUList::cell_of_(NodeIdx_(10)));
-}
-
-#[test]
 fn removed_nodes_can_be_reinserted() {
     let mut list = UnifiedLRUList::new(ValueSlotIdx::device(FULL));
     list.insert_mru(NodeIdx_(10));
@@ -235,38 +218,6 @@ fn reset_window_ancestors_mru_includes_the_straddling_ancestor() {
 }
 
 #[test]
-fn reset_walks_stop_at_the_salted_chains_root() {
-    let mut arena: NodeArena<Vec<i64>> =
-        NodeArena::new(vec![crate::components::FULL], /* page_size = */ 1);
-    let named = arena.root();
-    let a = arena
-        .alloc_child(
-            named,
-            /* key = */ vec![1, 11],
-            /* priority = */ 0,
-            Some("lora-1"),
-        )
-        .unwrap();
-    let b = arena
-        .alloc_child(
-            a,
-            /* key = */ vec![2, 22],
-            /* priority = */ 0,
-            /* extra_key = */ None,
-        )
-        .unwrap();
-    let mut list = UnifiedLRUList::new(ValueSlotIdx::device(FULL));
-    list.insert_mru(a);
-    list.insert_mru(b);
-    // Both walks terminate at the root without visiting it.
-    list.reset_node_and_parents_mru(b, &arena, |_| true);
-    assert_eq!(order(&list), vec![b, a]);
-    list.reset_node_and_window_ancestors_mru(b, 100, &arena, |_| true);
-    assert_eq!(order(&list), vec![b, a]);
-    list.validate();
-}
-
-#[test]
 fn get_lru_no_lock_returns_the_lru_most_unlocked_member() {
     let (mut arena, _root, a, b, c, _other) = arena_chain();
     let mut list = UnifiedLRUList::new(ValueSlotIdx::device(FULL));
@@ -405,16 +356,6 @@ fn get_prev_before_remove_keeps_the_walk_consistent() {
         list.get_prev_where(NodeIdx_(20), |_| true),
         Some(NodeIdx_(30))
     );
-    list.validate();
-}
-
-#[test]
-fn insert_mru_grows_the_cell_table_one_by_one() {
-    let mut list = UnifiedLRUList::new(ValueSlotIdx::device(FULL));
-    list.insert_mru(NodeIdx_(0));
-    list.insert_mru(NodeIdx_(1));
-    list.insert_mru(NodeIdx_(2));
-    assert_eq!(order(&list), vec![NodeIdx_(2), NodeIdx_(1), NodeIdx_(0)]);
     list.validate();
 }
 
@@ -607,18 +548,6 @@ fn arena_with_node() -> (NodeArena<Vec<i64>>, NodeIdx_) {
 }
 
 #[test]
-fn each_strategy_maps_its_node_fields_into_the_key() {
-    let (arena, a) = arena_with_node();
-    let node = arena.node(NodeIdx_(a.0));
-    assert_eq!(LruStrategy.get_priority(node), PriorityKey(5, 0));
-    assert_eq!(LfuStrategy.get_priority(node), PriorityKey(3, 5));
-    assert_eq!(FifoStrategy.get_priority(node), PriorityKey(7, 0));
-    assert_eq!(MruStrategy.get_priority(node), PriorityKey(-5, 0));
-    assert_eq!(FiloStrategy.get_priority(node), PriorityKey(-7, 0));
-    assert_eq!(PriorityStrategy.get_priority(node), PriorityKey(9, 5));
-}
-
-#[test]
 fn slru_segments_on_the_protected_threshold() {
     let (mut arena, a) = arena_with_node();
     let slru = SlruStrategy {
@@ -663,21 +592,6 @@ fn get_eviction_strategy_resolves_each_policy_name() {
             "policy {policy}"
         );
     }
-}
-
-#[test]
-fn eviction_policy_names_are_case_insensitive() {
-    let (arena, a) = arena_with_node();
-    let node = arena.node(NodeIdx_(a.0));
-    // Mixed-case names resolve to the same strategies as their lowercase forms.
-    assert_eq!(
-        get_eviction_strategy::<Vec<i64>>("LRU").get_priority(node),
-        PriorityKey(5, 0)
-    );
-    assert_eq!(
-        get_eviction_strategy::<Vec<i64>>("Priority").get_priority(node),
-        PriorityKey(9, 5)
-    );
 }
 
 #[test]

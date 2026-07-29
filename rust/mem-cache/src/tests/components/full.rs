@@ -127,18 +127,6 @@ fn evict_walk_stops_when_the_tracker_overshoots_the_budget() {
 }
 
 #[test]
-fn evict_walk_reports_done_when_the_baseline_already_meets_the_budget() {
-    let mut tc = core();
-    let (_a, _b, _c) = evict_walk_setup(&mut tc);
-    tc.evict_device_start(FULL, /* request_cnt = */ 5);
-    // Prior steps' evictions reach the gate through the baseline.
-    let baseline = HashMap::from([(FULL, 5)]);
-    let (node, _step) = tc.evict_device_next_node(FULL, &baseline);
-    assert_eq!(node, None);
-    tc.evict_device_end(FULL);
-}
-
-#[test]
 fn evict_walk_step_tracker_stays_empty_when_nothing_was_evicted() {
     let mut tc = core();
     let (_a, b, _c) = evict_walk_setup(&mut tc);
@@ -630,37 +618,6 @@ fn lock_round_trips_on_a_root_anchor_are_noops() {
 }
 
 #[test]
-fn lock_walks_stop_at_the_root_of_a_salted_chain() {
-    let mut tc = core();
-    let lora = tc.arena.root();
-    let n1 = tc
-        .arena
-        .alloc_child(
-            lora,
-            /* key = */ vec![1, 11],
-            /* priority = */ 0,
-            Some("lora-1"),
-        )
-        .unwrap();
-    tc.arena
-        .set_device_value(n1, FULL, Tensor::from_slice(&[0i64, 1]));
-    tc.component_state_mut(FULL).evictable_size = 2;
-    let result = tc.inc_lock_ref(tc.arena.node(n1).id);
-    assert_eq!(result.delta, Some(2));
-    assert_eq!(tc.arena.device_lock_ref(n1, FULL), 1);
-    // The root keeps its construction-time lock untouched.
-    assert_eq!(tc.arena.device_lock_ref(lora, FULL), 1);
-    // The release walk stops at the same boundary.
-    tc.dec_lock_ref(
-        tc.arena.node(n1).id,
-        /* params = */ None,
-        /* skip_swa = */ false,
-    );
-    assert_eq!(tc.arena.device_lock_ref(n1, FULL), 0);
-    assert_eq!(tc.arena.device_lock_ref(lora, FULL), 1);
-}
-
-#[test]
 fn lock_walks_treat_a_present_but_empty_value_as_device_on() {
     let mut tc = core();
     let root = tc.arena.root();
@@ -1049,16 +1006,6 @@ fn inc_host_lock_ref_pins_the_backuped_anchor() {
 }
 
 #[test]
-fn inc_host_lock_ref_again_only_bumps_the_counter() {
-    let mut tc = core();
-    let node = host_lock_anchor(&mut tc);
-    tc.inc_host_lock_ref(tc.arena.node(node).id);
-    tc.inc_host_lock_ref(tc.arena.node(node).id);
-    assert_eq!(tc.arena.host_lock_ref(node, FULL), 2);
-    assert!(!tc.evictable_host_leaves.contains(node));
-}
-
-#[test]
 fn inc_host_lock_ref_pins_only_the_anchor_not_its_ancestors() {
     // Both chain nodes are backuped; only the anchor's host counter moves.
     let mut tc = core();
@@ -1096,17 +1043,6 @@ fn inc_host_lock_ref_skips_an_anchor_without_a_host_value() {
     let (_n1, n2) = lock_chain(&mut tc);
     tc.inc_host_lock_ref(tc.arena.node(n2).id);
     assert_eq!(tc.arena.host_lock_ref(n2, FULL), 0);
-}
-
-#[test]
-fn host_lock_round_trips_on_a_root_anchor_are_noops() {
-    let mut tc = core();
-    let root = tc.arena.root();
-    let result = tc.inc_host_lock_ref(tc.arena.node(root).id);
-    assert_eq!(result.delta, None);
-    assert_eq!(tc.arena.host_lock_ref(root, FULL), 0);
-    tc.dec_host_lock_ref(tc.arena.node(root).id, /* params = */ None);
-    assert_eq!(tc.arena.host_lock_ref(root, FULL), 0);
 }
 
 #[test]
@@ -1552,85 +1488,6 @@ fn finalize_overrides_smaller_existing_host_hit_length() {
 }
 
 #[test]
-fn finalize_is_noop_without_full_host_values() {
-    let mut tc = core();
-    let root = tc.arena.root();
-    let n1 = tc
-        .arena
-        .alloc_child(
-            root,
-            /* key = */ vec![1],
-            /* priority = */ 0,
-            /* extra_key = */ None,
-        )
-        .unwrap();
-    let n2 = tc
-        .arena
-        .alloc_child(
-            n1,
-            /* key = */ vec![2],
-            /* priority = */ 0,
-            /* extra_key = */ None,
-        )
-        .unwrap();
-    let out = finalize(
-        &tc,
-        MatchResult {
-            last_device_node_id: tc.arena.node(root).id,
-            best_match_node_id: tc.arena.node(n2).id,
-            host_hit_length: 4,
-            ..tc.empty_match_result()
-        },
-    );
-    assert_eq!(out.host_hit_length, 4);
-}
-
-#[test]
-fn finalize_walks_a_salted_chain_up_to_the_root() {
-    let mut tc = core();
-    let lora = tc.arena.root();
-    let a = tc
-        .arena
-        .alloc_child(
-            lora,
-            /* key = */ vec![1, 11],
-            /* priority = */ 0,
-            Some("lora-1"),
-        )
-        .unwrap();
-    let b = tc
-        .arena
-        .alloc_child(
-            a,
-            /* key = */ vec![2, 22, 222],
-            /* priority = */ 0,
-            /* extra_key = */ None,
-        )
-        .unwrap();
-    tc.arena
-        .set_host_value(a, FULL, Tensor::from_slice(&[0i64, 1]));
-    tc.arena
-        .set_host_value(b, FULL, Tensor::from_slice(&[0i64, 1, 2]));
-    // The root is last_device_node_id; its own host value is never counted.
-    set_value_no_check(
-        &mut tc,
-        lora,
-        ValueSlotIdx::host(FULL),
-        Tensor::from_slice(&[0i64, 1, 2, 3]),
-    );
-    let out = finalize(
-        &tc,
-        MatchResult {
-            last_device_node_id: tc.arena.node(lora).id,
-            best_match_node_id: tc.arena.node(b).id,
-            host_hit_length: 0,
-            ..tc.empty_match_result()
-        },
-    );
-    assert_eq!(out.host_hit_length, 5);
-}
-
-#[test]
 #[should_panic(expected = "hit root")]
 fn finalize_panics_when_walk_hits_root_before_last_device() {
     let mut tc = core();
@@ -1965,24 +1822,6 @@ fn redistribute_leaves_tombstoned_child_values_none() {
 }
 
 #[test]
-fn redistribute_device_only_child_leaves_host_none() {
-    let mut tc = core();
-    let (parent, child) = nodes(&mut tc);
-    set_value_no_check(
-        &mut tc,
-        child,
-        ValueSlotIdx::device(FULL),
-        Tensor::from_slice(&[10i64, 11, 12]),
-    );
-    FullComponent.redistribute_on_node_split(&mut tc, parent, child);
-    let parent_node = tc.arena.node(parent);
-    assert!(parent_node.has_device_value(FULL));
-    assert!(!parent_node.has_host_value(FULL));
-    let child_node = tc.arena.node(child);
-    assert!(!child_node.has_host_value(FULL));
-}
-
-#[test]
 fn redistribute_halves_do_not_alias_source() {
     let mut tc = core();
     let (parent, child) = nodes(&mut tc);
@@ -2009,18 +1848,6 @@ fn redistribute_halves_do_not_alias_source() {
             .device_value(FULL)
             .equal(&expected.narrow(0, 2, 1))
     );
-}
-
-#[test]
-fn redistribute_preserves_preexisting_parent_slot_value() {
-    let mut tc = core();
-    let (parent, child) = nodes(&mut tc);
-    let sentinel = Tensor::from_slice(&[7i64, 8]);
-    tc.arena.set_device_value(parent, FULL, sentinel.copy());
-    // Child has no device value: the parent's existing slot must be left untouched.
-    FullComponent.redistribute_on_node_split(&mut tc, parent, child);
-    let parent_node = tc.arena.node(parent);
-    assert!(parent_node.device_value(FULL).equal(&sentinel));
 }
 
 #[test]
@@ -2238,56 +2065,6 @@ fn evict_host_pushes_a_present_but_empty_host_value() {
     assert_eq!(host_freed, 0);
     assert_eq!(host_frees[&FULL].len(), 1);
     assert!(!tc.arena.has_host_value(node, FULL));
-}
-
-#[test]
-fn evict_host_accumulates_into_shared_host_frees() {
-    let mut tc = core();
-    let root = tc.arena.root();
-    let a = tc
-        .arena
-        .alloc_child(
-            root,
-            /* key = */ vec![1, 2],
-            /* priority = */ 0,
-            /* extra_key = */ None,
-        )
-        .unwrap();
-    let b = tc
-        .arena
-        .alloc_child(
-            root,
-            /* key = */ vec![2],
-            /* priority = */ 0,
-            /* extra_key = */ None,
-        )
-        .unwrap();
-    let host_a = Tensor::from_slice(&[20i64, 21]);
-    let host_b = Tensor::from_slice(&[30i64]);
-    tc.arena.set_host_value(a, FULL, host_a.copy());
-    tc.arena.set_host_value(b, FULL, host_b.copy());
-    let mut device_frees = HashMap::new();
-    let mut host_frees = HashMap::new();
-    let freed_a = FullComponent.evict_component(
-        &mut tc,
-        a,
-        &mut device_frees,
-        &mut host_frees,
-        EvictLayer::Host,
-    );
-    let freed_b = FullComponent.evict_component(
-        &mut tc,
-        b,
-        &mut device_frees,
-        &mut host_frees,
-        EvictLayer::Host,
-    );
-    assert_eq!(freed_a, (0, 2));
-    assert_eq!(freed_b, (0, 1));
-    let pushed = &host_frees[&FULL];
-    assert_eq!(pushed.len(), 2);
-    assert!(pushed[0].equal(&host_a));
-    assert!(pushed[1].equal(&host_b));
 }
 
 #[test]

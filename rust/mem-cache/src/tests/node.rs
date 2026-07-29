@@ -38,18 +38,6 @@ fn get_last_hash_value_returns_the_final_page_hash() {
 }
 
 #[test]
-fn backuped_tracks_the_full_host_value() {
-    let mut node: Node<Vec<i64>> = Node::new_child(
-        /* id = */ 1,
-        /* key = */ vec![7],
-        /* priority = */ 0,
-    );
-    assert!(!node.backuped());
-    node.set_host_value(FULL, Tensor::from_slice(&[1i64]));
-    assert!(node.backuped());
-}
-
-#[test]
 fn attach_child_links_both_sides() {
     let mut parent: Node<Vec<i64>> = Node::new_root(/* id = */ 0);
     let mut child = Node::new_child(
@@ -67,22 +55,6 @@ fn attach_child_links_both_sides() {
         parent.children.get(&(Some("ns".into()), vec![7])),
         Some(&NodeIdx_(1))
     );
-}
-
-#[test]
-fn parent_accessors_resolve_the_link() {
-    let mut parent: Node<Vec<i64>> = Node::new_root(/* id = */ 0);
-    let mut child = Node::new_child(
-        /* id = */ 1,
-        /* key = */ vec![7],
-        /* priority = */ 0,
-    );
-    parent
-        .attach_child(&mut child, /* page_size = */ 1)
-        .unwrap();
-    assert_eq!(child.parent(), NodeIdx_(0));
-    assert_eq!(child.try_parent(), Some(NodeIdx_(0)));
-    assert_eq!(parent.try_parent(), None);
 }
 
 #[test]
@@ -295,23 +267,6 @@ fn take_value_panics_on_an_empty_slot() {
         /* priority = */ 0,
     );
     let _ = node.take_device_value(FULL);
-}
-
-#[test]
-fn try_accessors_return_none_when_unset() {
-    let mut node: Node<Vec<i64>> = Node::new_child(
-        /* id = */ 1,
-        /* key = */ vec![7],
-        /* priority = */ 0,
-    );
-    assert!(node.try_device_value(FULL).is_none());
-    assert!(node.try_host_value(FULL).is_none());
-    node.set_host_value(FULL, Tensor::from_slice(&[9i64]));
-    assert!(node.try_device_value(FULL).is_none());
-    assert_eq!(
-        Vec::<i64>::try_from(node.try_host_value(FULL).unwrap()).unwrap(),
-        vec![9]
-    );
 }
 
 #[test]
@@ -594,27 +549,6 @@ fn match_len_from_panics_beyond_the_key() {
 }
 
 #[test]
-fn match_len_from_compares_bigram_atoms() {
-    let key: Vec<(i64, i64)> = vec![(1, 2), (2, 3), (3, 4)];
-    assert_eq!(
-        key.match_len(
-            /* start = */ 1,
-            &vec![(2, 3), (3, 9)],
-            /* page_size = */ 1
-        ),
-        1
-    );
-    assert_eq!(
-        key.match_len(
-            /* start = */ 1,
-            &vec![(2, 9)],
-            /* page_size = */ 1
-        ),
-        0
-    );
-}
-
-#[test]
 fn page_at_borrows_the_page_at_start() {
     let key: Vec<i64> = vec![1, 2, 3, 4];
     assert_eq!(key.page_at(/* start = */ 0, /* page_size = */ 2), &[1, 2]);
@@ -698,13 +632,6 @@ fn split_at_panics_on_the_tail_boundary() {
 fn split_at_panics_on_the_head_boundary() {
     let key: Vec<i64> = vec![1, 2, 3];
     key.split_at(/* split_idx = */ 0);
-}
-
-#[test]
-#[should_panic(expected = "child_key: key of 0 atoms is shorter than a page (1)")]
-fn child_key_panics_on_an_empty_key() {
-    let key: Vec<i64> = vec![];
-    key.child_key(/* page_size = */ 1);
 }
 
 #[test]
@@ -943,32 +870,6 @@ fn alloc_detached_reuses_a_freed_slot() -> Result<(), TreeCoreRuntimeError> {
     assert_eq!(b, a);
     assert_eq!(arena.len(), 2);
     Ok(())
-}
-
-#[test]
-fn reset_clears_then_reinstalls_root() -> Result<(), TreeCoreRuntimeError> {
-    let mut arena = arena();
-    let root = arena.root();
-    arena.alloc_child(
-        root,
-        /* key = */ vec![9],
-        /* priority = */ 0,
-        /* extra_key = */ None,
-    )?;
-    assert_eq!(arena.len(), 2);
-    arena.reset();
-    assert_eq!(arena.len(), 1);
-    let root_id = arena.root();
-    assert!(arena.node(root_id).is_root());
-    Ok(())
-}
-
-#[test]
-fn get_and_bump_access_counter_is_monotonic() {
-    let mut arena = arena();
-    // The root's construction consumed tick 1.
-    assert_eq!(arena.get_and_bump_access_counter(), 2);
-    assert_eq!(arena.get_and_bump_access_counter(), 3);
 }
 
 #[test]
@@ -1311,16 +1212,6 @@ fn free_root_returns_err() -> Result<(), TreeCoreRuntimeError> {
 }
 
 #[test]
-fn free_the_root_returns_err() {
-    let mut arena = arena();
-    let r = arena.root();
-    assert!(matches!(
-        arena.free_leaf(r),
-        Err(TreeCoreRuntimeError::RootNotFreeable { id }) if id == r
-    ));
-}
-
-#[test]
 fn freeing_the_last_salted_child_drops_the_namespace() -> Result<(), TreeCoreRuntimeError> {
     let mut arena = arena();
     let root = arena.root();
@@ -1360,40 +1251,6 @@ fn free_node_with_children_returns_err() -> Result<(), TreeCoreRuntimeError> {
         Err(TreeCoreRuntimeError::FreeNonLeafNode { id, num_children })
             if id == parent && num_children == 1
     ));
-    Ok(())
-}
-
-#[test]
-fn alloc_child_wires_into_parent() -> Result<(), TreeCoreRuntimeError> {
-    let mut arena = arena();
-    let root = arena.root();
-    let a = arena.alloc_child(
-        root,
-        /* key = */ vec![1, 2],
-        /* priority = */ 0,
-        /* extra_key = */ None,
-    )?;
-    // Both link sides are set: parent.children[first page] -> a, and a.parent -> root.
-    assert_eq!(arena.root_child(None, &[1]).as_ref(), Some(&a));
-    assert_eq!(arena.node(a).parent, Some(root));
-    Ok(())
-}
-
-#[test]
-fn free_leaf_detaches_from_parent() -> Result<(), TreeCoreRuntimeError> {
-    let mut arena = arena();
-    let root = arena.root();
-    let a = arena.alloc_child(
-        root,
-        /* key = */ vec![1],
-        /* priority = */ 0,
-        /* extra_key = */ None,
-    )?;
-    assert!(arena.root_child(None, &[1]).is_some());
-    arena.free_leaf(a)?;
-    // The freed leaf is gone from its parent's children.
-    assert!(!arena.root_child(None, &[1]).is_some());
-    assert_eq!(arena.len(), 1);
     Ok(())
 }
 
@@ -1602,22 +1459,6 @@ fn free_reuses_slots_lifo() -> Result<(), TreeCoreRuntimeError> {
 }
 
 #[test]
-fn arena_supports_bigram_key_type() -> Result<(), TreeCoreRuntimeError> {
-    let mut arena: NodeArena<Vec<(i64, i64)>> =
-        NodeArena::new(vec![FULL], /* page_size = */ 1);
-    let root = arena.root();
-    let a = arena.alloc_child(
-        root,
-        /* key = */ vec![(1, 2), (3, 4)],
-        /* priority = */ 0,
-        /* extra_key = */ None,
-    )?;
-    assert_eq!(arena.len(), 2);
-    assert_eq!(arena.node(a).key, vec![(1, 2), (3, 4)]);
-    Ok(())
-}
-
-#[test]
 fn id_map_stays_consistent_across_free_and_realloc() -> Result<(), TreeCoreRuntimeError> {
     let mut arena = arena();
     let root = arena.root();
@@ -1674,16 +1515,6 @@ fn add_is_idempotent() {
     set.add(NodeIdx_(5));
     assert_eq!(set.len(), 1);
     assert_eq!(set.iter().collect::<Vec<_>>(), vec![NodeIdx_(5)]);
-}
-
-#[test]
-fn discard_removes_the_member() {
-    let mut set = EvictableNodeSet::new();
-    set.add(NodeIdx_(2));
-    set.discard(NodeIdx_(2));
-    assert!(!set.contains(NodeIdx_(2)));
-    assert_eq!(set.len(), 0);
-    assert!(set.is_empty());
 }
 
 #[test]

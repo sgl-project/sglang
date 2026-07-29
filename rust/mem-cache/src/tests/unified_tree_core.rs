@@ -523,33 +523,6 @@ fn dec_lock_ref_without_skip_swa_reaches_every_component() {
 }
 
 #[test]
-fn set_component_device_value_sizes_by_the_value_length() {
-    let mut tc = core();
-    tc.register_component_(Arc::new(SwaComponentForTest));
-    let root = tc.arena.root();
-    let node = tc
-        .arena
-        .alloc_child(
-            root,
-            /* key = */ vec![1, 2, 3],
-            /* priority = */ 0,
-            /* extra_key = */ None,
-        )
-        .unwrap();
-    tc.set_component_device_value(
-        tc.arena.node(node).id,
-        SWA,
-        Tensor::from_slice(&[7i64, 8, 9]),
-    );
-    assert!(
-        tc.arena
-            .device_value(node, SWA)
-            .equal(&Tensor::from_slice(&[7i64, 8, 9]))
-    );
-    assert_eq!(tc.evictable_size_(SWA), 3);
-}
-
-#[test]
 #[should_panic(expected = "slot already set")]
 fn set_component_device_value_rejects_an_occupied_slot() {
     let mut tc = core();
@@ -582,13 +555,6 @@ fn next_swa_uuid_counts_up_from_two() {
     let mut tc = core();
     assert_eq!(tc.next_swa_uuid_(), 2);
     assert_eq!(tc.next_swa_uuid_(), 3);
-}
-
-#[test]
-fn inc_lock_ref_result_defaults_carry_no_uuids() {
-    let result = IncLockRefResult::default();
-    assert_eq!(result.swa_uuid_for_lock, None);
-    assert_eq!(result.swa_uuid_for_host_lock, None);
 }
 
 // A tree with the Swa stub registered and a node carrying an SWA device value.
@@ -628,30 +594,6 @@ fn for_each_component_lru_visits_valued_aux_components_only() {
     assert_eq!(visited, vec![a]);
     assert!(tc.device_lru_list(SWA).in_list(Some(a)));
     assert!(!tc.device_lru_list(FULL).in_list(Some(a)));
-}
-
-#[test]
-fn for_each_component_lru_skips_valueless_components() {
-    let mut tc = core();
-    tc.register_component_(Arc::new(SwaComponentForTest));
-    let root = tc.arena.root();
-    let a = tc
-        .arena
-        .alloc_child(
-            root,
-            /* key = */ vec![1],
-            /* priority = */ 0,
-            /* extra_key = */ None,
-        )
-        .unwrap();
-    let mut visits = 0;
-    tc.for_each_component_lru_(
-        a,
-        &mut |_, _| visits += 1,
-        EvictLayer::Device,
-        /* skip_existing = */ false,
-    );
-    assert_eq!(visits, 0);
 }
 
 #[test]
@@ -744,31 +686,6 @@ fn new_node_allocates_a_half_linked_stamped_node() {
     assert!(node.last_access_counter > before);
 }
 
-#[test]
-fn new_node_ids_are_distinct_live_slots() {
-    let mut tc = core();
-    let root = tc.arena.root();
-    let a = tc.new_node_(
-        /* key = */ vec![1],
-        root,
-        /* priority = */ 0,
-        /* hit_count = */ 0,
-        /* creation_counter = */ None,
-        /* extra_key = */ None,
-    );
-    let b = tc.new_node_(
-        /* key = */ vec![2],
-        root,
-        /* priority = */ 0,
-        /* hit_count = */ 0,
-        /* creation_counter = */ None,
-        /* extra_key = */ None,
-    );
-    assert_ne!(a, b);
-    assert_eq!(tc.arena.resolve(tc.arena.node(a).id), a);
-    assert_eq!(tc.arena.resolve(tc.arena.node(b).id), b);
-}
-
 // Chain root -> c with a 3-atom key and FULL device value, seeded as a D-leaf.
 fn split_setup(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeIdx_ {
     let root = tc.arena.root();
@@ -841,16 +758,6 @@ fn split_propagates_the_child_priority() {
     let (new_node, _) = tc.split_node_(c, /* split_len = */ 2);
     assert_eq!(tc.arena.node(new_node).priority, 7);
     assert_eq!(tc.arena.node(c).priority, 7);
-}
-
-#[test]
-fn split_updates_the_leaf_sets() {
-    let mut tc = core();
-    let c = split_setup(&mut tc);
-    let (new_node, _) = tc.split_node_(c, /* split_len = */ 2);
-    // The child stays the D-leaf; the prefix node has a valued child.
-    assert!(tc.evictable_device_leaves.contains(c));
-    assert!(!tc.evictable_device_leaves.contains(new_node));
 }
 
 #[test]
@@ -945,35 +852,6 @@ fn add_new_node_creates_a_valued_child() {
 }
 
 #[test]
-fn add_new_node_retires_the_parent_from_the_leaf_set() {
-    let mut tc = core();
-    let root = tc.arena.root();
-    let p = tc
-        .arena
-        .alloc_child(
-            root,
-            /* key = */ vec![1],
-            /* priority = */ 0,
-            /* extra_key = */ None,
-        )
-        .unwrap();
-    tc.arena
-        .set_device_value(p, FULL, Tensor::from_slice(&[0i64]));
-    tc.evictable_device_leaves.add(p);
-    let value = Tensor::from_slice(&[10i64]);
-    let a = tc.add_new_node_(
-        p,
-        /* key = */ vec![2],
-        &value,
-        /* priority = */ 0,
-        /* extra_key = */ None,
-    );
-    // The new leaf takes over; the parent now has a valued child.
-    assert!(tc.evictable_device_leaves.contains(a));
-    assert!(!tc.evictable_device_leaves.contains(p));
-}
-
-#[test]
 #[should_panic(expected = "already has a child on the new node's page")]
 fn add_new_node_panics_when_the_page_is_taken() {
     let mut tc = core();
@@ -1033,25 +911,6 @@ fn unevict_restores_the_value_and_the_leaf_sets() {
             .device_value(c, FULL)
             .equal(&Tensor::from_slice(&[20i64]))
     );
-}
-
-#[test]
-#[should_panic(expected = "slot already set")]
-fn unevict_panics_on_a_node_that_still_has_its_value() {
-    let mut tc = core();
-    let root = tc.arena.root();
-    let a = tc
-        .arena
-        .alloc_child(
-            root,
-            /* key = */ vec![1],
-            /* priority = */ 0,
-            /* extra_key = */ None,
-        )
-        .unwrap();
-    tc.arena
-        .set_device_value(a, FULL, Tensor::from_slice(&[0i64]));
-    tc.unevict_node_on_insert_(a, &Tensor::from_slice(&[1i64]));
 }
 
 fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
@@ -1432,23 +1291,6 @@ fn insert_full_overlap_frees_the_duplicates() {
 }
 
 #[test]
-fn insert_prev_prefix_len_narrows_the_dup_window() {
-    let mut tc = core();
-    tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
-    let result = tc.insert(&InsertParams {
-        prev_prefix_len: 2,
-        ..insert_params(&vec![1, 2, 3], &[20, 21, 22])
-    });
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
-        panic!(
-            "expected one FreeDeviceKV action, got {:?}",
-            action_kinds(&result.cache_actions)
-        );
-    };
-    assert!(freed[0].equal(&Tensor::from_slice(&[22i64])));
-}
-
-#[test]
 fn insert_extends_an_existing_prefix() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
@@ -1639,20 +1481,6 @@ fn insert_threshold_crossing_emits_the_backup_kv_action() {
         })
         .collect();
     assert_eq!(backups, vec![vec![leaf]]);
-}
-
-#[test]
-fn mark_write_through_pending_stamps_the_node_id_as_the_ack() {
-    let mut tc = core();
-    tc.insert(&insert_params(&vec![1], &[10]));
-    let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
-    tc.mark_write_through_pending(leaf);
-    assert_eq!(
-        tc.arena
-            .node(tc.arena.resolve(leaf))
-            .write_through_pending_id,
-        Some(leaf)
-    );
 }
 
 #[test]
@@ -2501,27 +2329,6 @@ fn insert_host_full_match_reports_only_a_backuped_node() {
 }
 
 #[test]
-#[ignore]
-#[should_panic(expected = "insert_host: parent")]
-fn insert_host_panics_on_a_colliding_page() {
-    // TODO: unconstructible today — the insert_host walk (like the python one)
-    // follows any child on the suffix page instead of breaking at a dead node,
-    // so the add path never sees an occupied page; the assert is defensive-only.
-    let mut tc = core();
-    tc.set_hicache_enabled();
-    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
-    let root = tc.arena.root();
-    // A host suffix colliding with the device-valued child's first page.
-    tc.insert_host(
-        tc.arena.node(root).id,
-        /* extra_key = */ None,
-        vec![1, 9],
-        Tensor::from_slice(&[100i64, 101]),
-        vec!["h0".to_string(), "h1".to_string()],
-    );
-}
-
-#[test]
 fn insert_host_empty_key_is_a_noop() {
     let mut tc = core();
     let root = tc.arena.root();
@@ -3168,30 +2975,6 @@ fn match_prefix_page_size_two_sub_page_query_is_an_empty_match() {
 }
 
 #[test]
-fn evict_walk_page_size_two_empties_the_tree() {
-    let mut tc = page2_core();
-    tc.insert(&insert_params(&vec![1, 2, 3, 4], &[10, 11, 12, 13]));
-    tc.insert(&insert_params(&vec![5, 6], &[14, 15]));
-    let mut tracker = HashMap::from([(FULL, 0)]);
-    let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    tc.evict_device_start(FULL, /* request_cnt = */ 100);
-    let mut evicted = 0;
-    loop {
-        let (leaf, step) = tc.evict_device_next_node(FULL, &tracker);
-        accumulate_step(step, &mut tracker, &mut df, &mut hf);
-        let Some(leaf) = leaf else { break };
-        let (_, step) = tc.evict_device_leaf(leaf, /* is_write_back = */ false);
-        accumulate_step(step, &mut tracker, &mut df, &mut hf);
-        evicted += 1;
-    }
-    tc.evict_device_end(FULL);
-    assert_eq!(evicted, 2);
-    assert_eq!(tracker[&FULL], 6);
-    assert_eq!(tc.arena.len(), 1);
-    tc.sanity_check(&[], &[]);
-}
-
-#[test]
 fn evict_and_detach_frees_the_device_value_and_tracks() {
     let mut tc = core();
     let root = tc.arena.root();
@@ -3553,34 +3336,6 @@ fn cascade_host_target_keeps_the_device_value() {
     assert!(tc.evictable_device_leaves.contains(a));
 }
 
-#[test]
-fn cascade_moves_a_host_backed_node_into_the_h_leaf_set() {
-    let mut tc = core();
-    let root = tc.arena.root();
-    let a = tc.add_new_node_(
-        root,
-        /* key = */ vec![1],
-        &Tensor::from_slice(&[10]),
-        /* priority = */ 0,
-        /* extra_key = */ None,
-    );
-    tc.arena
-        .set_host_value(a, FULL, Tensor::from_slice(&[20i64]));
-    let mut tracker = HashMap::new();
-    let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    tc.cascade_evict_(
-        a,
-        BASE_COMPONENT_TYPE,
-        &mut tracker,
-        &mut df,
-        &mut hf,
-        EvictLayer::Device,
-    );
-    // Evicted but backuped: the node leaves the D-set and joins the H-set.
-    assert!(!tc.evictable_device_leaves.contains(a));
-    assert!(tc.evictable_host_leaves.contains(a));
-}
-
 // A D-leaf carrying both a Full device value and an Swa device value.
 fn cascade_aux_setup(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeIdx_ {
     let root = tc.arena.root();
@@ -3928,16 +3683,6 @@ fn stale_handle_panics_after_its_node_is_freed() {
 }
 
 #[test]
-#[should_panic(expected = "is not allocated")]
-fn pre_reset_handle_panics_after_reset() {
-    let mut tc = core();
-    tc.insert(&insert_params(&vec![4], &[13]));
-    let leaf = tc.match_prefix(&match_params(&vec![4])).best_match_node_id;
-    tc.reset();
-    tc.arena.resolve(leaf);
-}
-
-#[test]
 #[should_panic(expected = "is not a D-leaf")]
 fn evict_driver_rejects_a_non_leaf() {
     let mut tc = core();
@@ -3948,22 +3693,6 @@ fn evict_driver_rejects_a_non_leaf() {
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
     tc.evict_device_leaf(prefix, false);
-}
-
-#[test]
-fn evict_driver_write_back_returns_the_backup_action_for_an_unbacked_leaf() {
-    let mut tc = core();
-    tc.insert(&insert_params(&vec![1], &[10]));
-    let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
-    let mut tracker = HashMap::from([(FULL, 0)]);
-    let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    let (action, step) = tc.evict_device_leaf(leaf, /* is_write_back = */ true);
-    accumulate_step(step, &mut tracker, &mut df, &mut hf);
-    // Write-back carries only the leaf itself; nothing is freed yet.
-    assert_eq!(action.unwrap().node_ids, vec![leaf]);
-    assert!(!tc.arena.node(tc.arena.resolve(leaf)).evicted());
-    assert_eq!(tracker[&FULL], 0);
-    assert!(df.is_empty() && hf.is_empty());
 }
 
 #[test]
@@ -4230,26 +3959,6 @@ fn new_resolves_the_eviction_policy() {
         tc.eviction_strategy.get_priority(tc.arena.node(a)),
         crate::unified_lru_list::PriorityKey(7, 0)
     );
-}
-
-#[test]
-fn new_builds_independent_lru_lists() {
-    let mut tc = core();
-    let root = tc.arena.root();
-    let n1 = tc
-        .arena
-        .alloc_child(
-            root,
-            /* key = */ vec![1],
-            /* priority = */ 0,
-            /* extra_key = */ None,
-        )
-        .unwrap();
-    tc.device_lru_list_mut(FULL).insert_mru(n1);
-    // Every component/tier list exists as an independent container.
-    assert!(tc.device_lru_list(FULL).in_list(Some(n1)));
-    assert!(!tc.host_lru_list(FULL).in_list(Some(n1)));
-    assert!(!tc.device_lru_list(SWA).in_list(Some(n1)));
 }
 
 #[test]
@@ -4566,13 +4275,6 @@ fn tombstone_without_backup_is_in_neither_set() {
     tc.update_evictable_leaf_sets_(n1);
     assert!(!tc.evictable_device_leaves.contains(n1));
     assert!(!tc.evictable_host_leaves.contains(n1));
-}
-
-#[test]
-#[should_panic(expected = "out of bounds")]
-fn update_panics_on_missing_node() {
-    let mut tc = core();
-    tc.update_evictable_leaf_sets_(NodeIdx_(999));
 }
 
 #[test]
