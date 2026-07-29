@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sglang.multimodal_gen.runtime.distributed import get_tp_rank, get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_rank,
+    get_tp_world_size,
+    get_world_group,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     iter_materialized_weights,
@@ -170,15 +174,16 @@ class GPUWorkerPostTrainingMixin:
             return None, "serialized_named_tensors is required"
 
         if payload_gpu_uuids is None:
-            # Unlabeled legacy contract: one payload per tp rank, or one shared payload.
-            tp_world_size = get_tp_world_size()
-            if len(payloads) not in (1, tp_world_size):
+            # Unlabeled fallback: world rank equals tp rank for tp-only runs.
+            if len(payloads) == 1:
+                return payloads[0], None
+            world_group = get_world_group()
+            if len(payloads) != world_group.world_size:
                 return None, (
-                    f"serialized_named_tensors size must be 1 or tp_size "
-                    f"({tp_world_size}), got {len(payloads)}"
+                    f"serialized_named_tensors size must be 1 or world_size "
+                    f"({world_group.world_size}), got {len(payloads)}"
                 )
-            payload_idx = get_tp_rank() if len(payloads) == tp_world_size else 0
-            return payloads[payload_idx], None
+            return payloads[world_group.rank_in_group], None
 
         if len(payload_gpu_uuids) != len(payloads):
             return None, (
