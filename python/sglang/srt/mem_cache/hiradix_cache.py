@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
+from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import (
@@ -80,6 +81,8 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
+        allocator_type = get_allocator_type(server_args)
+
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
                 self.kv_cache,
@@ -87,7 +90,7 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
+                allocator_type=allocator_type,
             )
         elif isinstance(self.kv_cache, DSATokenToKVPool):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
@@ -102,7 +105,7 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
+                allocator_type=allocator_type,
             )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, DSA, and MSA models")
@@ -140,8 +143,6 @@ class HiRadixCache(RadixCache):
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
                 load_cache_event=self.load_cache_event,
-                attn_cp_group=self.attn_cp_group,
-                attn_tp_group=self.attn_tp_group,
             )
         elif isinstance(self.kv_cache, MiniMaxSparseKVPool):
             from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -156,8 +157,6 @@ class HiRadixCache(RadixCache):
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
                 load_cache_event=self.load_cache_event,
-                attn_cp_group=self.attn_cp_group,
-                attn_tp_group=self.attn_tp_group,
             )
         else:
             self.cache_controller = HiCacheController(
@@ -778,6 +777,10 @@ class HiRadixCache(RadixCache):
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
         super().reset()
+
+    def release_host_resources(self) -> None:
+        if self.token_to_kv_pool_host is not None:
+            self.token_to_kv_pool_host.destroy()
 
     def get_height(self, node: TreeNode):
         height = 0
@@ -1560,13 +1563,10 @@ class HiRadixCache(RadixCache):
         )
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
-        min_completed_tokens = completed_tokens
-        # Synchronize workers before mutating host cache tree state.
-        completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
-        self._all_reduce_attn_groups(
-            completed_tokens_tensor, torch.distributed.ReduceOp.MIN
+        min_completed_tokens = self._sync_and_clamp_prefetch_result(
+            operation, completed_tokens
         )
-        min_completed_tokens = completed_tokens_tensor.item()
+
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = operation.host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
@@ -1594,6 +1594,39 @@ class HiRadixCache(RadixCache):
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
 
         return True
+
+    def _sync_and_clamp_prefetch_result(
+        self,
+        operation: PrefetchOperation,
+        completed_tokens: int,
+    ) -> int:
+        """Sync prefetch results across ATTN groups and decide the usable prefix.
+
+        HiRadixCache only wires DSA-style stacks (Full attention + a KV-derived
+        ALL_PAGES sidecar such as the DSA / MiniMax indexer); For the DSA case we *clamp*
+        to the minimum fetched prefix shared by the Full KV pool and every
+        sidecar rather than discarding everything. With no sidecar (FULL-only)
+        this is just the synced Full KV completion.
+        """
+        # Sync completed tokens and per-pool hit pages across ATTN groups, taking
+        # the minimum so every rank agrees on the same usable prefix length.
+        pool_transfers = getattr(operation, "pool_transfers", None) or []
+        hit_pages = (
+            operation.pool_storage_result.extra_pool_hit_pages if pool_transfers else {}
+        )
+        pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
+        packed = torch.tensor([completed_tokens, *pool_hit_pages], dtype=torch.int)
+        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+        min_completed_tokens = int(packed[0].item())
+        pool_hit_pages = list(map(int, packed[1:].tolist()))
+
+        # Clamp to the shared minimum prefix of the Full KV completion and each
+        # KV-derived ALL_PAGES sidecar (e.g. the DSA indexer). FULL-only has no
+        # sidecar, so the usable prefix is just the Full KV completion.
+        usable_pages = min_completed_tokens // self.page_size
+        if pool_transfers:
+            usable_pages = min(usable_pages, *pool_hit_pages)
+        return usable_pages * self.page_size
 
     def terminate_prefetch(self, req_id: str):
         if req_id not in self.ongoing_prefetch:

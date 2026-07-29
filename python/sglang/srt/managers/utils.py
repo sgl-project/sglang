@@ -66,6 +66,13 @@ class GenerationBatchResult:
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
 
+    # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
+    # these once — eagerly via the scheduler's grammar barrier inside verify(), or
+    # lazily in _resolve_spec_v2_tokens — and the latter consumes
+    # grammar_retained_tokens instead of re-advancing the FSM.
+    grammar_advanced: bool = False
+    grammar_retained_tokens: Optional[list] = None
+
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
@@ -281,10 +288,7 @@ class EmbeddingBatchResult:
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[torch.cuda.Event] = None
-
-    @property
-    def can_run_cuda_graph(self) -> bool:
-        return False
+    can_run_cuda_graph: bool = False
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):
