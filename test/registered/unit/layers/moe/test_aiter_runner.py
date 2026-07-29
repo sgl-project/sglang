@@ -5,6 +5,9 @@ import pytest
 import torch
 
 import sglang.srt.layers.moe.moe_runner.aiter as aiter_runner
+from sglang.srt.artemis_kernels.mi355x.dsr1_fp8.fused_moe import (
+    dispatcher as artemis_dispatcher,
+)
 from sglang.srt.layers.moe.moe_runner.aiter import (
     AiterMoeQuantInfo,
     AiterQuantType,
@@ -113,6 +116,59 @@ def test_aiter_runner_preserves_no_combine_rank_for_empty_input(monkeypatch):
     output = runner.run(runner_input, _quant_info(), running_state={})
 
     assert output.hidden_states.shape == (0, 2, 4)
+
+
+def test_aiter_runner_short_circuits_stock_path_for_artemis_output(monkeypatch):
+    expected = torch.full((1, 4), 7, dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        artemis_dispatcher,
+        "dispatch_fused_moe",
+        lambda runner_input, quant_info, runner_config: expected,
+    )
+
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+    output = runner.run(_runner_input(), _quant_info(), running_state={})
+
+    assert output.hidden_states is expected
+
+
+def test_aiter_runner_falls_back_when_artemis_declines(monkeypatch):
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    monkeypatch.setattr(
+        artemis_dispatcher,
+        "dispatch_fused_moe",
+        lambda runner_input, quant_info, runner_config: None,
+    )
+
+    runner_input = _runner_input()
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+    output = runner.run(runner_input, _quant_info(), running_state={})
+
+    assert output.hidden_states is runner_input.hidden_states
+    assert captured["hidden_states"] is runner_input.hidden_states
+
+
+def test_artemis_dispatcher_is_fail_closed_when_disabled(monkeypatch):
+    monkeypatch.setattr(
+        artemis_dispatcher,
+        "is_artemis_fused_moe_enabled",
+        lambda: False,
+    )
+
+    assert (
+        artemis_dispatcher.dispatch_fused_moe(
+            _runner_input(),
+            _quant_info(),
+            MoeRunnerConfig(activation="silu"),
+        )
+        is None
+    )
 
 
 if __name__ == "__main__":
