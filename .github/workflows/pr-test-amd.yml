@@ -80,6 +80,11 @@ on:
         required: false
         type: string
         default: ''
+      runner_arch:
+        description: 'AMD runner pool to dispatch GPU jobs to'
+        required: false
+        type: string
+        default: mi300
       run_all_tests:
         description: "Run all tests (for releasing or testing purpose)"
         required: false
