@@ -1835,5 +1835,88 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args._check_two_batch_overlap()
 
 
+class TestDisablePrefillCudaGraphForTrtllmMla(CustomTestCase):
+    """Under a captured prefill graph the trtllm_mla family delegates prefill to
+    the FlashInfer MLA parent, which converts the whole KV pool to the query
+    dtype per layer (#28053, #32655). The guard must key on the resolved prefill
+    attention backend, not on the model architecture.
+    """
+
+    def _handled_args(
+        self,
+        prefill_attention_backend,
+        architectures=("KimiK25ForConditionalGeneration",),
+        is_multimodal_piecewise_supported=True,
+        **overrides,
+    ):
+        args = ServerArgs(model_path="dummy", **overrides)
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=list(architectures)),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=True,
+            is_multimodal_piecewise_cuda_graph_supported=is_multimodal_piecewise_supported,
+        )
+        with (
+            patch("sglang.srt.utils.is_cuda", return_value=True),
+            patch.object(ServerArgs, "use_mla_backend", return_value=True),
+            patch.object(
+                ServerArgs,
+                "_resolved_attention_backends",
+                return_value=(prefill_attention_backend, prefill_attention_backend),
+            ),
+        ):
+            # Mirrors the real call order in __post_init__.
+            args._handle_cuda_graph_config()
+            args._disable_prefill_cuda_graph_for_trtllm_mla()
+        return args
+
+    def test_non_deepseek_arch_on_trtllm_mla_disables_prefill_graph(self):
+        # #32655: Kimi is on the multimodal tc_piecewise allowlist (#30889), so
+        # without this guard it is auto-upgraded to tc_piecewise and pays the
+        # whole-KV-pool conversion on every prefill.
+        args = self._handled_args("trtllm_mla")
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+
+    def test_deepseek_arch_on_trtllm_mla_still_disabled(self):
+        # Original #28053 behavior must be preserved.
+        args = self._handled_args(
+            "trtllm_mla",
+            architectures=("DeepseekV3ForCausalLM",),
+            is_multimodal_piecewise_supported=False,
+        )
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+
+    def test_trtllm_mla_subclass_backends_disable_prefill_graph(self):
+        # tokenspeed_mla / cutedsl_mla subclass TRTLLMMLABackend and inherit the
+        # same prefill fallback.
+        for backend in ("tokenspeed_mla", "cutedsl_mla"):
+            with self.subTest(backend=backend):
+                args = self._handled_args(backend)
+
+                self.assertEqual(
+                    args.cuda_graph_config.prefill.backend, Backend.DISABLED
+                )
+
+    def test_other_attention_backends_keep_prefill_graph(self):
+        # Backends that do not take the FlashInfer-MLA prefill fallback must be
+        # left alone (fa3 keeps the #30889 multimodal piecewise win).
+        for backend in ("fa3", "flashinfer", "trtllm_mha"):
+            with self.subTest(backend=backend):
+                args = self._handled_args(backend)
+
+                self.assertNotEqual(
+                    args.cuda_graph_config.prefill.backend, Backend.DISABLED
+                )
+
+    def test_explicit_prefill_backend_pin_overrides_the_guard(self):
+        args = self._handled_args(
+            "trtllm_mla", cuda_graph_backend_prefill=Backend.TC_PIECEWISE
+        )
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.TC_PIECEWISE)
+
+
 if __name__ == "__main__":
     unittest.main()
