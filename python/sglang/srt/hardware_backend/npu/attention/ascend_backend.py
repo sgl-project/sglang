@@ -1049,9 +1049,7 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 else:
                     actual_seq_qlen = (
-                        torch.arange(1, q.shape[0] + 1)
-                        .to(q.device)
-                        .to(torch.int32)
+                        torch.arange(1, q.shape[0] + 1).to(q.device).to(torch.int32)
                     )
             else:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
