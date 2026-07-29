@@ -65,6 +65,14 @@ class _RecordingAllocator:
         self.free_calls.append(free_index)
         self._outstanding -= int(free_index.numel())
 
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        self.free(free_index)
+
+    def free_segments(self, segments) -> None:
+        for free_index, _start_pos in segments:
+            if free_index.numel():
+                self.free(free_index)
+
     @property
     def outstanding_slots(self) -> int:
         return self._outstanding
