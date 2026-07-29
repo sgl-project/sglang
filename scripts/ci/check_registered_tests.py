@@ -103,10 +103,8 @@ def main() -> int:
         if len(registries) == 0:
             missing.append(f)
             continue
-        # CI executes registered files as `python3 file.py`, so TestCase
-        # classes only run if __main__ invokes unittest.main()/pytest.main().
-        # A custom __main__ (e.g. an argparse CLI) exits 0 without running
-        # them -- the file stays green while its tests are dead.
+        # TestCase classes are dead unless __main__ runs them (CI does
+        # `python3 file.py`); the ERROR text below explains the fix.
         with open(f, "r", encoding="utf-8") as fh:
             tree = ast.parse(fh.read(), filename=f)
         if _defines_testcase(tree) and not _main_runs_tests(tree):

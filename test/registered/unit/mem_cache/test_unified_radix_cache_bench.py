@@ -1,7 +1,7 @@
 """Large-scale benchmark + fuzz correctness tests for UnifiedRadixCache.
 
 Usage (standalone):
-    bench: python3 test/registered/unit/mem_cache/test_unified_radix_cache_bench.py --num-seqs 5000 --verify --components mamba legacy-mamba swa legacy-swa
+    bench: python3 test/registered/unit/mem_cache/test_unified_radix_cache_bench.py --bench --num-seqs 5000 --verify --components mamba legacy-mamba swa legacy-swa
     CI Test: python -m pytest test/registered/unit/mem_cache/test_unified_radix_cache_bench.py -v -s
 """
 
@@ -251,8 +251,7 @@ def create_bench_cache(
         )
         _rid[0] += 1
         req_to_token_pool.alloc([req])
-        # Fabricated reqs bypass alloc_for_extend, which is where req.kv is
-        # normally created; the SWA component reads it in cache_finished_req.
+        # fabricated reqs bypass alloc_for_extend, the normal creator of req.kv
         req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
         return req
 
@@ -865,8 +864,7 @@ def _run_bench_cli():
 
 
 if __name__ == "__main__":
-    # CI runs `python3 file.py`, which must execute the TestBench_* classes;
-    # the manual benchmark CLI stays behind an explicit --bench flag.
+    # CI runs `python3 file.py`; it must execute the TestBench_* classes
     if "--bench" in sys.argv:
         sys.argv.remove("--bench")
         _run_bench_cli()
