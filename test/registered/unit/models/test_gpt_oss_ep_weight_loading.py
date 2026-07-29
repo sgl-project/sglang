@@ -2,14 +2,18 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.layers.moe import MoeRunnerBackend
 from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.models.gpt_oss import TinyGemmLinear, _narrow_fused_moe_ep_weight
+from sglang.srt.models.gpt_oss import (
+    GptOssSparseMoeBlock,
+    TinyGemmLinear,
+    _narrow_fused_moe_ep_weight,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -97,6 +101,41 @@ class TestGptOssEpWeightLoading(CustomTestCase):
         self.assertEqual(output.shape, (0, 128))
         self.assertEqual(output.dtype, torch.bfloat16)
         self.assertIsNone(output_bias)
+
+    @patch(
+        "sglang.srt.models.gpt_oss.should_skip_post_experts_all_reduce",
+        create=True,
+        return_value=True,
+    )
+    @patch("sglang.srt.models.gpt_oss.tensor_model_parallel_all_reduce")
+    @patch(
+        "sglang.srt.models.gpt_oss.get_forward",
+        return_value=SimpleNamespace(fuse_mlp_allreduce=False),
+    )
+    @patch(
+        "sglang.srt.models.gpt_oss.is_in_tc_piecewise_cuda_graph",
+        return_value=False,
+    )
+    def test_flashinfer_a2a_output_is_not_all_reduced(
+        self, _is_piecewise, _get_forward, all_reduce, _should_skip
+    ):
+        """FlashInfer combine already returns the complete source-rank output."""
+        block = GptOssSparseMoeBlock.__new__(GptOssSparseMoeBlock)
+        torch.nn.Module.__init__(block)
+        block.tp_size = 4
+        block.hidden_size = 3
+        block.__dict__["router"] = Mock(
+            return_value=(torch.zeros((2, 4), dtype=torch.float32), None)
+        )
+        topk_output = object()
+        block.__dict__["topk"] = Mock(return_value=topk_output)
+        block.__dict__["experts"] = Mock(side_effect=lambda x, _: x + 1)
+        hidden_states = torch.zeros((2, 3), dtype=torch.bfloat16)
+
+        actual = block.forward_normal(hidden_states)
+
+        torch.testing.assert_close(actual, hidden_states + 1)
+        all_reduce.assert_not_called()
 
     @patch.object(fused_moe_layer.UnquantizedFusedMoEMethod, "create_moe_runner")
     @patch.object(fused_moe_layer.UnquantizedFusedMoEMethod, "create_weights")
