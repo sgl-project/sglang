@@ -1399,6 +1399,10 @@ class SamplingParams:
                 spectrum_overrides[field_name] = getattr(args, arg_name)
         if spectrum_overrides:
             if not cli_args.get("enable_spectrum", False):
+                logger.info(
+                    "Spectrum override flags were provided without --enable-spectrum; "
+                    "auto-enabling Spectrum caching."
+                )
                 cli_args["enable_spectrum"] = True
             existing_spectrum_params = cli_args.get("spectrum_params")
             if isinstance(existing_spectrum_params, dict):
