@@ -346,6 +346,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             disable_index_value=disable_value,
             use_msa=self.use_msa,
             seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
 
         if actual_num_tokens < original_num_tokens:
