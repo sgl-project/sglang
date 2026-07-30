@@ -23,6 +23,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     gather_dequant_requant_fp8_paged,
 )
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
@@ -133,6 +134,17 @@ else:
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
     )
+
+
+def _aiter_mla_out_dtype(q_dtype: torch.dtype) -> torch.dtype:
+    """Output dtype for `aiter.mla.mla_decode_fwd`.
+
+    The callers below size their output buffer off q, but on the a8w8 path q is
+    fp8 while the attention output is not: aiter's reduce kernels
+    (`kn_mla_reduce_v1*`, aiter csrc/kernels/mla/reduce.cu) only instantiate
+    bf16 and fp16 `out_t` and hard-fail on anything else.
+    """
+    return torch.bfloat16 if q_dtype == fp8_dtype else q_dtype
 
 
 def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -437,10 +449,14 @@ class DeepseekSparseAttnBackend(
             if (
                 self.dsa_prefill_impl == "aiter" or self.dsa_decode_impl == "aiter"
             ) and model_runner.kv_cache_dtype == fp8_dtype:
+                # Warm the buffers with the dtype pair the forward will actually
+                # use, so no reallocation happens inside CUDA graph capture.
+                # With an fp8 KV cache the ROCm default routes q through
+                # `fused_qk_rope_cat_and_cache_mla`, which emits fp8 q.
                 self._ensure_aiter_dsa_decode_metadata_buffer(
                     max_seqlen_q=1,
                     batch_size=max_bs,
-                    q_dtype=torch.bfloat16,
+                    q_dtype=fp8_dtype,
                     kv_dtype=fp8_dtype,
                 )
 
@@ -585,6 +601,28 @@ class DeepseekSparseAttnBackend(
                 device=self.device,
             ),
         )
+
+    def _aiter_mla_scales(
+        self, q_dtype: torch.dtype, kv_dtype: torch.dtype
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Scale pair for `aiter.mla.mla_decode_fwd`.
+
+        `mla_decode_stage1_asm_fwd` hard-requires BOTH scales once q is fp8 and
+        only kv_scale when q stays bf16 (aiter csrc/py_itfs_cu/asm_mla.cu). q is
+        fp8 whenever `fused_qk_rope_cat_and_cache_mla` produced it, which is the
+        default on ROCm with an fp8 KV cache -- that op already folds k_scale
+        into q, so q and kv share one fp8 domain and both scales are identity.
+        Same convention as the fp8 sparse-MLA prefill path
+        (`_forward_sparse_mla_q8kv8`, `_q8kv8_identity_scale`).
+        """
+        if q_dtype != fp8_dtype and kv_dtype != fp8_dtype:
+            return None, None
+        if self._q8kv8_identity_scale is None:
+            self._q8kv8_identity_scale = torch.tensor(
+                [1.0], dtype=torch.float32, device=self.device
+            )
+        identity = self._q8kv8_identity_scale
+        return (identity if q_dtype == fp8_dtype else None), identity
 
     def _ensure_aiter_dsa_decode_metadata_buffer(
         self,
@@ -2738,10 +2776,18 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
+        # The output buffer must not inherit q's dtype on the a8w8 path: aiter's
+        # reduce (kn_mla_reduce_v1*) only instantiates bf16/fp16 `out_t`
+        # (csrc/kernels/mla/reduce.cu), and an fp8 q carries its scale
+        # out-of-band anyway, so the attention output is never fp8.
+        out_dtype = _aiter_mla_out_dtype(q.dtype)
+
         if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim), dtype=out_dtype
+            )
         else:
-            o = torch.empty_like(q)
+            o = torch.empty_like(q, dtype=out_dtype)
 
         if self.need_pad_heads:
             q_kernel = q.view(
@@ -2752,17 +2798,15 @@ class DeepseekSparseAttnBackend(
                     q.shape[0],
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=out_dtype,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        q_scale = None
-        kv_scale = None
+        q_scale, kv_scale = self._aiter_mla_scales(q_kernel.dtype, kv_cache.dtype)
         aiter_persistent_kwargs = {}
-        if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
 
         kv_indptr = self.kv_indptr
 
@@ -2816,10 +2860,14 @@ class DeepseekSparseAttnBackend(
         num_tokens = q_all.shape[0]
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
+        out_dtype = _aiter_mla_out_dtype(q.dtype)
+
         if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty(
+                (num_tokens, layer.tp_q_head_num * layer.v_head_dim), dtype=out_dtype
+            )
         else:
-            o = torch.empty_like(q)
+            o = torch.empty_like(q, dtype=out_dtype)
 
         if self.need_pad_heads:
             q_kernel = q.view(
@@ -2830,17 +2878,15 @@ class DeepseekSparseAttnBackend(
                     num_tokens,
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=out_dtype,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        q_scale = None
-        kv_scale = None
+        q_scale, kv_scale = self._aiter_mla_scales(q_kernel.dtype, kv_cache.dtype)
         aiter_persistent_kwargs = {}
-        if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
 
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)
