@@ -907,10 +907,11 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
     Consumes BYPASSED topk directly: the kernel routes from ``router_logits``
     internally. Quantizes the input itself (bf16 passthrough or mxfp8).
     """
-    from flashinfer import mxfp8_quantize, trtllm_fp4_block_scale_moe
+    from flashinfer import trtllm_fp4_block_scale_moe
 
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
     x = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
@@ -930,7 +931,9 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 value=0.0,
             )
     elif quant_info.flashinfer_mxfp4_moe_precision == "default":
-        x_quant, x_scale = mxfp8_quantize(x, False, alignment=quant_info.hidden_size)
+        x_quant, x_scale = flashinfer_mxfp8_quantize(
+            x, False, alignment=quant_info.hidden_size
+        )
         x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
     else:
         raise NotImplementedError(
