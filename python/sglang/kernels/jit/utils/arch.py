@@ -37,15 +37,20 @@ class ArchInfo:
 def _cuda_arch_suffix(major: int, minor: int) -> str:
     """Mirror FlashInfer's `_normalize_cuda_arch`: 9.x/10.x+ -> "a"; 12.0 -> "f"
     and 12.x (x>0) -> "a" (SM120/SM121 need separate cubins to avoid
-    cudaErrorIllegalInstruction, requires CUDA >= 12.9); below 9.0 -> plain.
-    Unlike FlashInfer, pre-12.9 CUDA falls back to plain instead of raising.
+    cudaErrorIllegalInstruction); below 9.0 -> plain.
+
+    The family-specific "f" target needs CUDA >= 12.9; older toolkits fall back
+    to "a", which SM120 has had since 12.8. Plain sm_120 is never a valid
+    fallback: without an a/f target CUTLASS's SM120 atoms lose LDSM/STSM and
+    compile down to trap stubs (verified via SASS), which asserts at launch
+    instead of failing the build.
     """
     if major == 9:
         return "a"
     if major == 12:
-        if get_cuda_version() < (12, 9):
-            return ""
-        return "f" if minor == 0 else "a"
+        if minor == 0 and get_cuda_version() >= (12, 9):
+            return "f"
+        return "a"
     if major >= 10:
         return "a"
     return ""
@@ -71,7 +76,8 @@ def _init_jit_cuda_arch_once():
     _CUDA_ARCH = ArchInfo(major, minor, suffix)
 
 
-def get_default_target_flags() -> List[str]:
+def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
+    """Default compile flags for `arch`, defaulting to the detected local GPU."""
     if is_hip_runtime():
         flags = ["-DUSE_ROCM", "-std=c++20", "-O3"]
         # Detect FP8 type based on GPU architecture
@@ -86,17 +92,29 @@ def get_default_target_flags() -> List[str]:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
     else:
+        if arch is None:
+            arch = get_jit_cuda_arch()
         return [
-            get_jit_cuda_arch().jit_flag,
+            arch.jit_flag,
             "-std=c++20",
             "-O3",
             "--expt-relaxed-constexpr",
         ]
 
 
+def make_jit_cuda_arch(major: int, minor: int) -> ArchInfo:
+    """Build the JIT target for an explicitly requested capability."""
+    return ArchInfo(major, minor, _cuda_arch_suffix(major, minor))
+
+
 @contextmanager
 def override_jit_cuda_arch(major: int, minor: int, suffix: str = ""):
-    """A context manager to temporarily override CUDA architecture."""
+    """A context manager to temporarily override CUDA architecture.
+
+    Kernels do not need this to reach an arch-specific target: `get_jit_cuda_arch`
+    already resolves the local GPU to its a/f target. Reach for it only to compile
+    for an arch the local GPU is not.
+    """
     global _CUDA_ARCH
     old_value = get_jit_cuda_arch()
     _CUDA_ARCH = ArchInfo(major, minor, suffix)
