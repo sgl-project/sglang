@@ -29,6 +29,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
+from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
@@ -201,24 +202,6 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
     ("gate_up_proj", "up_proj", 1),
 ]
-
-
-@functools.lru_cache(maxsize=1)
-def _sm120_prefill_no_pad_threshold() -> Optional[int]:
-    """Token count above which the SM120 sparse-prefill kernel is used.
-
-    Lazily resolved (and None off SM120) so importing this module during
-    model-registry discovery never touches CUDA.
-    """
-    from sglang.srt.utils import is_sm120_supported
-
-    if not is_sm120_supported():
-        return None
-    from sglang.kernels.ops.attention.flash_mla_sm120 import (
-        _SM120_DECODE_MAX_TOKENS,
-    )
-
-    return _SM120_DECODE_MAX_TOKENS
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
@@ -1205,12 +1188,9 @@ class MQALayer(MqaAttentionBase):
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
-        no_pad_threshold = _sm120_prefill_no_pad_threshold()
-        # Rows above the threshold route to the SM120 prefill kernel, which
-        # takes arbitrary h_q -- the decode-only 64-head pad would just be
-        # sliced back off (plus a .contiguous() copy) in the backend, so
-        # size q to the real local heads there instead.
-        skip_decode_pad = no_pad_threshold is not None and x.shape[0] > no_pad_threshold
+        # Above this the SM120 route is the prefill kernel, which takes
+        # arbitrary h_q, so the decode pad below would just be sliced back off.
+        skip_decode_pad = is_sm120_supported() and x.shape[0] > SM120_DECODE_MAX_TOKENS
         if self.attn_tp_size > 1:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to

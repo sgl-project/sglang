@@ -209,7 +209,7 @@ def _sm120_sparse_decode_fwd(
 _sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
 
 
-_SM120_DECODE_MAX_TOKENS = 64
+SM120_DECODE_MAX_TOKENS = 64
 
 
 def _flash_mla_sm120_prefill(
@@ -286,7 +286,7 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_topk_length = kwargs.get("extra_topk_length")
 
     if _sm120_default_backend == "flashinfer":
-        if q.shape[0] > _SM120_DECODE_MAX_TOKENS:
+        if q.shape[0] > SM120_DECODE_MAX_TOKENS:
             return _flash_mla_sm120_prefill(
                 q,
                 k_cache,
@@ -385,9 +385,9 @@ def _page_split_kernel(
 
     if page_idx >= N_pages:
         return
-    # Dirty-skip: only copy pages referenced by this step's sparse indices.
-    # The persistent dst buffer keeps prior contents for unreferenced pages,
-    # which are never read by this call (identity index mapping preserved).
+    # Only copy pages this step's sparse indices reference. The index mapping
+    # stays identity, so the stale contents the persistent dst buffer keeps for
+    # the rest are never read by this call.
     if tl.load(ref_mask_ptr + page_idx) == 0:
         return
 

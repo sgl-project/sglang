@@ -684,9 +684,8 @@ def _pre_permute_standard_contig(
     )
     dispose_tensor(hidden_states)
 
-    # ep_scatter fills expert slots in blocks of 128. Sizing uses a static
-    # upper bound and the counts are accumulated on-device, so this stays
-    # free of GPU->CPU syncs.
+    # ep_scatter fills expert slots in blocks of 128; size from a static upper
+    # bound and accumulate counts on-device to avoid a GPU->CPU sync.
     flat_ids = topk_ids.flatten().to(torch.int64)
     counts = torch.zeros(num_experts, device=device, dtype=torch.int32)
     counts.index_add_(0, flat_ids.clamp_min(0), (flat_ids >= 0).to(torch.int32))
@@ -1116,9 +1115,8 @@ def _varlen_deep_gemm_silu_mul_quant(
         use_jit_ep_activation and envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
     )
     if swiglu_limit is not None and not fuse_swiglu_limit:
-        # The JIT EP-activation kernel is the only fused consumer of
-        # swiglu_limit; when it cannot run (fusion off, or shape unsupported),
-        # clamp in-place first and fall through to a plain-silu activation.
+        # The JIT EP activation is the only fused consumer of swiglu_limit;
+        # when it cannot run, clamp in place and fall through to plain silu.
         _apply_swiglu_limit(
             gateup_output.view(-1, gateup_output.shape[-1]),
             swiglu_limit=swiglu_limit,
