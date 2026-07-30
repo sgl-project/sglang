@@ -1,15 +1,15 @@
 """Application service for realtime ASR inference.
 
 The processor is connection-scoped but keeps no stream progress itself. Each call
-plans and executes one stateless backend request, then commits the result to the
-explicit ``RealtimeASRState`` supplied by the realtime endpoint.
+builds and executes one stateless transcription step, then commits its outcome to
+the explicit ``RealtimeASRState`` supplied by the realtime endpoint.
 
 Per-chunk flow, driven by the endpoint::
 
     append audio -> next_chunk_ready()? -> process()
-        _plan    pick cumulative | windowed, fix the audio range and prompt
-        _infer   run one stateless backend request, reconcile the text
-        _commit  advance attempted/accepted cursors, compact windowed PCM
+        _build_transcription_step  resolve mode, audio range, and prompt
+        _execute_step              run the backend request, reconcile text
+        _commit                    advance cursors, compact windowed PCM
     -> transcript delta
     commit event -> process(is_last=True), or finalize() if no new audio
 
@@ -104,9 +104,8 @@ class RealtimeASRState(msgspec.Struct):
         return self.audio.received_bytes > self.audio.accepted_offset_bytes
 
 
-class _InferencePlan(msgspec.Struct, frozen=True):
-    """One request's mode and audio range, fixed before inference so a failed
-    request leaves no partial state and _commit can apply it atomically."""
+class _TranscriptionStep(msgspec.Struct, frozen=True):
+    """Resolved mode, audio range, and text context for one transcription."""
 
     is_last: bool
     windowed: bool
@@ -116,9 +115,12 @@ class _InferencePlan(msgspec.Struct, frozen=True):
     decoder_prefix: str = ""
 
 
-class _InferenceResult(msgspec.Struct, frozen=True):
-    """Inference outcome; accept_audio=False defers the covered audio so the
-    next request decodes it again instead of losing it."""
+class _TranscriptionOutcome(msgspec.Struct, frozen=True):
+    """Reconciled text and whether the step's audio may be committed.
+
+    ``accept_audio=False`` keeps the covered audio for the next step instead of
+    losing it when the model cannot produce a usable continuation.
+    """
 
     accept_audio: bool
     direct_delta: str = ""
@@ -236,7 +238,7 @@ class RealtimeASRProcessor:
         is_last: bool,
         sampling_params: Dict[str, Any],
     ) -> str:
-        """Run one inference round (plan -> infer -> commit) and return the delta.
+        """Run one transcription step and return its publishable delta.
 
         Windowed inference previews without mutating transcript state, so when
         its first decode reveals no-whitespace CJK the same audio is simply
@@ -250,17 +252,17 @@ class RealtimeASRProcessor:
         ):
             state.windowed_disabled = True
 
-        plan = self._plan(state, is_last)
-        result = await self._infer(state, plan, sampling_params)
+        step = self._build_transcription_step(state, is_last)
+        outcome = await self._execute_step(state, step, sampling_params)
 
-        if self._windowed_text_needs_fallback(state, plan, result):
+        if self._windowed_text_needs_fallback(state, step, outcome):
             # Nothing was emitted yet; redo this request on the cumulative path.
             state.windowed_disabled = True
-            plan = self._plan(state, is_last)
-            result = await self._infer(state, plan, sampling_params)
+            step = self._build_transcription_step(state, is_last)
+            outcome = await self._execute_step(state, step, sampling_params)
 
-        self._commit(state, plan, result)
-        return result.delta
+        self._commit(state, step, outcome)
+        return outcome.delta
 
     def finalize(self, state: RealtimeASRState) -> str:
         """Emit text still held back when the item commits without new audio."""
@@ -268,12 +270,12 @@ class RealtimeASRProcessor:
             return state.transcript.finalize_decoder_suffix()
         return state.transcript.finalize()
 
-    def _plan(
+    def _build_transcription_step(
         self,
         state: RealtimeASRState,
         is_last: bool,
-    ) -> _InferencePlan:
-        """Pick the inference mode and build the request plan."""
+    ) -> _TranscriptionStep:
+        """Resolve the mode, audio range, and text context for the next call."""
         transcript = state.transcript
         audio = state.audio
         policy = self._windowed_policy
@@ -285,7 +287,7 @@ class RealtimeASRProcessor:
                 or (not is_last and audio.received_bytes > policy.activation_bytes)
             )
         ):
-            return _InferencePlan(
+            return _TranscriptionStep(
                 is_last=is_last,
                 windowed=True,
                 committed_text="",
@@ -297,7 +299,7 @@ class RealtimeASRProcessor:
                     include_unconfirmed=not state.windowed_started,
                 ),
             )
-        return _InferencePlan(
+        return _TranscriptionStep(
             is_last=is_last,
             windowed=False,
             committed_text=transcript.get_prefix_text(),
@@ -326,41 +328,41 @@ class RealtimeASRProcessor:
         )
         return max(audio.base_offset_bytes, start)
 
-    async def _infer(
+    async def _execute_step(
         self,
         state: RealtimeASRState,
-        plan: _InferencePlan,
+        step: _TranscriptionStep,
         sampling_params: Dict[str, Any],
-    ) -> _InferenceResult:
-        if plan.windowed:
-            return await self._infer_windowed(state, plan, sampling_params)
-        return await self._infer_cumulative(state, plan, sampling_params)
+    ) -> _TranscriptionOutcome:
+        if step.windowed:
+            return await self._execute_windowed_step(state, step, sampling_params)
+        return await self._execute_cumulative_step(state, step, sampling_params)
 
-    async def _infer_cumulative(
+    async def _execute_cumulative_step(
         self,
         state: RealtimeASRState,
-        plan: _InferencePlan,
+        step: _TranscriptionStep,
         sampling_params: Dict[str, Any],
-    ) -> _InferenceResult:
+    ) -> _TranscriptionOutcome:
         """Re-transcribe the whole buffer and reconcile it against emitted
         text -- main's behavior, kept byte-identical below the gate."""
         samples = await self._snapshot_samples(
-            state.audio, plan.start_offset_bytes, plan.end_offset_bytes
+            state.audio, step.start_offset_bytes, step.end_offset_bytes
         )
         text = await self._generate(
             samples,
             sampling_params,
-            self.adapter.prompt_template + plan.committed_text,
+            self.adapter.prompt_template + step.committed_text,
         )
-        delta = state.transcript.apply_hypothesis(text, is_last=plan.is_last)
-        return _InferenceResult(accept_audio=True, direct_delta=delta)
+        delta = state.transcript.apply_hypothesis(text, is_last=step.is_last)
+        return _TranscriptionOutcome(accept_audio=True, direct_delta=delta)
 
-    async def _infer_windowed(
+    async def _execute_windowed_step(
         self,
         state: RealtimeASRState,
-        plan: _InferencePlan,
+        step: _TranscriptionStep,
         sampling_params: Dict[str, Any],
-    ) -> _InferenceResult:
+    ) -> _TranscriptionOutcome:
         """Decode only the transcript continuation for the rolling window.
 
         Flow: budget the intermediate decode by new-audio length (so one stuck
@@ -370,17 +372,17 @@ class RealtimeASRProcessor:
         -> preview the suffix delta for _commit."""
         policy = self._windowed_policy
         assert policy is not None
-        if plan.start_offset_bytes % policy.window_bytes:
+        if step.start_offset_bytes % policy.window_bytes:
             raise RuntimeError("encoder-window request is not window aligned")
         samples = await self._snapshot_samples(
-            state.audio, plan.start_offset_bytes, plan.end_offset_bytes
+            state.audio, step.start_offset_bytes, step.end_offset_bytes
         )
 
         # Intermediate requests decode only the new suffix; the final commit
         # may replay the prefix, so it keeps the adapter's full budget.
-        if not plan.is_last:
+        if not step.is_last:
             max_suffix_tokens = decoder_suffix_token_budget(
-                plan.end_offset_bytes - state.audio.accepted_offset_bytes,
+                step.end_offset_bytes - state.audio.accepted_offset_bytes,
                 self.bytes_per_second,
                 state.transcript.pending_suffix,
             )
@@ -395,15 +397,15 @@ class RealtimeASRProcessor:
         text = await self._generate(
             samples,
             sampling_params,
-            self.adapter.prompt_template + plan.decoder_prefix,
+            self.adapter.prompt_template + step.decoder_prefix,
             window_config=policy.window_config,
         )
 
         if not state.windowed_started:
             text = state.transcript.prepare_decoder_suffix_transition(text)
-        elif not plan.is_last and not text:
+        elif not step.is_last and not text:
             new_pcm = state.audio.snapshot(
-                state.audio.accepted_offset_bytes, plan.end_offset_bytes
+                state.audio.accepted_offset_bytes, step.end_offset_bytes
             )
             # Defer a voiced-but-empty decode so the next request re-covers
             # it, at most one window so a stuck decoder cannot grow requests.
@@ -412,14 +414,14 @@ class RealtimeASRProcessor:
                 and not is_near_silent_pcm(new_pcm)
                 and len(new_pcm) <= policy.window_bytes
             ):
-                return _InferenceResult(accept_audio=False)
+                return _TranscriptionOutcome(accept_audio=False)
 
         decision = state.transcript.preview_decoder_suffix(
             text,
-            is_last=plan.is_last,
+            is_last=step.is_last,
             holdback_words=policy.decoder_prefix_holdback_words,
         )
-        return _InferenceResult(
+        return _TranscriptionOutcome(
             accept_audio=True,
             decoder_decision=decision,
         )
@@ -453,39 +455,39 @@ class RealtimeASRProcessor:
     def _commit(
         self,
         state: RealtimeASRState,
-        plan: _InferencePlan,
-        result: _InferenceResult,
+        step: _TranscriptionStep,
+        outcome: _TranscriptionOutcome,
     ) -> None:
-        """Apply the result: `attempted` always advances so pacing waits for
-        new audio; `accepted` and PCM compaction advance only when the result
+        """Apply the outcome: `attempted` always advances so pacing waits for
+        new audio; `accepted` and PCM compaction advance only when the outcome
         entered the transcript."""
         audio = state.audio
-        audio.attempted_offset_bytes = plan.end_offset_bytes
-        if result.decoder_decision is not None:
+        audio.attempted_offset_bytes = step.end_offset_bytes
+        if outcome.decoder_decision is not None:
             state.transcript.commit_decoder_suffix(
-                result.decoder_decision,
-                is_last=plan.is_last,
+                outcome.decoder_decision,
+                is_last=step.is_last,
             )
             state.windowed_started = True
-        if not result.accept_audio:
+        if not outcome.accept_audio:
             return
-        audio.accepted_offset_bytes = plan.end_offset_bytes
-        if plan.is_last:
+        audio.accepted_offset_bytes = step.end_offset_bytes
+        if step.is_last:
             return
-        if plan.windowed:
-            audio.discard_before(plan.start_offset_bytes)
+        if step.windowed:
+            audio.discard_before(step.start_offset_bytes)
 
     def _windowed_text_needs_fallback(
         self,
         state: RealtimeASRState,
-        plan: _InferencePlan,
-        result: _InferenceResult,
+        step: _TranscriptionStep,
+        outcome: _TranscriptionOutcome,
     ) -> bool:
         # Decoder-prefix reconciliation is word based; the first windowed
         # decode may reveal a no-whitespace transcript that cannot use it.
         return (
-            plan.windowed
+            step.windowed
             and not state.windowed_started
-            and result.decoder_decision is not None
-            and is_cjk_no_whitespace(result.decoder_decision.pending_suffix or "")
+            and outcome.decoder_decision is not None
+            and is_cjk_no_whitespace(outcome.decoder_decision.pending_suffix or "")
         )

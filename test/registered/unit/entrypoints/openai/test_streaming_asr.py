@@ -333,11 +333,15 @@ class TestWindowedConfigGuard(CustomTestCase):
         # The session rejects appends past the cap, so the largest admissible
         # item is exactly max_buffer_bytes — still not past the gate.
         conn.asr_state.audio.append_pcm(bytes(conn.asr_processor.max_buffer_bytes))
-        self.assertFalse(conn.asr_processor._plan(conn.asr_state, False).windowed)
+        self.assertFalse(
+            conn.asr_processor._build_transcription_step(conn.asr_state, False).windowed
+        )
 
         conn = self._windowed_conn(buffer_seconds=120)
         conn.asr_state.audio.append_pcm(bytes(122))
-        self.assertTrue(conn.asr_processor._plan(conn.asr_state, False).windowed)
+        self.assertTrue(
+            conn.asr_processor._build_transcription_step(conn.asr_state, False).windowed
+        )
 
     def test_first_windowed_request_covers_all_audio_and_bounds_the_prefix(self):
         conn = self._windowed_conn()
@@ -346,8 +350,10 @@ class TestWindowedConfigGuard(CustomTestCase):
         conn.asr_state.audio.attempted_offset_bytes = 122
         conn.asr_state.transcript.emitted_text = "one two three four five"
 
-        intermediate = conn.asr_processor._plan(conn.asr_state, False)
-        final = conn.asr_processor._plan(conn.asr_state, True)
+        intermediate = conn.asr_processor._build_transcription_step(
+            conn.asr_state, False
+        )
+        final = conn.asr_processor._build_transcription_step(conn.asr_state, True)
 
         self.assertEqual(intermediate.start_offset_bytes, 0)
         self.assertEqual(final.start_offset_bytes, 0)
@@ -363,7 +369,7 @@ class TestWindowedConfigGuard(CustomTestCase):
         conn.asr_state.audio.accepted_offset_bytes = 192
         conn.asr_state.audio.attempted_offset_bytes = 192
 
-        rolling = conn.asr_processor._plan(conn.asr_state, False)
+        rolling = conn.asr_processor._build_transcription_step(conn.asr_state, False)
 
         self.assertEqual(rolling.start_offset_bytes, 128)
 
@@ -371,7 +377,9 @@ class TestWindowedConfigGuard(CustomTestCase):
         conn = self._windowed_conn()
         conn.asr_state.audio.append_pcm(bytes(122))
         conn.asr_state.windowed_disabled = True
-        self.assertFalse(conn.asr_processor._plan(conn.asr_state, False).windowed)
+        self.assertFalse(
+            conn.asr_processor._build_transcription_step(conn.asr_state, False).windowed
+        )
 
         conn = self._windowed_conn(windowed_config={})
         self.assertIsNone(conn.asr_processor._windowed_policy)
