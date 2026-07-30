@@ -314,12 +314,18 @@ jobs:
       matrix:
         test_config:
           # glm5_1 performance tests
+          - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
           - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26
             prefill_size: 2
             decode_size: 2
             router_size: 1
-            test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26.py
-            test_type: 'perf'
+            test_case: test/registered/npu/accuracy/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26.py
             prefill_decode_deployment: 'separation'
           # mimo_v2_flash performance tests
           - name: test_npu_mimo_v2_flash_1p1d_12p_in16k_out1_ttft_5s
@@ -360,10 +366,13 @@ jobs:
       matrix:
         test_config:
           # kimi_k2_6 performance tests
+          - name: kimi_k2_6_w4a8_16p_in64k_out1k_100ms
+            node_size: 2
+            test_case: test/registered/npu/performance/kimi_k2_6/test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms.py
+            test_type: 'perf'
           - name: kimi_k2_6_w4a8_16p_in64k_out1k_100ms_aime25
             node_size: 2
-            test_case: test/registered/npu/performance/kimi_k2_6/test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms_aime25.py
-            test_type: 'perf'
+            test_case: test/registered/npu/accuracy/kimi_k2_6/test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms_aime25.py
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-8

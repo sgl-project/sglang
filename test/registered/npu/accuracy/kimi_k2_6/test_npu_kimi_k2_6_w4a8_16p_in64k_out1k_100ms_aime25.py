@@ -5,11 +5,8 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
 )
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    AISBENCHMARK_DATASET_DEFAULT,
-    BENCHMARK_TOOL_DEFAULT,
     KIMI_K2_6_EAGLE3_MODEL_PATH,
     KIMI_K2_6_W4A8_MODEL_PATH,
-    TestNpuPerfMultiNodePdMixTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -17,7 +14,6 @@ register_npu_ci(
     est_time=1800,
     suite="nightly-8-npu-a3",
     nightly=True,
-    disabled="Currently it is executed by the npu performance workflow.",
 )
 
 ENVS = {
@@ -105,24 +101,6 @@ class TestNPUKimiK2_6_W4A8_16P_AIME2025(TestNpuAccuracyMultiNodePdMixTestCaseBas
 
     def test_aime2025(self):
         self.run_accuracy()
-
-
-class TestNPUKimiK2_6_W4A8_16P_In64k_Out1k_100ms(TestNpuPerfMultiNodePdMixTestCaseBase):
-    benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    dataset_type = AISBENCHMARK_DATASET_DEFAULT
-    model_config = MODEL_CONFIG
-    dataset_name = "random"
-    max_concurrency = 32
-    num_prompts = 32
-    input_len = 64000
-    output_len = 1000
-    random_range_ratio = 1
-    seed = 1
-    tpot = 100
-    output_token_throughput = 160
-
-    def test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms(self):
-        self.run_throughput()
 
 
 if __name__ == "__main__":
