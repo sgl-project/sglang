@@ -342,9 +342,8 @@ def build_eagle_verify_input(
             device,
         )
 
-    # Build tree mask. Write straight into the backend's buffer when it owns one
-    # and this batch fits it; a batch past the captured max_bs (eager path) falls
-    # back to a fresh allocation in the same layout.
+    # Write straight into the backend's buffer when it owns one and this batch
+    # fits; an eager batch past the captured max_bs falls back to allocating.
     target_attn_backend = target_worker.model_runner.attn_backend
     verify_mask = target_attn_backend.verify_mask
     if verify_mask is None:
