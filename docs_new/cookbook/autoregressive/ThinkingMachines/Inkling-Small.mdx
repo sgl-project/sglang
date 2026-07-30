@@ -1,6 +1,6 @@
 ---
-title: Inkling
-description: "Deploy Inkling with SGLang — verified launch commands, tuning, and multimodal / reasoning / tool-calling usage for Thinking Machines' 975B Mixture-of-Experts model with 1M-token context."
+title: Inkling-Small
+description: "Deploy Inkling-Small with SGLang — launch commands, tuning, and multimodal / reasoning / tool-calling usage for Thinking Machines' Inkling-Small Mixture-of-Experts model."
 tag: NEW
 ---
 
@@ -16,7 +16,7 @@ For all install methods and hardware platforms, see the [official SGLang install
 
 <Tab title="Python (pip / uv)">
 
-Inkling has merged to `main` but isn't in a `pip` release yet — install from source:
+Inkling-Small has merged to `main` but isn't in a `pip` release yet — install from source:
 
 ```bash Command
 pip install --upgrade pip
@@ -29,7 +29,7 @@ Then run the **Python** output of the command panel below.
 
 <Tab title="Docker">
 
-<Note>The Inkling images are being published to [`lmsysorg/sglang`](https://hub.docker.com/r/lmsysorg/sglang/tags) — watch the tag list for status.</Note>
+<Note>The Inkling-Small images are being published to [`lmsysorg/sglang`](https://hub.docker.com/r/lmsysorg/sglang/tags) — watch the tag list for status.</Note>
 
 There are two multi-arch (amd64 / arm64) CUDA builds plus a ROCm build; pick the CUDA build by your CUDA version, not your GPU:
 
@@ -50,8 +50,8 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 Pick your hardware to generate the launch command. Each platform ships a **Balanced** recipe plus **MTP** and **DSpark** (speculative decoding) tiers and a **Long Context (MXFP8 KV)** tier where validated; the **LoRA** variant serves adapters on top of the frozen base model. Set `MAX_LORAS` to the number of distinct adapters you serve (1 is fastest for single-adapter serving).
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
-import { config }     from "/src/snippets/configs/thinkingmachines/inkling.jsx";
-import { benchmarks } from "/src/snippets/configs/thinkingmachines/inkling-benchmarks.jsx";
+import { config }     from "/src/snippets/configs/thinkingmachines/inkling-small.jsx";
+import { benchmarks } from "/src/snippets/configs/thinkingmachines/inkling-small-benchmarks.jsx";
 
 <Deployment config={config} benchmarks={benchmarks} />
 
@@ -77,9 +77,9 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**Inkling** is a Mixture-of-Experts model from Thinking Machines — **975B** total parameters, **41B** active per token, with a **1M-token** context window and **open weights** (BF16 and NVFP4 checkpoints below). It handles text, image, and audio inputs natively, and exposes a **variable reasoning-effort** control to trade latency and cost against answer quality. This page covers serving Inkling on SGLang, including its **MTP** speculative-decoding path and long-context prefix caching (unified radix cache + HiCache).
+**Inkling-Small** is a Mixture-of-Experts model from Thinking Machines with **open weights** (BF16 and NVFP4 checkpoints below), in the same architecture family as Inkling. It handles text, image, and audio inputs natively, and exposes a **variable reasoning-effort** control to trade latency and cost against answer quality. This page covers serving Inkling-Small on SGLang, including its **MTP** speculative-decoding path and long-context prefix caching (unified radix cache + HiCache).
 
-**Resources:** HuggingFace — [Inkling](https://huggingface.co/thinkingmachines/Inkling) (BF16) · [Inkling-NVFP4](https://huggingface.co/thinkingmachines/Inkling-NVFP4).
+**Resources:** HuggingFace — [Inkling-Small](https://huggingface.co/thinkingmachines/Inkling-Small) (BF16) · [Inkling-Small-NVFP4](https://huggingface.co/thinkingmachines/Inkling-Small-NVFP4).
 
 ## 2. Configuration Tips
 
@@ -87,7 +87,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **Memory pool ratios.** `--swa-full-tokens-ratio` and `--mamba-full-memory-ratio` (both default `0.1`) size the SWA and Mamba/sconv state pools; tune them to your workload's usage.
 
-**MTP needs `--enable-multi-layer-eagle`.** The MTP recipe drives Inkling's multi-layer draft head; without this flag the standard EAGLE worker runs against it and outputs garbage.
+**MTP needs `--enable-multi-layer-eagle`.** The MTP recipe drives Inkling-Small's multi-layer draft head; without this flag the standard EAGLE worker runs against it and outputs garbage.
 
 **Reasoning effort.** Pass `reasoning_effort` as one of the named levels below; requests that omit it default to `high`, and `max` is the strongest. Each level maps to an internal effort value (max at `0.99`):
 
@@ -123,7 +123,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 resp = client.chat.completions.create(
-    model="thinkingmachines/Inkling-NVFP4",
+    model="thinkingmachines/Inkling-Small-NVFP4",
     messages=[{"role": "user", "content": "What is 17 times 24?"}],
     extra_body={"chat_template_kwargs": {"thinking": True}},
 )
@@ -189,7 +189,7 @@ tools = [
 ]
 
 resp = client.chat.completions.create(
-    model="thinkingmachines/Inkling-NVFP4",
+    model="thinkingmachines/Inkling-Small-NVFP4",
     messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
     tools=tools,
 )
@@ -213,7 +213,7 @@ Tool calls: [ChatCompletionMessageFunctionToolCall(id='call_98f772f3a0044f45b80c
 
 ### 3.3 Multimodal Input (Image + Audio)
 
-Inkling is multimodal: a single user message can mix **text**, **images**, and **audio**. Pass each media item as its own content part — `image_url` for images, `audio_url` for audio — with the `url` set to either an HTTP(S) link or a base64 `data:` URI. The server must be started with `--enable-multimodal` (already included in every recipe above).
+Inkling-Small is multimodal: a single user message can mix **text**, **images**, and **audio**. Pass each media item as its own content part — `image_url` for images, `audio_url` for audio — with the `url` set to either an HTTP(S) link or a base64 `data:` URI. The server must be started with `--enable-multimodal` (already included in every recipe above).
 
 <Accordion title="Image + Audio Example (Python)">
 
@@ -229,7 +229,7 @@ with open("audio.wav", "rb") as f:
     audio_b64 = base64.b64encode(f.read()).decode()
 
 resp = client.chat.completions.create(
-    model="thinkingmachines/Inkling-NVFP4",
+    model="thinkingmachines/Inkling-Small-NVFP4",
     messages=[
         {
             "role": "user",
@@ -266,13 +266,13 @@ client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 # Option A (recommended): "<model>:<adapter-name>" in the model field
 resp = client.chat.completions.create(
-    model="thinkingmachines/Inkling-NVFP4:lora0",
+    model="thinkingmachines/Inkling-Small-NVFP4:lora0",
     messages=[{"role": "user", "content": "Summarize the changelog."}],
 )
 
 # Option B: explicit lora_path via extra_body
 resp = client.chat.completions.create(
-    model="thinkingmachines/Inkling-NVFP4",
+    model="thinkingmachines/Inkling-Small-NVFP4",
     messages=[{"role": "user", "content": "Summarize the changelog."}],
     extra_body={"lora_path": "lora0"},
 )
@@ -288,7 +288,7 @@ One adapter per request — omit the `:adapter` suffix (and `lora_path`) to hit 
 
 ### 3.5 HiCache (Hierarchical KV Caching)
 
-Inkling serves on SGLang's **unified radix cache**: the historically separate full-attention, SWA, and Mamba/sconv caches are combined into one radix tree with typed components, and native HiCache offloads cold prefix pages across tiers (GPU HBM → host DRAM → disk / remote). This expands effective prefix-cache capacity for multi-turn and long-context workloads.
+Inkling-Small serves on SGLang's **unified radix cache**: the historically separate full-attention, SWA, and Mamba/sconv caches are combined into one radix tree with typed components, and native HiCache offloads cold prefix pages across tiers (GPU HBM → host DRAM → disk / remote). This expands effective prefix-cache capacity for multi-turn and long-context workloads.
 
 To enable HiCache, open the **HiCache** card in the [Playground above](#playground) and flip **Enable**, then pick a storage backend (`file` / `mooncake` / `nixl`) for the L3 tier. The Write policy defaults to `write_through`.
 
@@ -304,6 +304,6 @@ To try it, select the **Long Context** strategy in the Deploy panel above for an
 
 ### 3.7 DSpark (Speculative Decoding)
 
-The **DSpark** deploy strategy is the second speculative-decoding path for Inkling. Unlike **MTP**, which drives Inkling's own multi-layer draft head, DSpark runs a **separate draft checkpoint** — `RadixArk/Inkling-DSpark-Preview` — served unquantized alongside the NVFP4 target.
+The **DSpark** deploy strategy is the second speculative-decoding path for Inkling-Small. Unlike **MTP**, which drives Inkling-Small's own multi-layer draft head, DSpark runs a **separate draft checkpoint** — `RadixArk/Inkling-Small-DSpark-Preview` — served unquantized alongside the NVFP4 target.
 
 DSpark support ships in the images listed in §1 (`dev-inkling-dspark` for CUDA 13, `dev-cu12-inkling-dspark` for CUDA 12), so no separate build is needed. Verified end-to-end on B200 (TP=8, NVFP4).
