@@ -109,9 +109,10 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
 
     @staticmethod
     def _normalize_image_outputs(outputs: List[Dict]) -> Dict[str, List[torch.Tensor]]:
-        """Crop one or more image-scoped HF processor outputs."""
         pixel_values = []
 
+        # Hugging Face pads images in a multimodal batch to a common size. Crop each
+        # item to its reported dimensions before encoding it.
         for output in outputs:
             pixel_values.extend(
                 image[:, : int(height), : int(width)].contiguous()
@@ -123,9 +124,10 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
 
     @staticmethod
     def _normalize_audio_outputs(outputs: List[Dict]) -> Dict[str, List[torch.Tensor]]:
-        """Trim one or more audio-scoped HF processor outputs."""
         input_features = []
 
+        # Hugging Face pads audio features in a multimodal batch to a common length.
+        # Trim each item to its attention-mask length before encoding it.
         for output in outputs:
             input_features.extend(
                 audio[0, : int(mask.sum())].contiguous()
@@ -143,7 +145,15 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
         end_token_id: int,
         mm_token_id: int,
     ) -> List[List[tuple[int, int]]]:
-        """Find each delimited media item and its replaceable token fragments."""
+        """Generate per-item placeholder offsets from Apertus's expanded prompt.
+
+        It first finds each start/end delimiter pair, then extracts contiguous
+        ``mm_token_id`` spans fully inside that pair. A monotonic cursor assigns
+        each span to its delimiter range, excluding layout tokens such as rows.
+
+        Image token IDs to offset spans: ``[BOI, IMAGE, IMAGE, ROW, IMAGE, EOI]`` -> ``[(1, 2), (4, 4)]``.
+        Audio token IDs to offset spans: ``[BOA, AUDIO, AUDIO, EOA]`` -> ``[(1, 2)]``.
+        """
         # Assumption: canonical input IDs contain ordered, non-nested Apertus
         # start/end delimiters around every source media item.
         item_regions = self.get_mm_items_offset_by_pair(
@@ -192,7 +202,19 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
     def _expand_mm_items_with_apertus_offsets(
         self, mm_items: List[MultimodalDataItem], input_ids: torch.Tensor
     ) -> None:
-        """Normalize and split media items by Apertus delimiter regions."""
+        """Expand bundled media into per-item records aligned with prompt spans.
+
+        Processor outputs may bundle padded image or audio tensors, while
+        precomputed embeddings may be batched. Normalize and split every payload
+        into one ``MultimodalDataItem`` per source media item, then match it to
+        the corresponding ordered image/audio spans in Apertus's expanded prompt.
+
+        Generic ``process_and_combine_mm_data`` spans assume contiguous media
+        tokens, so replace them with delimiter-derived Apertus spans as needed.
+        The media-item count must equal the number of delimiter-derived prompt
+        span groups. The original modality items are replaced in place with the
+        aligned items, whose stale hash and padding metadata are reset.
+        """
         for modality in (Modality.IMAGE, Modality.AUDIO):
             modality_items = [item for item in mm_items if item.modality == modality]
             if not modality_items:
