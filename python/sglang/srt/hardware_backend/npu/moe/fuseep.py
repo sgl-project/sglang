@@ -8,7 +8,7 @@ weight-postprocess helper that NPU quant_methods call from their
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -50,23 +50,28 @@ def forward_fuseep(
     layer: FusedMoE,
     hidden_states: torch.Tensor,
     topk_output: TopKOutput,
-    m3_fuseep_normal: bool = False,
-    m3_fuseep_num_input_tokens: Optional[int] = None,
+    fuseep_activation,
+    fuseep_normal_mode: Optional[bool] = None,
 ) -> torch.Tensor:
-    if m3_fuseep_normal:
-        if envs.SGLANG_NPU_FUSED_MOE_MODE.get() != FusedMoEMode.DISPATCH_FFN_COMBINE.value:
-            raise RuntimeError("MiniMax-M3 FuseEP prefill requires SGLANG_NPU_FUSED_MOE_MODE=2")
+    (
+        activation_type,
+        activation_alpha,
+        gate_clamp_max,
+        up_clamp_min,
+        up_clamp_max,
+        up_add,
+    ) = fuseep_activation.kernel_args()
+    fuse_mode = envs.SGLANG_NPU_FUSED_MOE_MODE.get()
+    if fuseep_normal_mode is None:
+        fuseep_normal_mode = fuse_mode == FusedMoEMode.DISPATCH_FFN_COMBINE.value
+
+    if (
+        fuseep_normal_mode
+        and fuse_mode == FusedMoEMode.DISPATCH_FFN_COMBINE.value
+    ):
         buf = _get_fuseep_buffer(layer, normal_mode=True)
-        # The M3 operator's workspace must hold all routed tokens that could arrive
-        # at one EP rank. This conservative bound is safe for skewed router output.
-        num_input_tokens = (
-            m3_fuseep_num_input_tokens
-            if m3_fuseep_num_input_tokens is not None
-            else hidden_states.shape[0]
-        )
+        num_input_tokens = hidden_states.shape[0]
         if is_dp_attention_enabled():
-            # Idle DP ranks have no local tokens, but can receive routed tokens
-            # from another DP rank through the shared EP16 collective.
             global_num_tokens = get_dp_global_num_tokens()
             if global_num_tokens is not None:
                 num_input_tokens = max(num_input_tokens, sum(global_num_tokens))
@@ -90,58 +95,31 @@ def forward_fuseep(
         else:
             topk_ids = topk_output.topk_ids
             topk_weights = topk_output.topk_weights
-        # Padded decode tokens can carry -1 expert ids with zero gate weights.
-        # DispatchFFNCombineM3 indexes routing buffers with every id, so replace
-        # the sentinel with a valid expert while retaining the zero contribution.
         topk_ids = topk_ids.masked_fill(topk_ids < 0, 0)
         if is_dp_attention_enabled():
-            # DP MLP gather returns a view into a rank-padded buffer. The custom
-            # OPP requires a standalone base allocation for its input tensor.
             hidden_states = hidden_states.clone()
             topk_ids = topk_ids.contiguous()
             topk_weights = topk_weights.contiguous()
-        normal_decode = m3_fuseep_num_input_tokens is None
-        if normal_decode and hidden_states.shape[0] < 128:
-            # DispatchFFNCombineM3's normal-mode tiles require a non-trivial
-            # M dimension. Pad decode to one full M tile, then
-            # discard these dummy routes before returning to the model.
-            pad_tokens = 128 - hidden_states.shape[0]
-            hidden_states = torch.cat(
-                (hidden_states, hidden_states.new_zeros((pad_tokens, layer.hidden_size)))
-            )
-            topk_ids = torch.cat(
-                (
-                    topk_ids,
-                    torch.zeros(
-                        (pad_tokens, topk_ids.shape[1]),
-                        dtype=topk_ids.dtype,
-                        device=topk_ids.device,
-                    ),
-                )
-            )
-            topk_weights = torch.cat(
-                (topk_weights, topk_weights.new_ones((pad_tokens, topk_weights.shape[1])))
-            )
         max_output_size = max(num_input_tokens, 1) * topk_ids.shape[1]
         if not is_dp_attention_enabled():
             max_output_size *= get_tp_group().device_group.size()
-        if normal_decode:
-            max_output_size = max(
-                max_output_size,
-                hidden_states.shape[0]
-                * topk_ids.shape[1]
-                * get_tp_group().device_group.size(),
-            )
-        hidden_states, _ = buf.dispatch_ffn_combine_m3(
+        hidden_states, _ = buf.fused_deep_moe(
             hidden_states,
             topk_idx=topk_ids,
             topk_weights=topk_weights,
-            weight1=layer.w13_weight,
-            scale1=layer.w13_weight_scale,
-            weight2=layer.w2_weight,
-            scale2=layer.w2_weight_scale,
-            max_output_size=max_output_size,
+            gmm1_permuted_weight=layer.w13_weight,
+            gmm1_permuted_weight_scale=layer.w13_weight_scale,
+            gmm2_weight=layer.w2_weight,
+            gmm2_weight_scale=layer.w2_weight_scale,
+            num_max_dispatch_tokens_per_rank=max_output_size,
             num_experts=layer.num_experts,
+            fuse_mode=fuse_mode,
+            activation_type=activation_type,
+            activation_alpha=activation_alpha,
+            gate_clamp_max=gate_clamp_max,
+            up_clamp_min=up_clamp_min,
+            up_clamp_max=up_clamp_max,
+            up_add=up_add,
         )
         return hidden_states[:num_output_tokens]
 
@@ -178,7 +156,13 @@ def forward_fuseep(
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         ),
         num_experts=layer.num_experts,
-        fuse_mode=get_exec().moe.fuseep_mode,
+        fuse_mode=FusedMoEMode.FUSED_DEEP_MOE.value,
+        activation_type=activation_type,
+        activation_alpha=activation_alpha,
+        gate_clamp_max=gate_clamp_max,
+        up_clamp_min=up_clamp_min,
+        up_clamp_max=up_clamp_max,
+        up_add=up_add,
     )
     return hidden_states[:0] if is_idle_dp_rank else hidden_states
 

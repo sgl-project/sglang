@@ -46,7 +46,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
-    get_dp_global_num_tokens,
     get_is_extend_in_batch,
     is_dp_attention_enabled,
 )
@@ -59,7 +58,11 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    FuseEPActivationConfig,
+    FuseEPActivationType,
+    FusedMoE,
+)
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -332,6 +335,14 @@ class MiniMaxM3MoE(nn.Module):
             gemm1_clamp_limit=config.swiglu_limit,
             prefix=add_prefix("experts", prefix),
             gate_up_interleaved=False,
+            fuseep_activation=FuseEPActivationConfig(
+                activation_type=FuseEPActivationType.SWIGLU_OAI,
+                alpha=config.swiglu_alpha,
+                gate_clamp_max=config.swiglu_limit,
+                up_clamp_min=-config.swiglu_limit,
+                up_clamp_max=config.swiglu_limit,
+                up_add=1.0,
+            ),
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
@@ -449,38 +460,15 @@ class MiniMaxM3MoE(nn.Module):
         # here, unlike forward_normal), and the shared experts are replicated
         # (tp_size=1, see __init__), so both are complete per token and add directly.
         is_extend_in_batch = forward_batch.forward_mode.is_extend() or (
-            is_dp_attention_enabled() and get_is_extend_in_batch()
-        )
-        if is_dp_attention_enabled():
-            dp_global_num_tokens = get_dp_global_num_tokens()
-            num_prefill_tokens = (
-                sum(dp_global_num_tokens)
-                if dp_global_num_tokens is not None
-                else hidden_states.shape[0]
-            )
-        else:
-            num_prefill_tokens = hidden_states.shape[0]
-        dp_global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
-        if dp_global_num_tokens is None and is_dp_attention_enabled():
-            dp_global_num_tokens = get_dp_global_num_tokens()
-        m3_fuseep_num_input_tokens = (
-            sum(dp_global_num_tokens)
-            if is_extend_in_batch and dp_global_num_tokens is not None
-            else None
-        )
-        use_m3_fuseep_normal = (
-            envs.SGLANG_ENABLE_M3_FUSEEP_PREFILL.get()
-            # The normal operator is prefill-only; decode uses FuseEP's
-            # low-latency fused_deep_moe path with the same weight layout.
-            and is_extend_in_batch
-            and getattr(topk_output, "expert_location_dispatch_info", None) is None
+            is_dp_attention_enabled()
+            and hidden_states.shape[0] == 0
+            and get_is_extend_in_batch()
         )
         if get_moe_a2a_backend().is_ascend_fuseep():
             final_hidden_states = self.experts(
                 hidden_states,
                 topk_output,
-                m3_fuseep_normal=use_m3_fuseep_normal,
-                m3_fuseep_num_input_tokens=m3_fuseep_num_input_tokens,
+                fuseep_normal_mode=is_extend_in_batch,
             )
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)
