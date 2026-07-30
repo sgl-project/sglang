@@ -98,6 +98,16 @@ async fn main() -> Result<()> {
     );
 
     let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
+    let prefix_index = cfg
+        .model
+        .cache_aware
+        .as_ref()
+        .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
+        .map(|endpoint| {
+            Arc::new(sgl_kv_indexer::GrpcPrefixIndex::new(
+                sgl_kv_indexer::PrefixIndexConfig::new(endpoint.clone()),
+            ))
+        });
 
     // Build the KV-event index up front so the cache-aware-zmq policy can
     // share its `HashTree` handle + `BlockSizeOracle`. When no model uses
@@ -163,16 +173,17 @@ async fn main() -> Result<()> {
         .context("build proxy client")?,
     );
 
-    let ctx = Arc::new(
-        sgl_router::server::app_context::AppContext::with_active_load(
-            cfg.clone(),
-            tokenizers,
-            proxy,
-            registry,
-            policies,
-            active_load,
-        ),
+    let mut app_ctx = sgl_router::server::app_context::AppContext::with_active_load(
+        cfg.clone(),
+        tokenizers,
+        proxy,
+        registry,
+        policies,
+        active_load,
     );
+    app_ctx.prefix_index = prefix_index;
+    app_ctx.block_size_oracle = block_size_oracle;
+    let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 
     let app = sgl_router::server::app::build_router(ctx.clone());

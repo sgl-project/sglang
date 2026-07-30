@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::discovery::{ModelId, WorkerMode};
+use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
-use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
+use crate::policies::{request_tokens_for, ExternalPrefixSignal, RequestTokens, SelectionContext};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
@@ -16,6 +17,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
+use sgl_kv_indexer::PrefixIndex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -167,6 +169,29 @@ pub async fn chat_completions(
     let request_tokens = request_value
         .as_ref()
         .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
+    let external_prefix = match (
+        ctx.prefix_index.as_ref(),
+        request_tokens.as_ref(),
+        ctx.block_size_oracle.get(),
+    ) {
+        (Some(index), Some(tokens), Some(block_size)) => {
+            let hashes = if ctx.block_size_oracle.is_bigram() {
+                compute_block_hashes_bigram(&tokens.ids, block_size as usize)
+            } else {
+                compute_block_hashes(&tokens.ids, block_size as usize)
+            };
+            if hashes.is_empty() {
+                None
+            } else {
+                let query_blocks = hashes.len();
+                Some(ExternalPrefixSignal {
+                    outcome: index.match_prefix(hashes).await,
+                    query_blocks,
+                })
+            }
+        }
+        _ => None,
+    };
 
     // Sticky-session routing key. When the sticky policy is configured,
     // read the routing key from the operator-chosen header into the
@@ -181,7 +206,8 @@ pub async fn chat_completions(
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
-        .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
+        .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()))
+        .with_external_prefix(external_prefix.as_ref());
     let worker =
         policy
             .select(&workers, &selection_ctx)
