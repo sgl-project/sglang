@@ -211,6 +211,17 @@ class TestInklingDetector(CustomTestCase):
             content += detector.parse_streaming_increment(char).normal_text
         self.assertEqual(content, source)
 
+    def test_raw_text_tool_framing_is_preserved_for_the_tool_parser(self):
+        """The headerless <|content_invoke_tool_text|> block must survive into
+        content so the tool-call detector can surface it, rather than being
+        swallowed as header data."""
+        detector = InklingDetector()
+        source = "<|message_model|><|content_invoke_tool_text|>search<|end_message|>"
+        result = detector.detect_and_parse(source)
+        self.assertIn("<|content_invoke_tool_text|>", result.normal_text)
+        self.assertIn("search", result.normal_text)
+        self.assertEqual(result.reasoning_text, "")
+
     def test_quoted_message_model_token_inside_content_is_preserved(self):
         """Bug regression: the header branch flipped to header state on ANY
         <|message_model|> occurrence, so a literal token the model wrote
