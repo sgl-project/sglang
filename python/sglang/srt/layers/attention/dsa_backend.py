@@ -2817,6 +2817,17 @@ class DeepseekSparseAttnBackend(
         kv_indices = self.kv_indices
         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
 
+        # aiter takes its batch count from kv_indptr's LENGTH, not from
+        # qo_indptr: get_mla_metadata_v1_0_device (aiter csrc/kernels/mla/
+        # metadata/v1_0_device.cuh) does `num_batches = seqlens_kv_indptr.size(0)
+        # - 1`. self.kv_indptr is a max_bs+1 capacity buffer, so handing it over
+        # whole makes the metadata kernel emit work items for every stale slot
+        # past bs, with qo_start = bid * uni_seqlen_qo running far past the end
+        # of q/o -- the persistent MLA kernel then reads and writes out of
+        # bounds (GPU memory access fault). cu_seqlens_q is already a [: bs + 1]
+        # view; kv_indptr has to match it.
+        kv_indptr = kv_indptr[: bs + 1]
+
         kv_last_page_lens = metadata.cu_seqlens_q
         if kv_cache.dtype == fp8_dtype:
             aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
