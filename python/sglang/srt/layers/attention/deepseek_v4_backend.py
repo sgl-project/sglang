@@ -1882,72 +1882,64 @@ class DeepseekV4AttnBackend(
         q_f32 = q.float()  # [N_heads, 512]
         out = torch.zeros(N_heads, MXFP4_TOTAL_DIM, dtype=torch.float32, device=dev)
 
-        # For decode, all heads share the same page set. Collect from
-        # head 0 only (graph-safe, no per-head .item()).
+        # Graph-safe page collection: use tensor ops only, no .tolist().
+        # Dequant all SWA pages referenced by head 0 directly via tensor.
         swa_tk = num_valid
-        swa_pids = swa_page_indices[0, :swa_tk].long()
-        swa_pids = swa_pids[swa_pids >= 0].tolist()
-        unique_swa = set(swa_pids)
+        swa_pids = swa_page_indices[0, :swa_tk].long()  # [swa_tk]
+        swa_mask = swa_pids >= 0
+        swa_valid_pids = swa_pids[swa_mask]  # GPU tensor of valid page IDs
 
-        unique_extra: set[int] = set()
+        # --- dequant SWA pages (tensor-based, graph-safe) ---
+        swa_deq = None
+        if swa_valid_pids.numel() > 0:
+            # Compute flat token indices: for each page pid, tokens in
+            # [pid*page_size, (pid+1)*page_size). Use unique() to dedup.
+            swa_valid_pids = swa_valid_pids.unique(sorted=False)
+            swa_n_pages = swa_valid_pids.numel()
+            # Build flat_indices = pid*page_sz + offset, broadcasted
+            offsets = torch.arange(swa_phys_page_size, device=dev, dtype=torch.int32)
+            flat_indices = (
+                swa_valid_pids.unsqueeze(1) * swa_phys_page_size + offsets.unsqueeze(0)
+            ).reshape(-1)
+            swa_deq = dequantize_dsv4_mxfp4_k_cache_paged(
+                swa_k_cache, flat_indices, swa_phys_page_size
+            )[
+                :, 0, :
+            ]  # [n_pages * page_sz, 512]
+
+        # --- dequant extra pages (FP8, tensor-based, graph-safe) ---
+        extra_deq = None
         if extra_indices is not None and extra_topk_lengths is not None:
-            extra_tk = extra_topk_lengths.shape[-1]  # padded max, safe for collection
+            extra_tk = extra_topk_lengths.shape[-1]
             if extra_tk > 0:
                 extra_pids = extra_indices[0, :extra_tk].long()
-                extra_pids = extra_pids[extra_pids >= 0].tolist()
-                unique_extra = set(extra_pids)
+                extra_mask = extra_pids >= 0
+                extra_valid_pids = extra_pids[extra_mask]
+                if extra_valid_pids.numel() > 0:
+                    extra_valid_pids = extra_valid_pids.unique(sorted=False)
+                    offsets = torch.arange(
+                        extra_page_size, device=dev, dtype=torch.int32
+                    )
+                    extra_flat = (
+                        extra_valid_pids.unsqueeze(1) * extra_page_size
+                        + offsets.unsqueeze(0)
+                    ).reshape(-1)
+                    from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+                        dequantize_k_cache_paged as dequantize_fp8_k_cache_paged,
+                    )
 
-        # --- batch-dequant unique pages → flat row-indexed BF16 ---
-        def _dequant_swa_pages(cache, page_ids, page_sz):
-            """SWA pool: MXFP4 dequant → flat [total_tokens, 512] tensor."""
-            if not page_ids:
-                return None, {}
-            flat_indices = []
-            page_to_start = {}
-            for pid in sorted(page_ids):
-                page_to_start[pid] = len(flat_indices)
-                flat_indices.extend(range(pid * page_sz, (pid + 1) * page_sz))
-            indices_t = torch.tensor(flat_indices, dtype=torch.int32, device=dev)
-            deq = dequantize_dsv4_mxfp4_k_cache_paged(cache, indices_t, page_sz)
-            return deq[:, 0, :], page_to_start  # [total_tokens, 512], dict
+                    extra_deq = dequantize_fp8_k_cache_paged(
+                        extra_k_cache, extra_flat, extra_page_size
+                    )[
+                        :, 0, :
+                    ]  # [n_extra_pages * extra_page_sz, 512]
 
-        def _dequant_extra_pages(cache, page_ids, page_sz):
-            """C4/C128 pool: FP8 dequant → flat [total_tokens, 512] tensor."""
-            if not page_ids:
-                return None, {}
-            flat_indices = []
-            page_to_start = {}
-            for pid in sorted(page_ids):
-                page_to_start[pid] = len(flat_indices)
-                flat_indices.extend(range(pid * page_sz, (pid + 1) * page_sz))
-            indices_t = torch.tensor(flat_indices, dtype=torch.int32, device=dev)
-            from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
-                dequantize_k_cache_paged as dequantize_fp8_k_cache_paged,
-            )
-
-            deq = dequantize_fp8_k_cache_paged(cache, indices_t, page_sz)
-            return deq[:, 0, :], page_to_start  # [total_tokens, 512], dict
-
-        swa_deq, swa_lookup = _dequant_swa_pages(
-            swa_k_cache, unique_swa, swa_phys_page_size
-        )
-        extra_deq, extra_lookup = (
-            _dequant_extra_pages(extra_k_cache, unique_extra, extra_page_size)
-            if extra_k_cache is not None
-            else (None, {})
-        )
-
-        # --- Batched SDPA: single K, single matmul for all heads ---
-        # For decode, all heads attend to the same pages (collected from
-        # head 0 above). Graph-safe: no per-head .item() calls.
+        # --- Batched SDPA: single K tensor, single matmul for all heads ---
         k_segments = []
-        for pid in sorted(unique_swa):
-            start = swa_lookup[pid]
-            k_segments.append(swa_deq[start : start + swa_phys_page_size])
+        if swa_deq is not None:
+            k_segments.append(swa_deq)
         if extra_deq is not None:
-            for pid in sorted(unique_extra):
-                start = extra_lookup[pid]
-                k_segments.append(extra_deq[start : start + extra_page_size])
+            k_segments.append(extra_deq)
         if k_segments:
             k_all = torch.cat(k_segments, dim=0).float()  # [T, 512]
             scores = (q_f32 @ k_all.T) * self.softmax_scale  # [N_heads, T]
