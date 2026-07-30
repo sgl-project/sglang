@@ -525,16 +525,25 @@ class KimiK3MoE(nn.Module):
                 "got a checkpoint with different constants"
             )
 
-        # EP a2a backends (megamoe / DeepEP) move each row to its experts
-        # directly, so the MoE region can consume whatever rows this rank
-        # holds — an SP-MoE token shard (attn_tp > 1) or the DP-local batch
-        # (DP attention) — with every global token dispatched exactly once.
-        # No DP gather and no TP reduce is needed anywhere in the region.
+        # EP a2a backends (megamoe / DeepEP / MoRI) move each row to its
+        # experts directly, so the MoE region can consume whatever rows this
+        # rank holds — an SP-MoE token shard (attn_tp > 1) or the DP-local
+        # batch (DP attention) — with every global token dispatched exactly
+        # once. No DP gather and no TP reduce is needed anywhere in the region.
         _a2a_backend = get_moe_a2a_backend()
         self._ep_a2a = (
             _a2a_backend.is_megamoe()
             or _a2a_backend.is_deepep()
             or _a2a_backend.is_ascend_fuseep()
+            or _a2a_backend.is_mori()
+        )
+
+        # The flashinfer_mxfp4 (trtllm-gen) runner quantizes routed_input with
+        # the strided-input JIT group quant (_use_jit_mxfp8_quant in mxfp4.py),
+        # so the fused-front split view can be consumed as is; other runners
+        # (e.g. marlin) require a dense buffer.
+        self._moe_front_needs_contiguous = (
+            not get_moe_runner_backend().is_flashinfer_mxfp4()
         )
 
         # Defer the trtllm-gen finalize (top-k weighted unpermute) out of the
@@ -2081,7 +2090,7 @@ class KimiK3DecoderLayer(nn.Module):
             and layer_idx >= config.first_k_dense_replace
             and layer_idx % config.moe_layer_freq == 0
         )
-        # SP-MoE (EP a2a backend — megamoe or DeepEP): o_proj defers its
+        # SP-MoE (EP a2a backend — megamoe, DeepEP or MoRI): o_proj defers its
         # attention-TP reduction; this layer completes it as a reduce-scatter
         # so the whole MoE region (agg2, norms, gate, latent projs, tp1
         # shared experts, EP a2a dispatch) runs on 1/attn_tp of the rows,
@@ -2104,6 +2113,7 @@ class KimiK3DecoderLayer(nn.Module):
                 _a2a_backend.is_megamoe()
                 or _a2a_backend.is_deepep()
                 or _a2a_backend.is_ascend_fuseep()
+                or _a2a_backend.is_mori()
             )
             and self._is_moe_layer
             and get_parallel().attn_tp_group.world_size > 1
