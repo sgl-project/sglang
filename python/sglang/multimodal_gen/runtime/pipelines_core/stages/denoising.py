@@ -182,6 +182,12 @@ class _FullGraphRunner:
                     k: (v.clone() if isinstance(v, torch.Tensor) else v)
                     for k, v in kwargs.items()
                 }
+                # Run the exact captured path once eagerly first: first-step
+                # branches and lazy allocations (e.g. IPC staging keyed on
+                # this step's shapes) must settle so the recording bakes the
+                # steady-state path — a capture-time staging miss falls back
+                # to NCCL mid-graph and deadlocks replay.
+                self.model(**self.static_kwargs)
                 torch.cuda.synchronize()
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
