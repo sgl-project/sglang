@@ -1781,8 +1781,7 @@ class ServerArgs:
             help=(
                 "DeepSeek-V4 sparse prefill backend. 'auto' and "
                 "'flashmla_sparse' use the existing BF16 sparse prefill path; "
-                "'flashmla_sparse_q8' enables the experimental Q8KV8 sparse "
-                "prefill path."
+                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
             ),
             choices=DSV4_PREFILL_BACKEND_CHOICES,
         ),
