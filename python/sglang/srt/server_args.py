@@ -746,6 +746,7 @@ class ServerArgs:
                 "lof",
                 "priority",
                 "routing-key",
+                "hrrn",
             ],
         ),
     ] = "fcfs"
