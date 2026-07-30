@@ -23,7 +23,6 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     gather_dequant_requant_fp8_paged,
 )
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
-from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
@@ -34,6 +33,7 @@ from sglang.kernels.ops.attention.utils import (
     seqlens_expand_triton,
 )
 from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
