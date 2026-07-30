@@ -1018,7 +1018,7 @@ class TransformersBase(nn.Module):
             )
             hf_input_ids = None
 
-        return self.model(
+        hidden_states = self.model(
             input_ids=hf_input_ids,
             inputs_embeds=hf_input_embeds,
             use_cache=False,
@@ -1027,7 +1027,14 @@ class TransformersBase(nn.Module):
             forward_batch=forward_batch,
             attention_instances=self.attention_instances,
             **kwargs,
-        )[0][0, ...]
+        )[0]
+        # Some remote model code (e.g. ByteDance/Ouro's looped/early-exit
+        # architecture) doesn't fully honor `return_dict=False` and still
+        # wraps the first tuple element in a ModelOutput instead of a plain
+        # tensor. Unwrap one more level in that case.
+        if not isinstance(hidden_states, torch.Tensor):
+            hidden_states = hidden_states[0]
+        return hidden_states[0, ...]
 
     def _forward_hidden_states(
         self,

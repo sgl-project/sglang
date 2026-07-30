@@ -60,6 +60,8 @@ def apply_all():
     _patch_image_processor_kwargs()
     _patch_image_process_cuda_tensor()
     _patch_nemotron_h_pattern()
+    _patch_default_rope_init_function()
+    _patch_mask_function_input_embeds_kwarg()
 
     # v5 general patches
     _ensure_clean_up_tokenization_compat()
@@ -159,6 +161,139 @@ def _patch_rope_parameters_validation():
             return _orig_standardize(self)
 
         PretrainedConfig.standardize_rope_params = _safe_standardize
+
+
+def _compute_default_rope_parameters(
+    config=None, device=None, seq_len=None, layer_type=None, **rope_kwargs
+):
+    """Pre-refactor "default" (non-scaling) RoPE init formula.
+
+    Newer transformers versions moved this case into
+    ``RotaryEmbeddingConfigMixin`` and dropped it from the
+    ``ROPE_INIT_FUNCTIONS`` dispatch dict / off legacy ``RotaryEmbedding``
+    modules entirely, since they no longer need to compute it themselves.
+    Legacy remote model code (e.g. ByteDance/Ouro) predates this and still
+    expects it to be reachable both ways -- see the two call sites patched
+    by ``_patch_default_rope_init_function`` below.
+    """
+    import torch
+
+    if config is not None and len(rope_kwargs) > 0:
+        raise ValueError(
+            "Unexpected arguments: `**rope_kwargs` and `config` are mutually "
+            "exclusive in `_compute_default_rope_parameters`, got "
+            f"`rope_kwargs`={rope_kwargs} and `config`={config}"
+        )
+    if len(rope_kwargs) > 0:
+        base = rope_kwargs["base"]
+        dim = rope_kwargs["dim"]
+    else:
+        base = config.rope_theta
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        head_dim = getattr(config, "head_dim", None) or (
+            config.hidden_size // config.num_attention_heads
+        )
+        dim = int(head_dim * partial_rotary_factor)
+
+    attention_factor = 1.0  # Unused in this type of RoPE
+    inv_freq = 1.0 / (
+        base
+        ** (
+            torch.arange(0, dim, 2, dtype=torch.int64).to(
+                device=device, dtype=torch.float
+            )
+            / dim
+        )
+    )
+    return inv_freq, attention_factor
+
+
+def _patch_default_rope_init_function():
+    """Restore the ``"default"`` RoPE case for legacy remote model code.
+
+    Two independent transformers-internal spots special-case
+    ``rope_type == "default"`` and no longer resolve it the way legacy
+    ``trust_remote_code`` models expect:
+
+    1. ``ROPE_INIT_FUNCTIONS`` (a dispatch dict) dropped its ``"default"``
+       entry, keeping only the scaling strategies (linear, dynamic, yarn,
+       ...). Legacy code doing ``ROPE_INIT_FUNCTIONS[self.rope_type]`` with
+       ``rope_type == "default"`` gets ``KeyError``.
+    2. ``PreTrainedModel._init_weights``'s RotaryEmbedding branch resolves
+       the "default" case via ``module.compute_default_rope_parameters`` --
+       a method only the new ``RotaryEmbeddingConfigMixin``-based modules
+       define -- instead of consulting ``ROPE_INIT_FUNCTIONS``. Legacy
+       ``RotaryEmbedding`` modules (which only set ``rope_init_fn``) get
+       ``AttributeError`` during ``post_init()``.
+
+    Both are fixed with the same pre-refactor formula
+    (``_compute_default_rope_parameters``), since the underlying math for
+    the non-scaling case hasn't changed.
+    """
+    from transformers import modeling_rope_utils
+    from transformers.modeling_utils import PreTrainedModel
+
+    rope_init_functions = getattr(modeling_rope_utils, "ROPE_INIT_FUNCTIONS", None)
+    if rope_init_functions is not None and "default" not in rope_init_functions:
+        rope_init_functions["default"] = _compute_default_rope_parameters
+
+    _orig_init_weights = PreTrainedModel._init_weights
+
+    def _init_weights_with_legacy_rope_fallback(self, module):
+        if (
+            "RotaryEmbedding" in module.__class__.__name__
+            and hasattr(module, "original_inv_freq")
+            and getattr(module, "rope_type", None) == "default"
+            and not hasattr(module, "compute_default_rope_parameters")
+        ):
+            module.compute_default_rope_parameters = _compute_default_rope_parameters
+        return _orig_init_weights(self, module)
+
+    PreTrainedModel._init_weights = _init_weights_with_legacy_rope_fallback
+
+
+def _patch_mask_function_input_embeds_kwarg():
+    """Accept pre-refactor kwargs on mask-creation helpers.
+
+    ``transformers.masking_utils.create_causal_mask`` (and its
+    sliding-window/chunked/bidirectional siblings) dropped some legacy
+    kwargs. Some remote model code (e.g. ByteDance/Ouro) still calls them
+    the old way:
+
+    - ``input_embeds`` (singular) instead of the current ``inputs_embeds``.
+    - ``cache_position``, which the current docstring explicitly documents
+      as "Deprecated and unused" -- safe to drop rather than rename.
+
+    Wrap each to remap/drop these before forwarding, rather than reactively
+    special-casing every legacy kwarg one at a time: anything not accepted
+    by the *current* signature is filtered out, since passing it through
+    unfiltered would just raise ``TypeError`` anyway.
+    """
+    import inspect
+
+    from transformers import masking_utils
+
+    for name in (
+        "create_causal_mask",
+        "create_sliding_window_causal_mask",
+        "create_chunked_causal_mask",
+        "create_bidirectional_sliding_window_mask",
+    ):
+        orig_fn = getattr(masking_utils, name, None)
+        if orig_fn is None:
+            continue
+        accepted_params = set(inspect.signature(orig_fn).parameters)
+
+        def _make_wrapper(fn, accepted_params):
+            def _wrapper(*args, **kwargs):
+                if "input_embeds" in kwargs:
+                    kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
+                kwargs = {k: v for k, v in kwargs.items() if k in accepted_params}
+                return fn(*args, **kwargs)
+
+            return _wrapper
+
+        setattr(masking_utils, name, _make_wrapper(orig_fn, accepted_params))
 
 
 def _patch_flash_attn_availability():

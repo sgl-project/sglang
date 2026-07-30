@@ -311,6 +311,12 @@ def _patch_text_config(parent_config: PretrainedConfig, text_config):
     parent directly to the language model, others pass the text sub-config),
     so we propagate in both directions when an attribute is missing.
     (See https://github.com/huggingface/transformers/pull/41541)
+
+    Some trust_remote_code configs (e.g. ByteDance/Ouro's OuroConfig) never
+    set these attributes at all, on either side, so there's nothing to
+    propagate. Their remote modeling code still accesses them directly
+    (e.g. `config.pad_token_id`), which raises AttributeError instead of
+    returning None, so default to None when both sides are missing.
     """
     _ATTRS_TO_PROPAGATE = [
         "pad_token_id",
@@ -325,6 +331,10 @@ def _patch_text_config(parent_config: PretrainedConfig, text_config):
             setattr(text_config, attr, getattr(parent_config, attr))
         elif text_has and not parent_has:
             setattr(parent_config, attr, getattr(text_config, attr))
+        elif not parent_has and not text_has:
+            setattr(parent_config, attr, None)
+            if text_config is not parent_config:
+                setattr(text_config, attr, None)
     return text_config
 
 
@@ -394,7 +404,7 @@ def get_hf_text_config(config: PretrainedConfig):
 
     if text_config is not None:
         return _patch_text_config(config, text_config)
-    return config
+    return _patch_text_config(config, config)
 
 
 # ---------------------------------------------------------------------------
