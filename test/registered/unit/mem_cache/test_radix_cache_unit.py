@@ -590,8 +590,8 @@ class TestRadixCache(unittest.TestCase):
             f"evicted {result.num_tokens_evicted} tokens, expected at least 2",
         )
 
-        # Should have called free and reduced size
-        mock_allocator.free.assert_called()
+        # Should have called free_segment and reduced size
+        mock_allocator.free_segment.assert_called()
         self.assertLess(cache.total_size(), initial_size)
 
     def test_page_alignment_boundary(self):
