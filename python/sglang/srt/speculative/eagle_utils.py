@@ -152,7 +152,7 @@ def build_tree_kernel_efficient(
     tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
     tree_mask_buf: Optional[torch.Tensor] = None,
     position_buf: Optional[torch.Tensor] = None,
-    tree_mask_unread: bool = False,
+    fill_prefix_mask: bool = True,
 ):
     draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
 
@@ -169,10 +169,10 @@ def build_tree_kernel_efficient(
         elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
             tree_mask.fill_(0)
         elif tree_mask_mode == TreeMaskMode.FULL_MASK:
-            # The fill covers the [0, seq_len) prefix columns only; the kernel
-            # below writes every tree cell itself. Skip the (up to 100s of MB)
-            # per-step memset when the verify backend never reads the mask.
-            if not tree_mask_unread:
+            # Only the [0, seq_len) prefix columns depend on this fill; the
+            # kernel below writes every tree cell itself. Skip the (up to
+            # 100s of MB) per-step memset when nothing reads the mask.
+            if fill_prefix_mask:
                 tree_mask.fill_(True)
         else:
             raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
@@ -196,12 +196,11 @@ def build_tree_kernel_efficient(
             seq_lens_sum * num_verify_tokens
             + num_verify_tokens * num_verify_tokens * bs,
         )
-        # Same reasoning as the preallocated branch: only the [0, seq_len)
-        # prefix columns come from the fill, so drop it when nothing reads it.
+        # Same reasoning as the preallocated branch above.
         tree_mask = (
-            torch.empty(mask_shape, dtype=torch.bool, device=device)
-            if tree_mask_unread
-            else torch.full(mask_shape, True, dtype=torch.bool, device=device)
+            torch.full(mask_shape, True, dtype=torch.bool, device=device)
+            if fill_prefix_mask
+            else torch.empty(mask_shape, dtype=torch.bool, device=device)
         )
     else:
         raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
