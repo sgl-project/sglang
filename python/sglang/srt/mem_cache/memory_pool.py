@@ -339,7 +339,7 @@ class MambaPool:
         #   replayssm_rawv: [num_layers, num_slots, HV, L, V]  (conv/activation dtype)
         #   replayssm_rawk: [num_layers, num_slots, H,  L, K]  (conv/activation dtype)
         #   replayssm_beta: [num_layers, num_slots, HV, L]     (fp32)
-        # The raw rings + beta exist only under --enable-linear-replayssm-spec: the
+        # The raw rings + beta exist only under --enable-gdn-replayssm-spec: the
         # closed-loop exact fold sequentially replays them through the recurrent
         # update at flush -- bit-identical to the recurrent baseline -- instead
         # of folding the chunked `d` records open-loop (which accumulates error
@@ -375,7 +375,7 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        # None under --enable-linear-replayssm-spec: the spec ring owns rollback
+        # None under --enable-gdn-replayssm-spec: the spec ring owns rollback
         # (verify writes ring records, commit moves cursors), so the per-draft
         # full-state snapshots are never produced or consumed.
         intermediate_ssm: Optional[torch.Tensor]
@@ -463,8 +463,8 @@ class MambaPool:
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
-        enable_linear_replayssm_spec: bool = False,
-        linear_replayssm_spec_fold: bool = False,
+        enable_gdn_replayssm_spec: bool = False,
+        gdn_replayssm_spec_fold: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -487,17 +487,17 @@ class MambaPool:
         # therefore implies the ring, so the d/k/g + write_pos allocation gates on
         # `_replayssm_on` (either flag). GDN-only is enforced upstream + below.
         #
-        # Fold-every-commit variant (linear_replayssm_spec_fold, the mamba
+        # Fold-every-commit variant (gdn_replayssm_spec_fold, the mamba
         # extra_buffer + overlap-schedule protocol): the verify output comes from
         # the recurrent verify against the always-current checkpoint and the
         # commit replays the raw ring into it, so the chunked (d, k) records, the
         # g's reconstruction role, and all three cursors are unused -- only the
         # raw (v, k, g, beta) rings are allocated.
-        self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
+        self.enable_gdn_replayssm_spec = enable_gdn_replayssm_spec
         self.replayssm_spec_fold = bool(
-            enable_linear_replayssm_spec and linear_replayssm_spec_fold
+            enable_gdn_replayssm_spec and gdn_replayssm_spec_fold
         )
-        _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
+        _replayssm_on = enable_linear_replayssm or enable_gdn_replayssm_spec
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -575,7 +575,7 @@ class MambaPool:
             # flag is on; otherwise left as None so the legacy State is
             # byte-identical. temporal_state_shape == (HV, V, K). Either the decode
             # ring (--enable-linear-replayssm) or the spec-verify ring
-            # (--enable-linear-replayssm-spec) shares this allocation.
+            # (--enable-gdn-replayssm-spec) shares this allocation.
             replayssm_d = replayssm_k = replayssm_g = None
             replayssm_rawv = replayssm_rawk = replayssm_beta = None
             if _replayssm_on:
@@ -585,14 +585,14 @@ class MambaPool:
                 num_slots = size + 1
                 # Ring dtype. DECODE ring (--enable-linear-replayssm): records
                 # follow the SSM dtype -- its flush folds `d` directly into the
-                # state. SPEC-verify ring (--enable-linear-replayssm-spec): d/k feed
+                # state. SPEC-verify ring (--enable-gdn-replayssm-spec): d/k feed
                 # ONLY the one-shot output reconstruction (the closed-loop exact
                 # fold replays the raw rings for state instead), so their
                 # quantization noise stays below the bf16 output cast; keep them
                 # in the conv/activation dtype instead of the (fp32-enforced)
                 # SSM dtype to halve the ring traffic. g stays fp32 everywhere
                 # (exact-fold input). The two flags are mutually exclusive.
-                ring_dtype = conv_dtype if enable_linear_replayssm_spec else ssm_dtype
+                ring_dtype = conv_dtype if enable_gdn_replayssm_spec else ssm_dtype
                 # Fold-every-commit holds exactly one verify window (positions
                 # 0..spec_len-1, overwritten every step): its g/raw rings are
                 # sized to the draft maximum and no circular-ring invariants
@@ -635,7 +635,7 @@ class MambaPool:
                 # flush replays these through the recurrent update sequentially
                 # (bit-identical to the recurrent baseline) instead of folding
                 # the chunked `d` records open-loop.
-                if enable_linear_replayssm_spec:
+                if enable_gdn_replayssm_spec:
                     if not self.replayssm_spec_fold:
                         # Backstop for the spec-verify ring invariants; this pool
                         # is sized with the final adaptive-aware draft maximum.
@@ -686,7 +686,7 @@ class MambaPool:
                 # The recurrent-verify fallback cannot be reached under the flag
                 # (GDN + linear chain + triton enforced in server_args; the
                 # backend asserts loudly if it ever is).
-                if enable_linear_replayssm_spec:
+                if enable_gdn_replayssm_spec:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -819,7 +819,7 @@ class MambaPool:
                         f"rawv={get_tensor_size_bytes(replayssm_rawv) / GB:.3f}GB, "
                         f"rawk={get_tensor_size_bytes(replayssm_rawk) / GB:.3f}GB, "
                         f"beta={get_tensor_size_bytes(replayssm_beta) / GB:.3f}GB "
-                        if enable_linear_replayssm_spec
+                        if enable_gdn_replayssm_spec
                         else ""
                     )
                 )
@@ -845,12 +845,12 @@ class MambaPool:
             # None otherwise.
             self.replayssm_cache_base = (
                 torch.zeros((size + 1,), dtype=torch.int32, device=device)
-                if enable_linear_replayssm_spec and not self.replayssm_spec_fold
+                if enable_gdn_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
             self.replayssm_is_flush = (
                 torch.zeros((size + 1,), dtype=torch.int8, device=device)
-                if enable_linear_replayssm_spec and not self.replayssm_spec_fold
+                if enable_gdn_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
@@ -1164,8 +1164,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
-        enable_linear_replayssm_spec: bool = False,
-        linear_replayssm_spec_fold: bool = False,
+        enable_gdn_replayssm_spec: bool = False,
+        gdn_replayssm_spec_fold: bool = False,
     ):
         super().__init__(
             size=size,
@@ -1192,8 +1192,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
-            enable_linear_replayssm_spec=enable_linear_replayssm_spec,
-            linear_replayssm_spec_fold=linear_replayssm_spec_fold,
+            enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
+            gdn_replayssm_spec_fold=gdn_replayssm_spec_fold,
         )
 
     def _init_mamba_pool(
@@ -1209,8 +1209,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
-        enable_linear_replayssm_spec: bool = False,
-        linear_replayssm_spec_fold: bool = False,
+        enable_gdn_replayssm_spec: bool = False,
+        gdn_replayssm_spec_fold: bool = False,
     ):
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
@@ -1224,8 +1224,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
-            enable_linear_replayssm_spec=enable_linear_replayssm_spec,
-            linear_replayssm_spec_fold=linear_replayssm_spec_fold,
+            enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
+            gdn_replayssm_spec_fold=gdn_replayssm_spec_fold,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

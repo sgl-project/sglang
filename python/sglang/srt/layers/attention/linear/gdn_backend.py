@@ -591,7 +591,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         if is_target_verify:
             # ReplaySSM spec-verify (Part B of #28511), two protocols under
-            # --enable-linear-replayssm-spec (GDN + linear-chain topk<=1 only;
+            # --enable-gdn-replayssm-spec (GDN + linear-chain topk<=1 only;
             # KDA routes through kda_backend and never reaches here, plus the
             # `not replayssm_is_kda` guard as a backstop):
             # - fold-every-commit (mamba extra_buffer / overlap schedule): the
@@ -646,13 +646,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which
-                # the pool gates OFF under --enable-linear-replayssm-spec (the
+                # the pool gates OFF under --enable-gdn-replayssm-spec (the
                 # same flag that makes `use_replayssm_spec` true above), so
                 # this branch is unreachable with a None buffer by
                 # construction -- keep it loud rather than silently frozen.
                 assert intermediate_state_cache is not None, (
                     "recurrent target_verify fallback requires intermediate_ssm, "
-                    "which is not allocated under --enable-linear-replayssm-spec"
+                    "which is not allocated under --enable-gdn-replayssm-spec"
                 )
                 core_attn_out = self.kernel_dispatcher.target_verify(
                     A_log=layer.A_log,

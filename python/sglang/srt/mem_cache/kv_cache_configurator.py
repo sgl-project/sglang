@@ -678,6 +678,13 @@ class KVCacheConfigurator:
             enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
             mamba_size=self.server_args.max_mamba_cache_size,
             start_layer=self.layer_info.start_layer,
+            linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
+            mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
+            enable_gdn_replayssm_spec=(
+                self.server_args.enable_gdn_replayssm_spec
+                and self.hybrid_gdn_config is not None
+            ),
+            gdn_replayssm_spec_fold=self.server_args.enable_mamba_extra_buffer(),
         )
         return req_to_token_pool
 
@@ -738,14 +745,14 @@ class KVCacheConfigurator:
             # (rings + cursors + the intermediate_ssm gate) only for GDN-hybrid
             # models, so any other mamba-ish model (Mamba2/Nemotron, lightning,
             # ...) run with the flag set stays byte-identical to flag-off.
-            enable_linear_replayssm_spec=(
-                self.server_args.enable_linear_replayssm_spec
+            enable_gdn_replayssm_spec=(
+                self.server_args.enable_gdn_replayssm_spec
                 and self.hybrid_gdn_config is not None
             ),
             # Fold-every-commit protocol goes with mamba extra_buffer (the
             # radix strategy that keeps the overlap scheduler on); without it
             # the circular-ring + periodic-flush protocol is kept.
-            linear_replayssm_spec_fold=self.server_args.enable_mamba_extra_buffer(),
+            gdn_replayssm_spec_fold=self.server_args.enable_mamba_extra_buffer(),
         )
         return req_to_token_pool
 
@@ -1739,8 +1746,7 @@ class KVCacheConfigurator:
         # solve must charge it too or num_slots is over-provisioned (the ring
         # would silently eat into the KV budget).
         replayssm_active = (
-            server_args.enable_linear_replayssm_spec
-            and self.hybrid_gdn_config is not None
+            server_args.enable_gdn_replayssm_spec and self.hybrid_gdn_config is not None
         )
         if replayssm_active:
             spec_fold = server_args.enable_mamba_extra_buffer()

@@ -209,6 +209,10 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         mamba_size: int = None,
         start_layer: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        linear_replayssm_cache_len: int = 16,
+        mamba_envelope_layout: bool = False,
+        enable_gdn_replayssm_spec: bool = False,
+        gdn_replayssm_spec_fold: bool = False,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -253,6 +257,10 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            linear_replayssm_cache_len=linear_replayssm_cache_len,
+            mamba_envelope_layout=mamba_envelope_layout,
+            enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
+            gdn_replayssm_spec_fold=gdn_replayssm_spec_fold,
         )
 
     def clear(self):

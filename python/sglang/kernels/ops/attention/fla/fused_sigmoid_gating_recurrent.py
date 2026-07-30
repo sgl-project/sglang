@@ -398,6 +398,15 @@ def fused_sigmoid_gating_delta_rule_update(
     )
 
     if cache_ring:
+        # Per-layer [num_slots, heads, L, dim] views only: stride(0) is read as
+        # the slot pitch, so a tensor still carrying the layer dim would scribble
+        # far outside its slot.
+        assert (
+            replayssm_rawv.dim() == 4
+            and replayssm_rawk.dim() == 4
+            and replayssm_g.dim() == 3
+            and replayssm_beta.dim() == 3
+        ), "cache_ring expects per-layer ring views"
         max_cache_len = replayssm_rawv.shape[-2]
         stride_rawv_slot = replayssm_rawv.stride(0)
         stride_rawk_slot = replayssm_rawk.stride(0)
