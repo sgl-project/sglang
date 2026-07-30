@@ -1029,8 +1029,8 @@ class ServerArgs:
         Arg(
             help=(
                 "Load-balance method used by 'prefix_affinity' when it cannot honor "
-                "affinity (no routing key, or all live ranks over the load-skew "
-                "threshold)."
+                "affinity (no routing key and token fallback disabled or unusable, "
+                "or all live ranks over the load-skew threshold)."
             ),
             choices=["round_robin", "total_requests", "total_tokens"],
         ),

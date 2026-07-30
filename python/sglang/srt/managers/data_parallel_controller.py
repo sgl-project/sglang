@@ -911,7 +911,7 @@ class DataParallelController:
         if prefix_len <= 0:
             return None
         input_ids = getattr(req, "input_ids", None)
-        if not input_ids:
+        if input_ids is None or len(input_ids) == 0:
             return None
         h = hashlib.blake2b(digest_size=16)
         sliced = input_ids[:prefix_len]
@@ -928,7 +928,7 @@ class DataParallelController:
     @staticmethod
     def _estimated_tokens(req: Req) -> int:
         input_ids = getattr(req, "input_ids", None)
-        return len(input_ids) if input_ids else 0
+        return 0 if input_ids is None else len(input_ids)
 
     def _increment_rank_budget(self, rank: int, req: Req):
         """Speculatively record the dispatch, mirroring ``DPBudget.dispatch``.
