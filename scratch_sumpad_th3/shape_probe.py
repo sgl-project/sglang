@@ -112,6 +112,18 @@ def note_step(
     _dyn_gpu.copy_(_dyn_cpu, non_blocking=True)
 
 
+def note_decode_graph_replay() -> None:
+    note_step(
+        rank=-1,
+        real_local_tokens=-1,
+        padded_local_tokens=-1,
+        dp_pad_mode=-1,
+        dp_buffer_len=-1,
+        global_max_tokens=-1,
+        global_sum_tokens=-1,
+    )
+
+
 def note_used_prefill_graph(used: bool) -> None:
     _ensure_buffers()
     _dyn_cpu[8] = 1 if used else 0

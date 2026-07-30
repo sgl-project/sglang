@@ -1212,6 +1212,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        if envs.SGLANG_DBG_SHAPE_PROBE.get():
+            from scratch_sumpad_th3 import shape_probe
+
+            shape_probe.note_decode_graph_replay()
+
         timer_ctx = (
             self.model_runner.device_timer.wrap(
                 metadata={"category": forward_batch.forward_mode.name.lower()}

@@ -11,8 +11,9 @@ MODEL=${MODEL:-Qwen/Qwen3-8B}
 PORT=${PORT:-31500}
 UNIFORM_BS=${UNIFORM_BS:-64}
 ISL=${ISL:-2048}
+SKEW_ISL=${SKEW_ISL:-16384}
 SERVE_NUM_PROMPTS_UNIFORM=${SERVE_NUM_PROMPTS_UNIFORM:-256}
-SERVE_NUM_PROMPTS_SKEW=${SERVE_NUM_PROMPTS_SKEW:-32}
+SERVE_NUM_PROMPTS_SKEW=${SERVE_NUM_PROMPTS_SKEW:-16}
 
 mkdir -p "$OUT"
 
@@ -71,10 +72,11 @@ BASE="http://127.0.0.1:$PORT"
 run_bench_one_batch () {
   local name=$1
   local bs=$2
-  shift 2
+  local isl=$3
+  shift 3
   timeout 900 python3 -m sglang.benchmark.one_batch_server \
     --model None --base-url "$BASE" \
-    --batch-size "$bs" --input-len "$ISL" --output-len 1 \
+    --batch-size "$bs" --input-len "$isl" --output-len 1 \
     --show-report \
     "$@" \
     > "$OUT/bob_${name}.log" 2>&1
@@ -85,9 +87,10 @@ run_bench_serving () {
   local name=$1
   local conc=$2
   local nprompts=$3
+  local isl=$4
   timeout 1200 python3 -m sglang.bench_serving \
     --backend sglang --host 127.0.0.1 --port "$PORT" \
-    --dataset-name random --random-input-len "$ISL" --random-output-len 1 \
+    --dataset-name random --random-input-len "$isl" --random-output-len 1 \
     --random-range-ratio 1.0 \
     --num-prompts "$nprompts" --max-concurrency "$conc" \
     > "$OUT/serving_${name}.log" 2>&1
@@ -95,17 +98,16 @@ run_bench_serving () {
 }
 
 if [ "$PHASE" = "bench" ]; then
-  run_bench_one_batch uniform "$UNIFORM_BS"
-  run_bench_one_batch skew 1
-  run_bench_serving uniform 64 "$SERVE_NUM_PROMPTS_UNIFORM"
-  run_bench_serving skew 1 "$SERVE_NUM_PROMPTS_SKEW"
+  run_bench_one_batch uniform "$UNIFORM_BS" "$ISL"
+  run_bench_one_batch skew 1 "$SKEW_ISL"
+  run_bench_serving uniform 64 "$SERVE_NUM_PROMPTS_UNIFORM" "$ISL"
+  run_bench_serving skew 1 "$SERVE_NUM_PROMPTS_SKEW" "$SKEW_ISL"
 elif [ "$PHASE" = "evidence" ]; then
-  run_bench_one_batch uniform "$UNIFORM_BS"
-  run_bench_one_batch skew 1
-  run_bench_serving skew 1 8
+  run_bench_one_batch uniform "$UNIFORM_BS" "$ISL"
+  run_bench_one_batch skew 1 "$SKEW_ISL"
 elif [ "$PHASE" = "profile" ]; then
-  run_bench_one_batch uniform_prof "$UNIFORM_BS" --profile --profile-activities GPU --profile-by-stage
-  run_bench_one_batch skew_prof 1 --profile --profile-activities GPU --profile-by-stage
+  run_bench_one_batch uniform_prof "$UNIFORM_BS" "$ISL" --profile --profile-activities GPU --profile-by-stage
+  run_bench_one_batch skew_prof 1 "$SKEW_ISL" --profile --profile-activities GPU --profile-by-stage
 fi
 
 curl -s "$BASE/flush_cache" > /dev/null 2>&1

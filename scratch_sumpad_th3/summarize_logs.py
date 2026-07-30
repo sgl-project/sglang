@@ -64,6 +64,8 @@ def main(
         elif "[KPROBE]" in raw_line:
             fields = _parse_kv(raw_line[raw_line.index("[KPROBE]") :])
             rank = int(fields["rank"])
+            if rank < 0:
+                continue
             if rank_filter >= 0 and rank != rank_filter:
                 continue
             mode = int(fields["dp_pad_mode"])
