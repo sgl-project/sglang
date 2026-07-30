@@ -28,6 +28,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
+    from sglang.srt.constrained.base_grammar_backend import GrammarMask
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -490,7 +491,7 @@ def eagle_prepare_for_verify(
     target_worker: TpModelWorker,
 ):
     from sglang.kernels.ops.speculative.cache_locs import (
-        assign_extend_cache_locs_func,
+        assign_extend_cache_locs_uniform_func,
     )
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
@@ -510,11 +511,13 @@ def eagle_prepare_for_verify(
             "v2 prepare_for_verify input_ids",
         )
         device = batch.device
-        batch.out_cache_loc = assign_extend_cache_locs_func(
+        # Uniform variant: end offsets (= start + draft_token_num) are computed
+        # inside the kernel, keeping the eager `seq_lens + N` add off the host
+        # critical path (bs=1 MTP inter-phase seam).
+        batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
             req_pool_indices=batch.req_pool_indices,
             req_to_token=req_to_token_pool.req_to_token,
             start_offset=batch.seq_lens,
-            end_offset=batch.seq_lens + verify_input.draft_token_num,
             batch_size=bs,
             draft_token_num=verify_input.draft_token_num,
             device=device,
@@ -641,7 +644,7 @@ def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
-    vocab_mask: torch.Tensor = None,
+    grammar_mask: Optional[GrammarMask] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -702,11 +705,8 @@ def eagle_sample(
         )
 
     # Apply grammar mask if provided
-    if vocab_mask is not None:
-        assert verify_input.grammar is not None
-        verify_input.grammar.apply_vocab_mask(
-            logits=next_token_logits, vocab_mask=vocab_mask
-        )
+    if grammar_mask is not None:
+        grammar_mask.apply(next_token_logits)
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]

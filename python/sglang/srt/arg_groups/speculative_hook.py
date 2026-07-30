@@ -147,8 +147,10 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 def _handle_dflash(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import resolved_view
 
-    if not server_args.device.startswith("cuda"):
-        raise ValueError("DFLASH speculative decoding only supports CUDA device.")
+    if not (server_args.device.startswith("cuda") or server_args.device == "npu"):
+        raise ValueError(
+            "DFLASH speculative decoding only supports CUDA and NPU devices."
+        )
 
     if resolved_view(server_args).enable_dp_attention:
         raise ValueError(
@@ -482,13 +484,16 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             and len(layer_types) == num_layers
             and all(layer_type == "sliding_attention" for layer_type in layer_types)
         )
-        if not all_sliding:
+        all_causal = getattr(draft_text_config, "is_causal", False) is True
+        if not (all_sliding or all_causal):
             logger.warning(
                 "DFLASH only enables 'trtllm_mha' when every draft layer uses "
-                "causal sliding attention; got num_hidden_layers=%r, "
-                "layer_types=%r. Falling back to '%s'.",
+                "causal sliding attention or the draft is explicitly causal; "
+                "got num_hidden_layers=%r, layer_types=%r, is_causal=%r. "
+                "Falling back to '%s'.",
                 num_layers,
                 layer_types,
+                getattr(draft_text_config, "is_causal", None),
                 fallback_backend,
             )
             draft_backend = fallback_backend

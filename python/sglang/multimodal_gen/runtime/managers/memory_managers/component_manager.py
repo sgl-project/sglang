@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     is_text_encoder_component_name,
     is_vae_component_name,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import DiffusionNvtxHooks
@@ -94,6 +95,8 @@ class ComponentResidencyPipeline(Protocol):
 def should_cpu_offload_component(
     component_name: str, module: nn.Module, server_args: ServerArgs
 ) -> bool:
+    if current_platform.is_mps():
+        return False
     if server_args.use_fsdp_inference or is_fsdp_managed_module(module):
         return False
     if is_dit_component_name(component_name):
@@ -186,7 +189,10 @@ class ComponentResidencyManager:
     ) -> None:
         """A hook called before processing an actual request"""
         self.refresh_server_args(server_args)
-        self.state = ResidencyState(stages=stages, batch_is_warmup=batch.is_warmup)
+        self.state = ResidencyState(
+            stages=stages,
+            batch_is_warmup=self._is_warmup_batch(batch),
+        )
         self._active_use = None
         self._active_use_module = None
         self._disable_active_nvtx()
@@ -200,6 +206,14 @@ class ComponentResidencyManager:
         self._ordered_uses = tuple(
             use for uses in self._stage_uses_by_index for use in uses
         )
+
+    @staticmethod
+    def _is_warmup_batch(batch: ResidencyBatch | list[ResidencyBatch]) -> bool:
+        if isinstance(batch, list):
+            return bool(batch) and all(
+                getattr(item, "is_warmup", False) for item in batch
+            )
+        return batch.is_warmup
 
     def before_stage(
         self,

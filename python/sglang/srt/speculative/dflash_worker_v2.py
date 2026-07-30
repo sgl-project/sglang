@@ -325,11 +325,15 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
+        target_model = self.model_runner.model
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
-        ) is not None and hasattr(
-            self.model_runner.attn_backend,
-            "update_mamba_state_after_mtp_verify",
+        ) is not None and (
+            hasattr(
+                self.model_runner.attn_backend,
+                "update_mamba_state_after_mtp_verify",
+            )
+            or hasattr(target_model, "update_conv_state_after_mtp_verify")
         )
 
     def init_cuda_graphs(self):
@@ -1280,12 +1284,25 @@ class DFlashWorkerV2(BaseSpecWorker):
                 torch.full_like(to_track_ith, -1, dtype=torch.int64),
             )
 
-        attn_backend.update_mamba_state_after_mtp_verify(
-            last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
-            mamba_steps_to_track=mamba_steps_to_track,
-            model=self.target_worker.model_runner.model,
-        )
+        model_runner = self.target_worker.model_runner
+        if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+            attn_backend.update_mamba_state_after_mtp_verify(
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                model=model_runner.model,
+            )
+        elif hasattr(model_runner.model, "update_conv_state_after_mtp_verify"):
+            # Inkling's short convolutions access the mamba pool directly, so
+            # their accepted verify state is committed by the model rather
+            # than an attention-backend wrapper.
+            model_runner.model.update_conv_state_after_mtp_verify(
+                req_to_token_pool=model_runner.req_to_token_pool,
+                req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+            )
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
         if self._accept_bonus_buffer_cap >= int(bs):
@@ -1691,19 +1708,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
-        vocab_mask = None
+        grammar_mask = None
         if batch.has_grammar:
-            # Grammar barrier: advance the previous batch's FSM over its committed
-            # tokens before building this batch's bitmask. Runs after the target
-            # launch, so the advance and the traversal both overlap the forward.
-            if grammar_barrier is not None:
-                grammar_barrier()
-            vocab_mask = build_grammar_vocab_mask(
+            grammar_mask = build_grammar_vocab_mask(
                 reqs=batch.reqs,
-                verify_input=verify_input,
                 tree=grammar_tree,
                 sampling_info=batch.sampling_info,
                 device=logits_output.next_token_logits.device,
+                barrier=grammar_barrier,
             )
 
         if sampling_info is not None:
@@ -1714,10 +1726,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         # Constrain every chain position before accept picks from it.
-        if vocab_mask is not None:
-            verify_input.grammar.apply_vocab_mask(
-                logits=logits_output.next_token_logits, vocab_mask=vocab_mask
-            )
+        if grammar_mask is not None:
+            grammar_mask.apply(logits_output.next_token_logits)
 
         candidates = draft_tokens
         new_seq_lens = None

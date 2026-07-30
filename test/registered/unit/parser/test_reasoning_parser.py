@@ -6,6 +6,7 @@ from sglang.srt.parser.reasoning_parser import (
     Apertus2509Detector,
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
+    DeepSeekV4Detector,
     Gemma4Detector,
     Glm45Detector,
     HunyuanDetector,
@@ -166,6 +167,21 @@ class TestQwen3Detector(CustomTestCase):
         result = self.detector.detect_and_parse(text)
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.reasoning_text, "")
+
+
+class TestDeepSeekV4Detector(CustomTestCase):
+    def test_strict_thinking_excludes_deepseek_control_tokens(self):
+        detector = ReasoningParser(model_type="deepseek-v4").detector
+        self.assertIsInstance(detector, DeepSeekV4Detector)
+        self.assertEqual(
+            detector.think_excluded_tokens,
+            ["<｜end▁of▁sentence｜>", "｜DSML｜"],
+        )
+
+    def test_thinking_stays_explicit_opt_in(self):
+        detector = ReasoningParser(model_type="deepseek-v4").detector
+        self.assertEqual(detector.reasoning_default, "explicit_thinking")
+        self.assertTrue(detector.thinks_internally)
 
 
 class TestInklingDetector(CustomTestCase):
