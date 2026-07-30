@@ -1188,7 +1188,6 @@
                   "cookbook/diffusion/intro",
                   {
                     "group": "Cosmos",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Cosmos/Cosmos3"
                     ]
@@ -1201,7 +1200,6 @@
                   },
                   {
                     "group": "Ideogram",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Ideogram/Ideogram4"
                     ]
@@ -1215,7 +1213,6 @@
                   },
                   {
                     "group": "LongLive",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LongLive/LongLive-2.0"
                     ]
@@ -1228,7 +1225,6 @@
                   },
                   {
                     "group": "JoyAI-Echo",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/JoyEcho/JoyEcho"
                     ]
@@ -1248,7 +1244,6 @@
                   },
                   {
                     "group": "Krea",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Krea/Krea-2"
                     ]
@@ -1267,7 +1262,6 @@
                   },
                   {
                     "group": "LingBot World",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LingBot-World/LingBot-World",
                       "cookbook/diffusion/LingBot-World/LingBot-World-2.0"
@@ -1275,7 +1269,6 @@
                   },
                   {
                     "group": "SANA-WM",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/SANA-WM/SANA-WM"
                     ]
