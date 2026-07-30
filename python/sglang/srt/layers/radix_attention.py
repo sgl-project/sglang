@@ -195,14 +195,14 @@ class RadixAttention(nn.Module):
                     idx_v=idx_v,
                 )
                 return idx_out, attn_out
-            # FP8 q (e.g. mxfp8 KV-cache attention) still produces a bf16
-            # attention output; sizing the buffer off q's dtype would silently
-            # cast-copy the result to fp8.
-            out_dtype = (
-                torch.bfloat16
-                if q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-                else q.dtype
-            )
+            # Output dtype follows v (the model dtype) when available: qk-norm
+            # may emit q in a different dtype without changing the dtype the
+            # backend writes. FP8 q/v (e.g. mxfp8 KV-cache attention) still
+            # produce a bf16 attention output; sizing the buffer off an fp8
+            # dtype would silently cast-copy the result to fp8.
+            out_dtype = v.dtype if v is not None else q.dtype
+            if out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                out_dtype = torch.bfloat16
             if self.qk_head_dim != self.v_head_dim:
                 output = q.new_empty(
                     (q.shape[0], self.tp_q_head_num * self.v_head_dim),

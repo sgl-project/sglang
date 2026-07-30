@@ -37,7 +37,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -47,7 +47,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 
 # ===============================
 # Base image 950 and args
@@ -57,7 +57,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -67,7 +67,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 
 # Local source stage: with BRANCH_TYPE=local the build context is copied here and
 # used instead of git clone (mirrors docker/Dockerfile's local_src stage).
@@ -317,11 +317,11 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
        fi \
     && rm -rf /tmp/local_src \
     && cd sglang \
-    && cd sgl-kernel \
+    && cd python/sglang/kernels/aot \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
     && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install \
-    && cd .. \
+    && cd ../../../.. \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
          export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[srt_hip,diffusion_hip]"; \

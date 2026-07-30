@@ -186,7 +186,7 @@ sglang = "sglang.cli.main:main"
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
-  "jit_kernel/**/*",
+  "kernels/**/*",
 ]
 
 [tool.setuptools.packages.find]
