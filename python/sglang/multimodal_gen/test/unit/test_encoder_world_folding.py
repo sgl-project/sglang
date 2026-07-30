@@ -132,41 +132,18 @@ def test_fold_and_auto_policy_still_propose():
     assert _proposed_mode(tp=1, sp=2, cfg=1, policy="auto") == "world"
 
 
-def test_dp_policy_raises_default_batching_max_size():
-    # dp needs batch>1 to ever engage; raise the ceiling to the replica size
-    # so choosing dp isn't a silent no-op.
-    sa = _run([T5Config()], tp=1, sp=2, cfg=1, policy="dp")
-    assert sa.batching_max_size == 2
+def test_no_policy_touches_batching_max_size():
+    # An encoder flag must not switch DiT batching on: that changes the denoise
+    # batch shape, and with it the output, for every serve deployment. dp simply
+    # stays inactive until the operator raises the ceiling themselves.
+    for policy in ("auto", "fold", "dp", "replicate"):
+        sa = _run([T5Config()], tp=1, sp=2, cfg=1, policy=policy)
+        assert sa.batching_max_size == 1, policy
 
 
-def test_dp_policy_keeps_explicit_batching_max_size():
-    sa = _run(
-        [T5Config()],
-        tp=1,
-        sp=2,
-        cfg=1,
-        policy="dp",
-        batching_max_size=1,
-        explicit=("batching_max_size",),
-    )
-    assert sa.batching_max_size == 1
-
-
-def test_dp_policy_never_lowers_batching_max_size():
+def test_explicit_batching_max_size_is_preserved():
     sa = _run([T5Config()], tp=1, sp=2, cfg=1, policy="dp", batching_max_size=8)
     assert sa.batching_max_size == 8
-
-
-def test_non_dp_policy_does_not_touch_batching_max_size():
-    for policy in ("auto", "fold", "replicate"):
-        sa = _run([T5Config()], tp=1, sp=2, cfg=1, policy=policy)
-        assert sa.batching_max_size == 1
-
-
-def test_dp_policy_single_replica_does_not_raise_batching_max_size():
-    # replica_size == 1: dp has nothing to shard across, nothing to raise.
-    sa = _run([T5Config()], tp=1, sp=1, cfg=1, policy="dp")
-    assert sa.batching_max_size == 1
 
 
 # --- stage 2: size + divisibility gate (loader, on real dims) ----------------

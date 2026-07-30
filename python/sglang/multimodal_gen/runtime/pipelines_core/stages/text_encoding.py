@@ -24,7 +24,10 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.models.encoders.base import encoder_dp_worthwhile
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    TextEncoder,
+    encoder_dp_worthwhile,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.condition_encoding import (
     ConditionEncodingStage,
@@ -44,9 +47,10 @@ logger = init_logger(__name__)
 def _data_parallel_text_encode(forward_fn, forward_kwargs: dict, group):
     """each rank encodes its 1/world_size batch slice, then all-gathers
 
-    every rank runs the full unsharded encoder, so the gathered output is
-    bit-identical to the replicated forward; the batch is padded to a multiple
-    of world_size and padding rows are dropped after the gather
+    every rank runs the full unsharded encoder on its slice, so each row is
+    computed by the same kernels as the replicated forward; the batch is padded
+    to a multiple of world_size and padding rows are dropped after the gather.
+    Requires a TextEncoder (BaseEncoderOutput) -- see _text_encode_dp_group.
     """
     world = group.world_size
     rank = group.rank_in_group
@@ -508,14 +512,20 @@ class TextEncodingStage(ConditionEncodingStage):
         with set_forward_context(current_timestep=0, attn_metadata=None):
             return text_encoder(**encoder_forward_kwargs)
 
-    def _text_encode_dp_group(self, server_args, encoder_config, batch_size):
+    def _text_encode_dp_group(
+        self, server_args, encoder_config, batch_size, text_encoder
+    ):
         """group to data-parallel a batched text-encode over, or None
 
         requires a replicated encoder (tp==1, dp==1, not folded): each rank
-        would otherwise redundantly encode the whole batch
+        would otherwise redundantly encode the whole batch. Also requires a
+        TextEncoder, whose forward returns BaseEncoderOutput -- the gather needs
+        to know which fields carry the batch, and a raw transformers encoder
+        returns its own output type (e.g. Qwen2_5_VLCausalLMOutputWithPast).
         """
         if (
             server_args.encoder_parallel not in ("auto", "dp")
+            or not isinstance(text_encoder, TextEncoder)
             or not encoder_dp_worthwhile(encoder_config, batch_size)
             or (server_args.tp_size or 1) != 1
             or (server_args.dp_size or 1) != 1
@@ -670,7 +680,7 @@ class TextEncodingStage(ConditionEncodingStage):
                 encoder_forward_kwargs["use_cache"] = False
             self._manage_text_encoder_use(i)
             dp_group = self._text_encode_dp_group(
-                server_args, encoder_config, input_ids.shape[0]
+                server_args, encoder_config, input_ids.shape[0], text_encoder
             )
             if dp_group is not None:
                 outputs = _data_parallel_text_encode(
