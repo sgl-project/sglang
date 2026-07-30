@@ -1,5 +1,3 @@
-> **Customize this file**: Tailor this template to your project by noting specific contribution types you're looking for, adding a Code of Conduct, or adjusting the writing guidelines to match your style.
-
 # Contribute to the documentation
 
 Thank you for your interest in contributing to our documentation! This guide will help you get started.
