@@ -24,7 +24,11 @@ import triton
 
 # Layers - Attention
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.kernels.ops.attention.fla.layernorm_gated import (
+    rms_norm_gated_fp8_quant,
+)
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+    GDNDecodeProjection,
     fused_qkvzba_split_reshape_cat_contiguous,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
@@ -38,8 +42,11 @@ from sglang.srt.configs.qwen3_5 import (
 
 # Distributed
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.linear.utils import get_linear_attn_decode_backend
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
@@ -62,6 +69,9 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_utils import (
+    deepgemm_w8a8_block_fp8_linear_with_fallback,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -188,6 +198,26 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
         getattr(quant_method, "block_quant", False)
         or getattr(quant_method, "use_mxfp8", False)
+    )
+
+
+def _can_fuse_gdn_norm_quant(
+    linear: nn.Module, head_v_dim: int, num_groups: int, activation: str
+) -> bool:
+    quant_method = linear.quant_method
+    if quant_method.__class__.__name__ != "Fp8LinearMethod":
+        return False
+    return (
+        _is_cuda
+        and head_v_dim == 128
+        and activation in ("swish", "silu", "sigmoid")
+        and (not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or num_groups % 4 == 0)
+        and quant_method.block_quant
+        and quant_method.weight_block_size == [128, 128]
+        and linear.orig_dtype == torch.bfloat16
+        and quant_method.w8a8_block_fp8_linear
+        is deepgemm_w8a8_block_fp8_linear_with_fallback
+        and not envs.SGLANG_DISABLE_QWEN_GDN_NORM_QUANT_FUSION.get()
     )
 
 
@@ -368,6 +398,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("out_proj", prefix),
+        )
+        self.fuse_gdn_norm_quant = _can_fuse_gdn_norm_quant(
+            self.out_proj,
+            self.head_v_dim,
+            self.num_v_heads // self.attn_tp_size,
+            self.norm.activation,
         )
 
     @staticmethod
@@ -616,6 +652,32 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_ba, _ = self.in_proj_ba(hs_bf16)
         return projected_states_qkvz, projected_states_ba
 
+    def _can_fuse_decode_split_conv(
+        self,
+        projected_states_qkvz: torch.Tensor,
+        projected_states_ba: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> bool:
+        server_args = get_server_args()
+        return (
+            _is_cuda
+            and forward_batch.forward_mode.is_decode()
+            and forward_batch.spec_info is None
+            and get_linear_attn_decode_backend().is_triton()
+            and not server_args.enable_linear_replayssm
+            and not server_args.enable_gdn_replayssm_spec
+            and self.conv_kernel_size == 4
+            and self.attn.bias is None
+            and self.activation in ("silu", "swish")
+            and projected_states_qkvz.is_contiguous()
+            and projected_states_ba.is_contiguous()
+            and projected_states_qkvz.shape[1] == 6144
+            and projected_states_ba.shape[1] == 32
+            and self.attn.q_dim == 1024
+            and self.attn.k_dim == 1024
+            and self.attn.v_dim == 2048
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -631,7 +693,26 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:
+        if self._can_fuse_decode_split_conv(
+            projected_states_qkvz,
+            projected_states_ba,
+            forward_batch,
+        ):
+            mixed_qkv_output = projected_states_qkvz.new_empty(
+                projected_states_qkvz.shape[0], 4096
+            )
+            z = projected_states_qkvz.new_empty(
+                projected_states_qkvz.shape[0], 16, self.head_v_dim
+            )
+            b = projected_states_ba.new_empty(projected_states_ba.shape[0], 16)
+            a = torch.empty_like(b)
+            mixed_qkv = GDNDecodeProjection(
+                projected_states_qkvz,
+                projected_states_ba,
+                mixed_qkv_output,
+                z,
+            )
+        elif self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
                 num_v_heads_tp = self.num_v_heads // self.attn_tp_size
@@ -676,9 +757,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        if self.fuse_gdn_norm_quant:
+            core_attn_out, input_scale = rms_norm_gated_fp8_quant(
+                x=core_attn_out,
+                weight=self.norm.weight,
+                z=z,
+                eps=self.norm.eps,
+                num_groups=self.num_v_heads // self.attn_tp_size,
+                activation=self.norm.activation,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+            core_attn_out = core_attn_out.reshape(z_shape_og)
+            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+            core_attn_out = (core_attn_out, input_scale)
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
+            core_attn_out = core_attn_out.reshape(z_shape_og)
+            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
         output, _ = self.out_proj(core_attn_out)
         return output

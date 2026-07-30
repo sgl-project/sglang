@@ -32,6 +32,11 @@ if is_cuda() or is_hip():
         fused_qkv_split_gdn_prefill,
     )
 
+if is_cuda():
+    from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+        fused_qkvz_split_conv1d_update_contiguous,
+    )
+
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 
 if is_cuda():
@@ -397,15 +402,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
 
-        assert isinstance(mixed_qkv, torch.Tensor)
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv,
-            conv_states,
-            layer.conv_weights,
-            layer.bias,
-            layer.activation,
-            conv_state_indices=cache_indices,
-        )
+        if isinstance(mixed_qkv, tuple):
+            projected_qkvz, projected_ba, mixed_qkv, z = mixed_qkv
+            fused_qkvz_split_conv1d_update_contiguous(
+                projected_qkvz,
+                projected_ba,
+                mixed_qkv,
+                z,
+                b,
+                a,
+                conv_states,
+                layer.conv_weights,
+                cache_indices,
+                self.pad_slot_id,
+            )
+        else:
+            assert isinstance(mixed_qkv, torch.Tensor)
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_states,
+                layer.conv_weights,
+                layer.bias,
+                layer.activation,
+                conv_state_indices=cache_indices,
+            )
 
         # Skip split + reshape + separate gating kernel by consuming
         # the packed mixed_qkv directly in a single fused Triton kernel.
