@@ -268,6 +268,8 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
+    # If set, keep this many leading DiT layers resident on GPU
+    dit_layerwise_resident_layers: float = 0.0
     offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -282,6 +284,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Compilation
     enable_torch_compile: bool = False
+    regional_compile: bool = False
 
     # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
     # segments split at attention modules (SP all-to-all / dynamic attention
@@ -802,6 +805,8 @@ class ServerArgs(DisaggServerArgsMixin):
         normalized = backend.strip().lower()
         if normalized in ("fa3", "fa4"):
             normalized = "fa"
+        elif normalized == "cudnn_sdpa":
+            normalized = "torch_cudnn_sdpa"
         try:
             return AttentionBackendEnum[normalized.upper()].name.lower()
         except KeyError:
@@ -1131,8 +1136,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 or self.vae_cpu_offload
             ):
                 logger.warning(
-                    "Disabling component CPU offload on MPS because CPU-to-MPS "
-                    "module relocation can produce invalid diffusion outputs."
+                    "Disabling component CPU offload on MPS because the component "
+                    "residency offload strategy is only validated on CUDA."
                 )
             self.dit_cpu_offload = False
             self.text_encoder_cpu_offload = False
@@ -1510,6 +1515,16 @@ class ServerArgs(DisaggServerArgsMixin):
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
         parser.add_argument(
+            "--regional-compile",
+            action=StoreBoolean,
+            default=ServerArgs.regional_compile,
+            help=(
+                "Compile repeated DiT submodules selected by the model's "
+                "_compile_conditions instead of compiling the whole transformer. "
+                "Requires --enable-torch-compile."
+            ),
+        )
+        parser.add_argument(
             "--offload-during-compile",
             action=StoreBoolean,
             default=ServerArgs.offload_during_compile,
@@ -1635,6 +1650,18 @@ class ServerArgs(DisaggServerArgsMixin):
             type=float,
             default=ServerArgs.dit_offload_prefetch_size,
             help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is >= 1, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
+        )
+        parser.add_argument(
+            "--dit-layerwise-resident-layers",
+            type=float,
+            default=ServerArgs.dit_layerwise_resident_layers,
+            help="With --dit-layerwise-offload, keep this many leading DiT layers "
+            "permanently resident on GPU (retained across denoise steps) and stream "
+            "only the tail with --dit-offload-prefetch-size. 0.0 = off (pure "
+            "streaming). Between 0.0 and 1.0 = ratio of layers; >= 1 = absolute "
+            "count. Unlike raising the prefetch size, resident layers are transferred "
+            "once (not re-streamed every step), so this trades VRAM for lower denoise "
+            "latency when memory is available.",
         )
 
         # offload flags
@@ -2263,6 +2290,30 @@ class ServerArgs(DisaggServerArgsMixin):
         if 0.5 <= self.dit_offload_prefetch_size < 1.0:
             logger.info(
                 "We do not recommend --dit-offload-prefetch-size to be between 0.5 and 1.0"
+            )
+
+        # validate dit_layerwise_resident_layers (same ratio/absolute convention)
+        if self.dit_layerwise_resident_layers < 0.0:
+            raise ValueError("dit_layerwise_resident_layers must be non-negative")
+        if self.dit_layerwise_resident_layers >= 1 and (
+            isinstance(self.dit_layerwise_resident_layers, float)
+            and not self.dit_layerwise_resident_layers.is_integer()
+        ):
+            self.dit_layerwise_resident_layers = int(
+                math.floor(self.dit_layerwise_resident_layers)
+            )
+            logger.info(
+                "Invalid --dit-layerwise-resident-layers value passed, truncated to: "
+                f"{self.dit_layerwise_resident_layers}"
+            )
+        if (
+            self.dit_layerwise_resident_layers > 0
+            and not self.is_dit_layerwise_offload_selected
+        ):
+            logger.warning(
+                "--dit-layerwise-resident-layers has no effect because the DiT is not "
+                "layerwise-offloaded. It only applies together with "
+                "--dit-layerwise-offload (or 'dit' in --layerwise-offload-components)."
             )
 
         # validate layerwise offload conflicts
