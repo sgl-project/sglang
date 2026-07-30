@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.device_timer import device_timer_ctx
 
 _is_hip = is_hip()
 
@@ -615,14 +616,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.raw_bs = raw_bs
         self.bs = bs
         shape_key = self._make_graph_key(bs)
-        timer_ctx = (
-            self.model_runner.device_timer.wrap(
-                metadata={"category": "eagle_draft_extend"}
-            )
-            if self.model_runner.device_timer
-            else contextlib.nullcontext()
-        )
-        with timer_ctx:
+        with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(shape_key, forward_batch)
 
         out = LogitsProcessorOutput(

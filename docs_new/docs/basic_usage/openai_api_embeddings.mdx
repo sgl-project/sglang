@@ -12,7 +12,7 @@ This tutorial covers the embedding APIs for embedding models. For a list of the 
 
 ## Launch A Server
 
-Launch the server in your terminal and wait for it to initialize. Remember to add `--is-embedding` to the command.
+Launch the server in your terminal and wait for it to initialize. Native encoder embedding architectures and `google/embeddinggemma-300m` are detected automatically. Decoder-style embedding models still require `--is-embedding`.
 
 
 
@@ -22,8 +22,8 @@ from sglang.utils import wait_for_server, print_highlight, terminate_process
 
 embedding_process, port = launch_server_cmd(
     """
-python3 -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-1.5B-instruct \
-    --host 0.0.0.0 --is-embedding --log-level warning
+sglang serve --model-path Alibaba-NLP/gte-Qwen2-1.5B-instruct \
+    --is-embedding --log-level warning
 """
 )
 
@@ -115,6 +115,24 @@ input_ids_embedding = json.loads(subprocess.check_output(curl_ids, shell=True))[
 ]["embedding"]
 
 print_highlight(f"Input IDs embedding (first 10): {input_ids_embedding[:10]}")
+```
+
+## Compact Base64 Responses
+
+Set `encoding_format` to `base64` when JSON arrays would dominate response size. The encoded value contains little-endian FP32 values and can be decoded by OpenAI-compatible clients.
+
+```python Example
+response = requests.post(
+    f"http://localhost:{port}/v1/embeddings",
+    json={
+        "model": "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
+        "input": text,
+        "encoding_format": "base64",
+    },
+)
+
+base64_embedding = response.json()["data"][0]["embedding"]
+print_highlight(f"Base64 embedding: {base64_embedding[:20]}...")
 ```
 
 
