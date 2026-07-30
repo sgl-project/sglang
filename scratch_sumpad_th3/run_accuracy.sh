@@ -28,8 +28,12 @@ case "$CONFIG" in
   default-breakable) GRAPH_ARGS=(); DBG_MODE="" ;;
   # What #10414 guarantees today on the eager path: SUM_LEN, no fabrication.
   sum-disabled)      GRAPH_ARGS=(--cuda-graph-backend-prefill disabled); DBG_MODE="sum" ;;
-  # What deleting the #10414 condition would produce on the eager path.
+  # MAX_LEN on every forward. Stricter than deleting the #10414 condition.
   max-disabled)      GRAPH_ARGS=(--cuda-graph-backend-prefill disabled); DBG_MODE="max" ;;
+  # Exactly what deleting the #10414 condition does: fall back to the older
+  # communication-cost heuristic, which picks MAX_LEN on reasonably even batches.
+  no10414-disabled)  GRAPH_ARGS=(--cuda-graph-backend-prefill disabled); DBG_MODE="no10414" ;;
+  no10414-breakable) GRAPH_ARGS=(); DBG_MODE="no10414" ;;
   *) echo "unknown config: $CONFIG" >&2; exit 2 ;;
 esac
 
