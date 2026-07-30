@@ -57,12 +57,16 @@ def _reference_append_remap(
 )
 class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
     # (m, k, num_physical_routed, ep_size, ep_rank, num_fused_shared_experts).
-    # k and num_fused_shared_experts are kept powers of two (tl.arange constraint).
+    # Includes non-power-of-two k and num_fused_shared_experts (DeepSeek-V4 routes
+    # top-6): the kernel blocks over next_power_of_2 and masks, so these must work.
     CASES = [
         (1, 8, 256, 8, 0, 1),
         (4, 8, 256, 8, 7, 1),
         (17, 8, 264, 8, 3, 1),
         (128, 16, 128, 4, 2, 2),
+        (1, 6, 258, 6, 0, 1),  # DSV4: k=6 (non-pow2), s=1
+        (13, 6, 258, 6, 5, 1),  # DSV4: k=6 (non-pow2), non-zero ep_rank
+        (32, 6, 264, 4, 2, 3),  # non-pow2 k=6 and non-pow2 s=3 together
     ]
 
     def _make_inputs(self, m, k, num_physical_routed, ids_dtype=torch.int64):

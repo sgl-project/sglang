@@ -1246,12 +1246,9 @@ def biased_topk_jit_kernel_impl(
         from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 
         # DeepSeek-V4 stores e_score_correction_bias in bf16 (for the aiter
-        # sqrtsoftplus topk path), but moe_fused_gate asserts a float32 bias.
-        # This branch is taken when shared-experts fusion is enabled
-        # (num_fused_shared_experts > 0), so cast the bias to fp32 here.
-        if correction_bias is not None and correction_bias.dtype != torch.float32:
-            correction_bias = correction_bias.to(torch.float32)
-
+        # sqrtsoftplus topk path). moe_fused_gate upcasts the bias to fp32
+        # in-register, so pass it through directly rather than allocating a fresh
+        # fp32 copy of this static routing bias on every MoE invocation.
         topk_weights, topk_ids = moe_fused_gate(
             gating_output,
             correction_bias,
