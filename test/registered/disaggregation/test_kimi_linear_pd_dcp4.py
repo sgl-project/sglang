@@ -62,19 +62,16 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
         cls.launch_all()
 
     @classmethod
-    def _common_dcp_args(cls):
+    def _monolithic_reference_args(cls):
         return [
             "--tp-size",
             "4",
-            "--dcp-size",
+            "--ep-size",
             "4",
             "--attention-backend",
             "tokenspeed_mla",
             "--kv-cache-dtype",
             "fp8_e4m3",
-            "--dcp-comm-backend",
-            "a2a",
-            "--dcp-replicate-q-proj",
             "--trust-remote-code",
             "--random-seed",
             "0",
@@ -84,7 +81,6 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
             str(PHYSICAL_PAGE_SIZE),
             "--chunked-prefill-size",
             str(CHUNKED_PREFILL_SIZE),
-            "--disable-radix-cache",
             "--cuda-graph-max-bs-decode",
             "64",
             "--cuda-graph-backend-prefill",
@@ -234,7 +230,7 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
-            other_args=cls._common_dcp_args(),
+            other_args=cls._monolithic_reference_args(),
         )
         try:
             cls.tokenizer = AutoTokenizer.from_pretrained(
