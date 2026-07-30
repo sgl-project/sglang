@@ -1,3 +1,4 @@
+import contextlib
 import types
 import unittest
 from unittest.mock import patch
@@ -248,147 +249,162 @@ class TestFlashInferCommFusion(unittest.TestCase):
             fusion._flashinfer_allreduce_unavailable = original_unavailable
 
 
+# Stand-ins for the (device_group, cpu_group) pair a GroupCoordinator passes as
+# the workspace identity. Only object identity matters to the guard.
+_GROUP_KEY = ("device_group", "cpu_group")
+_OTHER_GROUP_KEY = ("other_device_group", "other_cpu_group")
+
+
 class TestFlashInferAllReduceOnly(unittest.TestCase):
-    def _make_manager(self, world_size):
+    def _make_manager(self, world_size, group_key=_GROUP_KEY):
         manager = fusion.FlashInferWorkspaceManager()
         manager.workspace = _FakeWorkspace(None, world_size)
         manager.initialized = True
+        manager.world_size = world_size
+        manager.group = group_key
         manager.max_token_num = 2048
         manager.hidden_dim = 4096
         return manager
 
-    def _set_attn_workspace_manager(self, manager):
+    @contextlib.contextmanager
+    def _patched_attn_workspace(self, manager):
+        """Install `manager` as the attention-TP workspace with flashinfer faked."""
         from sglang.srt.runtime_context import get_resources
 
         buffers = get_resources().buffers
         manager_key = "flashinfer_fusion_attn_tp_workspace"
         original_manager = buffers.get(manager_key)
-        buffers[manager_key] = manager
-        return buffers, manager_key, original_manager
-
-    def _restore_attn_workspace_manager(self, buffers, manager_key, original_manager):
-        if original_manager is None:
-            buffers.pop(manager_key, None)
-        else:
-            buffers[manager_key] = original_manager
-
-    def test_allreduce_output_equals_input_times_world_size(self):
-        world_size = 4
-        fake_comm = _FakeFlashInferComm()
-        manager = self._make_manager(world_size)
-
         original_comm = fusion._flashinfer_comm
         original_unavailable = fusion._flashinfer_allreduce_unavailable
-        buffers, manager_key, original_manager = self._set_attn_workspace_manager(
-            manager
-        )
-        try:
-            fusion._flashinfer_comm = fake_comm
-            fusion._flashinfer_allreduce_unavailable = False
 
-            if not torch.cuda.is_available():
-                self.skipTest("CUDA required for flashinfer custom op")
-            device = torch.device("cuda")
-            input_ = torch.randn(8, 16, dtype=torch.bfloat16, device=device)
+        buffers[manager_key] = manager
+        fusion._flashinfer_comm = _FakeFlashInferComm()
+        fusion._flashinfer_allreduce_unavailable = False
+        try:
+            yield
+        finally:
+            fusion._flashinfer_comm = original_comm
+            fusion._flashinfer_allreduce_unavailable = original_unavailable
+            if original_manager is None:
+                buffers.pop(manager_key, None)
+            else:
+                buffers[manager_key] = original_manager
+
+    def _allreduce(self, input_, world_size=4, group_key=_GROUP_KEY):
+        return fusion.flashinfer_allreduce(
+            input_,
+            use_attn_tp_group=True,
+            expected_world_size=world_size,
+            expected_group_key=group_key,
+        )
+
+    def test_allreduce_output_equals_input_times_world_size(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required for flashinfer custom op")
+        world_size = 4
+        with self._patched_attn_workspace(self._make_manager(world_size)):
+            input_ = torch.randn(8, 16, dtype=torch.bfloat16, device="cuda")
             expected = input_ * world_size
 
             with get_parallel().override(attn_tp_size=world_size):
-                result = fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
+                result = self._allreduce(input_, world_size=world_size)
 
             self.assertIsNotNone(result)
             torch.testing.assert_close(result, expected)
-        finally:
-            fusion._flashinfer_comm = original_comm
-            fusion._flashinfer_allreduce_unavailable = original_unavailable
-            self._restore_attn_workspace_manager(buffers, manager_key, original_manager)
 
     def test_shape_guard_returns_none_for_non_2d(self):
-        world_size = 4
-        fake_comm = _FakeFlashInferComm()
-        manager = self._make_manager(world_size)
-
-        original_comm = fusion._flashinfer_comm
-        original_unavailable = fusion._flashinfer_allreduce_unavailable
-        buffers, manager_key, original_manager = self._set_attn_workspace_manager(
-            manager
-        )
-        try:
-            fusion._flashinfer_comm = fake_comm
-            fusion._flashinfer_allreduce_unavailable = False
-
-            input_1d = torch.randn(16)
-            input_3d = torch.randn(2, 8, 16)
-
-            self.assertIsNone(
-                fusion.flashinfer_allreduce(input_1d, use_attn_tp_group=True)
-            )
-            self.assertIsNone(
-                fusion.flashinfer_allreduce(input_3d, use_attn_tp_group=True)
-            )
-        finally:
-            fusion._flashinfer_comm = original_comm
-            fusion._flashinfer_allreduce_unavailable = original_unavailable
-            self._restore_attn_workspace_manager(buffers, manager_key, original_manager)
+        with self._patched_attn_workspace(self._make_manager(4)):
+            self.assertIsNone(self._allreduce(torch.randn(16)))
+            self.assertIsNone(self._allreduce(torch.randn(2, 8, 16)))
 
     def test_shape_guard_returns_none_for_non_contiguous(self):
-        world_size = 4
-        fake_comm = _FakeFlashInferComm()
-        manager = self._make_manager(world_size)
-
-        original_comm = fusion._flashinfer_comm
-        original_unavailable = fusion._flashinfer_allreduce_unavailable
-        buffers, manager_key, original_manager = self._set_attn_workspace_manager(
-            manager
-        )
-        try:
-            fusion._flashinfer_comm = fake_comm
-            fusion._flashinfer_allreduce_unavailable = False
-
-            base = torch.randn(16, 8)
-            non_contiguous = base.t()
+        with self._patched_attn_workspace(self._make_manager(4)):
+            non_contiguous = torch.randn(16, 8).t()
             self.assertFalse(non_contiguous.is_contiguous())
-
-            self.assertIsNone(
-                fusion.flashinfer_allreduce(non_contiguous, use_attn_tp_group=True)
-            )
-        finally:
-            fusion._flashinfer_comm = original_comm
-            fusion._flashinfer_allreduce_unavailable = original_unavailable
-            self._restore_attn_workspace_manager(buffers, manager_key, original_manager)
+            self.assertIsNone(self._allreduce(non_contiguous))
 
     def test_returns_none_when_unavailable(self):
         original_unavailable = fusion._flashinfer_allreduce_unavailable
         try:
             fusion._flashinfer_allreduce_unavailable = True
-            input_ = torch.randn(8, 16)
-            self.assertIsNone(
-                fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
-            )
+            self.assertIsNone(self._allreduce(torch.randn(8, 16)))
         finally:
             fusion._flashinfer_allreduce_unavailable = original_unavailable
 
     def test_returns_none_when_workspace_uninitialized(self):
-        world_size = 4
-        fake_comm = _FakeFlashInferComm()
-        manager = fusion.FlashInferWorkspaceManager()
+        with self._patched_attn_workspace(fusion.FlashInferWorkspaceManager()):
+            with get_parallel().override(attn_tp_size=4):
+                self.assertIsNone(self._allreduce(torch.randn(8, 16)))
 
-        original_comm = fusion._flashinfer_comm
-        original_unavailable = fusion._flashinfer_allreduce_unavailable
-        buffers, manager_key, original_manager = self._set_attn_workspace_manager(
-            manager
-        )
-        try:
-            fusion._flashinfer_comm = fake_comm
-            fusion._flashinfer_allreduce_unavailable = False
+    def test_returns_none_when_workspace_group_differs(self):
+        """A workspace rendezvoused on other peers must not be reused.
 
-            input_ = torch.randn(8, 16)
-            with get_parallel().override(attn_tp_size=world_size):
-                result = fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
-            self.assertIsNone(result)
-        finally:
-            fusion._flashinfer_comm = original_comm
-            fusion._flashinfer_allreduce_unavailable = original_unavailable
-            self._restore_attn_workspace_manager(buffers, manager_key, original_manager)
+        Under hybrid EP+TP (e.g. tp=4, ep=2) the MoE-TP and MoE-EP groups have
+        the same world size but pair different ranks, so a workspace built for
+        one silently reduces across the wrong peers when used by the other --
+        wrong output rather than a crash.
+        """
+        with self._patched_attn_workspace(self._make_manager(2)):
+            self.assertIsNone(
+                self._allreduce(
+                    torch.randn(8, 16), world_size=2, group_key=_OTHER_GROUP_KEY
+                )
+            )
+
+    def test_returns_none_when_workspace_world_size_differs(self):
+        with self._patched_attn_workspace(self._make_manager(4)):
+            self.assertIsNone(self._allreduce(torch.randn(8, 16), world_size=2))
+
+
+class _FakeGroupCoordinator:
+    def __init__(self, world_size):
+        self.world_size = world_size
+        self._fi_workspace_hint = None
+
+
+class TestTagGroupsForFlashInferAllReduceOnly(unittest.TestCase):
+    """The MoE workspace rendezvouses on the EP group when moe_ep_size > 1 and
+    on the MoE-TP group otherwise, so only that one group may be tagged."""
+
+    def _tag(self, *, attn_tp, moe_ep, moe_tp):
+        from sglang.srt.distributed import parallel_state as ps
+
+        with patch.object(ps, "_ENABLE_FLASHINFER_ALLREDUCE_ONLY", True), patch.object(
+            ps, "_ATTN_TP", attn_tp
+        ), patch.object(ps, "_MOE_EP", moe_ep), patch.object(ps, "_MOE_TP", moe_tp):
+            ps._tag_groups_for_flashinfer_allreduce_only()
+
+    def test_hybrid_ep_tp_tags_only_the_ep_group(self):
+        attn_tp = _FakeGroupCoordinator(4)
+        moe_ep = _FakeGroupCoordinator(2)
+        moe_tp = _FakeGroupCoordinator(2)
+
+        self._tag(attn_tp=attn_tp, moe_ep=moe_ep, moe_tp=moe_tp)
+
+        self.assertEqual(attn_tp._fi_workspace_hint, "attn_tp")
+        self.assertEqual(moe_ep._fi_workspace_hint, "moe")
+        self.assertIsNone(moe_tp._fi_workspace_hint)
+
+    def test_pure_moe_tp_tags_only_the_moe_tp_group(self):
+        attn_tp = _FakeGroupCoordinator(4)
+        moe_ep = _FakeGroupCoordinator(1)
+        moe_tp = _FakeGroupCoordinator(4)
+
+        self._tag(attn_tp=attn_tp, moe_ep=moe_ep, moe_tp=moe_tp)
+
+        self.assertEqual(moe_tp._fi_workspace_hint, "moe")
+        self.assertIsNone(moe_ep._fi_workspace_hint)
+
+    def test_shared_coordinator_prefers_attn_tp(self):
+        # tp=4, ep=4: _ATTN_TP is _MOE_EP is _TP. Either workspace spans the
+        # same peers, but the choice must be deterministic.
+        shared = _FakeGroupCoordinator(4)
+        moe_tp = _FakeGroupCoordinator(1)
+
+        self._tag(attn_tp=shared, moe_ep=shared, moe_tp=moe_tp)
+
+        self.assertEqual(shared._fi_workspace_hint, "attn_tp")
+        self.assertIsNone(moe_tp._fi_workspace_hint)
 
 
 if __name__ == "__main__":

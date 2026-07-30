@@ -291,6 +291,10 @@ class GroupCoordinator:
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
+        # Which FlashInfer fusion workspace this group owns, or None when the
+        # group is not eligible for the allreduce-only kAllReduce path. Stamped
+        # by _tag_groups_for_flashinfer_allreduce_only() after group init.
+        self._fi_workspace_hint: Optional[str] = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
         if is_cuda_alike():
@@ -717,12 +721,14 @@ class GroupCoordinator:
                 self.pynccl_comm.all_reduce(input_)
                 return input_
 
-        fi_hint = getattr(self, "_fi_workspace_hint", None)
-        if fi_hint is not None and input_.ndim == 2 and input_.is_contiguous():
+        if self._fi_workspace_hint is not None:
             from sglang.srt.layers.flashinfer_comm_fusion import flashinfer_allreduce
 
             result = flashinfer_allreduce(
-                input_, use_attn_tp_group=(fi_hint == "attn_tp")
+                input_,
+                use_attn_tp_group=(self._fi_workspace_hint == "attn_tp"),
+                expected_world_size=self.world_size,
+                expected_group_key=(self.device_group, self.cpu_group),
             )
             if result is not None:
                 return result
@@ -2033,18 +2039,33 @@ def set_flashinfer_allreduce_only(enable: bool):
 
 
 def _tag_groups_for_flashinfer_allreduce_only():
-    """Stamp _fi_workspace_hint on each group coordinator so all_reduce() can dispatch
-    to flashinfer_allreduce() without touching the call sites."""
+    """Stamp _fi_workspace_hint on the group coordinators that own a FlashInfer
+    fusion workspace, so all_reduce() can dispatch to flashinfer_allreduce()
+    without touching the call sites.
+
+    Only two workspaces exist (see ``_get_workspace_manager``): one for
+    attention TP and one for MoE. A group may only be tagged for the workspace
+    that was rendezvoused on its own peers -- reducing over a workspace built
+    for a different set of peers silently returns wrong data.
+
+    - ``_TP`` is deliberately absent: it *is* ``_ATTN_TP`` when
+      ``attn_tp_size == tp_size``, and a strict superset of it otherwise (DP
+      attention), where the attention workspace addresses the wrong peers.
+    - The MoE workspace rendezvouses on the EP group when ``moe_ep_size > 1``
+      and on the MoE-TP group otherwise, so exactly one of ``_MOE_EP`` /
+      ``_MOE_TP`` is eligible. Tagging both makes a MoE-TP allreduce reduce
+      across the EP peers under hybrid EP+TP (e.g. tp=4, ep=2).
+    """
     if not _ENABLE_FLASHINFER_ALLREDUCE_ONLY:
         return
-    for group, hint in (
-        (_TP, "attn_tp"),
-        (_ATTN_TP, "attn_tp"),
-        (_MOE_TP, "moe_tp"),
-        (_MOE_EP, "moe_ep"),
-    ):
+
+    moe_group = _MOE_EP if (_MOE_EP is not None and _MOE_EP.world_size > 1) else _MOE_TP
+    # Attention is tagged last on purpose: when a coordinator backs both roles
+    # (e.g. _ATTN_TP is _MOE_EP is _TP at tp=4, ep=4) either workspace spans the
+    # same peers and is correct, so we just pick one deterministically.
+    for group, hint in ((moe_group, "moe"), (_ATTN_TP, "attn_tp")):
         if group is not None:
-            setattr(group, "_fi_workspace_hint", hint)
+            group._fi_workspace_hint = hint
 
 
 # TODO: refactor in-tree platforms to get rid of this wrapper
