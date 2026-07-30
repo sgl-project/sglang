@@ -104,10 +104,6 @@ class TestNPUQwen3_6_35BA3B_1P_In64k_Out1k_Prefix90_50ms(
     output_token_throughput = 660
     pop_sglang_is_in_ci_for_gsp = True
 
-    @classmethod
-    def setUpClass(cls):
-        pass
-
     def test_npu_qwen3_6_35b_a3b_1p_in64k_out1k_prefix90_50ms(self):
         """Run NPU performance test for Qwen3.6-35B-A3B in64k out1k prefix90 50ms"""
         self.run_throughput()

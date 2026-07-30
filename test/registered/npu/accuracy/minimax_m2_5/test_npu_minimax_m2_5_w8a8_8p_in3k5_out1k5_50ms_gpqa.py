@@ -5,11 +5,8 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    AISBENCHMARK_DATASET_DEFAULT,
-    BENCHMARK_TOOL_DEFAULT,
     MINIMAX_M2_5_EAGLE3_MODEL_PATH,
     MINIMAX_M2_5_W8A8_MODEL_PATH,
-    TestNpuPerformanceTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -17,7 +14,6 @@ register_npu_ci(
     est_time=3600,
     suite="full-16-npu-a3",
     nightly=True,
-    disabled="performance testcase",
 )
 
 MINIMAX_M2_5_HIGH_THROUGHPUT_ENVS = {
@@ -90,31 +86,6 @@ MINIMAX_M2_5_HIGH_THROUGHPUT_OTHER_ARGS = [
     "--tool-call-parser",
     "minimax-m2",
 ]
-
-
-class TestNPUMiniMaxM2_5_W8A8_8P_In3k5_Out1k5_HighThroughput(
-    TestNpuPerformanceTestCaseBase
-):
-    """Test NPU performance for MiniMax-M2.5-w8a8 8p single node high throughput in3k5 out1k5"""
-
-    benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    dataset_type = AISBENCHMARK_DATASET_DEFAULT
-    model = MINIMAX_M2_5_W8A8_MODEL_PATH
-    other_args = MINIMAX_M2_5_HIGH_THROUGHPUT_OTHER_ARGS
-    envs = MINIMAX_M2_5_HIGH_THROUGHPUT_ENVS
-    dataset_name = "random"
-    max_concurrency = 320
-    num_prompts = 1280
-    input_len = 3500
-    output_len = 1500
-    random_range_ratio = 1
-    seed = 1
-    tpot = 50
-    output_token_throughput = 5717.58
-
-    def test_npu_minimax_m2_5_w8a8_8p_in3k5_out1k5_high_throughput(self):
-        """Run NPU performance test for MiniMax-M2.5-w8a8 high throughput"""
-        self.run_throughput()
 
 
 class TestNPUMiniMaxM2_5_W8A8_8P_In3k5_Out1k5_GPQA(TestNpuAccuracyTestCaseBase):
