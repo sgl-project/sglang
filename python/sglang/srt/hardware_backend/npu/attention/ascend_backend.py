@@ -42,7 +42,6 @@ from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
-_npu_dsa_sparse_trim_logged = False
 
 
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
@@ -1006,7 +1005,6 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: torch.Tensor = None,
     ):
-        global _npu_dsa_sparse_trim_logged
 
         is_prefill = (
             forward_batch.forward_mode.is_extend()
@@ -1093,29 +1091,6 @@ class AscendAttnBackend(AttentionBackend):
             )
         else:
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
-            if trim_eager_padding and not _npu_dsa_sparse_trim_logged:
-                logger.info(
-                    "NPU DSA eager trim before sparse attention: "
-                    "mode=%s, layer=%s, query_rows=%s->%s, topk_rows=%s, "
-                    "query_length_rows=%s, kv_length_rows=%s, block_table_rows=%s, "
-                    "sparse_indices_aligned=%s, tnd_metadata_aligned=%s, "
-                    "original_num_tokens=%s, num_token_non_padded_cpu=%s",
-                    forward_batch.forward_mode,
-                    layer.layer_id,
-                    num_token_padding,
-                    q_nope.shape[0],
-                    topk_indices.shape[0],
-                    actual_seq_qlen.shape[0],
-                    actual_seq_lengths_kv.shape[0],
-                    self.forward_metadata.block_tables.shape[0],
-                    topk_indices.shape[0] == q_nope.shape[0],
-                    actual_seq_qlen.shape[0]
-                    == actual_seq_lengths_kv.shape[0]
-                    == self.forward_metadata.block_tables.shape[0],
-                    forward_batch._original_num_tokens,
-                    forward_batch.num_token_non_padded_cpu,
-                )
-                _npu_dsa_sparse_trim_logged = True
             attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,
                 key=k_nope,

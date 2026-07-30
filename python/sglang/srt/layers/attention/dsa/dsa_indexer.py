@@ -54,7 +54,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
-_npu_dsa_indexer_trim_logged = False
 
 global _use_multi_stream
 _is_cuda = is_cuda()
@@ -2080,8 +2079,6 @@ class Indexer(MultiPlatformOp):
         layer_scatter_modes=None,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
-        global _npu_dsa_indexer_trim_logged
-
         if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
             actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
         else:
@@ -2236,7 +2233,6 @@ class Indexer(MultiPlatformOp):
             layer_id, forward_batch.out_cache_loc, k
         )
 
-        num_token_padding = q.shape[0]
         num_token_non_padded = (
             forward_batch._original_num_tokens
             if forward_batch._original_num_tokens is not None
@@ -2329,28 +2325,6 @@ class Indexer(MultiPlatformOp):
         if trim_eager_padding:
             weights = weights[:num_token_non_padded]
         block_table = get_attn_backend().forward_metadata.block_tables
-        if trim_eager_padding and not _npu_dsa_indexer_trim_logged:
-            logger.info(
-                "NPU DSA eager trim before lightning indexer: "
-                "mode=%s, layer=%s, query_rows=%s->%s, weights_rows=%s, "
-                "query_length_rows=%s, kv_length_rows=%s, block_table_rows=%s, "
-                "tnd_metadata_aligned=%s, "
-                "original_num_tokens=%s, num_token_non_padded_cpu=%s",
-                forward_batch.forward_mode,
-                layer_id,
-                num_token_padding,
-                q.shape[0],
-                weights.shape[0],
-                actual_seq_lengths_q.shape[0],
-                actual_seq_lengths_kv.shape[0],
-                block_table.shape[0],
-                actual_seq_lengths_q.shape[0]
-                == actual_seq_lengths_kv.shape[0]
-                == block_table.shape[0],
-                forward_batch._original_num_tokens,
-                forward_batch.num_token_non_padded_cpu,
-            )
-            _npu_dsa_indexer_trim_logged = True
         if (
             is_prefill
             and self.dsa_enable_prefill_cp
