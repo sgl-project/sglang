@@ -558,6 +558,17 @@ def post_permute_triton_to_deepep_normal(
         # (kernel already applied the routing weight) scatter-adds back to its
         # token row, reproducing the per-token top-k reduction.
         if running_state.get("mori_dense", False):
+            # The dense path reconstructs per-token output through combine via a
+            # 2-D scatter; a no_combine run would hand back a 3-D
+            # [pairs, topk, hidden] tensor that index_add_ cannot consume. This
+            # combination is not supported (mirrors the aiter runner rejecting
+            # unsupported no_combine), so fail loudly instead of dim-mismatching.
+            if runner_config.no_combine:
+                raise NotImplementedError(
+                    "deepep_normal<->triton mori dense-compaction does not "
+                    "support no_combine=True: the post-permute scatter path "
+                    "reconstructs per-token output through combine."
+                )
             pair_rows = running_state["mori_dense_pair_rows"]
             out_rows = running_state["mori_dense_out_rows"]
             scattered = hidden_states.new_zeros((out_rows, hidden_states.shape[1]))
