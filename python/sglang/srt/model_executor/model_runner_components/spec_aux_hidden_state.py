@@ -21,6 +21,7 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
     dflash_target_layer_ids: Any = None
+    dflash_draft_model_config: Optional[ModelConfig] = None
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -163,3 +164,4 @@ def _resolve_dflash_aux_hidden_state(
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
+        config.dflash_draft_model_config = draft_model_config
