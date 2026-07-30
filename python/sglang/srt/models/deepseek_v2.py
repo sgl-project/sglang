@@ -3045,6 +3045,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+
         # Multi-modal: input_ids may be None (use input_embeds).
         # Non-first PP ranks: both are None (activations via pp_proxy_tensors).
         if input_ids is not None:
@@ -3053,26 +3054,27 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             len_input_ids = input_embeds.shape[0]
         else:
             len_input_ids = pp_proxy_tensors["hidden_states"].shape[0]
-        if self.dsa_enable_prefill_cp:
-            if can_dsa_cp_split(
-                len_input_ids, self.cp_size, self.use_dsa, forward_batch
-            ):
-                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len_input_ids,
-                    self.cp_rank,
-                    self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
-                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
-                )
-        elif self.mla_enable_prefill_cp:
-            if can_cp_split(len_input_ids, self.cp_size, forward_batch):
-                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len_input_ids,
-                    self.cp_rank,
-                    self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
-                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
-                )
+        if not is_cp_v2_active(forward_batch):
+            if self.dsa_enable_prefill_cp:
+                if can_dsa_cp_split(
+                    len_input_ids, self.cp_size, self.use_dsa, forward_batch
+                ):
+                    forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                        len_input_ids,
+                        self.cp_rank,
+                        self.cp_size,
+                        forward_batch.seq_lens_cpu.tolist(),
+                        extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+                    )
+            elif self.mla_enable_prefill_cp:
+                if can_cp_split(len_input_ids, self.cp_size, forward_batch):
+                    forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                        len_input_ids,
+                        self.cp_rank,
+                        self.cp_size,
+                        forward_batch.seq_lens_cpu.tolist(),
+                        extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+                    )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model(
