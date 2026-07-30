@@ -2539,15 +2539,6 @@ class ServerArgs:
         "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
         NS("exec.mamba"),
     ] = 16
-    # ReplaySSM spec-verify (Part B of RFC #28511): linear-attn target-verify via
-    # a per-slot ring + fold instead of per-draft full-state snapshots. GDN only;
-    # linear-chain (topk <= 1) only. Two protocols share the flag: with mamba
-    # extra_buffer (the overlap-schedule radix strategy) the verify writes a raw
-    # (v, pre-norm k, g, beta) ring that the commit folds into the fp32
-    # checkpoint every step (fold-every-commit, KDA-style); otherwise the
-    # circular (d, k, g) ring + periodic flush with per-slot cursors
-    # (cache_base, is_flush) is used. Ring length reuses
-    # `linear_replayssm_cache_len`.
     enable_gdn_replayssm_spec: A[
         bool,
         "Enable the ReplaySSM linear-attn spec-verify kernel (Part B of RFC #28511): a per-slot ring replacing the recurrent verify's per-draft full-state snapshots (fold-every-commit under mamba extra_buffer, circular ring + periodic flush otherwise). GDN only, linear-chain (--speculative-eagle-topk in {None, 1}) only. Reuses --linear-replayssm-cache-len for the ring length.",
@@ -6032,16 +6023,9 @@ class ServerArgs:
                     "EAGLE tree verify. Got "
                     f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
                 )
-            # Protocol selection. extra_buffer (the overlap-schedule-compatible
-            # radix strategy) uses the KDA-style fold-every-commit protocol:
-            # verify writes raw (v, pre-norm k, g, beta) ring entries and the
-            # commit replays the accepted prefix into the fp32 checkpoint, so
-            # `temporal` is always current and the radix mamba-track snapshot
-            # happens inside the same fold (no force-flush needed). Without
-            # extra_buffer the original circular-ring + periodic-flush protocol
-            # is kept. Read through the resolved view: the auto->extra_buffer
-            # strategy resolution is still a declaration at this point (the raw
-            # field would silently read "auto").
+            # Read through the resolved view: the auto->extra_buffer strategy
+            # resolution is still a declaration here (the raw field would
+            # silently read "auto").
             from sglang.srt.arg_groups.overrides import (
                 mamba_extra_buffer_of,
                 resolved_view,
@@ -6050,13 +6034,8 @@ class ServerArgs:
             _mamba_view = resolved_view(self)
             _spec_fold = mamba_extra_buffer_of(_mamba_view)
             if _spec_fold:
-                # Fold-every-commit never routes through the decode kernel
-                # (verify calls the Triton recurrent kernel directly for the
-                # fused ring-write; the commit fold is its own kernel; under
-                # spec the target runs no plain decode), so the decode backend
-                # only serves non-spec forwards and FlashInfer is fine. Its
-                # SM100 bf16-state requirement is enforced by the generic
-                # check above.
+                # The fold verify/commit never route through the decode kernel,
+                # so the decode backend only serves non-spec forwards.
                 if decode not in ("triton", "flashinfer"):
                     raise ValueError(
                         "--enable-gdn-replayssm-spec (fold-every-commit) "
@@ -6108,15 +6087,6 @@ class ServerArgs:
                 )
             # ring_len >= 2 * max drafts is checked in
             # _validate_gdn_replayssm_spec_ring() (draft tokens not derived yet).
-            # Closed-loop exact fold: the flush replays raw ring inputs through
-            # the recurrent update into the checkpoint, bit-identical to the
-            # recurrent baseline AT THE SAME checkpoint dtype. fp32 stays the
-            # default (bit-parity with the fp32 baseline); a 16-bit checkpoint
-            # is allowed (it ~halves the state pool and unlocks the SM100
-            # FlashInfer decode kernel) -- the fold then re-quantizes on every
-            # commit/flush, matching the 16-bit recurrent baseline's per-step
-            # rounding rather than the fp32 one, so validate accuracy per
-            # model/workload.
             if self.mamba_ssm_dtype is None:
                 logger.info(
                     "--enable-gdn-replayssm-spec: setting --mamba-ssm-dtype "
@@ -6150,8 +6120,6 @@ class ServerArgs:
         )
 
         if mamba_extra_buffer_of(resolved_view(self)):
-            # Fold-every-commit: the window is sized to the draft maximum and
-            # overwritten every verify step; no early-flush margin exists.
             return
         max_drafts = self.max_speculative_num_draft_tokens
         if max_drafts is None:

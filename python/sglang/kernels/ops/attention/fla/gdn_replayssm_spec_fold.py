@@ -1,38 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""ReplaySSM fold-every-commit state commit for GDN (Gated Delta Network).
+"""GDN ReplaySSM fold-every-commit: replay the ring-written raw inputs of the
+accepted draft prefix into the fp32 checkpoint on commit (replaces the
+per-draft ``intermediate_ssm`` snapshots).
 
-Counterpart of the KDA fold-every-commit spec-verify (Kimi-K3): the verify
-output comes from the unchanged recurrent verify kernel reading the
-always-current fp32 checkpoint, so — unlike the circular-ring GDN spec kernel
-(gdn_replayssm_spec_decode.py) — this module does NOT reconstruct the verify
-output and keeps no cross-step cursors. It only replaces the per-draft-token
-full-SSM snapshot cache (``intermediate_ssm``, the dominant speculative
-scratch) with a small per-request input window + an exact fold on commit.
-
-Scheme:
-  * during verify, the fused ring-write inside
-    ``fused_sigmoid_gating_delta_rule_update`` (CACHE_RING) stores the draft
-    window's raw inputs (raw v, raw pre-norm k, fp32 scalar gate ``g``, fp32
-    ``beta``) into the per-slot window at positions ``0..spec_len``;
-  * on commit, :func:`commit_gdn_replayssm_fold_all_layers` replays the
-    *accepted* prefix ``0..accept_len`` from the checkpoint (``temporal``)
-    into it in place — ``temporal`` is always the current committed state, so
-    the next verify reads it directly (no lag, no periodic flush).
-
-The exact fold is a BITWISE CLONE of
-``fused_sigmoid_gating_delta_rule_update_kernel``'s GDN (IS_KDA=False) branch:
-same [BK, BV] fp32 tile (K rows, V cols), same division-form L2 norm (eps
-inside sqrt), same scalar gate decay ``h *= exp(g)``, same
-decay→delta→rank-1 op order. Given identical inputs the folded checkpoint is
-bit-identical to the recurrent baseline's committed state. Do NOT reorder into
+The fold is a BITWISE CLONE of ``fused_sigmoid_gating_delta_rule_update_kernel``'s
+GDN branch (same tile, division-form L2 norm, op order). Do NOT reorder into
 tl.dot / reciprocal-multiply; keep num_warps=1 so the reduction trees match.
-
-With mamba extra_buffer (radix prefix caching) the same replay snapshots the
-interval-crossing state into the track slot in one pass, so no device-side
-force-flush or separate SSM track scatter is needed — which is what makes this
-protocol compatible with extra_buffer and hence the overlap scheduler.
-
-Linear chain only (NEXTN / MTP, topk <= 1).
 """
 
 from __future__ import annotations
@@ -80,8 +53,6 @@ def gdn_replayssm_exact_fold_kernel(
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
-    # program_id(2) packs (layer, v-head): layer-major so a single launch folds
-    # all GDN layers. num_layers=1 launches (per-layer entry) keep i_layer == 0.
     i_hvl = tl.program_id(2)
     # int64: layer stride * i_layer can overflow an int32 index product.
     i_layer = (i_hvl // HV).to(tl.int64)
@@ -113,15 +84,8 @@ def gdn_replayssm_exact_fold_kernel(
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
 
-    # [BK, BV] tile: K rows / V cols, matching the recurrent baseline's memory
-    # offset (v * K + k, K contiguous). Launch-config note (B200, bs 1..128):
-    # the kernel is bound by the mandatory checkpoint r+w (~94 MB/request at
-    # 45 layers x [16,128,128] fp32) at ~5.0-5.6 TB/s; num_stages is a no-op
-    # (the t-loop loads are tiny), num_warps > 1 gains ~6% at bs=1 but changes
-    # the tl.sum reduction tree and breaks the bitwise-clone guarantee, and an
-    # evict_first hint on this tile wins ~7% only with a warm L2 (back-to-back
-    # replays) while losing ~3% in the representative cold-L2 regime -- so the
-    # recurrent kernel's (num_warps=1, num_stages=3, plain policy) is kept.
+    # Checkpoint-bandwidth bound. Tuning tried and rejected: num_stages (no-op),
+    # num_warps > 1 (breaks the bitwise clone), evict_first (loses cold-L2).
     p_h0 = (
         h0
         + state_idx * stride_state_slot
@@ -156,7 +120,6 @@ def gdn_replayssm_exact_fold_kernel(
             beta_cache + state_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
         ).to(tl.float32)
 
-        # --- verbatim recurrent update, GDN branch (see module docstring) ---
         if USE_QK_L2NORM_IN_KERNEL:
             b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
         b_h *= tl.exp(b_g)
@@ -164,7 +127,6 @@ def gdn_replayssm_exact_fold_kernel(
         b_v *= b_beta
         b_h += b_k[:, None] * b_v[None, :]
 
-        # Interval-crossing snapshot -> track slot (state AFTER step `track_step`).
         if HAS_TRACK:
             if (t == track_step) and (track_idx > NULL_BLOCK_ID):
                 tl.store(
@@ -195,15 +157,8 @@ def commit_gdn_replayssm_fold_all_layers(
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = -1,
 ) -> None:
-    """Fold every layer's accepted window in a single launch.
-
-    The layer is packed into the head grid axis (program_id(2) = layer * HV +
-    head), so the result is bit-identical to a per-layer loop — each (layer,
-    head, v-tile) block runs the same per-slot recurrent replay. Tiling clones
-    the recurrent verify kernel (full-K rows, BV = min(np2(V), 32) cols,
-    num_warps=1) so the folded checkpoint is bit-identical to the recurrent
-    baseline's committed state.
-    """
+    """Fold every layer's accepted window in one launch (layer packed into
+    grid axis 2); bit-identical to a per-layer loop."""
     num_layers, num_slots, HV = checkpoint_state.shape[:3]
     K = rawk_cache.shape[-1]
     V = rawv_cache.shape[-1]
@@ -272,15 +227,8 @@ def commit_gdn_replayssm_fold_after_verify(
     mamba_steps_to_track: torch.Tensor | None = None,
     null_block_id: int = -1,
 ) -> None:
-    """Fold each layer's accepted window into ``temporal`` and roll back conv.
-
-    The SSM state lives in the per-slot window (written by the fused ring-write
-    during verify); the fold replays the accepted prefix into the checkpoint,
-    so ``temporal`` stays current. Conv still needs its usual accept-rollback,
-    plus the track-slot conv snapshot under extra_buffer (the fold already did
-    the SSM side via HAS_TRACK; the track scatter is mask-gated, step -1 =>
-    skip).
-    """
+    """Fold each layer's accepted window into ``temporal``, then do the usual
+    conv accept-rollback (+ the track-slot conv scatter under extra_buffer)."""
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
         fused_conv_window_scatter_with_mask,
     )

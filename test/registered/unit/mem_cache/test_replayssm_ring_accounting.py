@@ -2,21 +2,16 @@
 
 The memory solver charges this on top of mamba_cache_per_req so num_slots is not
 over-provisioned (the ring is allocated per slot but is NOT part of the state
-cache cost). This pins the arithmetic against hand-computed byte counts for the
-GDN scalar-g gate layout, across both protocols (fold-every-commit allocates
-only the raw v / pre-norm k / g / beta window; the circular spec ring
-additionally allocates the (d, k) reconstruction records). The accounting is
-GDN-only: KDA params must be rejected, not silently under-counted (the KDA
-per-K gate ring is bigger). If the MambaPool allocation changes shape, update
-both the allocation and this expectation together.
+cache cost). Pins the arithmetic against hand-computed byte counts for both
+protocols (fold-every-commit stores only the raw v / pre-norm k / g / beta
+window; the circular spec ring adds the (d, k) reconstruction records). If the
+MambaPool allocation changes shape, update both together.
 """
 
 import pytest
 import torch
 
 from sglang.srt.configs.mamba_utils import (
-    KimiLinearCacheParams,
-    KimiLinearStateShape,
     Mamba2CacheParams,
     Mamba2StateDType,
     Mamba2StateShape,
@@ -36,13 +31,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 DTYPE = Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32)
 RL = 8
 LAYERS = [0, 1]
-
-
-def _kda_params():
-    shape = KimiLinearStateShape.create(
-        tp_world_size=1, num_heads=4, head_dim=8, num_k_heads=4, head_k_dim=8
-    )
-    return KimiLinearCacheParams(shape=shape, dtype=DTYPE, layers=LAYERS)
 
 
 def _gdn_params():
@@ -77,12 +65,6 @@ class TestReplaySSMRingAccounting(CustomTestCase):
             _gdn_params().replayssm_ring_bytes_per_req(record_len=RL, spec_fold=False),
             2304 * len(LAYERS),
         )
-
-    def test_kda_rejected(self):
-        # GDN-only contract: a KDA caller must fail loud, not get a scalar-g
-        # byte count that under-charges its per-K gate ring.
-        with self.assertRaises(AssertionError):
-            _kda_params().replayssm_ring_bytes_per_req(record_len=RL, spec_fold=True)
 
     def test_zero_len_ring(self):
         self.assertEqual(

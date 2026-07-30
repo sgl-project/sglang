@@ -590,22 +590,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
-            # ReplaySSM spec-verify (Part B of #28511), two protocols under
-            # --enable-gdn-replayssm-spec (GDN + linear-chain topk<=1 only;
-            # KDA routes through kda_backend and never reaches here, plus the
-            # `not replayssm_is_kda` guard as a backstop):
-            # - fold-every-commit (mamba extra_buffer / overlap schedule): the
-            #   recurrent verify reads the always-current checkpoint for the
-            #   output and the fused ring-write stashes the window's raw
-            #   inputs; the worker folds the accepted prefix into `temporal`
-            #   on commit (commit_gdn_replayssm_fold_after_verify). No
-            #   cursors, no per-draft snapshots.
-            # - circular ring: reconstruct the verify output for the whole
-            #   draft window from the frozen checkpoint (`temporal`) + the
-            #   per-slot circular (d, k, g) ring; the cursors are advanced
-            #   once per verify step by the worker (commit_gdn_replayssm_spec).
-            # Falls back to the snapshotting recurrent verify when neither
-            # ring is allocated.
+            # ReplaySSM verify protocols: fold-every-commit (ring-write during
+            # verify, fold on commit), circular ring, or the snapshotting
+            # fallback when neither ring is allocated.
             mamba_pool = self.req_to_token_pool.mamba_pool
             use_replayssm_fold = (
                 mamba_cache_params.replayssm_rawv is not None
@@ -725,18 +712,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query_start_loc: torch.Tensor,
         retrieve_parent_token: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """ReplaySSM fold-every-commit spec-verify.
-
-        The unchanged Triton recurrent verify computes the window output from
-        the always-current fp32 checkpoint (``temporal``); the fused ring-write
-        (CACHE_RING) stashes each step's raw v / pre-norm k / gate / beta into
-        the per-slot window at positions ``0..spec_len``, and the worker's
-        commit replays the accepted prefix into ``temporal``
-        (commit_gdn_replayssm_fold_after_verify). Per-draft full-state
-        snapshots (``intermediate_ssm``) are never written. Called directly
-        (not via the kernel dispatcher): the ring-write exists only in the
-        Triton kernel.
-        """
+        """Recurrent verify + fused ring-write; the commit fold replays the
+        accepted prefix into ``temporal``. Called directly, not via the kernel
+        dispatcher: the ring-write exists only in the Triton kernel."""
         from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
             fused_sigmoid_gating_delta_rule_update,
         )

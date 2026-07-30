@@ -486,13 +486,8 @@ class MambaPool:
         # (replayssm_cache_base + replayssm_is_flush). Enabling the spec-verify path
         # therefore implies the ring, so the d/k/g + write_pos allocation gates on
         # `_replayssm_on` (either flag). GDN-only is enforced upstream + below.
-        #
-        # Fold-every-commit variant (gdn_replayssm_spec_fold, the mamba
-        # extra_buffer + overlap-schedule protocol): the verify output comes from
-        # the recurrent verify against the always-current checkpoint and the
-        # commit replays the raw ring into it, so the chunked (d, k) records, the
-        # g's reconstruction role, and all three cursors are unused -- only the
-        # raw (v, k, g, beta) rings are allocated.
+        # Fold-every-commit allocates only the raw (v, k, g, beta) rings: the
+        # chunked (d, k) records and all three cursors are unused.
         self.enable_gdn_replayssm_spec = enable_gdn_replayssm_spec
         self.replayssm_spec_fold = bool(
             enable_gdn_replayssm_spec and gdn_replayssm_spec_fold
@@ -593,11 +588,7 @@ class MambaPool:
                 # SSM dtype to halve the ring traffic. g stays fp32 everywhere
                 # (exact-fold input). The two flags are mutually exclusive.
                 ring_dtype = conv_dtype if enable_gdn_replayssm_spec else ssm_dtype
-                # Fold-every-commit holds exactly one verify window (positions
-                # 0..spec_len-1, overwritten every step): its g/raw rings are
-                # sized to the draft maximum and no circular-ring invariants
-                # apply; the chunked (d, k) records are never read, so they are
-                # not allocated.
+                # Fold-every-commit: one verify window, no chunked (d, k) records.
                 if self.replayssm_spec_fold:
                     record_len = (
                         speculative_num_draft_tokens
@@ -637,8 +628,6 @@ class MambaPool:
                 # the chunked `d` records open-loop.
                 if enable_gdn_replayssm_spec:
                     if not self.replayssm_spec_fold:
-                        # Backstop for the spec-verify ring invariants; this pool
-                        # is sized with the final adaptive-aware draft maximum.
                         if L & (L - 1) != 0:
                             raise ValueError(
                                 f"spec-verify ring length must be a power of two, got {L}"
@@ -840,9 +829,6 @@ class MambaPool:
             # circular ring's rolling origin (cache_base) + the per-slot flush flag
             # (is_flush). Block-keyed (indexed by the physical mamba slot), shared by
             # all GDN layers of one verify step; advanced by commit_gdn_replayssm_spec.
-            # Only allocated for the circular spec-verify ring (the decode ring does
-            # not use a circular buffer; fold-every-commit has no cursors at all);
-            # None otherwise.
             self.replayssm_cache_base = (
                 torch.zeros((size + 1,), dtype=torch.int32, device=device)
                 if enable_gdn_replayssm_spec and not self.replayssm_spec_fold

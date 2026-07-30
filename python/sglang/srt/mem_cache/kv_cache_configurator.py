@@ -741,17 +741,10 @@ class KVCacheConfigurator:
             enable_linear_replayssm=self.server_args.enable_linear_replayssm,
             linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
             mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
-            # ReplaySSM spec-verify is GDN-only: activate the pool machinery
-            # (rings + cursors + the intermediate_ssm gate) only for GDN-hybrid
-            # models, so any other mamba-ish model (Mamba2/Nemotron, lightning,
-            # ...) run with the flag set stays byte-identical to flag-off.
             enable_gdn_replayssm_spec=(
                 self.server_args.enable_gdn_replayssm_spec
                 and self.hybrid_gdn_config is not None
             ),
-            # Fold-every-commit protocol goes with mamba extra_buffer (the
-            # radix strategy that keeps the overlap scheduler on); without it
-            # the circular-ring + periodic-flush protocol is kept.
             gdn_replayssm_spec_fold=self.server_args.enable_mamba_extra_buffer(),
         )
         return req_to_token_pool
@@ -1738,13 +1731,8 @@ class KVCacheConfigurator:
         assert config is not None
 
         has_spec_dec = not self.spec_algorithm.is_none()
-        # ReplaySSM spec-verify drops the per-step intermediate_ssm scratch, so
-        # the mamba budget no longer reserves the intermediate factor -- the
-        # whole budget goes to persistent slots (K sized like non-spec), which
-        # is how the freed scratch turns into more cacheable states. The ring is
-        # allocated per slot but is not part of mamba_cache_per_req, so the
-        # solve must charge it too or num_slots is over-provisioned (the ring
-        # would silently eat into the KV budget).
+        # The ring is allocated per slot but is not part of mamba_cache_per_req;
+        # the solve must charge it too or num_slots is over-provisioned.
         replayssm_active = (
             server_args.enable_gdn_replayssm_spec and self.hybrid_gdn_config is not None
         )
@@ -1774,9 +1762,7 @@ class KVCacheConfigurator:
                 max_mamba_cache_size=server_args.max_mamba_cache_size
                 // self.ps.attn_dp_size,
             )
-            # Reserve intermediate memory based on capped max_num_reqs (+1: the
-            # pool's padding slot, see memory_pool.py). Skipped under replayssm
-            # (no intermediate_ssm allocated).
+            # Reserve intermediate memory based on capped max_num_reqs (+1 padding slot)
             if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
@@ -1799,8 +1785,7 @@ class KVCacheConfigurator:
                 max_mamba_cache_size=server_args.max_running_requests
                 // self.ps.attn_dp_size,
             )
-            # Reserve intermediate memory based on capped max_num_reqs (+1: the
-            # pool's padding slot). Skipped under replayssm.
+            # Reserve intermediate memory based on capped max_num_reqs (+1 padding slot)
             if has_spec_dec and not replayssm_active:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
@@ -1868,8 +1853,6 @@ class KVCacheConfigurator:
             )
 
         # +1: the pool's padding slot is allocated alongside the request slots.
-        # The ReplaySSM ring rides on every slot too (replayssm_ring_per_req is
-        # 0 when the ring is not allocated).
         mamba_state_memory = (
             (server_args.max_mamba_cache_size + 1)
             * (config.mamba2_cache_params.mamba_cache_per_req + replayssm_ring_per_req)

@@ -51,8 +51,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
-    # ReplaySSM fused ring-write (fold-every-commit spec verify). Pointers stay
-    # None and CACHE_RING False for decode / flag-off -> byte-identical.
     replayssm_rawv=None,
     replayssm_rawk=None,
     replayssm_g=None,
@@ -185,14 +183,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Compute beta = sigmoid(b)
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
-        # Fused ring-write: stash this step's raw inputs + in-kernel gate/beta
-        # into the per-slot ring for the commit fold to replay. Must sit here --
-        # b_k is still pre-l2norm, b_v still pre-delta, b_g/b_beta are formed --
-        # so the fold's replay is bit-identical to the state update below. rawk
-        # uses the k-head i_h (duplicate stores across a GQA group write the
-        # same value); rawv/g/beta use the v-head i_hv. step_idx < MAX_CACHE_LEN
-        # drops steps past the committable prefix (writing them would smash the
-        # next slot's ring).
+        # Stored here, pre-l2norm k / pre-delta v, so the commit fold's replay
+        # is bit-identical to the update below; steps >= MAX_CACHE_LEN would
+        # smash the next slot's ring.
         if CACHE_RING:
             ring_slot = tl.load(h0_indices + i_n).to(tl.int64)
             if ring_slot >= 0 and step_idx < MAX_CACHE_LEN:
@@ -320,10 +313,6 @@ def fused_sigmoid_gating_delta_rule_update(
         int
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
-    # Fused ReplaySSM ring-write (fold-every-commit spec verify). When
-    # cache_ring, each draft step stores raw v / pre-norm k / gate / beta into
-    # these per-slot rings for the commit-time fold. Off by default -> decode
-    # and the snapshotting verify stay unchanged.
     cache_ring: bool = False,
     replayssm_rawv: Optional[torch.Tensor] = None,
     replayssm_rawk: Optional[torch.Tensor] = None,
@@ -387,12 +376,9 @@ def fused_sigmoid_gating_delta_rule_update(
     )
 
     if cache_ring:
-        # GDN-only: the fused ring-write stores a scalar gate per (head, step);
-        # the KDA per-K gate layout is not wired up here.
-        assert not is_kda, "cache_ring supports GDN only"
-        # Per-layer [num_slots, heads, L, dim] views only: stride(0) is read as
-        # the slot pitch, so a tensor still carrying the layer dim would scribble
-        # far outside its slot.
+        assert not is_kda, "cache_ring supports GDN only (scalar gate layout)"
+        # stride(0) is used as the slot pitch, so a tensor still carrying the
+        # layer dim would scribble outside its slot.
         assert (
             replayssm_rawv.dim() == 4
             and replayssm_rawk.dim() == 4

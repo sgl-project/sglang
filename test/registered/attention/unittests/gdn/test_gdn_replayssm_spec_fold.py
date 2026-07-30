@@ -1,27 +1,12 @@
-"""Correctness tests for the GDN ReplaySSM fold-every-commit spec-verify pair:
+"""GDN ReplaySSM fold-every-commit: fused ring-write + commit fold.
 
-  * the fused ring-write inside ``fused_sigmoid_gating_delta_rule_update``
-    (``cache_ring=True``, fused_sigmoid_gating_recurrent.py), and
-  * the commit fold (``gdn_replayssm_spec_fold.py``).
-
-The design contract is BITWISE parity with the pre-existing recurrent verify +
-per-draft snapshot baseline (the fold clones the recurrent update's tile
-shape, division-form L2 norm, and op order; the ring stores the same pre-norm
-inputs the update consumes). Every case therefore asserts ``torch.equal``,
-not a tolerance:
-
-  * verify outputs are unchanged by the ring-write (pure side-channel store);
-  * the folded checkpoint equals the baseline's accepted-step snapshot
-    (``intermediate_ssm[slot, accept_len - 1]``), per layer, for fp32 AND
-    bf16 checkpoints (each dtype is compared against the SAME-dtype baseline);
-  * the extra_buffer track store (HAS_TRACK) equals the crossing-step
-    snapshot, and -1 steps / null slots are skipped;
-  * a LONG chain of verify->commit iterations stays bitwise equal to the
-    baseline chain at every step -- there is no accumulation channel on the
-    state path (guards the long-decode drift failure mode seen on KDA before
-    its fold was made bit-exact).
-
-Runnable as ``pytest`` and as ``__main__``.
+The design contract is BITWISE parity with the recurrent verify + per-draft
+snapshot baseline, so every case asserts ``torch.equal``: ring-write leaves the
+verify output unchanged; the folded checkpoint equals the accepted-step
+snapshot (fp32 and bf16, each vs the same-dtype baseline); HAS_TRACK stores the
+crossing-step state and skips -1 steps / null slots; a 256-iteration
+verify->commit chain stays bitwise equal at every step (no accumulation channel
+on the state path -- the long-decode drift failure mode).
 """
 
 import sys
@@ -213,10 +198,8 @@ class TestGdnReplayssmSpecFold(CustomTestCase):
 
     def test_long_chain_no_accumulation(self):
         """256 chained verify->commit iterations stay bitwise equal to the
-        recurrent-with-snapshot baseline chain at every iteration, for fp32
-        and bf16 checkpoints. Guards the long-decode drift failure mode:
-        because each commit is bit-identical, there is no error channel that
-        could accumulate with sequence length."""
+        baseline chain at every iteration (fp32 + bf16): no error channel
+        can accumulate with sequence length."""
         num_iters = 256
         for dtype in (torch.float32, torch.bfloat16):
             base_state = self._state(dtype)

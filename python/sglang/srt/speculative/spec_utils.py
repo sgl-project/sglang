@@ -811,13 +811,9 @@ def commit_mamba_states_after_verify(
     req_pool = model_runner.req_to_token_pool
     mamba_pool = getattr(req_pool, "mamba_pool", None)
 
-    # GDN ReplaySSM fold-every-commit (the mamba extra_buffer / overlap-schedule
-    # protocol): the draft window's raw inputs were written to the per-slot ring
-    # by the fused ring-write during verify; replay the accepted prefix into the
-    # fp32 checkpoint (`temporal`) here on commit -- `temporal` is always the
-    # current committed state. With extra_buffer the same fold snapshots the
-    # interval-crossing state into the track ping-pong slot (mirrors the regular
-    # commit's mamba_steps_to_track), so no device-side force-flush is needed.
+    # Fold-every-commit: replay the accepted prefix from the ring into
+    # `temporal`; the same fold stores the interval-crossing state to the
+    # track slot, so no SSM scatter or force-flush is needed here.
     if (
         mamba_pool is not None
         and getattr(mamba_pool, "replayssm_spec_fold", False)
