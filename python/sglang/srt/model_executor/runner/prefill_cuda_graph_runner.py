@@ -51,6 +51,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -1603,6 +1604,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
+            _dbg_report_prefill_graph_replay(
+                raw_num_tokens=raw_num_tokens,
+                static_num_tokens=static_num_tokens,
+                forward_batch=forward_batch,
+            )
             shape_key = self._shape_key(static_num_tokens, forward_batch)
             # The only variants this runner records are chunked-prefix ones.
             if shape_key.variant_label is not None:
@@ -1625,3 +1631,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     **kwargs,
                 )
             return self._finalize_execute_output(output)
+
+
+def _dbg_report_prefill_graph_replay(
+    *,
+    raw_num_tokens: int,
+    static_num_tokens: int,
+    forward_batch: ForwardBatch,
+) -> None:
+    log_enabled = envs.SGLANG_DBG_DP_PAD_LOG.get()
+    probe_enabled = envs.SGLANG_DBG_SHAPE_PROBE.get()
+    if not (log_enabled or probe_enabled):
+        return
+
+    if log_enabled:
+        print(
+            f"[PCG] raw_num_tokens={raw_num_tokens} bucket={static_num_tokens} "
+            f"mode={forward_batch.dp_padding_mode} "
+            f"global_num_tokens={forward_batch.global_num_tokens_cpu} "
+            f"buffer={forward_batch.global_dp_buffer_len}",
+            flush=True,
+        )
+
+    if probe_enabled:
+        from scratch_sumpad_th3 import shape_probe
+
+        shape_probe.note_used_prefill_graph(True)

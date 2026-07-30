@@ -1251,13 +1251,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # memory-efficient SUM_LEN. global_num_tokens is identical across ranks
         # (all-gathered), so the decision is consistent cluster-wide.
         prefill_cg = model_runner.server_args.cuda_graph_config.prefill
-        if (
+        prefill_cg_forced_max = bool(
             self.can_run_dp_breakable_cuda_graph
             and self.is_extend_in_batch
             and prefill_cg.bs
             and max(global_num_tokens) <= max(prefill_cg.bs)
-        ):
+        )
+        if prefill_cg_forced_max:
             dp_padding_mode = DpPaddingMode.MAX_LEN
+
+        dbg_pad_mode = envs.SGLANG_DBG_DP_PAD_MODE.get()
+        if sync_group_size > 1:
+            if dbg_pad_mode == "sum":
+                dp_padding_mode = DpPaddingMode.SUM_LEN
+            elif dbg_pad_mode == "max":
+                dp_padding_mode = DpPaddingMode.MAX_LEN
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
@@ -1284,6 +1292,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_num_tokens,
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
+
+        _dbg_report_dp_pad_decision(
+            forward_batch=self,
+            raw_global_num_tokens=list(self.original_global_num_tokens_cpu or []),
+            final_global_num_tokens=global_num_tokens,
+            dp_padding_mode=dp_padding_mode,
+            padded_local_tokens=num_tokens,
+            buffer_len=buffer_len,
+            prefill_cg_forced_max=prefill_cg_forced_max,
+            prefill_cg_bs=list(prefill_cg.bs or []),
+        )
 
         bs = self.batch_size
 
@@ -1720,3 +1739,56 @@ def _bootstrap_rooms_to_tensor(
 def _stable_hash_str_to_i64(rid: str) -> int:
     digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "little", signed=True)
+
+
+def _dbg_report_dp_pad_decision(
+    *,
+    forward_batch: ForwardBatch,
+    raw_global_num_tokens: List[int],
+    final_global_num_tokens: List[int],
+    dp_padding_mode: DpPaddingMode,
+    padded_local_tokens: int,
+    buffer_len: int,
+    prefill_cg_forced_max: bool,
+    prefill_cg_bs: List[int],
+) -> None:
+    log_enabled = envs.SGLANG_DBG_DP_PAD_LOG.get()
+    probe_enabled = envs.SGLANG_DBG_SHAPE_PROBE.get()
+    if not (log_enabled or probe_enabled):
+        return
+
+    dp_rank = get_parallel().attn_dp_rank
+    real_local_tokens = (
+        raw_global_num_tokens[dp_rank]
+        if len(raw_global_num_tokens) > dp_rank
+        else padded_local_tokens
+    )
+    global_max = max(raw_global_num_tokens) if raw_global_num_tokens else -1
+    global_sum = sum(raw_global_num_tokens) if raw_global_num_tokens else -1
+
+    if log_enabled:
+        print(
+            f"[DPPAD] rank={dp_rank} mode={dp_padding_mode.name} "
+            f"forward_mode={forward_batch.forward_mode.name} "
+            f"is_extend_in_batch={forward_batch.is_extend_in_batch} "
+            f"bcg_ok={forward_batch.can_run_dp_breakable_cuda_graph} "
+            f"forced_max_by_prefill_cg={prefill_cg_forced_max} "
+            f"raw={raw_global_num_tokens} final={final_global_num_tokens} "
+            f"real_local={real_local_tokens} padded_local={padded_local_tokens} "
+            f"buffer={buffer_len} "
+            f"max_prefill_cg_bs={max(prefill_cg_bs) if prefill_cg_bs else None}",
+            flush=True,
+        )
+
+    if probe_enabled:
+        from scratch_sumpad_th3 import shape_probe
+
+        shape_probe.note_step(
+            rank=dp_rank,
+            real_local_tokens=int(real_local_tokens),
+            padded_local_tokens=int(padded_local_tokens),
+            dp_pad_mode=int(dp_padding_mode),
+            dp_buffer_len=int(buffer_len),
+            global_max_tokens=int(global_max),
+            global_sum_tokens=int(global_sum),
+        )

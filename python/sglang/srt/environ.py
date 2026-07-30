@@ -285,6 +285,9 @@ class Envs:
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
 
     # Test & Debug
+    SGLANG_DBG_DP_PAD_MODE = EnvStr("")
+    SGLANG_DBG_DP_PAD_LOG = EnvBool(False)
+    SGLANG_DBG_SHAPE_PROBE = EnvBool(False)
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
     SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)

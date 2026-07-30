@@ -8,6 +8,7 @@ from torch import nn
 from sglang.srt.distributed import (
     get_pp_group,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -43,6 +44,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_dbg_shape_probe_enabled = envs.SGLANG_DBG_SHAPE_PROBE.get()
 
 _has_fused_qk_norm_mrope = False
 if _use_aiter:
@@ -271,6 +273,11 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if _dbg_shape_probe_enabled and self.attn.layer_id == self.start_layer:
+            from scratch_sumpad_th3 import shape_probe
+
+            shape_probe.probe(self.attn.layer_id, hidden_states)
+
         if get_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
