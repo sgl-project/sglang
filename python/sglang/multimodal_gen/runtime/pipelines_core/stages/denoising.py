@@ -117,6 +117,13 @@ from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import 
     RolloutDenoisingMixin,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.graph_tensor_tree import (
+    clone_output,
+    flatten_kwargs,
+    map_tensors,
+    signature_kwargs,
+    static_buffer_like,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -145,32 +152,24 @@ class _FullGraphRunner:
     """Replays the whole DiT forward (incl. SP collectives) as one CUDA graph;
     any tensor-signature change falls back to eager permanently."""
 
-    def __init__(self, model):
+    def __init__(self, model, device: torch.device):
         self.model = model
+        self.device = device
         self.graph = None
         self.static_kwargs = None
+        self.static_leaves = None
         self.static_out = None
         self.eager_left = 1
         self.sig = None
         self.disabled = False
 
-    @staticmethod
-    def _signature(kwargs):
-        return tuple(
-            (k, tuple(v.shape), str(v.dtype))
-            for k, v in sorted(kwargs.items())
-            if isinstance(v, torch.Tensor)
-        )
-
     def run(self, kwargs):
         if self.disabled:
             return self.model(**kwargs)
-        sig = self._signature(kwargs)
+        sig = signature_kwargs(kwargs)
         if self.sig is not None and sig != self.sig:
             self.disabled = True
-            logger.warning(
-                "DiT full CUDA graph: tensor signature changed, eager fallback"
-            )
+            logger.warning("DiT full CUDA graph: signature changed, eager fallback")
             return self.model(**kwargs)
         if self.eager_left > 0:
             self.eager_left -= 1
@@ -179,9 +178,10 @@ class _FullGraphRunner:
         if self.graph is None:
             try:
                 self.static_kwargs = {
-                    k: (v.clone() if isinstance(v, torch.Tensor) else v)
-                    for k, v in kwargs.items()
+                    name: map_tensors(v, lambda t: static_buffer_like(t, self.device))
+                    for name, v in kwargs.items()
                 }
+                self.static_leaves = flatten_kwargs(self.static_kwargs)
                 # Run the exact captured path once eagerly first: first-step
                 # branches and lazy allocations (e.g. IPC staging keyed on
                 # this step's shapes) must settle so the recording bakes the
@@ -198,19 +198,28 @@ class _FullGraphRunner:
                 self.graph.replay()
                 torch.cuda.synchronize()
                 logger.info("DiT full CUDA graph captured")
-                return self.static_out
+                return self._captured_output()
             except Exception:
                 logger.exception("DiT full CUDA graph capture failed, eager fallback")
                 self.graph = None
                 self.disabled = True
                 torch.cuda.synchronize()
                 return self.model(**kwargs)
-        for k, v in kwargs.items():
-            sv = self.static_kwargs.get(k)
-            if isinstance(sv, torch.Tensor) and isinstance(v, torch.Tensor):
-                sv.copy_(v, non_blocking=True)
+        live_leaves = flatten_kwargs(kwargs)
+        if len(live_leaves) != len(self.static_leaves):
+            # Structure changed under a matching signature — should not happen;
+            # fall back to eager rather than copy mismatched buffers.
+            return self.model(**kwargs)
+        for buf, live in zip(self.static_leaves, live_leaves):
+            buf.copy_(live, non_blocking=True)
         self.graph.replay()
-        return self.static_out
+        return self._captured_output()
+
+    def _captured_output(self):
+        """Copy this replay's result off the static output buffer. Unwrap first:
+        a diffusers-style output object would pass through clone_output intact,
+        leaving its .sample aliased to the buffer the next replay overwrites."""
+        return clone_output(_ensure_tensor_model_output(self.static_out))
 
 
 def _ensure_tensor_model_output(model_output):
@@ -310,6 +319,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._bcg_runners: dict[int, Any] = {}
         # Full-forward CUDA graph runners, one per transformer module (lazy).
         self._fcg_runners: dict[int, Any] = {}
+        self._fcg_skip_logged = False
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -712,9 +722,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         transformers with (potentially) different configurations.
 
         """
-        if self.server_args.enable_breakable_cuda_graph:
+        if self.server_args.dit_cuda_graph != "off":
             # Cache-DiT wraps transformer.forward with step-skipping control
-            # flow that must not be baked into a captured CUDA graph.
+            # flow that must not be baked into a captured CUDA graph (either
+            # mode); the graph takes priority.
             return
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
@@ -2176,15 +2187,48 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         runner = self._maybe_get_bcg_runner(current_model)
         if runner is not None:
             model_output = self._bcg_run(runner, call_kwargs, current_model)
-        elif self.server_args.dit_cuda_graph == "full" and not self._bcg_is_warmup():
+        elif self._fcg_eligible():
             fcg = self._fcg_runners.get(id(current_model))
             if fcg is None:
-                fcg = _FullGraphRunner(current_model)
+                fcg = _FullGraphRunner(current_model, self._fcg_device(call_kwargs))
                 self._fcg_runners[id(current_model)] = fcg
             model_output = fcg.run(call_kwargs)
         else:
             model_output = current_model(**call_kwargs)
         return _ensure_tensor_model_output(model_output)
+
+    def _fcg_eligible(self) -> bool:
+        """True when the full-forward graph may run this step.
+
+        Sparse backends (STA/VSA/SVG2/VMoBA/block-sparse/rain-fusion) rebuild
+        their attention metadata every step — a replay would reuse step 0's
+        block layout — and Cache-DiT decides per step whether to skip blocks,
+        which cannot be baked into one graph. Both keep eager."""
+        if self.server_args.dit_cuda_graph != "full" or self._bcg_is_warmup():
+            return False
+        if self._cache_dit_enabled:
+            self._fcg_log_skip("Cache-DiT is enabled (per-step block skipping)")
+            return False
+        if self.attn_backend.get_enum().is_sparse:
+            self._fcg_log_skip(
+                f"attention backend {self.attn_backend.get_enum()} rebuilds "
+                "per-step metadata"
+            )
+            return False
+        return True
+
+    def _fcg_log_skip(self, reason: str) -> None:
+        if not self._fcg_skip_logged:
+            self._fcg_skip_logged = True
+            logger.warning("DiT full CUDA graph disabled: %s", reason)
+
+    @staticmethod
+    def _fcg_device(call_kwargs: dict) -> torch.device:
+        """Capture device: the first CUDA tensor leaf, else the current device."""
+        for leaf in flatten_kwargs(call_kwargs):
+            if leaf.device.type == "cuda":
+                return leaf.device
+        return torch.device("cuda", torch.cuda.current_device())
 
     @staticmethod
     def _bcg_is_warmup() -> bool:

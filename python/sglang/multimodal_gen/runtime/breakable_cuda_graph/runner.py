@@ -39,6 +39,16 @@ import torch.nn as nn
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     replay_token_scope,
 )
+
+# Log under the multimodal_gen namespace so the diffusion server's logging
+# config surfaces the "[Diffusion BCG] captured ..." lines.
+from sglang.multimodal_gen.runtime.utils.graph_tensor_tree import (
+    clone_output,
+    flatten_kwargs,
+    map_tensors,
+    signature_kwargs,
+    static_buffer_like,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
@@ -47,8 +57,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
     enable_breakable_cuda_graph,
 )
 
-# Log under the multimodal_gen namespace so the diffusion server's logging
-# config surfaces the "[Diffusion BCG] captured ..." lines.
 logger = logging.getLogger(__name__)
 
 
@@ -72,61 +80,6 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         logger.warning("[BCG] ignoring invalid float %s=%r", name, raw)
         return default
-
-
-def _map_tensors(obj, fn):
-    """Rebuild ``obj`` applying ``fn`` to every tensor leaf, recursing into
-    list/tuple/dict containers; everything else passes through unchanged."""
-    if torch.is_tensor(obj):
-        return fn(obj)
-    if isinstance(obj, tuple):
-        return tuple(_map_tensors(o, fn) for o in obj)
-    if isinstance(obj, list):
-        return [_map_tensors(o, fn) for o in obj]
-    if isinstance(obj, dict):
-        return {k: _map_tensors(v, fn) for k, v in obj.items()}
-    return obj
-
-
-def _flatten_tensors(obj, out: list):
-    """Depth-first collect every tensor leaf into ``out`` (deterministic order:
-    dicts traversed in sorted-key order to match across calls)."""
-    if torch.is_tensor(obj):
-        out.append(obj)
-    elif isinstance(obj, (list, tuple)):
-        for o in obj:
-            _flatten_tensors(o, out)
-    elif isinstance(obj, dict):
-        for k in sorted(obj):
-            _flatten_tensors(obj[k], out)
-
-
-def _flatten_kwargs(kwargs: dict[str, Any]) -> list[torch.Tensor]:
-    out: list[torch.Tensor] = []
-    for name in sorted(kwargs):
-        _flatten_tensors(kwargs[name], out)
-    return out
-
-
-def _signature_leaf(obj: Any) -> Any:
-    if torch.is_tensor(obj):
-        return ("tensor", tuple(obj.shape), str(obj.dtype))
-    if isinstance(obj, tuple):
-        return ("tuple", tuple(_signature_leaf(o) for o in obj))
-    if isinstance(obj, list):
-        return ("list", tuple(_signature_leaf(o) for o in obj))
-    if isinstance(obj, dict):
-        return (
-            "dict",
-            tuple((k, _signature_leaf(obj[k])) for k in sorted(obj)),
-        )
-    if obj is None or isinstance(obj, (bool, int, float, str)):
-        return ("const", obj)
-    return ("object", type(obj).__module__, type(obj).__qualname__, id(obj))
-
-
-def _signature_kwargs(kwargs: dict[str, Any]) -> tuple:
-    return tuple((name, _signature_leaf(kwargs[name])) for name in sorted(kwargs))
 
 
 def _signature_summary_leaf(sig: Any, *, depth: int = 0) -> Any:
@@ -171,22 +124,12 @@ def _signature_summary(key: tuple) -> tuple:
     )
 
 
-def _clone_output(out: Any) -> Any:
-    if torch.is_tensor(out):
-        return out.clone()
-    if isinstance(out, tuple):
-        return tuple(_clone_output(o) for o in out)
-    if isinstance(out, list):
-        return [_clone_output(o) for o in out]
-    return out
-
-
 @dataclass
 class _CaptureEntry:
     graph: BreakableCUDAGraph
     # full captured kwargs with persistent static buffers at every tensor leaf
     static_kwargs: dict[str, Any]
-    # the same static buffers, flattened in _flatten_kwargs order (replay copies
+    # the same static buffers, flattened in flatten_kwargs order (replay copies
     # live tensors into these positionally)
     static_leaves: list[torch.Tensor]
     output: Any
@@ -313,7 +256,7 @@ class BaseBreakableCudaGraphRunner:
         return self.replay(entry, kwargs)
 
     def replay(self, entry: _CaptureEntry, kwargs: dict[str, Any]) -> Any:
-        live_leaves = _flatten_kwargs(kwargs)
+        live_leaves = flatten_kwargs(kwargs)
         if len(live_leaves) != len(entry.static_leaves):
             # Structure changed under a matching shape key — should not happen;
             # fall back to eager rather than copy mismatched buffers.
@@ -325,7 +268,7 @@ class BaseBreakableCudaGraphRunner:
         # Clone so the caller can hold the result across the next replay / the
         # other CFG branch (which shares this static output buffer when shapes
         # match). The clone is one cheap DtoD copy relative to the full DiT.
-        return _clone_output(entry.output)
+        return clone_output(entry.output)
 
     # ------------------------------------------------------------------ #
     # Internals
@@ -339,7 +282,7 @@ class BaseBreakableCudaGraphRunner:
         objects are keyed by identity to avoid replaying a graph whose eager
         break points still reference a previous request's state object.
         """
-        return _signature_kwargs(kwargs)
+        return signature_kwargs(kwargs)
 
     def _empty_cache(self) -> None:
         empty_cache = getattr(self.device_module, "empty_cache", None)
@@ -392,24 +335,11 @@ class BaseBreakableCudaGraphRunner:
             self._pool = self.device_module.graph_pool_handle()
 
         # Persistent static buffers at every tensor leaf; bake non-tensors.
-        def _to_static(t: torch.Tensor) -> torch.Tensor:
-            # Static buffers live on the capture device. A CPU input (e.g. a
-            # scalar timestep/sigma or an index tensor built on the host)
-            # would otherwise force a CPU->CUDA copy inside the captured
-            # region, which is illegal; place its buffer on the device so the
-            # only host->device copy happens here, before capture, and replay
-            # is device-to-device.
-            if t.device.type == "cpu":
-                buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
-            else:
-                buf = torch.empty_like(t)
-            buf.copy_(t)
-            return buf
-
         static_kwargs = {
-            name: _map_tensors(v, _to_static) for name, v in kwargs.items()
+            name: map_tensors(v, lambda t: static_buffer_like(t, self.device))
+            for name, v in kwargs.items()
         }
-        static_leaves = _flatten_kwargs(static_kwargs)
+        static_leaves = flatten_kwargs(static_kwargs)
 
         # Warm up on the capture stream so cuBLAS/cuDNN/Triton workspaces and
         # any lazy JIT are materialized before capture (mirrors the LLM runner
