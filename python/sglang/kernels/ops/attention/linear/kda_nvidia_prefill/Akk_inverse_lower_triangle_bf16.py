@@ -46,9 +46,6 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-# ===========================================================================
-# Constants
-# ===========================================================================
 BS = 64
 SB = 16
 THREADS = 128
@@ -59,9 +56,6 @@ AKK_PAD = 4
 AKK_STRIDE = BS // 2 + AKK_PAD  # 36 (in FP32 units = 72 bf16 elements)
 
 
-# ===========================================================================
-# BF16 MMA m16n8k16 with FP32 accumulator
-# ===========================================================================
 @dsl_user_op
 def mma_bf16_m16n8k16(
     a0,
@@ -121,10 +115,7 @@ def mma_bf16_m16n8k16(
     return d0, d1, d2, d3
 
 
-# ===========================================================================
-# movmatrix.sync.aligned.m8n8.trans.b16 — hardware A→B transpose (warp-level)
-# Works on any 16-bit format including BF16.
-# ===========================================================================
+# Warp-level hardware A->B transpose; works on any 16-bit format including BF16.
 @dsl_user_op
 def _movmatrix_trans(src, *, loc=None, ip=None):
     src_b = llvm.bitcast(T.i32(), src.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
@@ -142,9 +133,6 @@ def _movmatrix_trans(src, *, loc=None, ip=None):
     return cutlass.Float32(llvm.bitcast(T.f32(), result, loc=loc, ip=ip))
 
 
-# ===========================================================================
-# BF16x2 pack/unpack helpers
-# ===========================================================================
 @dsl_user_op
 def _pack_bf16x2(lo_f32, hi_f32, *, loc=None, ip=None):
     """Pack two FP32 values into one i32 holding two BF16 values.
@@ -235,14 +223,12 @@ def _unpack_bf16x2_hi(packed, *, loc=None, ip=None):
     return cutlass.Float32(llvm.bitcast(T.f32(), result, loc=loc, ip=ip))
 
 
-# ===========================================================================
 # Neumann diagonal 16×16 inversion using BF16 MMA m16n8k16 + FP32 accum
 #
 # (I+L)⁻¹ = (I-L)(I+L²)(I+L⁴)(I+L⁸)
 #
 # All intermediate values kept in FP32. Pack to bf16x2 only at MMA boundaries.
 # sAkk is packed bf16x2: sAkk[row, pair] = {bf16[row, 2*pair], bf16[row, 2*pair+1]}
-# ===========================================================================
 @dsl_user_op
 def _invert_diag_neumann(sAkk: cute.Tensor, block_idx, lane_id, *, loc=None, ip=None):
     r_off = block_idx * 16
@@ -452,9 +438,7 @@ def _invert_diag_neumann(sAkk: cute.Tensor, block_idx, lane_id, *, loc=None, ip=
     sAkk[r_off + gid + 8, c_off + 4 + tid] = _pack_bf16x2(INV_f6, INV_f7)
 
 
-# ===========================================================================
 # 16×16 matmul: load A & B from packed bf16x2 sAkk, BF16 MMA, return FP32 C
-# ===========================================================================
 @dsl_user_op
 def _matmul_AB(
     sAkk: cute.Tensor, br_A, bc_A, br_B, bc_B, lane_id, *, loc=None, ip=None
@@ -495,10 +479,8 @@ def _matmul_AB(
     return cn0_0, cn0_1, cn0_2, cn0_3, cn1_0, cn1_1, cn1_2, cn1_3
 
 
-# ===========================================================================
 # Chain MMA: pre-loaded A (from C→A pack), load B from sAkk  (Stage 2)
 # A-operand already packed as bf16x2 from previous C result.
-# ===========================================================================
 @dsl_user_op
 def _chain_mma_B(
     sAkk: cute.Tensor, br_B, bc_B, a0, a1, a2, a3, lane_id, *, loc=None, ip=None
@@ -528,12 +510,8 @@ def _chain_mma_B(
     return cn0_0, cn0_1, cn0_2, cn0_3, cn1_0, cn1_1, cn1_2, cn1_3
 
 
-# ===========================================================================
-# Chain MMA: load A from sAkk, pre-loaded B (from C→B shuffle)  (Stages 3-4)
-# B-operand from shuffle is still FP32 TF32-layout → need to convert.
-# Actually in BF16 version we use movmatrix, so B comes from pack+movmatrix.
-# This function takes B already in B-layout (packed bf16x2 after movmatrix).
-# ===========================================================================
+# Chain MMA (stages 3-4): load A from sAkk, B pre-loaded. B must already be in
+# B-layout, i.e. packed bf16x2 after movmatrix -- not the raw FP32 shuffle result.
 @dsl_user_op
 def _chain_mma_A(
     sAkk: cute.Tensor, br_A, bc_A, b0, b1, b2, b3, lane_id, *, loc=None, ip=None
@@ -559,14 +537,12 @@ def _chain_mma_A(
     return cn0_0, cn0_1, cn0_2, cn0_3, cn1_0, cn1_1, cn1_2, cn1_3
 
 
-# ===========================================================================
 # Store negated C result (16×16, FP32 accum) to packed bf16x2 sAkk
 # C-layout for m16n8k16 FP32 accum:
 #   cn0_0 = C[gid, 0..7 left half col0], cn0_1 = C[gid+8, left half col0]
 #   cn0_2 = C[gid, left half col1], cn0_3 = C[gid+8, left half col1]
 #   cn1_* = right half
 # Packing: negate FP32 then pack pairs → bf16x2
-# ===========================================================================
 @dsl_user_op
 def _store_neg_C(
     sAkk: cute.Tensor,
@@ -597,14 +573,12 @@ def _store_neg_C(
     sAkk[r + gid + 8, c + 4 + tid] = _pack_bf16x2(-c6, -c7)
 
 
-# ===========================================================================
 # Pack FP32 C-accum → bf16x2 A-operand for C→A chain
 # C-layout (FP32 accum, m16n8k16): 8 floats → 4 bf16x2 A-regs
 #   c0,c1 → a0 (rows gid/gid+8, left-half k0..7)
 #   c2,c3 → a1
 #   c4,c5 → a2 (right-half k8..15)
 #   c6,c7 → a3
-# ===========================================================================
 @dsl_user_op
 def _pack_C_to_A(c0, c1, c2, c3, c4, c5, c6, c7, *, loc=None, ip=None):
     a0 = _pack_bf16x2(c0, c1)
@@ -614,9 +588,7 @@ def _pack_C_to_A(c0, c1, c2, c3, c4, c5, c6, c7, *, loc=None, ip=None):
     return a0, a1, a2, a3
 
 
-# ===========================================================================
 # Convert FP32 C-accum → bf16x2 B-operand via pack + movmatrix
-# ===========================================================================
 @dsl_user_op
 def _pack_C_to_B(c0, c1, c2, c3, c4, c5, c6, c7, *, loc=None, ip=None):
     a0 = _pack_bf16x2(c0, c1)
@@ -630,9 +602,7 @@ def _pack_C_to_B(c0, c1, c2, c3, c4, c5, c6, c7, *, loc=None, ip=None):
     return b0, b1, b2, b3
 
 
-# ===========================================================================
 # sTemp helpers (FP32, non-swizzled, for inter-warp accumulator exchange)
-# ===========================================================================
 @dsl_user_op
 def _store_C_temp(
     sT: cute.Tensor,
@@ -677,9 +647,6 @@ def _load_C_temp(sT: cute.Tensor, buf, lane_id, *, loc=None, ip=None):
     return c0, c1, c2, c3, c4, c5, c6, c7
 
 
-# ===========================================================================
-# Main kernel
-# ===========================================================================
 @cute.kernel
 def akk_inv_kernel(
     g2s_copy: cute.TiledCopy,
@@ -958,9 +925,6 @@ def akk_inv_kernel(
                 mOut[b_idx, t_row, h_idx, pair] = final
 
 
-# ===========================================================================
-# Host JIT function
-# ===========================================================================
 @cute.jit
 def akk_inv_host(
     A_in: cute.Tensor,
@@ -1004,13 +968,10 @@ def akk_inv_host(
         cutlass.Float32,
         num_bits_per_copy=128,
     )
-    # Source layout: BS rows × BS//2 pairs = 64×32
-    # 128 threads, each copies 4 FP32 (128 bits) per iteration
-    # Need 64*32/128/4 = 4 iterations → but (16,8) × (1,4) = 128 threads × 4 vals = 512 per iter
-    # 64×32 = 2048 elements / 512 = 4 iterations. But SMEM is 64×36, need to handle padding.
-    # Actually: the copy maps source shape to SMEM shape.
-    # Source is (BS, BS//2) = (64, 32), SMEM is (BS, AKK_STRIDE) = (64, 36).
-    # The copy handles the actual data region (64, 32); padding cols 32-35 stay zero.
+    # 128 threads x 4 FP32 (128b) each = 512 elements per iteration, so the
+    # 64x32 source takes 4 iterations. The copy maps the source shape
+    # (BS, BS//2) = (64, 32) onto the SMEM shape (BS, AKK_STRIDE) = (64, 36):
+    # only the (64, 32) data region is written, padding cols 32-35 stay zero.
     g2s_copy = cute.make_tiled_copy_tv(
         copy_atom,
         thr_layout=cute.make_layout((16, 8), stride=(8, 1)),
@@ -1049,9 +1010,7 @@ def akk_inv_host(
     )
 
 
-# ===========================================================================
 # Input preparation: block-transpose lower triangle to upper triangle
-# ===========================================================================
 def prepare_input(M):
     """Take unit lower-triangular M [batch,64,64] and produce the
     block-transposed layout expected by the kernel."""
@@ -1068,6 +1027,4 @@ def prepare_input(M):
     return M_in
 
 
-# ===========================================================================
 # Test
-# ===========================================================================

@@ -417,10 +417,9 @@ QuantHostContext<Trait> build_quant_context( //
   }
   // The 32B/lane vectorized loads need every input row to start 32B-aligned
   // (kMaxVecBytes on Blackwell; over-strict but harmless on Hopper, whose
-  // 16B vectors only need 16). Contiguous allocations always satisfy this;
-  // it only bites hand-made row-strided views (the K3 fused-front split),
-  // which must keep rows aligned — rejected loudly here rather than densified
-  // silently at the call site.
+  // 16B vectors only need 16). Contiguous allocations always satisfy this; it
+  // only bites hand-made row-strided views, which must keep rows aligned --
+  // rejected loudly here rather than densified silently at the call site.
   CHECK_HOST(reinterpret_cast<uintptr_t>(input.data_ptr()) % 32 == 0)
       << "input base pointer must be 32B-aligned for the vectorized loads";
   CHECK_HOST((input.stride(-2) * sizeof(T)) % 32 == 0)

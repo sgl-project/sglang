@@ -233,9 +233,7 @@ def fast_rcp(x, *, loc=None, ip=None):
     return cutlass.Float32(result)
 
 
-# ============================================================
 # Akk inverse helpers (fused from Akk_inverse_lower_triangle_bf16.py)
-# ============================================================
 @dsl_user_op
 def store_internal_barrier(*, loc=None, ip=None):
     """Named barrier for Store warps (4 warps, 128 threads). barrier_id=3."""
@@ -1007,9 +1005,7 @@ def fused_kernel123(
         cgs_per_head = num_chunks // CHUNKS_PER_BLOCK
         total_cgs = cgs_per_head * num_heads * batch_size
 
-    # =====================================================================
     # SMEM allocation
-    # =====================================================================
     smem = cutlass.utils.SmemAllocator()
     sQ = smem.allocate_tensor(
         cutlass.BFloat16, qk_smem_layout.outer, 128, swizzle=qk_smem_layout.inner
@@ -1044,9 +1040,7 @@ def fused_kernel123(
     beta_smem_layout = cute.make_layout((BT, NUM_STAGES), stride=(1, BT))
     sBeta = smem.allocate_tensor(cutlass.BFloat16, beta_smem_layout, 128)
 
-    # =====================================================================
     # Mbarrier allocation & init
-    # =====================================================================
     tma_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
     stage_reuse_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
     k1_done_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
@@ -1066,7 +1060,6 @@ def fused_kernel123(
     cute.arch.mbarrier_init_fence()
     cute.arch.barrier()
 
-    # =====================================================================
     # SMEM init: zero out sAqk and sAkk valid 64x64 region (cols 64..71 are
     # padding for SMEM bank-conflict avoidance, never read or written by MMA
     # or store warps). Required for downstream row-major store optimizations
@@ -1078,7 +1071,6 @@ def fused_kernel123(
     #   - Per lane: 2 stages × 2 rows × 2 buffers × 2 cols = 16 bf16 stores
     #   - Adjacent (lane*2, lane*2+1) bf16 pairs are 4-byte aligned →
     #     ptxas should fuse into STS.32 (8 wide stores per lane).
-    # =====================================================================
     _warp_id_in_cta = tidx >> 5  # tidx // 32, range 0..31
     _lane_id_warp = tidx & 31  # tidx % 32, range 0..31
     _row_base = _warp_id_in_cta * 2  # this warp owns rows [_row_base, _row_base+1]
@@ -1093,11 +1085,9 @@ def fused_kernel123(
             sAkk[_row, _col_hi, _s] = cutlass.BFloat16(0.0)
     cute.arch.barrier()
 
-    # =====================================================================
     # Pre-arrive (MMA warps only)
     # stage_reuse_mbars: warp 0 waits before MMA arrives → pre-arrive all 12 MMA warps
     # store_done_mbars:  MMA waits before Store arrives → pre-arrive first 4 MMA warps
-    # =====================================================================
     if (
         warp_idx >= NUM_K1_TMA_WARPS
         and warp_idx < NUM_K1_TMA_WARPS + NUM_MMA_WARPS
@@ -1109,12 +1099,10 @@ def fused_kernel123(
             if mma_warp_tmp < NUM_STORE_WARPS:
                 cute.arch.mbarrier_arrive(store_done_mbars + s)
 
-    # =================================================================
     # Persistent outer loop. Single for_generate at top level (required).
     # Opaque asm barrier on work_id prevents MLIR LICM from hoisting
     # get_slice() and scalar layout invariants to the kernel prologue,
     # keeping register pressure < 64 and eliminating prologue spill.
-    # =================================================================
     for work_id in for_generate(block_id, total_cgs, NUM_SMS):
         i_cg = cutlass.Int32(0)
         i_h = cutlass.Int32(0)
@@ -1139,9 +1127,7 @@ def fused_kernel123(
         _lane = lane_id + _oz
         _warp = warp_idx + _oz
 
-        # =============================================================
         # Warps 0-15: Fused TMA + K1
-        # =============================================================
         if warp_idx < NUM_K1_TMA_WARPS:
             # Warp-layout invariants (scope-local → no cross-group register spill)
             k1_warp = _warp
@@ -1379,11 +1365,9 @@ def fused_kernel123(
                             rGkOut, mGkLast[i_b, chunk_idx, i_h, col_vec_idx, None]
                         )
 
-        # =============================================================
         # Warp 26 (TMA_WARP_ID): dedicated TMA producer.
         # Waits stage_reuse (gated by MMA arrives), issues TMA for Q/K/G,
         # signals tma_mbar. Decouples MMA -> TMA dependency from K1 compute.
-        # =============================================================
         if warp_idx == TMA_WARP_ID:
             gQ_head = tma_tensor_Q[(None, None, i_h)]
             gK_head = tma_tensor_K[(None, None, i_h)]
@@ -1499,9 +1483,7 @@ def fused_kernel123(
                 if lane_id == 0:
                     cute.arch.mbarrier_arrive(tma_mbars + next_stage)
 
-        # =============================================================
         # Warps 16-27 (excluding TMA_WARP_ID=26): K2 MMA Compute
-        # =============================================================
         if (
             warp_idx >= NUM_K1_TMA_WARPS
             and warp_idx < NUM_K1_TMA_WARPS + NUM_MMA_WARPS
@@ -2065,9 +2047,7 @@ def fused_kernel123(
 
                 cute.arch.mbarrier_arrive(mma_done_mbars + s)
 
-        # =============================================================
         # Warps 28-31: Store/Inversion warps
-        # =============================================================
         if warp_idx >= NUM_K1_TMA_WARPS + NUM_MMA_WARPS:
             store_warp = warp_idx - (NUM_K1_TMA_WARPS + NUM_MMA_WARPS)
             for chunk_iter in cutlass.range_constexpr(CHUNKS_PER_BLOCK):
@@ -2186,9 +2166,6 @@ def fused_kernel123(
         yield_out()
 
 
-# =========================================================================
-# Host function
-# =========================================================================
 def make_host_function(
     B,
     NT,

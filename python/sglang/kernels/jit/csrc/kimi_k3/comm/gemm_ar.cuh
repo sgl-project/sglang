@@ -24,9 +24,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-// ============================================================================
 // Local PTX / TMA primitives
-// ============================================================================
 // Only what this kernel issues, kept in-file on purpose: these are raw-ISA
 // shapes (sm_100+ tcgen05, the cta_group::1 multicast TMA load) that no shared
 // sglang header wraps, and splitting them out bought a dozen headers with

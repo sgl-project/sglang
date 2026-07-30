@@ -41,9 +41,7 @@ SGL_DEVICE float fma_f32_bf16(bf16_t a, bf16_t b, float acc) {
 #endif
 }
 
-// ---------------------------------------------------------------------------
 // Producer: per-rank column-slice GEMV, multicast store with Lamport markers.
-// ---------------------------------------------------------------------------
 
 struct ProducerParams {
   uint8_t* ws_mc;       // multicast VA of the push workspace base
@@ -136,9 +134,7 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
   PDLTriggerSecondary<kUsePDL>();
 }
 
-// ---------------------------------------------------------------------------
 // Consumer: Lamport spin + add3, one 16B vector (8 bf16) per thread.
-// ---------------------------------------------------------------------------
 
 struct ConsumerParams {
   uint8_t* ws_local;      // LOCAL VA of the push workspace base (poll + reset)
@@ -219,12 +215,10 @@ __global__ void spin_add3_kernel(const __grid_constant__ ConsumerParams params) 
 using namespace sglang;
 using host::distributed::CommunicatorRef;
 
-// ---------------------------------------------------------------------------
 // Host entry point (tiny_gemm style: one GEMV instantiation per M in
 // [1, kMaxM] selected through a constexpr function-pointer table, then the
 // spin consumer launched with PDL right behind it). Any (K, N) that passes
 // the kernels' static_asserts works; Kimi-K3 uses (3584, 7168).
-// ---------------------------------------------------------------------------
 
 template <uint32_t K, uint32_t N, uint32_t kMaxM, bool kUsePDL>
 struct GEMMAGKernel {

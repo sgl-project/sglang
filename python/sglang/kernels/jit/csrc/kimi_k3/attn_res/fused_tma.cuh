@@ -17,9 +17,7 @@
 #include <cstdint>
 #include <utility>
 
-// ----------------------------------------------------------------------------
 // Local PTX primitives (mbarrier / bulk TMA / tcgen05 / warp-group sync)
-// ----------------------------------------------------------------------------
 
 namespace ptx {
 
@@ -726,9 +724,7 @@ __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
 using namespace sglang;
 using host::distributed::CommunicatorRef;
 
-// ---------------------------------------------------------------------------
 // Host launcher: constexpr kernel table over nvb.
-// ---------------------------------------------------------------------------
 
 template <int64_t kDim, uint32_t kMaxBankRows, uint32_t kChunkRows, uint32_t kOccupancy, uint32_t kConsumerRegs>
 struct AttnResFusedTmaKernel {

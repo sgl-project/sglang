@@ -124,9 +124,7 @@ TEMP_COLS = SB + AKK_PAD  # 24
 NUM_TEMPS = 2
 
 
-# ===========================================================================
 # Inverse dsl_user_op functions (TF32 MMA m16n8k8, barrier 7)
-# ===========================================================================
 @dsl_user_op
 def mma_tf32_m16n8k8(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=None):
     a0b = llvm.bitcast(T.i32(), a0.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)

@@ -104,7 +104,7 @@ SGL_DEVICE uint32_t block_exclusive_sum(uint32_t cnt, uint32_t lane_id, uint32_t
   const uint32_t inc = warp_inclusive_sum(lane_id, cnt);
   if (lane_id == 31) smem_warp_sum[warp_id] = inc;
   __syncthreads();
-  // TODO: replace `__reduce_add_sync` with `warp::reduce_sum` after rebase
+  // TODO: replace `__reduce_add_sync` with `warp::reduce_sum`
   const auto base = __reduce_add_sync(0xFFFFFFFF, lane_id < warp_id ? smem_warp_sum[lane_id] : 0u);
   return base + inc - cnt;
 }

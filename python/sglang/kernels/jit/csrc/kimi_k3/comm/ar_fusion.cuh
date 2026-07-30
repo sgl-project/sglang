@@ -146,7 +146,7 @@ __global__ __launch_bounds__(1024, 1) void all_reduce_push_res_kernel(const __gr
 
 // --- deferred-finalize staging (finalize_push_norm) ------------------------
 // The trtllm-gen MoE with do_finalize=False hands back its finalize inputs
-// (see jit_kernel/trtllm_gen_moe.py); the fused kernel computes the finalize
+// (see kernels/ops/moe/trtllm_gen_moe.py); the fused kernel computes the finalize
 // during the push staging pass, so the rank-local latent never materializes.
 
 constexpr uint32_t kFinTopK = 16;
@@ -394,9 +394,7 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
   }
 }
 
-// ---------------------------------------------------------------------------
 // Pull family: low-SM NVLS, reusing the CustomAllReduceV2 pull semaphores
-// ---------------------------------------------------------------------------
 
 inline constexpr uint32_t kPullBlockSize = 512;
 
@@ -643,9 +641,7 @@ __launch_bounds__(kNormRowVecs, 1) void all_reduce_pull_norm_kernel(const __grid
 
 using namespace sglang;
 
-// ---------------------------------------------------------------------------
 // Host entry points
-// ---------------------------------------------------------------------------
 
 template <uint32_t kWorldSize, bool kUsePDL>
 struct AllReduceFusionKernel {

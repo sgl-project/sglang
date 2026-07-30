@@ -47,9 +47,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-// ----------------------------------------------------------------------------
 // Local PTX primitives (cp.async / mbarrier / async-proxy fence)
-// ----------------------------------------------------------------------------
 
 namespace ptx {
 

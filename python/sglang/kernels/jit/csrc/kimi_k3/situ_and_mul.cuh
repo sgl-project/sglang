@@ -12,7 +12,6 @@
 
 namespace {
 
-// ----------------------------------------------------------------
 // SiTU (SoftCap-GLU) activation:
 //   gate_out = beta * tanh(gate / beta) * sigmoid(gate)
 //   up_out   = linear_beta * tanh(up / linear_beta)
@@ -20,7 +19,6 @@ namespace {
 //
 // Input: bf16 tensor [N, 2*D] (gate = [:, :D], up = [:, D:])
 // Output: bf16 tensor [N, D]
-// ----------------------------------------------------------------
 
 struct SituAndMulParams {
   const void* __restrict__ input;
@@ -87,9 +85,7 @@ __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams par
   store_as<vec_t>(params.out, out, output_offset);
 }
 
-// ----------------------------------------------------------------
 // Host launcher
-// ----------------------------------------------------------------
 
 template <typename T, bool kUsePDL>
 struct SituAndMulKernel {

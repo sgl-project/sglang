@@ -212,7 +212,6 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 }
 
 // ---- Host wrapper
-// ------------------------------------------------------------------------------------------------------------------------
 
 template <int64_t kGroupSize, bool kScaleUE8M0, bool kSwizzle, bool kUsePDL>
 struct SituAndMulMaskedPostQuantKernel {

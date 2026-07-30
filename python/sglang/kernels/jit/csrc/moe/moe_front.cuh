@@ -1,7 +1,7 @@
 // K3 MoE front: the routing top-k, and the merged gate + down-proj epilogue.
 //
-// `KimiK3MoE._forward_unfused` -- the path every EP-a2a / WideEP deployment
-// takes -- runs three ops over the same `hidden_states [T, 7168]`:
+// The unfused MoE front -- the path every EP-a2a / WideEP deployment takes --
+// runs three ops over the same `hidden_states [T, 7168]`:
 //
 //     router_logits = gate(hidden_states)                    // [896, 7168]  12.85 MB
 //     topk_output   = topk(hidden_states, router_logits)
@@ -10,8 +10,8 @@
 // One entry point:
 //
 //   fused_front_epilogue the merged-front epilogue.  Plain [M, 896] fp32 logits
-//                        are handled by route_radix.cuh, which took fp32 support
-//                        in #237; this kernel exists for what that cannot do --
+//                        are handled by route_radix.cuh; this kernel exists for
+//                        what that cannot do --
 //                        read the gate slice of a wider merged GEMM output in
 //                        place (row stride 896 + latent) and fold the latent
 //                        cast into the same launch. The gate and the down-proj

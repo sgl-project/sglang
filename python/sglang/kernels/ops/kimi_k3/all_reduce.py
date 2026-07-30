@@ -71,9 +71,7 @@ def _jit_module(world_size: int) -> Module:
     )
 
 
-# ---------------------------------------------------------------------------
 # Storage plane: the CustomAllReduceV2 Communicator
-# ---------------------------------------------------------------------------
 
 
 class _CommEntry(NamedTuple):
@@ -92,11 +90,6 @@ def register_comm(comm: Communicator, *, pull_sem_mc_ptr: int = 0) -> None:
     multicast VA of the pull-semaphore region their barriers reuse.
     """
     _COMM_MAP[comm.world_size] = _CommEntry(obj=comm, pull_sem_mc_ptr=pull_sem_mc_ptr)
-
-
-# ---------------------------------------------------------------------------
-# Pull launch tuning
-# ---------------------------------------------------------------------------
 
 
 class PullTuning(NamedTuple):
@@ -150,9 +143,7 @@ def _resolve_tuning(
     )
 
 
-# ---------------------------------------------------------------------------
 # Custom ops, one per C++ entry point
-# ---------------------------------------------------------------------------
 
 
 @register_custom_op(mutates_args=["x"])
@@ -249,11 +240,6 @@ def _pull_norm_op(
         num_blocks,
         unroll,
     )
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 
 def all_reduce_push_res(
