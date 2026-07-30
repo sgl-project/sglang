@@ -2,11 +2,20 @@ import inspect
 import re
 from typing import Dict, List, Optional, Tuple, Type
 
+from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
+from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
+from sglang.srt.entrypoints.openai.encoding_dsv4 import (
+    thinking_end_token as dsv4_thinking_end_token,
+)
+from sglang.srt.entrypoints.openai.encoding_dsv4 import (
+    thinking_start_token as dsv4_thinking_start_token,
+)
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.parser.harmony_parser import HarmonyParser
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_INVOKE_TOOL_JSON,
+    CONTENT_INVOKE_TOOL_TEXT,
     CONTENT_MODEL_END_SAMPLING,
     CONTENT_TEXT,
     CONTENT_THINKING,
@@ -854,12 +863,12 @@ class InklingDetector(BaseReasoningFormatDetector):
                     # a real header can only follow an end token. Preserve it
                     # instead of rerouting the rest of the block into a header.
                     emit(token)
-            elif token == CONTENT_INVOKE_TOOL_JSON:
+            elif token in (CONTENT_INVOKE_TOOL_JSON, CONTENT_INVOKE_TOOL_TEXT):
+                # Preserve the tool-invocation framing (json and headerless raw
+                # text) in content so the tool-call detector receives it.
                 flush_reasoning()
                 if self._kind == "header":
-                    content.extend(
-                        (MESSAGE_MODEL, self._pending_header, CONTENT_INVOKE_TOOL_JSON)
-                    )
+                    content.extend((MESSAGE_MODEL, self._pending_header, token))
                     self._pending_header = ""
                 else:
                     content.append(token)
@@ -895,6 +904,29 @@ class _DeepSeekV3Detector(Qwen3Detector):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.reasoning_default = "explicit_thinking"
+
+
+class DeepSeekV4Detector(BaseReasoningFormatDetector):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            dsv4_thinking_start_token,
+            dsv4_thinking_end_token,
+            think_excluded_tokens=[dsv4_eos_token, dsv4_dsml_token],
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            thinks_internally=True,
+            reasoning_default="explicit_thinking",
+            force_nonempty_content=force_nonempty_content,
+        )
 
 
 class _MimoDetector(Qwen3Detector):
@@ -1385,7 +1417,7 @@ class ReasoningParser:
         "apertus2509": Apertus2509Detector,
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": _DeepSeekV3Detector,
-        "deepseek-v4": _DeepSeekV3Detector,
+        "deepseek-v4": DeepSeekV4Detector,
         "glm45": Glm45Detector,
         "hunyuan": HunyuanDetector,
         "gpt-oss": GptOssDetector,

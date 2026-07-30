@@ -6,6 +6,7 @@ from sglang.srt.parser.reasoning_parser import (
     Apertus2509Detector,
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
+    DeepSeekV4Detector,
     Gemma4Detector,
     Glm45Detector,
     HunyuanDetector,
@@ -167,6 +168,21 @@ class TestQwen3Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
 
 
+class TestDeepSeekV4Detector(CustomTestCase):
+    def test_strict_thinking_excludes_deepseek_control_tokens(self):
+        detector = ReasoningParser(model_type="deepseek-v4").detector
+        self.assertIsInstance(detector, DeepSeekV4Detector)
+        self.assertEqual(
+            detector.think_excluded_tokens,
+            ["<｜end▁of▁sentence｜>", "｜DSML｜"],
+        )
+
+    def test_thinking_stays_explicit_opt_in(self):
+        detector = ReasoningParser(model_type="deepseek-v4").detector
+        self.assertEqual(detector.reasoning_default, "explicit_thinking")
+        self.assertTrue(detector.thinks_internally)
+
+
 class TestInklingDetector(CustomTestCase):
     def test_streaming_routes_blocks_across_all_string_boundaries(self):
         detector = InklingDetector()
@@ -194,6 +210,17 @@ class TestInklingDetector(CustomTestCase):
         for char in source:
             content += detector.parse_streaming_increment(char).normal_text
         self.assertEqual(content, source)
+
+    def test_raw_text_tool_framing_is_preserved_for_the_tool_parser(self):
+        """The headerless <|content_invoke_tool_text|> block must survive into
+        content so the tool-call detector can surface it, rather than being
+        swallowed as header data."""
+        detector = InklingDetector()
+        source = "<|message_model|><|content_invoke_tool_text|>search<|end_message|>"
+        result = detector.detect_and_parse(source)
+        self.assertIn("<|content_invoke_tool_text|>", result.normal_text)
+        self.assertIn("search", result.normal_text)
+        self.assertEqual(result.reasoning_text, "")
 
     def test_quoted_message_model_token_inside_content_is_preserved(self):
         """Bug regression: the header branch flipped to header state on ANY
