@@ -88,11 +88,15 @@ class DpPaddingMode(IntEnum):
     ) -> DpPaddingMode:
         dp_size = get_attention_dp_size()
 
-        if is_extend_in_batch and dp_size > 1:
-            # Hybrid-SSM models materialize idle ranks via the MAX_LEN
-            # fabricated-row conversion.
-            if get_flags().dp.max_len_with_idle and min(global_num_tokens) == 0:
-                return DpPaddingMode.MAX_LEN
+        # Hybrid-SSM models materialize idle ranks via the MAX_LEN
+        # fabricated-row conversion.
+        if (
+            is_extend_in_batch
+            and dp_size > 1
+            and get_flags().dp.max_len_with_idle
+            and min(global_num_tokens) == 0
+        ):
+            return DpPaddingMode.MAX_LEN
 
         # we choose the mode that minimizes the communication cost
         # prefer MAX_LEN when communication cost is equal to enable symmetric memory
