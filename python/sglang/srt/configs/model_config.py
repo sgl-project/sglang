@@ -25,6 +25,7 @@ from typing import Any, List, Optional, Set, Union
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
@@ -293,6 +294,11 @@ class ModelConfig:
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
+        self.embedding_model_spec = resolve_embedding_model_spec(
+            self.hf_config.architectures,
+            is_embedding_requested=bool(is_embedding),
+            is_embedding_gemma=self.is_embedding_gemma,
+        )
 
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
@@ -713,6 +719,17 @@ class ModelConfig:
     def linear_attn_registry_result(self) -> Any:
         return get_linear_attn_config(self.hf_config)
 
+    @property
+    def has_asymmetric_kv(self) -> bool:
+        """Whether K and V rows differ in width (MiMoV2 is 192 / 128).
+
+        Not an ``__init__`` field because the MLA special-casing below still
+        rewrites ``v_head_dim``.
+        """
+        return (
+            self.head_dim != self.v_head_dim or self.swa_head_dim != self.swa_v_head_dim
+        )
+
     def _detect_attention_sinks(self) -> bool:
         """Check whether the model uses learned attention sinks.
 
@@ -1075,6 +1092,14 @@ class ModelConfig:
         # For non-grouped-query attention models, the number of KV heads is
         # equal to the number of attention heads.
         return self.hf_text_config.num_attention_heads
+
+    def get_max_num_attention_heads(self) -> int:
+        """Max per-layer query head count; num_attention_heads unless the
+        model sets num_attention_heads_per_layer."""
+        per_layer = getattr(self.hf_text_config, "num_attention_heads_per_layer", None)
+        if per_layer:
+            return max(per_layer)
+        return self.num_attention_heads
 
     def get_num_kv_heads(self, tensor_parallel_size) -> int:
         """Returns the number of KV heads per GPU."""
@@ -1706,6 +1731,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "XLMRobertaModel" in model_architectures
         or "XLMRobertaForSequenceClassification" in model_architectures
         or "Gemma2ForSequenceClassification" in model_architectures
+        or "Lfm2BidirectionalModel" in model_architectures
     ):
         return False
     else:

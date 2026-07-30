@@ -566,12 +566,15 @@ class MambaAttnBackendBase(AttentionBackend):
             self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
+        # Hand out only the refreshed [:bs] prefix — Mamba2's track-save slices
+        # [-num_decodes:], which on the full max_bs buffer binds the stale tail.
         track_buf = None
         if mamba_track_indices is not None:
-            track_buf = self.mamba_track_indices_buf
-            track_buf[: len(mamba_track_indices)].copy_(
-                self._translate_mamba_indices(mamba_track_indices)
-            )
+            assert (
+                len(mamba_track_indices) >= bs
+            ), f"{len(mamba_track_indices)=} < {bs=}"
+            track_buf = self.mamba_track_indices_buf[:bs]
+            track_buf.copy_(self._translate_mamba_indices(mamba_track_indices[:bs]))
         # Refresh the static write cursor in-place (mirrors the eager
         # snapshot-then-advance). Skip the advance during capture: dummy slots
         # would corrupt real ring positions.
@@ -724,16 +727,18 @@ class MambaAttnBackendBase(AttentionBackend):
     def _track_mamba_state_extend(
         self,
         forward_batch: ForwardBatch,
-        h: torch.Tensor,
+        h: Optional[torch.Tensor],
         ssm_states: torch.Tensor,
         forward_metadata: ForwardMetadata,
     ):
         """Copy extend SSM state at the last chunk boundary to track slots (source
         depends on chunk alignment; see `_init_track_ssm_indices`)."""
         if forward_metadata.has_mamba_track_mask:
-            h = h.squeeze(0)
-
+            # Triton always returns h; FlashInfer returns it only when checkpoints
+            # were requested. Aligned-only tracking reads the final state below.
             if forward_metadata.track_ssm_h_src.numel() > 0:
+                assert h is not None
+                h = h.squeeze(0)
                 ssm_states[forward_metadata.track_ssm_h_dst] = h[
                     forward_metadata.track_ssm_h_src
                 ].to(ssm_states.dtype, copy=False)

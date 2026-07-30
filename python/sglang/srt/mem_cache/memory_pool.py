@@ -1722,6 +1722,8 @@ class MHATokenToKVPool(KVCache):
         quant_method=None,
         post_capture_active: bool = False,
     ):
+        self.k_buffer = None
+        self.v_buffer = None
         if post_capture_active:
             # Reserved upper bound only (unbacked VA): page-align UP so
             # (size + page_size) % page_size == 0 holds for paged layouts.
@@ -2061,7 +2063,7 @@ class MHATokenToKVPool(KVCache):
         # Derive from the real buffers when they exist (covers arbitrary layouts,
         # e.g. vectorized_5d); fall back to _kv_buffer_shapes for the pre-allocation
         # post-capture call, which only runs for NHD/HND.
-        if getattr(self, "k_buffer", None) and getattr(self, "v_buffer", None):
+        if self.k_buffer and self.v_buffer:
             k_shape = tuple(self.k_buffer[0].shape)
             v_shape = tuple(self.v_buffer[0].shape)
         else:
@@ -3620,11 +3622,11 @@ class HybridLinearKVPool(KVCache):
 
     @property
     def post_capture_active(self) -> bool:
-        return getattr(self.full_kv_pool, "post_capture_active", False)
+        return self.full_kv_pool.post_capture_active
 
     @property
     def post_capture_backed_bytes(self) -> int:
-        return getattr(self.full_kv_pool, "post_capture_backed_bytes", 0)
+        return self.full_kv_pool.post_capture_backed_bytes
 
     def finalize_backing(self, config) -> None:
         # Only the attention KV is resized; the mamba state cache is fixed pre-capture.
@@ -3633,6 +3635,12 @@ class HybridLinearKVPool(KVCache):
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
+
+    def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
+        # Hybrid layer ids are global model-layer ids, while the backing pool
+        # is dense over only full-attention layers. Shape discovery does not
+        # need a global layer lookup, so delegate it to that backing pool.
+        return self.full_kv_pool.get_kv_buffer_shape()
 
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
