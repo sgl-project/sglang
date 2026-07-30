@@ -397,8 +397,7 @@ class TextEncodingStage(ConditionEncodingStage):
 
         all_indices: list[int] = list(range(len(self.text_encoders)))
 
-        # Get max_sequence_length from batch if available
-        max_seq_length = getattr(batch, "max_sequence_length", None)
+        max_seq_length = batch.max_sequence_length
 
         (
             prompt_embeds_list,

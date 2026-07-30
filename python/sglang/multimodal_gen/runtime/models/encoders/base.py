@@ -105,7 +105,7 @@ def finalize_encoder_folding(config: EncoderConfig, policy: str = "auto") -> Non
     if policy in ("dp", "replicate"):
         config.parallel_folding_mode = None
         return
-    group_size = getattr(get_folding_tp_group(config), "world_size", 1)
+    group_size = get_folding_tp_group(config).world_size
     keep = (
         _encoder_dims_divide(config, group_size)
         if policy == "fold"
