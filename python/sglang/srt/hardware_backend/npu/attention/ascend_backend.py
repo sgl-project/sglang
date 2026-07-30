@@ -515,7 +515,7 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-        else:
+        elif forward_batch.forward_mode.is_decode_or_idle():
             self.forward_metadata.actual_seq_lengths_q = torch.tensor(
                 [1 + i for i in range(forward_batch.seq_lens.shape[0])],
                 dtype=torch.int32,
