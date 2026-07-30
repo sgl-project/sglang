@@ -33,6 +33,75 @@ def _unflatten(x_flat: torch.Tensor, shape: torch.Size) -> torch.Tensor:
     return x_flat.reshape(shape)
 
 
+def _is_missing_linalg_backend_error(err: RuntimeError) -> bool:
+    """Detect the "no LAPACK / no MAGMA" RuntimeError PyTorch raises when the
+    build lacks a linear algebra backend for the tensor's device.
+
+    Some PyTorch builds (notably several ROCm wheels) ship without LAPACK for
+    CPU tensors *and* without MAGMA for CUDA/HIP tensors, making
+    ``torch.linalg.cholesky``/``torch.cholesky_solve`` unusable on any device.
+    """
+    msg = str(err)
+    return "LAPACK" in msg or "MAGMA" in msg
+
+
+def _cholesky_lower(a: torch.Tensor) -> torch.Tensor:
+    """Cholesky factorization ``A = L @ L.T`` without ``torch.linalg``.
+
+    Used as a fallback when the backend has no LAPACK/MAGMA support. ``a`` is
+    expected to be tiny (Chebyshev design matrix size), so the Python-level
+    loop is cheap.
+    """
+    n = a.shape[0]
+    L = torch.zeros_like(a)
+    for i in range(n):
+        for j in range(i + 1):
+            s = L[i, :j] @ L[j, :j]
+            if i == j:
+                L[i, j] = torch.sqrt(a[i, i] - s)
+            else:
+                L[i, j] = (a[i, j] - s) / L[j, j]
+    return L
+
+
+def _cholesky_solve_lower(l: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Solve ``(L @ L.T) @ x = b`` given lower-triangular Cholesky factor ``l``."""
+    n = l.shape[0]
+    y = torch.zeros_like(b)
+    for i in range(n):
+        y[i] = (b[i] - l[i, :i] @ y[:i]) / l[i, i]
+    x = torch.zeros_like(b)
+    for i in reversed(range(n)):
+        x[i] = (y[i] - l[i + 1 :, i] @ x[i + 1 :]) / l[i, i]
+    return x
+
+
+def _ridge_cholesky_solve(xtx: torch.Tensor, xth: torch.Tensor) -> torch.Tensor:
+    """Solve the ridge normal equations ``xtx @ coef = xth`` via Cholesky.
+
+    Prefers ``torch.linalg.cholesky``/``torch.cholesky_solve``, retrying once
+    with jitter if ``xtx`` is only marginally non-positive-definite. Falls
+    back to a manual, LAPACK/MAGMA-free Cholesky solve when the backend has
+    no linear algebra support at all for this device (see
+    `_is_missing_linalg_backend_error`).
+    """
+    p = xtx.shape[0]
+    eye = torch.eye(p, device=xtx.device, dtype=xtx.dtype)
+    try:
+        chol = torch.linalg.cholesky(xtx)
+        return torch.cholesky_solve(xth, chol)
+    except RuntimeError as e:
+        if _is_missing_linalg_backend_error(e):
+            chol = _cholesky_lower(xtx)
+            if not torch.isfinite(chol).all():
+                jitter = 1e-6 * xtx.diag().mean()
+                chol = _cholesky_lower(xtx + jitter * eye)
+            return _cholesky_solve_lower(chol, xth)
+        jitter = 1e-6 * xtx.diag().mean()
+        chol = torch.linalg.cholesky(xtx + jitter * eye)
+        return torch.cholesky_solve(xth, chol)
+
+
 class ChebyshevForecaster(nn.Module):
     """Chebyshev-basis ridge regression forecaster over diffusion step index.
 
@@ -157,15 +226,8 @@ class ChebyshevForecaster(nn.Module):
             lam_i = self.lam * torch.eye(p, device=x.device, dtype=x.dtype)
             xt = x.transpose(0, 1)
             xtx = xt @ x + lam_i
-            try:
-                chol = torch.linalg.cholesky(xtx)
-            except RuntimeError:
-                jitter = 1e-6 * xtx.diag().mean()
-                chol = torch.linalg.cholesky(
-                    xtx + jitter * torch.eye(p, device=x.device, dtype=x.dtype)
-                )
             xth = xt @ h
-            self._coef = torch.cholesky_solve(xth, chol).to(feature_dtype)
+            self._coef = _ridge_cholesky_solve(xtx, xth).to(feature_dtype)
 
     @torch.no_grad()
     def predict(self, t_star: float | torch.Tensor) -> torch.Tensor:
