@@ -33,6 +33,8 @@ def _draft_topk1_partial_argmax_kernel(
         mask=mask,
         other=-float("inf"),
     ).to(tl.float32)
+    # Keep NaNs on valid lanes from selecting the masked tail.
+    vals = tl.where(vals == vals, vals, -1e30)
 
     max_val, local_index = tl.max(vals, axis=0, return_indices=True)
     out_offset = out_row * num_splits + split

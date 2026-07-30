@@ -1365,9 +1365,14 @@ export const Playground = ({ config }) => {
     }
     let cmd;
     if (mode === "docker") {
-      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped (matches _deployment.jsx).
+      // Image keyed by `hw|quant|strategy` (most specific), then `hw|quant`, then
+      // `hw`; `:dev` if unmapped (matches _deployment.jsx). The strategy key covers
+      // a tier that needs its own build (e.g. a spec-decoding preview image), so the
+      // playground base must resolve it too or it hands back an image that cannot
+      // run the command.
       const di = config.dockerImages || {};
-      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
+      const image = di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
+        || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const dockerLines = [

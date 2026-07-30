@@ -82,6 +82,8 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
 from sglang.srt.utils.common import empty_context, fast_topk
+from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.profile_utils import build_step_span_name
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -738,53 +740,56 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         next_token_ids_backup = batch_result.next_token_ids.clone()
 
         if can_cuda_graph:
-            cgr = self.cuda_graph_runner_for_draft_extend
-            # Populate the single shared buffer set once; each step replays
-            # against it and the chain is advanced in place between steps.
-            cgr.prepare(forward_batch)
-            rotates_in_graph = cgr.rotates_in_graph
-            for step in range(self.speculative_num_steps):
-                _out, ret_topk_p, ret_topk_index = cgr.replay(step)
-                # Rejection sampling with the per-step runner re-picks X ~ q
-                # worker-side so the worker rotation carries it to step N+1; the
-                # single-CG runner samples in-graph (q cloned after the loop).
-                if (
-                    self.use_rejection_sampling
-                    and self.topk == 1
-                    and not rotates_in_graph
-                ):
-                    if cgr.prune_draft_extend_logits:
-                        step_logits = _out.next_token_logits
+            # Graph replay bypasses ModelRunner.forward, which emits the
+            # step[...] trace span for every other phase; emit it here.
+            with profile_range(build_step_span_name(forward_batch)):
+                cgr = self.cuda_graph_runner_for_draft_extend
+                # Populate the single shared buffer set once; each step replays
+                # against it and the chain is advanced in place between steps.
+                cgr.prepare(forward_batch)
+                rotates_in_graph = cgr.rotates_in_graph
+                for step in range(self.speculative_num_steps):
+                    _out, ret_topk_p, ret_topk_index = cgr.replay(step)
+                    # Rejection sampling with the per-step runner re-picks X ~ q
+                    # worker-side so the worker rotation carries it to step N+1; the
+                    # single-CG runner samples in-graph (q cloned after the loop).
+                    if (
+                        self.use_rejection_sampling
+                        and self.topk == 1
+                        and not rotates_in_graph
+                    ):
+                        if cgr.prune_draft_extend_logits:
+                            step_logits = _out.next_token_logits
+                        else:
+                            sel = cgr.buffers.select_index[: cgr.raw_bs]
+                            step_logits = _out.next_token_logits[sel]
+                        probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
+                            step_logits,
+                            forward_batch.sampling_info.temperatures,
+                        )
+                        ret_draft_probs_list.append(probs)
+                    if rotates_in_graph:
+                        # Single-CG step outputs coexist until the trailing cat.
+                        ret_topk_p_list.append(ret_topk_p)
+                        ret_topk_index_list.append(ret_topk_index)
                     else:
-                        sel = cgr.buffers.select_index[: cgr.raw_bs]
-                        step_logits = _out.next_token_logits[sel]
-                    probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
-                        step_logits,
-                        forward_batch.sampling_info.temperatures,
-                    )
-                    ret_draft_probs_list.append(probs)
-                if rotates_in_graph:
-                    # Single-CG step outputs coexist until the trailing cat.
-                    ret_topk_p_list.append(ret_topk_p)
-                    ret_topk_index_list.append(ret_topk_index)
-                else:
-                    # Per-step graphs share the global graph pool; snapshot
-                    # before the next step's replay can reuse the buffer.
-                    ret_topk_p_list.append(ret_topk_p.clone())
-                    ret_topk_index_list.append(ret_topk_index.clone())
-                # Advance the draft chain by rotating the shared input_ids window
-                # in place; step N+1's graph then reads the rotated values. The
-                # single-CG runner rotates in-graph, so skip the worker-side rotate.
-                if step < self.speculative_num_steps - 1 and not rotates_in_graph:
-                    rotate_input_ids(
-                        cgr.buffers.input_ids[: cgr.raw_num_tokens],
-                        cgr.buffers.extend_start_loc[: cgr.raw_bs],
-                        cgr.buffers.extend_seq_lens[: cgr.raw_bs],
-                        ret_topk_index,
-                        cgr.buffers.select_index[: cgr.raw_bs],
-                    )
-            if self.use_rejection_sampling and self.topk == 1 and rotates_in_graph:
-                ret_draft_probs = cgr.clone_draft_probs()
+                        # Per-step graphs share the global graph pool; snapshot
+                        # before the next step's replay can reuse the buffer.
+                        ret_topk_p_list.append(ret_topk_p.clone())
+                        ret_topk_index_list.append(ret_topk_index.clone())
+                    # Advance the draft chain by rotating the shared input_ids window
+                    # in place; step N+1's graph then reads the rotated values. The
+                    # single-CG runner rotates in-graph, so skip the worker-side rotate.
+                    if step < self.speculative_num_steps - 1 and not rotates_in_graph:
+                        rotate_input_ids(
+                            cgr.buffers.input_ids[: cgr.raw_num_tokens],
+                            cgr.buffers.extend_start_loc[: cgr.raw_bs],
+                            cgr.buffers.extend_seq_lens[: cgr.raw_bs],
+                            ret_topk_index,
+                            cgr.buffers.select_index[: cgr.raw_bs],
+                        )
+                if self.use_rejection_sampling and self.topk == 1 and rotates_in_graph:
+                    ret_draft_probs = cgr.clone_draft_probs()
         else:
             logger.warning_once(
                 "can't use cuda graph for draft extend! may have correctness issue!"
