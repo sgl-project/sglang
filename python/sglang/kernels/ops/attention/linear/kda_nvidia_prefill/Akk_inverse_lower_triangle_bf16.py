@@ -39,11 +39,9 @@ Outputs: A_out [B, T, H, BT] bf16
 import cuda.bindings.driver as cuda_drv
 import cutlass
 import cutlass.cute as cute
-import torch
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync
-from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 BS = 64
