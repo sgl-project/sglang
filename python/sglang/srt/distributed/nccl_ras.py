@@ -32,9 +32,7 @@ logger = logging.getLogger(__name__)
 # RAS STATUS timestamp format (local, second-granularity, no TZ).
 _RAS_TIMESTAMP_FMT = "%Y-%m-%d %H:%M:%S"
 
-# Collective types observed in collective_counts (all always present, unused=0).
-# Treated as an open set at parse time (unknown keys are tolerated), but used
-# as the canonical iteration order for divergence tracking.
+# Collective types observed in collective_counts (all present, unused=0).
 KNOWN_COLLECTIVES = (
     "AllReduce",
     "AllGather",
@@ -46,8 +44,6 @@ KNOWN_COLLECTIVES = (
 
 class RasState(IntEnum):
     # Ordered by severity so max() over comms yields the job-wide worst_state.
-    # UNKNOWN (poll failed / stale timestamp) ranks above HEALTHY but below
-    # SUSPECT so a flaky poll does not mask a real issue.
     HEALTHY = 0
     UNKNOWN = 1
     SUSPECT = 2
@@ -56,9 +52,6 @@ class RasState(IntEnum):
     DEAD = 5  # a rank is considered_dead (cross-node)
 
 
-# ---------------------------------------------------------------------------
-# msgspec structures (frozen; field names align with the verified RAS schema)
-# ---------------------------------------------------------------------------
 
 
 class RasRank(msgspec.Struct, frozen=True, kw_only=True):
@@ -129,9 +122,6 @@ class RasFindings(msgspec.Struct, frozen=True, kw_only=True):
     last_collection_age_sec: Optional[float] = None
 
 
-# ---------------------------------------------------------------------------
-# Parsing (pure function — fixture-testable, no socket)
-# ---------------------------------------------------------------------------
 
 
 def _parse_rank(raw: dict[str, Any]) -> RasRank:
@@ -200,9 +190,6 @@ def parse_status(raw: dict[str, Any]) -> RasStatus:
     )
 
 
-# ---------------------------------------------------------------------------
-# Socket client
-# ---------------------------------------------------------------------------
 
 
 class RasSocketClient:
@@ -297,9 +284,6 @@ class RasSocketClient:
 _MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
 
 
-# ---------------------------------------------------------------------------
-# Detector (pure state machine; holds cross-poll history)
-# ---------------------------------------------------------------------------
 
 
 # Staleness: a timestamp older than this means the RAS thread stopped
@@ -544,8 +528,7 @@ class RasDetector:
                 del tracker.recent_advance[ctype]
 
         # Stuck only if a rank froze stuck_polls samples on a diverging type
-        # (spread>0) whose leaders recently advanced — a subgroup lag, not a
-        # symmetric hang (nobody advances, spread stays ~constant).
+        # whose leaders recently advanced — a subgroup lag, not a symmetric hang.
         stuck = False
         if divergence:
             for (rkey, ctype), polls in tracker.frozen_polls.items():
@@ -599,9 +582,6 @@ class RasDetector:
         self._prev_state[comm_key] = state
 
 
-# ---------------------------------------------------------------------------
-# Daemon collector (job-wide singleton, world rank 0)
-# ---------------------------------------------------------------------------
 
 
 class RasMonitor:
