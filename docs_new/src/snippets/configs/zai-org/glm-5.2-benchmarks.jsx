@@ -103,12 +103,11 @@ export const benchmarks = [
   { match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "balanced",        nodes: "multi-2" } },
   { match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "multi-2" } },
   // ---- B200 + NVFP4 ----  (8-GPU single node, TP8; nvidia/GLM-5.2-NVFP4 via --quantization modelopt_fp4,
-  // measured on the lmsysorg/sglang:dev-glm52-nvfp4 preview image, flush-cache every run.
+  // flush-cache every run.
   // ttft_ms/tpot_ms are P50; tokens_per_sec_per_gpu = total (in+out) tok/s/GPU (output/GPU × (isl+osl)/osl).
   // balanced & high-throughput add DP-Attention (dp8); low-latency uses MTP 5-1-6, balanced MTP 2-1-3.)
   {
     match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-    sglang_version: "dev-glm52-nvfp4",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
         ttft_ms: 295, tpot_ms: 1.85, tokens_per_sec_per_gpu: 527 },
@@ -118,7 +117,6 @@ export const benchmarks = [
   },
   {
     match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
-    sglang_version: "dev-glm52-nvfp4",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
         ttft_ms: 5837, tpot_ms: 12.70, tokens_per_sec_per_gpu: 3770 },
@@ -128,19 +126,17 @@ export const benchmarks = [
   },
   {
     match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "dev-glm52-nvfp4",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
         ttft_ms: 130174, tpot_ms: 67.12, tokens_per_sec_per_gpu: 5305 },
     ],
   },
   // ---- B300 + NVFP4 ----  (8-GPU single node, TP8; nvidia/GLM-5.2-NVFP4 via --quantization modelopt_fp4,
-  // measured on the lmsysorg/sglang:dev-glm52-nvfp4 preview image, flush-cache every run.
+  // flush-cache every run.
   // tokens_per_sec_per_gpu = total (in+out) tok/s/GPU (measured output/GPU 51/224/153/205/430 × (isl+osl)/osl).
   // aime25 overrides the variant default (87.7 → 89.58, measured on this NVFP4 build); gsm8k inherits the default.)
   {
     match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-    sglang_version: "dev-glm52-nvfp4",
     accuracy: { aime25_pct: 89.58 },
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -151,7 +147,6 @@ export const benchmarks = [
   },
   {
     match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
-    sglang_version: "dev-glm52-nvfp4",
     accuracy: { aime25_pct: 89.58 },
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
@@ -162,7 +157,6 @@ export const benchmarks = [
   },
   {
     match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "dev-glm52-nvfp4",
     accuracy: { aime25_pct: 89.58 },
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
