@@ -2292,9 +2292,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else:
                     normal_text, tool_calls = delta, []
 
-                def _emit_tool_calls():
+                def _emit_tool_calls(calls):
                     nonlocal current_output_index
-                    if tool_calls:
+                    if calls:
                         if reasoning_state["open"]:
                             for ev in _close_reasoning_item():
                                 yield ev
@@ -2302,7 +2302,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             for ev in _close_message_item():
                                 yield ev
 
-                    for call in tool_calls:
+                    for call in calls:
                         tool_index = call.tool_index
                         state = tool_call_states.get(tool_index)
                         if state is None or state.get("done"):
@@ -2419,27 +2419,30 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
                         )
 
-                # A single delta can carry both text and calls, and the tuple
-                # loses their relative position. Recover it from the calls: if
-                # one of them opens a new block, the text in this delta preceded
-                # it and the message must land first. Otherwise the calls only
-                # continue / close arguments, whose trailing text is a separator
-                # that would truncate the args if it were emitted first.
-                # Same predicate the emit loop uses to allocate a new item, so
-                # the two cannot disagree (a call may open with an empty name).
-                opens_new_call = any(
-                    (state := tool_call_states.get(call.tool_index)) is None
-                    or state.get("done")
-                    for call in tool_calls
-                )
-                emitters = (
-                    (_emit_normal_text, _emit_tool_calls)
-                    if opens_new_call
-                    else (_emit_tool_calls, _emit_normal_text)
-                )
-                for emitter in emitters:
-                    for ev in emitter():
-                        yield ev
+                # A single delta can carry text and calls together, and the tuple
+                # loses their relative position. Recover it from what each call
+                # does: arguments continuing an open item textually precede this
+                # delta's text, and a call opening a new item follows it. Both
+                # kinds can appear in one delta, so emit in three phases rather
+                # than picking one global order -- draining continuations first
+                # keeps a closing "}" from being dropped when the text closes
+                # every open item, and deferring the openings keeps the message
+                # ahead of the tool item it preceded.
+                #
+                # Classify before emitting: emitting mutates tool_call_states.
+                def _is_continuing(call):
+                    state = tool_call_states.get(call.tool_index)
+                    return state is not None and not state.get("done")
+
+                continuing = [c for c in tool_calls if _is_continuing(c)]
+                opening = [c for c in tool_calls if not _is_continuing(c)]
+
+                for ev in _emit_tool_calls(continuing):
+                    yield ev
+                for ev in _emit_normal_text():
+                    yield ev
+                for ev in _emit_tool_calls(opening):
+                    yield ev
         except Exception:
             logger.exception("Error while streaming /v1/responses")
             failed = _sanitize_response_dict(

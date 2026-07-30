@@ -894,6 +894,75 @@ class MultiToolCallStreamingOrderTestCase(CustomTestCase):
         fc_added = [kind for _, kind in added if kind == "function_call"]
         self.assertEqual(len(fc_added), 1)
 
+    def test_call_tail_prose_and_next_call_in_one_delta(self):
+        """One delta closing tool1, carrying prose, and opening tool2 needs both
+        orders at once: tool1's trailing "}" must be drained before the prose
+        closes every open item, and tool2 must land after the message."""
+        from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+
+        serving = self.serving
+
+        det = Qwen3CoderDetector()
+        s, e = det.tool_call_start_token, det.tool_call_end_token
+        fp, fe = det.tool_call_prefix, det.function_end_token
+        pp, pe = det.parameter_prefix, det.parameter_end_token
+        tool1 = f"{s}{fp}get_weather>{pp}city>Beijing{pe}{fe}{e}"
+        tool2 = f"{s}{fp}get_time>{pp}tz>UTC{pe}{fe}{e}"
+        head = f"{s}{fp}get_weather>{pp}city>Beij"
+
+        async def fake_gen():
+            # First delta opens tool1 mid-arguments; the second closes it, adds
+            # prose, and opens tool2 -- all three in one chunk.
+            yield {"text": head, "meta_info": {}}
+            yield {"text": tool1 + "Here you go." + tool2, "meta_info": {}}
+            yield {
+                "text": tool1 + "Here you go." + tool2,
+                "meta_info": {
+                    "finish_reason": {"type": "stop"},
+                    "prompt_tokens": 5,
+                    "completion_tokens": 10,
+                },
+            }
+
+        request = ResponsesRequest(
+            model="x",
+            input="weather and time",
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": n,
+                    "parameters": {"type": "object"},
+                }
+                for n in ("get_weather", "get_time")
+            ],
+        )
+
+        async def run():
+            stream = serving.responses_stream_generator_non_harmony(
+                request,
+                {},
+                fake_gen(),
+                "x",
+                Mock(),
+                RequestResponseMetadata(request_id="r"),
+            )
+            return await collect_stream_events(stream)
+
+        events = asyncio.run(run())
+        seq = list(zip(event_types(events), event_payloads(events)))
+
+        done_items = [
+            p["item"]
+            for t, p in seq
+            if t == "response.output_item.done"
+            and p["item"].get("type") == "function_call"
+        ]
+        # No duplicate item invented for the already-closed call, and no call
+        # left nameless by being reopened from an args-only fragment.
+        self.assertEqual(len(done_items), 2)
+        self.assertTrue(all(item["name"] for item in done_items))
+
 
 if __name__ == "__main__":
     unittest.main()
