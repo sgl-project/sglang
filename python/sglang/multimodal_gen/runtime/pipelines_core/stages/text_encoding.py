@@ -516,7 +516,7 @@ class TextEncodingStage(ConditionEncodingStage):
         would otherwise redundantly encode the whole batch
         """
         if (
-            getattr(server_args, "encoder_parallel", "auto") not in ("auto", "dp")
+            server_args.encoder_parallel not in ("auto", "dp")
             or not encoder_dp_worthwhile(encoder_config, batch_size)
             or (server_args.tp_size or 1) != 1
             or (server_args.dp_size or 1) != 1

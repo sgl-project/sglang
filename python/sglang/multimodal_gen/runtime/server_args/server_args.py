@@ -602,7 +602,7 @@ class ServerArgs(DisaggServerArgsMixin):
             self.batching_max_size = max(self.batching_max_size, replica_size)
 
         # 1. adjust for encoder parallel folding (dp/replicate never fold)
-        if getattr(self, "encoder_parallel", "auto") in ("dp", "replicate"):
+        if self.encoder_parallel in ("dp", "replicate"):
             return
         fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
 
