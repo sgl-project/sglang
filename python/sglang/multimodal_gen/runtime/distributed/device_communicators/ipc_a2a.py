@@ -15,6 +15,7 @@ read of that slot.
 
 import logging
 import os
+from collections import OrderedDict
 
 import torch
 import torch.distributed as dist
@@ -24,15 +25,26 @@ from sglang.multimodal_gen import envs
 logger = logging.getLogger(__name__)
 
 _SYNC_DECL = (
-    "void spin_wait(torch::Tensor flag, torch::Tensor target);\n"
+    "void spin_wait(torch::Tensor flag, torch::Tensor target, torch::Tensor timed_out,"
+    " int64_t deadline_cycles);\n"
     "void bump_signal(torch::Tensor seq, torch::Tensor peer_flag);"
 )
 _SYNC_SRC = """
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
-__global__ void spin_wait_kernel(volatile int* flag, const int* target) {
+__global__ void spin_wait_kernel(volatile int* flag, const int* target,
+                                 int* timed_out, long long deadline) {
     int t = *target;
-    while (*flag < t) {}
+    long long start = clock64();
+    while (*flag < t) {
+        if (clock64() - start > deadline) {
+            // Give up rather than hang the stream forever. The peer never
+            // published, so this exchange's data is incomplete; the host reads
+            // the flag outside capture and disables the transport.
+            *timed_out = 1;
+            return;
+        }
+    }
     __threadfence_system();
 }
 __global__ void bump_signal_kernel(int* seq, volatile int* peer_flag) {
@@ -41,9 +53,11 @@ __global__ void bump_signal_kernel(int* seq, volatile int* peer_flag) {
     __threadfence_system();
     *peer_flag = v;
 }
-void spin_wait(torch::Tensor flag, torch::Tensor target) {
+void spin_wait(torch::Tensor flag, torch::Tensor target, torch::Tensor timed_out,
+               int64_t deadline_cycles) {
     spin_wait_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (volatile int*)flag.data_ptr<int>(), target.data_ptr<int>());
+        (volatile int*)flag.data_ptr<int>(), target.data_ptr<int>(),
+        timed_out.data_ptr<int>(), (long long)deadline_cycles);
 }
 void bump_signal(torch::Tensor seq, torch::Tensor peer_flag) {
     bump_signal_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -55,10 +69,15 @@ void bump_signal(torch::Tensor seq, torch::Tensor peer_flag) {
 class IpcA2AState:
     def __init__(self):
         self.ops = None
-        self.staging = {}
+        # insertion-ordered so eviction is identical on every rank (all ranks
+        # create and touch the same keys in the same order)
+        self.staging = OrderedDict()
         self.flag = None
         self.peer_flag = None
         self.my_seq = None
+        self.timed_out = None
+        self.deadline_cycles = 0
+        self.max_buffers = 0
         self.calls = 0
         self.rank = None
         self.failed = False
@@ -118,6 +137,15 @@ class IpcA2AState:
         )
         self.flag = torch.zeros(1, dtype=torch.int32, device="cuda")
         self.my_seq = torch.zeros(1, dtype=torch.int32, device="cuda")
+        self.timed_out = torch.zeros(1, dtype=torch.int32, device="cuda")
+        # clock64() counts SM cycles. Convert with the max clock: under a power
+        # cap the SM runs slower, so the real budget only ever comes out longer
+        # than asked, which is the safe direction for a watchdog.
+        cycles_per_ms = torch.cuda.clock_rate(dev) * 1000
+        self.deadline_cycles = int(
+            envs.SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS * cycles_per_ms
+        )
+        self.max_buffers = envs.SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS
         self.peer_flag = self._share(self.flag, group)
         self.inited = True
 
@@ -138,6 +166,10 @@ class IpcA2AState:
             local = torch.zeros(2, n_local, dtype=dtype, device="cuda")
             peer = self._share(local, group)
             pair = (local, peer)
+            if len(self.staging) >= self.max_buffers:
+                # Evicting drops my buffer while the peer still maps it, so both
+                # ranks must drop the same key: they share the insertion order.
+                self.staging.popitem(last=False)
             self.staging[key] = pair
         return pair
 
@@ -163,14 +195,28 @@ class IpcA2AState:
         return slot
 
     def signal_and_wait(self):
-        self.ops.bump_signal(self.my_seq, self.peer_flag)
-        self.ops.spin_wait(self.flag, self.my_seq)
+        self.signal()
+        self.wait()
 
     def signal(self):
         self.ops.bump_signal(self.my_seq, self.peer_flag)
 
     def wait(self):
-        self.ops.spin_wait(self.flag, self.my_seq)
+        self.ops.spin_wait(self.flag, self.my_seq, self.timed_out, self.deadline_cycles)
+
+    def check_timeout(self) -> bool:
+        """Read the timeout flag (a device sync, so call this between requests,
+        never inside a capture) and disable the transport if it fired."""
+        if self.failed or not self.inited or self.timed_out.item() == 0:
+            return False
+        logger.error(
+            "IPC all-to-all timed out waiting for the peer after %d ms; "
+            "falling back to NCCL. The exchange that timed out returned "
+            "incomplete data.",
+            envs.SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS,
+        )
+        self.failed = True
+        return True
 
 
 IPC_A2A = IpcA2AState()

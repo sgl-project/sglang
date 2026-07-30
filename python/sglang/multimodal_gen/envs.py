@@ -33,6 +33,12 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     SGLANG_DIFFUSION_IPC_A2A: bool = False
+    # generous enough to outlast one DiT block's compute on the peer, short
+    # enough that a desync degrades to NCCL instead of hanging the server
+    SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS: float = 200.0
+    # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
+    # slots and is never freed, so multi-resolution serving needs a cap
+    SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS: int = 16
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -222,6 +228,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable cache-dit acceleration for DiT inference
     # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
     "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A"),
+    "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS": _lazy_float(
+        "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS", 200.0
+    ),
+    "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
+        "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
+    ),
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)
     "SGLANG_CACHE_DIT_FN": _lazy_int("SGLANG_CACHE_DIT_FN", 1),
