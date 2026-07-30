@@ -82,6 +82,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.device_timer import device_timer_ctx
 
 if is_npu():
     from sglang.srt.speculative.multi_layer_eagle_utils import (
@@ -498,17 +499,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         self.bs = bs
         shape_key = self._make_graph_key(bs)
-        # Same fwd-occupancy accounting as the single-layer draft runners:
-        # without the wrap the draft replay's GPU time lands in the metric's
-        # denominator only.
-        timer_ctx = (
-            self.model_runner.device_timer.wrap(
-                metadata={"category": "eagle_draft_extend"}
-            )
-            if self.model_runner.device_timer
-            else contextlib.nullcontext()
-        )
-        with timer_ctx:
+        # Same fwd-occupancy accounting as the single-layer draft runners.
+        with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             return self._replay_graph(shape_key, fb_view)
 
 
@@ -984,14 +976,9 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
                 if r is not None:
                     r.deepep_adapter.replay()
             shape_key = first._make_graph_key(self.bs)
-            timer_ctx = (
-                first.model_runner.device_timer.wrap(
-                    metadata={"category": "eagle_draft_extend"}
-                )
-                if first.model_runner.device_timer
-                else contextlib.nullcontext()
-            )
-            with timer_ctx:
+            with device_timer_ctx(
+                first.model_runner.device_timer, "eagle_draft_extend"
+            ):
                 outs = first.backend.replay(shape_key, self._replay_spec_info)
             raw_bs = self.raw_bs
             self._cached = {}

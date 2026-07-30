@@ -201,6 +201,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
@@ -1319,12 +1320,7 @@ class ModelRunner:
             forward_batch.split_index + forward_count,
             self.model_config.num_hidden_layers,
         )
-        ctx = (
-            self.device_timer.wrap(metadata={"category": "split_prefill"})
-            if self.device_timer
-            else contextlib.nullcontext()
-        )
-        with ctx:
+        with device_timer_ctx(self.device_timer, "split_prefill"):
             ret = self.model.forward_split_prefill(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -1547,25 +1543,10 @@ class ModelRunner:
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
                 and get_cp_strategy() is None
             ):
-                category = (
-                    "target_verify"
-                    if forward_batch.forward_mode.is_target_verify()
-                    else "extend"
-                )
-                # Prefill cuda graph (piecewise).
+                # Prefill cuda graph (piecewise). Timing lives inside the
+                # runner's execute, wrapped around the model forward only.
                 kwargs = self._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
-                # TODO: device_timer.wrap is too broad here — it also includes
-                # load_batch time. Move timing into the prefill cuda graph runner
-                # to capture only the model.forward part.
-                ctx = (
-                    self.device_timer.wrap(metadata={"category": category})
-                    if self.device_timer
-                    else contextlib.nullcontext()
-                )
-                with ctx:
-                    ret = self.prefill_cuda_graph_runner.execute(
-                        forward_batch, **kwargs
-                    )
+                ret = self.prefill_cuda_graph_runner.execute(forward_batch, **kwargs)
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.

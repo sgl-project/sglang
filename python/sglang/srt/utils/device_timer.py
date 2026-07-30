@@ -1,9 +1,21 @@
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Callable, Deque, Dict, List, Optional
 
 import torch
+
+
+def device_timer_ctx(timer: Optional["DeviceTimer"], category: str):
+    """Timing context for one forward segment; no-op when the timer is absent.
+
+    Every runner wraps its graph replay / forward execution with this so the
+    segment's device time enters fwd_occupancy (and the metrics riding the
+    same timer).
+    """
+    if timer is None:
+        return nullcontext()
+    return timer.wrap(metadata={"category": category})
 
 
 class DeviceTimer:
