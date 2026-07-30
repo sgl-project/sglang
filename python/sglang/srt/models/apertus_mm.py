@@ -57,7 +57,11 @@ def _init_component_model(
 
 
 class _ApertusLogitsProcessor(LogitsProcessor):
-    """Expose impossible input-only Apertus IDs to every logits consumer."""
+    """Logits-processing hook that preserves the base behavior for Apertus.
+
+    It pads logits for input-only image and audio IDs so every logits consumer
+    sees the full Apertus input vocabulary.
+    """
 
     def __init__(self, config, input_vocab_size: int) -> None:
         super().__init__(config)
@@ -78,6 +82,8 @@ class _ApertusLogitsProcessor(LogitsProcessor):
             embedding_bias=embedding_bias,
             use_logits_buffer=use_logits_buffer,
         )
+        # Pad input-only IDs with -inf so repetition penalties and other sampling
+        # behavior can operate on the full input vocabulary.
         if logits.shape[-1] < self.input_vocab_size:
             logits = F.pad(
                 logits,
@@ -137,6 +143,8 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
                     "is smaller than the multimodal input vocabulary."
                 )
             if self.pp_group.is_last_rank:
+                # Apertus accepts image, audio, and text IDs but generates text only,
+                # so the output vocabulary omits the image and audio ID ranges.
                 self.lm_head = ParallelLMHead(
                     self._output_vocab_size,
                     self.config.hidden_size,
@@ -180,6 +188,8 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
         assert self.vision_tower is not None
         device, dtype = self._module_device_dtype(self.vision_tower)
         image_ids = []
+        # The vision tower expects a single image with a batch dimension;
+        # per-item encoding avoids observed quality degradation from tokenizer batching.
         for image in flatten_nested_list([item.feature for item in items]):
             if not isinstance(image, torch.Tensor):
                 continue
@@ -196,6 +206,8 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
         assert self.audio_tower is not None
         device, dtype = self._module_device_dtype(self.audio_tower)
         audio_ids = []
+        # The audio tower expects a single audio item with batch dimensions;
+        # per-item encoding avoids observed quality degradation from tokenizer batching.
         for audio in flatten_nested_list([item.feature for item in items]):
             if not isinstance(audio, torch.Tensor):
                 continue
@@ -247,8 +259,11 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
             return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        """Load multimodal tokenizer tensors and delegate language weights to the parent."""
         component_tensors = {}
         if self.pp_group.is_first_rank:
+            # Load vision and audio tower parameters here. Include buffers because
+            # the audio tower has checkpointed buffers in addition to parameters.
             for component_name, component in (
                 ("vision_tower", self.vision_tower),
                 ("audio_tower", self.audio_tower),
@@ -268,6 +283,7 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
                     )
 
         def remapped_weights():
+            # Map checkpoint names to the module names used by this implementation.
             for name, weight in weights:
                 if name.startswith("model.language_model."):
                     name = "model." + name[len("model.language_model.") :]
@@ -279,6 +295,7 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
                 yield name, weight
 
         def load_component_weight(name: str, weight: torch.Tensor) -> bool:
+            # Consume vision/audio tensors here; let language-model tensors pass through.
             if not name.startswith(("vision_tower.", "audio_tower.")):
                 return False
 
@@ -297,6 +314,7 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
             return True
 
         def filter_language_weights():
+            # Remove already-loaded multimodal tensors before delegating to the parent.
             for name, weight in remapped_weights():
                 if not load_component_weight(name, weight):
                     yield name, weight
