@@ -498,7 +498,18 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         self.bs = bs
         shape_key = self._make_graph_key(bs)
-        return self._replay_graph(shape_key, fb_view)
+        # Same fwd-occupancy accounting as the single-layer draft runners:
+        # without the wrap the draft replay's GPU time lands in the metric's
+        # denominator only.
+        timer_ctx = (
+            self.model_runner.device_timer.wrap(
+                metadata={"category": "eagle_draft_extend"}
+            )
+            if self.model_runner.device_timer
+            else contextlib.nullcontext()
+        )
+        with timer_ctx:
+            return self._replay_graph(shape_key, fb_view)
 
 
 class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
@@ -973,7 +984,15 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
                 if r is not None:
                     r.deepep_adapter.replay()
             shape_key = first._make_graph_key(self.bs)
-            outs = first.backend.replay(shape_key, self._replay_spec_info)
+            timer_ctx = (
+                first.model_runner.device_timer.wrap(
+                    metadata={"category": "eagle_draft_extend"}
+                )
+                if first.model_runner.device_timer
+                else contextlib.nullcontext()
+            )
+            with timer_ctx:
+                outs = first.backend.replay(shape_key, self._replay_spec_info)
             raw_bs = self.raw_bs
             self._cached = {}
             non_null = [r for r in self.runners if r is not None]
