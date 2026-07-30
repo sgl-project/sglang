@@ -821,7 +821,9 @@ class TokenizerControlMixin:
         if all_success:
             # Keep the tokenizer-manager's view of the role in sync so future
             # control ops and bootstrap routing behave consistently.
-            self.server_args.disaggregation_mode = obj.new_role
+            self.server_args.override(
+                "tokenizer.pd_role_switch", disaggregation_mode=obj.new_role
+            )
             msg = "ok"
         else:
             # Surface only the failing workers' messages.

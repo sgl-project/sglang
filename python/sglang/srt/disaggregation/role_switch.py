@@ -56,7 +56,9 @@ def handle_pd_role_switch(
         # is no in-place rollback.
         try:
             scheduler._teardown_disaggregation()
-            scheduler.server_args.disaggregation_mode = new_role
+            scheduler.server_args.override(
+                "role_switch.flip", disaggregation_mode=new_role
+            )
             scheduler.init_disaggregation()
         except Exception as e:
             scheduler._pd_role_switch_unhealthy = True

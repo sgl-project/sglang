@@ -1248,7 +1248,9 @@ class ModelRunner:
                 "Enabling decode CUDA graph on role switch (was disabled at startup)."
             )
             cfg.decode.backend = Backend.FULL
-            self.server_args.disable_cuda_graph = False
+            self.server_args.override(
+                "model_runner.ensure_decode_cuda_graphs", disable_cuda_graph=False
+            )
 
         if capture_bs:
             # Capture-to-fit: only the requested (router-sized) batch sizes.

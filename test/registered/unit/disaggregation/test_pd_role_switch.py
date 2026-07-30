@@ -39,10 +39,13 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
     def _scheduler(self, mode, *, enable=True, idle=True):
         s = Scheduler.__new__(Scheduler)
         s.disaggregation_mode = mode
-        s.server_args = SimpleNamespace(
+        sa = SimpleNamespace(
             enable_pd_role_switch=enable,
             disaggregation_mode=mode.value,
         )
+        # Mirror the real ServerArgs mutation entry the flip path calls.
+        sa.override = lambda source, **fields: sa.__dict__.update(fields)
+        s.server_args = sa
         s.is_fully_idle = MagicMock(return_value=idle)
         s._teardown_disaggregation = MagicMock()
         s.init_disaggregation = MagicMock()
