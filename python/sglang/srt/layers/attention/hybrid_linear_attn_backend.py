@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -924,7 +926,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             attn_backend.on_after_cuda_graph_warmup()
 
     @property
-    def verify_mask(self) -> Optional["VerifyMask"]:
+    def verify_mask(self) -> Optional[VerifyMask]:
         # The scratch lives on the full-attn child; the linear side reads no mask.
         return self.full_attn_backend.verify_mask
 

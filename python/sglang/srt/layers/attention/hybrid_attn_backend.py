@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -110,7 +112,7 @@ class HybridAttnBackend(AttentionBackend):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
 
     @property
-    def verify_mask(self) -> Optional["VerifyMask"]:
+    def verify_mask(self) -> Optional[VerifyMask]:
         return self._select_backend(ForwardMode.TARGET_VERIFY).verify_mask
 
     def forward(
