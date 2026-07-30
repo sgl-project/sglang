@@ -38,36 +38,31 @@ class _FeatureExtractor:
 
 
 class TestAudioEncoderWindowing(CustomTestCase):
-    def test_complete_windows_are_stable_and_tail_is_recomputable(self):
-        """A complete window's recomputed features must be byte-stable across
-        rolling requests: the embedding cache reuses encoder output purely by
-        hash identity, so any drift would silently re-encode (or worse, alias)
-        windows. The mutable tail must never claim a cacheable identity."""
-        processor = SimpleNamespace(
+    @classmethod
+    def setUpClass(cls):
+        cls.processor = SimpleNamespace(
             feature_extractor=_FeatureExtractor(),
             _get_feat_extract_output_lengths=lambda lengths: lengths,
         )
-        config = resolve_audio_encoder_window_config(
+        cls.config = resolve_audio_encoder_window_config(
             window_frames=8,
             alignment_frames=4,
-            processor=processor,
+            processor=cls.processor,
             model_sample_rate=16,
         )
 
-        def build(samples):
-            return build_audio_encoder_windows(
-                samples=samples,
-                input_ids=torch.tensor([10, 99, 11]),
-                placeholder_token_id=99,
-                config=config,
-                processor=processor,
-            )
+    def _build(self, sample_count):
+        return build_audio_encoder_windows(
+            samples=np.arange(sample_count, dtype=np.float32),
+            input_ids=torch.tensor([10, 99, 11]),
+            placeholder_token_id=99,
+            config=self.config,
+            processor=self.processor,
+        )
 
-        first_items, first_ids = build(np.arange(36, dtype=np.float32))
-        appended_items, _ = build(np.arange(40, dtype=np.float32))
-        tiny_tail_items, _ = build(np.arange(33, dtype=np.float32))
-        for item in first_items[:2] + appended_items[:2]:
-            item.set_pad_value()
+    def test_complete_windows_keep_their_cache_identity_after_append(self):
+        first_items, _ = self._build(36)
+        appended_items, _ = self._build(40)
 
         self.assertEqual(
             [item.use_embedding_cache for item in first_items], [True, True, False]
@@ -84,11 +79,16 @@ class TestAudioEncoderWindowing(CustomTestCase):
                 first_items[0].offsets,
             ),
         )
+
+    def test_placeholder_layout_keeps_the_tail_uncached(self):
+        items, input_ids = self._build(36)
+        tiny_tail_items, _ = self._build(33)
+
         self.assertEqual(
-            [item.offsets for item in first_items],
+            [item.offsets for item in items],
             [[(1, 8)], [(9, 16)], [(17, 18)]],
         )
-        self.assertEqual(int((first_ids == 99).sum()), 18)
+        self.assertEqual(int((input_ids == 99).sum()), 18)
         self.assertEqual(tiny_tail_items[-1].offsets, [(17, 18)])
         self.assertFalse(tiny_tail_items[-1].use_embedding_cache)
 
