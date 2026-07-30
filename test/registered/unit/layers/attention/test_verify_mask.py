@@ -60,17 +60,26 @@ class TestVerifyMaskSizing(CustomTestCase):
 
 
 class TestVerifyMaskCapacity(CustomTestCase):
-    """A batch past the captured max_bs must not silently reuse the mask --
-    the compact layout has no context-dimension slack to absorb the overflow."""
+    """A batch past the captured max_bs must not silently reuse the compact
+    layout -- it has no context-dimension slack to absorb the overflow."""
 
-    def test_fits_up_to_max_bs(self):
-        mask = _create()
-        self.assertTrue(mask.fits(_MAX_BS, _DRAFT, _MAX_CONTEXT_LEN))
-        self.assertTrue(mask.fits(1, _DRAFT, _MAX_CONTEXT_LEN))
+    def test_compact_layout_fits_up_to_max_bs(self):
+        # is_read=False pins QLEN_ONLY; the read layout is build-dependent.
+        mask = _create(is_read=False)
+        self.assertTrue(mask.fits(_MAX_BS, _DRAFT))
+        self.assertTrue(mask.fits(1, _DRAFT))
 
-    def test_does_not_fit_beyond_max_bs(self):
-        mask = _create()
-        self.assertFalse(mask.fits(_MAX_BS + 1, _DRAFT, _MAX_CONTEXT_LEN))
+    def test_compact_layout_does_not_fit_beyond_max_bs(self):
+        mask = _create(is_read=False)
+        self.assertFalse(mask.fits(_MAX_BS + 1, _DRAFT))
+
+    def test_full_mask_always_fits(self):
+        """FULL_MASK's context dimension absorbed oversized batches before this
+        buffer had a capacity notion; keep that, and it needs no max_context_len."""
+        mask = VerifyMask(
+            buffer=torch.zeros(8, dtype=torch.bool), mode=TreeMaskMode.FULL_MASK
+        )
+        self.assertTrue(mask.fits(_MAX_BS * 1000, _DRAFT))
 
 
 class TestVerifyMaskGate(CustomTestCase):
@@ -134,6 +143,14 @@ class TestHybridAttnBackendHandsOutSelectedChildMask(CustomTestCase):
         backend = _make_hybrid_backend("prefill", prefill_mask, decode_mask)
 
         self.assertIs(backend.verify_mask, prefill_mask)
+
+    def test_capacity_check_needs_nothing_from_the_backend(self):
+        """A composite backend carries no max_context_len of its own, so asking
+        the mask whether a batch fits must not reach back through it."""
+        backend = _make_hybrid_backend("prefill", _mask(64, is_read=False), None)
+
+        self.assertFalse(hasattr(backend, "max_context_len"))
+        self.assertTrue(backend.verify_mask.fits(_MAX_BS, _DRAFT))
 
 
 if __name__ == "__main__":

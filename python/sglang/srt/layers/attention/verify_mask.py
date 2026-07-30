@@ -40,15 +40,17 @@ class VerifyMask(msgspec.Struct):
     mode: TreeMaskMode
     is_read: bool = True
 
-    def fits(self, bs: int, num_draft_tokens: int, max_context_len: int) -> bool:
+    def fits(self, bs: int, num_draft_tokens: int) -> bool:
         """Whether this batch's writes stay inside the buffer.
 
-        The compact layout has no context-dimension slack, so an overflowing
-        batch has to allocate rather than reuse this one.
+        Only the compact layout can overflow: FULL_MASK's context dimension is
+        slack that already absorbed oversized batches before this buffer had a
+        capacity notion at all, and its bound needs a max_context_len that
+        composite backends do not carry.
         """
-        return self.buffer.numel() >= tree_mask_numel(
-            self.mode, bs, num_draft_tokens, max_context_len
-        )
+        if self.mode != TreeMaskMode.QLEN_ONLY:
+            return True
+        return self.buffer.numel() >= bs * num_draft_tokens * num_draft_tokens
 
 
 def maybe_create_verify_mask(
