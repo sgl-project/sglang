@@ -36,6 +36,11 @@ register_cuda_ci(
     runner_config="4-gpu-b200",
 )
 
+pytestmark = pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 10,
+    reason="K3 fused all-reduce CI coverage requires SM100+ multicast",
+)
+
 H = 7168  # Kimi-K3 hidden size; the kernels are tuned/used at multiples of it
 NORM_DIM = 3584  # latent width; the norm buffer is [N, NORM_DIM] + [N, 2*NORM_DIM]
 MB = 1024 * 1024

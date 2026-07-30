@@ -16,7 +16,7 @@ import torch.distributed as dist
 
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
-from sglang.kernels.ops.kimi_k3 import sp_collective
+from sglang.kernels.ops.kimi_k3 import attn_res, sp_collective
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
@@ -55,6 +55,7 @@ def _init_comm() -> CustomAllReduceV2:
     if comm.disabled or comm.mc_base_ptr == 0:
         raise RuntimeError("SP collectives require multicast symmetric memory")
     sp_collective.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
+    attn_res.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
     register_comm_cleanup(comm)
     return comm
 
@@ -207,6 +208,108 @@ def test_pull_reduce_scatter_and_direct_all_gather():
     torch.testing.assert_close(ag_output, ag_ref, rtol=0, atol=0)
     assert input_handle is not None
     assert output_handle is not None
+
+
+def _attn_res_inputs(num_tokens: int, num_bank_rows: int):
+    rank = dist.get_rank()
+    generator = torch.Generator(device="cuda").manual_seed(1200 + rank)
+    prefix = torch.randn(
+        (num_tokens, _HIDDEN_SIZE),
+        generator=generator,
+        device=_device(),
+        dtype=torch.bfloat16,
+    )
+    bank = torch.randn(
+        (num_tokens, num_bank_rows, _HIDDEN_SIZE),
+        generator=generator,
+        device=_device(),
+        dtype=torch.bfloat16,
+    )
+    cw = torch.linspace(
+        -0.01, 0.01, _HIDDEN_SIZE, device=_device(), dtype=torch.bfloat16
+    )
+    ow = torch.linspace(
+        1.25, 0.75, _HIDDEN_SIZE, device=_device(), dtype=torch.bfloat16
+    )
+    return prefix, bank, cw, ow
+
+
+@torch.inference_mode()
+def test_attention_residual_direct_all_gather():
+    _require_sm100()
+    comm = _init_comm()
+    local_tokens, nvb, eps = 8, 3, 1e-6
+    prefix, bank, cw, ow = _attn_res_inputs(local_tokens, nvb + 1)
+
+    local_reference = torch.empty_like(prefix)
+    attn_res.attn_res_fused_tma(prefix, bank.clone(), cw, ow, local_reference, nvb, eps)
+    full_reference = torch.empty(
+        (comm.world_size * local_tokens, _HIDDEN_SIZE),
+        device=_device(),
+        dtype=torch.bfloat16,
+    )
+    _, nccl_group = _init_world()
+    dist.all_gather_into_tensor(full_reference, local_reference, group=nccl_group)
+
+    output, output_handle, output_mc_ptr = _symmetric_tensor(
+        tuple(full_reference.shape)
+    )
+    attn_res.attn_res_fused_direct_ag(
+        comm.world_size,
+        prefix,
+        bank,
+        cw,
+        ow,
+        output,
+        nvb,
+        eps,
+        output_mc_ptr=output_mc_ptr,
+        max_blocks=4,
+        write_prefix=True,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, full_reference, rtol=2e-2, atol=3e-2)
+    assert torch.equal(bank[:, nvb], prefix)
+    assert output_handle is not None
+
+
+@torch.inference_mode()
+def test_attention_residual_pull_reduce_scatter():
+    _require_sm100()
+    comm = _init_comm()
+    rs_input, residual, rs_ref, _, _ = _make_inputs()
+    local_tokens, nvb, eps = rs_ref.shape[0], 3, 1e-6
+    _, bank, cw, ow = _attn_res_inputs(local_tokens, nvb + 1)
+
+    expected = torch.empty_like(rs_ref)
+    attn_res.attn_res_fused_tma(rs_ref, bank.clone(), cw, ow, expected, nvb, eps)
+
+    symmetric_input, input_handle, input_mc_ptr = _symmetric_tensor(
+        tuple(rs_input.shape)
+    )
+    symmetric_input.copy_(rs_input)
+    output = torch.empty_like(rs_ref)
+    prefix_output = torch.empty_like(rs_ref)
+    attn_res.attn_res_fused_pull_rs(
+        comm.world_size,
+        symmetric_input,
+        residual,
+        bank,
+        cw,
+        ow,
+        output,
+        prefix_output,
+        nvb,
+        eps,
+        input_mc_ptr=input_mc_ptr,
+        max_blocks=4,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(prefix_output, rs_ref, rtol=2e-2, atol=3e-2)
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=3e-2)
+    assert input_handle is not None
 
 
 def _precompile(num_gpus):

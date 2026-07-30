@@ -37,6 +37,11 @@ register_cuda_ci(
     runner_config="4-gpu-b200",
 )
 
+pytestmark = pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 10,
+    reason="K3 GEMM+AG CI coverage requires SM100+ multicast",
+)
+
 K, N = gemm_ag.K, gemm_ag.N
 MB = 1024 * 1024
 
