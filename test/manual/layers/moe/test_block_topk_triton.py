@@ -20,55 +20,60 @@ def block_topk_reference(
     expert_capacity: int,
     top_k: int,
 ):
-    """Pure PyTorch reference implementation of block-level expert routing."""
+    """Independent PyTorch reference for block-level expert routing.
+
+    Selection uses the unmodified corrected score. Stable argsort defines the
+    exact-tie contract as lower expert ID first, without copying the Triton
+    kernel's threshold/cumsum implementation. Routing weights are unbiased
+    sigmoid scores normalized in FP32.
+    """
     num_tokens, num_experts = router_logits.shape
-    assert num_tokens % block_size == 0
     device = router_logits.device
+    if num_tokens == 0:
+        return (
+            torch.empty((0, top_k), dtype=torch.float32, device=device),
+            torch.empty((0, top_k), dtype=torch.int32, device=device),
+        )
 
     base_scores = torch.sigmoid(router_logits.float())
-    routing_scores = base_scores + correction_bias.float()
+    corrected_scores = base_scores + correction_bias.float().unsqueeze(0)
+    num_blocks = (num_tokens + block_size - 1) // block_size
+    padded_tokens = num_blocks * block_size
+    if padded_tokens != num_tokens:
+        corrected_scores_padded = torch.nn.functional.pad(
+            corrected_scores,
+            (0, 0, 0, padded_tokens - num_tokens),
+            value=float("-inf"),
+        )
+    else:
+        corrected_scores_padded = corrected_scores
 
-    num_blocks = num_tokens // block_size
-    topk_ids = torch.zeros((num_tokens, top_k), dtype=torch.int32, device=device)
-    topk_weights = torch.zeros((num_tokens, top_k), dtype=router_logits.dtype, device=device)
+    block_scores = corrected_scores_padded.view(
+        num_blocks, block_size, num_experts
+    ).amax(dim=1)
+    allowed_ids = torch.argsort(
+        block_scores, dim=-1, descending=True, stable=True
+    )[:, :expert_capacity]
+    allowed = torch.zeros(
+        (num_blocks, num_experts), dtype=torch.bool, device=device
+    )
+    allowed.scatter_(1, allowed_ids, True)
+    token_allowed = allowed.repeat_interleave(block_size, dim=0)[:num_tokens]
 
-    for b in range(num_blocks):
-        start = b * block_size
-        end = start + block_size
-        block_scores = routing_scores[start:end]
+    token_scores = corrected_scores.masked_fill(~token_allowed, float("-inf"))
+    topk_ids = torch.argsort(
+        token_scores, dim=-1, descending=True, stable=True
+    )[:, :top_k]
+    selected_base_scores = base_scores.gather(1, topk_ids)
+    if top_k > 1:
+        weight_sum = selected_base_scores.sum(dim=-1, keepdim=True)
+        normalized = selected_base_scores / weight_sum.clamp_min(1e-30)
+        uniform = torch.full_like(selected_base_scores, 1.0 / top_k)
+        topk_weights = torch.where(weight_sum > 1e-30, normalized, uniform)
+    else:
+        topk_weights = selected_base_scores
 
-        # Phase 1: block-level allowed mask
-        block_expert_scores = block_scores.max(dim=0).values
-        # Tie-break by expert index
-        expert_indices = torch.arange(num_experts, device=device, dtype=torch.float32)
-        combined_block = block_expert_scores - expert_indices * 3e-7
-        _, sorted_idx = combined_block.sort(descending=True)
-        allowed_experts = sorted_idx[:expert_capacity]
-        allowed_mask = torch.zeros(num_experts, dtype=torch.bool, device=device)
-        allowed_mask[allowed_experts] = True
-
-        # Phase 2: per-token top-k within allowed set
-        for t in range(start, end):
-            token_scores = routing_scores[t].clone()
-            combined_token = token_scores - expert_indices * 3e-7
-            combined_token[~allowed_mask] = -10000.0
-            _, token_sorted_idx = combined_token.sort(descending=True)
-            selected = token_sorted_idx[:top_k]
-            topk_ids[t] = selected.int()
-
-            # Weights: normalized base_scores (without bias)
-            selected_base_scores = base_scores[t, selected]
-            if top_k > 1:
-                m = selected_base_scores.max()
-                if m > 1e-30:
-                    scaled = selected_base_scores / m
-                    topk_weights[t] = (scaled / scaled.sum()).to(router_logits.dtype)
-                else:
-                    topk_weights[t] = 1.0 / top_k
-            else:
-                topk_weights[t] = selected_base_scores.to(router_logits.dtype)
-
-    return topk_weights, topk_ids
+    return topk_weights.float(), topk_ids.to(torch.int32)
 
 
 class TestBlockTopkTriton(unittest.TestCase):
@@ -90,45 +95,17 @@ class TestBlockTopkTriton(unittest.TestCase):
             router_logits, correction_bias, block_size, expert_capacity, top_k
         )
 
-        # The Triton kernel returns IDs sorted by expert index (ascending),
-        # while the reference sorts by score (descending). We compare the
-        # selected expert SET per token, ignoring order.
-        ids_triton_sorted, _ = ids_triton.sort(dim=1)
-        ids_ref_sorted, _ = ids_ref.sort(dim=1)
         self.assertTrue(
-            torch.equal(ids_triton_sorted, ids_ref_sorted),
-            f"IDs mismatch (as sets) for config ({num_tokens}, {num_experts}, "
+            torch.equal(ids_triton, ids_ref),
+            f"IDs mismatch for config ({num_tokens}, {num_experts}, "
             f"cap={expert_capacity}, bs={block_size}, k={top_k}).\n"
-            f"  Triton sorted: {ids_triton_sorted[:4]}\n"
-            f"  Ref sorted:    {ids_ref_sorted[:4]}",
+            f"  Triton: {ids_triton[:4]}\n"
+            f"  Ref:    {ids_ref[:4]}",
         )
-
-        # Verify weights: for each token, gather triton weights by expert id
-        # and compare against reference weights gathered the same way.
-        # This is order-independent.
-        base_scores = torch.sigmoid(router_logits.float())
-        for t in range(num_tokens):
-            triton_experts = ids_triton[t]
-            ref_experts = ids_ref[t]
-            # Both should select same experts (verified above), so weights
-            # for the same expert should match.
-            triton_weight_map = {
-                int(triton_experts[k]): float(weights_triton[t, k])
-                for k in range(top_k)
-            }
-            ref_weight_map = {
-                int(ref_experts[k]): float(weights_ref[t, k])
-                for k in range(top_k)
-            }
-            for expert_id in triton_weight_map:
-                self.assertAlmostEqual(
-                    triton_weight_map[expert_id],
-                    ref_weight_map[expert_id],
-                    places=3,
-                    msg=f"Weight mismatch at token={t}, expert={expert_id} "
-                    f"for config ({num_tokens}, {num_experts}, "
-                    f"cap={expert_capacity}, bs={block_size}, k={top_k})",
-                )
+        self.assertEqual(weights_triton.dtype, torch.float32)
+        torch.testing.assert_close(
+            weights_triton, weights_ref, rtol=0.0, atol=2e-6
+        )
 
     def test_basic_small(self):
         """32 tokens, 16 experts, capacity=8, block_size=8, top_k=2."""
@@ -145,7 +122,7 @@ class TestBlockTopkTriton(unittest.TestCase):
     def test_large_expert_count(self):
         """256 experts (production-like config)."""
         self._run_case(
-            num_tokens=64, num_experts=256, expert_capacity=48, block_size=32, top_k=6
+            num_tokens=64, num_experts=256, expert_capacity=48, block_size=32, top_k=8
         )
 
     def test_capacity_equals_experts(self):
@@ -173,5 +150,42 @@ class TestBlockTopkTriton(unittest.TestCase):
         )
 
 
+    def test_partial_block_and_non_power_of_two_experts(self):
+        """Tail tokens and non-power-of-two expert counts are supported."""
+        self._run_case(
+            num_tokens=65, num_experts=100, expert_capacity=48,
+            block_size=32, top_k=8,
+        )
+
+    def test_exact_ties_choose_lower_expert_id(self):
+        logits = torch.zeros((33, 100), dtype=torch.float32, device="cuda")
+        bias = torch.zeros((100,), dtype=torch.float32, device="cuda")
+        weights, ids = block_topk_triton(logits, bias, 32, 48, 8)
+        expected_ids = torch.arange(8, dtype=torch.int32, device="cuda").expand(33, -1)
+        self.assertTrue(torch.equal(ids, expected_ids))
+        torch.testing.assert_close(
+            weights, torch.full_like(weights, 1.0 / 8), rtol=0.0, atol=0.0
+        )
+
+    def test_close_unequal_scores_are_not_reordered(self):
+        logits = torch.full((32, 16), -20.0, dtype=torch.float32, device="cuda")
+        bias = torch.zeros((16,), dtype=torch.float32, device="cuda")
+        logits[:, 0] = 0.0
+        logits[:, 1] = 0.0
+        bias[1] = 2e-7
+        _, ids = block_topk_triton(logits, bias, 32, 16, 1)
+        self.assertTrue(torch.equal(ids, torch.ones_like(ids)))
+
+    def test_empty_input_returns_fp32_weights(self):
+        logits = torch.empty((0, 16), dtype=torch.bfloat16, device="cuda")
+        bias = torch.zeros((16,), dtype=torch.float32, device="cuda")
+        weights, ids = block_topk_triton(logits, bias, 32, 8, 2)
+        self.assertEqual(weights.shape, (0, 2))
+        self.assertEqual(ids.shape, (0, 2))
+        self.assertEqual(weights.dtype, torch.float32)
+        self.assertEqual(ids.dtype, torch.int32)
+
+
 if __name__ == "__main__":
     unittest.main()
+

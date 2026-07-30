@@ -54,12 +54,17 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.topk import TopK, StandardTopKOutput
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopK,
+    TritonKernelTopKOutput,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -99,13 +104,14 @@ _is_npu = is_npu()
 
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 
 @triton.jit
 def _block_aggregation_kernel(
     router_logits_ptr,
     correction_bias_ptr,
-    allowed_mask_ptr,
+    allowed_ids_ptr,
     num_tokens,
     num_experts_total: tl.constexpr,
     block_size: tl.constexpr,
@@ -114,49 +120,65 @@ def _block_aggregation_kernel(
     stride_logits_e,
     BLOCK_SIZE_E: tl.constexpr,
 ):
-    """Phase 1: Compute block-level expert scores and allowed mask. One program per block."""
+    """Select the block-level expert set and store compact expert IDs."""
     block_id = tl.program_id(0)
     block_start_token = block_id * block_size
 
     expert_offs = tl.arange(0, BLOCK_SIZE_E)
     expert_mask = expert_offs < num_experts_total
+    bias = tl.load(
+        correction_bias_ptr + expert_offs,
+        mask=expert_mask,
+        other=0.0,
+    ).to(tl.float32)
 
-    bias = tl.load(correction_bias_ptr + expert_offs, mask=expert_mask, other=0.0)
+    token_in_block = tl.arange(0, block_size)
+    token_offs = block_start_token + token_in_block[:, None]
+    valid_2d = (token_offs < num_tokens) & expert_mask[None, :]
+    logits_ptrs = (
+        router_logits_ptr
+        + token_offs * stride_logits_n
+        + expert_offs[None, :] * stride_logits_e
+    )
+    logits = tl.load(logits_ptrs, mask=valid_2d, other=float("-inf"))
+    corrected_scores = tl.sigmoid(logits.to(tl.float32)) + bias[None, :]
+    block_scores = tl.max(corrected_scores, axis=0)
+    block_scores = tl.where(expert_mask, block_scores, float("-inf"))
 
-    offs_token_in_block = tl.arange(0, block_size)
-    token_offs = block_start_token + offs_token_in_block[:, None]
-    token_mask = token_offs < num_tokens
+    # Select on the unmodified score.  Expert IDs participate only when scores
+    # are exactly tied, avoiding the old expert_id * 3e-7 ranking perturbation.
+    sorted_scores = tl.sort(block_scores, descending=True)
+    threshold = tl.sum(
+        tl.where(
+            expert_offs == expert_capacity - 1,
+            sorted_scores,
+            0.0,
+        ),
+        axis=0,
+    )
+    better = (block_scores > threshold) & expert_mask
+    tied = (block_scores == threshold) & expert_mask
+    num_better = tl.sum(better.to(tl.int32), axis=0)
+    ties_needed = expert_capacity - num_better
+    tie_rank = tl.cumsum(tied.to(tl.int32), axis=0)
+    selected = better | (tied & (tie_rank <= ties_needed))
 
-    ptr_2d = router_logits_ptr + token_offs * stride_logits_n + expert_offs[None, :] * stride_logits_e
-    mask_2d = token_mask & expert_mask[None, :]
-
-    logits_2d = tl.load(ptr_2d, mask=mask_2d, other=float('-inf'))
-    scores_2d = tl.sigmoid(logits_2d.to(tl.float32))
-    routing_scores_2d = scores_2d + bias[None, :]
-
-    block_expert_scores = tl.max(routing_scores_2d, axis=0)
-
-    # Tie-break by expert index.
-    combined_values = block_expert_scores - (expert_offs.to(tl.float32) * 3e-7)
-    combined_values = tl.where(expert_mask, combined_values, float('-inf'))
-    sorted_scores = tl.sort(combined_values, descending=True)
-    mask = expert_capacity - 1 == expert_offs
-    threshold_val = tl.sum(sorted_scores * mask)
-
-    allowed = combined_values >= threshold_val
-    allowed = allowed & expert_mask
-    allowed_cumsum = tl.cumsum(allowed.to(tl.int32), axis=0)
-    allowed = allowed & (allowed_cumsum <= expert_capacity)
-
-    tl.store(allowed_mask_ptr + block_id * num_experts_total + expert_offs,
-             allowed, mask=expert_mask)
+    # IDs are compact and ascending.  Phase 2 consequently scans capacity
+    # candidates (normally 48, padded to 64) instead of every expert.
+    selected_rank = tl.cumsum(selected.to(tl.int32), axis=0) - 1
+    safe_rank = tl.where(selected, selected_rank, 0)
+    tl.store(
+        allowed_ids_ptr + block_id * expert_capacity + safe_rank,
+        expert_offs,
+        mask=selected,
+    )
 
 
 @triton.jit
 def _token_topk_kernel(
     router_logits_ptr,
     correction_bias_ptr,
-    allowed_mask_ptr,
+    allowed_ids_ptr,
     topk_ids_ptr,
     topk_weights_ptr,
     num_tokens,
@@ -166,70 +188,94 @@ def _token_topk_kernel(
     top_k: tl.constexpr,
     stride_logits_n,
     stride_logits_e,
-    BLOCK_SIZE_E: tl.constexpr,
+    BLOCK_SIZE_C: tl.constexpr,
     TOPK_POW2: tl.constexpr,
 ):
-    """Phase 2: Per-token top-k selection using precomputed allowed_mask."""
+    """Ordered per-token top-k over the compact block-level candidates."""
     token_idx = tl.program_id(0)
     if token_idx >= num_tokens:
         return
 
     block_id = token_idx // block_size
-
-    expert_offs = tl.arange(0, BLOCK_SIZE_E)
-    expert_mask = expert_offs < num_experts_total
-
-    bias = tl.load(correction_bias_ptr + expert_offs, mask=expert_mask, other=0.0)
-
+    candidate_offs = tl.arange(0, BLOCK_SIZE_C)
+    candidate_mask = candidate_offs < expert_capacity
+    expert_ids = tl.load(
+        allowed_ids_ptr + block_id * expert_capacity + candidate_offs,
+        mask=candidate_mask,
+        other=0,
+    ).to(tl.int32)
+    bias = tl.load(
+        correction_bias_ptr + expert_ids,
+        mask=candidate_mask,
+        other=0.0,
+    ).to(tl.float32)
     logits = tl.load(
-        router_logits_ptr + token_idx * stride_logits_n + expert_offs * stride_logits_e,
-        mask=expert_mask,
-        other=float('-inf')
-    )
-    base_scores = tl.sigmoid(logits.to(tl.float32))
-    routing_scores = base_scores + bias
-
-    allowed_mask = tl.load(
-        allowed_mask_ptr + block_id * num_experts_total + expert_offs,
-        mask=expert_mask,
-        other=False
+        router_logits_ptr
+        + token_idx * stride_logits_n
+        + expert_ids * stride_logits_e,
+        mask=candidate_mask,
+        other=float("-inf"),
     )
 
-    masked_scores = tl.where(allowed_mask, routing_scores, -10000.0)
+    # libdevice exp plus round-to-nearest division matches ATen's FP32 sigmoid
+    # more closely than Triton's approximate tl.sigmoid.  This is important at
+    # token top-k boundaries and keeps routing weights in FP32.
+    base_scores = libdevice.div_rn(
+        1.0,
+        1.0 + libdevice.exp(-logits.to(tl.float32)),
+    )
+    remaining = tl.where(
+        candidate_mask,
+        base_scores + bias,
+        float("-inf"),
+    )
 
-    combined_scores = masked_scores - (expert_offs.to(tl.float32) * 3e-7)
-    combined_scores = tl.where(expert_mask, combined_scores, float('-inf'))
-    sorted_combined = tl.sort(combined_scores, descending=True)
+    out_offs = tl.arange(0, TOPK_POW2)
+    out_ids = tl.zeros([TOPK_POW2], dtype=tl.int32)
+    out_raw = tl.zeros([TOPK_POW2], dtype=tl.float32)
+    raw_sum = 0.0
+    for k in tl.static_range(0, top_k):
+        # Compact candidates are ascending expert IDs, so leftmost argmax gives
+        # the deterministic lower-ID tie break shared by the reference test.
+        selected_pos = tl.argmax(remaining, axis=0, tie_break_left=True)
+        selected_id = tl.sum(
+            tl.where(candidate_offs == selected_pos, expert_ids, 0),
+            axis=0,
+        )
+        selected_raw = tl.sum(
+            tl.where(candidate_offs == selected_pos, base_scores, 0.0),
+            axis=0,
+        )
+        out_ids = tl.where(out_offs == k, selected_id, out_ids)
+        out_raw = tl.where(out_offs == k, selected_raw, out_raw)
+        raw_sum += selected_raw
+        remaining = tl.where(
+            candidate_offs == selected_pos,
+            float("-inf"),
+            remaining,
+        )
 
-    threshold_token_score = tl.sum(sorted_combined * (top_k - 1 == expert_offs))
-    token_expert_mask = combined_scores >= threshold_token_score
-    token_expert_mask = token_expert_mask & expert_mask
-    token_expert_idx_cumsum = tl.cumsum(token_expert_mask.to(tl.int32), axis=0)
-    token_expert_mask = token_expert_mask & (token_expert_idx_cumsum <= top_k)
-    token_expert_idx = token_expert_idx_cumsum * token_expert_mask - 1
-    safe_expert_idx = tl.where(token_expert_mask, token_expert_idx, 0)
-    tl.store(topk_ids_ptr + token_idx * top_k + safe_expert_idx, expert_offs, token_expert_mask)
-    offs_topk = tl.arange(0, TOPK_POW2)
-    topk_mask = offs_topk < top_k
-    tl.debug_barrier()
-    current_topk_ids = tl.load(topk_ids_ptr + token_idx * top_k + offs_topk, mask=topk_mask, other=0)
-    current_topk_vals = tl.where(topk_mask, base_scores.gather(current_topk_ids, 0), 0.)
-
+    out_mask = out_offs < top_k
     if top_k > 1:
-        # Normalize with row-max rescaling; uniform fallback if all scores ≈ 0.
-        m = tl.max(current_topk_vals, axis=0)
-        safe = m > 1e-30
-        inv_m = 1.0 / tl.where(safe, m, 1.0)
-        scaled = current_topk_vals * inv_m
-        sum_val = tl.sum(scaled, axis=0)
-        normalized = scaled / sum_val
-        uniform = tl.where(topk_mask, 1.0 / top_k, 0.0)
-        current_topk_weights = tl.where(safe, normalized, uniform)
+        safe = raw_sum > 1e-30
+        out_weights = tl.where(
+            safe,
+            out_raw / tl.where(safe, raw_sum, 1.0),
+            1.0 / top_k,
+        )
     else:
-        current_topk_weights = current_topk_vals
+        out_weights = out_raw
 
-    offs_out = token_idx * top_k + offs_topk
-    tl.store(topk_weights_ptr + offs_out, current_topk_weights, mask=topk_mask)
+    tl.store(
+        topk_ids_ptr + token_idx * top_k + out_offs,
+        out_ids,
+        mask=out_mask,
+    )
+    tl.store(
+        topk_weights_ptr + token_idx * top_k + out_offs,
+        out_weights,
+        mask=out_mask,
+    )
 
 
 def block_topk_triton(
@@ -239,48 +285,76 @@ def block_topk_triton(
     expert_capacity: int,
     top_k: int,
 ):
-    """Two-phase block routing: phase1 computes allowed_mask per block, phase2 does per-token top-k."""
+    """Two-phase block routing with compact candidates and FP32 weights."""
+    if not router_logits.is_cuda or not correction_bias.is_cuda:
+        raise ValueError("block_topk_triton requires CUDA tensors")
+    if router_logits.ndim != 2:
+        raise ValueError(
+            f"router_logits must be 2-D, got shape={tuple(router_logits.shape)}"
+        )
+
     num_tokens, num_experts_total = router_logits.shape
+    if correction_bias.shape != (num_experts_total,):
+        raise ValueError(
+            "correction_bias must have shape "
+            f"({num_experts_total},), got {tuple(correction_bias.shape)}"
+        )
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if not (0 < top_k <= expert_capacity <= num_experts_total):
+        raise ValueError(
+            "expected 0 < top_k <= expert_capacity <= num_experts, got "
+            f"top_k={top_k}, expert_capacity={expert_capacity}, "
+            f"num_experts={num_experts_total}"
+        )
+
     device = router_logits.device
     if num_tokens == 0:
         return (
-            torch.empty((0, top_k), dtype=router_logits.dtype, device=device),
+            torch.empty((0, top_k), dtype=torch.float32, device=device),
             torch.empty((0, top_k), dtype=torch.int32, device=device),
         )
-    assert num_tokens % block_size == 0
 
-    num_blocks = num_tokens // block_size
-
-    allowed_mask = torch.empty(
-        (num_blocks, num_experts_total), dtype=torch.bool, device=device
+    # Tail blocks are valid; invalid token lanes are masked inside phase 1.
+    num_blocks = (num_tokens + block_size - 1) // block_size
+    allowed_ids = torch.empty(
+        (num_blocks, expert_capacity),
+        dtype=torch.int32,
+        device=device,
     )
-    topk_ids = torch.empty((num_tokens, top_k), dtype=torch.int32, device=device)
-    topk_weights = torch.empty((num_tokens, top_k), dtype=router_logits.dtype, device=device)
+    topk_ids = torch.empty(
+        (num_tokens, top_k),
+        dtype=torch.int32,
+        device=device,
+    )
+    topk_weights = torch.empty(
+        (num_tokens, top_k),
+        dtype=torch.float32,
+        device=device,
+    )
 
-    BLOCK_SIZE_E = triton.next_power_of_2(num_experts_total)
+    block_size_e = triton.next_power_of_2(num_experts_total)
+    block_size_c = triton.next_power_of_2(expert_capacity)
     topk_pow2 = triton.next_power_of_2(top_k)
 
-    # Phase 1: Block aggregation + allowed_mask
     _block_aggregation_kernel[(num_blocks,)](
         router_logits,
         correction_bias,
-        allowed_mask,
+        allowed_ids,
         num_tokens,
         num_experts_total,
         block_size,
         expert_capacity,
         router_logits.stride(0),
         router_logits.stride(1),
-        BLOCK_SIZE_E=BLOCK_SIZE_E,
+        BLOCK_SIZE_E=block_size_e,
         num_warps=4,
-        num_stages=3,
+        num_stages=1,
     )
-
-    # Phase 2: Per-token top-k
     _token_topk_kernel[(num_tokens,)](
         router_logits,
         correction_bias,
-        allowed_mask,
+        allowed_ids,
         topk_ids,
         topk_weights,
         num_tokens,
@@ -290,12 +364,11 @@ def block_topk_triton(
         top_k,
         router_logits.stride(0),
         router_logits.stride(1),
-        BLOCK_SIZE_E=BLOCK_SIZE_E,
+        BLOCK_SIZE_C=block_size_c,
         TOPK_POW2=topk_pow2,
-        num_warps=4,
-        num_stages=3,
+        num_warps=1,
+        num_stages=1,
     )
-
     return topk_weights, topk_ids
 
 
@@ -386,10 +459,10 @@ class LLaDA2MoeGate(nn.Module):
             self.expert_bias = None
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, None).to(
-            hidden_states.dtype
-        )
-        return logits
+        # Keep router logits in the configured router/weight dtype. In
+        # particular, router_dtype="fp32" must not be truncated back to the
+        # BF16 activation dtype before block routing.
+        return F.linear(hidden_states.to(self.weight.dtype), self.weight, None)
 
 
 class LLaDA2MoeSparseMoeBlock(nn.Module):
@@ -464,6 +537,36 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         self.correction_bias = (
             self.gate.expert_bias.data if self.gate.expert_bias is not None else None
         )
+
+        if self.use_block_routing:
+            if get_moe_a2a_backend().is_deepep():
+                raise ValueError(
+                    "LLaDA2 block routing does not support "
+                    "--moe-a2a-backend deepep"
+                )
+            if self.correction_bias is None:
+                raise ValueError(
+                    "block routing requires moe_router_enable_expert_bias=True"
+                )
+            if self.score_function != "sigmoid":
+                raise ValueError(
+                    "block routing requires score_function='sigmoid', got "
+                    f"{self.score_function!r}"
+                )
+            if not isinstance(self.block_size, int) or self.block_size <= 0:
+                raise ValueError(
+                    f"block_size must be a positive integer, got {self.block_size!r}"
+                )
+            if not (
+                0 < self.top_k <= self.expert_capacity <= self.num_experts
+            ):
+                raise ValueError(
+                    "block routing requires "
+                    "0 < num_experts_per_tok <= expert_capacity <= num_experts, "
+                    f"got top_k={self.top_k}, "
+                    f"expert_capacity={self.expert_capacity}, "
+                    f"num_experts={self.num_experts}"
+                )
 
         if self.score_function is not None:
             assert (
@@ -564,16 +667,80 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             self.top_k,
         )
 
+    def _make_block_topk_output(
+        self,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ):
+        """Convert block-routing results to the selected MoE runner format."""
+        if not get_moe_runner_backend().is_triton_kernels():
+            return StandardTopKOutput(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=router_logits,
+            )
+
+        # triton_kernels needs expert-sorted routing metadata. Reuse the
+        # block router's selected expert ids via y_indx, but do not use the
+        # values produced by triton_kernels_topk: block routing uses sigmoid
+        # scores normalized over its own selected experts, not softmax scores.
+        from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
+        from triton_kernels.tensor import make_ragged_tensor_metadata
+        from triton_kernels.topk import topk as triton_kernels_topk
+
+        if topk_ids.numel() == 0:
+            # Avoid launching the Triton top-k kernel with a zero-row grid.
+            dispatch_indx = torch.empty(
+                (0,), dtype=torch.int32, device=topk_ids.device
+            )
+            combine_indx = torch.empty_like(dispatch_indx)
+            expert_counts = torch.zeros(
+                (self.num_experts,), dtype=torch.int32, device=topk_ids.device
+            )
+        else:
+            sparse_logits = triton_kernels_topk(
+                router_logits,
+                self.top_k,
+                apply_softmax=False,
+                y_indx=topk_ids,
+            )
+            dispatch_indx = sparse_logits.mask_metadata.row_sorted_indx
+            combine_indx = sparse_logits.mask_metadata.col_sorted_indx
+            expert_counts = sparse_logits.mask_metadata.col_sum
+
+        ragged_metadata = make_ragged_tensor_metadata(
+            expert_counts,
+            dispatch_indx.shape[0],
+        )
+
+        # combine_indx is the same token-major -> expert-major permutation
+        # used by sglang.srt.layers.moe.topk.routing(). Preserve block
+        # routing's FP32 weights while putting them in the runner's order.
+        gate_scal = topk_weights.flatten()[combine_indx]
+        routing_data = RoutingData(
+            gate_scal,
+            ragged_metadata.slice_sizes,
+            self.num_experts,
+            self.top_k,
+            ragged_metadata,
+        )
+        gather_indx = GatherIndx(combine_indx, dispatch_indx)
+        scatter_indx = ScatterIndx(dispatch_indx, combine_indx)
+        return TritonKernelTopKOutput(
+            routing_data=routing_data,
+            gather_indx=gather_indx,
+            scatter_indx=scatter_indx,
+        )
+
     def _forward_router_experts(self, hidden_states: torch.Tensor):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
 
         if self.use_block_routing:
             topk_weights, topk_ids = self._block_topk(router_logits)
-            topk_output = StandardTopKOutput(
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                router_logits=router_logits,
+            topk_output = self._make_block_topk_output(
+                router_logits, topk_weights, topk_ids
             )
         else:
             topk_output = self.topk(hidden_states, router_logits)
@@ -600,10 +767,8 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         with torch.cuda.stream(self.alt_stream):
             shared_hidden_states = self.shared_experts.act_fn(shared_gate_up)
             shared_output, _ = self.shared_experts.down_proj(shared_hidden_states)
-        topk_output = StandardTopKOutput(
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            router_logits=router_logits,
+        topk_output = self._make_block_topk_output(
+            router_logits, topk_weights, topk_ids
         )
         router_output = self.experts(hidden_states, topk_output)
         current_stream.wait_stream(self.alt_stream)
