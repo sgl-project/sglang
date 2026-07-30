@@ -746,6 +746,18 @@ def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
     """
     assert input_scale is None
 
+    # swapAB only pays off for a skinny M: at M >= 32 the tensor-core tile is
+    # already full, so DeepGEMM is faster, and just above the threshold
+    # flashinfer's non-swapAB kernel is the slowest of the three. Route large M
+    # to DeepGEMM, mirroring vLLM's FlashInferFp8DeepGEMMDynamicBlockScaledKernel.
+    if (
+        deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and input.view(-1, input.shape[-1]).shape[0] >= 32
+    ):
+        return deepgemm_w8a8_block_fp8_linear_with_fallback(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
+
     output_dtype = input.dtype
     dtype_supported = output_dtype == torch.bfloat16
 
