@@ -52,6 +52,11 @@ These settings should preserve model behavior while changing residency, parallel
       <td style={{padding: "9px 12px"}}><a href="./ring_sp_performance">Sequence Parallelism</a></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500}}><code>--encoder-parallel</code></td>
+      <td style={{padding: "9px 12px"}}>Text/image encoding is a visible share of the request and the DiT replica sits idle during it.</td>
+      <td style={{padding: "9px 12px"}}><a href="./encoder_parallel">Encoder Parallelism</a></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>Attention backend</td>
       <td style={{padding: "9px 12px"}}>Kernel choice dominates DiT latency or memory.</td>
       <td style={{padding: "9px 12px"}}><a href="./attention_backends">Attention Backends</a></td>

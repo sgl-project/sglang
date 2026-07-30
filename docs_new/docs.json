@@ -402,6 +402,10 @@
       "destination": "/docs/sglang-diffusion/ring_sp_performance"
     },
     {
+      "source": "/diffusion/performance/encoder_parallel.html",
+      "destination": "/docs/sglang-diffusion/encoder_parallel"
+    },
+    {
       "source": "/diffusion/quantization.html",
       "destination": "/docs/sglang-diffusion/quantization"
     },
@@ -1332,6 +1336,7 @@
                   "docs/sglang-diffusion/deployment_cookbook",
                   "docs/sglang-diffusion/attention_backends",
                   "docs/sglang-diffusion/ring_sp_performance",
+                  "docs/sglang-diffusion/encoder_parallel",
                   "docs/sglang-diffusion/dynamic_batching",
                   {
                     "group": "Caching Acceleration",
