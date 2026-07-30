@@ -894,6 +894,23 @@ class TestForwardFlags(_IsolatedServerArgs):
             self.assertTrue(fwd.flashinfer_trtllm_bypass)
         self.assertFalse(fwd.flashinfer_trtllm_bypass)
 
+    def test_dp_reduce_scatterv_requires_single_rank_attention_dp_shards(self):
+        from sglang.srt.layers.moe.utils import should_use_dp_reduce_scatterv
+
+        reset_context()
+        with patch(
+            "sglang.srt.layers.moe.utils.is_dp_attention_enabled",
+            return_value=True,
+        ):
+            # The optimized path is valid when the collective group and the
+            # variable-split list have the same number of entries.
+            with get_parallel().override(tp_size=8, attn_dp_size=8, moe_ep_size=8):
+                self.assertTrue(should_use_dp_reduce_scatterv())
+
+            # Otherwise the standard all-reduce plus scatter path must be used.
+            with get_parallel().override(tp_size=8, attn_dp_size=2, moe_ep_size=2):
+                self.assertFalse(should_use_dp_reduce_scatterv())
+
 
 class TestPublishLifecycle(_IsolatedServerArgs):
     """Publish installs the resolved server_args and seeds the capture tier."""
