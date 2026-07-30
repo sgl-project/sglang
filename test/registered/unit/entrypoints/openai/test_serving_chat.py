@@ -119,7 +119,6 @@ class ServingChatTestCase(unittest.TestCase):
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
 
-    # ------------- model input capability validation -------------
     def test_text_only_model_rejects_media_before_generation(self):
         media_parts = {
             "image_url": {
