@@ -35,11 +35,7 @@ def _as_payloads(payload, *, split_batched_tensor: bool = False):
     """Return source payloads without splitting a single rank-2 embedding."""
     if isinstance(payload, (list, tuple)):
         return list(payload)
-    if (
-        split_batched_tensor
-        and isinstance(payload, torch.Tensor)
-        and payload.dim() > 2
-    ):
+    if split_batched_tensor and isinstance(payload, torch.Tensor) and payload.dim() > 2:
         return list(payload.unbind(dim=0))
     return [payload]
 
@@ -248,10 +244,7 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
                                 }
                             ]
                         )["input_features"]
-                elif (
-                    bundled_item.format
-                    == MultimodalInputFormat.PRECOMPUTED_EMBEDDING
-                ):
+                elif bundled_item.format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
                     embeddings = bundled_item.precomputed_embeddings
                     if embeddings is None:
                         # The shared collector keeps this payload in ``feature``.
@@ -337,7 +330,7 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
         Its resulting IDs are temporary: final IDs and offsets always come
         from the canonical expanded sequence returned with the base output.
         """
-        self.validate_mm_data(image_data, audio_data)
+        self.validate_mm_data(image_data=image_data, audio_data=audio_data)
 
         if isinstance(input_text, list):
             canonical_input_ids = torch.tensor(input_text, dtype=torch.long)
