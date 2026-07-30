@@ -69,12 +69,20 @@ fi
 
 BASE="http://127.0.0.1:$PORT"
 
+server_alive () {
+  curl -s --max-time 20 "http://127.0.0.1:$PORT/health_generate" > /dev/null 2>&1
+}
+
 run_bench_one_batch () {
   local name=$1
   local bs=$2
   local isl=$3
   shift 3
-  timeout 900 python3 -m sglang.benchmark.one_batch_server \
+  if ! server_alive; then
+    echo "SKIP bob_${name}: server not alive" | tee -a "$OUT/SKIPPED"
+    return
+  fi
+  timeout 420 python3 -m sglang.benchmark.one_batch_server \
     --model None --base-url "$BASE" \
     --batch-size "$bs" --input-len "$isl" --output-len 1 \
     --show-report \
@@ -88,7 +96,11 @@ run_bench_serving () {
   local conc=$2
   local nprompts=$3
   local isl=$4
-  timeout 1200 python3 -m sglang.bench_serving \
+  if ! server_alive; then
+    echo "SKIP serving_${name}: server not alive" | tee -a "$OUT/SKIPPED"
+    return
+  fi
+  timeout 600 python3 -m sglang.bench_serving \
     --backend sglang --host 127.0.0.1 --port "$PORT" \
     --dataset-name random --random-input-len "$isl" --random-output-len 1 \
     --random-range-ratio 1.0 \
