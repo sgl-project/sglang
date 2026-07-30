@@ -38,6 +38,7 @@ from sglang.srt.layers.dcp.comm import (
     all_gather_kv_cache_for_mha_extend,
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
+    alloc_dcp_q_combine_buf,
     cp_lse_ag_out_rs_mha,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
@@ -52,6 +53,20 @@ from sglang.srt.layers.dcp.layout import (
     update_local_kv_lens_for_dcp,
 )
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+from sglang.srt.layers.dcp.shared_output import (
+    DCP_OUTPUT_VMM_MAX_ROWS,
+    dcp_output_vmm_lse_reduce,
+    init_dcp_output_vmm_workspaces,
+)
+from sglang.srt.layers.dcp.shared_query_direct import (
+    DCP_QUERY_DIRECT_VMM_MAX_ROWS,
+    get_dcp_query_direct_vmm_workspace,
+    init_dcp_query_direct_vmm_workspace,
+)
+from sglang.srt.layers.dcp.shared_topk_vmm import (
+    DCP_TOPK_VMM_MAX_ROWS,
+    init_dcp_topk_vmm_workspace,
+)
 
 # NOTE: planner.py is intentionally NOT imported here. It depends on server_args
 # (get_server_args), whereas this package-init executes at module-load time
@@ -62,21 +77,30 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 # planner functions from sglang.srt.layers.dcp.planner directly.
 
 __all__ = [
+    "DCP_OUTPUT_VMM_MAX_ROWS",
+    "DCP_QUERY_DIRECT_VMM_MAX_ROWS",
+    "DCP_TOPK_VMM_MAX_ROWS",
     "DecodeContextParallelMetadata",
-    "dcp_a2a_lse_reduce",
-    "init_fi_a2a_workspace",
     "all_gather_kv_cache_for_dcp",
     "all_gather_kv_cache_for_mha_chunk_extend",
     "all_gather_kv_cache_for_mha_extend",
     "all_gather_kv_cache_for_mla_extend",
     "all_gather_q_for_mla_decode",
+    "alloc_dcp_q_combine_buf",
     "cp_lse_ag_out_rs_mha",
     "cp_lse_ag_out_rs_mla",
     "create_triton_kv_indices_for_dcp_triton",
+    "dcp_a2a_lse_reduce",
     "dcp_enabled",
+    "dcp_output_vmm_lse_reduce",
     "filter_dcp_local_kv_indices",
     "get_attention_dcp_rank",
     "get_attention_dcp_world_size",
+    "get_dcp_query_direct_vmm_workspace",
     "get_dcp_lens",
+    "init_dcp_output_vmm_workspaces",
+    "init_dcp_query_direct_vmm_workspace",
+    "init_dcp_topk_vmm_workspace",
+    "init_fi_a2a_workspace",
     "update_local_kv_lens_for_dcp",
 ]

@@ -74,7 +74,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -4303,8 +4303,24 @@ class DSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
+        parallel = get_parallel()
+        self.index_dcp_owner_sharded = (
+            parallel.dcp_enabled
+            and get_server_args().dcp_indexer_backend == "owner_sharded"
+        )
+        self.index_dcp_size = (
+            parallel.attn_dcp_size if self.index_dcp_owner_sharded else 1
+        )
+        self.index_dcp_rank = (
+            parallel.attn_dcp_rank if self.index_dcp_owner_sharded else 0
+        )
         if index_buf_size is None:
             index_buf_size = size
+            if parallel.dcp_enabled and not self.index_dcp_owner_sharded:
+                # The indexer K cache is not sharded under DCP: every rank
+                # keeps index_k for every token (global-slot addressed) so
+                # all ranks compute identical top-k.
+                index_buf_size = size * parallel.attn_dcp_size
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
@@ -4365,8 +4381,35 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        if self.index_dcp_owner_sharded:
+            if not torch.equal(
+                src_loc_flat % self.index_dcp_size,
+                tgt_loc_flat % self.index_dcp_size,
+            ):
+                raise RuntimeError(
+                    "owner-sharded DCP Indexer move changed token ownership"
+                )
+            owned = tgt_loc_flat % self.index_dcp_size == self.index_dcp_rank
+            tgt_loc_flat = tgt_loc_flat[owned] // self.index_dcp_size
+            src_loc_flat = src_loc_flat[owned] // self.index_dcp_size
         for index_k in self.index_k_with_scale_buffer:
-            index_k[tgt_loc_flat] = index_k[src_loc_flat]
+            index_buf_accessor.MoveKAndS.execute(
+                self,
+                index_k,
+                tgt_loc_flat,
+                src_loc_flat,
+            )
+
+    def _index_page_indices_for_slots(self, indices: torch.Tensor) -> torch.Tensor:
+        slots = indices.view(-1).long()
+        if self.index_dcp_owner_sharded:
+            slots = (
+                slots[slots % self.index_dcp_size == self.index_dcp_rank]
+                // self.index_dcp_size
+            )
+        if slots.numel() == 0:
+            return slots
+        return torch.unique_consecutive(slots // self.page_size)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
@@ -4450,7 +4493,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         # DSA attention reads garbage at those token positions.
         kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
 
-        page_indices = indices[:: self.page_size] // self.page_size
+        page_indices = self._index_page_indices_for_slots(indices)
         torch.cuda.synchronize()
         index_k_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -4472,7 +4515,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             kv_cache_cpu_dict["kv"], indices, mamba_indices=mamba_indices
         )
 
-        page_indices = indices[:: self.page_size] // self.page_size
+        page_indices = self._index_page_indices_for_slots(indices)
         index_k_cpu = kv_cache_cpu_dict["index_k"]
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size

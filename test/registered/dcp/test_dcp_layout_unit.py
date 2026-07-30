@@ -19,7 +19,10 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.dcp.layout import (
+    build_dcp_indexer_local_page_table,
+    get_dcp_lens,
+)
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -230,6 +233,50 @@ class TestGetDcpLens(CustomTestCase):
             )
             self.assertEqual(local_cells * dcp_size, full_replica_cells)
             self.assertEqual(local_pages * dcp_size, full_replica_pages)
+
+    def test_owner_sharded_indexer_page_table(self):
+        page_size = 64
+        dcp_size = 4
+        # Two non-contiguous physical logical pages followed by padding.
+        page_table_1 = torch.cat(
+            (
+                torch.arange(0, 256, dtype=torch.int32),
+                torch.arange(512, 768, dtype=torch.int32),
+                torch.full((256,), -1, dtype=torch.int32),
+            )
+        ).view(1, -1)
+
+        for rank in range(dcp_size):
+            actual = build_dcp_indexer_local_page_table(
+                page_table_1,
+                page_size,
+                dcp_size,
+                rank,
+            )
+            expected = torch.tensor([[0, 2, -1]], dtype=torch.int32)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            self.assertTrue(actual.is_contiguous())
+            self.assertEqual(actual.stride(1), 1)
+
+    def test_owner_sharded_indexer_singleton_page_table_has_unit_inner_stride(self):
+        page_size = 64
+        dcp_size = 4
+        page_table_1 = torch.arange(256, dtype=torch.int32).view(1, -1)
+
+        for rank in range(dcp_size):
+            actual = build_dcp_indexer_local_page_table(
+                page_table_1,
+                page_size,
+                dcp_size,
+                rank,
+            )
+            torch.testing.assert_close(
+                actual,
+                torch.zeros((1, 1), dtype=torch.int32),
+                rtol=0,
+                atol=0,
+            )
+            self.assertEqual(actual.stride(1), 1)
 
     def test_hybrid_pool_reports_the_backing_attention_shape(self):
         pool = object.__new__(HybridLinearKVPool)

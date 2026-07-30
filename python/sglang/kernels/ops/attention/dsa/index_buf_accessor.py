@@ -271,7 +271,76 @@ class SetKAndS:
             index_k=index_k,
             index_k_scale=index_k_scale,
             page_size=pool.page_size,
+            dcp_rank=getattr(pool, "index_dcp_rank", 0),
+            dcp_size=getattr(pool, "index_dcp_size", 1),
         )
+
+
+class MoveKAndS:
+    @classmethod
+    def execute(
+        cls,
+        pool: "DSATokenToKVPool",
+        buf: torch.Tensor,
+        tgt_loc: torch.Tensor,
+        src_loc: torch.Tensor,
+    ) -> None:
+        tgt_loc = tgt_loc.to(torch.int64).contiguous()
+        src_loc = src_loc.to(torch.int64).contiguous()
+        if tgt_loc.shape != src_loc.shape:
+            raise ValueError(
+                f"Indexer move shape mismatch: {tgt_loc.shape} != {src_loc.shape}"
+            )
+        if tgt_loc.numel() == 0:
+            return
+        if buf.dtype != torch.uint8 or not buf.is_contiguous():
+            raise TypeError("Indexer move requires a contiguous uint8 buffer")
+        _move_k_and_s_triton_kernel[(tgt_loc.numel(),)](
+            buf,
+            tgt_loc,
+            src_loc,
+            buf.stride(0),
+            page_size=pool.page_size,
+            index_head_dim=pool.index_head_dim,
+            block_size=128,
+        )
+
+
+@triton.jit
+def _move_k_and_s_triton_kernel(
+    buf,
+    tgt_loc,
+    src_loc,
+    buf_page_stride: tl.constexpr,
+    page_size: tl.constexpr,
+    index_head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    token = tl.program_id(0)
+    target = tl.load(tgt_loc + token)
+    source = tl.load(src_loc + token)
+    target_page = target // page_size
+    target_offset = target % page_size
+    source_page = source // page_size
+    source_offset = source % page_size
+
+    byte = tl.arange(0, block_size)
+    k_mask = byte < index_head_dim
+    source_k = source_page * buf_page_stride + source_offset * index_head_dim + byte
+    target_k = target_page * buf_page_stride + target_offset * index_head_dim + byte
+    value = tl.load(buf + source_k, mask=k_mask)
+    tl.store(buf + target_k, value, mask=k_mask)
+
+    scale_byte = tl.arange(0, 4)
+    scale_base = page_size * index_head_dim
+    source_scale = (
+        source_page * buf_page_stride + scale_base + source_offset * 4 + scale_byte
+    )
+    target_scale = (
+        target_page * buf_page_stride + scale_base + target_offset * 4 + scale_byte
+    )
+    scale = tl.load(buf + source_scale)
+    tl.store(buf + target_scale, scale)
 
 
 def _set_k_and_s_triton(
@@ -280,6 +349,8 @@ def _set_k_and_s_triton(
     index_k: torch.Tensor,
     index_k_scale: torch.Tensor,
     page_size: int,
+    dcp_rank: int = 0,
+    dcp_size: int = 1,
 ):
     """
     :param buf: (num_pages, page_size 64 * (128B data + 4B scale)), uint8
@@ -345,6 +416,8 @@ def _set_k_and_s_triton(
         NUM_K_ELEMS_PER_TOKEN=index_head_dim,
         S_OFFSET_NBYTES_IN_PAGE=page_size * index_head_dim,
         PRESHUFFLE_TILE=INDEXER_K_CACHE_PRESHUFFLE_TILE if _use_aiter_preshuffle else 0,
+        DCP_RANK=dcp_rank,
+        DCP_SIZE=dcp_size,
     )
 
 
@@ -361,10 +434,14 @@ def _set_k_and_s_triton_kernel(
     NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     PRESHUFFLE_TILE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
 
     loc = tl.load(loc_ptr + token_id)
+    owned = loc % DCP_SIZE == DCP_RANK
+    loc = tl.where(owned, loc // DCP_SIZE, 0)
 
     in_k_offsets = token_id * index_k_ptr_stride_0 + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
 
@@ -403,8 +480,8 @@ def _set_k_and_s_triton_kernel(
         + loc_token_offset_in_page
     )
 
-    tl.store(buf_fp8_ptr + out_k_offsets, k)
-    tl.store(buf_fp32_ptr + out_s_offset, k_scale)
+    tl.store(buf_fp8_ptr + out_k_offsets, k, mask=owned)
+    tl.store(buf_fp32_ptr + out_s_offset, k_scale, mask=owned)
 
 
 def _get_k_triton(

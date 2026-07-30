@@ -219,6 +219,9 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
+        self._pre_initialize_dcp_query_vmm_workspace()
+        self._pre_initialize_dcp_output_vmm_workspaces()
+        self._pre_initialize_dcp_topk_vmm_workspace()
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
@@ -269,6 +272,80 @@ class BaseRunner(ABC):
         from sglang.srt.layers.dcp import init_fi_a2a_workspace
 
         init_fi_a2a_workspace(get_parallel().dcp_group)
+
+    def _pre_initialize_dcp_output_vmm_workspaces(self):
+        """Create reusable VMM receive slots before CUDA graph capture."""
+        mr = self.model_runner
+        if mr.server_args.dcp_size <= 1 or mr.server_args.dcp_comm_backend != "vmm":
+            return
+
+        from sglang.srt.layers.dcp import init_dcp_output_vmm_workspaces
+
+        parallel = get_parallel()
+        local_heads = mr.model_config.get_num_attention_heads(parallel.attn_tp_size)
+        init_dcp_output_vmm_workspaces(
+            parallel.dcp_group,
+            total_heads=local_heads * parallel.dcp_size,
+            head_dim=mr.model_config.kv_lora_rank,
+        )
+
+    def _pre_initialize_dcp_query_vmm_workspace(self):
+        """Create the selected peer Query workspace before graph capture."""
+        mr = self.model_runner
+        if (
+            mr.server_args.dcp_size <= 1
+            or mr.server_args.dcp_query_backend == "allgather"
+        ):
+            return
+
+        if mr.server_args.dsa_decode_backend != "trtllm":
+            raise RuntimeError(
+                f"--dcp-query-backend {mr.server_args.dcp_query_backend} "
+                "requires --dsa-decode-backend trtllm"
+            )
+        if mr.kv_cache_dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                f"--dcp-query-backend {mr.server_args.dcp_query_backend} "
+                "requires FP8 E4M3 KV cache; "
+                f"resolved dtype is {mr.kv_cache_dtype}"
+            )
+
+        parallel = get_parallel()
+        local_heads = mr.model_config.get_num_attention_heads(parallel.attn_tp_size)
+        init_args = dict(
+            group=parallel.dcp_group,
+            local_heads=local_heads,
+            nope_dim=mr.model_config.kv_lora_rank,
+            rope_dim=mr.model_config.qk_rope_head_dim,
+        )
+        if mr.server_args.dcp_query_backend == "vmm_direct":
+            from sglang.srt.layers.dcp import (
+                init_dcp_query_direct_vmm_workspace,
+            )
+
+            init_dcp_query_direct_vmm_workspace(**init_args)
+        else:
+            raise AssertionError(
+                "unhandled DCP Query backend " f"{mr.server_args.dcp_query_backend!r}"
+            )
+
+    def _pre_initialize_dcp_topk_vmm_workspace(self):
+        """Create the owner-local candidate workspace before graph capture."""
+        mr = self.model_runner
+        if (
+            mr.server_args.dcp_size <= 1
+            or mr.server_args.dcp_indexer_backend != "owner_sharded"
+            or mr.server_args.dcp_topk_backend != "vmm"
+        ):
+            return
+
+        from sglang.srt.configs.model_config import get_dsa_index_topk
+        from sglang.srt.layers.dcp import init_dcp_topk_vmm_workspace
+
+        init_dcp_topk_vmm_workspace(
+            get_parallel().dcp_group,
+            local_candidates=get_dsa_index_topk(mr.model_config.hf_text_config),
+        )
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
