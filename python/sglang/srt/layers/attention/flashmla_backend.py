@@ -17,6 +17,7 @@ from sglang.kernels.ops.attention.utils import (
     get_num_kv_index_blocks_flashmla,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.layers.attention.base_attn_backend import VerifyBuffersToFill
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -294,8 +295,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     device="cuda",
                 )
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        return [self.cuda_graph_custom_mask, None]
+    def get_verify_buffers_to_fill_after_draft(self) -> VerifyBuffersToFill:
+        return VerifyBuffersToFill(tree_mask=self.cuda_graph_custom_mask)
 
     def _apply_decode_target_verify_metadata(
         self,

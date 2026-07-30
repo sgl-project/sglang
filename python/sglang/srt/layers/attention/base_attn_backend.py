@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -13,6 +14,21 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+@dataclass
+class VerifyBuffersToFill:
+    """Buffers for build_tree_kernel_efficient to fill in-place after draft,
+    plus whether target-verify attention actually reads the tree mask it fills.
+
+    tree_mask_is_read=False lets build_tree_kernel_efficient skip the
+    full-buffer prefix fill (max_num_tokens x max_context_len bool memset per
+    verify step).
+    """
+
+    tree_mask: Optional[torch.Tensor] = None
+    positions: Optional[torch.Tensor] = None
+    tree_mask_is_read: bool = True
 
 
 class AttentionBackend(ABC):
@@ -166,21 +182,13 @@ class AttentionBackend(ABC):
         """
         pass
 
-    def get_verify_buffers_to_fill_after_draft(self):
+    def get_verify_buffers_to_fill_after_draft(self) -> VerifyBuffersToFill:
         """
         Return buffers of verify attention kernels that needs to be filled after draft.
 
         Typically, these are tree mask and position buffers.
         """
-        return [None, None]
-
-    def target_verify_reads_custom_mask(self) -> bool:
-        """Whether target-verify attention reads spec_info.custom_mask at all.
-
-        When False, build_tree_kernel_efficient skips the full-buffer prefix
-        fill (max_num_tokens x max_context_len bool memset per verify step).
-        """
-        return True
+        return VerifyBuffersToFill()
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]

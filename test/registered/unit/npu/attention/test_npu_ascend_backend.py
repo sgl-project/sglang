@@ -36,6 +36,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
+from sglang.srt.layers.attention.base_attn_backend import VerifyBuffersToFill
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
@@ -691,8 +692,10 @@ class TestGetVerifyBuffers(unittest.TestCase):
     def test_returns_none_none(self):
         backend = object.__new__(AscendAttnBackend)
         result = backend.get_verify_buffers_to_fill_after_draft()
-        self.assertEqual(result, [None, None])
-        self.assertEqual(len(result), 2)
+        self.assertEqual(result, VerifyBuffersToFill())
+        self.assertIsNone(result.tree_mask)
+        self.assertIsNone(result.positions)
+        self.assertTrue(result.tree_mask_is_read)
 
     def test_update_is_noop(self):
         backend = object.__new__(AscendAttnBackend)

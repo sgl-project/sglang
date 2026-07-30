@@ -20,7 +20,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    VerifyBuffersToFill,
+)
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
@@ -1171,13 +1174,13 @@ class TritonAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
-    def get_verify_buffers_to_fill_after_draft(self):
+    def get_verify_buffers_to_fill_after_draft(self) -> VerifyBuffersToFill:
         """
         Return buffers for verify attention kernels that needs to be filled after draft.
 
         Typically, these are tree mask and position buffers.
         """
-        return [self.cuda_graph_custom_mask, None]
+        return VerifyBuffersToFill(tree_mask=self.cuda_graph_custom_mask)
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]

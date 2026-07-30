@@ -17,7 +17,10 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    VerifyBuffersToFill,
+)
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import AttentionType
@@ -2557,16 +2560,16 @@ class FlashAttentionBackend(AttentionBackend):
 
         return metadata, metadata_expand
 
-    def get_verify_buffers_to_fill_after_draft(self):
+    def get_verify_buffers_to_fill_after_draft(self) -> VerifyBuffersToFill:
         # Return the preallocated FULL_MASK tree-mask scratch so that
         # build_tree_kernel_efficient fills it in-place and the worker never
         # needs seq_lens_sum to size a dynamic allocation (no D2H sync).
-        return [self.cuda_graph_custom_mask, None]
-
-    def target_verify_reads_custom_mask(self) -> bool:
+        #
         # topk<=1 verify never extracts from custom_mask (both the eager and
         # cuda-graph metadata paths gate the extraction on topk > 1).
-        return self.topk > 1
+        return VerifyBuffersToFill(
+            tree_mask=self.cuda_graph_custom_mask, tree_mask_is_read=self.topk > 1
+        )
 
     @staticmethod
     def _host_max_seq_len(

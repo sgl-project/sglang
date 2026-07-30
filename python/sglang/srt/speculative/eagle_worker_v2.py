@@ -1238,7 +1238,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         retrieve_next_sibling = torch.full((bs, 1), -1, dtype=torch.long, device=device)
 
         attn_backend = self._target_worker.model_runner.attn_backend
-        mask_buf, position_buf = attn_backend.get_verify_buffers_to_fill_after_draft()
+        verify_buffers = attn_backend.get_verify_buffers_to_fill_after_draft()
+        mask_buf, position_buf = verify_buffers.tree_mask, verify_buffers.positions
         if mask_buf is not None:
             custom_mask = mask_buf
             custom_mask.fill_(True)

@@ -12,7 +12,10 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     track_mamba_states_if_needed,
 )
 from sglang.srt.configs.hybrid_arch import mamba2_config
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    VerifyBuffersToFill,
+)
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
@@ -920,16 +923,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.on_after_cuda_graph_warmup()
 
-    def get_verify_buffers_to_fill_after_draft(self):
+    def get_verify_buffers_to_fill_after_draft(self) -> VerifyBuffersToFill:
         # Verify tree-mask / position buffers live on the full-attn child (the
         # linear side consumes no mask). Handing them out lets the draft stage
         # write straight into the captured verify buffers instead of allocating
         # a fresh mask every step.
         return self.full_attn_backend.get_verify_buffers_to_fill_after_draft()
-
-    def target_verify_reads_custom_mask(self) -> bool:
-        # Same child that hands out the mask buffer answers whether it is read.
-        return self.full_attn_backend.target_verify_reads_custom_mask()
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]

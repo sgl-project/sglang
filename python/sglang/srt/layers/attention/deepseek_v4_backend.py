@@ -39,7 +39,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     ComputeDsparkWindowGather,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    VerifyBuffersToFill,
+)
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
@@ -1521,12 +1524,11 @@ class DeepseekV4AttnBackend(
                 device=self.device,
             )
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        return [self.cuda_graph_custom_mask, None]
-
-    def target_verify_reads_custom_mask(self) -> bool:
+    def get_verify_buffers_to_fill_after_draft(self) -> VerifyBuffersToFill:
         # DSV4 verify metadata never extracts from custom_mask.
-        return False
+        return VerifyBuffersToFill(
+            tree_mask=self.cuda_graph_custom_mask, tree_mask_is_read=False
+        )
 
     def replay_cuda_graph_metadata_from(
         self,

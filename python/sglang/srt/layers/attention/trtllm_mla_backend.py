@@ -31,6 +31,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import VerifyBuffersToFill
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
@@ -367,8 +368,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        return [self.cuda_graph_custom_mask, None]
+    def get_verify_buffers_to_fill_after_draft(self) -> VerifyBuffersToFill:
+        return VerifyBuffersToFill(tree_mask=self.cuda_graph_custom_mask)
 
     def _init_cuda_graph_metadata(
         self,
