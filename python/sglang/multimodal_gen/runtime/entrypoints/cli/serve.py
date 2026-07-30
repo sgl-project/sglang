@@ -33,7 +33,7 @@ def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None =
     server_args = ServerArgs.from_cli_args(
         args,
         unknown_args,
-        default_args={"warmup_mode": "server", "encoder_parallel": "dp"},
+        default_args={"warmup_mode": "server"},
     )
 
     dispatch_launch(server_args)

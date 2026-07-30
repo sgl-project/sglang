@@ -315,7 +315,11 @@ class TextEncoderLoader(ComponentLoader):
         if post_diffusers_config_update is not None:
             post_diffusers_config_update()
         # real dims are populated now; resolve fold vs replicate
-        finalize_encoder_folding(encoder_config, server_args.encoder_parallel)
+        finalize_encoder_folding(
+            encoder_config,
+            server_args.encoder_parallel,
+            batched=server_args.batching_max_size > 1,
+        )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
             encoder_index
         ]

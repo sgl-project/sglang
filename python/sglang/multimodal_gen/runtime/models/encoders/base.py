@@ -110,36 +110,40 @@ def group_has_measured_topology(group) -> bool:
     )
 
 
-def encoder_dp_worthwhile(
-    config: EncoderConfig, batch_size: int, measured_topology: bool = True
-) -> bool:
+def encoder_dp_capable(config: EncoderConfig) -> bool:
+    """wide enough that splitting a batched encode beats its one all_gather"""
     hidden, _, _ = _encoder_dims(config)
-    return (
-        measured_topology
-        and batch_size > 1
-        and hidden is not None
-        and hidden >= DP_MIN_HIDDEN_SIZE
-    )
+    return hidden is not None and hidden >= DP_MIN_HIDDEN_SIZE
 
 
-def finalize_encoder_folding(config: EncoderConfig, policy: str = "auto") -> None:
+def encoder_dp_worthwhile(
+    config: EncoderConfig, batch_size: int, measured_topology: bool
+) -> bool:
+    return measured_topology and batch_size > 1 and encoder_dp_capable(config)
+
+
+def finalize_encoder_folding(
+    config: EncoderConfig, policy: str = "auto", batched: bool = False
+) -> None:
     """resolve fold-vs-replicate once real dims are known (post update_model_arch,
-    pre construction); folding shards the weights, so it excludes dp/replicate
-    for the lifetime of the loaded model"""
+    pre construction); folding shards the weights, so it rules out dp for the
+    lifetime of the loaded model. `batched` is the batching ceiling being > 1."""
     if config.parallel_folding_mode is None:
         return
-    if policy in ("dp", "replicate"):
-        config.parallel_folding_mode = None
-        return
     group = get_folding_tp_group(config)
-    group_size = group.world_size
     if policy == "fold":
-        # explicit: shard whenever the dims allow it, topology is the caller's call
-        keep = _encoder_dims_divide(config, group_size)
-    else:
-        keep = encoder_folding_worthwhile(
-            config, group_size
-        ) and group_has_measured_topology(group)
+        # explicit: shard whenever the dims allow, topology is the caller's call
+        keep = _encoder_dims_divide(config, group.world_size)
+    elif policy == "auto":
+        # a batched encode prefers dp (one all_gather) over folding (an
+        # all_reduce per layer), so leave a dp-capable encoder unsharded
+        keep = (
+            not (batched and encoder_dp_capable(config))
+            and encoder_folding_worthwhile(config, group.world_size)
+            and group_has_measured_topology(group)
+        )
+    else:  # dp / replicate
+        keep = False
     if not keep:
         config.parallel_folding_mode = None
 

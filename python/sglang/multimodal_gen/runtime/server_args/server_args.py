@@ -592,30 +592,6 @@ class ServerArgs(DisaggServerArgsMixin):
         # one replica = all its GPUs
         replica_size = (self.num_gpus or tp_size) // dp_size
 
-        # dp only engages once a single encode call carries more than one
-        # prompt, which needs --batching-max-size > 1. Say so rather than
-        # raising it here: that would switch DiT batching on as a side effect of
-        # an encoder flag, which changes the denoise batch shape (and therefore
-        # the output) for every serve deployment.
-        if (
-            self.encoder_parallel == "dp"
-            and replica_size > 1
-            and self.batching_max_size <= 1
-        ):
-            logger.info(
-                "encoder_parallel=dp stays inactive at batching_max_size=1: it "
-                "splits a batched encode across ranks, so pass "
-                "--batching-max-size > 1 to use it."
-            )
-
-        # 1. adjust for encoder parallel folding. replicate never folds; dp only
-        # displaces folding when it can actually engage -- it needs a batched
-        # encode, so at a batching ceiling of 1 folding is the better answer and
-        # dropping it would leave the encoder replicated for nothing.
-        if self.encoder_parallel == "replicate" or (
-            self.encoder_parallel == "dp" and self.batching_max_size > 1
-        ):
-            return
         fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
 
         if fold_world:

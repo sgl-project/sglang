@@ -51,7 +51,11 @@ class ImageEncoderLoader(TextEncoderLoader):
         encoder_config = server_args.pipeline_config.image_encoder_config
         encoder_config.update_model_arch(model_config)
         # real dims are populated now; resolve fold vs replicate
-        finalize_encoder_folding(encoder_config, server_args.encoder_parallel)
+        finalize_encoder_folding(
+            encoder_config,
+            server_args.encoder_parallel,
+            batched=server_args.batching_max_size > 1,
+        )
 
         # Always start with local device; load_model will adjust for offload if needed
         # TODO(will): add support for other dtypes

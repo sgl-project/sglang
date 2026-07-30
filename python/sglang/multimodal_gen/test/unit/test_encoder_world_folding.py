@@ -121,27 +121,10 @@ def test_all_encoders_get_the_same_proposed_mode():
     assert img.parallel_folding_mode == "world"
 
 
-def test_replicate_policy_proposes_nothing():
-    assert _proposed_mode(tp=1, sp=2, cfg=1, policy="replicate") is None
-
-
-def test_dp_only_displaces_folding_once_it_can_engage():
-    # dp needs a batched encode. At a ceiling of 1 it can never engage, so
-    # dropping the fold proposal would leave the encoder replicated for nothing
-    # (this is what serve's dp default did to qwen-image on 2 GPUs).
-    enc = T5Config()
-    enc.parallel_folding_mode = None
-    _run([enc], tp=1, sp=2, cfg=1, policy="dp", batching_max_size=1)
-    assert enc.parallel_folding_mode == "world"
-
-    enc.parallel_folding_mode = None
-    _run([enc], tp=1, sp=2, cfg=1, policy="dp", batching_max_size=2)
-    assert enc.parallel_folding_mode is None
-
-
-def test_fold_and_auto_policy_still_propose():
-    assert _proposed_mode(tp=1, sp=2, cfg=1, policy="fold") == "world"
-    assert _proposed_mode(tp=1, sp=2, cfg=1, policy="auto") == "world"
+def test_adjust_proposes_regardless_of_policy():
+    # adjust reads the parallelism only; finalize owns the policy decision.
+    for policy in ("auto", "fold", "dp", "replicate"):
+        assert _proposed_mode(tp=1, sp=2, cfg=1, policy=policy) == "world", policy
 
 
 def test_no_policy_touches_batching_max_size():
@@ -216,35 +199,42 @@ def test_dims_divide():
     assert _encoder_dims_divide(_enc(4096, 64, 10240), 1) is False  # group of 1
 
 
-def test_dp_unmeasured_topology_stays_replicated():
-    # the width thresholds were measured on NVLink H100s; without peer-to-peer
-    # between ranks the collective costs several times more, so auto declines.
-    wide = _enc(4096, 64, 10240)
-    assert encoder_dp_worthwhile(wide, 4, measured_topology=False) is False
-    assert encoder_dp_worthwhile(wide, 4, measured_topology=True) is True
-
-
 def test_dp_worthwhile():
-    # batch data-parallel pays only above the latency-bound width and batch>1.
-    assert encoder_dp_worthwhile(_enc(4096, 64, 10240), batch_size=2) is True
-    assert encoder_dp_worthwhile(_enc(2560, 32, 9728), batch_size=4) is True
-    assert encoder_dp_worthwhile(_enc(768, 12, 3072), batch_size=8) is False  # CLIP-L
-    assert encoder_dp_worthwhile(_enc(4096, 64, 10240), batch_size=1) is False
-    assert encoder_dp_worthwhile(TextEncoderConfig(), batch_size=4) is False
+    # dp pays above the latency-bound width, with a batch, on a measured topology
+    wide = _enc(4096, 64, 10240)
+    assert encoder_dp_worthwhile(wide, 2, True) is True
+    assert encoder_dp_worthwhile(_enc(2560, 32, 9728), 4, True) is True
+    assert encoder_dp_worthwhile(_enc(768, 12, 3072), 8, True) is False  # CLIP-L
+    assert encoder_dp_worthwhile(wide, 1, True) is False  # unbatched
+    assert encoder_dp_worthwhile(wide, 4, False) is False  # no peer-to-peer
+    assert encoder_dp_worthwhile(TextEncoderConfig(), 4, True) is False
 
 
 # --- stage 3: finalize dispatches on the encoder_parallel policy --------------
 
 
-def _finalize(monkeypatch, hidden, heads, inter, policy, mode="world", group_size=2):
+def _finalize(
+    monkeypatch,
+    hidden,
+    heads,
+    inter,
+    policy,
+    mode="world",
+    group_size=2,
+    batched=False,
+    measured=True,
+):
     monkeypatch.setattr(
         _base_mod,
         "get_folding_tp_group",
         lambda config: SimpleNamespace(world_size=group_size),
     )
+    monkeypatch.setattr(
+        _base_mod, "group_has_measured_topology", lambda group: measured
+    )
     enc = _enc(hidden, heads, inter)
     enc.parallel_folding_mode = mode
-    finalize_encoder_folding(enc, policy)
+    finalize_encoder_folding(enc, policy, batched=batched)
     return enc.parallel_folding_mode
 
 
@@ -257,6 +247,19 @@ def test_finalize_dp_replicate_never_fold(monkeypatch):
 def test_finalize_auto_keeps_wide_clears_narrow(monkeypatch):
     assert _finalize(monkeypatch, 4096, 64, 10240, "auto") == "world"
     assert _finalize(monkeypatch, 2560, 32, 9728, "auto") is None  # below threshold
+
+
+def test_finalize_auto_leaves_dp_capable_unsharded_when_batched(monkeypatch):
+    # with a batch, dp (one all_gather) beats folding (an all_reduce per layer)
+    assert _finalize(monkeypatch, 4096, 64, 10240, "auto", batched=True) is None
+    # CLIP-L cannot dp either, so folding remains the only question
+    assert _finalize(monkeypatch, 768, 12, 3072, "auto", batched=True) is None
+
+
+def test_finalize_auto_needs_a_measured_topology(monkeypatch):
+    assert _finalize(monkeypatch, 4096, 64, 10240, "auto", measured=False) is None
+    # explicit fold is the operator's call, topology included
+    assert _finalize(monkeypatch, 4096, 64, 10240, "fold", measured=False) == "world"
 
 
 def test_finalize_fold_ignores_size_but_needs_divisible(monkeypatch):
