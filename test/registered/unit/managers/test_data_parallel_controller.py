@@ -461,7 +461,8 @@ class TestPrefixAffinityFallback(CustomTestCase):
         )
         ctl.prefix_affinity_scheduler(req)  # must not raise
         self.assertEqual(
-            sum(w.send_pyobj.call_count for w in ctl.workers), 1,
+            sum(w.send_pyobj.call_count for w in ctl.workers),
+            1,
             "keyless req without a routing_key attribute must dispatch exactly once",
         )
 
