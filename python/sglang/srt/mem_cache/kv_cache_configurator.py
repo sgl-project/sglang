@@ -1358,11 +1358,24 @@ class KVCacheConfigurator:
             pool_kwargs["quant_method"] = quant_method
         else:
             pool_kwargs["post_capture_active"] = self.post_capture_kv_active
+        # DFLASH draft + prefill-CP: the dense draft attention shards KV heads by
+        # the full tp_size (see DFlashAttention), but attn_tp_size collapses to 1
+        # under CP. Size the draft KV pool by tp_size so its per-rank row geometry
+        # matches the draft attention output (otherwise the graph-captured
+        # store_cache write sees cp_size x too many index slots) and the pool does
+        # not over-allocate ~cp_size x. No-op when attn_tp_size == tp_size (non-CP).
+        _dflash_cp_kv_head_tp = get_parallel().attn_tp_size
+        if (
+            self.is_draft_worker
+            and self.spec_algorithm.is_dflash_family()
+            and get_parallel().attn_tp_size != get_parallel().tp_size
+        ):
+            _dflash_cp_kv_head_tp = get_parallel().tp_size
         token_to_kv_pool = pool_cls(
             max_total_num_tokens,
             page_size=self.server_args.page_size,
             dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
+            head_num=self.model_config.get_num_kv_heads(_dflash_cp_kv_head_tp),
             head_dim=self.model_config.head_dim,
             v_head_dim=self.model_config.v_head_dim,
             layer_num=self.layer_info.num_effective_layers,

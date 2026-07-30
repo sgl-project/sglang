@@ -304,6 +304,30 @@ class AiterAttnBackend(AttentionBackend):
             )
             global _use_mla_ps_kernel, fast_mode, intra_batch_mode
 
+            # V3 no-pad (SGLANG_AITER_MLA_NO_PAD_HEADS): route the native qh8/gqaratio8
+            # aiter MLA kernel instead of repeat_interleave-padding q-heads 8 -> 16.
+            # gfx950 mla_decode_fwd natively supports nhead in {8,16} on the non-persistent
+            # path; force non-persistent (persistent fake-nps for nhead != 16 can gpu-fault),
+            # matching how the padded bf16 tp8 path already runs.
+            self._aiter_no_pad_heads = get_bool_env_var(
+                "SGLANG_AITER_MLA_NO_PAD_HEADS", "False"
+            ) and self.num_head in (4, 8)
+            if self._aiter_no_pad_heads:
+                self.num_head_padded = self.num_head
+                self.head_repeat_factor = 1
+                if get_bool_env_var("SGLANG_AITER_MLA_NO_PAD_NONPERSIST", "False"):
+                    # decode qseqlen=1 works, but EAGLE verify qseqlen=4 has no qh8
+                    # kernel on the non-persistent path -> NaN. Kept as an opt-in.
+                    _use_mla_ps_kernel = False
+                    fast_mode = False
+                    intra_batch_mode = False
+                else:
+                    # Persistent path: gfx950 bf16 natively supports any nhead+qseqlen.
+                    # Use the non-fake-nps combo (fast_mode=True, intra_batch_mode=False),
+                    # same as the num_head in (32,64,128) branch below.
+                    fast_mode = True
+                    intra_batch_mode = False
+
             # current mla_decode_fwd only support fake-nps in self.num_head == 16
             # so all num_head size does not use qh16 kernel to simulate
             # it should not use fake-nps (fast_mode = False, intra_batch_mode = True)

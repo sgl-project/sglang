@@ -6,6 +6,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -99,7 +102,8 @@ class DSATopKBackend(Enum):
         # matches we commit to v2 and never silently fall back to the legacy
         # page_size=1 path from here.
         if (
-            envs.SGLANG_OPT_USE_TOPK_V2.get()
+            not _is_hip
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
             and topk_transform_method == TopkTransformMethod.PAGED
             and row_starts is None
             and batch_idx_list is None
