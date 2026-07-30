@@ -10,6 +10,7 @@ The BMM absorb steps stay module level to keep ROCm kernel selection localized.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -67,6 +68,16 @@ from sglang.srt.utils import BumpAllocator
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
+
+def _is_pow2(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+@dataclass(frozen=True)
+class RocmMlaProjectionFusionPlan:
+    q_nope: torch.Tensor
+
+
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
@@ -112,6 +123,9 @@ if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
         fused_rms_fp8_group_quant,
+    )
+    from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
+        fused_fp4_bmm_rope_cat_and_cache_mla,
     )
 
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
@@ -287,6 +301,40 @@ def _fused_rope_cat_and_cache(
 
 class DeepseekMLARocmForwardMixin:
 
+    def _can_fuse_rocm_mla_projection_rope_cache(
+        self: DeepseekV2AttentionMLA,
+        forward_batch: ForwardBatch,
+        *,
+        is_capture_mode: bool,
+    ) -> bool:
+        return (
+            _use_aiter_gfx95
+            and envs.SGLANG_ROCM_FUSE_MLA_PROJECTION_ROPE_CACHE.get()
+            and is_capture_mode
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and self.current_attention_backend == "aiter"
+            and not self.use_dsa
+            and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+            and not is_kv_b_lora_active(self)
+            and not get_parallel().dcp_enabled
+            and self.w_kc.dtype == torch.uint8
+            and self.w_scale_k is not None
+            and self.rotary_emb is not None
+            # Kernel shape constraints. fused_fp4_bmm_rope_cat_and_cache_mla
+            # tiles the latent and rope widths as unmasked tl.arange tiles and
+            # quantizes the BMM K dim in 32-wide MXFP4 groups, so all three must
+            # be powers of two (K additionally a multiple of 32, and <= 256 so
+            # the packed A-load stays on the single-tile path). None of this is
+            # asserted kernel-side -- a bad shape reads out of bounds silently.
+            # The kernel is key-side only: it never sees v_head_dim, and
+            # q_lora_rank is upstream of the absorbed projection.
+            and _is_pow2(self.qk_nope_head_dim)
+            and 32 <= self.qk_nope_head_dim <= 256
+            and _is_pow2(self.kv_lora_rank)
+            and _is_pow2(self.qk_rope_head_dim)
+            and self.qk_rope_head_dim >= 2
+        )
+
     def forward_absorb_rocm_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -458,12 +506,26 @@ class DeepseekMLARocmForwardMixin:
 
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
+        rocm_projection_plan = None
+        if self._can_fuse_rocm_mla_projection_rope_cache(
+            forward_batch,
+            is_capture_mode=get_is_capture_mode(),
+        ):
+            rocm_projection_plan = RocmMlaProjectionFusionPlan(q_nope=q_nope)
+            logger.info_once(
+                "ROCm Kimi MLA absorbed projection + RoPE/cache fusion is enabled."
+            )
+
         if q_replicate_active:
             q_nope_out = (
                 torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
                 .transpose(0, 1)
                 .contiguous()
             )
+        elif rocm_projection_plan is not None:
+            # The absorbed projection is fused with the independent RoPE and
+            # KV-cache branch in forward_absorb_rocm_core.
+            q_nope_out = None
         else:
             _kvb_q = None
             if _SGLANG_EXPERIMENTAL_LORA_OPTI:
@@ -587,6 +649,7 @@ class DeepseekMLARocmForwardMixin:
             positions,
             topk_indices,
             llama_4_scaling,
+            rocm_projection_plan,
         )
 
     def forward_absorb_rocm_core(
@@ -600,10 +663,44 @@ class DeepseekMLARocmForwardMixin:
         positions,
         topk_indices,
         llama_4_scaling,
+        rocm_projection_plan: Optional[RocmMlaProjectionFusionPlan] = None,
     ):
         save_kv_cache = True
 
-        if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
+        if rocm_projection_plan is not None:
+            kv_cache_dtype = (
+                fp8_dtype
+                if self.kv_cache_dtype == "fp8_e4m3"
+                else rocm_projection_plan.q_nope.dtype
+            )
+            q, _, _, k = fused_fp4_bmm_rope_cat_and_cache_mla(
+                rocm_projection_plan.q_nope.transpose(0, 1),
+                self.w_kc.transpose(-2, -1),
+                self.w_scale_k.transpose(-2, -1),
+                q_pe,
+                k_nope,
+                k_pe,
+                get_token_to_kv_pool().get_key_buffer(self.attn_mqa.layer_id),
+                forward_batch.out_cache_loc,
+                positions,
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                k_scale=self.attn_mqa.k_scale,
+                is_neox=self.rotary_emb.is_neox_style,
+                q_out_dtype=kv_cache_dtype,
+            )
+            save_kv_cache = False
+            if llama_4_scaling is not None:
+                q *= llama_4_scaling
+            attn_output = self.attn_mqa(
+                q,
+                k,
+                k_nope,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+            )
+        elif self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
                 q_cat, _, k_pe_fused, _ = _fused_rope_cat_and_cache(
                     self,
