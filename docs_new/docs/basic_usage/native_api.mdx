@@ -64,6 +64,7 @@ Get the information of the model.
 - `has_audio_understanding`: Whether the model has audio-understanding capability.
 - `model_type`: The model type from the HuggingFace config (e.g., "qwen2", "llama").
 - `architectures`: The model architectures from the HuggingFace config (e.g., ["Qwen2ForCausalLM"]).
+- `embedding`: The resolved embedding-serving plan. It includes pooling, normalization, execution and attention style, Matryoshka dimensions, cache policy, and effective BCG prefill settings. This field is available when the model configuration exposes an embedding capability contract.
 
 ```python Example
 url = f"http://localhost:{port}/get_model_info"
@@ -85,6 +86,7 @@ assert response_json.keys() == {
     "has_audio_understanding",
     "model_type",
     "architectures",
+    "embedding",
 }
 ```
 

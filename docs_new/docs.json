@@ -402,6 +402,10 @@
       "destination": "/docs/sglang-diffusion/ring_sp_performance"
     },
     {
+      "source": "/diffusion/performance/encoder_parallel.html",
+      "destination": "/docs/sglang-diffusion/encoder_parallel"
+    },
+    {
       "source": "/diffusion/quantization.html",
       "destination": "/docs/sglang-diffusion/quantization"
     },
@@ -970,6 +974,39 @@
                 "pages": [
                   "cookbook/autoregressive/intro",
                   {
+                    "group": "Kimi (Moonshot AI)",
+                    "pages": [
+                      "cookbook/autoregressive/Moonshotai/Kimi-K3",
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2.7-Code",
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2.5",
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2",
+                      "cookbook/autoregressive/Moonshotai/Kimi-Linear"
+                    ]
+                  },
+                  {
+                    "group": "Thinking Machines",
+                    "pages": [
+                      "cookbook/autoregressive/ThinkingMachines/Inkling"
+                    ]
+                  },
+                  {
+                    "group": "GLM",
+                    "pages": [
+                      "cookbook/autoregressive/GLM/GLM-5.2",
+                      "cookbook/autoregressive/GLM/GLM-5.1",
+                      "cookbook/autoregressive/GLM/GLM-5",
+                      "cookbook/autoregressive/GLM/GLM-OCR",
+                      "cookbook/autoregressive/GLM/GLM-Glyph",
+                      "cookbook/autoregressive/GLM/GLM-4.7",
+                      "cookbook/autoregressive/GLM/GLM-4.7-Flash",
+                      "cookbook/autoregressive/GLM/GLM-4.6",
+                      "cookbook/autoregressive/GLM/GLM-4.6V",
+                      "cookbook/autoregressive/GLM/GLM-4.5",
+                      "cookbook/autoregressive/GLM/GLM-4.5V"
+                    ]
+                  },
+                  {
                     "group": "Qwen",
                     "pages": [
                       "cookbook/autoregressive/Qwen/Qwen3.6",
@@ -1010,28 +1047,6 @@
                     ]
                   },
                   {
-                    "group": "GLM",
-                    "pages": [
-                      "cookbook/autoregressive/GLM/GLM-5.2",
-                      "cookbook/autoregressive/GLM/GLM-5.1",
-                      "cookbook/autoregressive/GLM/GLM-5",
-                      "cookbook/autoregressive/GLM/GLM-OCR",
-                      "cookbook/autoregressive/GLM/GLM-Glyph",
-                      "cookbook/autoregressive/GLM/GLM-4.7",
-                      "cookbook/autoregressive/GLM/GLM-4.7-Flash",
-                      "cookbook/autoregressive/GLM/GLM-4.6",
-                      "cookbook/autoregressive/GLM/GLM-4.6V",
-                      "cookbook/autoregressive/GLM/GLM-4.5",
-                      "cookbook/autoregressive/GLM/GLM-4.5V"
-                    ]
-                  },
-                  {
-                    "group": "Thinking Machines",
-                    "pages": [
-                      "cookbook/autoregressive/ThinkingMachines/Inkling"
-                    ]
-                  },
-                  {
                     "group": "Meituan",
                     "pages": [
                       "cookbook/autoregressive/Meituan/LongCat-2.0"
@@ -1055,17 +1070,6 @@
                     "group": "OpenAI",
                     "pages": [
                       "cookbook/autoregressive/OpenAI/GPT-OSS"
-                    ]
-                  },
-                  {
-                    "group": "Moonshotai",
-                    "pages": [
-                      "cookbook/autoregressive/Moonshotai/Kimi-K3",
-                      "cookbook/autoregressive/Moonshotai/Kimi-K2.7-Code",
-                      "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
-                      "cookbook/autoregressive/Moonshotai/Kimi-K2.5",
-                      "cookbook/autoregressive/Moonshotai/Kimi-K2",
-                      "cookbook/autoregressive/Moonshotai/Kimi-Linear"
                     ]
                   },
                   {
@@ -1188,7 +1192,6 @@
                   "cookbook/diffusion/intro",
                   {
                     "group": "Cosmos",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Cosmos/Cosmos3"
                     ]
@@ -1201,7 +1204,6 @@
                   },
                   {
                     "group": "Ideogram",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Ideogram/Ideogram4"
                     ]
@@ -1215,7 +1217,6 @@
                   },
                   {
                     "group": "LongLive",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LongLive/LongLive-2.0"
                     ]
@@ -1228,7 +1229,6 @@
                   },
                   {
                     "group": "JoyAI-Echo",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/JoyEcho/JoyEcho"
                     ]
@@ -1248,7 +1248,6 @@
                   },
                   {
                     "group": "Krea",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Krea/Krea-2"
                     ]
@@ -1267,7 +1266,6 @@
                   },
                   {
                     "group": "LingBot World",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/LingBot-World/LingBot-World",
                       "cookbook/diffusion/LingBot-World/LingBot-World-2.0"
@@ -1275,7 +1273,6 @@
                   },
                   {
                     "group": "SANA-WM",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/SANA-WM/SANA-WM"
                     ]
@@ -1339,6 +1336,7 @@
                   "docs/sglang-diffusion/deployment_cookbook",
                   "docs/sglang-diffusion/attention_backends",
                   "docs/sglang-diffusion/ring_sp_performance",
+                  "docs/sglang-diffusion/encoder_parallel",
                   "docs/sglang-diffusion/dynamic_batching",
                   {
                     "group": "Caching Acceleration",
