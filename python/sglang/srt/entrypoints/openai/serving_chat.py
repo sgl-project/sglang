@@ -77,6 +77,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
+
 
 def normalize_tool_content(role: str, content):
     """Normalize tool message content from OpenAI array format to plain string.
@@ -604,6 +606,17 @@ class OpenAIServingChat(OpenAIServingBase):
         """Validate that the input is valid."""
         if not request.messages:
             return "Messages cannot be empty."
+
+        if not self.tokenizer_manager.model_config.is_multimodal:
+            for message in request.messages:
+                if not isinstance(message.content, list):
+                    continue
+                for part in message.content:
+                    if part.type in _MEDIA_CONTENT_PART_TYPES:
+                        return (
+                            "Model only supports text input; "
+                            f"received unsupported content type '{part.type}'."
+                        )
 
         if (
             isinstance(request.tool_choice, str)
