@@ -1667,12 +1667,12 @@ class Req(ReqDllmMixin):
         if not isinstance(token_id, list):
             token_id = [token_id]
 
-        try:
-            end_pos = token_id.index(think_end_id)
-            self.reasoning_tokens += end_pos + 1
-            self._is_reasoning_over = True
-        except ValueError:
-            self.reasoning_tokens += len(token_id)
+        for i, val in enumerate(token_id)):
+            if val == think_end_id:
+                self.reasoning_tokens += i + 1
+                self._is_reasoning_over = True
+                return
+        self.reasoning_tokens += len(token_id)
 
     def __repr__(self):
         return (
