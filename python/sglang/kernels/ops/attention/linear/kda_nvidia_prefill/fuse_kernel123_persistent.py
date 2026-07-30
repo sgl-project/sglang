@@ -1,7 +1,7 @@
 # Vendored from the NVIDIA KDA_prefill package (benchmark/ Blackwell path)
 # for the Kimi-K3 chunked prefill forward. Local deltas: fla.* imports
 # re-pointed to sglang's vendored fla subset, flat sibling imports made
-# package-relative, RCP_LN2 inlined. INTERNAL COLLABORATION ONLY.
+# package-relative, RCP_LN2 inlined.
 # ruff: noqa  -- vendored kernel library, minimal local deltas
 """
 Persistent Fused K1+K2+K3 Kernel for KDA.

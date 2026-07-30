@@ -4,8 +4,6 @@
 //
 // Kernel body vendored from the NVIDIA x Moonshot Kimi K3 optimization
 // package (KDA_decode/kda_decode_fusion_kernel.cu, many-heads variant).
-// INTERNAL COLLABORATION CODE - not for open-source release without approval
-// from both Moonshot and NVIDIA.
 //
 // Local integration changes vs. the NV source (assembled by script, each
 // patch anchored on exact source text):
