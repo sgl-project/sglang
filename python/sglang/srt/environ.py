@@ -706,6 +706,9 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    # Fail allocation instead of silently falling back to 4KiB pages when an
+    # explicitly requested hugepage mapping cannot be created.
+    SGLANG_HUGEPAGE_STRICT = EnvBool(False)
 
     # ===================================================================
     # KV-transfer staging and Mooncake transport
