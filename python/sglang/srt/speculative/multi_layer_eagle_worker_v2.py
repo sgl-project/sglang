@@ -551,8 +551,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
-        # Multi-layer eagle has no multimodal-embedding path; the parameter
-        # exists only to match the shared skeleton's call shape.
+        # Only present to match the shared skeleton's call shape.
         assert (
             mm_input_embeds is None
         ), "multi-layer eagle does not support mm_input_embeds"
@@ -962,7 +961,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        # Rebuild the frozen collaborator view (see EagleWorkerContext).
         self._ctx = EagleWorkerContext.build(self)
 
     def forward_batch_generation(

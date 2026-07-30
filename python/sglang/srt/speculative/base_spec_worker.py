@@ -35,11 +35,8 @@ class EagleDraftWorkerBase(ABC):
         return [self.draft_runner]
 
     def draft_stage_ctx(self, stage: str):
-        """Context wrapped around this draft worker's forward stages ("draft" /
-        "draft_extend") by the shared eagle_forward_generation skeleton.
-        Default: none. Single-layer eagle overrides with its draft-TP +
-        speculative-MoE + stage-span stack; multi-layer eagle has never
-        wrapped (kept verbatim, open drift item)."""
+        """Context wrapped around the draft / draft_extend forwards. Default
+        none; multi-layer eagle has never wrapped one (open drift item)."""
         return contextlib.nullcontext()
 
     def alloc_memory_pool(self, **kwargs):

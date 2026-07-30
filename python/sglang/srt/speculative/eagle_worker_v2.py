@@ -465,8 +465,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     @contextlib.contextmanager
     def draft_stage_ctx(self, stage: str):
-        # Draft-side forwards run under draft-TP + speculative-MoE contexts;
-        # the stage span feeds spec-stage profiling.
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
@@ -1081,7 +1079,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        # Rebuild the frozen collaborator view (see EagleWorkerContext).
         self._ctx = EagleWorkerContext.build(self)
 
     def init_cuda_graphs(self):
@@ -1138,10 +1135,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _forward_decode_zero_steps(
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
     ):
-        """Decode flow with drafting disabled (adaptive spec at high batch
-        size), preserved from the pre-skeleton code: a trivial 1-node verify
-        keeps routing through the TARGET_VERIFY graph, and draft_extend below
-        still runs, keeping draft KV warm for when the batch shrinks."""
+        """Decode with drafting disabled (adaptive spec at high batch size): a
+        trivial 1-node verify keeps routing through the TARGET_VERIFY graph,
+        and draft_extend still runs to keep draft KV warm."""
         ensure_idle_draft_input(batch, self._ctx, self.topk)
         verify_input = self._build_trivial_verify_input(batch)
         assert verify_input.is_verify_input()
@@ -1439,8 +1435,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
-        # Kept as a method: the zero-steps path and FrozenKVMTPWorkerV2's own
-        # forward_batch_generation still call it.
+        # Still a method: the zero-steps path and FrozenKVMTPWorkerV2 call it.
         return run_eagle_verify(
             batch,
             self._ctx,

@@ -64,28 +64,14 @@ if TYPE_CHECKING:
 
 
 class EagleWorkerContext(msgspec.Struct, frozen=True, kw_only=True):
-    """Stable collaborators + capability flags for the eagle worker-step
-    functions in this module.
+    """Stable collaborators + capability flags for this module's eagle
+    worker-step functions; built only by workers running the eagle pipeline.
 
-    A derived, frozen VIEW of the owning worker's state, not a second source
-    of truth: the worker's ``self.*`` stays authoritative, and the context is
-    rebuilt unconditionally at the end of ``alloc_memory_pool``.
-
-    Membership: a worker builds this iff it runs the eagle pipeline (draft
-    tree proposal -> ``EagleVerifyInput`` verify -> draft extend). Other spec
-    families (ngram / dflash / dspark) never build it; they define their own
-    context type if they ever need one -- this one is never subclassed or
-    extended with Optional fields.
-
-    Rules (do not relax without a design round):
-    - Fields are identity-stable handles or true constants; values rewritten
-      at runtime (adaptive ``topk`` / ``num_steps`` / ``num_draft_tokens``)
-      stay per-call arguments.
-    - No methods besides ``build``, no callable-hook fields; behavior lives
-      in module functions. Variation lanes: prove a no-op gate and merge it,
-      compose at the worker wrapper, or write a separate pipeline function.
-    - Capability flags are named for what the worker IS (not which code block
-      to skip) and must carry a removal path.
+    A derived, frozen view of the owning worker: ``self.*`` stays
+    authoritative and the context is rebuilt at the end of
+    ``alloc_memory_pool``. Fields are identity-stable handles or true
+    constants -- values rewritten at runtime (adaptive ``topk`` /
+    ``num_steps`` / ``num_draft_tokens``) stay per-call arguments.
     """
 
     draft_worker: EagleDraftWorkerBase
@@ -96,21 +82,17 @@ class EagleWorkerContext(msgspec.Struct, frozen=True, kw_only=True):
     plan_stream: Any
     plan_stream_ctx: contextlib.AbstractContextManager
     device: str
-    # Capability flags (see class docstring for the admission rules).
     # Marks verify forward-metadata ready pre-pad. No worker sets it since
     # #31681 adopted the fix for multi-layer; drop it with its gated block.
     preplans_verify_metadata: bool
     # Compacts the accepted tree path to the front of each per-req block for
-    # topk > 1 (single-layer eagle behavior). Removal: adopt for multi-layer
-    # after GPU validation.
+    # topk > 1. Removal: adopt for multi-layer after GPU validation.
     compacts_accept_path: bool
     # False only for STANDALONE drafting, which skips hidden states end-to-end.
     captures_hidden_states: bool
 
     @classmethod
     def build(cls, worker: BaseSpecWorker) -> EagleWorkerContext:
-        """Snapshot the worker's collaborators into a frozen view; call at
-        the end of ``alloc_memory_pool`` (asserted below)."""
         assert worker.req_to_token_pool is not None, (
             "EagleWorkerContext.build before pool allocation; "
             "build it at the end of alloc_memory_pool"
@@ -538,12 +520,8 @@ def run_eagle_verify(
     num_draft_tokens: int,
     grammar_barrier=None,
 ) -> GenerationBatchResult:
-    """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
-
-    The single-layer eagle verify body is the source of truth (superset); the
-    two ``ctx`` capability flags encode the multi-layer worker's
-    preserved-verbatim differences (see EagleWorkerContext's field comments).
-    """
+    """Shared verify step: target-verify forward, sampling, acceptance
+    bookkeeping."""
     target_worker = ctx.target_worker
     req_to_token_pool = ctx.req_to_token_pool
     token_to_kv_pool_allocator = ctx.token_to_kv_pool_allocator
@@ -723,8 +701,8 @@ def run_eagle_verify(
 def ensure_idle_draft_input(
     batch: ScheduleBatch, ctx: EagleWorkerContext, idle_topk: int
 ) -> None:
-    """Fill ``batch.spec_info`` with an idle ``EagleDraftInput`` if the batch
-    carries none (idle forward on this rank)."""
+    """Fill ``batch.spec_info`` with an idle ``EagleDraftInput`` if it has
+    none."""
     if batch.spec_info is not None:
         return
     capture_mode = (
@@ -757,12 +735,8 @@ def eagle_forward_generation(
     """Shared forward step: target prefill + draft prefill, or draft -> verify
     -> draft extend.
 
-    The single-layer eagle body is the source of truth. Worker-specific parts
-    stay in the worker wrappers: single-layer's num_steps == 0 trivial-verify
-    path and the adaptive activate hook run before delegating here; draft-side
-    context wrapping comes from ``draft_worker.draft_stage_ctx``. ``idle_topk``
-    is the idle draft input's topk_p/topk_index width (single-layer: topk;
-    multi-layer: topk * num_steps).
+    ``idle_topk`` is the idle draft input's topk_p/topk_index width
+    (single-layer: topk; multi-layer: topk * num_steps).
     """
     draft_worker = ctx.draft_worker
     target_worker = ctx.target_worker
