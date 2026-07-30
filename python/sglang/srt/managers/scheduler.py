@@ -993,7 +993,18 @@ class Scheduler(
         if (
             get_exec().moe.elastic_ep_backend is not None
             and get_exec().moe.ep_join_mode == "recover"
+            and not self.server_args.is_ep_offset_joiner
         ):
+            # Only plain fault-recovery joiners (offset=0) need the deferred
+            # post-cuda-graph rejoin. Grow-into-retired-slot joiners
+            # (recover mode, offset > 0) have already completed the
+            # equivalent rejoin + metadata broadcast eagerly in
+            # ``ModelRunner.__init__`` because their metadata must be
+            # available BEFORE the model loads. Calling this again would
+            # re-issue ``_join_world_group``/``_refresh_ep_members`` on a
+            # Mooncake WORLD that already sees this rank as active, and
+            # would also reset ``ElasticEPStateManager`` back out of
+            # ``serving_expanded`` immediately after ``__init__`` set it.
             model_runner.post_capture_elastic_ep_recover()
 
         # Dispatch the model worker
