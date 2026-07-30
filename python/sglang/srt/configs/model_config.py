@@ -660,8 +660,8 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
-        if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
-            self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
+        if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoeForCausalLM":
+            self.hf_config.architectures[0] = "ExaoneMoeForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] in [
@@ -1969,6 +1969,8 @@ def is_hybrid_swa_model(
         "Gemma4ForConditionalGeneration",
         "Gemma4UnifiedForConditionalGeneration",
         "LagunaForCausalLM",
+        "Exaone4ForCausalLM",
+        "ExaoneMoeForCausalLM",
         "MellumForCausalLM",
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
@@ -2083,6 +2085,17 @@ def get_hybrid_layer_ids(
         ]
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if i not in local_layer_id_set
+        ]
+    elif (
+        "ExaoneMoeForCausalLM" in model_architectures
+        or "Exaone4ForCausalLM" in model_architectures
+    ):
+        layer_types = getattr(hf_text_config, "layer_types", [])
+        swa_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
     elif "UnlimitedOCRForCausalLM" in model_architectures:
         swa_attention_layer_ids = list(range(num_hidden_layers))

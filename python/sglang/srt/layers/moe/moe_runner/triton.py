@@ -106,6 +106,7 @@ class TritonRunnerCore(MoeRunnerCore):
                 routed_scaling_factor=self.config.routed_scaling_factor,
                 gemm1_alpha=self.config.gemm1_alpha,
                 gemm1_limit=self.config.gemm1_clamp_limit,
+                gemm1_clamp_before_silu=self.config.gemm1_clamp_before_silu,
                 swiglu_limit=self.config.swiglu_limit,
                 gate_up_interleaved=self.config.gate_up_interleaved,
             )
@@ -160,6 +161,7 @@ class TritonRunnerCore(MoeRunnerCore):
             routed_scaling_factor=self.config.routed_scaling_factor,
             gemm1_alpha=self.config.gemm1_alpha,
             gemm1_limit=self.config.gemm1_clamp_limit,
+            gemm1_clamp_before_silu=self.config.gemm1_clamp_before_silu,
             filter_expert=filter_expert,
             hooks=hooks,
             swiglu_limit=self.config.swiglu_limit,

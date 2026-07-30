@@ -580,16 +580,6 @@ def _gemma2_gemma3_overrides(server_args: Any, hf_config: Any) -> dict:
     return {"disable_hybrid_swa_memory": True}
 
 
-@_register_for("Exaone4ForCausalLM", "ExaoneMoEForCausalLM")
-def _exaone_overrides(server_args: Any, hf_config: Any) -> dict:
-    if hf_config.sliding_window_pattern is not None:
-        logger.warning(
-            f"Disabling hybrid SWA memory for {hf_config.architectures[0]} as it is not yet supported."
-        )
-        return {"disable_hybrid_swa_memory": True}
-    return {}
-
-
 @_register_for("GptOssForCausalLM")
 def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides: Dict[str, Any] = {}

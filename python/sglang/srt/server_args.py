@@ -5369,16 +5369,24 @@ class ServerArgs:
             # The prefill attention backend default + validation moved to the
             # override registry (arg_groups/overrides.py: _moss_vl_overrides).
             pass
-        elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
-            if hf_config.sliding_window_pattern is not None:
-                # disable_hybrid_swa_memory moved to the override registry
-                # (arg_groups/overrides.py: _exaone_overrides).
-                # https://docs.sglang.ai/advanced_features/attention_backend.html
-                accepted_backends = ["fa3", "triton", "trtllm_mha"]
-                attention_backend = resolved_view(self).attention_backend
-                assert (
-                    attention_backend in accepted_backends
-                ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
+        elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoeForCausalLM"]:
+            accepted_backends = ["triton", "fa3", "fa4", "trtllm_mha"]
+            if self.attention_backend is None:
+                if is_cuda() and is_sm100_supported():
+                    self.attention_backend = "trtllm_mha"
+                elif is_cuda() and get_device_sm() >= 90:
+                    self.attention_backend = "fa3"
+                else:
+                    self.attention_backend = "triton"
+            assert (
+                self.attention_backend in accepted_backends
+            ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
+
+            if is_sm100_supported():
+                logger.warning(
+                    f"Disabling hybrid SWA memory for {model_arch} to prevent accuracy degradation."
+                )
+                self.disable_hybrid_swa_memory = True
         elif model_arch in ["Olmo2ForCausalLM"]:
             # disable_hybrid_swa_memory + attention backend selection moved to
             # the override registry (arg_groups/overrides.py: _olmo2_overrides).
