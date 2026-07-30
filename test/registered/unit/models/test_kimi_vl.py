@@ -14,9 +14,9 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.kimi_vl import KimiVLForConditionalGeneration
-from sglang.srt.models.kimi_vl_moonvit import MoonVitEncoderLayer, multihead_attention
+from sglang.srt.models.kimi_vl_moonvit import MoonVitEncoderLayer
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -80,17 +80,16 @@ class TestKimiVLEncoderParallelism(CustomTestCase):
     def test_moonvit_uses_tensor_parallel_layers(self):
         with get_parallel().override(
             tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
-        ):
+        ), get_context().override_server_args():
             layer = MoonVitEncoderLayer(
                 num_heads=2,
                 hidden_dim=8,
                 mlp_dim=16,
                 prefix="vision_tower.encoder.blocks.0",
-                use_tensor_parallel=True,
             )
 
-        self.assertIsInstance(layer.wqkv, QKVParallelLinear)
-        self.assertIsInstance(layer.wo, RowParallelLinear)
+        self.assertIsInstance(layer.attn.qkv_proj, QKVParallelLinear)
+        self.assertIsInstance(layer.attn.proj, RowParallelLinear)
         self.assertIsInstance(layer.mlp.fc0, ColumnParallelLinear)
         self.assertIsInstance(layer.mlp.fc1, RowParallelLinear)
 
@@ -141,18 +140,6 @@ class TestKimiVLEncoderParallelism(CustomTestCase):
             )
         self.assertIsInstance(output, torch.Tensor)
         self.assertEqual(output.shape, (1, 4, 2))
-
-    def test_moonvit_attention_accepts_precomputed_max_seqlen(self):
-        q = torch.randn(4, 2, 4, dtype=torch.bfloat16)
-        cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
-        fake_output = torch.randn_like(q)
-        with patch(
-            "sglang.srt.models.kimi_vl_moonvit.flash_attn_varlen_func",
-            return_value=fake_output,
-        ) as flash_attn:
-            output = multihead_attention(q, q, q, cu_seqlens, cu_seqlens, max_seqlen=4)
-        self.assertTrue(torch.equal(output, fake_output.flatten(start_dim=-2)))
-        self.assertEqual(flash_attn.call_args.args[5:7], (4, 4))
 
 
 if __name__ == "__main__":

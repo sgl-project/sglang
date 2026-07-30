@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -146,7 +145,7 @@ def apply_dflash_verify_logits_adjustments(
 
     acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
-    vocab_mask = getattr(sampling_info, "vocab_mask", None)
+    grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
     logits_3d: Optional[torch.Tensor] = None
@@ -162,7 +161,7 @@ def apply_dflash_verify_logits_adjustments(
     # broadcast over the verify block without materializing a repeated buffer.
     if (
         penalizer is not None and penalizer.is_required and acc_linear_penalties is None
-    ) or vocab_mask is not None:
+    ) or grammar_mask is not None:
         linear_penalty = torch.zeros(
             (bs, next_token_logits.shape[1]),
             dtype=torch.float32,
@@ -794,26 +793,11 @@ def build_dflash_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def validate_dflash_request(
-    req: Req, enable_overlap: bool, spec_algorithm: SpeculativeAlgorithm
-) -> Optional[str]:
+def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."
 
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
-
-    # Grammar support in this family is the verify-time bitmask plus the grammar
-    # barrier, so the capability that gates the barrier also gates admission.
-    if not spec_algorithm.supports_grammar_overlap() and (
-        req.sampling_params.json_schema is not None
-        or req.sampling_params.regex is not None
-        or req.sampling_params.ebnf is not None
-        or req.sampling_params.structural_tag is not None
-    ):
-        return (
-            f"{spec_algorithm.name} speculative decoding does not support "
-            "grammar-constrained decoding yet."
-        )
 
     return None
