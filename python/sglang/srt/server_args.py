@@ -6825,7 +6825,11 @@ class ServerArgs:
                 "--ep-dispatch-algorithm dynamic with --moe-a2a-backend none."
             )
 
-        if self.enable_eplb and self.ep_join_mode != "scale":
+        if (
+            self.enable_eplb
+            and self.ep_join_mode != "scale"
+            and not self.is_ep_offset_joiner
+        ):
             assert self._resolved().ep_size > 1
 
     def _handle_elastic_ep(self):
@@ -6855,6 +6859,55 @@ class ServerArgs:
                 self.mooncake_ib_device = self._validate_ib_devices(
                     self.mooncake_ib_device
                 )
+                # Per-PG safety audit for Mooncake-native scale-down:
+                # the attention_tp pynccl fast-path is built directly on
+                # raw NCCL and does NOT consult Mooncake's active_ranks
+                # mask, so a retired rank would still be expected to
+                # participate in these collectives after mask flip --
+                # deadlock or NCCL abort. Refuse to boot under those
+                # knobs so nobody hits this trap silently during a
+                # scale-down. Fixing this without rebuilding the raw
+                # NCCL comm on shrink is an open follow-up.
+                if envs.SGLANG_SYNC_TOKEN_IDS_ACROSS_TP.get():
+                    raise ValueError(
+                        "SGLANG_SYNC_TOKEN_IDS_ACROSS_TP is incompatible with "
+                        "--elastic-ep-backend mooncake. This flag enables the "
+                        "attention_tp pynccl fast-path, which is raw NCCL and "
+                        "does not honor Mooncake's active_ranks mask -- a "
+                        "retiring rank would deadlock any post-flip collective. "
+                        "Unset the env var, or use --elastic-ep-backend nixl."
+                    )
+                if self.enable_symm_mem:
+                    raise ValueError(
+                        "--enable-symm-mem is incompatible with "
+                        "--elastic-ep-backend mooncake. Symmetric memory "
+                        "enables raw NCCL / MSCCL++ fast-paths on the "
+                        "attention_tp group that bypass Mooncake's "
+                        "active_ranks mask -- a retiring rank would deadlock "
+                        "any post-flip collective. Drop --enable-symm-mem, "
+                        "or use --elastic-ep-backend nixl."
+                    )
+                # The shm MessageQueue broadcaster is fixed-size at
+                # cohort launch and has no remove_reader primitive. If
+                # a retiree exits mid-fanout its reader flag never
+                # flips and the next full wrap deadlocks the writer.
+                # Under --elastic-ep-backend mooncake we force it OFF
+                # -- the fallback path in
+                # ``GroupCoordinator.broadcast_object`` goes through
+                # ``torch.distributed.broadcast_object_list`` on the
+                # cpu_group (Mooncake-CPU backend, honors active_ranks
+                # mask), which naturally skips retirees on a post-flip
+                # broadcast. Adding MessageQueue.remove_reader is a
+                # follow-up.
+                if envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get():
+                    envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.set(False)
+                    logger.warning(
+                        "[Elastic EP] --elastic-ep-backend mooncake forces "
+                        "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=False. The shm "
+                        "broadcaster is fixed at cohort launch and deadlocks "
+                        "when a retiree exits; the torch broadcast_object_list "
+                        "fallback on cpu_group is mask-aware and safe."
+                    )
         if self.ep_join_mode is not None:
             assert (
                 self.elastic_ep_backend is not None
@@ -6870,9 +6923,14 @@ class ServerArgs:
                     "effective EP size."
                 )
         if self.ep_join_rank_offset != 0:
-            assert self.ep_join_mode == "scale", (
+            # ``scale`` (append-only) and ``recover``
+            # (grow-into-retired-slot) both slot a joiner into a
+            # specific global rank via the offset. Everything else
+            # (implicit fault recovery of a rank inside the current
+            # cohort) uses offset=0.
+            assert self.ep_join_mode in ("scale", "recover"), (
                 "--elastic-ep-join-rank-offset is only valid with "
-                "--elastic-ep-join-mode scale."
+                "--elastic-ep-join-mode scale or recover."
             )
             assert (
                 self.ep_join_rank_offset >= 0
@@ -6928,6 +6986,25 @@ class ServerArgs:
                 if self.tp_size == 1:
                     assert self.moe_dense_tp_size == 1, (
                         "A single-rank Elastic EP joining group requires "
+                        "--moe-dense-tp-size 1."
+                    )
+            elif self.is_ep_offset_joiner:
+                # Recover-into-retired-slot joiner: slots INSIDE the
+                # existing launch cohort, so offset < initial_size and
+                # offset + tp_size <= initial_size.
+                assert self.elastic_ep_initial_size is not None, (
+                    "Elastic EP recover joiners require --elastic-ep-initial-size "
+                    "set to the primary deployment's launch-time EP size."
+                )
+                join_target = self.ep_join_rank_offset + self.tp_size
+                assert join_target <= self.elastic_ep_initial_size, (
+                    "Elastic EP recover joiner target rank exceeds the launch "
+                    f"cohort size (join_target={join_target}, "
+                    f"initial={self.elastic_ep_initial_size})."
+                )
+                if self.tp_size == 1:
+                    assert self.moe_dense_tp_size == 1, (
+                        "A single-rank Elastic EP recover joiner requires "
                         "--moe-dense-tp-size 1."
                     )
             else:
@@ -6989,8 +7066,8 @@ class ServerArgs:
                 "Elastic EP scale-up requires dp_size == tp_size "
                 f"(got dp_size={self.dp_size}, tp_size={self.tp_size})."
             )
-            assert resolved.moe_a2a_backend == "nixl", (
-                "Elastic EP scale-up requires --moe-a2a-backend nixl "
+            assert resolved.moe_a2a_backend in ("nixl", "mooncake"), (
+                "Elastic EP requires --moe-a2a-backend nixl or mooncake "
                 f"(got moe_a2a_backend={resolved.moe_a2a_backend})."
             )
 
@@ -8503,6 +8580,22 @@ class ServerArgs:
     def is_ep_scale_joiner(self) -> bool:
         return self.ep_join_mode == "scale"
 
+    @property
+    def is_ep_offset_joiner(self) -> bool:
+        """True if this joiner slots into a specific pre-known global rank.
+
+        Covers both ``scale`` (append into a fresh slot beyond the
+        launch cohort) and ``recover`` when it also carries a non-zero
+        ``ep_join_rank_offset`` (grow-into-retired-slot). Contrast with
+        the offset=0 recover path, which is implicit fault recovery of a
+        rank already inside the current effective cohort.
+        """
+        if self.ep_join_mode == "scale":
+            return True
+        if self.ep_join_mode == "recover" and self.ep_join_rank_offset > 0:
+            return True
+        return False
+
     def ssl_verify(self):
         """Return the value for the requests library's verify= parameter.
 
@@ -8701,8 +8794,13 @@ class ServerArgs:
             )
 
     def check_server_args(self):
-        # Check parallel size constraints
-        if self.ep_join_mode != "scale":
+        # Elastic-EP offset joiners (scale-append AND recover-into-
+        # retired-slot) run with a per-cohort ``tp_size`` that is
+        # deliberately smaller than the wider deployment and are
+        # launched as ``--nnodes 2 --node-rank 1`` under the joiner
+        # convention. Their ``tp_size % nnodes`` is not meaningful
+        # because they only occupy the joiner half.
+        if not self.is_ep_offset_joiner:
             assert (
                 self.tp_size * self.pp_size
             ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"

@@ -313,13 +313,25 @@ class GroupCoordinator:
             if "mooncake" in torch_distributed_backend:
                 from mooncake.pg import MooncakeBackendOptions
 
-                pg_active_size = len(ranks)
+                # Primaries reserve ``max_world_size`` slots only when it
+                # exceeds the current group size; recovered-rank joiners
+                # must pass ``max_world_size`` whenever it is at least
+                # the group size so Mooncake attaches to the pre-reserved
+                # peer pool instead of allocating a fresh one.
+                if recovered_rank:
+                    pass_max_ws = (
+                        max_world_size is not None and max_world_size >= len(ranks)
+                    )
+                else:
+                    pass_max_ws = (
+                        max_world_size is not None and max_world_size > len(ranks)
+                    )
+                pg_active_size = max_world_size if pass_max_ws else len(ranks)
                 if not recovered_rank and max_world_size is not None:
                     assert max_world_size >= len(ranks), (
                         f"max_world_size ({max_world_size}) must be >= "
                         f"group size ({len(ranks)})"
                     )
-                    pg_active_size = max_world_size
 
                 pg_active_ranks = torch.zeros(
                     pg_active_size, dtype=torch.int32, device=self.device
@@ -328,7 +340,7 @@ class GroupCoordinator:
                 pg_active_ranks_cpu = torch.zeros(pg_active_size, dtype=torch.int32)
                 pg_active_ranks_cpu[: len(ranks)] = 1
 
-                if not recovered_rank and max_world_size is not None:
+                if pass_max_ws:
                     dev_opts = MooncakeBackendOptions(
                         pg_active_ranks, recovered_rank, max_world_size
                     )
@@ -2131,7 +2143,19 @@ def init_distributed_environment(
         if backend == "mooncake":
             from mooncake.pg import MooncakeBackendOptions
 
-            use_max_ws = max_world_size and max_world_size > world_size
+            # Growth-capable launches (``max_world_size > world_size``)
+            # reserve extra slots in the peer pool so a later
+            # ``recover_ranks`` / grow-back can reactivate a reserved
+            # slot. A recovered-rank joiner uses ``>=`` because it may
+            # fill the last reserved slot exactly.
+            if recovered_rank:
+                use_max_ws = (
+                    max_world_size is not None and max_world_size >= world_size
+                )
+            else:
+                use_max_ws = (
+                    max_world_size is not None and max_world_size > world_size
+                )
             ar_size = max_world_size if use_max_ws else world_size
             active_ranks = torch.zeros(ar_size, dtype=torch.int32, device="cuda")
             active_ranks[:world_size] = 1

@@ -34,11 +34,19 @@ logger = logging.getLogger(__name__)
 
 def _prefer_same_node_experts() -> bool:
     from sglang.srt.elastic_ep.elastic_ep import elastic_expanded_world_enabled
-    from sglang.srt.runtime_context import get_exec
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
-    return (
-        get_exec().moe.ep_join_mode != "scale" and not elastic_expanded_world_enabled()
+    # Skip same-node preference for offset joiners (scale-append OR
+    # recover-into-retired-slot). Their per-cohort ep_size/nnodes is 0
+    # in the joiner subprocess view, which blows up _find_nearest_expert
+    # with ZeroDivisionError.
+    moe = get_exec().moe
+    is_offset_joiner = moe.ep_join_mode == "scale" or (
+        moe.ep_join_mode == "recover" and get_parallel().ep_join_rank_offset > 0
     )
+    if is_offset_joiner:
+        return False
+    return not elastic_expanded_world_enabled()
 
 
 def _compute_elastic_expert_layout(
@@ -243,11 +251,17 @@ class ExpertLocationMetadata:
         num_physical_experts = base_num_physical_experts
         initial_ep_size = get_parallel().elastic_ep_initial_size
         if initial_ep_size is not None:
+            # Offset joiners (scale-append OR recover-into-retired-slot) boot
+            # with local ep_size = tp_size but must size EPLB metadata against
+            # the WIDER post-join deployment. Scale joiners target
+            # offset + tp_size; recover joiners target elastic_ep_initial_size.
             if get_exec().moe.ep_join_mode == "scale":
                 ep_size = max(
                     ep_size,
                     get_parallel().ep_join_rank_offset + server_args.tp_size,
                 )
+            elif server_args.is_ep_offset_joiner:
+                ep_size = max(ep_size, initial_ep_size)
             num_physical_experts, num_local_physical_experts = (
                 _compute_elastic_expert_layout(
                     base_num_physical_experts,

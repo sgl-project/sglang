@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
 
 import torch
@@ -53,6 +53,10 @@ class ElasticEPState:
     original_ep_size: int = 0
     has_scaled: bool = False
     ep_join_rank_offset: int = 0
+    # Global ranks whose Mooncake ``active_ranks`` slot must be flipped
+    # 0->1 during the pending grow (grow-into-retired-slot). Empty
+    # when the pending grow is an append-only scale-up.
+    pending_recover_ranks: List[int] = field(default_factory=list)
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
@@ -174,6 +178,39 @@ class ElasticEPStateManager:
             or inst.scale_phase == "recovery_unsupported"
         ):
             return False
+        # Reject invalid targets synchronously so the tokenizer's
+        # admission gate can 4xx to the operator instead of stalling
+        # for the outer ``elastic_ep_scale_timeout`` (~600s) on an
+        # unreachable target. ``active_ranks_cpu`` is sized to the
+        # configured ``--max-ep-size`` capacity at :meth:`init`, so
+        # its element count is the max cohort size this deployment
+        # can grow to.
+        if n <= 0:
+            logger.warning(
+                "[Elastic EP] request_scale rejected: target ep_size=%d must be > 0",
+                n,
+            )
+            return False
+        if n == inst.effective_ep_size:
+            logger.info(
+                "[Elastic EP] request_scale rejected: target ep_size=%d is a "
+                "no-op (already the effective cohort size)",
+                n,
+            )
+            return False
+        max_cap = (
+            inst.active_ranks_cpu.numel()
+            if inst.active_ranks_cpu is not None
+            else None
+        )
+        if max_cap is not None and n > max_cap:
+            logger.warning(
+                "[Elastic EP] request_scale rejected: target ep_size=%d exceeds "
+                "max_ep_size capacity=%d",
+                n,
+                max_cap,
+            )
+            return False
         inst.pending_ep_size = n
         inst.scale_phase = "waiting_for_cohort"
         inst.last_error = None
@@ -205,22 +242,85 @@ class ElasticEPStateManager:
         cls._mark_phase("syncing_new_world")
 
     @classmethod
+    def mark_draining(cls) -> None:
+        """Enter the drain phase for a pending scale-DOWN.
+
+        Survivors + retirees pause admission of new work and wait for
+        in-flight batches to complete before the mask flip.
+        """
+        cls._mark_phase("draining")
+
+    @classmethod
+    def mark_retiring(cls) -> None:
+        """Enter the retire phase for a pending scale-DOWN.
+
+        Survivors flip ``active_ranks[retiree]=0`` on every launch-time PG;
+        retirees run local Mooncake quiesce and ``sys.exit(0)``.
+        """
+        cls._mark_phase("retiring")
+
+    @classmethod
+    def mark_reconfiguring(cls) -> None:
+        """Enter the reconfig phase for a pending scale-DOWN.
+
+        Survivors rebuild MoE dispatcher / dp_attention / expert-location
+        for the shrunk K-rank cohort. Symmetric with grow's
+        ``mark_configuring_data_plane``; kept as a separate phase name so
+        observers can distinguish shrink from grow direction.
+        """
+        cls._mark_phase("reconfiguring")
+
+    @classmethod
     def _mark_phase(cls, phase: str) -> None:
         inst = cls._instance
         if inst is not None and inst.pending_ep_size is not None:
             inst.scale_phase = phase
 
     @classmethod
+    def get_shrink_direction(cls) -> Optional[str]:
+        """Return ``"shrink"`` / ``"grow"`` / ``None`` for the pending op.
+
+        Determined by comparing ``pending_ep_size`` against ``effective_ep_size``.
+        Returns ``None`` if no scale is pending.
+        """
+        inst = cls._instance
+        if inst is None or inst.pending_ep_size is None:
+            return None
+        if inst.pending_ep_size < inst.effective_ep_size:
+            return "shrink"
+        if inst.pending_ep_size > inst.effective_ep_size:
+            return "grow"
+        return None
+
+    @classmethod
+    def get_pending_shrink_ranks(cls) -> List[int]:
+        """Return the global-rank list being retired by the pending shrink.
+
+        Retirees are the highest-numbered ranks in the current cohort:
+        ``[pending_ep_size, ..., effective_ep_size - 1]``. The retirement
+        scope is contiguous whole-TP-group suffixes. Returns an empty
+        list if no shrink is pending.
+        """
+        inst = cls._instance
+        if inst is None or inst.pending_ep_size is None:
+            return []
+        if inst.pending_ep_size >= inst.effective_ep_size:
+            return []
+        return list(range(inst.pending_ep_size, inst.effective_ep_size))
+
+    @classmethod
     def commit_scale(cls) -> None:
         inst = cls._instance
         if inst is None or inst.pending_ep_size is None:
             return
+        direction = cls.get_shrink_direction()
         inst.effective_ep_size = inst.pending_ep_size
         inst.pending_ep_size = None
         inst.has_scaled = True
-        inst.scale_phase = "serving_expanded"
+        inst.scale_phase = "serving_shrunk" if direction == "shrink" else "serving_expanded"
         inst.last_error = None
         inst.pending_since = None
+        inst.pending_recover_ranks = []
         inst.reset()
 
     @classmethod
@@ -232,6 +332,7 @@ class ElasticEPStateManager:
         inst.scale_phase = "failed"
         inst.last_error = error
         inst.pending_since = None
+        inst.pending_recover_ranks = []
         inst.reset()
 
     @classmethod
@@ -241,6 +342,22 @@ class ElasticEPStateManager:
             return
         inst.scale_phase = "recovery_unsupported"
         inst.last_error = error
+
+    @classmethod
+    def set_pending_recover_ranks(cls, ranks: List[int]) -> None:
+        """Record the global ranks that a pending grow must reactivate."""
+        inst = cls._instance
+        if inst is None:
+            return
+        inst.pending_recover_ranks = list(ranks)
+
+    @classmethod
+    def get_pending_recover_ranks(cls) -> List[int]:
+        """Return the global ranks that the pending grow must reactivate."""
+        inst = cls._instance
+        if inst is None:
+            return []
+        return list(inst.pending_recover_ranks)
 
     @classmethod
     def get_effective_ep_size(cls) -> int:
@@ -382,16 +499,64 @@ def _try_recover_world(global_ranks: List[int]) -> bool:
 
 
 def try_admit_scale_ranks(global_ranks: List[int]) -> bool:
-    """Admit append-only ranks into the expandable WORLD group."""
+    """Admit append-only ranks into the expandable WORLD group.
+
+    Symmetric with :func:`try_recover_ranks` on the mask-flip side: the
+    admitted ranks live in ``[elastic_ep_initial_size, max_ep_size)`` and
+    were born with ``active_ranks[i] = 0``. Mooncake's C++ side is
+    updated by ``mooncake_ep.recover_ranks(WORLD, ...)`` inside
+    :func:`_try_recover_world`, but the Python-owned tensors (top-level
+    :class:`ElasticEPStateManager` bitmap, sub-group masks, and the
+    default WORLD backend handle) all need an explicit flip to publish
+    the same value that :func:`get_backend_active_ranks(WORLD)` and
+    :func:`try_retire_ranks` will later read.
+
+    Without these three flips, a subsequent scale-DOWN that retires an
+    ex-scale-up-v1-append joiner (e.g. ``4 -> 6 -> 3``) reads a stale
+    ``active_ranks[8] = 0`` on the survivor's WORLD backend mask, and
+    the WORLD-scope collectives inside ``_finalize_scale_down`` observe
+    an inconsistent view relative to Mooncake's C++ mask (which was
+    already flipped to 1 during grow). This is the mask-flip half of
+    the fix; sub-group iteration is a no-op today because scale-mode
+    append never joins an existing sub-group, but it is kept for
+    symmetry with the recover path so a future sub-group topology
+    change doesn't silently regress the append path.
+    """
     if not _try_recover_world(global_ranks):
         return False
+
+    inst = ElasticEPStateManager.instance()
+    if inst is not None and inst.active_ranks is not None:
+        for global_rank in global_ranks:
+            if 0 <= global_rank < inst.active_ranks.numel():
+                inst.active_ranks[global_rank] = 1
+        inst.snapshot_active_to_last()
+        inst.sync_active_to_cpu()
+
+    for group in _iter_live_parallel_groups():
+        _flip_active_rank_mask(group, global_ranks, value=1)
+        _maybe_create_message_queue(group)
+
+    # ``mooncake_ep.recover_ranks(WORLD, ...)`` inside ``_try_recover_
+    # world`` flipped the mask on Mooncake's C++ side. Publish the same
+    # value on the python-side handle so ``get_backend_active_ranks
+    # (WORLD)`` observers agree -- symmetric with ``try_recover_ranks``.
+    _flip_world_backend_active_rank_mask(global_ranks, value=1)
 
     _refresh_ep_members()
     return True
 
 
 def try_recover_ranks(global_ranks: List[int]) -> bool:
-    """Recover ranks in WORLD and every launch-time parallel group."""
+    """Recover ranks in WORLD and every launch-time parallel group.
+
+    Also defensively flips the Python-side ``active_ranks`` slice 0->1
+    for the recovered ranks on every group. Mooncake C++
+    ``recover_ranks`` writes back through the shared tensor storage,
+    but not all launch paths observe that write from Python, so the
+    explicit flip keeps EPLB / dp_attention / ``ElasticEPStateManager``
+    consistent with the Mooncake view.
+    """
     if not _try_recover_world(global_ranks):
         return False
 
@@ -406,6 +571,7 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
         recover_ranks(group.device_group, local_ranks)
         _wait_for_peer_state(group.cpu_group, local_ranks)
         recover_ranks(group.cpu_group, local_ranks)
+        _flip_active_rank_mask(group, global_ranks, value=1)
         _maybe_create_message_queue(group)
 
     _refresh_ep_members()
@@ -518,3 +684,125 @@ def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
         except StopIteration:
             break
     return True
+
+
+def _flip_active_rank_mask(group, global_ranks: List[int], value: int) -> None:
+    """Write ``value`` (0 or 1) into ``group.active_ranks[local_rank]``.
+
+    Mirrors what ``mooncake_ep.recover_ranks`` does for the 0->1 direction
+    on the ``MooncakeBackendOptions.activeRanks_`` tensor, except we do the
+    write directly since Mooncake exposes no ``deactivate_ranks`` primitive.
+    Skips ranks not in ``group.ranks`` (retiree not a member of this
+    subgroup).
+
+    The tensor referenced by ``group.active_ranks`` is the same slice that
+    was passed into ``MooncakeBackendOptions`` at PG construction (see
+    ``parallel_state.py:376-377``), so an in-place write here is observed
+    by the Mooncake C++ backend on the next collective read.
+    """
+    local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
+    if not local_ranks:
+        return
+    active_ranks = getattr(group, "active_ranks", None)
+    active_ranks_cpu = getattr(group, "active_ranks_cpu", None)
+    if active_ranks is None:
+        return
+    for local_rank in local_ranks:
+        active_ranks[local_rank] = value
+    if active_ranks_cpu is not None:
+        for local_rank in local_ranks:
+            active_ranks_cpu[local_rank] = value
+
+
+def try_retire_ranks(global_ranks: List[int]) -> bool:
+    """Retire ranks in WORLD and every launch-time parallel group.
+
+    Symmetric counterpart to :func:`try_recover_ranks`. Called
+    collectively from every rank in the current cohort (survivors AND
+    retirees) after the drain barrier has completed. Each rank:
+
+    1. Flips ``active_ranks[retiree]=0`` on every live parallel group's
+       ``active_ranks`` / ``active_ranks_cpu`` tensor.
+    2. Also flips the top-level ``ElasticEPStateManager`` bitmap.
+    3. Refreshes the Mooncake EPBuffer peer table so subsequent MoE
+       dispatch skips the retired slots.
+
+    Unlike :func:`try_recover_ranks`, no ``mooncake_ep`` primitive is
+    called: Mooncake exposes ``join_group`` / ``recover_ranks`` (grow
+    direction) but no counterpart for retirement. The mask tensor is
+    Python-owned (constructed in :func:`sglang.srt.distributed.parallel_
+    state.GroupCoordinator.__init__` and passed by reference into
+    ``MooncakeBackendOptions``), so a direct in-place write is the
+    Mooncake-recommended way to update it -- consistent with how
+    :func:`ElasticEPStateManager._finalize_scale_up`-style code paths
+    already flip the mask via ``inst.active_ranks[rank] = 1`` for grow.
+
+    Retirees stay in the WORLD PG's membership list; their slots remain
+    reserved so a future :func:`try_recover_ranks` on the same rank can
+    reactivate them cleanly (slot-reuse property).
+    """
+    if not global_ranks:
+        return True
+
+    inst = ElasticEPStateManager.instance()
+    if inst is not None and inst.active_ranks is not None:
+        for global_rank in global_ranks:
+            if 0 <= global_rank < inst.active_ranks.numel():
+                inst.active_ranks[global_rank] = 0
+        inst.snapshot_active_to_last()
+        inst.sync_active_to_cpu()
+
+    for group in _iter_live_parallel_groups():
+        _flip_active_rank_mask(group, global_ranks, value=0)
+
+    _refresh_ep_members()
+    logger.debug("[Elastic EP][retire] retire_ranks(%s) done", global_ranks)
+    return True
+
+
+def retire_barrier() -> None:
+    """Cohort-wide barrier on ``torch.distributed.group.WORLD``.
+
+    Called by every rank (survivors + retirees) BEFORE the mask flip in
+    :func:`try_retire_ranks`. Two invariants are enforced by this
+    barrier:
+
+    * All in-flight collectives on WORLD have completed (barrier is
+      posted after the drain phase halts new work).
+    * All ranks have reached the mask-flip point simultaneously, so no
+      survivor flips the mask while another rank is still expecting the
+      retiree to participate in a prior collective.
+
+    This is the last collective retirees post before ``sys.exit(0)``.
+    After the barrier, retirees do only local state cleanup + exit;
+    survivors flip the mask and proceed to reconfig.
+    """
+    torch.distributed.barrier(group=torch.distributed.group.WORLD)
+
+
+def retiree_local_cleanup() -> None:
+    """Local Mooncake / CUDA quiesce, run by retirees just before exit.
+
+    Called on the retiree AFTER :func:`retire_barrier` and BEFORE
+    ``sys.exit(0)``. Deliberately narrow scope:
+
+    * ``torch.cuda.synchronize()`` -- drain any pending GPU kernels
+      launched by the last forward pass.
+    * ``torch.cuda.empty_cache()`` -- release the PyTorch caching
+      allocator's reservations so process teardown returns memory to the
+      OS promptly.
+
+    We deliberately do NOT call ``torch.distributed.destroy_process_
+    group()``. The launch-time process groups (both torch default WORLD
+    and every sglang parallel group) stay at their launch-time
+    membership; destroying them here would trigger the well-known
+    "destroy blocks on live NCCL/Mooncake comms" hang (see the
+    ``# Why`` note at ``parallel_state.py:2775-2784``). Process exit
+    reclaims all Mooncake / NCCL / CUDA state for this process; the
+    survivors' Mooncake internal peer state moves the retiree slot to
+    inactive via the mask, and the reserved-but-inactive slot stays
+    available for a later ``recover_ranks`` reactivation.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
