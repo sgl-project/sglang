@@ -180,7 +180,8 @@ html.dark table tbody tr:nth-child(even) td,
 }
 
 .prose:has(.sgd-model-tags) {
-  overflow-x: hidden;
+  overflow-x: clip;
+  overflow-y: visible;
 }
 
 .sgd-muted {
