@@ -19,8 +19,15 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
+_is_hip = is_hip()
+
+_GLM_DSA_MODEL_ARCHS = (
+    "GlmMoeDsaForCausalLM",
+    "GlmMoeDsaForCausalLMNextN",
+)
 
 # Page layout constants for DSv4-Flash (MODEL1):
 #   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
@@ -400,14 +407,19 @@ def _flash_mla_flashinfer(
     extra_indices,
     extra_topk_length,
 ):
-    """FlashInfer SM120 sparse MLA via sparse_mla_sm120_decode_dsv4.
+    """FlashInfer SM120 sparse MLA via the paged-attention dispatcher.
 
     SGLang SWA pool uses page_size=256 (footer format: 256*576 bytes data + 256*8 bytes scale).
     FlashInfer decode_dsv4 fast path requires page_block_size=64 (footer: 64*576 + 64*8).
     We split 256-token pages into 4 virtual 64-token pages.
     Token indices are invariant under page-split (identity mapping).
     """
-    from flashinfer.mla._sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
+    from flashinfer.mla._sparse_mla_sm120 import (
+        _DECODE_MAX_TOKENS as _FI_DECODE_MAX_TOKENS,
+    )
+    from flashinfer.mla._sparse_mla_sm120 import (
+        _sparse_mla_sm120_paged_attention,
+    )
 
     B, _, H, D = q.shape  # (batch, 1, num_heads, head_dim)
     dev = q.device
@@ -435,32 +447,112 @@ def _flash_mla_flashinfer(
     output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=dev)
     out_lse = torch.empty(B, H, dtype=torch.float32, device=dev)
 
-    # Pre-allocate split-K scratch for decode-dsv4 fast path.
-    topk = idx.shape[-1]
-    extra_topk = extra_idx.shape[-1] if extra_idx is not None else 0
-    _BI = 64
-    num_splits = (topk + _BI - 1) // _BI + (
-        (extra_topk + _BI - 1) // _BI if extra_topk > 0 else 0
-    )
-    mid_out = torch.empty(
-        B, H, num_splits, head_dim_v, dtype=torch.bfloat16, device=dev
-    )
-    mid_lse = torch.empty(B, H, num_splits, dtype=torch.float32, device=dev)
+    # Use split-K for decode-sized batches and paged attention otherwise.
+    if B <= _FI_DECODE_MAX_TOKENS:
+        topk = idx.shape[-1]
+        extra_topk = extra_idx.shape[-1] if extra_idx is not None else 0
+        _BI = 64
+        num_splits = (topk + _BI - 1) // _BI + (
+            (extra_topk + _BI - 1) // _BI if extra_topk > 0 else 0
+        )
+        mid_out = torch.empty(
+            B, H, num_splits, head_dim_v, dtype=torch.bfloat16, device=dev
+        )
+        mid_lse = torch.empty(B, H, num_splits, dtype=torch.float32, device=dev)
+    else:
+        mid_out = None
+        mid_lse = None
 
-    sparse_mla_sm120_decode_dsv4(
-        q=q.squeeze(1) if q.ndim == 4 else q,
-        kv_cache=kv_64,
-        indices=idx,
-        mid_out=mid_out,
-        mid_lse=mid_lse,
-        output=output,
-        out_lse=out_lse,
-        sm_scale=softmax_scale,
+    _sparse_mla_sm120_paged_attention(
+        q.squeeze(1) if q.ndim == 4 else q,
+        kv_64,
+        idx,
+        output,
+        out_lse,
+        softmax_scale,
+        d_v=head_dim_v,
         topk_length=topk_length,
         attn_sink=attn_sink,
         extra_kv_cache=extra_kv_64,
         extra_indices=extra_idx,
         extra_topk_length=extra_topk_length,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
     )
 
     return (output.unsqueeze(1), None)
+
+
+def _validate_flashinfer_sparse_mla_backend(
+    *,
+    model_arch: str,
+    device_sm_major: int,
+    kv_cache_dtype: torch.dtype,
+    prefill_impl: str,
+    decode_impl: str,
+) -> bool:
+    selected = {prefill_impl, decode_impl}
+    uses_flashinfer_sparse_mla = "flashinfer_sparse_mla" in selected
+    is_glm_sm12_fp8 = (
+        model_arch in _GLM_DSA_MODEL_ARCHS
+        and device_sm_major == 12
+        and kv_cache_dtype == torch.float8_e4m3fn
+        and not _is_hip
+    )
+    if uses_flashinfer_sparse_mla and not is_glm_sm12_fp8:
+        raise ValueError(
+            "flashinfer_sparse_mla supports only GLM DSA with FP8 KV cache "
+            "on NVIDIA SM120/SM121; "
+            f"got model_arch={model_arch!r}, sm_major={device_sm_major}, "
+            f"kv_cache_dtype={kv_cache_dtype}, prefill_impl={prefill_impl!r}, "
+            f"decode_impl={decode_impl!r}."
+        )
+    if is_glm_sm12_fp8:
+        unsupported = selected - {"flashinfer_sparse_mla"}
+        if unsupported:
+            raise ValueError(
+                "GLM DSA with FP8 KV cache on NVIDIA SM120/SM121 supports "
+                "only flashinfer_sparse_mla, "
+                f"but got {sorted(unsupported)}."
+            )
+    return uses_flashinfer_sparse_mla
+
+
+def flashinfer_sparse_mla_forward(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    *,
+    page_size: int,
+    kv_cache_dim: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    sm_scale: float,
+    skip_softmax_threshold_scale_factor: float | None,
+) -> torch.Tensor:
+    """Run FlashInfer's SM120 sparse MLA kernel on SGLang's packed DSA cache."""
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    topk = indices.shape[1]
+    result = trtllm_batch_decode_with_kv_cache_mla(
+        query=q.unsqueeze(1),
+        kv_cache=kv_cache.view(torch.uint8)
+        .view(-1, page_size, kv_cache_dim)
+        .unsqueeze(1),
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=indices.unsqueeze(1),
+        seq_lens=seq_lens,
+        max_seq_len=topk,
+        sparse_mla_top_k=topk,
+        bmm1_scale=float(sm_scale),
+        bmm2_scale=1.0,
+        kv_scale_format="arbitrary_fp32",
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+    )
+    return result.squeeze(1)

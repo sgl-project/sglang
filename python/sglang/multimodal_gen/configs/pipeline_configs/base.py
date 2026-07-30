@@ -224,6 +224,7 @@ class PipelineConfig:
     # VAE configuration
     vae_config: VAEConfig = field(default_factory=VAEConfig)
     vae_precision: str = "fp32"
+    vae_decode_precision: str | None = None
     vae_tiling: bool = True
     vae_slicing: bool = False
     vae_sp: bool = True
@@ -675,6 +676,10 @@ class PipelineConfig:
     def get_neg_prompt_embeds(self, batch):
         return batch.negative_prompt_embeds
 
+    def expand_conditioning_to_sample_batch(self, batch):
+        """Used for single-request multi-output generation case."""
+        return batch
+
     def post_denoising_loop(self, latents, batch):
         latents = maybe_unpad_latents(latents, batch)
         return latents
@@ -793,6 +798,17 @@ class PipelineConfig:
             default=PipelineConfig.vae_precision,
             choices=["fp32", "fp16", "bf16"],
             help="Precision for VAE",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}vae-decode-precision",
+            type=str,
+            dest=f"{prefix_with_dot.replace('-', '_')}vae_decode_precision",
+            default=PipelineConfig.vae_decode_precision,
+            choices=["fp32", "fp16", "bf16"],
+            help=(
+                "Optional decode-only VAE precision override. "
+                "Defaults to --vae-precision when unset."
+            ),
         )
         parser.add_argument(
             f"--{prefix_with_dot}vae-tiling",

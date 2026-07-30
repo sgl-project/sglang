@@ -10,8 +10,13 @@ from transformers.activations import PytorchGELUTanh
 
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
@@ -38,8 +43,6 @@ from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
-
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
 _is_npu = is_npu()
 
@@ -145,6 +148,7 @@ class MoonViTEncoderLayer(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         rope_freqs_cis: torch.Tensor | None = None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
         sequence_lengths: torch.Tensor | None = None,
     ):
         residual = hidden_states
@@ -154,6 +158,7 @@ class MoonViTEncoderLayer(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_freqs_cis,
+            forward_metadata=forward_metadata,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
         )
@@ -484,12 +489,17 @@ class MoonViT3dEncoder(nn.Module):
         max_seqlen = int(lengths.max().item())
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=hidden_states.device
+        )
+
         for block in self.blocks:
             hidden_states = block(
                 hidden_states,
                 cu_seqlens,
                 max_seqlen,
                 rope_freqs_cis=rope_freqs_cis,
+                forward_metadata=forward_metadata,
                 sequence_lengths=sequence_lengths,
             )
 
@@ -784,6 +794,35 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.language_model._routed_experts_weights_of_layer.value
             if self.language_model is not None
             else {}
+        )
+
+    def prepare_context_parallel_metadata_for_dcp(
+        self,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        req_to_token: torch.Tensor,
+        seq_lens_sum: int,
+        kv_buffer_shape: torch.Size,
+        kv_cache_dtype,
+        kv_cache_device,
+        create_chunked_prefix_cache_kv_indices_fn,
+    ):
+        # DCP metadata is built on the inner DeepSeek-V3 language model.
+        return self.language_model.prepare_context_parallel_metadata_for_dcp(
+            seq_lens=seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens_sum=seq_lens_sum,
+            kv_buffer_shape=kv_buffer_shape,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_cache_device=kv_cache_device,
+            create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
         )
 
     def forward(
