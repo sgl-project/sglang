@@ -8,6 +8,7 @@ pub mod factory;
 pub mod itl;
 pub mod kv_events;
 pub mod load_based;
+pub mod mm_affinity;
 pub mod power_of_two;
 pub mod random;
 pub mod registry;
@@ -75,21 +76,11 @@ pub fn request_tokens_for(
             // thinking-mode / reasoning-effort the way the engine does (per-request
             // override, else the router's engine-matching default) so the routing
             // tokens still match when the engine runs a non-default thinking mode.
-            let opts = crate::tokenizer::dsv4::resolve_render_opts(value);
-            // Request-level dsv4 steering (`task`, `continue_final_message`) —
-            // mirrored by the built-in dsv4 encoder, ignored by Jinja. The
-            // bool is coerced the way pydantic would (`openai_bool`), not
-            // `as_bool` — an engine-true `"true"`/`1` must not render as
-            // router-false while the engine does the surgery.
-            let parts = crate::tokenizer::dsv4::RequestParts {
-                task: value.get("task").and_then(|v| v.as_str()),
-                continue_final_message: value
-                    .get("continue_final_message")
-                    .and_then(crate::tokenizer::openai_bool)
-                    == Some(true),
-            };
+            // `resolve` also reads the request-level dsv4 steering (`task`,
+            // `continue_final_message`) into `dsv4_parts`.
+            let opts = crate::tokenizer::ChatRenderOpts::resolve(value);
             if let Some(ids) =
-                tokenizers.encode_chat(&model_id.0, messages, value.get("tools"), opts, parts)
+                tokenizers.encode_chat(&model_id.0, messages, value.get("tools"), &opts)
             {
                 return Some(RequestTokens {
                     ids,
@@ -215,6 +206,16 @@ pub struct SelectionContext<'a> {
     request_body: Option<&'a [u8]>,
     routing_key: Option<&'a str>,
     request_tokens: Option<&'a [u32]>,
+    /// Tri-state, and the nesting is load-bearing:
+    ///   * `None`         — nobody resolved it; the policy must derive it.
+    ///   * `Some(None)`   — the ingress looked and there is no image.
+    ///   * `Some(Some(k))`— the ingress resolved this key.
+    ///
+    /// A plain `Option` collapsed the first two, so every TEXT-ONLY request
+    /// fell through to the policy's body-reparse fallback — a full
+    /// `serde_json` parse of the whole body on the majority path, repeated on
+    /// each `select()` (admission re-runs it per claim race and per retry).
+    mm_affinity_key: Option<Option<&'a str>>,
 }
 
 impl<'a> SelectionContext<'a> {
@@ -224,6 +225,7 @@ impl<'a> SelectionContext<'a> {
             request_body,
             routing_key: None,
             request_tokens: None,
+            mm_affinity_key: None,
         }
     }
 
@@ -237,6 +239,7 @@ impl<'a> SelectionContext<'a> {
             request_body,
             routing_key,
             request_tokens: None,
+            mm_affinity_key: None,
         }
     }
 
@@ -246,6 +249,22 @@ impl<'a> SelectionContext<'a> {
     pub fn with_request_tokens(mut self, request_tokens: Option<&'a [u32]>) -> Self {
         self.request_tokens = request_tokens;
         self
+    }
+
+    /// Record that the ingress resolved the multimodal affinity key (see
+    /// [`mm_affinity::affinity_key`]) — passing `None` for a request that
+    /// carries no image. Calling this marks the key RESOLVED either way, which
+    /// is what stops the policy re-parsing the body for text-only traffic.
+    pub fn with_mm_affinity_key(mut self, key: Option<&'a str>) -> Self {
+        self.mm_affinity_key = Some(key);
+        self
+    }
+
+    /// `None` when no caller resolved a key — the policy must derive one.
+    /// `Some(inner)` is the resolved answer, where `inner` is `None` for a
+    /// request with no image.
+    pub fn mm_affinity_key(&self) -> Option<Option<&str>> {
+        self.mm_affinity_key
     }
 
     pub fn model(&self) -> &ModelId {

@@ -336,7 +336,7 @@ async fn chat_completions_inner(
     // renders differently, so concatenating a chat-rendered suffix onto it
     // would produce garbage — those requests take the full-re-encode fallback
     // instead (`prompt = None`). Bundled with the request's resolved
-    // `RenderOpts` (the same resolution `request_tokens_for` used) so the
+    // `ChatRenderOpts` (the same resolution `request_tokens_for` used) so the
     // reply's turn suffix renders in the same thinking/effort mode as the
     // prompt. Cost when armed: one Vec clone (4 B/token), held until the
     // response completes.
@@ -347,7 +347,7 @@ async fn chat_completions_inner(
             .zip(request_value.as_ref())
             .map(|(t, v)| cache_sim_extend::IngressPrompt {
                 ids: t.ids.clone(),
-                opts: crate::tokenizer::dsv4::resolve_render_opts(v),
+                opts: crate::tokenizer::ChatRenderOpts::resolve(v),
             })
     } else {
         None
@@ -388,9 +388,34 @@ async fn chat_completions_inner(
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
+    // Affinity key for image-carrying conversations. Computed here because the
+    // body is already parsed; the policy would otherwise re-parse it on every
+    // request just to check for an image. `None` for text-only traffic, which
+    // keeps routing by prefix overlap.
+    // A media-carrying request the key derivation could not key gets no affinity
+    // AND no usable prefix hash, so it routes cold on every turn. That is
+    // invisible without its own label — the hit/assigned mix stays healthy while
+    // a whole shape class silently degrades. The distinction comes from
+    // `affinity_key` itself rather than from a separate "is this multimodal?"
+    // test on the body: any such test here would be a SECOND, differently-wrong
+    // definition of multimodal (the previous one keyed on "some `content` is an
+    // array", which the plain-text `[{"type":"text",…}]` shape satisfies).
+    let mm_affinity_key = match request_value
+        .as_ref()
+        .map(|v| crate::policies::mm_affinity::affinity_key(&model_str, v))
+    {
+        Some(crate::policies::mm_affinity::AffinityKey::Key(k)) => Some(k),
+        Some(crate::policies::mm_affinity::AffinityKey::Unkeyed) => {
+            ctx.metrics
+                .record_mm_affinity(crate::server::metrics::MmAffinityOutcome::Unkeyed);
+            None
+        }
+        Some(crate::policies::mm_affinity::AffinityKey::NoMedia) | None => None,
+    };
     let selection_ctx =
         SelectionContext::with_routing_key(&model_id, Some(&body), routing_key_owned.as_deref())
-            .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
+            .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()))
+            .with_mm_affinity_key(mm_affinity_key.as_deref());
     // Admission gate: pick a worker and claim an in-flight slot, parking until
     // one frees if every candidate is at its cap. A pass-through (immediate
     // dispatch, unconditional guard) when no per-worker cap is configured.
@@ -1839,6 +1864,20 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
         "reasoning",
         "reasoning_effort",
         "task",
+        // The four below steer the Kimi-K3 encoder specifically. Unlike the
+        // DeepSeek-V4 / Jinja encoders — which ignore them — K3 renders each one
+        // into the prompt as an injected system message (`tool_choice`,
+        // `response_format`), as the effort preamble (`thinking_effort`, which is
+        // a DIFFERENT field from the `reasoning_effort` above), or as the whole
+        // channel choice (`thinking`, Moonshot's {type, keep, effort} object,
+        // whose `type: "disabled"` moves the generation prompt off the think
+        // channel and changes the prompt by 67 tokens). Whether the engine
+        // injects a byte-identical block is unverifiable today, so these ids stay
+        // router-side.
+        "response_format",
+        "tool_choice",
+        "thinking_effort",
+        "thinking",
     ] {
         if value.get(key).is_some_and(|v| !v.is_null()) {
             return false;
@@ -1933,15 +1972,26 @@ fn last_message_is_assistant(value: &serde_json::Value) -> bool {
 /// encoder renders only `messages`, so its `input_ids` would omit the tool
 /// schemas the engine's template injects into the prompt — the caller must let
 /// the engine tokenize these itself.
+///
+/// Tools also ride on a `system` MESSAGE, not just the top level: that is
+/// Kimi-K3's lazy-loading path, which renders a whole "New Tools Available"
+/// block plus the schema JSON. Checking only the top level would forward that
+/// block while withholding the identical top-level one.
 fn request_has_tools(value: &serde_json::Value) -> bool {
-    let nonempty = |key: &str| {
-        value.get(key).is_some_and(|v| match v {
+    let nonempty_in = |obj: &serde_json::Value, key: &str| {
+        obj.get(key).is_some_and(|v| match v {
             serde_json::Value::Array(a) => !a.is_empty(),
             serde_json::Value::Null => false,
             _ => true,
         })
     };
-    nonempty("tools") || nonempty("functions")
+    if nonempty_in(value, "tools") || nonempty_in(value, "functions") {
+        return true;
+    }
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|msgs| msgs.iter().any(|m| nonempty_in(m, "tools")))
 }
 
 /// Whether any message carries non-string (array / multimodal) content. A text
@@ -2910,6 +2960,44 @@ mod tests {
         })));
         assert!(!request_is_multimodal(&serde_json::json!({
             "messages":[{"role":"user","content":"hello"}]
+        })));
+    }
+
+    /// Fields that steer the Kimi-K3 encoder specifically. Each one changes the
+    /// rendered prompt (an injected system message, or the effort preamble)
+    /// while the request otherwise looks like plain text, so without these the
+    /// ids would be forwarded as engine-equivalent when they are not.
+    #[test]
+    fn input_ids_safe_to_forward_blocks_kimi_k3_render_inputs() {
+        let blockers = [
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                               "response_format":{"type":"json_object"}}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                               "tool_choice":"none"}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                               "thinking_effort":"low"}),
+            // Moonshot's thinking object: `type` picks the generation channel and
+            // `effort` renders the preamble, so the ids are not engine-equivalent.
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                               "thinking":{"type":"disabled"}}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                               "thinking":{"effort":"low"}}),
+            // Tools on a system MESSAGE — K3's lazy-loading path. Top-level
+            // tools are already withheld; this renders the same kind of block.
+            serde_json::json!({"messages":[
+                {"role":"user","content":"hi"},
+                {"role":"system","tools":[{"type":"function","function":{"name":"f"}}]}]}),
+        ];
+        for b in blockers {
+            assert!(
+                !input_ids_safe_to_forward(&b),
+                "must not forward input_ids for {b}"
+            );
+        }
+        // An EMPTY message-level tools list renders nothing, so it must not
+        // block — otherwise a common no-op field would disable forwarding.
+        assert!(input_ids_safe_to_forward(&serde_json::json!({
+            "messages":[{"role":"user","content":"hi"},{"role":"system","tools":[]}]
         })));
     }
 

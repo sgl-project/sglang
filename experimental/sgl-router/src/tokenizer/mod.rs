@@ -4,6 +4,9 @@
 pub mod adapter;
 pub mod chat_template;
 pub mod dsv4;
+pub mod kimi_k3;
+pub mod kimi_vocab;
+pub(crate) mod pyjson;
 
 use anyhow::Result;
 use chat_template::ChatTemplate;
@@ -11,6 +14,160 @@ use dashmap::DashMap;
 use dynamo_tokenizers::Tokenizer;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// One piece of a rendered prompt, together with how it must be tokenized.
+///
+/// Most encoders produce a single string in which every `<|marker|>` was put
+/// there by the encoder itself, so promoting all of them to special ids is
+/// correct. The Kimi-K3 encoder does not: it interleaves structural markers with
+/// client-supplied text, and the engine encodes the two differently — markers
+/// with specials recognized, client text with specials DISABLED, so a literal
+/// `<|open|>` in a prompt can never become a control token. Preserving that
+/// split is what makes the router's ids match the engine's for such prompts.
+/// Construct via [`Segment::marker`] / [`Segment::client_text`]. Note what the
+/// private fields do and do not buy: they stop callers OUTSIDE this module from
+/// marking client-supplied text as a marker, but `kimi_k3` is a CHILD module and
+/// so can write the struct literal directly — its tests already read the private
+/// field. The load-bearing guard is [`Segment::marker`]'s `&'static str`, which
+/// a runtime `String` cannot reach even from inside this module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Segment {
+    text: String,
+    allow_special: bool,
+}
+
+impl Segment {
+    /// Structure the ENCODER emitted. Tokenized with special tokens recognized.
+    ///
+    /// `&'static str` is the guard, not a convenience: client text is always a
+    /// runtime `String`, so it cannot be passed here even by mistake.
+    pub fn marker(text: &'static str) -> Self {
+        Segment {
+            text: text.to_string(),
+            allow_special: true,
+        }
+    }
+
+    /// Text that came from the CLIENT, or that the encoder formatted from client
+    /// data. Tokenized with special tokens disabled.
+    pub fn client_text(text: impl Into<String>) -> Self {
+        Segment {
+            text: text.into(),
+            allow_special: false,
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Whether this segment tokenizes with special tokens recognized. Read only
+    /// by [`kimi_vocab::KimiVocab::encode_segments`] — the single interpreter.
+    pub fn allows_special(&self) -> bool {
+        self.allow_special
+    }
+
+    /// Rebuild a segment from a parity fixture, which stores the raw flag.
+    ///
+    /// Test-only, and deliberately the one way to set the flag from data: the
+    /// fixtures are generated from the Python reference, so this is the only
+    /// place the flag legitimately comes from outside the encoder.
+    #[cfg(test)]
+    pub(crate) fn from_fixture(text: String, allow_special: bool) -> Self {
+        Segment {
+            text,
+            allow_special,
+        }
+    }
+}
+
+/// How to render a chat request, for every built-in encoder.
+///
+/// Bundled rather than per-encoder because the ingress resolves options once,
+/// before it knows (or cares) which encoder the model uses; each encoder reads
+/// only its own half.
+///
+/// The unused half is cheap but NOT free: resolving it is a handful of JSON
+/// lookups, plus a clone of `response_format` when the request carries one. Both
+/// halves must therefore stay side-effect free — an earlier version logged the
+/// K3 defaults during resolution, which made a DeepSeek-only router announce
+/// Kimi settings on its first request. Per-encoder side effects belong at
+/// encoder-attach time (see `resolve_chat_encoder`), not here.
+///
+/// If a third encoder lands, prefer passing the request down and letting each
+/// encoder resolve its own options over growing this struct.
+#[derive(Clone, Debug, Default)]
+pub struct ChatRenderOptsDsv4Parts {
+    /// See [`dsv4::RequestParts::task`]. Owned rather than borrowed: resolved
+    /// options outlive the request body they came from (the cache-sim tee
+    /// carries them past the handler that parsed it).
+    pub task: Option<String>,
+    /// See [`dsv4::RequestParts::continue_final_message`].
+    pub continue_final_message: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChatRenderOpts {
+    pub dsv4: dsv4::RenderOpts,
+    /// Request-level dsv4 steering (`task`, `continue_final_message`) —
+    /// mirrored by the built-in dsv4 encoder, ignored by Jinja and by K3.
+    pub dsv4_parts: ChatRenderOptsDsv4Parts,
+    pub kimi_k3: kimi_k3::RenderOpts,
+}
+
+// Deliberately NO `Default` impl: the only sensible body would be `chat()`, and
+// a derived `..Default::default()` in a struct update is exactly how a request
+// would silently acquire reference defaults instead of the router's resolved
+// ones. Callers must choose `chat()` or `resolve()` explicitly.
+
+impl ChatRenderOpts {
+    /// Every encoder's REFERENCE default: DeepSeek-V4 in non-thinking mode with
+    /// no effort preamble, Kimi-K3 at `apply_chat_template`'s own defaults.
+    ///
+    /// Deliberately env-independent, and therefore NOT what a request should be
+    /// rendered with. Both encoders' `resolve_render_opts` fall back to the
+    /// router's env defaults (`SGLANG_ROUTER_DSV4_*` / `SGLANG_ROUTER_K3_*`) for
+    /// anything the request omits, so on a router where those are set this
+    /// disagrees with [`ChatRenderOpts::resolve`] on an empty request — by
+    /// design. Use it for fixtures and for probes that sweep modes explicitly
+    /// (see [`extension_concat_safe`]); use `resolve` for anything derived from
+    /// a real request.
+    pub fn chat() -> Self {
+        ChatRenderOpts {
+            dsv4: dsv4::RenderOpts::chat(),
+            dsv4_parts: ChatRenderOptsDsv4Parts::default(),
+            kimi_k3: kimi_k3::RenderOpts::default(),
+        }
+    }
+
+    /// Borrow the request-level dsv4 steering in the shape [`dsv4`] renders
+    /// with.
+    fn dsv4_parts(&self) -> dsv4::RequestParts<'_> {
+        dsv4::RequestParts {
+            task: self.dsv4_parts.task.as_deref(),
+            continue_final_message: self.dsv4_parts.continue_final_message,
+        }
+    }
+
+    /// Resolve both encoders' options from one request body.
+    pub fn resolve(request: &serde_json::Value) -> Self {
+        ChatRenderOpts {
+            dsv4: dsv4::resolve_render_opts(request),
+            // The bool is coerced the way pydantic would (`openai_bool`), not
+            // `as_bool` — an engine-true `"true"`/`1` must not render as
+            // router-false while the engine does the surgery.
+            dsv4_parts: ChatRenderOptsDsv4Parts {
+                task: request
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                continue_final_message: request.get("continue_final_message").and_then(openai_bool)
+                    == Some(true),
+            },
+            kimi_k3: kimi_k3::resolve_render_opts(request),
+        }
+    }
+}
 
 /// How to turn a chat request's `messages` into the prompt the engine tokenizes
 /// and caches. Cache-aware routing renders this before hashing so its query
@@ -22,6 +179,13 @@ pub enum ChatEncoder {
     Jinja(Box<ChatTemplate>),
     /// DeepSeek-V4 ships no template; the engine encodes in code. See [`dsv4`].
     DeepSeekV4,
+    /// Kimi-K3 ships no chat template; the prompt is built in code and tokenized
+    /// segment by segment (see [`Segment`]) rather than as one string, so this
+    /// variant holds a backend that implements `Encoder::encode_segments`.
+    /// [`kimi_vocab::KimiVocab`] is that backend — the HF one does not implement
+    /// segmented encode at all. The `Arc` is the SAME instance the registry serves
+    /// from `get()`, so this costs no second copy of the vocabulary.
+    KimiK3(Arc<kimi_vocab::KimiVocab>),
 }
 
 impl ChatEncoder {
@@ -30,6 +194,10 @@ impl ChatEncoder {
     /// `continue_final_message` extracted a trailing assistant turn, its content
     /// for the caller to encode and append after the prompt ids (the engine's
     /// `_append_assistant_prefix_to_prompt_ids`).
+    ///
+    /// Only for the encoders whose output IS one uniformly-tokenized string;
+    /// [`ChatEncoder::KimiK3`] has no such form and is handled by
+    /// [`TokenizerRegistry::encode_chat`] directly.
     ///
     /// The DeepSeek-V4 encoder renders `tools` (see [`dsv4::render_messages`]) so
     /// cache-aware routing matches the engine's cached blocks for tool traffic,
@@ -41,17 +209,23 @@ impl ChatEncoder {
         &self,
         messages: &serde_json::Value,
         tools: Option<&serde_json::Value>,
-        opts: dsv4::RenderOpts,
-        parts: dsv4::RequestParts<'_>,
+        opts: &ChatRenderOpts,
     ) -> Result<(String, Option<String>)> {
         match self {
             // The Jinja path does not thread thinking-mode/tools/parts yet
-            // (future work); it ignores `opts` and `parts` and renders the
-            // model's default template.
+            // (future work); it ignores `opts` and renders the model's default
+            // template.
             ChatEncoder::Jinja(t) => t.render(messages).map(|s| (s, None)),
             ChatEncoder::DeepSeekV4 => {
-                dsv4::render_request(messages, tools, opts, parts).map_err(anyhow::Error::from)
+                dsv4::render_request(messages, tools, opts.dsv4, opts.dsv4_parts())
+                    .map_err(anyhow::Error::from)
             }
+            // `encode_chat` routes K3 to the segment path before reaching here.
+            // An error rather than a panic: a mis-wired caller should degrade
+            // this model to raw-text routing, not take the router down.
+            ChatEncoder::KimiK3(_) => Err(anyhow::anyhow!(
+                "Kimi-K3 renders segments, not a string; encode_chat must take the segment path"
+            )),
         }
     }
 
@@ -65,11 +239,16 @@ impl ChatEncoder {
         &self,
         messages: &serde_json::Value,
         tools: Option<&serde_json::Value>,
-        opts: dsv4::RenderOpts,
+        opts: &ChatRenderOpts,
     ) -> Result<String> {
         match self {
             ChatEncoder::Jinja(t) => t.render(messages),
-            ChatEncoder::DeepSeekV4 => Ok(dsv4::render_messages(messages, tools, opts)),
+            ChatEncoder::DeepSeekV4 => Ok(dsv4::render_messages(messages, tools, opts.dsv4)),
+            // As in `render`: K3 has no single-string form, so the segment path
+            // in `encode_chat_plain` handles it before reaching here.
+            ChatEncoder::KimiK3(_) => Err(anyhow::anyhow!(
+                "Kimi-K3 renders segments, not a string; encode_chat_plain must take the segment path"
+            )),
         }
     }
 
@@ -86,6 +265,13 @@ impl ChatEncoder {
             // The dsv4 encoder mirrors the engine's full dsv4 request
             // handling (`input_ids_safe_to_forward_dsv4`).
             ChatEncoder::DeepSeekV4 => ForwardParity::Dsv4Full,
+            // K3 has no forwarding predicate of its own yet, and
+            // `input_ids_safe_to_forward_dsv4` encodes dsv4-specific
+            // reasoning about what the engine mirrors — it must not be
+            // borrowed for another model. Conservative until a K3 predicate
+            // exists: K3 ids still drive cache-aware routing, they are just
+            // not forwarded as `input_ids`.
+            ChatEncoder::KimiK3(_) => ForwardParity::Conservative,
         }
     }
 }
@@ -193,10 +379,10 @@ impl ChatEncoderEntry {
 /// call lands on can never change the tokenization output — only which lock
 /// it contends.
 struct TokenizerShards {
-    /// Always non-empty — the type's only constructors (`load`, and the
-    /// `#[cfg(test)]`-only `single`) both guarantee at least one element, so
-    /// `next()`'s `% self.shards.len()` can never divide by zero. Never
-    /// resized after construction: no method here takes `&mut self`.
+    /// Always non-empty — the type's only constructors (`load` and `shared`)
+    /// both guarantee at least one element, so `next()`'s `%
+    /// self.shards.len()` can never divide by zero. Never resized after
+    /// construction: no method here takes `&mut self`.
     shards: Vec<Arc<Tokenizer>>,
     /// Round-robin cursor, incremented per selection. Wraps via `%
     /// shards.len()`; overflow of the counter itself is harmless (wrapping
@@ -282,12 +468,11 @@ impl TokenizerShards {
         Arc::clone(&self.shards[i])
     }
 
-    /// Wrap a single already-loaded instance as a one-shard set. Lets tests
-    /// outside this module that build a `TokenizerRegistry` by hand (via
-    /// `attach_chat_encoder_for_test`'s siblings) keep constructing it from a
-    /// single `adapter::load` call.
-    #[cfg(test)]
-    fn single(t: Arc<Tokenizer>) -> Self {
+    /// Wrap one already-loaded instance as a single-shard set, for a backend that
+    /// gains nothing from sharding. Sharding exists to spread the HF backend's
+    /// shared merge-cache lock; a backend without one gets no throughput from N
+    /// instances and pays for the vocabulary N times.
+    fn shared(t: Arc<Tokenizer>) -> Self {
         Self {
             shards: vec![t],
             next: AtomicUsize::new(0),
@@ -322,8 +507,97 @@ impl TokenizerRegistry {
             backend: m.tokenizer_backend,
             l1_cache_bytes: m.tokenizer_l1_cache_mb.saturating_mul(1024 * 1024),
         };
-        let shards = TokenizerShards::load(&m.tokenizer_path, m.tokenizer_shards, opts)?;
-        me.inner.insert(m.id.clone(), shards);
+
+        // A Kimi-K3 model is loaded explicitly rather than through
+        // `TokenizerShards::load`, because it needs the SEGMENTED encode path and
+        // `Encoder::encode_segments` is implemented by the Baseten backend only —
+        // the HF backend that `Tokenizer::from_file` picks for a `.json` inherits
+        // the erroring trait default. The one instance built here backs both the
+        // registry and the chat encoder; sharding it would duplicate a ~164k-entry
+        // vocabulary per shard.
+        let k3_tokenizer = match adapter::resolve_artifact(&m.tokenizer_path)? {
+            // A raw tiktoken directory carries no `tokenizer.json`, so the K3
+            // segment encoder cannot be built from it — but the vocabulary itself
+            // still loads through upstream's tiktoken backend, which is what
+            // Kimi-K2 and Moonlight (tiktoken-only repos, no `tokenizer.json`)
+            // need. They get a working tokenizer and raw-prompt routing; only K3
+            // chat encoding is unavailable, and only K3 is told where to look.
+            adapter::TokenizerArtifact::TikTokenDir(dir) => {
+                let tk = adapter::load_tiktoken(&dir)?;
+                tracing::info!(model = %m.id, dir = %dir.display(),
+                    "loaded tiktoken vocabulary (this repo ships no tokenizer.json); \
+                     tokenizer sharding is not applied");
+                if is_kimi_k3(&m.id) {
+                    tracing::warn!(model = %m.id,
+                        "model id looks like Kimi-K3 but its tokenizer path has no \
+                         tokenizer.json, which the K3 segment encoder requires; chat traffic \
+                         routes by raw prompt text. Point --tokenizer-path at \
+                         `baseten/kimi-k3-tokenizer` to enable K3 encoding");
+                }
+                me.inner
+                    .insert(m.id.clone(), TokenizerShards::shared(Arc::new(tk)));
+                None
+            }
+            adapter::TokenizerArtifact::HfJson(path) if is_kimi_k3(&m.id) => {
+                let source = path.to_str().unwrap_or(&m.tokenizer_path);
+                // A vocabulary the Baseten backend cannot read is NOT fatal. It
+                // costs K3 segment encoding — so chat traffic routes by raw text —
+                // but the standard loader can still serve `/v1/tokenize` and
+                // raw-prompt routing for this model, which is strictly better than
+                // refusing to start. Same degrade-with-signal shape as the fastokens
+                // fallback in `adapter::load_with_opts`.
+                match kimi_vocab::KimiVocab::from_file(&path) {
+                    Ok(bt) => {
+                        let bt = Arc::new(bt);
+                        tracing::info!(model = %m.id, path = %source,
+                            vocab_size = bt.vocab_size(),
+                            "loaded Kimi-K3 vocabulary (Baseten BPE, reference-faithful input \
+                             chunking); tokenizer sharding is not applied");
+                        // These knobs are properties of the HuggingFace/fast
+                        // backends. Ignoring them silently would leave an operator
+                        // reading a dashboard that says `backend="fast"` while none
+                        // of it applies, so say so once at startup instead.
+                        if m.tokenizer_backend != adapter::TokenizerBackend::default()
+                            || m.tokenizer_l1_cache_mb > 0
+                            || m.tokenizer_shards > 1
+                        {
+                            tracing::warn!(model = %m.id,
+                                backend = ?m.tokenizer_backend,
+                                l1_cache_mb = m.tokenizer_l1_cache_mb,
+                                shards = m.tokenizer_shards,
+                                "--tokenizer-backend / --tokenizer-l1-cache-mb / \
+                                 --tokenizer-shards do not apply to a Kimi-K3 model and are \
+                                 ignored");
+                        }
+                        me.inner.insert(
+                            m.id.clone(),
+                            TokenizerShards::shared(Arc::new(Tokenizer::from(Arc::clone(&bt)))),
+                        );
+                        Some(bt)
+                    }
+                    Err(e) => {
+                        tracing::warn!(model = %m.id, path = %source, error = %format!("{e:#}"),
+                            "Kimi-K3 vocabulary could not be loaded through the Baseten backend; \
+                             falling back to the standard tokenizer, so chat traffic routes by \
+                             raw prompt text. Point --tokenizer-path at \
+                             `baseten/kimi-k3-tokenizer` to enable K3 encoding");
+                        let shards = TokenizerShards::load(source, m.tokenizer_shards, opts)?;
+                        me.inner.insert(m.id.clone(), shards);
+                        None
+                    }
+                }
+            }
+            // Load from the RESOLVED path, not the raw config string:
+            // `resolve_artifact` already turned a model DIRECTORY into the
+            // `tokenizer.json` inside it, and re-resolving would hand the
+            // directory itself to the HF loader, which cannot open it.
+            adapter::TokenizerArtifact::HfJson(path) => {
+                let source = path.to_str().unwrap_or(&m.tokenizer_path);
+                let shards = TokenizerShards::load(source, m.tokenizer_shards, opts)?;
+                me.inner.insert(m.id.clone(), shards);
+                None
+            }
+        };
         // Resolve the chat encoder, best-effort: a Jinja template from
         // tokenizer_config.json, else a built-in encoder for a recognized model
         // (DeepSeek-V4), else none (chat traffic routes via raw text). Every
@@ -331,7 +605,7 @@ impl TokenizerRegistry {
         // model is the single most useful signal for diagnosing "cache-aware
         // routing degraded to overlap=0 on chat traffic", so it must never be
         // silent.
-        if let Some(encoder) = me.resolve_chat_encoder(&m.id, &m.tokenizer_path) {
+        if let Some(encoder) = me.resolve_chat_encoder(&m.id, &m.tokenizer_path, k3_tokenizer) {
             me.encoders
                 .insert(m.id.clone(), Arc::new(ChatEncoderEntry::new(encoder)));
         }
@@ -339,7 +613,55 @@ impl TokenizerRegistry {
     }
 
     /// Pick the chat encoder for a model, logging the outcome on every branch.
-    fn resolve_chat_encoder(&self, model_id: &str, tokenizer_path: &str) -> Option<ChatEncoder> {
+    ///
+    /// `k3` is the Baseten-backed vocabulary loaded for a Kimi-K3 model; it is
+    /// what makes the K3 encoder available.
+    fn resolve_chat_encoder(
+        &self,
+        model_id: &str,
+        tokenizer_path: &str,
+        k3: Option<Arc<kimi_vocab::KimiVocab>>,
+    ) -> Option<ChatEncoder> {
+        // Checked before the Jinja template: K3 ships a `tokenizer_config.json`
+        // with no `chat_template`, so the template branch would fall through
+        // anyway — but ordering it first keeps "we loaded a K3 vocabulary for
+        // this model" and "we use the matching encoder" in one place.
+        if is_kimi_k3(model_id) {
+            // Every outcome sets the resolved state, not just the failures: an
+            // exported "active" is what makes its absence alertable. A warn alone
+            // is invisible after log rotation, and this degradation is permanent
+            // for the process — see `adapter::k3_encoder_state`.
+            let Some(tk) = k3 else {
+                // The load already warned with the underlying cause; do not invent
+                // a second, different explanation for the same state here.
+                tracing::warn!(model = %model_id,
+                    "Kimi-K3 encoding is unavailable for this model (see the preceding \
+                     tokenizer warning for why); chat traffic routes by raw prompt text");
+                adapter::note_k3_encoder(adapter::K3EncoderState::VocabUnavailable);
+                return None;
+            };
+            // Loading is NOT sufficient: without the structural markers the
+            // encoder would emit a prompt containing no control tokens at all,
+            // then mark it engine-equivalent and forward it. Raw-text routing is a
+            // large downgrade; forwarding a structurally empty prompt is a wrong
+            // answer. Refuse — and say WHICH marker failed and how, because an
+            // unregistered marker and an unusable vocabulary need different fixes.
+            if let Err(why) = kimi_k3::markers_resolve(tk.as_ref()) {
+                tracing::error!(model = %model_id, error = %format!("{why:#}"),
+                    markers = ?kimi_k3::CONTROL_MARKERS,
+                    "Kimi-K3 vocabulary does not resolve the XTML control markers to single \
+                     ids; K3 encoding is DISABLED and chat traffic routes by raw prompt text. \
+                     Point --tokenizer-path at `baseten/kimi-k3-tokenizer`");
+                adapter::note_k3_encoder(adapter::K3EncoderState::MarkersUnresolved);
+                return None;
+            }
+            tracing::info!(model = %model_id,
+                "Kimi-K3 routing enabled; chat requests route via the built-in K3 XTML \
+                 encoder over the Baseten-backed vocabulary");
+            kimi_k3::log_defaults();
+            adapter::note_k3_encoder(adapter::K3EncoderState::Active);
+            return Some(ChatEncoder::KimiK3(tk));
+        }
         match adapter::load_tokenizer_config(tokenizer_path) {
             Ok(Some(cfg_json)) => match ChatTemplate::from_tokenizer_config(&cfg_json) {
                 Ok(Some(tmpl)) => {
@@ -390,28 +712,64 @@ impl TokenizerRegistry {
             .unwrap_or(ForwardParity::Conservative)
     }
 
-    /// Render `messages` through the model's chat encoder, then tokenize the
-    /// result the same way the engine does (`add_special_tokens = false`, so the
-    /// encoder's literal `bos_token`/role markers carry the specials). `parts`
-    /// carries the request-level dsv4 steering (`task`, `continue_final_message`;
-    /// ignored on the Jinja path). Returns `None` — caller falls back to raw
-    /// routing — when the model has no encoder, no tokenizer, or
-    /// rendering/encoding fails or yields no tokens.
+    /// Render `messages` through the model's chat encoder and tokenize the
+    /// result, by one of two paths depending on the encoder:
+    ///
+    /// - **String** (Jinja, DeepSeek-V4): render to text, then tokenize it the
+    ///   same way the engine does (`add_special_tokens = false`, so the
+    ///   encoder's literal `bos_token`/role markers carry the specials).
+    /// - **Segments** (Kimi-K3): render to [`Segment`]s and tokenize each with
+    ///   specials recognized or disabled per segment. There is no intermediate
+    ///   string, which is the whole point — a literal `<|open|>` in client text
+    ///   must not become a control token.
+    ///
+    /// `opts.dsv4_parts` carries the request-level dsv4 steering (`task`,
+    /// `continue_final_message`; ignored on the Jinja and K3 paths).
+    ///
+    /// Returns `None` — caller falls back to raw routing — when the model has no
+    /// encoder, no tokenizer, or rendering/encoding fails or yields no tokens.
     pub fn encode_chat(
         &self,
         model_id: &str,
         messages: &serde_json::Value,
         tools: Option<&serde_json::Value>,
-        opts: dsv4::RenderOpts,
-        parts: dsv4::RequestParts<'_>,
+        opts: &ChatRenderOpts,
     ) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.
         let entry = Arc::clone(&*self.encoders.get(model_id)?);
+        // Listed explicitly, not `_`: a future segment-based encoder must break
+        // THIS match too, not silently fall into the string path where it would
+        // fail every request behind one warn.
+        match &entry.encoder {
+            // Segment-wise: each piece carries whether special tokens are
+            // recognized in it, and only the K3 tokenizer can honor that
+            // distinction — so this path never goes through `adapter::encode`.
+            // K3 does no request-level surgery, so there is no assistant prefix
+            // to append after the prompt ids either.
+            ChatEncoder::KimiK3(tk) => {
+                let segments = kimi_k3::render_segments(messages, tools, &opts.kimi_k3)
+                    .inspect_err(|e| entry.log_fallback(model_id, &format!("render failed: {e:#}")))
+                    .ok()?;
+                return match tk.encode_segments(&segments) {
+                    Ok(ids) if !ids.is_empty() => Some(ids),
+                    Ok(_) => {
+                        entry.log_fallback(model_id, "rendered prompt tokenized to zero tokens");
+                        None
+                    }
+                    Err(e) => {
+                        entry.log_fallback(model_id, &format!("tokenize failed: {e:#}"));
+                        None
+                    }
+                };
+            }
+            ChatEncoder::Jinja(_) | ChatEncoder::DeepSeekV4 => {}
+        }
+
         let tokenizer = self.get(model_id)?;
         let (rendered, assistant_prefix) = entry
             .encoder
-            .render(messages, tools, opts, parts)
+            .render(messages, tools, opts)
             .inspect_err(|e| {
                 // A dsv4 RenderErr is a REQUEST error the engine would also
                 // reject (invalid task / task without user), not encoder
@@ -475,16 +833,34 @@ impl TokenizerRegistry {
         model_id: &str,
         messages: &serde_json::Value,
         tools: Option<&serde_json::Value>,
-        opts: dsv4::RenderOpts,
+        opts: &ChatRenderOpts,
     ) -> Option<Vec<u32>> {
         let entry = Arc::clone(&*self.encoders.get(model_id)?);
-        let tokenizer = self.get(model_id)?;
-        let rendered = entry
-            .encoder
-            .render_plain(messages, tools, opts)
-            .inspect_err(|e| entry.log_fallback(model_id, &format!("plain render failed: {e:#}")))
-            .ok()?;
-        match adapter::encode(&tokenizer, &rendered) {
+        // Same split as `encode_chat`: K3 tokenizes segments, everything else
+        // renders to one string. K3 has no request-level surgery to skip, so
+        // "plain" and request rendering coincide for it.
+        let encoded = match &entry.encoder {
+            ChatEncoder::KimiK3(tk) => {
+                let segments = kimi_k3::render_segments(messages, tools, &opts.kimi_k3)
+                    .inspect_err(|e| {
+                        entry.log_fallback(model_id, &format!("plain render failed: {e:#}"))
+                    })
+                    .ok()?;
+                tk.encode_segments(&segments)
+            }
+            ChatEncoder::Jinja(_) | ChatEncoder::DeepSeekV4 => {
+                let tokenizer = self.get(model_id)?;
+                let rendered = entry
+                    .encoder
+                    .render_plain(messages, tools, opts)
+                    .inspect_err(|e| {
+                        entry.log_fallback(model_id, &format!("plain render failed: {e:#}"))
+                    })
+                    .ok()?;
+                adapter::encode(&tokenizer, &rendered)
+            }
+        };
+        match encoded {
             Ok(ids) if !ids.is_empty() => Some(ids),
             Ok(_) => {
                 entry.log_fallback(model_id, "plain render tokenized to zero tokens");
@@ -520,15 +896,15 @@ impl TokenizerRegistry {
     /// has no encoder, the self-check failed, or the suffix render/encode
     /// fails.
     ///
-    /// `opts` MUST be the same [`dsv4::RenderOpts`] the ingress resolved for
-    /// this request ([`dsv4::resolve_render_opts`]): thinking mode changes
-    /// whether the reply's `reasoning_content` renders into the turn suffix.
+    /// `opts` MUST be the same [`ChatRenderOpts`] the ingress resolved for this
+    /// request ([`ChatRenderOpts::resolve`]): DSV4 thinking mode changes whether
+    /// the reply's `reasoning_content` renders into the turn suffix.
     pub fn encode_chat_extension(
         &self,
         model_id: &str,
         prompt_ids: &[u32],
         reply: &serde_json::Value,
-        opts: dsv4::RenderOpts,
+        opts: &ChatRenderOpts,
     ) -> Option<Vec<u32>> {
         let entry = Arc::clone(&*self.encoders.get(model_id)?);
         let tokenizer = self.get(model_id)?;
@@ -604,7 +980,7 @@ impl TokenizerRegistry {
 fn assistant_turn_suffix(
     encoder: &ChatEncoder,
     reply: &serde_json::Value,
-    opts: dsv4::RenderOpts,
+    opts: &ChatRenderOpts,
 ) -> Option<String> {
     // Plain render: the reply models a mid-conversation assistant turn in the
     // NEXT round's history — request-level surgery must not run here (it
@@ -642,23 +1018,33 @@ fn extension_concat_safe(encoder: &ChatEncoder, tokenizer: &Tokenizer) -> bool {
     // `official`, so a verdict reached under the wrong profile would bless a
     // render state production never produces.
     let profile = dsv4::active_effort_profile();
+    // Only the DSV4 half varies across probes: these are DSV4's render modes,
+    // the Jinja path ignores `opts` entirely, and K3 fails the probe on its
+    // first `render` call regardless of them.
+    let dsv4_variant = |dsv4| ChatRenderOpts {
+        dsv4,
+        ..ChatRenderOpts::chat()
+    };
     let opt_variants = [
-        dsv4::RenderOpts::chat(),
-        dsv4::RenderOpts {
+        dsv4_variant(dsv4::RenderOpts::chat()),
+        dsv4_variant(dsv4::RenderOpts {
             thinking: true,
             reasoning_effort: dsv4::ReasoningEffort::None,
             reasoning_effort_profile: profile,
-        },
-        dsv4::RenderOpts {
+        }),
+        // High renders identically to None today, but it is a distinct engine
+        // state — probe it so an engine build that gives `high` its own
+        // rendering can't be silently blessed by a verdict that never saw it.
+        dsv4_variant(dsv4::RenderOpts {
             thinking: true,
             reasoning_effort: dsv4::ReasoningEffort::High,
             reasoning_effort_profile: profile,
-        },
-        dsv4::RenderOpts {
+        }),
+        dsv4_variant(dsv4::RenderOpts {
             thinking: true,
             reasoning_effort: dsv4::ReasoningEffort::Max,
             reasoning_effort_profile: profile,
-        },
+        }),
     ];
     let tools_probe = serde_json::json!([{
         "type": "function",
@@ -686,7 +1072,7 @@ fn extension_concat_safe(encoder: &ChatEncoder, tokenizer: &Tokenizer) -> bool {
             "function": {"name": "probe", "arguments": "{\"a\": 1}"},
         }]}),
     ];
-    for opts in opt_variants {
+    for opts in &opt_variants {
         for tools in tool_variants {
             for base in &bases {
                 let Ok(prompt_text) = encoder.render_plain(base, tools, opts) else {
@@ -737,6 +1123,34 @@ fn is_deepseek_v4(model_id: &str) -> bool {
     id.contains("deepseek") && id.contains("v4")
 }
 
+/// Whether `model_id` denotes a Kimi-K3 model, which ships no Jinja template and
+/// is encoded by [`kimi_k3`].
+///
+/// Heuristic on the served model id, like [`is_deepseek_v4`]. Deliberately
+/// narrow: K2/K2.5 use a completely different (non-XTML) prompt format, so
+/// matching bare "kimi" would render them wrong. `k3` is matched with its
+/// separator so a version string like `k30` can't be mistaken for it.
+///
+/// A DOTTED minor version (`kimi-k3.5`) is likewise not matched. K2 → K2.5 is
+/// precisely a bump across which the prompt format changed, so a new minor
+/// version has to be opted into here explicitly. The cost of the false negative
+/// is raw-text routing (a degradation); the cost of the false positive would be
+/// rendering a different format's prompt and calling it engine-equivalent (a
+/// wrong answer). This function prefers the former, as the encoder-attach path
+/// does for unresolved markers.
+fn is_kimi_k3(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    if !id.contains("kimi") {
+        return false;
+    }
+    ["k3", "k-3", "k_3"].iter().any(|marker| {
+        id.match_indices(marker).any(|(i, m)| {
+            let after = id[i + m.len()..].chars().next();
+            after.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '.')
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,6 +1191,193 @@ mod tests {
             admission: crate::config::AdmissionConfig::default(),
             retry: crate::config::RetryConfig::default(),
         }
+    }
+
+    /// K2/K2.5 must NOT match: they share the "kimi" name but use a completely
+    /// different prompt format, so claiming them would render every request
+    /// wrong rather than merely missing an optimization.
+    #[test]
+    fn kimi_k3_detection_is_narrow() {
+        for id in [
+            "moonshotai/Kimi-K3",
+            "kimi-k3",
+            "Kimi_K3_Instruct",
+            "org/kimi-k3-fp8",
+        ] {
+            assert!(is_kimi_k3(id), "{id} should be detected as Kimi-K3");
+        }
+        for id in [
+            "moonshotai/Kimi-K2-Instruct",
+            "Kimi-K2.5",
+            "kimi-linear",
+            "deepseek-v4-flash",
+            // A longer version token that merely starts with k3.
+            "kimi-k30",
+            // A dotted MINOR version. K2 → K2.5 is exactly the bump across
+            // which the prompt format changed, so K3.x must be opted in
+            // explicitly rather than inheriting K3's encoder.
+            "Kimi-K3.5",
+            "moonshotai/kimi-k3.5-instruct",
+        ] {
+            assert!(!is_kimi_k3(id), "{id} must not be detected as Kimi-K3");
+        }
+    }
+
+    /// End-to-end registry wiring for a Kimi-K3 model: the Baseten-backed
+    /// vocabulary loads, `get()` serves it, and the chat encoder attaches and
+    /// produces ids. Uses the committed synthetic vocabulary.
+    #[test]
+    fn kimi_k3_model_loads_baseten_vocab_and_attaches_encoder() {
+        let mut c = cfg();
+        c.model.id = "moonshotai/Kimi-K3".into();
+        c.model.tokenizer_path = "src/tokenizer/testdata/kimi_k3_tiny_vocab".into();
+        let r = TokenizerRegistry::load_from_config(&c).expect("load K3 registry");
+
+        assert!(
+            r.get("moonshotai/Kimi-K3").is_some(),
+            "tokenizer must be served"
+        );
+        assert!(
+            r.has_chat_encoder("moonshotai/Kimi-K3"),
+            "K3 must get the built-in XTML encoder"
+        );
+
+        // The encoder must hold the SAME vocabulary instance the registry
+        // serves, not a second copy — the doc on ChatEncoder::KimiK3 asserts it
+        // and nothing else checks it.
+        {
+            let entry = r
+                .encoders
+                .get("moonshotai/Kimi-K3")
+                .expect("K3 encoder attached");
+            let ChatEncoder::KimiK3(encoder_tk) = &entry.encoder else {
+                panic!("expected the KimiK3 encoder variant");
+            };
+            // A direct pointer comparison isn't available: the registry holds
+            // `Arc<Tokenizer>`, and `Tokenizer` wraps its own `Arc<dyn ..>`, so
+            // the two smart pointers have different types. Strong count is the
+            // usable proxy — it is >= 2 only because the shard and the encoder
+            // share ONE `Arc<KimiVocab>`. Rebuilding the vocabulary for
+            // the encoder (a second load) would leave this at 1 and fail.
+            assert!(
+                Arc::strong_count(encoder_tk) >= 2,
+                "the encoder's vocabulary must be shared with the registry shard, \
+                 not a second copy (strong_count = {})",
+                Arc::strong_count(encoder_tk)
+            );
+        }
+
+        let messages = serde_json::json!([{"role": "user", "content": "hello world"}]);
+        let ids = r
+            .encode_chat(
+                "moonshotai/Kimi-K3",
+                &messages,
+                None,
+                &ChatRenderOpts::chat(),
+            )
+            .expect("K3 chat encoding");
+        assert!(!ids.is_empty());
+
+        // The registry's own tokenizer is the SAME vocabulary the encoder used,
+        // so its raw encode of the equivalent text shares the chat ids' tail.
+        let raw = adapter::encode(&r.get("moonshotai/Kimi-K3").unwrap(), "hello world")
+            .expect("raw encode");
+        assert!(
+            ids.windows(raw.len()).any(|w| w == raw),
+            "the user's text must appear verbatim inside the rendered prompt's ids"
+        );
+    }
+
+    /// A model whose id looks like K3 but whose tokenizer path holds a plain
+    /// `tokenizer.json` gets NO encoder — better to route by raw text than to
+    /// render K3 XTML against a vocabulary that isn't K3's.
+    #[test]
+    fn kimi_k3_falls_back_to_the_standard_loader_when_the_vocab_is_unreadable() {
+        let mut c = cfg();
+        // `tiny_tokenizer.json`'s `model` object has no `type`, which the Baseten
+        // backend rejects — so this drives the load-failure arm specifically.
+        c.model.id = "kimi-k3-mislabelled".into();
+        let r = TokenizerRegistry::load_from_config(&c).expect("must NOT refuse to start");
+
+        // The whole point of degrading instead of bailing: the model is still
+        // served. Asserting only `!has_chat_encoder` would pass even if the
+        // fallback dropped the model entirely.
+        let tk = r
+            .get("kimi-k3-mislabelled")
+            .expect("the fallback must still register a usable tokenizer");
+        assert!(
+            !adapter::encode(&tk, "hello")
+                .expect("fallback tokenizer encodes")
+                .is_empty(),
+            "the fallback tokenizer must actually tokenize"
+        );
+        assert!(
+            !r.has_chat_encoder("kimi-k3-mislabelled"),
+            "K3 segment encoding is unavailable, so no encoder attaches"
+        );
+        // Deliberately NOT asserting `adapter::k3_encoder_state()` here.
+        // It is a process-global with last-write-wins (same contract as
+        // `BACKEND_STATE`/`L1_STATE`), and the sibling tests that load a K3
+        // registry set it to other values on other threads — so asserting a
+        // specific value here is a race, not a check. The gauge's label set is
+        // covered by the /metrics render test instead.
+    }
+
+    /// A K3 model pointed at a tiktoken-only directory: the vocabulary still
+    /// loads (upstream's tiktoken backend reads it), but segment encoding needs a
+    /// `tokenizer.json`, so the encoder declines rather than the router refusing
+    /// to start.
+    #[test]
+    fn kimi_k3_with_only_a_tiktoken_dir_serves_without_the_encoder() {
+        let dir = std::env::temp_dir().join("sgl_router_k3_tiktoken_only");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tokenizer/testdata");
+        for f in ["tiktoken.model", "tokenizer_config.json"] {
+            std::fs::copy(src.join("kimi_k3_tiny_vocab").join(f), dir.join(f)).unwrap();
+        }
+        // `from_file_auto` needs a `model_type` to pick the BPE pattern.
+        std::fs::write(dir.join("config.json"), br#"{"model_type": "kimi_k3"}"#).unwrap();
+
+        let mut c = cfg();
+        c.model.id = "moonshotai/Kimi-K3".into();
+        c.model.tokenizer_path = dir.to_str().unwrap().into();
+        let r = TokenizerRegistry::load_from_config(&c).expect("must NOT refuse to start");
+        assert!(
+            r.get("moonshotai/Kimi-K3").is_some(),
+            "the tiktoken vocabulary still serves /v1/tokenize and raw-prompt routing"
+        );
+        assert!(
+            !r.has_chat_encoder("moonshotai/Kimi-K3"),
+            "segment encoding needs a tokenizer.json"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A NON-K3 tiktoken-only model (Kimi-K2, Moonlight) must load exactly as it
+    /// did before Kimi-K3 support existed. Regression guard: making the tiktoken
+    /// arm fatal broke every one of these.
+    #[test]
+    fn non_k3_tiktoken_only_model_still_loads() {
+        let dir = std::env::temp_dir().join("sgl_router_k2_tiktoken_only");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tokenizer/testdata");
+        for f in ["tiktoken.model", "tokenizer_config.json"] {
+            std::fs::copy(src.join("kimi_k3_tiny_vocab").join(f), dir.join(f)).unwrap();
+        }
+        std::fs::write(dir.join("config.json"), br#"{"model_type": "kimi_k2"}"#).unwrap();
+
+        let mut c = cfg();
+        c.model.id = "moonshotai/Kimi-K2-Instruct".into();
+        c.model.tokenizer_path = dir.to_str().unwrap().into();
+        let r = TokenizerRegistry::load_from_config(&c).expect("a K2 model must still start");
+        let tk = r.get("moonshotai/Kimi-K2-Instruct").expect("served");
+        assert!(
+            !adapter::encode(&tk, "hello").expect("encodes").is_empty(),
+            "a tiktoken-only vocabulary must tokenize"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -970,6 +1571,35 @@ mod tests {
         assert_eq!(cfg["chat_template"], "X");
     }
 
+    /// A model DIRECTORY is a valid `--tokenizer-path`, and it also satisfies
+    /// `looks_like_path` — so the config probe must read the file inside it,
+    /// not `.parent()`'s. Getting this wrong disables chat-template routing
+    /// while logging exactly what a template-less model logs, which is why the
+    /// decoy config one level up is part of the fixture: the parent-probing
+    /// version of this code passes a test that only asserts "not the right
+    /// one is absent".
+    #[test]
+    fn load_tokenizer_config_reads_inside_a_directory_path() {
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::write(
+            parent.path().join("tokenizer_config.json"),
+            r#"{"chat_template":"DECOY"}"#,
+        )
+        .unwrap();
+        let model_dir = parent.path().join("model");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
+        std::fs::write(
+            model_dir.join("tokenizer_config.json"),
+            r#"{"chat_template":"REAL"}"#,
+        )
+        .unwrap();
+        let cfg = adapter::load_tokenizer_config(model_dir.to_str().unwrap())
+            .unwrap()
+            .expect("the directory's own tokenizer_config.json is loaded");
+        assert_eq!(cfg["chat_template"], "REAL");
+    }
+
     #[test]
     fn load_tokenizer_config_absent_returns_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -1035,7 +1665,7 @@ mod tests {
         let reg = TokenizerRegistry::default();
         reg.inner.insert(
             "tiny".into(),
-            TokenizerShards::single(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
+            TokenizerShards::shared(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
         );
         let cfg = serde_json::json!({
             "chat_template": "{{ bos_token }}{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}{% endfor %}",
@@ -1046,13 +1676,7 @@ mod tests {
 
         let messages = serde_json::json!([{"role":"user","content":"hi"}]);
         let chat_ids = reg
-            .encode_chat(
-                "tiny",
-                &messages,
-                None,
-                dsv4::RenderOpts::chat(),
-                dsv4::RequestParts::default(),
-            )
+            .encode_chat("tiny", &messages, None, &ChatRenderOpts::chat())
             .expect("encode_chat");
         assert!(!chat_ids.is_empty());
 
@@ -1069,12 +1693,7 @@ mod tests {
             .get("tiny")
             .unwrap()
             .encoder
-            .render(
-                &messages,
-                None,
-                dsv4::RenderOpts::chat(),
-                dsv4::RequestParts::default(),
-            )
+            .render(&messages, None, &ChatRenderOpts::chat())
             .unwrap();
         assert_eq!(chat_ids, adapter::encode(&tok, &rendered).unwrap());
     }
@@ -1089,7 +1708,7 @@ mod tests {
         let reg = TokenizerRegistry::default();
         reg.inner.insert(
             "tiny".into(),
-            TokenizerShards::single(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
+            TokenizerShards::shared(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
         );
         reg.attach_chat_encoder_for_test("tiny", ChatEncoder::DeepSeekV4);
 
@@ -1097,12 +1716,15 @@ mod tests {
             {"role":"user","content":"count: 2 + 2 ="},
             {"role":"assistant","content":"4, and 3 + 3 ="}
         ]);
-        let parts = dsv4::RequestParts {
-            task: None,
-            continue_final_message: true,
+        let opts = ChatRenderOpts {
+            dsv4_parts: ChatRenderOptsDsv4Parts {
+                task: None,
+                continue_final_message: true,
+            },
+            ..ChatRenderOpts::chat()
         };
         let got = reg
-            .encode_chat("tiny", &messages, None, dsv4::RenderOpts::chat(), parts)
+            .encode_chat("tiny", &messages, None, &opts)
             .expect("encode_chat");
 
         let tok = reg.get("tiny").unwrap();
@@ -1117,13 +1739,7 @@ mod tests {
         // Control: without the flag the SAME messages rewrite the trailing
         // assistant to a user turn (no prefix, different ids).
         let without = reg
-            .encode_chat(
-                "tiny",
-                &messages,
-                None,
-                dsv4::RenderOpts::chat(),
-                dsv4::RequestParts::default(),
-            )
+            .encode_chat("tiny", &messages, None, &ChatRenderOpts::chat())
             .expect("encode_chat");
         assert_ne!(got, without);
     }
@@ -1140,7 +1756,7 @@ mod tests {
         let reg = TokenizerRegistry::default();
         reg.inner.insert(
             "dsv4".into(),
-            TokenizerShards::single(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
+            TokenizerShards::shared(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
         );
         reg.attach_chat_encoder_for_test("dsv4", ChatEncoder::DeepSeekV4);
 
@@ -1154,11 +1770,14 @@ mod tests {
             "function": {"name": "add", "parameters": {"type": "object"}},
         }]);
         let opt_variants = [
-            dsv4::RenderOpts::chat(),
-            dsv4::RenderOpts {
-                thinking: true,
-                reasoning_effort: dsv4::ReasoningEffort::Max,
-                reasoning_effort_profile: dsv4::ReasoningEffortProfile::Official,
+            ChatRenderOpts::chat(),
+            ChatRenderOpts {
+                dsv4: dsv4::RenderOpts {
+                    thinking: true,
+                    reasoning_effort: dsv4::ReasoningEffort::Max,
+                    reasoning_effort_profile: dsv4::active_effort_profile(),
+                },
+                ..ChatRenderOpts::chat()
             },
         ];
         let replies = [
@@ -1170,16 +1789,10 @@ mod tests {
                 "function": {"name": "add", "arguments": "{\"a\":3,\"b\":3}"},
             }]}),
         ];
-        for opts in opt_variants {
+        for opts in &opt_variants {
             for tools in [None, Some(&tools)] {
                 let prompt_ids = reg
-                    .encode_chat(
-                        "dsv4",
-                        &messages,
-                        tools,
-                        opts,
-                        dsv4::RequestParts::default(),
-                    )
+                    .encode_chat("dsv4", &messages, tools, opts)
                     .expect("encode_chat");
                 for reply in &replies {
                     let inc = reg
@@ -1197,7 +1810,7 @@ mod tests {
                         inc, full,
                         "incremental extension must be byte-identical to a full \
                          re-encode for {reply} (thinking={})",
-                        opts.thinking,
+                        opts.dsv4.thinking,
                     );
                 }
             }
@@ -1211,11 +1824,11 @@ mod tests {
         let reg = TokenizerRegistry::default();
         reg.inner.insert(
             "tiny".into(),
-            TokenizerShards::single(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
+            TokenizerShards::shared(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
         );
         let reply = serde_json::json!({"role": "assistant", "content": "x"});
         assert!(reg
-            .encode_chat_extension("tiny", &[1, 2], &reply, dsv4::RenderOpts::chat())
+            .encode_chat_extension("tiny", &[1, 2], &reply, &ChatRenderOpts::chat())
             .is_none());
     }
 
@@ -1227,7 +1840,7 @@ mod tests {
         let reg = TokenizerRegistry::default();
         reg.inner.insert(
             "tiny".into(),
-            TokenizerShards::single(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
+            TokenizerShards::shared(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
         );
         reg.attach_chat_template_for_test(
             "tiny",
@@ -1238,7 +1851,7 @@ mod tests {
         );
         let reply = serde_json::json!({"role": "assistant", "content": "x"});
         assert!(
-            reg.encode_chat_extension("tiny", &[1, 2], &reply, dsv4::RenderOpts::chat())
+            reg.encode_chat_extension("tiny", &[1, 2], &reply, &ChatRenderOpts::chat())
                 .is_none(),
             "a failing self-check must force the full-re-encode fallback"
         );
@@ -1249,18 +1862,12 @@ mod tests {
         let reg = TokenizerRegistry::default();
         reg.inner.insert(
             "tiny".into(),
-            TokenizerShards::single(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
+            TokenizerShards::shared(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
         );
         assert!(!reg.has_chat_encoder("tiny"));
         let messages = serde_json::json!([{"role":"user","content":"hi"}]);
         assert!(reg
-            .encode_chat(
-                "tiny",
-                &messages,
-                None,
-                dsv4::RenderOpts::chat(),
-                dsv4::RequestParts::default()
-            )
+            .encode_chat("tiny", &messages, None, &ChatRenderOpts::chat())
             .is_none());
     }
 
@@ -1272,7 +1879,7 @@ mod tests {
         let reg = TokenizerRegistry::default();
         reg.inner.insert(
             "tiny".into(),
-            TokenizerShards::single(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
+            TokenizerShards::shared(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
         );
         reg.attach_chat_template_for_test(
             "tiny",
@@ -1284,14 +1891,8 @@ mod tests {
         assert!(reg.has_chat_encoder("tiny"));
         let messages = serde_json::json!([{"role":"user","content":"hi"}]);
         assert!(
-            reg.encode_chat(
-                "tiny",
-                &messages,
-                None,
-                dsv4::RenderOpts::chat(),
-                dsv4::RequestParts::default()
-            )
-            .is_none(),
+            reg.encode_chat("tiny", &messages, None, &ChatRenderOpts::chat())
+                .is_none(),
             "a failing render must yield None so routing falls back to raw text"
         );
     }

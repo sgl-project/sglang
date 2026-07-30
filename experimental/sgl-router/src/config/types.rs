@@ -585,6 +585,19 @@ pub struct CacheAwareConfig {
     /// fires first). Like the queue limit, scale it with `dp_size`: the
     /// queue reading is summed across a worker's dp ranks.
     pub saturation_queue_floor: Option<NonZeroUsize>,
+    /// Evict a multimodal conversation's worker pin after it has been idle
+    /// this many seconds. Bounds the pin map against unbounded image
+    /// cardinality. `0` disables multimodal affinity entirely, so image
+    /// traffic routes purely by overlap/load again.
+    ///
+    /// Default 1800 — sized for a human-paced multi-turn conversation with
+    /// images: long enough that thinking time between turns keeps the pin,
+    /// short enough that abandoned conversations do not accumulate.
+    pub mm_affinity_idle_secs: u64,
+    /// Wall-clock cadence of the pin-eviction sweep. Eviction is a memory
+    /// bound, not a correctness deadline, so this is coarser than the idle
+    /// window it enforces.
+    pub mm_affinity_eviction_interval_secs: u64,
 }
 
 impl Default for CacheAwareConfig {
@@ -596,8 +609,18 @@ impl Default for CacheAwareConfig {
             bootstrap_fetch_timeout_cap_ms: default_bootstrap_fetch_timeout_cap_ms(),
             min_load_choices: default_min_load_choices(),
             saturation_queue_floor: None,
+            mm_affinity_idle_secs: default_mm_affinity_idle_secs(),
+            mm_affinity_eviction_interval_secs: default_mm_affinity_eviction_interval_secs(),
         }
     }
+}
+
+pub fn default_mm_affinity_idle_secs() -> u64 {
+    30 * 60
+}
+
+pub fn default_mm_affinity_eviction_interval_secs() -> u64 {
+    60
 }
 
 fn default_cache_threshold() -> f32 {

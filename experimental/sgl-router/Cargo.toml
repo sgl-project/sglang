@@ -51,13 +51,33 @@ dynamo-protocols = { git = "https://github.com/ai-dynamo/dynamo", rev = "1efdd4d
 # this is in a transitive dep 1.3.2 pulled forward (the `tokenizers` crate
 # itself, or `fastokens`) rather than anything dynamo-tokenizers added.
 #
-# Held below 1.5 on purpose. 1.5.x made `CachedTokenizer::new` fallible, which
-# breaks the builder chain in `tokenizer/adapter.rs`. Because `Cargo.lock` is
-# gitignored here, a caret range let a container build resolve 1.5.x and fail
-# to compile on a commit that builds locally — a drift that reads as a broken
-# HEAD. Keep the tilde until that call site is migrated.
-dynamo-tokenizers = "~1.4"
+# Two independent floors, both load-bearing:
+#   * 1.5.3 made `CachedTokenizer::new` fallible — see the call site in
+#     `tokenizer/adapter.rs`.
+#   * 1.6.0 added `Encoder::encode_segments` with its per-segment `allow_special`
+#     flag, which is the trait `tokenizer/kimi_vocab.rs` implements, and put
+#     `kimi_k3` in `TikTokenTokenizer`'s `detect_bpe_pattern` allowlist, which is
+#     how a Kimi model that ships only `tiktoken.model` still loads.
+# 1.7 is therefore not a floor, it is the latest release this tree is verified
+# against — `cargo test tokenizer::kimi_k3` with SGLANG_ROUTER_K3_TEST_VOCAB_DIR
+# set checks it id-for-id against the Python reference over the real vocabulary.
+#
+# `~`, not `^`: `Cargo.lock` is gitignored here, so a caret range lets a
+# container build resolve a minor this tree has never compiled against and fail
+# on a commit that builds locally — a drift that reads as a broken HEAD. The
+# tilde narrows that window without closing it, since upstream has changed a
+# public signature in a PATCH release (1.5.2 -> 1.5.3); the actual fix is
+# landing the lockfile and building `--locked`.
+dynamo-tokenizers = "~1.7"
 dynamo-parsers = { git = "https://github.com/ai-dynamo/dynamo", rev = "1efdd4dcb901caeae636131321094090d252c8d6" }
+# The Kimi BPE, used DIRECTLY rather than through
+# `dynamo_tokenizers::BasetenTokenizer`, because only this crate exposes a
+# segmented encode that does not impose its own input chunking — and its chunking
+# disagrees with the Python reference on U+001C..U+001F. See
+# `src/tokenizer/kimi_vocab.rs`. Pinned to the exact version `dynamo-tokenizers`
+# depends on so the tree carries ONE copy of this BPE; two would be a silent
+# tokenization fork between the chat encoder and the registry.
+basetenkenizer = { version = "=0.2.8", default-features = false }
 
 # Async runtime + http
 tokio = { version = "1.42", features = ["full"] }
@@ -122,6 +142,7 @@ rustc-hash = "2"
 rmp-serde = "1"
 sha2 = "0.10"
 url = "2"
+
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
 hmac = "0.12"
 hex = "0.4"
@@ -136,6 +157,9 @@ pprof = { version = "0.13", features = ["flamegraph"], optional = true }
 profiling = ["pprof"]
 
 [dev-dependencies]
+# Decodes the committed tiny `tiktoken.model` in the fixture-drift test. Test-only:
+# production reads a `tokenizer.json`, never a base64 rank file.
+base64 = "0.22"
 dirs = "5"
 http-body-util = "0.1"
 # Capture the router's `tracing` access log in tests (assert every request

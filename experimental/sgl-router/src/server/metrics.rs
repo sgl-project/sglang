@@ -40,6 +40,7 @@
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
+//! | `sgl_router_mm_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //! | `sgl_router_backpressure_rejected_total` | Counter | `model_id` |
 //! | `sgl_router_engine_aborts_total` | Counter | `reason` |
@@ -320,6 +321,50 @@ impl StickyOutcome {
     }
 }
 
+/// Multimodal-affinity outcome label.
+///
+/// Distinguishing these matters operationally: a healthy image workload is
+/// mostly `hit` (turn 2+ returning to the worker that has the image cached).
+/// Mostly `assigned` means conversations are not being recognized across turns
+/// — affinity is not doing its job — and `unavailable` tracks turns bounced off
+/// a pinned worker that was not on offer. There is no `remap` here; that is
+/// [`StickyOutcome`]'s, and sticky reassigns where affinity keeps the pin.
+#[derive(Debug, Clone, Copy)]
+pub enum MmAffinityOutcome {
+    /// The conversation's pinned worker was found and is healthy.
+    Hit,
+    /// First image turn for this key, or a re-pin after the normal path chose.
+    Assigned,
+    /// The request carries media the key derivation could not key, so it gets
+    /// NO affinity — the exact regression this feature exists to prevent,
+    /// happening to a shape nobody anticipated (a non-image medium, or an image
+    /// part with no payload). Without this label the hit/assigned mix looks
+    /// healthy while a whole shape class silently routes cold every turn.
+    ///
+    /// Counts MEDIA only. Text-only traffic — including the
+    /// `content: [{"type":"text",…}]` array shape most SDKs send — is
+    /// `AffinityKey::NoMedia` and records nothing, because affinity does not
+    /// apply to it and counting it here would drown the signal in the
+    /// majority path.
+    Unkeyed,
+    /// A pin exists but its worker was not among the offered candidates —
+    /// at its in-flight cap, or departed. The pin is kept so the conversation
+    /// can return; this turn routes elsewhere. Sustained `unavailable` means
+    /// image conversations are repeatedly bounced off their cached worker.
+    Unavailable,
+}
+
+impl MmAffinityOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Assigned => "assigned",
+            Self::Unkeyed => "unkeyed",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// Stale-request outcome label.
 #[derive(Debug, Clone, Copy)]
 pub enum StaleRequestOutcome {
@@ -529,6 +574,7 @@ pub struct MetricsRegistry {
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    mm_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     backpressure_rejected_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     /// Outcomes of the best-effort cache-sim tee (see
@@ -616,6 +662,7 @@ impl Default for MetricsRegistry {
             stale_requests_total: Default::default(),
             decode_affinity_total: Default::default(),
             sticky_total: Default::default(),
+            mm_affinity_total: Default::default(),
             cache_sim_tee_total: Default::default(),
             s3_export_total: Default::default(),
             s3_export_records_uploaded: AtomicU64::new(0),
@@ -1042,6 +1089,17 @@ impl MetricsRegistry {
     /// Bump `sgl_router_decode_affinity_total{outcome}`.
     pub fn record_decode_affinity(&self, outcome: DecodeAffinityOutcome) {
         let mut guard = self.decode_affinity_total.lock();
+        let counter = guard
+            .entry(outcome.as_str())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_mm_affinity_total{outcome}`.
+    pub fn record_mm_affinity(&self, outcome: MmAffinityOutcome) {
+        let mut guard = self.mm_affinity_total.lock();
         let counter = guard
             .entry(outcome.as_str())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
@@ -1698,6 +1756,26 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // mm_affinity_total
+        out.push_str(
+            "# HELP sgl_router_mm_affinity_total Multimodal conversation affinity outcomes \
+(image-carrying requests, which cache-aware prefix matching cannot route).\n",
+        );
+        out.push_str("# TYPE sgl_router_mm_affinity_total counter\n");
+        let guard = self.mm_affinity_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for (outcome, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_mm_affinity_total{{outcome=\"{}\"}} {}\n",
+                outcome, value,
+            ));
+        }
+        drop(guard);
+
         // cache_sim_tee_total
         out.push_str(
             "# HELP sgl_router_cache_sim_tee_total Best-effort cache-sim tee outcomes (result=sent|http_error|error|dropped|closed for the ingress /ingest_ids tee, extend_sent|extend_http_error|extend_error for the response-completion /extend_ids tee; dropped/closed are shared queue outcomes, NOT split by leg). Observational tee to the theoretical cache-sim; a nonzero http_error (cache-sim 4xx/5xx) or error (transport) while serving is healthy means the tee is broken — extend_http_error specifically suggests a cache-sim too old to have /extend_ids.\n",
@@ -1799,6 +1877,21 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "sgl_router_tokenizer_l1_state{{state=\"{s}\"}} {}\n",
                 u8::from(s == l1_state)
+            ));
+        }
+        // Same contract for the Kimi-K3 chat encoder: losing it silently drops
+        // K3 chat traffic to raw-prompt-text routing for the process lifetime,
+        // and the resulting KV-cache hit-rate drop is otherwise indistinguishable
+        // from a workload change.
+        let k3_state = crate::tokenizer::adapter::k3_encoder_state();
+        out.push_str(
+            "# HELP sgl_router_tokenizer_k3_encoder_state Resolved Kimi-K3 segment-encoder state; anything other than active or not_applicable means K3 chat requests route on raw prompt text instead of engine-equivalent ids.\n",
+        );
+        out.push_str("# TYPE sgl_router_tokenizer_k3_encoder_state gauge\n");
+        for s in crate::tokenizer::adapter::K3_ENCODER_STATES {
+            out.push_str(&format!(
+                "sgl_router_tokenizer_k3_encoder_state{{state=\"{s}\"}} {}\n",
+                u8::from(s == k3_state)
             ));
         }
 
@@ -2029,6 +2122,7 @@ mod tests {
         // sibling tokenizer tests in this binary may have bumped them.
         assert!(out.contains("# TYPE sgl_router_tokenizer_backend gauge"));
         assert!(out.contains("# TYPE sgl_router_tokenizer_l1_state gauge"));
+        assert!(out.contains("# TYPE sgl_router_tokenizer_k3_encoder_state gauge"));
         for series in [
             r#"sgl_router_tokenizer_backend{backend="hf"} "#,
             r#"sgl_router_tokenizer_backend{backend="fast"} "#,
@@ -2036,6 +2130,13 @@ mod tests {
             r#"sgl_router_tokenizer_l1_state{state="off"} "#,
             r#"sgl_router_tokenizer_l1_state{state="active"} "#,
             r#"sgl_router_tokenizer_l1_state{state="disabled_no_specials"} "#,
+            // Every K3 label value renders, so a dashboard sees a 0 rather than a
+            // missing series. WHICH one is 1 is not asserted: the backing gauge is
+            // process-global and sibling tokenizer tests set it.
+            r#"sgl_router_tokenizer_k3_encoder_state{state="not_applicable"} "#,
+            r#"sgl_router_tokenizer_k3_encoder_state{state="active"} "#,
+            r#"sgl_router_tokenizer_k3_encoder_state{state="vocab_unavailable"} "#,
+            r#"sgl_router_tokenizer_k3_encoder_state{state="markers_unresolved"} "#,
             r#"sgl_router_tokenizer_l1_lookups_total{outcome="hit"} "#,
             r#"sgl_router_tokenizer_l1_lookups_total{outcome="miss"} "#,
             r#"sgl_router_tokenizer_l1_tokens_total{source="cached"} "#,

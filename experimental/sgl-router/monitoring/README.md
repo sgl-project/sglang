@@ -49,6 +49,7 @@ PromQL rather than a dedicated panel:
 | `sgl_router_stale_requests_total` | Counter | Stale-request cancellations |
 | `sgl_router_decode_affinity_total` | Counter | PD decode-affinity outcomes |
 | `sgl_router_sticky_total` | Counter | Sticky-session selection outcomes |
+| `sgl_router_mm_affinity_total` | Counter | Multimodal-affinity outcomes by `outcome` (`hit` / `assigned` / `unkeyed` / `unavailable`). Healthy image traffic is mostly `hit`; sustained `unkeyed` means a media shape gets no affinity and routes cold every turn |
 
 The `sgl_router_workers` / `sgl_router_worker_*` gauges are sampled from the
 live worker registry on every scrape, so a removed worker stops emitting

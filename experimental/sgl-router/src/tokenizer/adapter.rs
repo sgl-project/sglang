@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use dynamo_tokenizers::{traits::DecodeResult, CachedTokenizer, FastTokenizer, Tokenizer};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -69,6 +69,62 @@ const L1_OFF: u8 = 0;
 const L1_ACTIVE: u8 = 1;
 const L1_DISABLED_NO_SPECIALS: u8 = 2;
 
+/// Whether the Kimi-K3 chat encoder is live, for the same reason
+/// [`BACKEND_STATE`] exists: losing it is a PERMANENT, process-lifetime
+/// degradation — every K3 chat request then routes on raw prompt text instead of
+/// engine-equivalent ids — and its only other signal is one startup log line.
+/// The symptom operators actually see is a KV-cache hit-rate drop that survives
+/// restarts and looks like a workload change, so the resolved state is exported.
+static K3_STATE: AtomicU8 = AtomicU8::new(K3_NOT_APPLICABLE);
+
+const K3_NOT_APPLICABLE: u8 = 0;
+const K3_ACTIVE: u8 = 1;
+const K3_VOCAB_UNAVAILABLE: u8 = 2;
+const K3_MARKERS_UNRESOLVED: u8 = 3;
+
+/// The outcome of resolving the Kimi-K3 chat encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum K3EncoderState {
+    /// Segment encoding is live for this model.
+    Active,
+    /// No vocabulary the segment encoder can use (no `tokenizer.json`, or it
+    /// failed to load). Chat traffic routes by raw prompt text.
+    VocabUnavailable,
+    /// The vocabulary loaded but does not resolve the XTML control markers.
+    MarkersUnresolved,
+}
+
+/// Record the resolved Kimi-K3 encoder state for `/metrics`.
+pub fn note_k3_encoder(state: K3EncoderState) {
+    K3_STATE.store(
+        match state {
+            K3EncoderState::Active => K3_ACTIVE,
+            K3EncoderState::VocabUnavailable => K3_VOCAB_UNAVAILABLE,
+            K3EncoderState::MarkersUnresolved => K3_MARKERS_UNRESOLVED,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Every `sgl_router_tokenizer_k3_encoder_state` label value, so the renderer
+/// emits all of them and a dashboard sees a zero rather than a missing series.
+pub const K3_ENCODER_STATES: [&str; 4] = [
+    "not_applicable",
+    "active",
+    "vocab_unavailable",
+    "markers_unresolved",
+];
+
+/// The resolved Kimi-K3 encoder state as a `K3_ENCODER_STATES` label value.
+pub fn k3_encoder_state() -> &'static str {
+    match K3_STATE.load(Ordering::Relaxed) {
+        K3_ACTIVE => "active",
+        K3_VOCAB_UNAVAILABLE => "vocab_unavailable",
+        K3_MARKERS_UNRESOLVED => "markers_unresolved",
+        _ => "not_applicable",
+    }
+}
+
 /// Snapshot of the process-wide L1 prefix-cache counters, in the order
 /// `(hits, misses, cached_tokens, uncached_tokens)`. Hit/miss count cache
 /// LOOKUPS (one per encode while L1 is active — boundary-less prompts count
@@ -105,6 +161,115 @@ pub fn tokenizer_runtime_states() -> (&'static str, &'static str) {
     (backend, l1)
 }
 
+/// Which on-disk tokenizer artifact a `--tokenizer-path` resolves to.
+///
+/// Almost every model ships a HuggingFace `tokenizer.json`; some Kimi repos ship
+/// a raw tiktoken rank file instead. The two need different loaders
+/// ([`load_with_opts`] and [`load_tiktoken`]), and the operator should not have
+/// to say which — the artifact that exists decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenizerArtifact {
+    /// A HuggingFace `tokenizer.json`.
+    HfJson(PathBuf),
+    /// A directory containing `tiktoken.model` and no `tokenizer.json`. Loads
+    /// through [`load_tiktoken`], which is sufficient for every Kimi model except
+    /// K3 — its segment encoder needs a `tokenizer.json` (see
+    /// [`super::kimi_vocab`]), so the caller warns and falls back to raw-text
+    /// routing for that one.
+    TikTokenDir(PathBuf),
+}
+
+/// Load a raw tiktoken directory through upstream's tiktoken backend.
+///
+/// For the models that ship `tiktoken.model` and no `tokenizer.json` — Kimi-K2,
+/// Moonlight — this is the whole vocabulary story: encode, decode, and
+/// `/v1/tokenize`. It is NOT enough for Kimi-K3, whose chat encoder needs a
+/// segmented encode with reference-faithful chunking (see
+/// [`super::kimi_vocab`]); K3 therefore wants a `tokenizer.json` instead.
+///
+/// `from_file_auto` reads the BPE pattern from `config.json`'s `model_type` and
+/// the specials from `tokenizer_config.json`, both alongside the model file —
+/// which is why [`resolve_artifact`] fetches all three for a repo id.
+pub fn load_tiktoken(dir: &Path) -> Result<Tokenizer> {
+    let model = dir.join("tiktoken.model");
+    let path = model
+        .to_str()
+        .context("tiktoken.model path is not valid UTF-8")?;
+    Tokenizer::from_file(path).with_context(|| format!("load {path} through the tiktoken backend"))
+}
+
+/// Classify `source` — a local path or a HuggingFace repo id — as one of
+/// [`TokenizerArtifact`].
+///
+/// Local resolution never touches the network. For a repo id, `tokenizer.json`
+/// is attempted first (the overwhelmingly common case, and the only one that
+/// used to exist); only when that fetch fails is `tiktoken.model` tried, so a
+/// normal model pays no extra request and a tiktoken-only repo needs no extra
+/// flag. That repo's `config.json` and `tokenizer_config.json` are fetched
+/// alongside so they land in the same snapshot directory the loader reads from:
+/// without the first there is no `model_type` to pick a BPE pattern, and without
+/// the second every special token falls back to its `<|reserved_token_N|>` name.
+pub fn resolve_artifact(source: &str) -> Result<TokenizerArtifact> {
+    let path = Path::new(source);
+    if path.is_dir() {
+        if path.join("tokenizer.json").is_file() {
+            return Ok(TokenizerArtifact::HfJson(path.join("tokenizer.json")));
+        }
+        if path.join("tiktoken.model").is_file() {
+            return Ok(TokenizerArtifact::TikTokenDir(path.to_path_buf()));
+        }
+        bail!(
+            "tokenizer path {} is a directory with neither tokenizer.json nor tiktoken.model",
+            path.display()
+        );
+    }
+    if path.is_file() || looks_like_path(source) {
+        // An explicit `.../tiktoken.model` names the file; the loader wants its
+        // directory, since it also reads `tokenizer_config.json` from there.
+        if path.extension().is_some_and(|e| e == "model") {
+            let dir = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            return Ok(TokenizerArtifact::TikTokenDir(dir.to_path_buf()));
+        }
+        return Ok(TokenizerArtifact::HfJson(path.to_path_buf()));
+    }
+
+    match download_tokenizer_json(source) {
+        Ok(p) => Ok(TokenizerArtifact::HfJson(p)),
+        Err(hf_err) => match download_repo_file(source, "tiktoken.model") {
+            Ok(model) => {
+                // `from_file_auto` needs BOTH of these next to the model file:
+                // `config.json` for the `model_type` that selects the BPE pattern,
+                // `tokenizer_config.json` for the special-token names. Fetched
+                // best-effort so the loader — not this function — reports what is
+                // missing, with the path in hand.
+                let _ = download_repo_file(source, "config.json");
+                let _ = download_repo_file(source, "tokenizer_config.json");
+                let dir = model
+                    .parent()
+                    .context("downloaded tiktoken.model has no parent directory")?
+                    .to_path_buf();
+                tracing::info!(repo = %source, dir = %dir.display(),
+                    "no tokenizer.json in this repo; using its tiktoken.model");
+                Ok(TokenizerArtifact::TikTokenDir(dir))
+            }
+            // Surface the tokenizer.json failure: for the ~all models that
+            // should have one, that is the real error, and the tiktoken miss is
+            // just noise about a fallback that was never going to apply. The
+            // exception is a genuine Kimi repo whose tiktoken fetch failed on
+            // auth or network — that operator needs the tiktoken cause, so log
+            // it rather than dropping it entirely.
+            Err(tiktoken_err) => {
+                tracing::debug!(repo = %source, error = %tiktoken_err,
+                    "tiktoken.model fallback also failed");
+                Err(hf_err)
+            }
+        },
+    }
+}
+
 /// Resolve `source` to a local tokenizer file: an existing local file (or
 /// anything with a filesystem-path shape) is used as-is; otherwise `source`
 /// is treated as a HuggingFace repo id and its `tokenizer.json` is
@@ -112,6 +277,9 @@ pub fn tokenizer_runtime_states() -> (&'static str, &'static str) {
 /// the HF cache, honoring `HF_TOKEN` / `HF_HOME` / `HF_HUB_OFFLINE`.
 /// `dynamo_tokenizers` itself has no HF-download path, so the fetch is done
 /// here via `hf-hub`.
+///
+/// This is the `tokenizer.json` path only; a tiktoken model is classified and
+/// located by [`resolve_artifact`] instead.
 fn resolve_local(source: &str) -> Result<PathBuf> {
     if Path::new(source).is_file() || looks_like_path(source) {
         Ok(Path::new(source).to_path_buf())
@@ -204,31 +372,54 @@ pub fn load_with_opts(source: &str, opts: TokenizerLoadOpts) -> Result<Arc<Token
         L1_STATE.store(L1_DISABLED_NO_SPECIALS, Ordering::Relaxed);
         return Ok(Arc::new(inner));
     }
-    L1_STATE.store(L1_ACTIVE, Ordering::Relaxed);
-    tracing::info!(%path, budget_bytes = opts.l1_cache_bytes, n_special = specials.len(),
-        "tokenizer L1 prefix cache enabled (special-token-boundary caching, extend-on-hit)");
+    let n_special = specials.len();
+    // Fallible since dynamo-tokenizers 1.5.3: the wrapper asks the backend
+    // whether prefix caching is sound for it (`Tokenizer::validate_prefix_cache`,
+    // whose trait default REFUSES). Propagate rather than fall back to the
+    // unwrapped backend — the operator asked for L1 with a byte budget, so
+    // silently serving without it is the wrong kind of quiet.
+    //
+    // No backend this function can select refuses today: `FastTokenizer` accepts
+    // unconditionally, and the HF wrapper refuses only under
+    // `add_special_tokens = true`, which this crate never sets. So this is
+    // forward-insurance for a future backend, not a live failure path.
     let cached = CachedTokenizer::new(
         (*inner).clone(), // Arc<dyn traits::Tokenizer> via Deref — a refcount bump
         specials,
         opts.l1_cache_bytes,
     )
-    // Extend-on-hit: a partial hit also caches the freshly-encoded suffix,
-    // so each turn of a growing conversation hits deeper than the last —
-    // per-turn tokenization cost stops growing with conversation length.
-    // This is the multi-turn workload the cache exists for.
-    .with_extend(true)
-    .with_observer(
-        Arc::new(|| {
-            L1_HITS.fetch_add(1, Ordering::Relaxed);
-        }),
-        Arc::new(|| {
-            L1_MISSES.fetch_add(1, Ordering::Relaxed);
-        }),
-    )
-    .with_token_observer(Arc::new(|usage| {
-        L1_CACHED_TOKENS.fetch_add(usage.cached_tokens as u64, Ordering::Relaxed);
-        L1_UNCACHED_TOKENS.fetch_add(usage.uncached_tokens as u64, Ordering::Relaxed);
-    }));
+    .with_context(|| {
+        format!(
+            "wrap {path} in the L1 prefix cache; \
+             pass --tokenizer-l1-cache-mb 0 to start without it"
+        )
+    })?;
+    // Only now is the cache a fact. Storing L1_ACTIVE or logging "enabled"
+    // ahead of the construction above would leave the resolved-state gauge
+    // (`sgl_router_tokenizer_l1_state`) claiming active on a router that failed
+    // to build the cache — the exact "requested X, running Y" blind spot that
+    // gauge exists to close.
+    L1_STATE.store(L1_ACTIVE, Ordering::Relaxed);
+    tracing::info!(%path, budget_bytes = opts.l1_cache_bytes, n_special,
+        "tokenizer L1 prefix cache enabled (special-token-boundary caching, extend-on-hit)");
+    let cached = cached
+        // Extend-on-hit: a partial hit also caches the freshly-encoded suffix,
+        // so each turn of a growing conversation hits deeper than the last —
+        // per-turn tokenization cost stops growing with conversation length.
+        // This is the multi-turn workload the cache exists for.
+        .with_extend(true)
+        .with_observer(
+            Arc::new(|| {
+                L1_HITS.fetch_add(1, Ordering::Relaxed);
+            }),
+            Arc::new(|| {
+                L1_MISSES.fetch_add(1, Ordering::Relaxed);
+            }),
+        )
+        .with_token_observer(Arc::new(|usage| {
+            L1_CACHED_TOKENS.fetch_add(usage.cached_tokens as u64, Ordering::Relaxed);
+            L1_UNCACHED_TOKENS.fetch_add(usage.uncached_tokens as u64, Ordering::Relaxed);
+        }));
     Ok(Arc::new(Tokenizer::from(Arc::new(cached))))
 }
 
@@ -251,8 +442,8 @@ pub fn load_with_opts(source: &str, opts: TokenizerLoadOpts) -> Result<Arc<Token
 /// forwarded to the engine as `input_ids` — so this filters conservatively
 /// and warns about what it drops.
 ///
-/// Fail-soft by design: an unreadable or non-JSON file (e.g. a tiktoken
-/// `.model`) yields an empty list — the cache degrades to disabled rather
+/// Fail-soft by design: an unreadable or non-JSON file (any artifact that is not
+/// a `tokenizer.json`) yields an empty list — the cache degrades to disabled rather
 /// than failing startup, since the tokenizer load itself is the
 /// authoritative validation of the file. Reads the file because the
 /// `dynamo_tokenizers::traits::Tokenizer` trait does not re-expose special
@@ -392,14 +583,23 @@ fn download_repo_file(repo_id: &str, file: &str) -> Result<PathBuf> {
 }
 
 /// Load the `tokenizer_config.json` co-located with the tokenizer named by
-/// `source` (the same value passed to [`load`]). For a local
-/// `.../tokenizer.json` path this is the sibling file; for an HF repo id it is
-/// downloaded from the same repo.
+/// `source` (the same value passed to [`load`]). For a model DIRECTORY this is
+/// the file inside it; for a local `.../tokenizer.json` path it is the sibling
+/// file; for an HF repo id it is downloaded from the same repo.
+///
+/// The directory case is checked FIRST and is not merely a convenience: a
+/// directory is a valid `--tokenizer-path` (see [`resolve_artifact`]), and it
+/// also satisfies `looks_like_path`, so without this branch it would take
+/// `.parent()` and probe the directory ABOVE the model — finding nothing, and
+/// silently disabling chat-template routing with the same log line a genuinely
+/// template-less model emits.
 ///
 /// Returns `Ok(None)` when the model ships no `tokenizer_config.json` (rare but
 /// valid) — the caller then has no chat template and routes via raw prompt text.
 pub fn load_tokenizer_config(source: &str) -> Result<Option<serde_json::Value>> {
-    let path = if Path::new(source).is_file() || looks_like_path(source) {
+    let path = if Path::new(source).is_dir() {
+        Path::new(source).join("tokenizer_config.json")
+    } else if Path::new(source).is_file() || looks_like_path(source) {
         match Path::new(source).parent() {
             Some(dir) => dir.join("tokenizer_config.json"),
             None => return Ok(None),
@@ -463,6 +663,65 @@ pub fn decode_complete(t: &Tokenizer, ids: &[u32], skip_special: bool) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which loader a path selects is decided by the artifact that EXISTS, not
+    /// by a flag — so these classifications are the whole contract. A directory
+    /// carrying both files must pick `tokenizer.json`: that is the path every
+    /// pre-existing model took, and silently switching them to tiktoken would
+    /// change their tokenization.
+    #[test]
+    fn resolve_artifact_classifies_local_paths() {
+        let dir = std::env::temp_dir().join("sgl_router_artifact_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("tiktoken.model"), "").unwrap();
+        assert_eq!(
+            resolve_artifact(dir.to_str().unwrap()).unwrap(),
+            TokenizerArtifact::TikTokenDir(dir.clone())
+        );
+
+        std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+        assert_eq!(
+            resolve_artifact(dir.to_str().unwrap()).unwrap(),
+            TokenizerArtifact::HfJson(dir.join("tokenizer.json")),
+            "tokenizer.json wins when both are present"
+        );
+
+        // An explicit .model file resolves to its DIRECTORY, because the loader
+        // also needs the tokenizer_config.json sitting next to it.
+        let model = dir.join("tiktoken.model");
+        assert_eq!(
+            resolve_artifact(model.to_str().unwrap()).unwrap(),
+            TokenizerArtifact::TikTokenDir(dir.clone())
+        );
+
+        // A path-shaped source that doesn't exist stays HfJson so the loader
+        // reports a missing-file error rather than attempting a network fetch.
+        assert_eq!(
+            resolve_artifact("/nonexistent/tokenizer.json").unwrap(),
+            TokenizerArtifact::HfJson(PathBuf::from("/nonexistent/tokenizer.json"))
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A directory with neither artifact is a configuration error, reported as
+    /// such instead of falling through to a doomed HF download of its name.
+    #[test]
+    fn resolve_artifact_rejects_an_empty_directory() {
+        let dir = std::env::temp_dir().join("sgl_router_artifact_empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = resolve_artifact(dir.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("neither tokenizer.json nor tiktoken.model"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// The L1 cache's split boundaries come from this extraction — a fixture
     /// drift that drops the special flag would silently disable the cache,

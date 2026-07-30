@@ -203,8 +203,12 @@ mod tests {
     #[tokio::test]
     async fn tokenize_request_does_not_advertise_add_special_tokens() {
         // Regression: TokenizeRequest must not have an `add_special_tokens` field.
-        // Background: dynamo-tokenizers cannot honor it. Silently ignoring it
-        // would be a footgun for clients that set it.
+        // Background: the ROUTER cannot honor it per request. dynamo-tokenizers
+        // does carry `TokenizerOptions::add_special_tokens`, but it is a
+        // construction-time option applied at load, and only the HF backend
+        // reads it — `FastTokenizer` implements neither `with_options` nor the
+        // flag. So a per-request field would be silently ignored, which is a
+        // footgun for clients that set it.
         let req: TokenizeRequest =
             serde_json::from_str(r#"{"model": "tiny", "prompt": "hi"}"#).unwrap();
         let _ = req; // compiles → schema is correct minus that field

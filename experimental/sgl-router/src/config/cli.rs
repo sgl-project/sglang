@@ -240,6 +240,15 @@ pub struct Cli {
     /// Defaults to 60.
     #[arg(long)]
     pub sticky_eviction_interval_secs: Option<u64>,
+    /// Evict a multimodal conversation's worker pin after it has been idle
+    /// this many seconds. `0` disables multimodal affinity, so image traffic
+    /// routes purely by cache overlap and load. Defaults to 1800.
+    #[arg(long)]
+    pub mm_affinity_idle_secs: Option<u64>,
+    /// Wall-clock cadence of the multimodal pin-eviction sweep, in seconds.
+    /// Defaults to 60.
+    #[arg(long)]
+    pub mm_affinity_eviction_interval_secs: Option<u64>,
 
     // ---- discovery: static ----
     /// Static worker URLs (space-separated or repeated). Mutually
@@ -423,14 +432,29 @@ impl Cli {
             || self.kv_peer_selector.is_some()
             || self.worker_queue_limit.is_some()
             || self.min_load_choices.is_some()
-            || self.saturation_queue_floor.is_some();
+            || self.saturation_queue_floor.is_some()
+            || self.mm_affinity_idle_secs.is_some()
+            || self.mm_affinity_eviction_interval_secs.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
                 "cache-aware tuning (--cache-threshold / --balance-abs-threshold / \
                  --balance-rel-threshold / --kv-bootstrap-timeout-ms / \
                  --kv-bootstrap-fetch-timeout-cap-ms / --kv-peer-selector / \
-                 --worker-queue-limit / --min-load-choices / --saturation-queue-floor) \
+                 --worker-queue-limit / --min-load-choices / --saturation-queue-floor / \
+                 --mm-affinity-idle-secs / --mm-affinity-eviction-interval-secs) \
                  requires --policy cache_aware_zmq"
+            ));
+        }
+        // `tokio::time::interval(0)` panics, and here it would do so INSIDE the
+        // spawned sweeper task: the process survives with pin eviction dead for
+        // its whole lifetime, so the map grows unbounded with no crash to
+        // explain it. Unlike sticky, `--mm-affinity-idle-secs 0` is deliberately
+        // NOT rejected — for affinity that is the documented kill switch (see
+        // `MultimodalAffinity::new`), not a misconfiguration.
+        if self.mm_affinity_eviction_interval_secs == Some(0) {
+            return Err(anyhow!(
+                "--mm-affinity-eviction-interval-secs must be greater than 0 \
+                 (use --mm-affinity-idle-secs 0 to disable multimodal affinity)"
             ));
         }
         // The queue gate replaces the fleet-spread check rather than layering on
@@ -632,6 +656,12 @@ impl Cli {
                     .map(NonZeroUsize::get)
                     .unwrap_or(d.min_load_choices),
                 saturation_queue_floor: self.saturation_queue_floor,
+                mm_affinity_idle_secs: self
+                    .mm_affinity_idle_secs
+                    .unwrap_or(d.mm_affinity_idle_secs),
+                mm_affinity_eviction_interval_secs: self
+                    .mm_affinity_eviction_interval_secs
+                    .unwrap_or(d.mm_affinity_eviction_interval_secs),
             })
         } else {
             None
@@ -1874,6 +1904,87 @@ mod tests {
         assert_eq!(c.active_load.stale_request_timeout_secs, 240);
         assert_eq!(c.proxy.stream_idle_timeout_secs, 90);
         assert_eq!(c.proxy.stream_send_stall_secs, 45);
+    }
+
+    /// The multimodal-affinity knobs must reach CacheAwareConfig, and tuning
+    /// only them must be enough to build one — otherwise the flags parse and
+    /// are silently dropped.
+    #[test]
+    fn mm_affinity_flags_reach_cache_aware_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--mm-affinity-idle-secs",
+            "120",
+            "--mm-affinity-eviction-interval-secs",
+            "7",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache-aware config built");
+        assert_eq!(ca.mm_affinity_idle_secs, 120);
+        assert_eq!(ca.mm_affinity_eviction_interval_secs, 7);
+        // Untouched knobs keep their defaults.
+        assert_eq!(ca.cache_threshold, 0.5);
+    }
+
+    /// The defaults an operator gets without touching anything.
+    #[test]
+    fn mm_affinity_defaults() {
+        let d = CacheAwareConfig::default();
+        assert_eq!(d.mm_affinity_idle_secs, 1800);
+        assert_eq!(d.mm_affinity_eviction_interval_secs, 60);
+    }
+
+    /// Cache-aware tuning on a non-cache-aware policy is an error, and the new
+    /// flags must participate in that gate rather than being silently accepted.
+    #[test]
+    fn mm_affinity_flags_require_cache_aware_policy() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "round_robin",
+            "--mm-affinity-idle-secs",
+            "120",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires --policy cache_aware_zmq"), "{err}");
+    }
+
+    /// A zero eviction interval would panic `tokio::time::interval` inside the
+    /// spawned sweeper — the process keeps serving with eviction dead, so this
+    /// has to fail at startup. Zero IDLE stays legal: it is the kill switch.
+    #[test]
+    fn zero_mm_affinity_eviction_interval_is_rejected_but_zero_idle_is_not() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--mm-affinity-eviction-interval-secs",
+            "0",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--mm-affinity-eviction-interval-secs must be greater than 0"),
+            "{err}"
+        );
+
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--mm-affinity-idle-secs",
+            "0",
+        ]))
+        .expect("--mm-affinity-idle-secs 0 is the documented way to disable affinity");
+        let ca = c.model.cache_aware.expect("cache-aware config built");
+        assert_eq!(ca.mm_affinity_idle_secs, 0);
     }
 
     #[test]
