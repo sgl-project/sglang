@@ -283,6 +283,32 @@ class TestHiSparseUnifiedPool(unittest.TestCase):
 
         self.assertEqual(translated.item(), 7)
 
+    def test_compressor_store_uses_compressed_logical_mapping(self):
+        stage_ratios = [4]
+        unified = self._build_unified_pool(stage_ratios)
+        pool, _ = self._build_hisparse_pool(unified, stage_ratios)
+        mapping = torch.zeros(
+            C4_ROWS + C4_PAD_ROWS + 1, dtype=torch.int64, device="cuda"
+        )
+        pool.register_mapping(mapping)
+
+        compressed_logical = torch.tensor([3, 9], dtype=torch.int64, device="cuda")
+        mapping[compressed_logical] = torch.tensor(
+            [17, 5], dtype=torch.int64, device="cuda"
+        )
+
+        unified_rows = pool.compressed_logical_to_unified_hot_row(compressed_logical)
+        self.assertTrue(
+            torch.equal(
+                unified_rows,
+                torch.tensor(
+                    [pool.swa_pages + 17, pool.swa_pages + 5],
+                    dtype=torch.int64,
+                    device="cuda",
+                ),
+            )
+        )
+
     def test_alloc_oversubscribe_returns_none(self):
         if not is_hip():
             self.skipTest("page_size==1 alloc path is ROCm-specific")

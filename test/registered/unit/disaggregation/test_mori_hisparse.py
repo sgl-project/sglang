@@ -252,6 +252,11 @@ class TestMoriHiSparseTransfer(unittest.TestCase):
             )
             pool.destroy()
             self.assertEqual(unregister.call_count, 3)
+            self.assertIsNone(pool.kv_buffer)
+            self.assertEqual(pool.data_refs, [])
+            self.assertIsNone(pool.data_ptrs)
+            pool.destroy()
+            self.assertEqual(unregister.call_count, 3)
 
     def test_mixed_item_plan_scatters_fragmented_host_rows(self):
         manager = object.__new__(MoriKVManager)

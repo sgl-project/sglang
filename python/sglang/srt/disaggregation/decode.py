@@ -1517,11 +1517,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.req_pool_idx,
                     prefix_len:origin_input_len,
                 ]
-                translate_kv_loc = getattr(
-                    self.token_to_kv_pool_allocator, "translate_kv_loc", None
+                full_kv_indices = (
+                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                        full_kv_indices
+                    )
                 )
-                if translate_kv_loc is not None:
-                    full_kv_indices = translate_kv_loc(full_kv_indices.long())
                 device_page_indices = kv_to_page_indices(
                     full_kv_indices,
                     page_size,

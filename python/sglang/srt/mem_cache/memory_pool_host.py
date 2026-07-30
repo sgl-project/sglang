@@ -336,6 +336,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             for chunk in self._host_register_chunks:
                 _cuda_host_unregister(chunk)
             self._host_register_chunks.clear()
+            self.kv_buffer = None
+            self.data_refs = []
+            self.data_ptrs = None
+            self.staging_buffer = None
             return
         super().destroy()
 
