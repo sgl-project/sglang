@@ -1,9 +1,8 @@
-export const DiffusionModelTags = ({ tags = [], pullUp = false }) => {
+export const DiffusionModelTags = ({ tags = [] }) => {
   const normalizedTags = Array.isArray(tags) ? tags : [tags];
-  const className = `not-prose sgd-model-tags${pullUp ? ' sgd-model-tags--pull-up' : ''}`;
 
   return (
-    <div className={className}>
+    <div className="not-prose sgd-model-tags">
       {normalizedTags.map((tag) => (
         <span key={tag} className="sgd-chip">
           {tag}

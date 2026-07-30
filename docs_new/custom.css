@@ -168,11 +168,7 @@ html.dark table tbody tr:nth-child(even) td,
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  margin: 2px 0 0;
-}
-
-.sgd-model-tags--pull-up {
-  margin-top: -1.25rem;
+  margin: -1.5rem 0 0;
 }
 
 .sgd-model-tags .sgd-chip {
