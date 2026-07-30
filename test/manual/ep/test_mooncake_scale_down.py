@@ -87,27 +87,54 @@ LAUNCH_EP_SIZE = 4
 _MAX_EP_ENV = os.environ.get("SGLANG_MC_MAX_EP_SIZE", "").strip()
 MAX_EP_SIZE = int(_MAX_EP_ENV) if _MAX_EP_ENV else LAUNCH_EP_SIZE
 GSM8K_MIN_SCORE = float(os.environ.get("SGLANG_MC_GSM8K_MIN", "0.50"))
-# Relative-drop tolerance for post-shrink GSM8K parity. Was 0.05 originally
-# and reliable pre-fork on this suite. Raised to 0.10 after empirical
-# characterisation showed the DSV3-lite test model's 3-round GSM8K soak
-# (MC06) can drift by 4-7% relative on a healthy shrunk cohort due to a
-# combination of upstream numerics changes since the fork base, none of
-# which are attributable to this branch's own edits (verified: our
-# elastic-EP hooks are gated to joiner subprocesses or fire only during
-# scale events, and never execute on the survivor forward path that MC06
-# exercises during its soak). The dominant contributor is upstream's
-# "evict only the KV shortfall in evict_from_tree_cache" (2026-07-22),
-# which keeps more FP8-quantised KV cached across the 3 back-to-back
-# rounds and introduces a monotonic R1>R2>R3 accuracy drift on our small
-# test model. Remaining residual drift is cumulative small-numeric change
-# spread across ~100 upstream commits (top-k renorm fp32 upcast, kernel
-# migration, attention backend rewrites, quantization pipeline updates).
-# 0.10 was chosen to comfortably cover the observed post-fork tail
-# (max delta seen: 7.5%) while still catching any wholesale post-shrink
-# quality collapse. Same threshold is applied to MC02's post-scale-up
-# GSM8K parity check.
+# Relative-drop tolerance for the single-round post-scale GSM8K parity
+# tests (MC02 scale-up, MC04 chained shrink, MC05 multi-node shrink,
+# MC12 chained NIXL shrink). MC06 is deliberately excluded: it has
+# been restructured to run under
+# :option:`--enable-deterministic-inference` (see
+# :attr:`_MooncakeShrinkEndToEndBase.DETERMINISTIC` and
+# :class:`TestMooncakeScaleDown4To3Soak`) and asserts byte-identical
+# scores across three post-shrink rounds, not a tolerance vs the pre-
+# shrink baseline.
+#
+# Was 0.05 originally and reliable pre-fork on this suite. Raised to
+# 0.10 after empirical characterisation showed the DSV3-lite test
+# model can drift 4-7% relative on a single-round post-scale GSM8K
+# pass due to a combination of upstream numerics changes since the
+# fork base, none of which are attributable to this branch's own
+# edits (verified: our elastic-EP hooks are gated to joiner
+# subprocesses or fire only during scale events, and never execute on
+# the survivor forward path that these single-round parity checks
+# exercise). Cumulative small-numeric change is spread across
+# ~100 upstream commits (top-k renorm fp32 upcast, kernel migration,
+# attention backend rewrites, quantization pipeline updates,
+# minimal-eviction KV cache policy). 0.10 was chosen to comfortably
+# cover the observed post-fork tail (max delta seen: 7.5%) while
+# still catching any wholesale post-scale quality collapse.
 GSM8K_REL_TOL = float(os.environ.get("SGLANG_MC_GSM8K_REL_TOL", "0.10"))
 GSM8K_NUM_EXAMPLES = int(os.environ.get("SGLANG_MC_GSM8K_NUM", "128"))
+# GSM8K workload size for deterministic-mode tests (currently MC06 only).
+# Kept smaller than ``GSM8K_NUM_EXAMPLES`` because deterministic mode
+# forces ``num_threads=1`` (no concurrent batching, since concurrent
+# batching is what makes GSM8K scores drift run-to-run). A 32-question
+# serial pass takes ~90 s on the DSV3-lite fp8 test model, so a full
+# MC06 run (1 pre + 3 post rounds) fits inside ~6 min end-to-end.
+GSM8K_NUM_EXAMPLES_DETERMINISTIC = int(
+    os.environ.get("SGLANG_MC_GSM8K_NUM_DETERMINISTIC", "32")
+)
+# Fixed random seed for :option:`--random-seed` on deterministic-mode
+# launches. The specific value does not matter; only that it is the
+# same on every launch so the three post-shrink GSM8K rounds sample
+# from the same RNG stream.
+DETERMINISTIC_SEED = int(os.environ.get("SGLANG_MC_DETERMINISTIC_SEED", "42"))
+# Loose wholesale-corruption safety margin for the deterministic path.
+# The primary signal is exact byte-equality across the three post-
+# shrink rounds; this floor only fires if the shrunk cohort produces
+# categorically worse output than the pre-shrink baseline (e.g. weight
+# corruption or a broken MoE dispatch), not for run-to-run noise.
+GSM8K_DETERMINISTIC_SAFETY_MARGIN = float(
+    os.environ.get("SGLANG_MC_GSM8K_DETERMINISTIC_SAFETY_MARGIN", "0.15")
+)
 
 # Number of logical experts in the test model. DeepSeek-V3-Lite (both
 # the fp8 and bf16 variants used here) has 72 routed experts. Kept as
@@ -208,6 +235,7 @@ def _shrink_common_args(
     moe_dense_tp_size: int | None,
     ep_num_redundant_experts: int = 24,
     moe_a2a_backend: str = "mooncake",
+    deterministic: bool = False,
 ) -> list[str]:
     """Common `sglang serve` args for Mooncake-native shrink tests.
 
@@ -220,6 +248,16 @@ def _shrink_common_args(
     never validated. ``ep_num_redundant_experts`` controls how far the
     cohort can shrink (the chained 4->3->2 test needs 72 so every
     logical still has a replica after a 4->2 shrink).
+
+    ``deterministic=True`` opts the launched server into
+    :option:`--enable-deterministic-inference`, plus a fixed random seed
+    and an explicit ``fa3`` attention backend (which is the Hopper +
+    DeepSeek default that upstream's deterministic-inference resolver
+    would pick anyway; we set it explicitly so the flag survives a
+    server_args resolve pass). Reserved for tests that need
+    across-round-numerically-identical GSM8K scores (MC06) so the
+    correctness signal can be an exact-equality assert rather than a
+    fuzzy tolerance.
     """
     args = [
         "--trust-remote-code",
@@ -255,6 +293,55 @@ def _shrink_common_args(
     ]
     if moe_dense_tp_size is not None:
         args.extend(["--moe-dense-tp-size", str(moe_dense_tp_size)])
+    if deterministic:
+        args.extend(
+            [
+                "--enable-deterministic-inference",
+                "--random-seed",
+                str(DETERMINISTIC_SEED),
+                # ``fa3`` is what upstream's deterministic-inference
+                # resolver falls back to on Hopper + DeepSeek anyway
+                # (see ``_deterministic_attention_backend`` in
+                # ``arg_groups/overrides.py``). Setting it explicitly
+                # here removes the resolver's "falling back to fa3"
+                # warning from the launch log and pins the backend so
+                # a future resolver-default change cannot silently
+                # move MC06 off fa3.
+                "--attention-backend",
+                "fa3",
+                # EPLB automatic re-balance fires every ``N`` forward
+                # passes (default N=1000). A single 32-question GSM8K
+                # round on the DSV3-lite test model runs on the order
+                # of 1500 forward passes, so an automatic rebalance
+                # would land inside a round, mutate the physical
+                # expert map mid-flight, and break byte-equality
+                # between rounds even though every OTHER source of
+                # non-determinism is pinned. Pin it well above the
+                # combined forward-pass count for the whole three-
+                # round soak (~6k passes) so no automatic rebalance
+                # can fire inside the test. Do NOT set this to a
+                # very-large number: ``server_args._handle_moe`` uses
+                # this same value as the default
+                # ``expert_distribution_recorder_buffer_size``, and
+                # that buffer is allocated as
+                # ``(N * num_layers * num_physical_experts * 4)``
+                # int32 bytes on every rank. On DSV3-lite that is
+                # ~11 KB/step, so N=10_000_000 would ask for ~107 GB
+                # on every GPU and OOM before the model even loads.
+                "--eplb-rebalance-num-iterations",
+                "100000",
+                # Detach the expert-distribution recorder buffer size
+                # from ``--eplb-rebalance-num-iterations`` so the
+                # buffer stays a fixed ~11 MB on DSV3-lite regardless
+                # of how far into the future we push the automatic-
+                # rebalance trigger. Without this the buffer would
+                # inherit 100_000 (~1 GB) from the flag above, which
+                # is not wrong but is 100x wasteful for a test that
+                # only writes ~6k steps into it.
+                "--expert-distribution-recorder-buffer-size",
+                "1024",
+            ]
+        )
     return args + DISABLED_CUDA_GRAPH_ARGS + _extra_server_args()
 
 
@@ -292,6 +379,17 @@ class _MooncakeShrinkEndToEndBase(CustomTestCase):
     # scale-up invariant that a joiner boots with
     # ``max_world_size > pg_world_size``.
     MAX_EP: int = MAX_EP_SIZE
+    # Launch the server with :option:`--enable-deterministic-inference`
+    # + a fixed :option:`--random-seed` + an explicit ``fa3`` attention
+    # backend. Enables byte-identical numerics across GSM8K rounds so
+    # the subclass can assert exact-equality on repeated evaluations
+    # (see ``TestMooncakeScaleDown4To3Soak``). Off by default because
+    # deterministic mode disables aiter fusion + forces the pytorch
+    # sampling backend and would slow down all other MC0N tests
+    # without buying them anything (they run a single GSM8K pass
+    # against a noisy pre-shrink baseline, so exact-equality never
+    # holds).
+    DETERMINISTIC: bool = False
 
     @classmethod
     def setUpClass(cls):
@@ -307,6 +405,7 @@ class _MooncakeShrinkEndToEndBase(CustomTestCase):
             moe_dense_tp_size=cls.MOE_DENSE_TP_SIZE,
             ep_num_redundant_experts=cls.EP_NUM_REDUNDANT_EXPERTS,
             moe_a2a_backend=cls.MOE_A2A_BACKEND,
+            deterministic=cls.DETERMINISTIC,
         )
         primary_env = os.environ.copy()
         visible_devices = _visible_device_ids()
@@ -357,7 +456,27 @@ class _MooncakeShrinkEndToEndBase(CustomTestCase):
             resp.status_code, 200, f"/generate {msg_suffix} failed: {resp.text}"
         )
 
-    def _run_gsm8k(self, tag: str) -> float:
+    def _run_gsm8k(
+        self,
+        tag: str,
+        *,
+        num_threads: int | None = None,
+        num_examples: int | None = None,
+    ) -> float:
+        """Run GSM8K against the currently-serving cohort.
+
+        Defaults to a 128-question workload at ``num_threads=16``, which
+        matches the historical MC0N shrink matrix (bounded to keep
+        in-flight tokens under the Mooncake EP per-rank cap of 1024 on a
+        4-rank cohort). Callers can override both to run a smaller
+        serial pass (e.g. :class:`TestMooncakeScaleDown4To3Soak`
+        MC06 in deterministic mode passes ``num_threads=1``,
+        ``num_examples=GSM8K_NUM_EXAMPLES_DETERMINISTIC``).
+        """
+        if num_threads is None:
+            num_threads = 16
+        if num_examples is None:
+            num_examples = GSM8K_NUM_EXAMPLES
         metrics = run_eval(
             SimpleNamespace(
                 base_url=self.base_url,
@@ -365,15 +484,42 @@ class _MooncakeShrinkEndToEndBase(CustomTestCase):
                 eval_name="gsm8k",
                 api="completion",
                 max_tokens=512,
-                num_examples=GSM8K_NUM_EXAMPLES,
-                # Bounded to keep in-flight tokens under the Mooncake EP
-                # per-rank cap of 1024 on a 4-rank cohort.
-                num_threads=16,
+                num_examples=num_examples,
+                num_threads=num_threads,
             )
         )
         score = float(metrics["score"])
-        print(f"[TEST] GSM8K accuracy ({tag}): {score:.2%}")
+        print(
+            f"[TEST] GSM8K accuracy ({tag}): {score:.2%} "
+            f"(n={num_examples}, threads={num_threads})"
+        )
         return score
+
+    def _flush_kv_cache(self, *, timeout_s: float = 60.0) -> None:
+        """Ask the server to flush its radix + KV caches.
+
+        Used by deterministic-mode tests (currently MC06) between
+        GSM8K rounds so each round starts from a clean cache state.
+        Without this, cross-round KV residue interacts with upstream
+        commit ``98cc8d91cf`` ("Evict only the KV shortfall in
+        ``evict_from_tree_cache``"): more FP8-quantised KV persists
+        across rounds and the three back-to-back scores stop being
+        byte-identical even under
+        :option:`--enable-deterministic-inference`.
+
+        Server-side handler is
+        :meth:`sglang.srt.managers.tokenizer_manager.TokenizerManager.flush_cache`;
+        it is a synchronous no-op if there are no in-flight requests.
+        """
+        resp = requests.post(
+            f"{self.base_url}/flush_cache",
+            timeout=timeout_s,
+        )
+        self.assertEqual(
+            resp.status_code,
+            200,
+            f"/flush_cache failed: HTTP {resp.status_code} body={resp.text!r}",
+        )
 
     def _poll_until_serving(
         self,
@@ -2292,13 +2438,52 @@ class TestMooncakeScaleDown4To3Soak(_MooncakeShrinkEndToEndBase):
       * Scheduler timers / DPC keep-alive paths that pause between
         rounds and never resume.
 
-    All three post-shrink rounds must hold GSM8K parity against the
-    pre-shrink baseline (same ``GSM8K_REL_TOL`` as MC01).
+    **Deterministic structural signal (this class opts in).**
+
+    Runs the server with :option:`--enable-deterministic-inference` +
+    a fixed :option:`--random-seed` (via ``DETERMINISTIC = True``),
+    drives GSM8K serially at ``num_threads=1``, and flushes the KV
+    cache before every round. Under this configuration the three
+    post-shrink GSM8K scores are byte-identical to each other on a
+    healthy shrunk cohort, because every source of run-to-run drift
+    is fixed:
+
+      * batch composition (``num_threads=1`` -> one request in
+        flight -> no concurrent-batching order),
+      * cross-round KV residue (:meth:`_flush_kv_cache` between
+        rounds),
+      * kernel non-determinism (``--enable-deterministic-inference``
+        forces the pytorch sampling backend, disables aiter allreduce
+        fusion, and pins the attention backend to ``fa3`` on Hopper),
+      * RNG stream (``--random-seed``).
+
+    The primary correctness assertion is therefore an **exact
+    equality** across the three post-shrink rounds. A regression that
+    corrupts the shrunk cohort in a batch-order-dependent way (e.g. a
+    stale expert weight, an off-by-one MoE dispatch, a partially
+    initialised KV pool) will make at least one of the three rounds
+    diverge and fail this assertion long before it would move the
+    GSM8K score by 5-10 percent.
+
+    A wholesale-corruption safety net ("post >= pre *
+    ``(1 - GSM8K_DETERMINISTIC_SAFETY_MARGIN)``") is retained so a
+    shrunk cohort that reproducibly answers everything wrong still
+    fails. That floor is intentionally loose (15% default) because it
+    is *not* the primary signal; single-round GSM8K noise on a 32-
+    example workload can be several percent absolute without the
+    model being wrong.
     """
+
+    DETERMINISTIC = True
 
     def test_soak_after_shrink(self):
         self._generate_ok("pre-shrink")
-        pre_score = self._run_gsm8k("pre-shrink 4-rank")
+        self._flush_kv_cache()
+        pre_score = self._run_gsm8k(
+            "pre-shrink 4-rank",
+            num_threads=1,
+            num_examples=GSM8K_NUM_EXAMPLES_DETERMINISTIC,
+        )
 
         self._scale_to(old_ep_size=4, target_ep_size=3)
         self._generate_ok("post-shrink initial ping")
@@ -2306,7 +2491,12 @@ class TestMooncakeScaleDown4To3Soak(_MooncakeShrinkEndToEndBase):
 
         post_scores: list[float] = []
         for i in range(3):
-            score = self._run_gsm8k(f"post-shrink round {i+1}/3")
+            self._flush_kv_cache()
+            score = self._run_gsm8k(
+                f"post-shrink round {i+1}/3",
+                num_threads=1,
+                num_examples=GSM8K_NUM_EXAMPLES_DETERMINISTIC,
+            )
             post_scores.append(score)
             if i < 2:
                 # Idle window between rounds -- catches bugs that only
@@ -2314,25 +2504,52 @@ class TestMooncakeScaleDown4To3Soak(_MooncakeShrinkEndToEndBase):
                 # -> cold -> warm transition after a scale event.
                 time.sleep(30)
 
-        for i, score in enumerate(post_scores):
-            rel_delta = (pre_score - score) / max(pre_score, 1e-9)
-            print(
-                f"[TEST] MC06 round {i+1}/3: pre={pre_score:.2%} "
-                f"post={score:.2%} rel_delta={rel_delta:.2%} "
-                f"tol={GSM8K_REL_TOL:.2%}"
-            )
-            self.assertLess(
-                rel_delta,
-                GSM8K_REL_TOL,
-                f"MC06 round {i+1} regressed more than "
-                f"{GSM8K_REL_TOL:.0%}: pre={pre_score:.2%} "
-                f"post={score:.2%}",
-            )
-            self.assertGreater(
-                score,
-                GSM8K_MIN_SCORE,
-                f"MC06 round {i+1} accuracy too low: {score:.2%}",
-            )
+        print(
+            f"[TEST] MC06 pre={pre_score:.4%} "
+            f"post_scores={[f'{s:.4%}' for s in post_scores]}"
+        )
+
+        # Primary signal: byte-identical scores across the three
+        # deterministic post-shrink rounds.
+        unique_scores = sorted(set(post_scores))
+        self.assertEqual(
+            len(unique_scores),
+            1,
+            "MC06 post-shrink GSM8K is non-deterministic across "
+            f"rounds under --enable-deterministic-inference: "
+            f"scores={post_scores}. Expected byte-identical scores; "
+            f"got {len(unique_scores)} distinct values "
+            f"({unique_scores}). This indicates either a genuine "
+            "batch-order-dependent correctness bug in the shrunk "
+            "cohort, or upstream's deterministic-inference guarantee "
+            "is no longer holding for our (backend, model, kernel) "
+            "combination.",
+        )
+
+        # Wholesale-corruption safety net (loose floor).
+        deterministic_score = post_scores[0]
+        rel_delta = (pre_score - deterministic_score) / max(pre_score, 1e-9)
+        print(
+            f"[TEST] MC06 safety-margin check: pre={pre_score:.2%} "
+            f"post={deterministic_score:.2%} rel_delta={rel_delta:.2%} "
+            f"margin={GSM8K_DETERMINISTIC_SAFETY_MARGIN:.0%}"
+        )
+        self.assertLess(
+            rel_delta,
+            GSM8K_DETERMINISTIC_SAFETY_MARGIN,
+            "MC06 post-shrink accuracy collapsed vs pre-shrink: "
+            f"pre={pre_score:.2%} post={deterministic_score:.2%} "
+            f"rel_delta={rel_delta:.2%} "
+            f"(safety margin={GSM8K_DETERMINISTIC_SAFETY_MARGIN:.0%}). "
+            "Byte-identical across rounds but categorically worse "
+            "than pre-shrink indicates a reproducible-but-corrupt "
+            "shrunk cohort.",
+        )
+        self.assertGreater(
+            deterministic_score,
+            GSM8K_MIN_SCORE,
+            f"MC06 post-shrink accuracy too low: {deterministic_score:.2%}",
+        )
 
 
 @unittest.skipUnless(
