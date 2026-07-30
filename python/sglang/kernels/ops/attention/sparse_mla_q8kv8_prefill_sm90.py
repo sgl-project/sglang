@@ -68,6 +68,7 @@ def _jit_sparse_mla_q8kv8_prefill_module() -> Module:
             cuda_wrappers=[
                 ("dispatch", "sparse_prefill_q8kv8_dispatch"),
                 ("dispatch_full", "sparse_prefill_q8kv8_dispatch_full"),
+                ("dispatch_topk_length", "sparse_prefill_q8kv8_dispatch_topk_length"),
             ],
             extra_cuda_cflags=_q8kv8_cuda_flags(),
             extra_dependencies=["cutlass"],
@@ -86,6 +87,7 @@ def _get_entries() -> tuple:
         _resolved_entries = (
             m["dispatch"],
             m["dispatch_full"],
+            m["dispatch_topk_length"],
         )
     return _resolved_entries
 
@@ -146,7 +148,7 @@ def _sparse_mla_q8kv8_prefill_op(
     sm_scale: float,
     cuda_stream: int,
 ) -> None:
-    dispatch_fn, _ = _get_entries()
+    dispatch_fn, _, _ = _get_entries()
     dispatch_fn(
         q,
         kv,
@@ -193,7 +195,7 @@ def _sparse_mla_q8kv8_prefill_full_op(
     sm_scale: float,
     cuda_stream: int,
 ) -> None:
-    _, dispatch_full_fn = _get_entries()
+    _, dispatch_full_fn, _ = _get_entries()
     dispatch_full_fn(
         q,
         kv,
@@ -201,6 +203,53 @@ def _sparse_mla_q8kv8_prefill_full_op(
         q_scale,
         kv_scale,
         attn_sink,
+        topk_length,
+        out,
+        max_logits,
+        lse,
+        s_q,
+        s_kv,
+        h_q,
+        h_kv,
+        d_qk,
+        d_v,
+        topk,
+        sm_scale,
+        cuda_stream,
+    )
+
+
+@register_custom_op(
+    op_name="sparse_mla_q8kv8_prefill_topk_length",
+    mutates_args=["out", "max_logits", "lse"],
+)
+def _sparse_mla_q8kv8_prefill_topk_length_op(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    topk_length: torch.Tensor,
+    out: torch.Tensor,
+    max_logits: torch.Tensor,
+    lse: torch.Tensor,
+    s_q: int,
+    s_kv: int,
+    h_q: int,
+    h_kv: int,
+    d_qk: int,
+    d_v: int,
+    topk: int,
+    sm_scale: float,
+    cuda_stream: int,
+) -> None:
+    _, _, dispatch_topk_length_fn = _get_entries()
+    dispatch_topk_length_fn(
+        q,
+        kv,
+        indices,
+        q_scale,
+        kv_scale,
         topk_length,
         out,
         max_logits,
@@ -256,8 +305,8 @@ def sparse_mla_q8kv8_prefill_fwd(
             f"sparse_mla_q8kv8_prefill_fwd only supports d_v=512, got {d_v}"
         )
 
-    if (attn_sink is None) != (topk_length is None):
-        raise ValueError("attn_sink and topk_length must be provided together")
+    if attn_sink is not None and topk_length is None:
+        raise ValueError("attn_sink requires topk_length to be provided as well")
 
     device = q.device
     if out is None:
@@ -291,6 +340,27 @@ def sparse_mla_q8kv8_prefill_fwd(
             q_scale,
             kv_scale,
             attn_sink,
+            topk_length,
+            out,
+            max_logits,
+            lse,
+            s_q,
+            s_kv,
+            h_q,
+            h_kv,
+            d_qk,
+            d_v,
+            topk,
+            sm_scale,
+            cuda_stream,
+        )
+    elif topk_length is not None:
+        _sparse_mla_q8kv8_prefill_topk_length_op(
+            q,
+            kv,
+            indices,
+            q_scale,
+            kv_scale,
             topk_length,
             out,
             max_logits,

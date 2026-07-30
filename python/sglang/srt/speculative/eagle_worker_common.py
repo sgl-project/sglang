@@ -383,6 +383,7 @@ def build_eagle_verify_input(
         effective_tree_mask_mode,
         tree_mask_buf,
         position_buf,
+        fill_prefix_mask=target_worker.model_runner.attn_backend.target_verify_reads_custom_mask(),
     )
 
     return EagleVerifyInput(

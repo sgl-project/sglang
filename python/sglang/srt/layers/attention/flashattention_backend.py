@@ -136,6 +136,10 @@ class FlashAttentionBackend(AttentionBackend):
     needs_cpu_seq_lens: bool = False
     supports_ragged_verify_graph: bool = True
 
+    # Chunked-prefix attention reads the stable ForwardBatch cu-seqlens and
+    # KV-index buffers directly, so it needs no backend-private replay state.
+    supports_full_cuda_graph_chunked_prefix = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -2558,6 +2562,11 @@ class FlashAttentionBackend(AttentionBackend):
         # build_tree_kernel_efficient fills it in-place and the worker never
         # needs seq_lens_sum to size a dynamic allocation (no D2H sync).
         return [self.cuda_graph_custom_mask, None]
+
+    def target_verify_reads_custom_mask(self) -> bool:
+        # topk<=1 verify never extracts from custom_mask (both the eager and
+        # cuda-graph metadata paths gate the extraction on topk > 1).
+        return self.topk > 1
 
     @staticmethod
     def _host_max_seq_len(
