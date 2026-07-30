@@ -974,6 +974,21 @@ class MooncakeKVManager(CommonKVManager):
     ) -> Tuple[bool, bool]:
         skip_kv = False
         skip_state = False
+
+        # Must be checked before the non-hybrid early return below, or every CP
+        # rank re-sends the same state and we transfer it cp_size times over.
+        # Prefill CP all-gathers before writing the pool, so every CP rank holds
+        # the full state regardless of whether the pool is hybrid. We assume no
+        # structure about the state rows, so we don't split them across CP ranks
+        # -- just let rank 0 send the whole thing (unless layer split already
+        # shards it per rank).
+        if (
+            self.attn_cp_size > 1
+            and self.attn_cp_rank != 0
+            and not self.server_args.enable_dsa_cache_layer_split
+        ):
+            skip_state = True
+
         if not self.is_hybrid_mla_backend:
             return skip_kv, skip_state
 
@@ -985,13 +1000,6 @@ class MooncakeKVManager(CommonKVManager):
                 skip_kv = True
                 # Hybrid-MLA KV is replicated across these source ranks, but
                 # TP-sharded state needs every rank for the aggregation path.
-
-        if (
-            self.attn_cp_size > 1
-            and self.attn_cp_rank != 0
-            and not self.server_args.enable_dsa_cache_layer_split
-        ):
-            skip_state = True
 
         return skip_kv, skip_state
 
