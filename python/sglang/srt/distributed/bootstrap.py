@@ -168,7 +168,11 @@ def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
     set_custom_all_reduce(not server_args.disable_custom_all_reduce)
     set_mscclpp_all_reduce(server_args.enable_mscclpp)
     set_torch_symm_mem_all_reduce(server_args.enable_torch_symm_mem)
-    set_flashinfer_allreduce_only(server_args.enable_flashinfer_allreduce_only)
+    # The kAllReduce path reuses the fusion workspace, so it rides on the same
+    # flag rather than getting a switch of its own.
+    set_flashinfer_allreduce_only(
+        server_args.flashinfer_allreduce_fusion_backend is not None
+    )
 
 
 def _init_cpu_threads_env(
