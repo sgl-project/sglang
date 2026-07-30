@@ -247,9 +247,7 @@ class PrefillDelayer:
                     # Bound the wait like the "mixed" branch: on a saturated
                     # engine slot_condition may never turn false, so cap the
                     # delay by both max_delay_passes and wall-clock time.
-                    prev_delayed_count = (
-                        prev_state.delayed_count if prev_state else 0
-                    )
+                    prev_delayed_count = prev_state.delayed_count if prev_state else 0
                     delayed_ms = (
                         (time.perf_counter() - prev_state.start_time) * 1000.0
                         if prev_state is not None
