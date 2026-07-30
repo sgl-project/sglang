@@ -84,10 +84,9 @@ class TestQVGKVQuantArgs(unittest.TestCase):
                 a.asymmetric,
                 a.keep_recent_chunks,
                 a.sink,
-                a.sink_span,
                 a.sink_keep_chunks,
             ),
-            (4, 1, 128, 64, 2, False, 1, True, "chunk", 0),
+            (4, 1, 128, 64, 2, False, 1, True, 0),
         )
 
     def test_overrides_and_validation(self):

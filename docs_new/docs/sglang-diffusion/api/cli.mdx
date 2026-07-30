@@ -106,7 +106,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 
 For frame interpolation and upscaling, see [Post-Processing](./post_processing).
 
-### Quantized transformers
+### Quantization
 
 For quantized transformer checkpoints, prefer:
 
@@ -115,6 +115,10 @@ For quantized transformer checkpoints, prefer:
 - `--transformer-weights-path` for a quantized safetensors file, directory, or repo
 - `--quantization` for online quantization (apply quantization to unquantized models at load time, activations are quantized dynamically)
 - `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
+
+For supported realtime causal video models, `--kv-cache-quant {off|int4|int2}`
+compresses completed KV-cache chunks independently of transformer weight
+quantization. It is lossy and disabled by default.
 
 See [Quantization](../quantization) for supported quantization families and examples.
 

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Path-B Quant-VideoGen KV cache: PRQ-packed span storage that ACTUALLY frees
-VRAM (completed chunks are packed and their bf16 freed).
+"""Quant-VideoGen KV cache with PRQ-packed storage for completed chunks.
 
 Storage model (mirrors Quant-VideoGen's ChunkedKVCache, fitted to SGLang's
 ``update_and_get_attention_kv`` contract):
@@ -26,6 +25,7 @@ rather than silently diverge.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
 
 import torch
 
@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+@cache
 def _qvg_functions():
     try:
         from quant_videogen.functions import (
@@ -125,7 +126,6 @@ class QVGPackedCausalKVCache:
         self._cur: _Segment | None = None  # current (mutable) chunk
         self._global_end = 0
         self._chunk_tokens = 0  # inferred from first advance
-        self._logged = False
 
     # ------------------------------------------------------------------ api
     def reset_indices(self) -> None:
@@ -204,14 +204,7 @@ class QVGPackedCausalKVCache:
         seg.packed_v = q(seg.v)
         seg.k = None
         seg.v = None
-        if not self._logged:
-            self._logged = True
-            logger.info(
-                "[QVG-KV packed] ACTIVE %s (first packed g=[%d,%d))",
-                self.q.describe(),
-                seg.g0,
-                seg.g1,
-            )
+        logger.info_once(f"Using QVG packed KV cache: {self.q.describe()}")
 
     def _dequant(self, packed: dict) -> torch.Tensor:
         _, triton_prq_dequantize_tensor = _qvg_functions()
@@ -323,7 +316,7 @@ class QVGPackedCausalKVCache:
         self.global_end_index.fill_(self._global_end)
         self.local_end_index.fill_(min(self._global_end, self.cache_size))
 
-        vk, vv = self._reconstruct(current_chunk_start, num_new, recent_window_tokens)
+        vk, vv = self._reconstruct(current_chunk_start, recent_window_tokens)
         return CausalAttentionKVView(
             k=vk,
             v=vv,
@@ -336,7 +329,6 @@ class QVGPackedCausalKVCache:
     def _reconstruct(
         self,
         current_chunk_start: int,
-        num_new: int,
         recent_window_tokens: int | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Dense visible window = sink prefix ++ rolling recent tail, matching
@@ -368,74 +360,3 @@ class QVGPackedCausalKVCache:
         vk = ks[0] if len(ks) == 1 else torch.cat(ks, dim=1)
         vv = vs[0] if len(vs) == 1 else torch.cat(vs, dim=1)
         return vk, vv
-
-
-def make_causal_self_attention_kv_cache(
-    *,
-    quant_args: QVGKVQuantArgs | None,
-    batch_size: int,
-    kv_cache_size: int,
-    num_attention_heads: int,
-    attention_head_dim: int,
-    dtype: torch.dtype,
-    device,
-    use_int_indices: bool = False,
-    sink_tokens: int = 0,
-    global_sink_tokens: int = 0,
-    attention_window_size: int | None = None,
-    allow_growth: bool = False,
-):
-    """Factory for the causal self-attn KV cache.
-
-    ``quant_args`` disabled/None -> the plain dense bf16 ``CausalSelfAttentionKVCache``
-    (allocated here). Enabled -> the PRQ-packed cache that frees VRAM. The packed
-    path is scoped to the LingBot realtime sliding-window+sink case and rejects
-    base-class features it does not reproduce.
-    """
-    from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
-        CausalSelfAttentionKVCache,
-    )
-
-    if attention_window_size is None:
-        attention_window_size = kv_cache_size
-    global_end = torch.zeros(1, dtype=torch.long, device=device)
-    local_end = torch.zeros(1, dtype=torch.long, device=device)
-
-    if quant_args is None or not quant_args.enabled:
-        int_index = 0 if use_int_indices else None
-        shape = [batch_size, kv_cache_size, num_attention_heads, attention_head_dim]
-        return CausalSelfAttentionKVCache(
-            k=torch.zeros(shape, dtype=dtype, device=device),
-            v=torch.zeros(shape, dtype=dtype, device=device),
-            global_end_index=global_end,
-            local_end_index=local_end,
-            global_end_index_int=int_index,
-            local_end_index_int=int_index,
-            cache_size=kv_cache_size,
-            sink_tokens=sink_tokens,
-            global_sink_tokens=global_sink_tokens,
-            attention_window_size=attention_window_size,
-            allow_growth=allow_growth,
-        )
-
-    # use_int_indices is a no-op here: the packed cache tracks the global end as
-    # a Python int already. global_sink_tokens/allow_growth are genuinely
-    # unsupported (LingBot realtime uses neither).
-    if global_sink_tokens or allow_growth:
-        raise NotImplementedError(
-            "QVG packed KV cache is scoped to the LingBot realtime path "
-            "(global_sink_tokens/allow_growth not supported)."
-        )
-    return QVGPackedCausalKVCache(
-        batch_size=batch_size,
-        cache_size=kv_cache_size,
-        num_heads=num_attention_heads,
-        head_dim=attention_head_dim,
-        dtype=dtype,
-        device=device,
-        global_end_index=global_end,
-        local_end_index=local_end,
-        sink_tokens=sink_tokens,
-        attention_window_size=attention_window_size,
-        quant_args=quant_args,
-    )

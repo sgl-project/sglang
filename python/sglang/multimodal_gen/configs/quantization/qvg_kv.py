@@ -14,11 +14,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
-
-
 _BITS = {"off": None, "none": None, "bf16": None, "int4": 4, "int2": 2}
 
 
@@ -47,7 +42,6 @@ class QVGKVQuantArgs:
     asymmetric: bool = False  # KIVI-style asymmetric residual quant
     keep_recent_chunks: int = 1  # completed chunks kept bf16 (recency guard)
     sink: bool = True  # quantize the attention sink too
-    sink_span: str = "chunk"  # "chunk" (per-chunk) | "full" (one span)
     sink_keep_chunks: int = 0  # leading sink chunks kept bf16 forever
 
     @property
@@ -57,10 +51,6 @@ class QVGKVQuantArgs:
     def validate(self) -> QVGKVQuantArgs:
         if self.bits not in (None, 2, 4):
             raise ValueError(f"kv-cache-quant bits must be 2 or 4, got {self.bits}")
-        if self.sink_span not in ("chunk", "full"):
-            raise ValueError(
-                f"kv-cache-quant-sink-span must be 'chunk' or 'full', got {self.sink_span!r}"
-            )
         for name in ("centroids", "block_size", "stages", "kmeans_iters"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"kv-cache-quant-{name} must be > 0")
@@ -75,19 +65,15 @@ class QVGKVQuantArgs:
             f"int{self.bits} centroids={self.centroids} block={self.block_size} "
             f"stages={self.stages} iters={self.kmeans_iters} "
             f"asym={self.asymmetric} recent={self.keep_recent_chunks} "
-            f"sink={self.sink} sink_span={self.sink_span} sink_keep={self.sink_keep_chunks}"
+            f"sink={self.sink} sink_keep={self.sink_keep_chunks}"
         )
 
     @classmethod
     def from_dict(cls, kwargs: dict) -> QVGKVQuantArgs:
-        """Build from flat CLI kwargs (dest names ``kv_cache_quant*``).
-
-        If the master flag ``--kv-cache-quant`` was not supplied, fall back to
-        the legacy env vars so existing scripts keep working.
-        """
+        """Build from flat CLI kwargs (dest names ``kv_cache_quant*``)."""
         master = kwargs.get("kv_cache_quant")
         if master is None:
-            return cls()  # disabled by default (no env fallback)
+            return cls()
         inst = cls(bits=_parse_bits(master))
         cli_map = {
             "kv_cache_quant_centroids": "centroids",
@@ -98,7 +84,6 @@ class QVGKVQuantArgs:
             "kv_cache_quant_sink_keep": "sink_keep_chunks",
             "kv_cache_quant_asymmetric": "asymmetric",
             "kv_cache_quant_sink": "sink",
-            "kv_cache_quant_sink_span": "sink_span",
         }
         for cli_name, field_name in cli_map.items():
             val = kwargs.get(cli_name)

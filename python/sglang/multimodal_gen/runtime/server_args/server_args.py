@@ -1701,8 +1701,7 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Enable Quant-VideoGen PRQ KV-cache quantization (off|int4|int2). "
             "Defaults reproduce the tuned per-chunk config (stages=1, "
             "centroids=128, block=64, symmetric, iters=2, recent=1, "
-            "per-chunk sink). Legacy SGLANG_QVG_KV_* env vars are honored "
-            "when this flag is omitted.",
+            "per-chunk sink).",
         )
         parser.add_argument(
             "--kv-cache-quant-centroids",
@@ -1746,13 +1745,6 @@ class ServerArgs(DisaggServerArgsMixin):
             default=None,
             choices=[0, 1],
             help="Quantize the attention sink too (1, default) " "or keep it bf16 (0).",
-        )
-        parser.add_argument(
-            "--kv-cache-quant-sink-span",
-            type=str,
-            default=None,
-            choices=["chunk", "full"],
-            help="Sink quantization span: per-chunk (default) or one compact span.",
         )
         parser.add_argument(
             "--kv-cache-quant-sink-keep",
