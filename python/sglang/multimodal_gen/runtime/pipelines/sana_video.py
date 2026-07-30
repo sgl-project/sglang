@@ -14,7 +14,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
-
 SANA_VIDEO_COMPLEX_HUMAN_INSTRUCTION = (
     "Given a user prompt, generate an 'Enhanced prompt' that provides detailed "
     "visual descriptions suitable for video generation. Evaluate the level of "
