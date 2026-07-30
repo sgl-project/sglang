@@ -38,6 +38,7 @@ def main(
     pcg_buckets: Counter[int] = Counter()
     pcg_raw_vs_bucket: list[tuple[int, int]] = []
     kprobe_rows: dict[tuple[int, int], Counter[int]] = defaultdict(Counter)
+    capture_rows: Counter[int] = Counter()
     kprobe_real = 0
     kprobe_graph_rows = 0
     kprobe_graph_steps = 0
@@ -69,6 +70,9 @@ def main(
             if rank_filter >= 0 and rank != rank_filter:
                 continue
             mode = int(fields["dp_pad_mode"])
+            if mode == 0:
+                capture_rows[int(fields["graph_rows"])] += 1
+                continue
             used_graph = int(fields["used_prefill_graph"])
             graph_rows = int(fields["graph_rows"])
             kprobe_rows[(mode, used_graph)][graph_rows] += 1
@@ -94,6 +98,7 @@ def main(
         )
     print(f"[PCG] bucket histogram        : {dict(pcg_buckets)}")
     print(f"[PCG] replays                 : {sum(pcg_buckets.values())}")
+    print(f"[KPROBE] capture launches     : {sum(capture_rows.values())} rows={dict(sorted(capture_rows.items()))}")
     print(f"[KPROBE] graphed / eager steps: {kprobe_graph_steps} / {kprobe_eager_steps}")
     print(f"[KPROBE] sum real local tokens: {kprobe_real}")
     print(f"[KPROBE] sum attn rows        : {kprobe_graph_rows}")
