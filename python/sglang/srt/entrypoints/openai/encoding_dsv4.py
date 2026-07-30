@@ -528,7 +528,10 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     }
                 )
         elif role == "user":
-            text_block = {"type": "text", "text": _flatten_content(msg.get("content", ""))}
+            text_block = {
+                "type": "text",
+                "text": _flatten_content(msg.get("content", "")),
+            }
             if (
                 merged
                 and merged[-1].get("role") == "user"
