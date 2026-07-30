@@ -215,24 +215,13 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                         b_k.to(replayssm_rawk.dtype.element_ty),
                         mask=mask_k,
                     )
-                    if IS_KDA:
-                        tl.store(
-                            replayssm_g
-                            + ring_slot * stride_g_slot
-                            + i_hv * MAX_CACHE_LEN * K
-                            + step_idx * K
-                            + o_k,
-                            b_g,
-                            mask=mask_k,
-                        )
-                    else:
-                        tl.store(
-                            replayssm_g
-                            + ring_slot * stride_g_slot
-                            + i_hv * MAX_CACHE_LEN
-                            + step_idx,
-                            b_g,
-                        )
+                    tl.store(
+                        replayssm_g
+                        + ring_slot * stride_g_slot
+                        + i_hv * MAX_CACHE_LEN
+                        + step_idx,
+                        b_g,
+                    )
                     if i_k == 0:
                         tl.store(
                             replayssm_beta
@@ -398,6 +387,9 @@ def fused_sigmoid_gating_delta_rule_update(
     )
 
     if cache_ring:
+        # GDN-only: the fused ring-write stores a scalar gate per (head, step);
+        # the KDA per-K gate layout is not wired up here.
+        assert not is_kda, "cache_ring supports GDN only"
         # Per-layer [num_slots, heads, L, dim] views only: stride(0) is read as
         # the slot pitch, so a tensor still carrying the layer dim would scribble
         # far outside its slot.

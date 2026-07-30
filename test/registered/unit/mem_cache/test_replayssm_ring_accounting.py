@@ -2,12 +2,13 @@
 
 The memory solver charges this on top of mamba_cache_per_req so num_slots is not
 over-provisioned (the ring is allocated per slot but is NOT part of the state
-cache cost). This pins the arithmetic against hand-computed byte counts, across
-both gate layouts (KDA per-K vector g vs GDN scalar g) and both protocols
-(fold-every-commit allocates only the raw v / pre-norm k / g / beta window; the
-circular spec ring additionally allocates the (d, k) reconstruction records).
-If the MambaPool allocation changes shape, update both the allocation and this
-expectation together.
+cache cost). This pins the arithmetic against hand-computed byte counts for the
+GDN scalar-g gate layout, across both protocols (fold-every-commit allocates
+only the raw v / pre-norm k / g / beta window; the circular spec ring
+additionally allocates the (d, k) reconstruction records). The accounting is
+GDN-only: KDA params must be rejected, not silently under-counted (the KDA
+per-K gate ring is bigger). If the MambaPool allocation changes shape, update
+both the allocation and this expectation together.
 """
 
 import pytest
@@ -29,9 +30,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 # 2 layers. conv bf16 (2B), fp32 gate/beta (4B). Ring tensors (per slot, per
 # layer):
 #   rawv hv*RL*v_dim, rawk h_k*RL*k_dim -> conv dtype
-#   g    hv*RL*k_dim (KDA) / hv*RL (GDN) -> fp32
-#   beta hv*RL                           -> fp32
-#   d    hv*RL*v_dim, k    h_k*RL*k_dim  -> conv dtype (circular ring only)
+#   g    hv*RL                          -> fp32
+#   beta hv*RL                          -> fp32
+#   d    hv*RL*v_dim, k    h_k*RL*k_dim -> conv dtype (circular ring only)
 DTYPE = Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32)
 RL = 8
 LAYERS = [0, 1]
@@ -77,13 +78,11 @@ class TestReplaySSMRingAccounting(CustomTestCase):
             2304 * len(LAYERS),
         )
 
-    def test_kda_per_k_gate(self):
-        # KDA g is a per-K VECTOR (4*8*8*4 = 1024, not 128):
-        # fold: rawv 512 + rawk 512 + g 1024 + beta 128 = 2176
-        self.assertEqual(
-            _kda_params().replayssm_ring_bytes_per_req(record_len=RL, spec_fold=True),
-            2176 * len(LAYERS),
-        )
+    def test_kda_rejected(self):
+        # GDN-only contract: a KDA caller must fail loud, not get a scalar-g
+        # byte count that under-charges its per-K gate ring.
+        with self.assertRaises(AssertionError):
+            _kda_params().replayssm_ring_bytes_per_req(record_len=RL, spec_fold=True)
 
     def test_zero_len_ring(self):
         self.assertEqual(

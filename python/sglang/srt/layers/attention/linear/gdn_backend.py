@@ -610,6 +610,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             use_replayssm_fold = (
                 mamba_cache_params.replayssm_rawv is not None
                 and getattr(mamba_pool, "replayssm_spec_fold", False)
+                and not getattr(mamba_pool, "replayssm_is_kda", False)
             )
             use_replayssm_spec = (
                 mamba_cache_params.replayssm_d is not None

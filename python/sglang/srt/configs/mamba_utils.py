@@ -132,16 +132,17 @@ class BaseLinearStateParams(ABC):
         fold-every-commit allocates only the raw (v, pre-norm k, g, beta) window
         of ``record_len`` = the draft maximum; the circular ring additionally
         allocates the (d, k) reconstruction records at ``record_len`` = L. Raw
-        records use the conv dtype; g and beta are fp32."""
+        records use the conv dtype; g and beta are fp32. GDN only: the scalar-g
+        layout below does not cover the KDA per-K gate ring."""
+        assert not self.is_kda, "replayssm ring accounting supports GDN only"
         hv, v_dim, k_dim = self.shape.temporal
         h_k = self.shape.num_k_heads_per_tp
         conv_b = self.dtype.conv.itemsize
         fp32_b = 4
-        g_numel = hv * record_len * (k_dim if self.is_kda else 1)
         per_layer = (
             hv * record_len * v_dim * conv_b
             + h_k * record_len * k_dim * conv_b
-            + g_numel * fp32_b
+            + hv * record_len * fp32_b
             + hv * record_len * fp32_b
         )
         if not spec_fold:

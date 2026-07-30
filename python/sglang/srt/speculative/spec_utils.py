@@ -818,7 +818,11 @@ def commit_mamba_states_after_verify(
     # current committed state. With extra_buffer the same fold snapshots the
     # interval-crossing state into the track ping-pong slot (mirrors the regular
     # commit's mamba_steps_to_track), so no device-side force-flush is needed.
-    if mamba_pool is not None and getattr(mamba_pool, "replayssm_spec_fold", False):
+    if (
+        mamba_pool is not None
+        and getattr(mamba_pool, "replayssm_spec_fold", False)
+        and not getattr(mamba_pool, "replayssm_is_kda", False)
+    ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
         from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
