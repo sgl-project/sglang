@@ -284,6 +284,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Compilation
     enable_torch_compile: bool = False
+    regional_compile: bool = False
 
     # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
     # segments split at attention modules (SP all-to-all / dynamic attention
@@ -1512,6 +1513,16 @@ class ServerArgs(DisaggServerArgsMixin):
             + "When no warmup mode is configured, this enables server warmup "
             + "so first real requests do not pay compile latency. "
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--regional-compile",
+            action=StoreBoolean,
+            default=ServerArgs.regional_compile,
+            help=(
+                "Compile repeated DiT submodules selected by the model's "
+                "_compile_conditions instead of compiling the whole transformer. "
+                "Requires --enable-torch-compile."
+            ),
         )
         parser.add_argument(
             "--offload-during-compile",

@@ -845,6 +845,11 @@ class Envs:
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
     # falls back to the per-conv-type Python loop.
     SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)
+    # Opt-in: on the unified radix tree, leave the matched-prefix mamba evictable
+    # during decode (it is already COW'd to the request's own slot) and shrink the
+    # mamba pool ratio accordingly. Frees one resident slot per running request,
+    # raising max_running_requests. Off = original locking + ratio (escape hatch).
+    SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
 
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
