@@ -54,6 +54,11 @@ on:
         required: false
         type: boolean
         default: false
+      target_jobs:
+        description: 'Comma-separated extra-a job names to run. Default: all'
+        required: false
+        type: string
+        default: 'all'
   workflow_call:
     inputs:
       ref:
@@ -81,6 +86,11 @@ on:
         required: false
         type: boolean
         default: false
+      target_jobs:
+        description: 'Comma-separated extra-a job names to run. Default: all'
+        required: false
+        type: string
+        default: 'all'
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
@@ -132,7 +142,15 @@ jobs:
   extra-a-test-1-gpu-small-amd:
     name: ${{ format('extra-a-test-1-gpu-small-amd{0} (linux-{1}-1gpu-sglang)', inputs.rocm_version && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    if: |
+      !cancelled() &&
+      needs.call-gate.result == 'success' &&
+      (
+        !inputs.target_jobs ||
+        inputs.target_jobs == 'all' ||
+        contains(format(',{0},', inputs.target_jobs), ',extra-a-test-1-gpu-small-amd,') ||
+        contains(format(',{0},', inputs.target_jobs), ',extra-a-test-1-gpu-small-amd-rocm720,')
+      )
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -164,7 +182,15 @@ jobs:
   extra-a-test-1-gpu-large-amd:
     name: ${{ format('extra-a-test-1-gpu-large-amd{0} (linux-{1}-1gpu-sglang)', inputs.rocm_version && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    if: |
+      !cancelled() &&
+      needs.call-gate.result == 'success' &&
+      (
+        !inputs.target_jobs ||
+        inputs.target_jobs == 'all' ||
+        contains(format(',{0},', inputs.target_jobs), ',extra-a-test-1-gpu-large-amd,') ||
+        contains(format(',{0},', inputs.target_jobs), ',extra-a-test-1-gpu-large-amd-rocm720,')
+      )
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -194,7 +220,15 @@ jobs:
   extra-a-test-2-gpu-large-amd:
     name: ${{ format('extra-a-test-2-gpu-large-amd{0} (linux-{1}-2gpu-sglang)', inputs.rocm_version && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    if: |
+      !cancelled() &&
+      needs.call-gate.result == 'success' &&
+      (
+        !inputs.target_jobs ||
+        inputs.target_jobs == 'all' ||
+        contains(format(',{0},', inputs.target_jobs), ',extra-a-test-2-gpu-large-amd,') ||
+        contains(format(',{0},', inputs.target_jobs), ',extra-a-test-2-gpu-large-amd-rocm720,')
+      )
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code

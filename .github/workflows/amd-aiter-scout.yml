@@ -16,6 +16,26 @@ on:
         required: false
         type: string
         default: 'all'
+      nightly_amd_target_jobs:
+        description: 'Comma-separated Nightly AMD job names. Default: all'
+        required: false
+        type: string
+        default: 'all'
+      nightly_amd_rocm720_target_jobs:
+        description: 'Comma-separated Nightly AMD ROCm 7.2 job names. Default: all'
+        required: false
+        type: string
+        default: 'all'
+      pr_test_amd_target_jobs:
+        description: 'Comma-separated PR Test AMD job/stage names, including extra-a jobs. Default: all'
+        required: false
+        type: string
+        default: 'all'
+      pr_test_amd_rocm720_target_jobs:
+        description: 'Comma-separated PR Test AMD ROCm 7.2 job/stage names, including extra-a jobs. Default: all'
+        required: false
+        type: string
+        default: 'all'
       continue_on_error:
         description: 'Continue running other workflows even if one fails'
         required: false
@@ -96,7 +116,7 @@ jobs:
     with:
       ref: amd/aiter-ci
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
-      job_filter: 'all'
+      job_filter: ${{ inputs.nightly_amd_target_jobs || 'all' }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   call-nightly-amd-rocm720:
@@ -107,7 +127,7 @@ jobs:
     with:
       ref: amd/aiter-ci
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
-      job_filter: 'all'
+      job_filter: ${{ inputs.nightly_amd_rocm720_target_jobs || 'all' }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   call-pr-test-amd:
@@ -117,7 +137,8 @@ jobs:
     secrets: inherit
     with:
       ref: amd/aiter-ci
-      run_all_tests: true
+      run_all_tests: ${{ !inputs.pr_test_amd_target_jobs || inputs.pr_test_amd_target_jobs == 'all' }}
+      target_stage: ${{ inputs.pr_test_amd_target_jobs != 'all' && inputs.pr_test_amd_target_jobs || '' }}
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
@@ -128,7 +149,8 @@ jobs:
     secrets: inherit
     with:
       ref: amd/aiter-ci
-      run_all_tests: true
+      run_all_tests: ${{ !inputs.pr_test_amd_rocm720_target_jobs || inputs.pr_test_amd_rocm720_target_jobs == 'all' }}
+      target_stage: ${{ inputs.pr_test_amd_rocm720_target_jobs != 'all' && inputs.pr_test_amd_rocm720_target_jobs || '' }}
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
