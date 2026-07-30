@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from sglang.multimodal_gen.benchmarks.bench_offline_throughput import (
-    BenchArgs,
     BatchOutput,
+    BenchArgs,
     RequestOutput,
     calculate_metrics,
     generate_batch,

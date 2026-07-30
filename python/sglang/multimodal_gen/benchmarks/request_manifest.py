@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-
 _TOP_LEVEL_SAMPLING_FIELDS = {
     "fps",
     "guidance_scale",
