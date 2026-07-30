@@ -157,16 +157,14 @@ class PipelineExecutor(ABC):
         stages: List["PipelineStage"],
         batches: list[Req],
         server_args: ServerArgs,
-        grouped_stage_count: int,
     ):
-        """Run a grouped prefix, then yield each request after its tail completes."""
+        """Run stage 0 as a group, then yield each request after its tail completes."""
         with self.profile_execution(batches[0], dump_rank=0):
             with current_platform.inference_mode():
                 yield from self.execute_group_sequentially(
                     stages,
                     batches,
                     server_args,
-                    grouped_stage_count=grouped_stage_count,
                 )
 
     @staticmethod
@@ -267,15 +265,11 @@ class PipelineExecutor(ABC):
         stages: List["PipelineStage"],
         batches: list[Req],
         server_args: ServerArgs,
-        grouped_stage_count: int,
     ):
-        """Yield outputs after a shared grouped prefix and per-request tails."""
-        if grouped_stage_count:
-            batches = self.execute_group(
-                stages[:grouped_stage_count], batches, server_args
-            )
+        """Yield outputs after grouped stage 0 and per-request tails."""
+        batches = self.execute_group(stages[:1], batches, server_args)
 
-        remaining_stages = stages[grouped_stage_count:]
+        remaining_stages = stages[1:]
         for batch in batches:
             try:
                 yield self.execute(remaining_stages, batch, server_args)

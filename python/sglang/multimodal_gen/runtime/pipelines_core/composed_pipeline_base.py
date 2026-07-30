@@ -1042,10 +1042,8 @@ class ComposedPipelineBase(ABC):
             self, server_args
         )
         self.executor.component_residency_manager = self.component_residency_manager
-        grouped_stage_count = server_args.pipeline_config.num_grouped_prefix_stages
         yield from self.executor.execute_group_sequentially_with_profiling(
             self.stages,
             batches,
             server_args,
-            grouped_stage_count=grouped_stage_count,
         )
