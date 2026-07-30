@@ -206,6 +206,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         manager.kv_args = SimpleNamespace(
             kv_data_ptrs=[1000, 2000, 3000],
             kv_item_lens=[100, 100, 100],
+            kv_layer_ids=[],
             mla_compression_ratios=[4, 128, 4, 128],
             prefill_start_layer=0,
             prefill_end_layer=2,

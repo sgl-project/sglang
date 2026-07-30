@@ -247,12 +247,9 @@ class CompressorBackendMixin:
                     # compressed region. Only C4 layers are offloaded; C128 (HCA)
                     # layers keep the dense compressed slot via the swa-offset
                     # unified out_loc below.
-                    out_loc = (
-                        token_to_kv_pool.c4_kv_pool._translate_loc_to_hisparse_device(
-                            self.forward_metadata.core_metadata.c4_out_loc
-                        )
+                    out_loc = token_to_kv_pool.c4_kv_pool.compressed_logical_to_unified_hot_row(
+                        self.forward_metadata.core_metadata.c4_out_loc
                     )
-                    out_loc = out_loc + token_to_kv_pool.unified_swa_pages
                 else:
                     out_loc = getattr(
                         self.forward_metadata.core_metadata.unified,

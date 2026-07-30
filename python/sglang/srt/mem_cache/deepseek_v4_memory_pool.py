@@ -330,6 +330,21 @@ class HiSparseUnifiedC4DevicePool(HiSparseC4DevicePool):
             device=self.device,
         )
 
+    def compressed_logical_to_unified_hot_row(
+        self, compressed_logical_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Map stable compressed logical ids to absolute unified hot rows.
+
+        The HiSparse mapping is keyed by compressed logical ids, not by the
+        MultiEndedAllocator's relocatable full-attention physical pages. The
+        returned hot index is relative to rows[swa_pages:], so add the SWA-ring
+        prefix exactly once for the compressor's absolute unified-buffer store.
+        """
+        return (
+            self._translate_loc_to_hisparse_device(compressed_logical_indices)
+            + self.swa_pages
+        )
+
 
 class DeepSeekV4IndexerPool(KVCache):
     quant_block_size = 128

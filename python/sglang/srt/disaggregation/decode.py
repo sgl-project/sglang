@@ -58,6 +58,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
     prepare_abort,
+    resolve_physical_kv_indices,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -1145,11 +1146,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # != physical after churn. Resolve to current PHYSICAL so prefill's
                 # RDMA write lands in the right decode slots (mirrors prefill
                 # send_kv_chunk). getattr-guarded: no-op without translate_kv_loc.
-                translate_kv_loc = getattr(
-                    self.token_to_kv_pool_allocator, "translate_kv_loc", None
+                kv_indices = resolve_physical_kv_indices(
+                    self.token_to_kv_pool_allocator, kv_indices
                 )
-                if translate_kv_loc is not None:
-                    kv_indices = translate_kv_loc(kv_indices.long())
 
             seq_len = origin_input_len
 
@@ -1282,11 +1281,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.req_pool_idx,
                     prefix_len:origin_input_len,
                 ]
-                translate_kv_loc = getattr(
-                    self.token_to_kv_pool_allocator, "translate_kv_loc", None
+                full_kv_indices = resolve_physical_kv_indices(
+                    self.token_to_kv_pool_allocator, full_kv_indices
                 )
-                if translate_kv_loc is not None:
-                    full_kv_indices = translate_kv_loc(full_kv_indices.long())
                 device_page_indices = kv_to_page_indices(
                     full_kv_indices,
                     page_size,
