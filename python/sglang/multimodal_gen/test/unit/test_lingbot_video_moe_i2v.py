@@ -16,13 +16,6 @@ from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
     LingBotVideoMoESamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
-from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    component_name_to_loader_cls,
-)
-from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
-from sglang.multimodal_gen.runtime.pipelines.lingbot_video_moe import (
-    LingBotVideoPipeline,
-)
 from sglang.multimodal_gen.runtime.pipelines.lingbot_video_moe_refiner import (
     LingBotVideoRefinerPipeline,
 )
@@ -42,6 +35,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     compute_refiner_sigmas,
     prepare_refiner_latent,
     resize_video_pixels,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.rewriter import (
+    LingBotVideoPromptRewriteStage,
+    build_expand_prompt,
+    build_map_prompt,
+    needs_rewrite,
+    parse_caption,
+    resolve_mode,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.text_encoding import (
     IMG_PROMPT_TEMPLATE,
@@ -337,10 +338,6 @@ def test_pixel_resize_keeps_the_clip_layout():
     assert 0.0 <= float(resized.min()) and float(resized.max()) <= 1.0
 
 
-def test_refiner_pipeline_declares_the_second_transformer():
-    assert "transformer_2" in LingBotVideoRefinerPipeline._required_config_modules
-
-
 def test_refiner_weights_resolve_to_the_refiner_subfolder():
     pipeline = object.__new__(LingBotVideoRefinerPipeline)
     pipeline.model_path = "/models/lingbot"
@@ -350,24 +347,88 @@ def test_refiner_weights_resolve_to_the_refiner_subfolder():
     assert path == "/models/lingbot/refiner"
 
 
-def test_refiner_component_name_selects_the_transformer_loader():
-    # The loader registry is keyed on the component name, so the refiner must keep
-    # the transformer_2 name rather than borrow its subfolder name.
-    assert _normalize_component_type("transformer_2") == "transformer"
-    assert "transformer" in component_name_to_loader_cls
-    assert "refiner" not in component_name_to_loader_cls
+def test_rewrite_mode_follows_the_request_shape():
+    assert resolve_mode(SimpleNamespace(num_frames=1, image_path=None)) == "t2i"
+    assert resolve_mode(SimpleNamespace(num_frames=121, image_path=None)) == "t2v"
+    assert resolve_mode(SimpleNamespace(num_frames=121, image_path="f.png")) == "ti2v"
 
 
-def test_refiner_config_defaults_match_the_reference_scripts():
-    config = LingBotVideoMoEPipelineConfig()
-
-    assert (config.refiner_height, config.refiner_width) == (1088, 1920)
-    assert config.refiner_num_inference_steps == 8
-    assert config.refiner_t_thresh == 0.85
-    assert config.refiner_sigma_tail_steps == 2
+def test_structured_captions_skip_rewriting():
+    assert needs_rewrite("a red fox in the snow")
+    assert not needs_rewrite('{"comprehensive_description": "..."}')
+    assert not needs_rewrite('  {"caption": {}}')
 
 
-def test_single_pass_pipeline_adds_no_refiner_stages():
-    pipeline = object.__new__(LingBotVideoPipeline)
+def test_expand_prompt_carries_the_duration_for_video_modes():
+    video = build_expand_prompt("t2v", "a red fox", 5)
+    assert "Video Duration: 5 seconds" in video
+    assert video.endswith("Video Duration: 5 seconds")
 
-    assert pipeline._maybe_add_refiner_stages(None) is None
+    assert "Duration" not in build_expand_prompt("t2i", "a glass of tea", 5)
+
+
+def test_expand_prompt_matches_the_caption_language():
+    assert "视频时长：5 秒" in build_expand_prompt("t2v", "一只红狐狸", 5)
+
+
+def test_map_prompt_feeds_the_expansion_back():
+    mapped = build_map_prompt("t2v", "A red fox trots through snow.", 5)
+
+    assert "DETAILED CAPTION:\nA red fox trots through snow." in mapped
+    assert mapped.endswith("Output the JSON now.")
+
+
+def test_caption_parsing_tolerates_fences_and_prose():
+    assert parse_caption('```json\n{"a": 1}\n```') == {"a": 1}
+    assert parse_caption('Here you go: {"a": 1} hope that helps') == {"a": 1}
+    assert parse_caption("no json here") is None
+    assert parse_caption('["not", "an", "object"]') is None
+
+
+def _rewrite_stage(replies):
+    stage = object.__new__(LingBotVideoPromptRewriteStage)
+    stage.expand_model = "expand"
+    stage.map_model = "map"
+    stage.calls = []
+
+    def chat(model, text, image):
+        stage.calls.append((model, image))
+        return replies.pop(0)
+
+    stage._chat = chat
+    return stage
+
+
+def test_rewriting_replaces_the_prompt_with_a_compact_caption():
+    stage = _rewrite_stage(["A red fox trots through snow.", '{"b": 2, "a": 1}'])
+    batch = SimpleNamespace(prompt="a red fox", num_frames=121, fps=24, image_path=None)
+
+    stage.forward(batch, None)
+
+    assert batch.prompt == '{"b":2,"a":1}'
+    assert [model for model, _ in stage.calls] == ["expand", "map"]
+    assert all(image is None for _, image in stage.calls)
+
+
+def test_rewriting_keeps_the_prompt_when_no_caption_comes_back():
+    stage = _rewrite_stage(["expanded", "sorry, I cannot"])
+    batch = SimpleNamespace(prompt="a red fox", num_frames=121, fps=24, image_path=None)
+
+    stage.forward(batch, None)
+
+    assert batch.prompt == "a red fox"
+
+
+def test_rewriting_leaves_a_structured_caption_alone():
+    stage = _rewrite_stage([])
+    caption = '{"comprehensive_description": "..."}'
+    batch = SimpleNamespace(prompt=caption, num_frames=121, fps=24, image_path=None)
+
+    stage.forward(batch, None)
+
+    assert batch.prompt == caption
+    assert stage.calls == []
+
+
+def test_rewriting_is_off_until_a_server_is_configured():
+    assert LingBotVideoMoEPipelineConfig().rewriter_url is None

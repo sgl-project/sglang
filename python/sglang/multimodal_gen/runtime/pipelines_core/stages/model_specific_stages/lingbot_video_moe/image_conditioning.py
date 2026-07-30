@@ -29,11 +29,7 @@ logger = init_logger(__name__)
 
 
 class LingBotVideoImageConditioningStage(ImageVAEEncodingStage):
-    """Condition-frame preparation for LingBot-Video I2V.
-
-    The frame is used twice: as a patch-aligned image for Qwen3-VL, and as a clean
-    latent that overwrites the head of the diffusion latent throughout sampling.
-    """
+    """Turn the condition frame into a Qwen3-VL image and a clean latent."""
 
     deduplicated_output_fields = ()
 

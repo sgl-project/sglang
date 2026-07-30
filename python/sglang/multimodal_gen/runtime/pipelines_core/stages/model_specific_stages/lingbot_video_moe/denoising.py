@@ -14,13 +14,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class LingBotVideoDenoisingStage(DenoisingStage):
-    """Denoising with the condition frame pinned to the head of the latent.
-
-    The clean condition latent is written before sampling and re-written after every
-    scheduler step, so the conditioned frames stay clean while the rest denoise
-    against them through attention. Text-only requests carry no condition latent and
-    denoise unchanged.
-    """
+    """Denoising that re-pins the clean condition latent after every scheduler step."""
 
     def _prepare_denoising_loop(self, batch: Req, server_args: ServerArgs):
         if batch.extra.get(COND_LATENT_KEY) is not None and self._sp_world_size() > 1:

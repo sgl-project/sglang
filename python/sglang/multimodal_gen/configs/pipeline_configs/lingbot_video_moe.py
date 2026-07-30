@@ -64,14 +64,19 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
     refiner_flow_shift: float = 3.0
     refiner_t_thresh: float = 0.85
     refiner_sigma_tail_steps: int = 2
+    # Prompt rewriting is skipped unless rewriter_url points at a served VLM.
+    rewriter_url: str | None = None
+    rewriter_expand_model: str = "lingbot-rewriter-base"
+    rewriter_map_model: str = "lingbot-rewriter-lora"
+    rewriter_timeout: float = 300.0
 
     def __post_init__(self):
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
 
     def supports_dynamic_batching(self) -> bool:
-        # The base class excludes TI2V; the image is optional here, so keep the
-        # T2V behaviour.
+        # The scheduler keeps requests carrying an image out of dynamic batches, so
+        # text-only ones can still batch even though the task type is TI2V.
         return True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:

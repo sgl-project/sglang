@@ -39,11 +39,7 @@ logger = init_logger(__name__)
 
 
 class LingBotVideoRefinerUpscaleStage(DecodingStage):
-    """Hand the base pass to the refiner at its own resolution.
-
-    The reference implementation routes the two passes through an mp4 on disk; this
-    keeps the clip in memory, so refined output is not bit-identical to it.
-    """
+    """Decode the base pass, resize to the refiner resolution, and re-encode."""
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:

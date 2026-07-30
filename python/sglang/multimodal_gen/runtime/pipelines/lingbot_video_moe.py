@@ -8,6 +8,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import InputValidationS
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe import (
     LingBotVideoDenoisingStage,
     LingBotVideoImageConditioningStage,
+    LingBotVideoPromptRewriteStage,
     LingBotVideoTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -36,6 +37,16 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         self.add_stage(InputValidationStage())
+        config = server_args.pipeline_config
+        self.add_stage_if(
+            config.rewriter_url is not None,
+            LingBotVideoPromptRewriteStage(
+                url=config.rewriter_url or "",
+                expand_model=config.rewriter_expand_model,
+                map_model=config.rewriter_map_model,
+                timeout=config.rewriter_timeout,
+            ),
+        )
         # Ahead of text encoding, which takes the condition frame as visual context.
         self.add_stage(
             LingBotVideoImageConditioningStage(vae=self.get_module("vae")),
