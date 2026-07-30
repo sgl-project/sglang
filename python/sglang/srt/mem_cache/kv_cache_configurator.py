@@ -58,7 +58,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
@@ -97,11 +97,17 @@ def _should_enable_lazy_compaction() -> bool:
     return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
 
 
-# the ratio of mamba cache pool size to max_running_requests
+# base ratio of mamba pool size to max_running_requests. Under
+# SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK the decode-time skip frees one resident slot
+# per running request, so the base drops by 1 (overlap 5->4, lazy 4->3). no_buffer
+# stays at effective 3 either way: its binding limit is the prefill->decode peak,
+# which the decode-time drop does not shrink.
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
+MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER = 1
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -205,7 +211,7 @@ class KVCacheConfigurator:
     def _build_fp4_quant_method(self, *, num_layers: int):
         if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
             return None
-        quant_name = resolve_kv_cache_quant(self.server_args.kv_cache_dtype)
+        quant_name = resolve_kv_cache_quant(get_model().kv_cache_dtype)
         if quant_name is None:
             return None
         quant_method = get_kv_cache_quant_method(
@@ -682,7 +688,12 @@ class KVCacheConfigurator:
         extra_max_context_len: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
-        from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+        if _is_npu and is_deepseek_v4(self.model_config.hf_config):
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
+                DSV4NPUDecodeReqToTokenPool as DecodeReqToTokenPool,
+            )
+        else:
+            from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 
         req_to_token_pool = DecodeReqToTokenPool(
             size=max_num_reqs,
@@ -1191,7 +1202,7 @@ class KVCacheConfigurator:
             }
         swa_pool_class = (
             MHATokenToKVPoolMXFP8
-            if self.server_args.kv_cache_dtype == "mxfp8"
+            if get_model().kv_cache_dtype == "mxfp8"
             else mha_pool_class
         )
         swa_attention_layer_ids = self.model_config.swa_attention_layer_ids
@@ -1289,7 +1300,7 @@ class KVCacheConfigurator:
         # buffers) for the full-attention layers, same as the SWA branch.
         full_pool_class = (
             MHATokenToKVPoolMXFP8
-            if self.server_args.kv_cache_dtype == "mxfp8" and not self.use_mla_backend
+            if get_model().kv_cache_dtype == "mxfp8" and not self.use_mla_backend
             else mha_pool_class
         )
         token_to_kv_pool = HybridLinearKVPool(
@@ -1334,7 +1345,7 @@ class KVCacheConfigurator:
     def _build_mha_kv_pool(
         self, *, max_total_num_tokens: int, mha_pool_class: type, quant_method=None
     ) -> KVCache:
-        if self.server_args.kv_cache_dtype == "mxfp8":
+        if get_model().kv_cache_dtype == "mxfp8":
             pool_cls = MHATokenToKVPoolMXFP8
         else:
             pool_cls = (
@@ -1540,7 +1551,7 @@ class KVCacheConfigurator:
             # Mamba state is a fixed pre-capture allocation, so it can't ride the ~0 post-capture slack.
             slack_gb = max(
                 slack_gb,
-                self.server_args.mamba_pre_capture_reserve_mb(
+                self.server_args.pre_capture_activation_reserve_mb(
                     get_device_memory_capacity(self.device)
                 )
                 / 1024,
@@ -1573,6 +1584,11 @@ class KVCacheConfigurator:
         if self.server_args.disable_radix_cache:
             return 1
 
+        skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+        base = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO - (
+            MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP if skip_decode_lock else 0
+        )
+
         additional_ratio = 0
         if self.server_args.enable_mamba_extra_buffer():
             # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
@@ -1587,8 +1603,13 @@ class KVCacheConfigurator:
                     not self.server_args.enable_mamba_extra_buffer_lazy()
                 ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
+        elif skip_decode_lock:
+            # no_buffer under skip: add the base drop back so effective stays 3,
+            # the prefill->decode peak needs ~3 slots/req and this leaf-only mode
+            # has no ping-pong to absorb it.
+            additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER
 
-        return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
+        return base + additional_ratio
 
     def _apply_token_constraints(self, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
@@ -1717,7 +1738,7 @@ class KVCacheConfigurator:
                 max_mamba_cache_size=server_args.max_mamba_cache_size
                 // self.ps.attn_dp_size,
             )
-            # Reserve intermediate memory based on capped max_num_reqs
+            # Reserve intermediate memory based on capped max_num_reqs (+1 padding slot)
             if has_spec_dec:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
@@ -1726,7 +1747,7 @@ class KVCacheConfigurator:
                 )
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
-                    * capped_reqs
+                    * (capped_reqs + 1)
                     * server_args.speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -1740,11 +1761,11 @@ class KVCacheConfigurator:
                 max_mamba_cache_size=server_args.max_running_requests
                 // self.ps.attn_dp_size,
             )
-            # Reserve intermediate memory based on capped max_num_reqs
+            # Reserve intermediate memory based on capped max_num_reqs (+1 padding slot)
             if has_spec_dec:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
-                    * server_args.max_mamba_cache_size
+                    * (server_args.max_mamba_cache_size + 1)
                     * server_args.speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -1753,11 +1774,9 @@ class KVCacheConfigurator:
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
             per_req = config.mamba2_cache_params.mamba_cache_per_req
 
-            # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
-            # The mamba budget (from the ratio split) must cover both:
-            #   1. main mamba state: max_mamba_cache_size * per_req
-            #   2. intermediate states: (max_mamba_cache_size / ratio) * D * per_req
-            # So: max_mamba_cache_size * per_req * (1 + D/ratio) = mamba_budget_bytes
+            # Solve jointly for max_mamba_cache_size (K), including the pool's
+            # +1 padding slot on both buffers (see memory_pool.py):
+            #   (K + 1) * per_req + (K / ratio + 1) * D * per_req = mamba_budget_bytes
             mamba_budget = (
                 total_rest_memory
                 * server_args.mamba_full_memory_ratio
@@ -1772,7 +1791,8 @@ class KVCacheConfigurator:
                 server_args.override(
                     "mamba_pool.memory_budget_spec",
                     max_mamba_cache_size=int(
-                        mamba_budget_bytes // (per_req * (1 + D / ratio))
+                        (mamba_budget_bytes - per_req * (1 + D))
+                        // (per_req * (1 + D / ratio))
                     ),
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
@@ -1781,12 +1801,12 @@ class KVCacheConfigurator:
                     server_args.max_running_requests // self.ps.attn_dp_size,
                     server_args.max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * capped_reqs * D
+                intermediate_size = per_req * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 server_args.override(
                     "mamba_pool.memory_budget",
-                    max_mamba_cache_size=int(mamba_budget_bytes // per_req),
+                    max_mamba_cache_size=int((mamba_budget_bytes - per_req) // per_req),
                 )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
@@ -1805,8 +1825,9 @@ class KVCacheConfigurator:
                 f"(4) use GPUs with more memory."
             )
 
+        # +1: the pool's padding slot
         mamba_state_memory = (
-            server_args.max_mamba_cache_size
+            (server_args.max_mamba_cache_size + 1)
             * config.mamba2_cache_params.mamba_cache_per_req
             / (1 << 30)
         )

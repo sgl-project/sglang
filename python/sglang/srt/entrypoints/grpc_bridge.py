@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from pydantic import ValidationError
 
+from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -382,6 +383,13 @@ class RuntimeHandle:
             "model_type": getattr(model_config.hf_config, "model_type", None),
             "architectures": getattr(model_config.hf_config, "architectures", None),
         }
+        embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
+        if embedding_model_spec is not None:
+            result["embedding"] = resolved_embedding_plan(
+                embedding_model_spec,
+                server_args=self.server_args,
+                model_config=model_config,
+            )
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:

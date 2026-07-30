@@ -25,6 +25,7 @@ from typing import Any, List, Optional, Set, Union
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
@@ -211,6 +212,9 @@ def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
+REQUANTIZATION_METHODS = ["quark_mxfp4"]
+
+
 def get_num_indexer_layers(config) -> int:
     """Layer count for the global indexer-topk capturer's host buffer.
 
@@ -289,6 +293,12 @@ class ModelConfig:
             )
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
+        self.embedding_model_spec = resolve_embedding_model_spec(
+            self.hf_config.architectures,
+            is_embedding_requested=bool(is_embedding),
+            is_embedding_gemma=self.is_embedding_gemma,
+        )
 
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
@@ -396,7 +406,7 @@ class ModelConfig:
             self.hf_text_config, "attention_chunk_size", None
         )
         self.sliding_window_size = self._get_sliding_window_size()
-        self.is_generation = is_generation_model(
+        self.is_generation = not self.is_embedding_gemma and is_generation_model(
             self.hf_config.architectures, is_embedding
         )
         # The vision_config/audio_config attribute heuristic is only applied when
@@ -643,6 +653,8 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] in [
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForCausalLM",
             "InternS2PreviewForConditionalGeneration",
         ]:
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
@@ -706,6 +718,17 @@ class ModelConfig:
     @cached_property
     def linear_attn_registry_result(self) -> Any:
         return get_linear_attn_config(self.hf_config)
+
+    @property
+    def has_asymmetric_kv(self) -> bool:
+        """Whether K and V rows differ in width (MiMoV2 is 192 / 128).
+
+        Not an ``__init__`` field because the MLA special-casing below still
+        rewrites ``v_head_dim``.
+        """
+        return (
+            self.head_dim != self.v_head_dim or self.swa_head_dim != self.swa_v_head_dim
+        )
 
     def _detect_attention_sinks(self) -> bool:
         """Check whether the model uses learned attention sinks.
@@ -1070,6 +1093,14 @@ class ModelConfig:
         # equal to the number of attention heads.
         return self.hf_text_config.num_attention_heads
 
+    def get_max_num_attention_heads(self) -> int:
+        """Max per-layer query head count; num_attention_heads unless the
+        model sets num_attention_heads_per_layer."""
+        per_layer = getattr(self.hf_text_config, "num_attention_heads_per_layer", None)
+        if per_layer:
+            return max(per_layer)
+        return self.num_attention_heads
+
     def get_num_kv_heads(self, tensor_parallel_size) -> int:
         """Returns the number of KV heads per GPU."""
         total_num_kv_heads = self.get_total_num_kv_heads()
@@ -1242,7 +1273,7 @@ class ModelConfig:
             log_str = f"quant={quant_method}"
 
             # Append interesting fields if they exist
-            for field in ["bits", "quant_algo", "fmt"]:
+            for field in ["bits", "quant_algo", "fmt", "requantization_method"]:
                 if field in quant_cfg:
                     log_str += f", {field}={quant_cfg[field]}"
 
@@ -1441,6 +1472,10 @@ class ModelConfig:
                         f"Using draft model's detected quantization: {quant_method}"
                     )
                     self.quantization = quant_method
+                elif self.quantization in REQUANTIZATION_METHODS:
+                    logger.info_once(
+                        f"Requantizing from quant_method='{quant_method}' to the requested online quantization='{self.quantization}'. Beware that requantization may incur a loss in accuracy, the requantized model should be re-validated/re-evaluated. More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."
+                    )
                 else:
                     raise ValueError(
                         "Quantization method specified in the model config "
@@ -1661,6 +1696,18 @@ def _get_and_verify_dtype(
     return torch_dtype
 
 
+def is_embedding_gemma(config) -> bool:
+    """Whether ``config`` is Google's bidirectional EmbeddingGemma checkpoint.
+
+    EmbeddingGemma uses the otherwise generative ``Gemma3TextModel``
+    architecture, so its model type alone is insufficient for dispatch.  The
+    upstream ``use_bidirectional_attention`` flag is the defining distinction.
+    """
+    return getattr(config, "model_type", None) == "gemma3_text" and getattr(
+        config, "use_bidirectional_attention", False
+    )
+
+
 def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
     # We have two ways to determine whether a model is a generative model.
     # 1. Check the model architecture
@@ -1676,6 +1723,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "Qwen3ForRewardModel" in model_architectures
         or "Qwen2ForSequenceClassification" in model_architectures
         or "Qwen3ForSequenceClassification" in model_architectures
+        or "Qwen3Model" in model_architectures
         or "CLIPModel" in model_architectures
         or "BertModel" in model_architectures
         or "Contriever" in model_architectures
@@ -1683,6 +1731,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "XLMRobertaModel" in model_architectures
         or "XLMRobertaForSequenceClassification" in model_architectures
         or "Gemma2ForSequenceClassification" in model_architectures
+        or "Lfm2BidirectionalModel" in model_architectures
     ):
         return False
     else:
