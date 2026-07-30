@@ -543,6 +543,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return result
         if self.disable:
             return IncLockRefResult()
+        # Match results carry NodeIds after the TreeCore split, while cache
+        # components still operate on the corresponding node objects.
+        node = self.resolve_node_handle(node)
         result = IncLockRefResult()
         for component in self._components_tuple:
             if component.component_type in skip_lock_components:
@@ -556,7 +559,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 continue
             result = component.acquire_component_lock(node=node, result=result)
 
-        self._update_evictable_leaf_sets(node)
+        self.tree_core._update_evictable_leaf_sets(node)
         return result
 
     def dec_lock_ref(
