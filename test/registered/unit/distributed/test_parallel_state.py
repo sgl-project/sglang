@@ -268,6 +268,85 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             parallel_state.destroy_model_parallel()
 
 
+def _capture_group_descs(backend, group_name, group_ranks=None):
+    """Construct a GroupCoordinator with all communicators disabled and capture
+    the ``group_desc`` passed to every ``torch.distributed.new_group`` call.
+
+    Returns the captured ``group_desc`` values in call order (device group first,
+    then cpu group). ``torch.distributed.new_group`` is mocked, so no real NCCL /
+    Gloo / GPU is required. The mooncake backend's ``mooncake.ep`` import is faked.
+    """
+    import types
+
+    if group_ranks is None:
+        group_ranks = [[0, 1]]
+
+    captured = []
+
+    def fake_new_group(*args, **kwargs):
+        captured.append(kwargs.get("group_desc"))
+        return Mock()
+
+    fake_mooncake = types.ModuleType("mooncake")
+    fake_mooncake_ep = types.ModuleType("mooncake.ep")
+    fake_mooncake_ep.MooncakeBackendOptions = lambda *a, **k: Mock()
+
+    with (
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.new_group", side_effect=fake_new_group),
+        # Force the CPU code path so the test needs no GPU/NPU/XPU.
+        patch.object(parallel_state, "is_cuda_alike", return_value=False),
+        patch.dict(
+            sys.modules,
+            {"mooncake": fake_mooncake, "mooncake.ep": fake_mooncake_ep},
+        ),
+    ):
+        parallel_state.GroupCoordinator(
+            group_ranks=group_ranks,
+            local_rank=0,
+            torch_distributed_backend=backend,
+            use_pynccl=False,
+            use_pymscclpp=False,
+            use_custom_allreduce=False,
+            use_torch_symm_mem_all_reduce=False,
+            use_hpu_communicator=False,
+            use_xpu_communicator=False,
+            use_npu_communicator=False,
+            use_message_queue_broadcaster=False,
+            group_name=group_name,
+        )
+
+    return captured
+
+
+@pytest.mark.parametrize("group_name", ["tp", "pp"])
+def test_group_desc_propagated_normal_backend(group_name):
+    """Regression guard: each GroupCoordinator branch must tag its ProcessGroups
+    with ``group_desc=f"{group_name}:{device|cpu}"``.
+
+    This is the metadata NCCL Inspector reads to distinguish TP/PP communicators;
+    dropping it in any ``new_group`` branch reintroduces the PP-misclassified-as-TP
+    bug. The device group is created before the cpu group, so the captured order is
+    fixed.
+    """
+    captured = _capture_group_descs("nccl", group_name)
+    assert captured == [f"{group_name}:device", f"{group_name}:cpu"], captured
+
+
+def test_group_desc_none_normalized_to_anonymous():
+    """group_name=None keeps the existing "anonymous" normalization, so the
+    emitted descs must be anonymous:device / anonymous:cpu (not None:device)."""
+    captured = _capture_group_descs("nccl", None)
+    assert captured == ["anonymous:device", "anonymous:cpu"], captured
+
+
+def test_group_desc_propagated_mooncake_backend():
+    """The mooncake branch creates its own device/cpu groups and must not miss
+    group_desc — it is a separate code path from the normal backend."""
+    captured = _capture_group_descs("mooncake", "pp")
+    assert captured == ["pp:device", "pp:cpu"], captured
+
+
 if __name__ == "__main__":
     # Run tests without requiring GPUs
     import sys
@@ -275,6 +354,10 @@ if __name__ == "__main__":
     try:
         test_parallel_group_construction_tp8_attn_cp2()
         test_parallel_group_construction_tp8_moe_ep4_cp2()
+        test_group_desc_propagated_normal_backend("tp")
+        test_group_desc_propagated_normal_backend("pp")
+        test_group_desc_none_normalized_to_anonymous()
+        test_group_desc_propagated_mooncake_backend()
 
         sys.exit(0)
     except AssertionError as e:
