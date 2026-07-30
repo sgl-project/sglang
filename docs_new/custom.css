@@ -167,11 +167,16 @@ html.dark table tbody tr:nth-child(even) td,
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  margin: 4px 0 8px;
+  gap: 6px;
+  margin: 2px 0 0;
+}
+
+.sgd-model-tags .sgd-chip {
+  margin: 0;
 }
 
 .sgd-model-tags + h2 {
-  margin-top: 1.25rem;
+  margin-top: 0.75rem;
 }
 
 .sgd-muted {
