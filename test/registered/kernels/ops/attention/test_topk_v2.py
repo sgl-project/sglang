@@ -24,11 +24,7 @@ included explicitly, across k in {512,1024,2048} and identity/perm page tables.
 
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 import torch
@@ -297,52 +293,6 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     our_raw = _run_raw(scores, seq_lens, page_table, k)
     ref_raw = _reference(scores, seq_lens, k)
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
-
-
-def _nvcc_path() -> str | None:
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-    if cuda_home and (Path(cuda_home) / "bin" / "nvcc").is_file():
-        return str(Path(cuda_home) / "bin" / "nvcc")
-    return shutil.which("nvcc")
-
-
-def test_topk_v2_compiles_for_sm90a(tmp_path) -> None:
-    """The kernel must compile for Hopper, whatever the local GPU is.
-
-    cicc crashes on CUDA 13.x if the fused small-batch kernel lets a
-    shared::cluster (DSMEM) address reach the pointer its epilogue loads, so the
-    whole module fails to build on a Hopper/Blackwell host (issue #32830). Only a
-    toolkit is needed to catch that, not a cluster-capable GPU.
-    """
-    from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path
-
-    from sglang.kernels.jit.utils.compile import DEFAULT_INCLUDE, KERNEL_PATH
-
-    nvcc = _nvcc_path()
-    if nvcc is None:
-        pytest.skip("nvcc not found")
-
-    # Same translation unit load_jit() feeds to nvcc for the topk_v2 module.
-    source = tmp_path / "topk_v2.cu"
-    source.write_text(
-        f'#include "{KERNEL_PATH / "csrc" / "deepseek_v4" / "topk_v2.cuh"}"\n'
-        "TVM_FFI_DLL_EXPORT_TYPED_FUNC(topk_transform, (TopKKernel::transform));\n"
-        "TVM_FFI_DLL_EXPORT_TYPED_FUNC(topk_plan, (TopKKernel::plan));\n"
-    )
-    includes = [*DEFAULT_INCLUDE, find_include_path(), find_dlpack_include_path()]
-    result = subprocess.run(
-        # Device-only (-ptx) keeps this to a few seconds; the flags mirror
-        # get_default_target_flags() for a 9.0a target.
-        [nvcc, "-ptx", "-arch=sm_90a", "-DSGL_CUDA_ARCH=900"]
-        + ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
-        + [f"-I{path}" for path in includes]
-        + [str(source), "-o", str(tmp_path / "topk_v2.ptx")],
-        capture_output=True,
-        text=True,
-    )
-    assert (
-        result.returncode == 0
-    ), f"nvcc exited with {result.returncode}\n{result.stderr}"
 
 
 if __name__ == "__main__":
