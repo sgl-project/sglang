@@ -1347,6 +1347,9 @@ class DeepseekV4AttnBackend(
             else:
                 seq_len = swa_window
             self._mx_nv = min(seq_len, swa_window)
+            # Pre-compute extra_tk for C4/C128 layers (avoid .item() in forward).
+            # For decode, all heads share the same extra_topk_length.
+            self._mx_extra_tk = 0
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
@@ -1873,28 +1876,26 @@ class DeepseekV4AttnBackend(
             )
             return out_flat.view(*q_orig_shape[:-1], -1)
 
-        # ── C4/C128: batch-dequant unique pages, then SDPA per head ──────
+        # ── C4/C128: batch-dequant unique pages, then batched SDPA ──────
         swa_phys_page_size = self.token_to_kv_pool.swa_page_size
         extra_page_size = self.token_to_kv_pool.page_size // compress_ratio
         q_f32 = q.float()  # [N_heads, 512]
         out = torch.zeros(N_heads, MXFP4_TOTAL_DIM, dtype=torch.float32, device=dev)
 
-        # --- collect unique page indices across all heads ---
-        per_head_swa = []
-        per_head_extra = []
-        unique_swa = set()
-        unique_extra = set()
+        # For decode, all heads share the same page set. Collect from
+        # head 0 only (graph-safe, no per-head .item()).
+        swa_tk = num_valid
+        swa_pids = swa_page_indices[0, :swa_tk].long()
+        swa_pids = swa_pids[swa_pids >= 0].tolist()
+        unique_swa = set(swa_pids)
 
-        for h in range(N_heads):
-            swa_pids = swa_page_indices[h, : int(swa_topk_lengths[h].item())].long()
-            swa_pids = swa_pids[swa_pids >= 0].tolist()
-            extra_pids = extra_indices[h, : int(extra_topk_lengths[h].item())].long()
-            extra_pids = extra_pids[extra_pids >= 0].tolist()
-
-            per_head_swa.append(swa_pids)
-            per_head_extra.append(extra_pids)
-            unique_swa.update(swa_pids)
-            unique_extra.update(extra_pids)
+        unique_extra: set[int] = set()
+        if extra_indices is not None and extra_topk_lengths is not None:
+            extra_tk = extra_topk_lengths.shape[-1]  # padded max, safe for collection
+            if extra_tk > 0:
+                extra_pids = extra_indices[0, :extra_tk].long()
+                extra_pids = extra_pids[extra_pids >= 0].tolist()
+                unique_extra = set(extra_pids)
 
         # --- batch-dequant unique pages → flat row-indexed BF16 ---
         def _dequant_swa_pages(cache, page_ids, page_sz):
@@ -1936,52 +1937,24 @@ class DeepseekV4AttnBackend(
             else (None, {})
         )
 
-        # --- Check if all heads share the same page set ---
-        first_swa = tuple(per_head_swa[0])
-        first_extra = tuple(per_head_extra[0])
-        all_same = all(
-            tuple(per_head_swa[h]) == first_swa
-            and tuple(per_head_extra[h]) == first_extra
-            for h in range(1, N_heads)
-        )
-
-        if all_same:
-            # --- Batched SDPA: single K, single matmul for all heads ---
-            k_segments = []
-            for pid in sorted(unique_swa):
-                start = swa_lookup[pid]
-                k_segments.append(swa_deq[start : start + swa_phys_page_size])
-            if extra_deq is not None:
-                for pid in sorted(unique_extra):
-                    start = extra_lookup[pid]
-                    k_segments.append(extra_deq[start : start + extra_page_size])
-            if k_segments:
-                k_all = torch.cat(k_segments, dim=0).float()  # [T, 512]
-                scores = (q_f32 @ k_all.T) * self.softmax_scale  # [N_heads, T]
-                sink = attn_sink.float().unsqueeze(1)  # [N_heads, 1]
-                scores_aug = torch.cat([scores, sink], dim=1)
-                weights = torch.softmax(scores_aug, dim=1)[:, : scores.shape[1]]
-                out = weights @ k_all
-        else:
-            # --- Per-head SDPA (heads differ, e.g. C4 indexer) ---
-            for h in range(N_heads):
-                k_rows = []
-                for pid in per_head_swa[h]:
-                    start = swa_lookup[pid]
-                    k_rows.append(swa_deq[start : start + swa_phys_page_size])
-                if extra_deq is not None:
-                    for pid in per_head_extra[h]:
-                        start = extra_lookup[pid]
-                        k_rows.append(extra_deq[start : start + extra_page_size])
-                if not k_rows:
-                    continue
-                k_all = torch.cat(k_rows, dim=0).float()  # [T, 512]
-                qi = q_f32[h : h + 1]  # [1, 512]
-                scores = (qi @ k_all.T).squeeze(0) * self.softmax_scale  # [T]
-                sink_val = float(attn_sink[h])
-                scores_aug = torch.cat([scores, torch.tensor([sink_val], device=dev)])
-                weights = torch.softmax(scores_aug, dim=0)[: scores.numel()]
-                out[h] = (weights.unsqueeze(0) @ k_all).squeeze(0)
+        # --- Batched SDPA: single K, single matmul for all heads ---
+        # For decode, all heads attend to the same pages (collected from
+        # head 0 above). Graph-safe: no per-head .item() calls.
+        k_segments = []
+        for pid in sorted(unique_swa):
+            start = swa_lookup[pid]
+            k_segments.append(swa_deq[start : start + swa_phys_page_size])
+        if extra_deq is not None:
+            for pid in sorted(unique_extra):
+                start = extra_lookup[pid]
+                k_segments.append(extra_deq[start : start + extra_page_size])
+        if k_segments:
+            k_all = torch.cat(k_segments, dim=0).float()  # [T, 512]
+            scores = (q_f32 @ k_all.T) * self.softmax_scale  # [N_heads, T]
+            sink = attn_sink.float().unsqueeze(1)  # [N_heads, 1]
+            scores_aug = torch.cat([scores, sink], dim=1)
+            weights = torch.softmax(scores_aug, dim=1)[:, : scores.shape[1]]
+            out = weights @ k_all
 
         return out.view(*q_orig_shape[:-1], -1).to(torch.bfloat16)
 
@@ -2007,10 +1980,12 @@ class DeepseekV4AttnBackend(
         dev = q.device
         swa_page_size = page_size
 
+        # Collect unique SWA pages from all heads (graph-safe: use shape,
+        # not .item()). All heads share the same pages for decode SWA.
+        max_tk = swa_page_indices.shape[1]
         unique_pages = set()
         for h in range(min(N, swa_page_indices.shape[0])):
-            topk = int(swa_topk_lengths[h].item())
-            for pid in swa_page_indices[h, :topk].tolist():
+            for pid in swa_page_indices[h, :max_tk].tolist():
                 if pid >= 0:
                     unique_pages.add(pid)
 
