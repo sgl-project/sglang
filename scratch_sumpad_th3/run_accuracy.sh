@@ -45,6 +45,11 @@ export SGLANG_DBG_DP_PAD_MODE="$DBG_MODE"
 export SGLANG_DBG_DP_PAD_LOG=1
 echo "config=$CONFIG SGLANG_DBG_DP_PAD_MODE='$DBG_MODE' graph_args='${GRAPH_ARGS[*]}'" | tee "$OUT/env.log"
 
+# launch_server spawns scheduler children that outlive a plain kill of the parent, so
+# clear any leftover server on this port before binding it again.
+pkill -f "sglang.launch_server.*--port $PORT" 2>/dev/null
+sleep 20
+
 exec_command python -m sglang.launch_server \
   --model-path "$MODEL" \
   --trust-remote-code \
@@ -83,3 +88,4 @@ grep -c "\[DPPAD\]" "$OUT/server.log" > "$OUT/dppad_lines.txt" 2>/dev/null
 echo "DONE" > "$OUT/DONE"
 kill "$SERVER_PID" 2>/dev/null
 wait "$SERVER_PID" 2>/dev/null
+pkill -f "sglang.launch_server.*--port $PORT" 2>/dev/null
