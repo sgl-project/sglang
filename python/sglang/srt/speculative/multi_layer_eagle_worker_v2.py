@@ -401,7 +401,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_cuda_graph = prepare_for_draft(
+        forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
             batch,
@@ -727,7 +727,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         forward_batch.spec_info.num_accept_tokens = batch_result.accept_lens
 
         # Run draft extend batch in the main compute stream
-        can_cuda_graph = (
+        can_run_decode_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
@@ -737,7 +737,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         ret_draft_probs = None
         next_token_ids_backup = batch_result.next_token_ids.clone()
 
-        if can_cuda_graph:
+        if can_run_decode_cuda_graph:
             cgr = self.cuda_graph_runner_for_draft_extend
             # Populate the single shared buffer set once; each step replays
             # against it and the chain is advanced in place between steps.

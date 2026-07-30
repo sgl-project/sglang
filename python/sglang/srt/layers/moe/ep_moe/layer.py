@@ -176,10 +176,7 @@ class DeepEPMoE(FusedMoE):
         router_logits: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        # Runs eagerly between BCG segments at every replay. Scope
-        # is_extend_in_batch=True so a2a resolves NORMAL (capture pins
-        # False for PCG). Mutate caller-allocated output: the next
-        # segment reads its recorded address.
+        # eager run under breakable cuda graph
         saved_is_extend_in_batch = get_is_extend_in_batch()
         set_is_extend_in_batch(True)
         try:
@@ -213,6 +210,7 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
+        # DeepEP NORMAL mode is not capturable; run it as an eager node.
         if is_in_breakable_cuda_graph():
             assert TopKOutputChecker.format_is_standard(
                 topk_output

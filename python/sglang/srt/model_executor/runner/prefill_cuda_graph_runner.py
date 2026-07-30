@@ -1003,7 +1003,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.mha_return_lse = False
         forward_batch.set_attn_attend_prefix_cache(False)
 
-    def replay_ineligible_locally(
+    def can_replay_locally(
         self,
         *,
         batch_size: int,
@@ -1025,16 +1025,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         rank-uniform; forward-time-only checking cannot split the group).
         """
         if self._is_full_backend and batch_size > self._capture_req_slots:
-            return True
+            return False
         # LoRA replays need prepare_lora_batch's static metadata. lora_manager
         # keeps LoRA prefill eager on every rank under dp attention, so the
         # schedule-time vote derives this from enable_lora alone.
         if lora_ineligible:
-            return True
+            return False
         if input_embeds is not None:
-            return True
+            return False
         if replace_embeds is not None:
-            return True
+            return False
         # A prefix forces the MHA companion path, whose captured state is
         # frozen prefix-free; DSA models are exempt (capture/replay force
         # the sparse path, which takes any prefix via device metadata).
@@ -1045,32 +1045,32 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and prefix_lens is not None
             and any(prefix_lens)
         ):
-            return True
+            return False
         # FullCG's chunked-prefix topology covers a bounded prefix. The flag
         # gating it is FULL-backend-only, so this is inert for the breakable
         # vote path.
         if chunked_prefix_uncapturable:
-            return True
+            return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if is_target_verify:
-            return True
+            return False
         if (
             capture_hidden_mode is not None
             and capture_hidden_mode != self.capture_hidden_mode
         ):
-            return True
-        if return_logprob and not self._uses_eager_prefill_tail():
-            return True
-        if num_tokens is None:
             return False
-        if num_tokens > self.max_num_tokens:
+        if return_logprob and not self._uses_eager_prefill_tail():
+            return False
+        if num_tokens is None:
             return True
+        if num_tokens > self.max_num_tokens:
+            return False
         # No exact-shape check: load_batch bucket-pads; only reject
         # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
-            return True
-        return False
+            return False
+        return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         # DP check: group verdict from the schedule-time all-gather
@@ -1087,7 +1087,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         # Non-DP local check (sole decision for tp-only).
-        if self.replay_ineligible_locally(
+        if not self.can_replay_locally(
             batch_size=forward_batch.batch_size,
             num_tokens=len(forward_batch.input_ids),
             input_embeds=forward_batch.input_embeds,

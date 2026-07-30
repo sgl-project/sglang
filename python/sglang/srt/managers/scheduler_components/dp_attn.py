@@ -27,12 +27,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
@@ -83,11 +83,11 @@ class MLPSyncBatchInfo:
 
     num_tokens: int
     num_tokens_for_logprob: int
-    can_cuda_graph: bool
+    can_run_decode_cuda_graph: bool
+    can_run_prefill_cuda_graph: bool
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
-    can_run_breakable_cuda_graph: bool
 
     # some gathered elements
     tp0_info: torch.Tensor = None
@@ -102,11 +102,11 @@ class MLPSyncBatchInfo:
             [
                 self.num_tokens,
                 self.num_tokens_for_logprob,
-                int(self.can_cuda_graph),
+                int(self.can_run_decode_cuda_graph),
                 int(self.is_extend_in_batch),
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
-                int(self.can_run_breakable_cuda_graph),
+                int(self.can_run_prefill_cuda_graph),
             ],
             device=device,
             dtype=dtype,
@@ -117,11 +117,11 @@ class MLPSyncBatchInfo:
             [
                 0,  # num_tokens
                 0,  # num_tokens_for_logprob
-                1,  # can_cuda_graph
+                1,  # can_run_decode_cuda_graph
                 0,  # is_extend_in_batch
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
-                0,  # can_run_breakable_cuda_graph
+                0,  # can_run_prefill_cuda_graph
             ],
             device=device,
             dtype=dtype,
@@ -184,9 +184,9 @@ class MLPSyncBatchInfo:
         cpu_data = tp0_info[:, :2].cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
-        self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
+        self.can_run_decode_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
-        self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
+        self.can_run_prefill_cuda_graph = bool(tp0_info[:, 6].min().item())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
@@ -212,12 +212,13 @@ def _update_gather_batch(
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
 
     # Check forward mode for cuda graph
-    batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
-    batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_breakable_cuda_graph
+    batch.can_run_dp_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
+    batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
 
 
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
+    model_runner: ModelRunner,
     dp_size: int,
     attn_tp_size: int,
     attn_cp_size: int,
@@ -228,7 +229,6 @@ def prepare_mlp_sync_batch_raw(
     disable_overlap_schedule: bool,
     offload_tags: set[str],
     dwdp: bool = False,
-    local_breakable_eligible: Optional[Callable[[ScheduleBatch], bool]] = None,
 ):
     # Check if other DP workers have running batches
     if (
@@ -257,28 +257,38 @@ def prepare_mlp_sync_batch_raw(
         )
 
     skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
-    can_cuda_graph = (
+    can_run_decode_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
-    # Idle/None ranks are permissive (like can_cuda_graph): the all-gather
-    # min()-reduces this across DP ranks, so a prefill batch with idle ranks
-    # still resolves to True (idle ranks become a padded dummy extend).
-    # Vote transport only: the eligibility conditions themselves live in
-    # PrefillCudaGraphRunner.replay_ineligible_locally (reached through
-    # local_breakable_eligible); idle/None ranks stay permissive.
-    can_run_breakable_cuda_graph = (
+    breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+    prefill_graph_runner = (
+        model_runner.prefill_cuda_graph_runner if breakable_prefill else None
+    )
+    can_run_prefill_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_idle()
+        # Breakable Cuda Graph Backend Check.
         or (
             local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
             and (
-                local_breakable_eligible is None
-                or local_breakable_eligible(local_batch)
+                prefill_graph_runner is None
+                or prefill_graph_runner.can_replay_locally(
+                    batch_size=local_batch.batch_size(),
+                    num_tokens=local_batch.extend_num_tokens,
+                    input_embeds=local_batch.input_embeds,
+                    replace_embeds=None,
+                    prefix_lens=local_batch.prefix_lens,
+                    is_target_verify=local_batch.forward_mode.is_target_verify(),
+                    capture_hidden_mode=None,
+                    return_logprob=local_batch.return_logprob,
+                    lora_ineligible=prefill_graph_runner.enable_lora,
+                )
             )
+            and breakable_prefill
         )
-    ) and check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+    )
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
     if local_batch is not None:
@@ -317,11 +327,11 @@ def prepare_mlp_sync_batch_raw(
         cp_size=attn_cp_size,
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
-        can_cuda_graph=can_cuda_graph,
+        can_run_decode_cuda_graph=can_run_decode_cuda_graph,
+        can_run_prefill_cuda_graph=can_run_prefill_cuda_graph,
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
-        can_run_breakable_cuda_graph=can_run_breakable_cuda_graph,
     )
 
     if not skip_all_gather:
@@ -372,37 +382,9 @@ def prepare_mlp_sync_batch_raw(
     return local_batch
 
 
-def make_local_breakable_eligible_fn(
-    tp_worker,
-) -> Callable[[ScheduleBatch], bool]:
-    """Bind the rank-local breakable-replay eligibility check
-    (PrefillCudaGraphRunner.replay_ineligible_locally) to the worker's
-    target-model prefill graph runner, for the mlp-sync consensus.
-    """
-    if isinstance(tp_worker, BaseSpecWorker):
-        tp_worker = tp_worker.target_worker
-
-    def local_breakable_eligible(batch: ScheduleBatch) -> bool:
-        if not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
-            return True
-        runner = tp_worker.model_runner.prefill_cuda_graph_runner
-        return not runner.replay_ineligible_locally(
-            batch_size=batch.batch_size(),
-            num_tokens=batch.extend_num_tokens,
-            input_embeds=batch.input_embeds,
-            replace_embeds=None,
-            prefix_lens=batch.prefix_lens,
-            is_target_verify=batch.forward_mode.is_target_verify(),
-            capture_hidden_mode=None,
-            return_logprob=batch.return_logprob,
-            lora_ineligible=runner.enable_lora,
-        )
-
-    return local_breakable_eligible
-
-
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerDPAttnAdapter:
+    model_runner: ModelRunner
     tp_group: GroupCoordinator
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
@@ -414,11 +396,11 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
-    local_breakable_eligible_fn: Optional[Callable[[ScheduleBatch], bool]] = None
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
             local_batch,
+            model_runner=self.model_runner,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.ps.attn_tp_size,
             attn_cp_size=self.ps.attn_cp_size,
@@ -429,7 +411,6 @@ class SchedulerDPAttnAdapter:
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=self.server_args.dwdp_size > 1,
-            local_breakable_eligible=self.local_breakable_eligible_fn,
         )
 
     def maybe_prepare_mlp_sync_batch(
