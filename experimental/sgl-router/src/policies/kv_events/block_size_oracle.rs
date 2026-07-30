@@ -14,14 +14,6 @@
 //! `CacheAwareConfig`; nothing reconciled it with the worker-reported
 //! value, so a mismatch silently destroyed cache-hit routing.
 //!
-//! Dynamo's design treats `kv_cache_block_size` as a property of the
-//! `ModelDeploymentCard` populated by the worker registrar (see
-//! `~/dynamo/components/src/dynamo/sglang/register.py`); a mismatch
-//! across workers for the same model is rejected loudly
-//! (`lib/kv-router/src/standalone_indexer/registry.rs::bail!`). The
-//! oracle here is the sgl-router analog — first worker establishes the
-//! value, mismatches are refused.
-//!
 //! # Single oracle vs per-model
 //!
 //! For now the oracle is process-wide. Realistic deployments use one
@@ -100,8 +92,8 @@ impl BlockSizeOracle {
         match self.bigram.compare_exchange(
             BIGRAM_UNKNOWN,
             candidate,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
+            Ordering::Release,
+            Ordering::Acquire,
         ) {
             Ok(_) => {}
             Err(existing) if existing == candidate => {}
@@ -119,10 +111,32 @@ impl BlockSizeOracle {
     }
 
     /// Whether query hashing should use the bigram variant
-    /// ([`super::hash::compute_block_hashes_bigram`]). Defaults to `false`
-    /// until a worker reports an EAGLE-family `speculative_algorithm`.
+    /// ([`super::hash::compute_block_hashes_bigram`]).
+    ///
+    /// This accessor collapses "not reported" into `false`; routing-time
+    /// callers must use [`Self::hash_config`] so unknown mode cannot be
+    /// mistaken for established unigram hashing.
     pub fn is_bigram(&self) -> bool {
-        self.bigram.load(Ordering::Relaxed) == BIGRAM_BIGRAM
+        self.bigram.load(Ordering::Acquire) == BIGRAM_BIGRAM
+    }
+
+    /// Return a coherent block-hashing configuration once both worker
+    /// properties have been established.
+    ///
+    /// `add_worker` publishes `block_size` before `bigram`; the release/acquire
+    /// pair on `bigram` makes the preceding size write visible here. Returning
+    /// `None` while either half is unknown prevents a transient unigram lookup
+    /// against an EAGLE tree during first-worker registration.
+    pub fn hash_config(&self) -> Option<(u32, bool)> {
+        let bigram = self.bigram.load(Ordering::Acquire);
+        if bigram == BIGRAM_UNKNOWN {
+            return None;
+        }
+        let block_size = self.value.load(Ordering::Relaxed);
+        if block_size == 0 {
+            return None;
+        }
+        Some((block_size, bigram == BIGRAM_BIGRAM))
     }
 
     /// Publish a candidate block size. Returns the established value on
@@ -206,6 +220,20 @@ mod tests {
         assert!(!oracle.is_bigram(), "established as unigram");
         oracle.set_bigram(true); // conflicting; first (unigram) wins
         assert!(!oracle.is_bigram());
+    }
+
+    #[test]
+    fn hash_config_requires_both_worker_properties() {
+        let oracle = BlockSizeOracle::new();
+        assert_eq!(oracle.hash_config(), None);
+        oracle.try_set(64).unwrap();
+        assert_eq!(
+            oracle.hash_config(),
+            None,
+            "a block size alone must not transiently imply unigram hashing",
+        );
+        oracle.set_bigram(true);
+        assert_eq!(oracle.hash_config(), Some((64, true)));
     }
 
     #[test]

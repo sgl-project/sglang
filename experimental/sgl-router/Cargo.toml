@@ -89,6 +89,13 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Utilities
+# Decodes the peer-snapshot response. Deliberately NOT reqwest's `gzip` feature:
+# that feature is crate-wide and defaults every client in the process to
+# advertising and auto-decoding gzip (reqwest `Accepts::default`), including the
+# proxy client on the streaming hot path. Decoding one response by hand keeps the
+# change confined to the bootstrap fetch, and
+# `a_default_client_does_not_advertise_gzip` fails if the feature is ever added.
+flate2 = "1"
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }

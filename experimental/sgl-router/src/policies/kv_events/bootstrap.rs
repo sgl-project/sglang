@@ -73,8 +73,11 @@
 //! The tree re-checks shape on its own behalf regardless.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use flate2::read::GzDecoder;
 
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
@@ -90,6 +93,16 @@ pub const SNAPSHOT_FORMAT: u32 = 1;
 
 /// Path served by the producer and fetched by the consumer.
 pub const SNAPSHOT_PATH: &str = "/internal/kv_snapshot";
+
+/// Ceiling on a decompressed peer snapshot, as a resource guard rather than a
+/// format bound.
+///
+/// A legitimate body is bounded by the fleet's total KV capacity in blocks, which
+/// is orders of magnitude below this; the ceiling exists because gzip lets a small
+/// response demand an arbitrarily large allocation, and the producing route is
+/// unauthenticated. Generous on purpose: rejecting a real snapshot costs a cold
+/// boot, so this should only ever catch a body no honest peer would send.
+const MAX_INFLATED_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Query parameter by which a consumer states how stale a cached snapshot it
 /// will accept, in milliseconds. See [`PRODUCER_CACHE_TTL`].
@@ -1137,13 +1150,29 @@ fn snapshot_url(peer_base_url: &str, max_age: Option<Duration>) -> String {
 /// wrong for a bootstrap — see [`PRODUCER_CACHE_TTL`]. An older router image
 /// ignores the parameter and answers from its own cache, so a mixed-version
 /// fleet degrades to the pre-parameter behaviour rather than failing.
+/// # Compression
+///
+/// The snapshot body is the largest thing this router ever transfers — it carries
+/// the whole tree, so it grows with the node count rather than with the fleet size
+/// — and slow transfers are what starve the bootstrap deadline, so the request
+/// asks for gzip and the producer compresses that route.
+///
+/// Negotiated by hand rather than via reqwest's `gzip` feature: that feature is
+/// crate-wide, and with it compiled in `Accepts::default()` sets `gzip: true`, so
+/// EVERY client in the process would start advertising gzip and auto-decoding
+/// responses — including the proxy client carrying SSE on the hot path. Asking
+/// on this one request keeps the behaviour change where it belongs.
 pub async fn fetch_snapshot(
     http: &reqwest::Client,
     peer_base_url: &str,
     max_age: Option<Duration>,
-) -> Result<Option<PeerSnapshot>, reqwest::Error> {
+) -> Result<Option<PeerSnapshot>, anyhow::Error> {
     let url = snapshot_url(peer_base_url, max_age);
-    let resp = http.get(&url).send().await?;
+    let resp = http
+        .get(&url)
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip")
+        .send()
+        .await?;
     if !resp.status().is_success() {
         debug!(
             peer = %peer_base_url,
@@ -1152,7 +1181,56 @@ pub async fn fetch_snapshot(
         );
         return Ok(None);
     }
-    Ok(Some(resp.json::<PeerSnapshot>().await?))
+    // Branch on what the peer actually sent, not on what we asked for: a router
+    // image that predates route compression answers identity, and must keep
+    // working. reqwest leaves both the header and the body untouched here because
+    // its `gzip` feature is off.
+    //
+    // Exact-match on purpose. The only legitimate producer is another router of
+    // this codebase, which sends the bare token, so a compound or non-canonical
+    // coding means an intermediary rewrote the body — better surfaced as a decode
+    // failure than guessed at.
+    let gzipped = resp
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"gzip"));
+    let body = resp.bytes().await?;
+    // Inflating and parsing a multi-megabyte tree is seconds of CPU with no await
+    // point, and this runs on the runtime that also proxies requests — including
+    // the SSE hot path. Hand it to the blocking pool instead of occupying a worker
+    // for the whole decode. The splice probe makes this load-bearing: it spawns one
+    // task per expired rank, each fetching from every candidate.
+    tokio::task::spawn_blocking(move || decode_snapshot(&body, gzipped))
+        .await?
+        .map(Some)
+}
+
+/// Inflate (when gzipped) and parse one snapshot body. Blocking and CPU-bound —
+/// callers run it off the async runtime.
+fn decode_snapshot(body: &[u8], gzipped: bool) -> Result<PeerSnapshot, anyhow::Error> {
+    if !gzipped {
+        return Ok(serde_json::from_slice(body)?);
+    }
+    // Bounded on purpose. The producing endpoint is unauthenticated (see the
+    // `kv_snapshot` route), gzip amplifies by up to ~1000x, and an unbounded
+    // `read_to_end` would let one small response OOM a booting router — the most
+    // silent failure available, since the process dies before it can log. The
+    // ceiling sits far above a maxed-out fleet's tree so it only ever rejects a
+    // body no legitimate peer would send.
+    let mut inflated = Vec::new();
+    let read = GzDecoder::new(body)
+        .take(MAX_INFLATED_SNAPSHOT_BYTES + 1)
+        .read_to_end(&mut inflated)?;
+    if read as u64 > MAX_INFLATED_SNAPSHOT_BYTES {
+        anyhow::bail!(
+            "peer snapshot inflates past the {MAX_INFLATED_SNAPSHOT_BYTES}-byte ceiling; \
+             refusing to buffer it"
+        );
+    }
+    // Parse from the slice rather than streaming the decoder into serde: for one
+    // large document `from_slice` can borrow string data straight out of the
+    // buffer where `from_reader` must copy.
+    Ok(serde_json::from_slice(&inflated)?)
 }
 
 #[cfg(test)]

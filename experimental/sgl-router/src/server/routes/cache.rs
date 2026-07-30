@@ -123,11 +123,12 @@ pub async fn kv_snapshot(
             let body = index.peer_snapshot_body(max_age).await;
             if body.is_empty() {
                 // The encode failed (see `snapshot_entry`). Must NOT be a 200: the
-                // consumer's `fetch_snapshot` would fail JSON decode, which lands
-                // in the one `sweep_peers` arm that skips the peer cooldown — so a
-                // booting sibling would re-request this same broken body every
-                // 250ms for its whole bootstrap window. A non-success status reads
-                // as "no snapshot here" and earns the cooldown.
+                // consumer's `fetch_snapshot` would fail to decode it, and a
+                // decode failure is indistinguishable from a peer whose transport
+                // is broken. A non-success status reads as "no snapshot here",
+                // which is what this is. Both paths now earn the sweep's peer
+                // cooldown, so neither turns a booting sibling into a 250ms retry
+                // loop against a multi-megabyte body.
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(serde_json::json!({
@@ -311,6 +312,93 @@ mod tests {
         let body = res.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice::<PeerSnapshot>(&body)
             .expect("route body must deserialise as a PeerSnapshot");
+    }
+
+    /// Compression is the whole point of asking for gzip on the fetch side, and it
+    /// lives on the route rather than the app — so it has to be asserted HERE,
+    /// against the router `build_router` actually produces. A component test that
+    /// mounts its own `CompressionLayer` proves tower-http works, not that this
+    /// route is wired to it, and would stay green if the layer were dropped.
+    ///
+    /// Both directions in one test, because they are one contract: a consumer that
+    /// asks gets gzip, and one that does not — an image predating the layer — still
+    /// gets parseable JSON.
+    #[tokio::test]
+    async fn kv_snapshot_route_compresses_only_when_the_caller_accepts_gzip() {
+        use crate::policies::kv_events::bootstrap::{PeerSnapshot, SNAPSHOT_PATH};
+        use std::io::Read;
+
+        let ctx = Arc::new(AppContext::stub());
+        ctx.attach_kv_index(crate::policies::kv_events::KvEventIndex::new());
+
+        let gzipped = crate::server::app::build_router(Arc::clone(&ctx))
+            .oneshot(
+                Request::builder()
+                    .uri(SNAPSHOT_PATH)
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gzipped.status(), StatusCode::OK);
+        assert_eq!(
+            gzipped
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "the snapshot route must compress for a caller that accepts gzip",
+        );
+        let compressed = gzipped.into_body().collect().await.unwrap().to_bytes();
+        let mut inflated = Vec::new();
+        flate2::read::GzDecoder::new(compressed.as_ref())
+            .read_to_end(&mut inflated)
+            .expect("body must be valid gzip");
+        serde_json::from_slice::<PeerSnapshot>(&inflated)
+            .expect("inflated body must deserialise as a PeerSnapshot");
+
+        let identity = crate::server::app::build_router(Arc::clone(&ctx))
+            .oneshot(
+                Request::builder()
+                    .uri(SNAPSHOT_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            identity.headers().get(header::CONTENT_ENCODING).is_none(),
+            "a caller that never asked for gzip must get identity",
+        );
+
+        // The layer must stay SCOPED to this route. Moving it to the app-level
+        // `Router::layer` would compress every JSON response on the proxy hot
+        // path, and nothing else would notice — tower-http's default predicate
+        // exempts `text/event-stream`, so even the SSE stream would look fine.
+        let other = crate::server::app::build_router(Arc::clone(&ctx))
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            other.headers().get(header::CONTENT_ENCODING).is_none(),
+            "compression must not leak off the snapshot route",
+        );
+        // Guard against proving that vacuously: tower-http skips bodies at or
+        // below 32 bytes, so a tiny response would satisfy the assertion above
+        // even under a global layer.
+        let other_len = other.into_body().collect().await.unwrap().to_bytes().len();
+        assert!(
+            other_len > 32,
+            "the comparison endpoint must be large enough for the layer to have \
+             compressed it; got {other_len} bytes",
+        );
     }
 
     /// The freshness parameter must be OPTIONAL at the extractor. A router image

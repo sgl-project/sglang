@@ -24,6 +24,7 @@ use sgl_router::policies::kv_events::bootstrap::{
 };
 use sgl_router::policies::kv_events::{HashTree, KvWorkerId};
 use tokio::net::TcpListener;
+use tower_http::compression::{CompressionLayer, CompressionLevel};
 
 /// Serve a fixed snapshot at the real path and return the base URL.
 ///
@@ -39,6 +40,37 @@ async fn serve_snapshot(snap: PeerSnapshot) -> (String, tokio::task::JoinHandle<
             let body = Arc::clone(&body);
             async move { Json((*body).clone()) }
         }),
+    );
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// The snapshot path wrapped in a compression layer configured to MATCH
+/// `server::app`'s snapshot route — a copy, not the production wiring, so this
+/// proves only that the consumer decodes a compressed body over a real socket.
+/// That the production route is actually wired to a layer is asserted separately,
+/// against `build_router`, in `server::routes::cache`'s tests; without that this
+/// helper would keep passing if the real layer were dropped.
+async fn serve_snapshot_gzip(snap: PeerSnapshot) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = Arc::new(snap);
+    let app = Router::new().route(
+        SNAPSHOT_PATH,
+        get(move || {
+            let body = Arc::clone(&body);
+            async move { Json((*body).clone()) }
+        })
+        .layer(
+            CompressionLayer::new()
+                .gzip(true)
+                .no_br()
+                .no_deflate()
+                .no_zstd()
+                .quality(CompressionLevel::Fastest),
+        ),
     );
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -135,6 +167,88 @@ fn snapshot_of(tree: &HashTree, cursors: &[(KvWorkerId, i64)]) -> PeerSnapshot {
         cursors: cursor_wire,
         nodes,
     }
+}
+
+/// The snapshot body is compressed in production, so the consumer must end up
+/// with the same routing view over a gzipped transport as over an identity one.
+/// The sibling tests all serve identity, which is what keeps a mixed-version
+/// fleet (a peer predating route compression) covered.
+#[tokio::test]
+async fn new_replica_view_matches_warm_replica_over_gzipped_http() {
+    let workers = vec![
+        worker("http://w1:30000", 0),
+        worker("http://w2:30000", 0),
+        worker("http://w2:30000", 1),
+    ];
+    let old_tree = warm_tree(&workers);
+    let (base_url, _server) = serve_snapshot_gzip(snapshot_of(&old_tree, &[])).await;
+
+    // Prove the body really was compressed, so this test cannot silently
+    // degrade into another identity-transport test if the layer is dropped.
+    let raw = reqwest::Client::new()
+        .get(format!("{base_url}{SNAPSHOT_PATH}"))
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip")
+        .send()
+        .await
+        .expect("raw fetch succeeds");
+    assert_eq!(
+        raw.headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "producer must compress the snapshot route when gzip is acceptable",
+    );
+
+    let http = reqwest::Client::new();
+    let fetched = fetch_snapshot(&http, &base_url, None)
+        .await
+        .expect("fetch succeeds")
+        .expect("peer serves a snapshot");
+    let live: HashSet<KvWorkerId> = workers.iter().cloned().collect();
+    let vetted = VettedSnapshot::from_wire(fetched, &live, Some(64), false).expect("vets clean");
+    let new_tree = HashTree::new();
+    vetted.graft_into(&new_tree).expect("restore succeeds");
+    assert_same_view(&old_tree, &new_tree, "gzipped bootstrap");
+}
+
+/// Guard on the blast radius of the compression change.
+///
+/// Enabling reqwest's crate-wide `gzip` feature would make `Accepts::default()`
+/// set `gzip: true`, so every client in the process — including the proxy client
+/// carrying SSE — would start advertising gzip and auto-decoding responses. The
+/// snapshot fetch therefore asks for gzip on its own request instead. If someone
+/// adds the feature to Cargo.toml, a default client starts advertising it and
+/// this fails.
+#[tokio::test]
+async fn a_default_client_does_not_advertise_gzip() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new().route(
+        "/echo-accept-encoding",
+        get(|headers: axum::http::HeaderMap| async move {
+            headers
+                .get(reqwest::header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<absent>")
+                .to_string()
+        }),
+    );
+    let _server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let seen = reqwest::Client::new()
+        .get(format!("http://{addr}/echo-accept-encoding"))
+        .send()
+        .await
+        .expect("request succeeds")
+        .text()
+        .await
+        .expect("body reads");
+    assert!(
+        !seen.contains("gzip"),
+        "a default reqwest client must not advertise gzip — reqwest's crate-wide \
+         `gzip` feature would flip every client in the process, including the SSE \
+         proxy path. Got Accept-Encoding: {seen}",
+    );
 }
 
 /// The headline guarantee: after bootstrapping over real HTTP, the new

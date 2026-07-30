@@ -408,7 +408,11 @@ fn default_balance_rel() -> f32 {
 
 /// 5s: long enough for a peer fetch plus a multi-MB snapshot graft, short
 /// enough to sit inside a normal readinessProbe budget.
-fn default_bootstrap_timeout_ms() -> u64 {
+///
+/// `pub(crate)` so the per-fetch timeout derived from it can be tested AT this
+/// value — an earlier test covered only deadlines above the floor and so missed
+/// that the default was the one budget the derivation mishandled.
+pub(crate) fn default_bootstrap_timeout_ms() -> u64 {
     5_000
 }
 

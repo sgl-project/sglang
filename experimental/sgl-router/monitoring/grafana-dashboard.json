@@ -1921,12 +1921,272 @@
       ]
     },
     {
+      "type": "timeseries",
+      "title": "Cache-aware lookup health",
+      "description": "Match is the weighted matched/query block ratio among tree lookups; coverage is the fraction of policy evaluations that reached a tree lookup. Low match with a healthy tree points to a token/render/hash parity mismatch. Low coverage exposes early exits such as hash_config_unknown. Admission races can repeat evaluations, while parked hand-offs skip them, so neither series is request-level.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 57,
+        "w": 6,
+        "h": 8
+      },
+      "id": 42,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (instance, model_id) (rate(sgl_router_overlap_blocks_sum{model_id=~\"$model_id\"}[$__rate_interval])) / (sum by (instance, model_id) (rate(sgl_router_cache_aware_query_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{instance}} {{model_id}} match",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "(sum by (instance, model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\",decision=~\"cache_hit|below_threshold|matched_node_unowned|matched_workers_ineligible\"}[$__rate_interval])) or 0 * sum by (instance, model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval]))) / (sum by (instance, model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
+          "range": true,
+          "refId": "B",
+          "legendFormat": "{{instance}} {{model_id}} lookup coverage",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache-aware policy evaluations",
+      "description": "Terminal policy-evaluation outcomes, not request counts: admission races can evaluate repeatedly and parked hand-offs skip evaluation. below_threshold isolates tree/hash misses; load_imbalance is intentional; matched_node_unowned identifies tree lifecycle state; matched_workers_ineligible commonly means cached owners were at capacity; hash_config_unknown and tokenization_unavailable identify routing-input failures. request_body_unavailable or request_json_invalid indicates a broken ingress invariant and emits an error log.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 57,
+        "w": 6,
+        "h": 8
+      },
+      "id": 43,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (instance, decision) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{instance}} {{decision}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "KV tree nodes by replica",
+      "description": "A sharp per-replica drop exposes a cold router tree immediately. Compare with bootstrap state and below_threshold decisions.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 57,
+        "w": 6,
+        "h": 8
+      },
+      "id": 44,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sgl_router_kv_tree_nodes",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{instance}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "KV bootstrap settled by replica",
+      "description": "0 while peer bootstrap is pending, 1 after it settles. Pair with tree nodes: settled=1 plus a tiny tree means bootstrap timed out or recovered incomplete state.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 57,
+        "w": 6,
+        "h": 8
+      },
+      "id": 45,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sgl_router_kv_bootstrap_settled",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{instance}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Routing Policy",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 57,
+        "y": 65,
         "w": 24,
         "h": 1
       },
@@ -1943,7 +2203,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 58,
+        "y": 66,
         "w": 8,
         "h": 8
       },
@@ -2036,7 +2296,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 58,
+        "y": 66,
         "w": 8,
         "h": 8
       },
@@ -2129,7 +2389,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 58,
+        "y": 66,
         "w": 8,
         "h": 8
       },

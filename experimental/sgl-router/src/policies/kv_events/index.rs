@@ -86,6 +86,53 @@ const BOOTSTRAP_QUEUE_DEPTH: usize = 1024;
 /// the retry useful without the load.
 const PEER_COOLDOWN_PASSES: u32 = 4;
 
+/// How many snapshot fetches the per-request timeout should leave room for
+/// within one bootstrap deadline.
+///
+/// A single fetch must not be allowed to consume the whole deadline. The sweep
+/// walks candidates sequentially and awaits each fetch, so a per-request timeout
+/// equal to the deadline means the first unresponsive peer starves every other
+/// candidate — the outer deadline then cancels the sweep mid-fetch, so the
+/// replica boots cold having tallied no peer outcome at all while the terminal
+/// log still reports the full candidate list. Budgeting several attempts per
+/// deadline is what makes the "try the next peer" loop reachable under a slow
+/// producer.
+const SNAPSHOT_FETCH_ATTEMPTS_PER_DEADLINE: u32 = 4;
+
+/// Preferred floor for the per-fetch timeout: the snapshot body is a
+/// multi-megabyte tree, so too short a timeout would reject every peer instead.
+///
+/// Preferred, not absolute — see [`snapshot_fetch_timeout`], which lets the
+/// deadline override it. An unconditional floor would hand a single fetch the
+/// entire budget at the default deadline, reintroducing the starvation above.
+const SNAPSHOT_FETCH_TIMEOUT_FLOOR: Duration = Duration::from_secs(5);
+
+/// Cap for the per-fetch timeout, so a deliberately generous deadline (see
+/// `MAX_KV_BOOTSTRAP_TIMEOUT_MS`) still cannot let one hung peer park for
+/// minutes.
+const SNAPSHOT_FETCH_TIMEOUT_CAP: Duration = Duration::from_secs(30);
+
+/// Per-request timeout for a peer snapshot fetch, a strict fraction of the
+/// configured bootstrap budget so several peers can be tried within it.
+///
+/// Derived from the CONFIGURED budget, not from the time a given sweep has left:
+/// a later sweep running on a shrunken remainder still carries this value, so it
+/// bounds the search less tightly than the first sweep. Recomputing per sweep
+/// would need the client rebuilt per sweep, which costs a connection pool.
+fn snapshot_fetch_timeout(deadline: Duration) -> Duration {
+    // A pre-settled (bootstrap-disabled) tracker reports a zero deadline. The
+    // client is still built, and a zero reqwest timeout means "expire
+    // immediately" rather than "no timeout", so fall back to the floor.
+    if deadline.is_zero() {
+        return SNAPSHOT_FETCH_TIMEOUT_FLOOR;
+    }
+    // The floor yields to the deadline rather than overriding it. The default
+    // budget equals the floor, so an unconditional floor would make every
+    // default-configured router spend its whole deadline on one peer.
+    let floor = SNAPSHOT_FETCH_TIMEOUT_FLOOR.min(deadline / 2);
+    (deadline / SNAPSHOT_FETCH_ATTEMPTS_PER_DEADLINE).clamp(floor, SNAPSHOT_FETCH_TIMEOUT_CAP)
+}
+
 /// How long a grafted rank may wait for its own live stream to prove the splice
 /// before the fleet is asked instead.
 ///
@@ -253,8 +300,12 @@ pub struct KvEventIndex {
     /// right for `/server_info` introspection and far too short for a
     /// multi-megabyte tree body. Sharing it would make peer bootstrap silently
     /// fail for exactly the large trees worth bootstrapping, and report the
-    /// failure as `unreachable`. Total sweep time stays bounded by the bootstrap
-    /// deadline, so a generous per-request timeout costs nothing.
+    /// failure as `unreachable`.
+    ///
+    /// Its timeout is a strict fraction of the bootstrap deadline, not the
+    /// deadline itself — see [`snapshot_fetch_timeout`]. The sweep bounding the
+    /// whole search is not enough on its own: the sweep awaits candidates in
+    /// turn, so only a shorter per-request bound lets it reach a second one.
     snapshot_http: reqwest::Client,
     /// Obligations waiting for the coordinator to fold them into the sweep that
     /// is in flight, or to start one. See [`bootstrap_coordinator`].
@@ -645,10 +696,11 @@ impl KvEventIndex {
         block_size_oracle: Arc<BlockSizeOracle>,
         bootstrap: Arc<BootstrapTracker>,
     ) -> Arc<Self> {
-        // At least 10s so a small configured deadline does not reintroduce the
-        // too-short-timeout problem; the sweep deadline is the real bound.
+        // A fraction of the deadline, not the deadline itself: see
+        // `snapshot_fetch_timeout`. The sweep bounds the whole search, but only a
+        // shorter per-request bound lets it reach a second candidate.
         let snapshot_http = reqwest::Client::builder()
-            .timeout(bootstrap.timeout().max(Duration::from_secs(10)))
+            .timeout(snapshot_fetch_timeout(bootstrap.timeout()))
             .build()
             .unwrap_or_else(|_| http.clone());
         let tree = Arc::new(HashTree::new());
@@ -758,10 +810,11 @@ impl KvEventIndex {
     /// A snapshot that declares itself useless, for the paths that must answer
     /// without a tree. Consumers skip a `producer_ready: false` peer and retry.
     fn not_ready_snapshot(&self) -> PeerSnapshot {
+        let (block_size, is_bigram) = self.block_size_oracle.hash_config().unwrap_or((0, false));
         PeerSnapshot {
             format: SNAPSHOT_FORMAT,
-            block_size: self.block_size_oracle.get().unwrap_or(0),
-            is_bigram: self.block_size_oracle.is_bigram(),
+            block_size,
+            is_bigram,
             producer_ready: false,
             workers: Vec::new(),
             cursors: Vec::new(),
@@ -827,10 +880,12 @@ impl KvEventIndex {
             .iter()
             .filter_map(|(w, seq)| index_of.get(w).map(|&i| (i, *seq)))
             .collect();
+        let hash_config = self.block_size_oracle.hash_config();
+        let (block_size, is_bigram) = hash_config.unwrap_or((0, false));
         let snap = Arc::new(PeerSnapshot {
             format: SNAPSHOT_FORMAT,
-            block_size: self.block_size_oracle.get().unwrap_or(0),
-            is_bigram: self.block_size_oracle.is_bigram(),
+            block_size,
+            is_bigram,
             // "Am I worth copying?", not merely "did I stop waiting?".
             //
             // `settled()` latches when the bootstrap deadline expires, so a
@@ -840,7 +895,7 @@ impl KvEventIndex {
             // inherit nothing. Requiring a non-empty tree also correctly makes
             // the very first replica of a cold fleet a non-source until it has
             // learned something from live events.
-            producer_ready: self.bootstrap.settled() && !nodes.is_empty(),
+            producer_ready: hash_config.is_some() && self.bootstrap.settled() && !nodes.is_empty(),
             workers: worker_table
                 .iter()
                 .map(|w| WireWorker {
@@ -1384,6 +1439,10 @@ async fn sweep_peers(
         oracle,
         freshness_floor,
     } = ctx;
+    // Do not vet a snapshot against a partially published local hash config:
+    // accepting unigram state during the block-size/bigram registration
+    // window would permanently graft incomparable hashes into an EAGLE tree.
+    let (local_block_size, local_is_bigram) = oracle.hash_config()?;
     for peer in peers.candidates() {
         // A format / block-size / bigram mismatch is a stable property of that
         // peer for the life of the process, so re-downloading its whole tree on
@@ -1411,18 +1470,29 @@ async fn sweep_peers(
                 continue;
             }
             Err(e) => {
+                // `{e:#}` for the anyhow chain: the bare Display prints only the
+                // outermost message, dropping the reqwest/io cause that names what
+                // actually went wrong.
                 bootstrap.record_peer_outcome(
                     SnapshotOutcome::Unreachable,
                     &peer,
-                    Some(&e.to_string()),
+                    Some(&format!("{e:#}")),
                 );
+                // Cool this peer down like every other non-accept outcome. The
+                // failures reaching here are mostly stable properties of that peer
+                // for the life of the process — a transport it cannot complete, a
+                // body that will not inflate, JSON that will not parse — so
+                // re-fetching a multi-megabyte body from it on every 250ms pass is
+                // pure load on a replica that is itself serving traffic, and it
+                // starves candidates that might actually answer.
+                cooldown.insert(peer.clone(), PEER_COOLDOWN_PASSES);
                 continue;
             }
         };
         // Snapshot the live set at vet time so a peer cannot introduce a worker
         // this replica has not discovered.
         let live = live_workers.lock().clone();
-        match VettedSnapshot::from_wire(snap, &live, oracle.get(), oracle.is_bigram()) {
+        match VettedSnapshot::from_wire(snap, &live, Some(local_block_size), local_is_bigram) {
             Ok(vetted) => {
                 // Vetting only proves the snapshot is well formed and hash-
                 // comparable. It can still know nothing about the ranks we are
@@ -2343,6 +2413,48 @@ mod tests {
 
         assert_eq!(drain_ready(&mut rx, &mut pending), 1);
         assert!(pending.deferred.is_empty());
+    }
+
+    /// One snapshot fetch must never be able to consume the whole bootstrap
+    /// deadline: the sweep awaits each candidate in turn, so a per-request timeout
+    /// equal to the deadline lets the first unresponsive peer starve every other
+    /// candidate and the replica boots cold with warm peers still unqueried.
+    ///
+    /// The deadline set below spans the CONFIGURED DEFAULT upward. An earlier
+    /// version of this test started at 10s, which is above the floor and so could
+    /// not observe that the floor swallowed the division at the default — the one
+    /// value every unconfigured router actually runs with.
+    #[test]
+    fn snapshot_fetch_timeout_is_a_strict_fraction_of_every_nonzero_deadline() {
+        let default_secs = crate::config::types::default_bootstrap_timeout_ms() / 1_000;
+        assert_eq!(default_secs, 5, "test's premise: the default budget is 5s");
+
+        for deadline_secs in [1, 2, default_secs, 6, 10, 20, 30, 60, 120, 600] {
+            let deadline = Duration::from_secs(deadline_secs);
+            let per_fetch = snapshot_fetch_timeout(deadline);
+            assert!(
+                per_fetch < deadline,
+                "a single fetch may not consume the whole {deadline_secs}s deadline \
+                 (got {per_fetch:?})",
+            );
+            assert!(
+                deadline.as_secs_f64() / per_fetch.as_secs_f64() >= 2.0,
+                "{deadline_secs}s must buy at least two attempts; one fetch got {per_fetch:?}",
+            );
+        }
+
+        // Above the floor the divisor governs, so the budget buys the full
+        // attempt count rather than merely two.
+        assert_eq!(
+            snapshot_fetch_timeout(Duration::from_secs(120)) * SNAPSHOT_FETCH_ATTEMPTS_PER_DEADLINE,
+            Duration::from_secs(120),
+        );
+        // A pre-settled (bootstrap-disabled) tracker reports a zero deadline, where
+        // a derived value would be zero — an immediate expiry, not "no timeout".
+        assert_eq!(
+            snapshot_fetch_timeout(Duration::ZERO),
+            SNAPSHOT_FETCH_TIMEOUT_FLOOR,
+        );
     }
 
     /// The producer reuses its cached export only for a caller whose freshness
