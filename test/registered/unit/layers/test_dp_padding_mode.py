@@ -49,17 +49,31 @@ class TestGetDpPaddingMode(unittest.TestCase):
             DpPaddingMode.MAX_LEN,
         )
 
-    def test_skewed_extend_batch_uses_sum_len(self):
-        """A skewed extend batch would materialize pad rows, so it stays SUM_LEN."""
+    def test_uneven_extend_batch_without_idle_rank_uses_the_cost_heuristic(self):
+        """Padding an active rank is cheap, so an uneven batch keeps the heuristic."""
         self.assertEqual(
             get_mode([128, 64, 128, 128], is_extend_in_batch=True),
+            DpPaddingMode.MAX_LEN,
+        )
+
+    def test_very_skewed_extend_batch_uses_sum_len(self):
+        """The cost heuristic still rejects MAX_LEN once one rank dominates."""
+        self.assertEqual(
+            get_mode([128, 1, 1, 1], is_extend_in_batch=True),
             DpPaddingMode.SUM_LEN,
         )
 
     def test_extend_batch_with_idle_rank_uses_sum_len(self):
-        """An idle rank makes the batch skewed, which must not select MAX_LEN."""
+        """An idle rank takes the fabricated-row path, which must not select MAX_LEN."""
         self.assertEqual(
             get_mode([128, 0, 128, 128], is_extend_in_batch=True),
+            DpPaddingMode.SUM_LEN,
+        )
+
+    def test_extend_batch_with_idle_rank_uses_sum_len_even_when_cheap(self):
+        """The idle-rank guard overrides the cost heuristic, which would pick MAX_LEN."""
+        self.assertEqual(
+            get_mode([128, 128, 128, 0], is_extend_in_batch=True),
             DpPaddingMode.SUM_LEN,
         )
 
@@ -68,10 +82,10 @@ class TestGetDpPaddingMode(unittest.TestCase):
         drive the rank into the fabricated-row conversion with 0 tokens."""
         self.assertEqual(get_mode([0], is_extend_in_batch=True), DpPaddingMode.SUM_LEN)
 
-    def test_skewed_decode_batch_still_uses_the_cost_heuristic(self):
-        """The uniformity restriction applies to extend batches only."""
+    def test_decode_batch_with_idle_rank_still_uses_the_cost_heuristic(self):
+        """The idle-rank guard applies to extend batches only."""
         self.assertEqual(
-            get_mode([128, 64, 128, 128], is_extend_in_batch=False),
+            get_mode([128, 0, 128, 128], is_extend_in_batch=False),
             DpPaddingMode.MAX_LEN,
         )
 

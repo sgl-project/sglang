@@ -108,16 +108,12 @@ class DpPaddingMode(IntEnum):
         if max(global_num_tokens) == 0:
             return cls.SUM_LEN
 
-        # MAX_LEN pads every rank up to the global max, and those pad rows are
-        # only handled on the paths written for them (idle-rank fabrication,
-        # MoE topk masking, num_token_non_padded). Restrict extend batches to
-        # the case where padding is a no-op, so MAX_LEN buys the all_gather /
-        # symmetric-memory win without materializing a single pad row.
-        if (
-            is_extend_in_batch
-            and dp_size > 1
-            and min(global_num_tokens) != max(global_num_tokens)
-        ):
+        # An idle rank is where MAX_LEN turns expensive and unsafe at once: it
+        # drives that rank into the fabricated-row conversion, and it inflates
+        # every rank's buffer to max_len * dp_size (measured 6.5x GEMM on a
+        # skewed 8-rank prefill). A merely uneven batch costs ~2% of padding,
+        # so keep it on the communication-cost heuristic below.
+        if is_extend_in_batch and dp_size > 1 and min(global_num_tokens) == 0:
             return cls.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
