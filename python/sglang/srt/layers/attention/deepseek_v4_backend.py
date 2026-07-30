@@ -1880,68 +1880,86 @@ class DeepseekV4AttnBackend(
             )
             return o_swa.view(*q_orig_shape[:-1], -1)
 
-        # ── C4/C128: dequant unique pages + SDPA ──────
+        # ── C4/C128: per-request dequant + SDPA ──────
+        #
+        # Each request in the batch has its own set of KV cache pages.
+        # Dequantize pages independently per request so that each request's
+        # heads attend to their own K cache — avoids cross-request KV cache
+        # contamination when decode batch size > 1.
         swa_phys_page_size = self.token_to_kv_pool.swa_page_size
         extra_page_size = self.token_to_kv_pool.page_size // compress_ratio
-        q_f32 = q.float()  # [N_heads, 512]
 
-        # swa_page_indices contains TOKEN POSITIONS (not page indices).
-        # Dequantize individual tokens directly (no page expansion).
-        swa_tk = num_valid
-        swa_positions = swa_page_indices[0, :swa_tk].long()  # [swa_tk] TOKEN positions
-        swa_valid_mask = swa_positions >= 0
-        swa_positions_safe = swa_positions.clamp(min=0)
-
-        swa_deq = dequantize_dsv4_mxfp4_k_cache_paged(
-            swa_k_cache, swa_positions_safe, swa_phys_page_size
-        )[
-            :, 0, :
-        ]  # [swa_tk, 512]
-        swa_deq = swa_deq * swa_valid_mask.unsqueeze(1).float()
-
-        # --- dequant extra pages (FP8) ---
         from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
             dequantize_k_cache_paged as dequantize_fp8_k_cache_paged,
         )
 
-        extra_deq = None
-        if (
-            extra_indices is not None
-            and extra_topk_lengths is not None
-            and extra_k_cache is not None
-        ):
-            extra_tk = extra_topk_lengths.shape[-1]
-            if extra_tk > 0:
-                # extra_indices contains flat TOKEN POSITIONS (same as swa).
-                extra_positions = extra_indices[0, :extra_tk].long()
-                extra_valid_mask = extra_positions >= 0
-                extra_positions_safe = extra_positions.clamp(min=0)
-                extra_deq = dequantize_fp8_k_cache_paged(
-                    extra_k_cache, extra_positions_safe, extra_page_size
+        # Recover batch structure from the original (pre-flatten) q shape.
+        if len(q_orig_shape) >= 3:
+            bs, n_heads_per_req = q_orig_shape[0], q_orig_shape[1]
+        else:
+            bs = 1
+            n_heads_per_req = N_heads
+
+        swa_tk = num_valid
+        # extra_max_tk: use the same width as the old code path
+        # (extra_topk_lengths.shape[-1]), *not* extra_indices.shape[-1].
+        # extra_indices is padded to page-pool width which can be very
+        # large (e.g. 4096), flooding softmax with invalid zero-K entries.
+        extra_max_tk = (
+            extra_topk_lengths.shape[-1] if extra_topk_lengths is not None else 0
+        )
+
+        outputs: list[torch.Tensor] = []
+        for r in range(bs):
+            head_start = r * n_heads_per_req
+            head_end = head_start + n_heads_per_req
+            q_r = q[head_start:head_end].float()  # [n_heads_per_req, 512]
+
+            # -- SWA dequant for this request --
+            swa_positions = swa_page_indices[r, :swa_tk].long()
+            swa_valid = swa_positions >= 0
+            swa_deq = dequantize_dsv4_mxfp4_k_cache_paged(
+                swa_k_cache, swa_positions.clamp(min=0), swa_phys_page_size
+            )[
+                :, 0, :
+            ]  # [swa_tk, 512]
+            swa_deq = swa_deq * swa_valid.unsqueeze(1).float()
+
+            # -- Extra dequant for this request --
+            extra_deq_r: torch.Tensor | None = None
+            if (
+                extra_indices is not None
+                and extra_max_tk > 0
+                and extra_k_cache is not None
+            ):
+                extra_positions = extra_indices[r, :extra_max_tk].long()
+                extra_valid = extra_positions >= 0
+                extra_deq_r = dequantize_fp8_k_cache_paged(
+                    extra_k_cache,
+                    extra_positions.clamp(min=0),
+                    extra_page_size,
                 )[
                     :, 0, :
-                ]  # [extra_tk, 512]
-                extra_deq = extra_deq * extra_valid_mask.unsqueeze(1).float()
+                ]  # [extra_max_tk, 512]
+                extra_deq_r = extra_deq_r * extra_valid.unsqueeze(1).float()
 
-        # --- Batched SDPA ---
-        k_segments = []
-        if swa_deq is not None:
-            k_segments.append(swa_deq)
-        if extra_deq is not None:
-            k_segments.append(extra_deq)
-        if k_segments:
+            # -- Concatenate and compute attention for this request's heads --
+            k_segments: list[torch.Tensor] = [swa_deq]
+            if extra_deq_r is not None:
+                k_segments.append(extra_deq_r)
             k_all = torch.cat(k_segments, dim=0).float()  # [T, 512]
-            scores = (q_f32 @ k_all.T) * self.softmax_scale  # [N_heads, T]
+
+            scores = (q_r @ k_all.T) * self.softmax_scale
             if attn_sink is not None:
-                sink = attn_sink.float().unsqueeze(1)  # [N_heads, 1]
-                scores_aug = torch.cat([scores, sink], dim=1)
+                sink_r = attn_sink[head_start:head_end].float().unsqueeze(1)
+                scores_aug = torch.cat([scores, sink_r], dim=1)
                 weights = torch.softmax(scores_aug, dim=1)[:, : scores.shape[1]]
             else:
                 weights = torch.softmax(scores, dim=1)
-            out = weights @ k_all
-        else:
-            out = torch.zeros(N_heads, MXFP4_TOTAL_DIM, dtype=torch.float32, device=dev)
+            out_r = weights @ k_all
+            outputs.append(out_r)
 
+        out = torch.cat(outputs, dim=0)  # [N_heads, 512]
         return out.view(*q_orig_shape[:-1], -1).to(torch.bfloat16)
 
     def _mxfp4_decode_sdpa_fallback(
