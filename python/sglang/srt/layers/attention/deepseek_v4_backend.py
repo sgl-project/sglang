@@ -1620,12 +1620,15 @@ class DeepseekV4AttnBackend(
 
             # --- MXFP4 path (before FP8-specific reshapes) ---
             if token_to_kv_pool.dsv4_kv_cache_store_mxfp4:
-                # For multi-token batches (real prefill), use sparse prefill
-                # with MXFP4 dequant workspace. For single-token batches
-                # (decode, even when forward_mode is EXTEND due to disabled
-                # CUDA graphs), use the fused decode jit_kernel.
+                # Use sparse prefill for true multi-token extend (prefill)
+                # batches. For decode (single-token, or decode CUDA graph
+                # capture with bs>1 but is_extend=False), use the fused
+                # MXFP4 decode kernel.
                 num_q_tokens = q.shape[0]
-                if num_q_tokens > 1:
+                is_real_extend = (
+                    forward_batch.forward_mode.is_extend_without_speculative()
+                )
+                if is_real_extend and num_q_tokens > 1:
                     return self._forward_prefill_sparse(
                         q=q,
                         layer_id=layer_id,
@@ -1635,7 +1638,7 @@ class DeepseekV4AttnBackend(
                         core_attn_metadata=core_attn_metadata,
                         attn_sink=attn_sink,
                     )
-                # Single-token (decode): fused MXFP4 jit_kernel
+                # Decode (or small extend): fused MXFP4 jit_kernel
                 return self._forward_mxfp4_decode(
                     q=q,
                     forward_batch=forward_batch,
@@ -1797,7 +1800,7 @@ class DeepseekV4AttnBackend(
         swa_window = 128
         seq_lens = getattr(forward_batch, "seq_lens", None)
         if seq_lens is not None and seq_lens.numel() > 0:
-            seq_len = int(seq_lens[0].item())
+            seq_len = int(seq_lens.min().item())  # min across batch for safety
         else:
             seq_len = swa_window  # conservative: scan full page
         num_valid = min(seq_len, swa_window)
