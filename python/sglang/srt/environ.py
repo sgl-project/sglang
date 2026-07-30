@@ -786,6 +786,10 @@ class Envs:
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
 
+    # Path to the self-contained cubin pool used by the optional
+    # TRT-LLM-generated fused-MoE JIT kernel.
+    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
+
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
