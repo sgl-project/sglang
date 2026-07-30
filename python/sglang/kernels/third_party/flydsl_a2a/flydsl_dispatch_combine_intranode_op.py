@@ -10,13 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-import mori.shmem as ms
-import torch
-from mori.shmem import mori_shmem_create_tensor
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import mori.shmem as ms
+import torch
 from flydsl.runtime.device import get_rocm_arch
+from mori.shmem import mori_shmem_create_tensor
 
 from .communication_ops_utils import GeometryTuningTable
 from .flydsl_dispatch_combine_intranode_kernel import (

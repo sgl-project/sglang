@@ -133,6 +133,7 @@ class SiluAndMulOp(_GatedActivationOp):
         self, input: torch.Tensor, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         import torch
+
         from aiter import silu_and_mul as _aiter_silu_and_mul
 
         d = input.shape[-1] // 2

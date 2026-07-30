@@ -41,8 +41,9 @@ def rocm_aiter_asm_moe_tkw1(
     activation_method: int = ActivationMethod.SILU.value,
 ) -> torch.Tensor:
 
-    from aiter import ActivationType
     from aiter.fused_moe_bf16_asm import asm_moe_tkw1
+
+    from aiter import ActivationType
 
     activation = ActivationType(activation_method)
 

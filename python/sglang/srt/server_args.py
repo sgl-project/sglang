@@ -6391,9 +6391,9 @@ class ServerArgs:
                     )
                 )
                 if current < self.chunked_prefill_size:
-                    os.environ[
-                        "SGLANG_FLYDSL_NUM_MAX_DISPATCH_TOKENS_PER_RANK"
-                    ] = str(self.chunked_prefill_size)
+                    os.environ["SGLANG_FLYDSL_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = str(
+                        self.chunked_prefill_size
+                    )
                     logger.warning(
                         "auto set SGLANG_FLYDSL_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
                         f"{self.chunked_prefill_size} (was {current})"

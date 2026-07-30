@@ -298,9 +298,7 @@ class PrefillDelayer:
             # slots free rather than timing out. max_running_requests is a
             # rank-invariant server setting; running/max-prefill are gathered.
             if self._mixed_slot_guard:
-                effective_max_running = int(
-                    global_max_running_requests.max().item()
-                )
+                effective_max_running = int(global_max_running_requests.max().item())
                 global_running_batch_max = int(global_running_batch.max().item())
                 global_max_prefill_bs_max = int(global_max_prefill_bs.max().item())
                 slot_condition = (

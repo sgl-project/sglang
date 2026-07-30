@@ -42,6 +42,9 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 try:
+    from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+    from aiter.ops.triton.attention.unified_attention import unified_attention
+
     from aiter import (
         flash_attn_varlen_func,
         get_mla_metadata_info_v1,
@@ -53,8 +56,6 @@ try:
         mla_reduce_v1,
         paged_attention_ragged,
     )
-    from aiter.mla import mla_decode_fwd, mla_prefill_fwd
-    from aiter.ops.triton.attention.unified_attention import unified_attention
 except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."

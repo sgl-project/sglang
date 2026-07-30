@@ -5,9 +5,9 @@
 import logging
 import os
 
-import aiter
 import torch
 
+import aiter
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
