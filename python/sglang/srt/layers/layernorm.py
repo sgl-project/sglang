@@ -26,10 +26,7 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.device_capabilities import (
-    NPUFeature,
-    supports_npu_feature,
-)
+from sglang.srt.hardware_backend.npu.device_operator import NPUDeviceOperator
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -163,7 +160,6 @@ logger = logging.getLogger(__name__)
 
 if _is_npu:
     import torch_npu
-    from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
 
 
 @lru_cache(maxsize=1)
@@ -999,19 +995,11 @@ class GemmaRMSNorm(MultiPlatformOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            norm_out, residual = add_gemma_rms_norm(
+            return NPUDeviceOperator.add_gemma_rms_norm(
                 x, self.weight, residual, self.variance_epsilon
             )
-            return norm_out, residual
 
-        if supports_npu_feature(NPUFeature.NATIVE_GEMMA_RMS_NORM):
-            x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
-            return x
-
-        # Gemma RMSNorm == normalize(x) * (1 + weight). Ascend A5 does not
-        # provide the fused Gemma kernel, so use the equivalent RMSNorm path.
-        x, _ = torch_npu.npu_rms_norm(x, 1.0 + self.weight, self.variance_epsilon)
-        return x
+        return NPUDeviceOperator.gemma_rms_norm(x, self.weight, self.variance_epsilon)
 
     def forward_xpu(
         self,
@@ -1103,10 +1091,13 @@ class Gemma3RMSNorm(MultiPlatformOp):
         return self.forward_native(x, residual)
 
     def forward_npu(self, x, residual: Optional[torch.Tensor] = None):
-        if residual is not None:
+        if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
             return self.forward_native(x, residual)
-        output, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.eps)
-        return output
+        if residual is not None:
+            return NPUDeviceOperator.add_gemma_rms_norm(
+                x, self.weight, residual, self.eps
+            )
+        return NPUDeviceOperator.gemma_rms_norm(x, self.weight, self.eps)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"

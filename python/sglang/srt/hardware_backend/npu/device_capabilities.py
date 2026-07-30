@@ -8,26 +8,27 @@ logger = logging.getLogger(__name__)
 
 
 class NPUDeviceFamily(str, Enum):
-    A2 = "a2"
-    A3 = "a3"
-    A5 = "a5"
+    ASCEND_910B = "ascend_910b"
+    ASCEND_910C = "ascend_910c"
+    ASCEND_950 = "ascend_950"
     UNKNOWN = "unknown"
 
 
 class NPUFeature(str, Enum):
     NATIVE_GEMMA_RMS_NORM = "native_gemma_rms_norm"
+    TRITON_GEMMA_RMS_NORM = "triton_gemma_rms_norm"
 
 
 _DEVICE_FAMILY_RANGES = (
-    (220, 225, NPUDeviceFamily.A2),
-    (250, 255, NPUDeviceFamily.A3),
-    (260, 260, NPUDeviceFamily.A5),
+    (220, 225, NPUDeviceFamily.ASCEND_910B),
+    (250, 255, NPUDeviceFamily.ASCEND_910C),
+    (260, 260, NPUDeviceFamily.ASCEND_950),
 )
 
 _FEATURES_BY_DEVICE_FAMILY = {
-    NPUDeviceFamily.A2: frozenset({NPUFeature.NATIVE_GEMMA_RMS_NORM}),
-    NPUDeviceFamily.A3: frozenset({NPUFeature.NATIVE_GEMMA_RMS_NORM}),
-    NPUDeviceFamily.A5: frozenset(),
+    NPUDeviceFamily.ASCEND_910B: frozenset({NPUFeature.NATIVE_GEMMA_RMS_NORM}),
+    NPUDeviceFamily.ASCEND_910C: frozenset({NPUFeature.NATIVE_GEMMA_RMS_NORM}),
+    NPUDeviceFamily.ASCEND_950: frozenset({NPUFeature.TRITON_GEMMA_RMS_NORM}),
     NPUDeviceFamily.UNKNOWN: frozenset(),
 }
 
