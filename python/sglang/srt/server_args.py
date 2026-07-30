@@ -3673,6 +3673,38 @@ class ServerArgs:
                 "prompt attention."
             )
 
+        # EmbeddingGemma is a Gemma3TextModel with bidirectional prompt
+        # attention. Prefix reuse and split prefills would reuse K/V states
+        # whose values depend on later prompt tokens, so both are invalid.
+        # Breakable CUDA Graph captures one complete prefill and is the graph
+        # mode validated for this encoder-style attention.
+        if getattr(model_config, "is_embedding_gemma", False):
+            self.disable_radix_cache = True
+            self.chunked_prefill_size = -1
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            if is_cuda() and self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                self.cuda_graph_config.prefill.backend = Backend.BREAKABLE
+                # CUDA-graph sizing has already run by this point. With
+                # chunked prefill disabled its generic default is -1, which
+                # otherwise leaves BCG with no shapes to capture. Use the
+                # model's maximum request length as the safe default; callers
+                # can still raise it for larger aggregate prefill batches.
+                if (self.cuda_graph_config.prefill.max_bs or 0) <= 0:
+                    self.cuda_graph_config.prefill.max_bs = model_config.context_len
+                    self.cuda_graph_config.prefill.bs = (
+                        self._generate_prefill_cuda_graph_batch_sizes(
+                            model_config.context_len
+                        )
+                    )
+            elif not is_cuda():
+                # BCG is CUDA-only. Other graph backends do not support this
+                # encoder-style prefill, so retain the eager Triton path.
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            logger.info(
+                "EmbeddingGemma detected: disabling radix cache and chunked "
+                "prefill; using breakable CUDA graph for CUDA prefill."
+            )
+
         if (
             model_config.is_multimodal
             and not model_config.is_multimodal_chunked_prefill_supported
@@ -4264,6 +4296,8 @@ class ServerArgs:
                 "MoE A2A backend",
                 lambda: _resolved_view(self).moe_a2a_backend != "none",
             ),
+            # Dynamo blocks LoRA under tc_piecewise (per-batch LoRABatchInfo
+            # rebinds break guards); breakable/full support LoRA.
             ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
             (
                 "multimodal model",
@@ -4339,8 +4373,6 @@ class ServerArgs:
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
             ),
-            # BCG capture + LoRA adapter weights exceed host RAM headroom.
-            ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
             # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
             (
                 "MoE A2A backend",
