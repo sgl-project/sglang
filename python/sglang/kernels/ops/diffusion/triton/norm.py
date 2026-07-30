@@ -648,7 +648,7 @@ def norm_infer(
 
 
 if current_platform.is_mps():
-    from .mps_fallback import norm_infer_native, rms_norm_fn_native
+    from .torch_fallback import norm_infer_native, rms_norm_fn_native
 
     norm_infer = norm_infer_native
     rms_norm_fn = rms_norm_fn_native

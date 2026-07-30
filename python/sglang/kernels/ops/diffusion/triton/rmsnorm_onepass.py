@@ -70,7 +70,7 @@ def triton_one_pass_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6
 
 
 if current_platform.is_mps():
-    from .mps_fallback import triton_one_pass_rms_norm_native
+    from .torch_fallback import triton_one_pass_rms_norm_native
 
     @debug_kernel_api
     def triton_one_pass_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6):
