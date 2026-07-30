@@ -22,6 +22,26 @@ pub fn action(kind: ExternalKvActionType, tier: i32, values: &[&str]) -> Externa
         r#type: kind as i32,
         tier,
         hashes: hashes(values),
+        component_masks: Vec::new(),
+        block_sizes: Vec::new(),
+    }
+}
+
+/// A component-aware REPORT action: each hash carries its component bitmask and
+/// token count, index-aligned with `values`.
+#[allow(dead_code)] // used by redis_integration, not grpc_contract
+pub fn component_report(
+    tier: i32,
+    values: &[&str],
+    masks: &[u32],
+    block_sizes: &[u32],
+) -> ExternalKvAction {
+    ExternalKvAction {
+        r#type: ExternalKvActionType::ActionReport as i32,
+        tier,
+        hashes: hashes(values),
+        component_masks: masks.to_vec(),
+        block_sizes: block_sizes.to_vec(),
     }
 }
 
@@ -36,5 +56,6 @@ pub fn apply_request(
         seq,
         actions,
         worker_address: address.to_string(),
+        cache_spec: None,
     }
 }

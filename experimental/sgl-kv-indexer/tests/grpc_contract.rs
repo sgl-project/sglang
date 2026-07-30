@@ -421,10 +421,13 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
         worker_id: "w".into(),
         seq: 1,
         worker_address: String::new(),
+        cache_spec: None,
         actions: vec![ExternalKvAction {
             r#type: 999,
             tier: hbm(),
             hashes: vec!["h".into()],
+            component_masks: Vec::new(),
+            block_sizes: Vec::new(),
         }],
     };
     let err = c

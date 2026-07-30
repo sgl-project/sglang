@@ -9,8 +9,10 @@
 //!
 //! This build tracks placement only. There is no sequence gate, no incarnation
 //! or generation fencing, and no reset script: every apply is unconditional, so
-//! the scripts reduce to "set a tier bit", "clear a tier bit", "read the
-//! placement hash", and "bump a hit counter".
+//! the scripts reduce to "replace a (worker,tier) component set", "clear a
+//! (worker,tier) placement", "read the placement hash", and "bump a hit
+//! counter". Placement fields are `worker_id \x1f tier`; a single reserved field
+//! holds the block's token count.
 
 use std::sync::LazyLock;
 
@@ -42,56 +44,57 @@ impl std::ops::Deref for RedisScript {
     }
 }
 
-/// Sets a tier bit for a worker in a placement hash.
+/// Replaces the component set for one `(worker, tier)` placement, REPLACE
+/// semantics (the value overwrites whatever was there for that tier only).
 ///
 /// KEYS: `[placement_key]`
-/// ARGV: `[worker_id, bit]`
-/// Returns `1` if the placement changed, else `0`. The caller performs the
-/// idempotent reverse-index `SADD` either way.
+/// ARGV: `[worker_tier_field, components, token_count_field, token_count]`
+/// `token_count` is written only when non-empty. Always returns `1`; the caller
+/// performs the idempotent reverse-index `SADD`.
 pub static PLACEMENT_SET: LazyLock<RedisScript> = LazyLock::new(|| {
     RedisScript::new(
         r#"
-local cur = tonumber(redis.call('HGET', KEYS[1], ARGV[1])) or 0
-local bit = tonumber(ARGV[2])
-if math.floor(cur / bit) % 2 == 1 then
-  return 0
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+if ARGV[4] ~= '' then
+  redis.call('HSET', KEYS[1], ARGV[3], ARGV[4])
 end
-redis.call('HSET', KEYS[1], ARGV[1], cur + bit)
 return 1
 "#,
     )
 });
 
-/// Clears a tier bit for a worker in a placement hash.
+/// Clears one `(worker, tier)` placement.
 ///
 /// KEYS: `[placement_key, hit_key]`
-/// ARGV: `[worker_id, bit]`
+/// ARGV: `[worker_tier_field, worker_field_prefix, token_count_field]`
 /// Returns `1` when the worker no longer holds the hash at any tier (the caller
 /// then removes it from the reverse index), else `0`.
 ///
-/// When the placement hash becomes empty the block no longer exists anywhere, so
-/// the co-located hit key (same `{hash}` slot) is deleted in the same script.
-/// Otherwise a matched-then-evicted block would leak its `:h` key forever, since
-/// the hit key is created lazily on match and nothing else ever removes it.
+/// The token-count field is bookkeeping, not a placement, so it does not keep a
+/// block alive: when no `worker \x1f tier` field remains the block is gone
+/// everywhere and the whole placement hash (token count included) plus the
+/// co-located hit key (same `{hash}` slot) are deleted. Otherwise a
+/// matched-then-evicted block would leak its `:h` key forever, since the hit key
+/// is created lazily on match and nothing else ever removes it.
 pub static PLACEMENT_CLEAR: LazyLock<RedisScript> = LazyLock::new(|| {
     RedisScript::new(
         r#"
-local cur = tonumber(redis.call('HGET', KEYS[1], ARGV[1]))
-local worker_gone = 0
-if cur == nil then
-  worker_gone = 1
-else
-  local bit = tonumber(ARGV[2])
-  local new = cur
-  if math.floor(cur / bit) % 2 == 1 then new = cur - bit end
-  if new == 0 then
-    redis.call('HDEL', KEYS[1], ARGV[1])
-    worker_gone = 1
-  else
-    redis.call('HSET', KEYS[1], ARGV[1], new)
+redis.call('HDEL', KEYS[1], ARGV[1])
+local prefix = ARGV[2]
+local plen = string.len(prefix)
+local tc_field = ARGV[3]
+local worker_gone = 1
+local placements = 0
+local fields = redis.call('HKEYS', KEYS[1])
+for _, f in ipairs(fields) do
+  if f ~= tc_field then
+    placements = placements + 1
+    if string.sub(f, 1, plen) == prefix then
+      worker_gone = 0
+    end
   end
 end
-if redis.call('HLEN', KEYS[1]) == 0 then
+if placements == 0 then
   redis.call('DEL', KEYS[1])
   redis.call('DEL', KEYS[2])
 end
@@ -103,7 +106,9 @@ return worker_gone
 /// Reads a placement hash.
 ///
 /// KEYS: `[placement_key]`
-/// Returns `[worker, mask, ...]`.
+/// Returns `[field, value, ...]` where each field is either a
+/// `worker_id \x1f tier` placement (value = component set) or the reserved
+/// token-count field.
 pub static MATCH_HASH: LazyLock<RedisScript> = LazyLock::new(|| {
     RedisScript::new(
         r#"

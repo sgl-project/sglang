@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::future::try_join_all;
+use prost::Message;
 use redis::FromRedisValue;
 use tokio::sync::Semaphore;
 use tonic::Status;
@@ -44,13 +45,17 @@ use crate::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvActionType,
     ExternalKvNodeMatch, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
     HitCountEntry, MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse,
-    MatchExternalKvRequest, MatchExternalKvResponse, TierHashes,
+    MatchExternalKvRequest, MatchExternalKvResponse, TierHashes, WorkerCacheSpec,
 };
-use crate::service::{assemble_prefix_response, prefix_limit, KvIndexerBackend};
+use crate::service::{
+    assemble_prefix_response, compute_prefix_response, prefix_limit, BlockComponents,
+    KvIndexerBackend, WorkerPrefixInput,
+};
 
 use conn::{ClusterConn, RedisConn, SingleConn};
 use schema::{
-    hit_key, placement_key, tier_bit, tiers_from_mask, worker_blocks_key, worker_meta_key,
+    decode_mask, encode_mask, hit_key, parse_placement_field, placement_field, placement_key,
+    worker_blocks_key, worker_field_prefix, worker_meta_key, TOKEN_COUNT_FIELD,
 };
 use scripts::{HIT_BUMP, MATCH_HASH, PLACEMENT_CLEAR, PLACEMENT_SET};
 
@@ -96,6 +101,14 @@ pub struct RedisKvIndexerBackend {
     ns: String,
     /// Bounds concurrent prefix queries; see [`PREFIX_QUERY_MAX_INFLIGHT`].
     prefix_semaphore: Arc<Semaphore>,
+}
+
+/// One hash's REPLACE report at a single tier: the resident component bitmask
+/// (`0` for a legacy whole-block store) and the block's token count.
+struct ReportOne<'a> {
+    hash: &'a str,
+    mask: u32,
+    token_count: u32,
 }
 
 impl RedisKvIndexerBackend {
@@ -183,22 +196,63 @@ impl RedisKvIndexerBackend {
         if !req.worker_address.is_empty() {
             self.set_worker_address(worker, &req.worker_address).await?;
         }
+        // Record the worker's component spec (carried on every batch, so it
+        // self-heals across reconnects). When absent, clear any stored spec so a
+        // worker that reverts to legacy / full-only is never scored against a
+        // stale component rule set.
+        match &req.cache_spec {
+            Some(spec) => self.set_worker_spec(worker, spec).await?,
+            None => self.clear_worker_spec(worker).await?,
+        }
 
         // Actions are applied in order. An empty batch is a no-op.
         for action in &req.actions {
-            let bit = tier_bit(action.tier);
+            let tier = action.tier;
             match ExternalKvActionType::try_from(action.r#type) {
                 Ok(ExternalKvActionType::ActionReport) => {
-                    for chunk in action.hashes.chunks(REDIS_FANOUT_CHUNK) {
-                        try_join_all(chunk.iter().map(|hash| self.report_one(worker, hash, bit)))
+                    // Each hash carries its own REPLACE component snapshot and
+                    // token count, index-aligned with `hashes`; both arrays are
+                    // empty for a legacy whole-block store. Deduplicate by hash
+                    // keeping the LAST occurrence: a REPLACE is last-write-wins,
+                    // and a hash repeated within one action (e.g. a coalesced
+                    // store+restate of the same block) must not be fanned out
+                    // concurrently against the same key and race to a
+                    // nondeterministic snapshot.
+                    // The per-hash arrays are validated at the service entry to be
+                    // empty (legacy) or aligned with `hashes`, so an empty array
+                    // means "no detail" and a non-empty one indexes directly.
+                    let has_masks = !action.component_masks.is_empty();
+                    let has_sizes = !action.block_sizes.is_empty();
+                    let mut last_by_hash: HashMap<&str, ReportOne> = HashMap::new();
+                    for (index, hash) in action.hashes.iter().enumerate() {
+                        last_by_hash.insert(
+                            hash.as_str(),
+                            ReportOne {
+                                hash: hash.as_str(),
+                                mask: if has_masks {
+                                    action.component_masks[index]
+                                } else {
+                                    0
+                                },
+                                token_count: if has_sizes {
+                                    action.block_sizes[index]
+                                } else {
+                                    0
+                                },
+                            },
+                        );
+                    }
+                    let reports: Vec<ReportOne> = last_by_hash.into_values().collect();
+                    for chunk in reports.chunks(REDIS_FANOUT_CHUNK) {
+                        try_join_all(chunk.iter().map(|r| self.report_one(worker, tier, r)))
                             .await?;
                     }
                 }
                 Ok(ExternalKvActionType::ActionRevoke) => {
-                    self.revoke_many(worker, &action.hashes, bit).await?;
+                    self.revoke_many(worker, &action.hashes, tier).await?;
                 }
                 Ok(ExternalKvActionType::ActionClearAllAtTier) => {
-                    self.clear_all_at_tier(worker, bit).await?;
+                    self.clear_all_at_tier(worker, tier).await?;
                 }
                 _ => return Err(Status::invalid_argument("unsupported action type")),
             }
@@ -226,6 +280,40 @@ impl RedisKvIndexerBackend {
             .unwrap_or_default())
     }
 
+    /// Records a worker's component spec (prost-encoded) in its registry hash.
+    async fn set_worker_spec(&self, worker: &str, spec: &WorkerCacheSpec) -> Result<(), Status> {
+        let mut cmd = redis::cmd("HSET");
+        cmd.arg(worker_meta_key(&self.ns, worker))
+            .arg("spec")
+            .arg(spec.encode_to_vec());
+        self.conn.query(cmd).await.map_err(to_status)?;
+        Ok(())
+    }
+
+    /// Clears a worker's stored component spec (idempotent). Called when a batch
+    /// carries no spec, so a worker that reverts to legacy drops its old rules.
+    async fn clear_worker_spec(&self, worker: &str) -> Result<(), Status> {
+        let mut cmd = redis::cmd("HDEL");
+        cmd.arg(worker_meta_key(&self.ns, worker)).arg("spec");
+        self.conn.query(cmd).await.map_err(to_status)?;
+        Ok(())
+    }
+
+    /// Reads a worker's component spec, `None` when it never declared one
+    /// (a legacy / full-only worker).
+    async fn worker_spec(&self, worker: &str) -> Result<Option<WorkerCacheSpec>, Status> {
+        let mut cmd = redis::cmd("HGET");
+        cmd.arg(worker_meta_key(&self.ns, worker)).arg("spec");
+        let v = self.conn.query(cmd).await.map_err(to_status)?;
+        let bytes = Option::<Vec<u8>>::from_redis_value(&v).map_err(to_status)?;
+        match bytes {
+            Some(bytes) => WorkerCacheSpec::decode(bytes.as_slice())
+                .map(Some)
+                .map_err(|e| Status::internal(format!("corrupt worker spec: {e}"))),
+            None => Ok(None),
+        }
+    }
+
     /// Reads one `SSCAN` page of a worker's reverse index, returning the next
     /// cursor (`0` once the iteration is complete) alongside the members.
     ///
@@ -244,30 +332,45 @@ impl RedisKvIndexerBackend {
         <(u64, Vec<String>)>::from_redis_value(&value).map_err(to_status)
     }
 
-    async fn report_one(&self, worker: &str, hash: &str, bit: i64) -> Result<(), Status> {
+    async fn report_one(
+        &self,
+        worker: &str,
+        tier: i32,
+        report: &ReportOne<'_>,
+    ) -> Result<(), Status> {
         self.conn
             .invoke(
                 &PLACEMENT_SET,
-                vec![placement_key(&self.ns, hash)],
-                vec![worker.to_string(), bit.to_string()],
+                vec![placement_key(&self.ns, report.hash)],
+                vec![
+                    placement_field(worker, tier),
+                    encode_mask(report.mask),
+                    TOKEN_COUNT_FIELD.to_string(),
+                    if report.token_count > 0 {
+                        report.token_count.to_string()
+                    } else {
+                        String::new()
+                    },
+                ],
             )
             .await
             .map_err(to_status)?;
 
         let mut cmd = redis::cmd("SADD");
-        cmd.arg(worker_blocks_key(&self.ns, worker)).arg(hash);
+        cmd.arg(worker_blocks_key(&self.ns, worker))
+            .arg(report.hash);
         self.conn.query(cmd).await.map_err(to_status)?;
         Ok(())
     }
 
-    async fn revoke_many(&self, worker: &str, hashes: &[String], bit: i64) -> Result<(), Status> {
+    async fn revoke_many(&self, worker: &str, hashes: &[String], tier: i32) -> Result<(), Status> {
         for chunk in hashes.chunks(REDIS_FANOUT_CHUNK) {
-            try_join_all(chunk.iter().map(|hash| self.revoke_one(worker, hash, bit))).await?;
+            try_join_all(chunk.iter().map(|hash| self.revoke_one(worker, hash, tier))).await?;
         }
         Ok(())
     }
 
-    async fn revoke_one(&self, worker: &str, hash: &str, bit: i64) -> Result<(), Status> {
+    async fn revoke_one(&self, worker: &str, hash: &str, tier: i32) -> Result<(), Status> {
         // Placement and hit keys share a slot; the script drops hits when the
         // final placement disappears.
         let v = self
@@ -275,7 +378,11 @@ impl RedisKvIndexerBackend {
             .invoke(
                 &PLACEMENT_CLEAR,
                 vec![placement_key(&self.ns, hash), hit_key(&self.ns, hash)],
-                vec![worker.to_string(), bit.to_string()],
+                vec![
+                    placement_field(worker, tier),
+                    worker_field_prefix(worker),
+                    TOKEN_COUNT_FIELD.to_string(),
+                ],
             )
             .await
             .map_err(to_status)?;
@@ -288,7 +395,7 @@ impl RedisKvIndexerBackend {
         Ok(())
     }
 
-    async fn clear_all_at_tier(&self, worker: &str, bit: i64) -> Result<(), Status> {
+    async fn clear_all_at_tier(&self, worker: &str, tier: i32) -> Result<(), Status> {
         let mut cursor = 0;
         loop {
             let (next, page) = self.reverse_page(worker, cursor).await?;
@@ -297,7 +404,7 @@ impl RedisKvIndexerBackend {
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
-            self.revoke_many(worker, &hashes, bit).await?;
+            self.revoke_many(worker, &hashes, tier).await?;
             cursor = next;
             if cursor == 0 {
                 return Ok(());
@@ -330,19 +437,23 @@ impl RedisKvIndexerBackend {
         }
 
         let mut worker_order: Vec<String> = Vec::new();
-        let mut by_worker: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+        let mut by_worker: HashMap<String, BTreeMap<i32, Vec<String>>> = HashMap::new();
+        let mut matched_hashes: Vec<String> = Vec::new();
+        let mut seen_hashes: HashSet<String> = HashSet::new();
         for (hash, flat) in hashes.iter().zip(per_hash) {
-            for pair in flat.chunks(2) {
-                if pair.len() != 2 {
-                    continue;
-                }
-                let worker = &pair[0];
-                let mask = pair[1].parse::<i64>().unwrap_or(0);
-                let entry = by_worker.entry(worker.clone()).or_insert_with(|| {
+            let placement = parse_hash_placement(&flat);
+            if placement.entries.is_empty() {
+                continue;
+            }
+            if seen_hashes.insert(hash.clone()) {
+                matched_hashes.push(hash.clone());
+            }
+            for (worker, tier, _mask) in placement.entries {
+                let by_tier = by_worker.entry(worker.clone()).or_insert_with(|| {
                     worker_order.push(worker.clone());
-                    Vec::new()
+                    BTreeMap::new()
                 });
-                entry.push((hash.clone(), mask));
+                by_tier.entry(tier).or_default().push(hash.clone());
             }
         }
 
@@ -355,22 +466,8 @@ impl RedisKvIndexerBackend {
         }
 
         let mut matches = Vec::new();
-        let mut matched_hashes: Vec<String> = Vec::new();
-        let mut seen_hashes: HashSet<String> = HashSet::new();
         for (worker, address) in worker_order.into_iter().zip(addresses) {
-            let mut by_tier: BTreeMap<i32, Vec<String>> = BTreeMap::new();
-            for (hash, mask) in by_worker.remove(&worker).unwrap_or_default() {
-                let tiers = tiers_from_mask(mask);
-                if tiers.is_empty() {
-                    continue;
-                }
-                for tier in tiers {
-                    by_tier.entry(tier).or_default().push(hash.clone());
-                }
-                if seen_hashes.insert(hash.clone()) {
-                    matched_hashes.push(hash);
-                }
-            }
+            let by_tier = by_worker.remove(&worker).unwrap_or_default();
             if by_tier.is_empty() {
                 continue;
             }
@@ -399,7 +496,7 @@ impl RedisKvIndexerBackend {
         Ok(MatchExternalKvResponse { matches })
     }
 
-    /// Workers that hold a block hash at any valid tier.
+    /// Workers that hold a block hash at any tier.
     async fn placement_holders(&self, hash: &str) -> Result<Vec<String>, Status> {
         let v = self
             .conn
@@ -408,36 +505,94 @@ impl RedisKvIndexerBackend {
             .map_err(to_status)?;
         let flat = Vec::<String>::from_redis_value(&v).map_err(to_status)?;
         let mut holders = Vec::new();
-        for pair in flat.chunks(2) {
-            if pair.len() != 2 {
-                continue;
-            }
-            let mask = pair[1].parse::<i64>().unwrap_or(0);
-            if !tiers_from_mask(mask).is_empty() {
-                holders.push(pair[0].clone());
+        let mut seen = HashSet::new();
+        for (worker, _tier, _mask) in parse_hash_placement(&flat).entries {
+            if seen.insert(worker.clone()) {
+                holders.push(worker);
             }
         }
         Ok(holders)
     }
 
-    /// Three-stage forward scan producing the same prefix semantics as the trait
-    /// default implementation.
+    /// Reads the placement of `hashes[0..)` and builds per-worker prefix inputs
+    /// (per-tier component sets, token counts, and the worker's spec), aligned
+    /// with the query order. This is the component-aware read the rule engine
+    /// consumes; it is also exposed as the backend's
+    /// `collect_worker_prefix_inputs` so the trait default and the fast path share
+    /// one definition.
+    async fn collect_prefix_inputs(
+        &self,
+        hashes: &[String],
+    ) -> Result<Vec<WorkerPrefixInput>, Status> {
+        // Per-block placement read, preserving hash order.
+        let mut per_hash = Vec::with_capacity(hashes.len());
+        for chunk in hashes.chunks(REDIS_FANOUT_CHUNK) {
+            let values = try_join_all(chunk.iter().map(|hash| async move {
+                let v = self
+                    .conn
+                    .invoke(&MATCH_HASH, vec![placement_key(&self.ns, hash)], Vec::new())
+                    .await?;
+                Vec::<String>::from_redis_value(&v)
+            }))
+            .await
+            .map_err(to_status)?;
+            per_hash.extend(values);
+        }
+
+        let n = hashes.len();
+        let mut worker_order: Vec<String> = Vec::new();
+        let mut blocks_by_worker: HashMap<String, Vec<Option<BlockComponents>>> = HashMap::new();
+        for (index, flat) in per_hash.iter().enumerate() {
+            let placement = parse_hash_placement(flat);
+            let mut per_worker: HashMap<String, Vec<(i32, u32)>> = HashMap::new();
+            for (worker, tier, mask) in placement.entries {
+                per_worker.entry(worker).or_default().push((tier, mask));
+            }
+            for (worker, tier_masks) in per_worker {
+                let blocks = blocks_by_worker.entry(worker.clone()).or_insert_with(|| {
+                    worker_order.push(worker.clone());
+                    vec![None; n]
+                });
+                blocks[index] = Some(BlockComponents {
+                    token_count: placement.token_count,
+                    tier_masks,
+                });
+            }
+        }
+
+        // Resolve each candidate worker's routing address and component spec.
+        let mut inputs = Vec::with_capacity(worker_order.len());
+        for chunk in worker_order.chunks(REDIS_FANOUT_CHUNK) {
+            let resolved = try_join_all(chunk.iter().map(|worker| async move {
+                let address = self.worker_address(worker).await?;
+                let spec = self.worker_spec(worker).await?;
+                Ok::<_, Status>((worker.clone(), address, spec))
+            }))
+            .await?;
+            for (worker, address, spec) in resolved {
+                let blocks = blocks_by_worker
+                    .remove(&worker)
+                    .unwrap_or_else(|| vec![None; n]);
+                inputs.push(WorkerPrefixInput {
+                    worker_id: worker,
+                    address,
+                    spec,
+                    blocks,
+                });
+            }
+        }
+        Ok(inputs)
+    }
+
+    /// Component-aware prefix query. Keeps the first-block-miss short-circuit (a
+    /// missing first block costs a single Redis command) and otherwise reads the
+    /// placement for every considered block, then runs the shared rule engine so
+    /// the result is field-for-field identical to the trait default.
     ///
-    /// 1. Read `hashes[0]`'s placement to get every worker that could hold *any*
-    ///    prefix. If none, one Redis command answers the whole query.
-    /// 2. Read the routing registry once, for that worker set only; the candidate
-    ///    set only shrinks afterwards, so later blocks never re-read the registry.
-    /// 3. From index 1, scan forward in windows, advancing each surviving worker's
-    ///    contiguous prefix and dropping it at its first missing block; stop when
-    ///    no candidate remains or the scan/`max_blocks` cap is reached.
-    ///
-    /// The win here is *fewer Redis commands* — a first-block miss costs one
-    /// command instead of one per block — not lower latency; a fully-cached long
-    /// prefix takes more round-trips than reading every block at once. The
-    /// registry is read as a snapshot: a worker that restarts mid-scan can still
-    /// contribute entries this build never fences, so a prefix may come out longer
-    /// than the worker truly holds (never shorter). The index is advisory, so this
-    /// window is acceptable.
+    /// The placement is read as a snapshot: a worker that restarts mid-query can
+    /// still contribute entries this build never fences, so a prefix may come out
+    /// longer than the worker truly holds (never shorter). The index is advisory,
+    /// so this window is acceptable.
     async fn do_match_prefix(
         &self,
         req: MatchExternalKvPrefixRequest,
@@ -456,63 +611,14 @@ impl RedisKvIndexerBackend {
             return Ok(MatchExternalKvPrefixResponse::default());
         }
 
-        // Stage 1: the first block's holders bound the candidate set.
-        let holders0 = self.placement_holders(&hashes[0]).await?;
-        let mut blocks_read = 1u32;
-        if holders0.is_empty() {
-            return Ok(assemble_prefix_response(Vec::new(), blocks_read));
+        // First-block miss: nobody holds the first block, so no worker can hold
+        // any prefix. One read answers the whole query.
+        if self.placement_holders(&hashes[0]).await?.is_empty() {
+            return Ok(assemble_prefix_response(Vec::new(), 1));
         }
 
-        // Stage 2: one registry read for those workers; drop unroutable (empty
-        // address) ones now (see the proto's worker_address contract).
-        let mut addresses = Vec::with_capacity(holders0.len());
-        for chunk in holders0.chunks(REDIS_FANOUT_CHUNK) {
-            let values =
-                try_join_all(chunk.iter().map(|worker| self.worker_address(worker))).await?;
-            addresses.extend(values);
-        }
-        // (worker_id, address, prefix_so_far); every survivor holds block 0.
-        let mut active: Vec<(String, String, u32)> = holders0
-            .into_iter()
-            .zip(addresses)
-            .filter(|(_, addr)| !addr.is_empty())
-            .map(|(worker, addr)| (worker, addr, 1u32))
-            .collect();
-        let mut done: Vec<(String, String, u32)> = Vec::new();
-
-        // Stage 3: scan forward, windowed, until candidates or blocks run out.
-        let mut idx = 1usize;
-        while idx < hashes.len() && !active.is_empty() {
-            let end = (idx + REDIS_FANOUT_CHUNK).min(hashes.len());
-            let window = &hashes[idx..end];
-            let holder_sets = try_join_all(window.iter().map(|hash| async move {
-                Ok::<HashSet<String>, Status>(
-                    self.placement_holders(hash).await?.into_iter().collect(),
-                )
-            }))
-            .await?;
-            blocks_read += window.len() as u32;
-
-            for holders in holder_sets {
-                let mut still = Vec::with_capacity(active.len());
-                for (worker, addr, prefix) in active.drain(..) {
-                    if holders.contains(&worker) {
-                        still.push((worker, addr, prefix + 1));
-                    } else {
-                        done.push((worker, addr, prefix));
-                    }
-                }
-                active = still;
-                if active.is_empty() {
-                    break;
-                }
-            }
-            idx = end;
-        }
-        // Survivors reached the scan limit with an unbroken prefix.
-        done.append(&mut active);
-
-        Ok(assemble_prefix_response(done, blocks_read))
+        let inputs = self.collect_prefix_inputs(hashes).await?;
+        Ok(compute_prefix_response(&inputs, limit as u32))
     }
 
     async fn do_hit_counts(
@@ -564,6 +670,13 @@ impl KvIndexerBackend for RedisKvIndexerBackend {
         self.do_match(request).await
     }
 
+    async fn collect_worker_prefix_inputs(
+        &self,
+        hashes: &[String],
+    ) -> Result<Vec<WorkerPrefixInput>, Status> {
+        self.collect_prefix_inputs(hashes).await
+    }
+
     async fn match_external_kv_prefix(
         &self,
         request: MatchExternalKvPrefixRequest,
@@ -576,6 +689,34 @@ impl KvIndexerBackend for RedisKvIndexerBackend {
         request: GetExternalKvHitCountsRequest,
     ) -> Result<GetExternalKvHitCountsResponse, Status> {
         self.do_hit_counts(request).await
+    }
+}
+
+/// A block hash's placement, parsed from a `MATCH_HASH` (HGETALL) reply.
+struct HashPlacement {
+    /// One `(worker, tier, component bitmask)` per placement field.
+    entries: Vec<(String, i32, u32)>,
+    /// The block's token count, `0` when unset.
+    token_count: u32,
+}
+
+fn parse_hash_placement(flat: &[String]) -> HashPlacement {
+    let mut entries = Vec::new();
+    let mut token_count = 0u32;
+    for pair in flat.chunks(2) {
+        if pair.len() != 2 {
+            continue;
+        }
+        let (field, value) = (&pair[0], &pair[1]);
+        if field == TOKEN_COUNT_FIELD {
+            token_count = value.parse().unwrap_or(0);
+        } else if let Some((worker, tier)) = parse_placement_field(field) {
+            entries.push((worker, tier, decode_mask(value)));
+        }
+    }
+    HashPlacement {
+        entries,
+        token_count,
     }
 }
 
