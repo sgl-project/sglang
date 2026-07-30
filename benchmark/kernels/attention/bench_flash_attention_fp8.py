@@ -1,7 +1,7 @@
 # Benchmark FP8 attention for FA4 (CuTe-DSL) on SM100.
 #
 # Run (recommended):
-#   python -m flash_attn.cute.benchmark_flash_attention_fp8
+#   python benchmark/kernels/attention/bench_flash_attention_fp8.py
 #
 # Notes:
 # - This is intended to be used while bringing up FP8 support for SM100.
@@ -20,8 +20,8 @@ from typing import Iterable
 
 import torch
 from einops import rearrange
+from fa4_benchmark_utils import benchmark_forward
 
-from sglang.kernels.ops.attention.flash_attn.cute.benchmark import benchmark_forward
 from sglang.kernels.ops.attention.flash_attn.cute.interface import (
     _flash_attn_fwd as flash_attn_cute_fwd,
 )
