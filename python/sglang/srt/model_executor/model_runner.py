@@ -37,6 +37,7 @@ from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     maybe_init_shared_mooncake_transfer_engine,
 )
+from sglang.srt.distributed.parallel_state import RankParallelismConfig
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
@@ -201,6 +202,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
@@ -295,6 +297,7 @@ class ModelRunner:
         self.enable_hisparse = server_args.enable_hisparse
 
         self.init_remote_instance_weight_transporter()
+        self.parallelism_config = None
 
         self.init_msprobe()
 
@@ -587,6 +590,8 @@ class ModelRunner:
             disable_routed_experts_capture_for_draft(self.model)
         self.maybe_init_expert_backup_client()
         self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
+        if self.parallelism_config is not None:
+            self._register_parallelism_config_to_bootstrap()
         self.layer_info: ModelLayerInfo = resolve_layer_indices(
             model=self.model,
             model_config=self.model_config,
@@ -612,6 +617,56 @@ class ModelRunner:
     def maybe_init_remote_instance_transfer_engine(self):
         if self.server_args.remote_instance_weight_loader_use_transfer_engine():
             self.remote_instance_weight_transporter.init_engine()
+            self.parallelism_config = RankParallelismConfig.from_parallel_state(
+                self.ps.tp_rank
+            )
+
+    def _register_parallelism_config_to_bootstrap(self):
+        """Register this rank's parallelism config with the bootstrap server."""
+        import requests as http_requests
+
+        bootstrap_na = self._get_bootstrap_network_address()
+        url = f"{bootstrap_na.to_url()}/register_parallelism_config"
+        payload = {
+            "tp_rank": self.ps.tp_rank,
+            "parallelism_config": self.parallelism_config.to_dict(),
+        }
+
+        try:
+            resp = http_requests.put(url, json=payload, timeout=5)
+            if resp.status_code == 200:
+                logger.info(
+                    "Registered parallelism config for tp_rank=%s with bootstrap "
+                    "server at %s",
+                    self.ps.tp_rank,
+                    bootstrap_na,
+                )
+            else:
+                logger.error(
+                    "Failed to register parallelism config for tp_rank=%s: %s, %s",
+                    self.ps.tp_rank,
+                    resp.status_code,
+                    resp.text,
+                )
+        except Exception as e:
+            logger.error(
+                "Failed to register parallelism config for tp_rank=%s: %s",
+                self.ps.tp_rank,
+                e,
+            )
+
+    def _get_bootstrap_network_address(self) -> NetworkAddress:
+        """Return the engine-info bootstrap server's network address."""
+        if self.server_args.dist_init_addr:
+            bootstrap_host = (
+                NetworkAddress.parse(self.server_args.dist_init_addr).resolved().host
+            )
+        else:
+            bootstrap_host = "127.0.0.1"
+
+        return NetworkAddress(
+            bootstrap_host, self.server_args.engine_info_bootstrap_port
+        )
 
     def maybe_init_expert_location_metadata(self):
         if self.is_draft_worker:
