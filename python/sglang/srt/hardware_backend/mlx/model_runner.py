@@ -111,6 +111,38 @@ _MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
 }
 _MLX_KV_FLOAT_DTYPES = {mx.float16, mx.bfloat16, mx.float32}
 
+# Gemma 4's mlx-lm cache contract cannot yet be represented by SGLang's
+# uniform attention pool.  In particular, it combines per-layer sliding
+# windows, heterogeneous head dimensions, and YOCO layers that reuse K/V from
+# earlier layers (and therefore do not own cache entries).  Keep the initial
+# support narrow and correctness-first: let mlx-lm own those caches until the
+# SGLang pool grows the corresponding per-layer metadata.
+_NATIVE_CACHE_FALLBACK_MODEL_TYPES = frozenset({"gemma4", "gemma4_text"})
+_NATIVE_CACHE_FALLBACK_DEFAULT_POOL_SIZE = 2048
+
+
+def _mlx_model_type(model: Any) -> str | None:
+    """Return the mlx-lm model type from a text or conditional wrapper."""
+    for candidate in (model, getattr(model, "language_model", None)):
+        if candidate is None:
+            continue
+        model_type = getattr(candidate, "model_type", None)
+        if model_type:
+            return str(model_type)
+        args = getattr(candidate, "args", None)
+        model_type = getattr(args, "model_type", None)
+        if model_type:
+            return str(model_type)
+    return None
+
+
+def _mlx_text_model_args(model: Any) -> Any | None:
+    """Return the text-backbone args, unwrapping mlx-lm's Gemma 4 shell."""
+    language_model = getattr(model, "language_model", None)
+    if language_model is not None and getattr(language_model, "args", None) is not None:
+        return language_model.args
+    return getattr(model, "args", None)
+
 
 class MlxModelRunner:
     """MLX model runner with radix-cache prefix sharing."""
@@ -140,6 +172,17 @@ class MlxModelRunner:
 
         self._load_model()
 
+        self._native_cache_fallback = (
+            _mlx_model_type(self.model) in _NATIVE_CACHE_FALLBACK_MODEL_TYPES
+        )
+        if self._native_cache_fallback and not self.disable_radix_cache:
+            raise NotImplementedError(
+                "Gemma 4 on the MLX backend currently requires "
+                "--disable-radix-cache. Its YOCO sharing, mixed head dimensions, "
+                "and sliding-window cache cannot be represented by the uniform "
+                "SGLang MLX radix pool yet."
+            )
+
         # Pin MLX allocations to prevent OS paging
         device_info = mx.device_info()
         max_wired = int(device_info.get("max_recommended_working_set_size", 0))
@@ -147,7 +190,13 @@ class MlxModelRunner:
             mx.set_wired_limit(max_wired)
             logger.info(f"Wired memory limit set to {max_wired / (1024**3):.1f} GB")
 
-        patch_model_attention(self.model)
+        if self._native_cache_fallback:
+            logger.info(
+                "Using mlx-lm native caches for Gemma 4 text generation "
+                "(radix reuse and batched attention are disabled)"
+            )
+        else:
+            patch_model_attention(self.model)
 
         layer_list, attn_attrs = find_attention_layers(self.model)
         self._cache_layout = MlxModelCacheLayout.from_attention_discovery(
@@ -162,7 +211,7 @@ class MlxModelRunner:
             raise RuntimeError(
                 "MLX models with auxiliary cache state require model.make_cache()."
             )
-        if self._cache_layout.has_auxiliary_state:
+        if self._cache_layout.has_auxiliary_state and not self._native_cache_fallback:
             self._model_embed, self._model_norm, self._model_lm_head = (
                 self._extract_model_components()
             )
@@ -189,6 +238,8 @@ class MlxModelRunner:
 
     def _new_cache_skeleton(self) -> list[Any]:
         """Create a model-shaped cache list before attention cache wiring."""
+        if self.native_cache_fallback:
+            return list(self.model.make_cache())
         if self._cache_layout.has_auxiliary_state:
             cache = self.model.make_cache()
             if len(cache) != self._cache_layout.num_layers:
@@ -203,12 +254,16 @@ class MlxModelRunner:
     def _new_native_cache(self) -> list[Any]:
         """Create a model-shaped cache list with attention KV adapters."""
         cache = self._new_cache_skeleton()
+        if self.native_cache_fallback:
+            return cache
         for layer_idx in self._cache_layout.attention_layer_indices:
             cache[layer_idx] = ContiguousAttentionKVCache(max_seq_len=self._max_seq_len)
         return cache
 
     def _acquire_cache(self) -> list[Any]:
         """Get a reusable cache list from the pool, or create a new one."""
+        if self.native_cache_fallback:
+            return self._new_native_cache()
         if not self._cache_layout.has_auxiliary_state and self._cache_pool:
             cache = self._cache_pool.pop()
             for c in cache:
@@ -218,6 +273,8 @@ class MlxModelRunner:
 
     def _release_cache(self, cache: list[Any]) -> None:
         """Return a cache list to the pool for reuse."""
+        if self.native_cache_fallback:
+            return
         if not self._cache_layout.has_auxiliary_state:
             self._cache_pool.append(cache)
 
@@ -550,6 +607,27 @@ class MlxModelRunner:
         """Determine pool slot count (auto-size from available memory if needed)."""
         if explicit_size is not None:
             return explicit_size
+        if self.native_cache_fallback:
+            # Native caches grow per request and do not allocate an SGLang KV
+            # pool.  The scheduler still needs a finite token capacity for its
+            # CPU-side slot allocator. Keep the prototype default conservative:
+            # Gemma 4 advertises a 131k context, which would otherwise combine
+            # with the generic request-count default to allocate a very large
+            # CPU ReqToTokenPool. Production launches can raise this explicitly
+            # with --max-total-tokens.
+            args = _mlx_text_model_args(self.model)
+            context_len = int(getattr(args, "max_position_embeddings", 4096))
+            pool_size = min(
+                context_len,
+                _NATIVE_CACHE_FALLBACK_DEFAULT_POOL_SIZE,
+            )
+            logger.info(
+                "Using conservative native-cache scheduler capacity: %d tokens "
+                "(model context=%d; override with --max-total-tokens)",
+                pool_size,
+                context_len,
+            )
+            return pool_size
         n_kv_heads, head_dim, dtype = self._get_attn_config()
         num_layers = self._cache_layout.num_attention_layers
         sys_available = psutil.virtual_memory().available
@@ -579,8 +657,15 @@ class MlxModelRunner:
     def pool_size(self) -> int:
         return self._pool_size
 
+    @property
+    def native_cache_fallback(self) -> bool:
+        """Whether inference uses model-owned caches instead of SGLang's pool."""
+        return getattr(self, "_native_cache_fallback", False)
+
     def _build_aot_kernels(self) -> MlxAOTKernelSet:
         """Build model-level set of optional registered AOT kernels."""
+        if self.native_cache_fallback:
+            return MlxAOTKernelSet()
         if self._cache_layout.num_attention_layers == 0:
             return MlxAOTKernelSet()
         layer_idx = self._cache_layout.first_attention_layer_index
@@ -1167,7 +1252,12 @@ class MlxModelRunner:
         last_tokens = [self._req_token_ids[rid][-1] for rid in req_ids]
         batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
 
-        if self._cache_layout.has_auxiliary_state:
+        if self.native_cache_fallback:
+            lazy_tokens = self._decode_with_native_cache(
+                caches,
+                [batched_input[i : i + 1] for i in range(len(caches))],
+            )
+        elif self._cache_layout.has_auxiliary_state:
             lazy_tokens = self._decode_with_hybrid_batching(
                 caches, batched_input, list(req_ids)
             )
@@ -1212,7 +1302,12 @@ class MlxModelRunner:
         # So layer-0 offsets reflect the position the NEW token will
         # be written at in step N+1 (and equivalently the RoPE offset).
         batched_input = prev.lazy_tokens[:, None]
-        if self._cache_layout.has_auxiliary_state:
+        if self.native_cache_fallback:
+            lazy_tokens = self._decode_with_native_cache(
+                caches,
+                [batched_input[i : i + 1] for i in range(len(caches))],
+            )
+        elif self._cache_layout.has_auxiliary_state:
             lazy_tokens = self._decode_with_hybrid_batching(
                 caches, batched_input, prev.req_ids
             )
