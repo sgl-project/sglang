@@ -367,6 +367,8 @@ class MoeFlags(_FlagGroupBase):
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
+    nccl_ep_mode: Any = None  # NcclEpMode | None (typed Any to avoid import cycle)
+    nccl_ep_num_max_dispatch_tokens_per_rank: int = 0
 
 
 @dataclasses.dataclass

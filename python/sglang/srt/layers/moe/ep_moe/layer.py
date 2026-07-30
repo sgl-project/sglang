@@ -283,6 +283,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         or get_moe_a2a_backend().is_deepep()
         or get_moe_a2a_backend().is_mooncake()
         or get_moe_a2a_backend().is_nixl()
+        or get_moe_a2a_backend().is_nccl_ep()
     ):
         return DeepEPMoE
     return FusedMoE

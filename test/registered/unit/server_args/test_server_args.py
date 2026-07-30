@@ -1134,6 +1134,51 @@ class TestWaterfillArgs(CustomTestCase):
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
 
+class TestNcclEpArgs(CustomTestCase):
+    """NCCL EP MoE A2A backend (--moe-a2a-backend nccl_ep).
+
+    Capability detection falls back to none/deepep when nccl4py is unavailable
+    (the CPU CI case). On a CUDA13 + Hopper/Blackwell box with nccl4py[cu13]
+    installed, the backend stays nccl_ep.
+    """
+
+    def test_nccl_ep_flag_accepted(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="nccl_ep",
+            nccl_ep_mode="low_latency",
+            nccl_ep_num_max_dispatch_tokens_per_rank=1024,
+        )
+        # dummy-model path short-circuits __post_init__; invoke the handler directly.
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.nccl_ep_mode, "low_latency")
+        self.assertEqual(
+            server_args.nccl_ep_num_max_dispatch_tokens_per_rank, 1024
+        )
+
+    def test_nccl_ep_falls_back_when_unavailable(self):
+        # On CPU CI (no nccl4py / no CUDA), is_nccl_ep_available() is False and
+        # the backend must degrade to 'none' (or 'deepep' if deep_ep importable).
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import (
+            is_nccl_ep_available,
+        )
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="nccl_ep",
+        )
+        server_args._handle_a2a_moe()
+
+        if is_nccl_ep_available():
+            self.assertEqual(server_args.moe_a2a_backend, "nccl_ep")
+        else:
+            self.assertIn(
+                server_args.moe_a2a_backend, ("none", "deepep"),
+                f"expected fallback to none/deepep, got {server_args.moe_a2a_backend}",
+            )
+
+
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
     """Validation for --prefill-only-disable-kv-cache.
 
