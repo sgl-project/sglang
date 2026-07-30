@@ -263,9 +263,9 @@ python/kernel.lock
 
 # MUSA section
 # Generated source files by torchada
-sgl-kernel/csrc_musa/
-sgl-kernel/include_musa/
-sgl-kernel/csrc/**/*_musa/
+python/sglang/kernels/aot/csrc_musa/
+python/sglang/kernels/aot/include_musa/
+python/sglang/kernels/aot/csrc/**/*_musa/
 
 # MUSA core dump files
 *.mudmp
@@ -283,3 +283,6 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+
+# Internal, non-published docs
+internal-docs/

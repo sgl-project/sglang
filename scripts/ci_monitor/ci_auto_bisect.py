@@ -576,7 +576,7 @@ def _infer_related_paths(test_file: str) -> List[str]:
         "specul": ["python/sglang/srt/speculative/"],
         "vision": ["python/sglang/srt/models/"],
         "embed": ["python/sglang/srt/layers/"],
-        "kernel": ["sgl-kernel/", "python/sglang/srt/layers/"],
+        "kernel": ["python/sglang/kernels/aot/", "python/sglang/srt/layers/"],
         "bench": ["benchmark/"],
         "constrained": ["python/sglang/srt/constrained/"],
     }
