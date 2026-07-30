@@ -179,6 +179,10 @@ html.dark table tbody tr:nth-child(even) td,
   margin-top: 0.75rem;
 }
 
+.prose:has(.sgd-model-tags) {
+  overflow-x: hidden;
+}
+
 .sgd-muted {
   color: rgb(107, 114, 128);
   font-size: 0.85rem;
