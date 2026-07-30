@@ -57,6 +57,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import route_quant_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import (
@@ -349,6 +350,20 @@ def _add3(
 
 # One-shot log guard: proves the merged front is live (see _ep_front).
 _EP_FRONT_LOGGED = False
+
+
+def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
+    """Whether o_proj can write into caller-owned storage. ``apply_into`` is an
+    optional quant-method capability; only the unquantized method has it."""
+    return getattr(o_proj.quant_method, "apply_into", None) is not None
+
+
+def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
+    """Symmetric storage for o_proj's TP-partial output; the fused attention
+    all-reduce reduces it in place."""
+    return k3_ar_fusion.symm_buffer(
+        k3_ar_fusion.ATTN_O_PROJ, x.shape[0], o_proj.weight.shape[0], x.dtype
+    )
 
 
 class KimiK3MoE(nn.Module):
@@ -972,10 +987,31 @@ class KimiK3MoE(nn.Module):
             return _add3(out, shared_output, prefix_sum)
         return out if prefix_sum is None else out + prefix_sum
 
+    @cached_property
+    def _route_quant_fuse_eligible(self) -> bool:
+        """Whether to stage routed_input for the fused route+pack+quant launch
+        (route_quant_handoff). Only the trtllm-gen SiTU runner with mxfp8
+        activations consumes the staged quant, so only that runner stages."""
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        method = self.experts.quant_method
+        return (
+            isinstance(method, Mxfp4MoEMethod)
+            and method.use_flashinfer
+            and not method.use_marlin
+            and method.flashinfer_mxfp4_moe_precision == "default"
+            and self.experts.moe_runner_config.activation == "situ"
+        )
+
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
-        topk_output = self.topk(hidden_states, router_logits)
-        with zero_copy_context.set_moe_output(latent):
-            expert_output = self.experts(routed_input, topk_output)
+        if self._route_quant_fuse_eligible:
+            route_quant_handoff.stage(routed_input)
+        try:
+            topk_output = self.topk(hidden_states, router_logits)
+            with zero_copy_context.set_moe_output(latent):
+                expert_output = self.experts(routed_input, topk_output)
+        finally:
+            route_quant_handoff.clear()
         if expert_output.data_ptr() != latent.data_ptr():
             latent.copy_(expert_output)
 
@@ -984,8 +1020,13 @@ class KimiK3MoE(nn.Module):
         FlashInferTrtllmDeferredFinalizeOutput triple (permuted gemm2 output,
         expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
         all-reduce."""
-        topk_output = self.topk(hidden_states, router_logits)
-        return self.experts.forward_deferred_finalize(routed_input, topk_output)
+        if self._route_quant_fuse_eligible:
+            route_quant_handoff.stage(routed_input)
+        try:
+            topk_output = self.topk(hidden_states, router_logits)
+            return self.experts.forward_deferred_finalize(routed_input, topk_output)
+        finally:
+            route_quant_handoff.clear()
 
     def _forward_shared(self, gate_up, shared_output):
         shared = self.shared_experts
@@ -1036,8 +1077,14 @@ class KimiK3MoE(nn.Module):
             routed_input = routed_input.contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
-            with k3_ar_fusion.symm_alloc():
-                buf = hidden_states.new_empty(latent_numel + num_tokens * hidden_size)
+            # the shared-expert AR is pull-only, so its input must be a
+            # symm_buffer slice for every rank to resolve the same offset
+            buf = k3_ar_fusion.symm_buffer(
+                k3_ar_fusion.MOE_LATENT_SHARED,
+                num_tokens,
+                self.moe_hidden_size + hidden_size,
+                hidden_states.dtype,
+            ).view(-1)
         else:
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1449,14 +1496,20 @@ class KimiK3DeltaAttention(nn.Module):
             # group (sums across DP groups) and asymmetric vs idle DP ranks
             # (deadlocks the per-layer DP gather). Off under all_reduce_fusion:
             # the fused AR does the reduce itself (reduce_results=False) and the
-            # forward wraps o_proj in k3 symm_alloc — leaving this True would
-            # nest use_symmetric_memory(attn_tp) inside symm_alloc and misroute
-            # the GEMM output away from the k3 pool (rendezvous miss). At the
-            # fusion config attn_tp==tp so the fused full-TP reduce is the same
-            # group anyway.
+            # forward hands o_proj a slice of a persistent symmetric region —
+            # leaving this True would wrap the GEMM in
+            # use_symmetric_memory(attn_tp), which allocates its own output and
+            # so defeats the caller-owned buffer. At the fusion config
+            # attn_tp==tp so the fused full-TP reduce is the same group anyway.
             use_dp_attention_reduce=not self.all_reduce_fusion,
             prefix=f"{prefix}.o_proj",
         )
+        if self.all_reduce_fusion and not _o_proj_takes_output(self.o_proj):
+            # the fused AR reduces o_proj's output in place out of a symmetric
+            # buffer, which needs the GEMM to write into caller-owned storage
+            self.all_reduce_fusion = False
+            self.o_proj.reduce_results = True
+            self.o_proj.use_dp_attention_reduce = True
         k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
@@ -1663,8 +1716,8 @@ class KimiK3DeltaAttention(nn.Module):
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
         if self.all_reduce_fusion:
-            with k3_ar_fusion.symm_alloc():
-                partial, _ = self.o_proj(core_attn_out)
+            out = _k3_symm_o_proj_out(self.o_proj, core_attn_out)
+            partial, _ = self.o_proj(core_attn_out, output_tensor=out)
             return partial
         return self.o_proj(core_attn_out)[0]
 
@@ -1707,26 +1760,38 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         )
         # Installed before the output-gate wrap below so the gate multiply is
         # applied to x before the fused GEMM+AR sees it.
+        if self.all_reduce_fusion and not _o_proj_takes_output(self.o_proj):
+            # the fused AR reduces o_proj's output in place out of a symmetric
+            # buffer, which needs the GEMM to write into caller-owned storage
+            self.all_reduce_fusion = False
+            self.o_proj.reduce_results = True
+            self.o_proj.use_dp_attention_reduce = True
         k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
         if self.all_reduce_fusion:
             # reduce_results=False was passed through super().__init__ above;
-            # the fused all-reduce does the reduce itself and needs the o_proj
-            # output in the k3 symm pool, so install the symm-pool wrap and do
-            # NOT set use_dp_attention_reduce (its inner attn_tp symm_ctx would
-            # nest inside symm_alloc and misroute the GEMM output away from the
-            # k3 pool → rendezvous miss). At the fusion config (attn_tp==tp) the
-            # fused full-TP reduce is the same group as the attn_tp reduce.
+            # the fused all-reduce does the reduce itself and reduces the o_proj
+            # output in place, so hand the GEMM a slice of the persistent
+            # symmetric buffer (k3_ar_fusion.symm_buffer) and do NOT set
+            # use_dp_attention_reduce — its inner attn_tp symm_ctx allocates its
+            # own output and would defeat the caller-owned buffer. At the fusion
+            # config (attn_tp==tp) the fused full-TP reduce is the same group as
+            # the attn_tp reduce.
             # The wrap is installed before the output-gate wrap below so the
-            # gate multiply stays outside the pool and only the o_proj GEMM
-            # output lands in it. NOTE: the captured name must differ from the
+            # gate multiply stays outside it and only the o_proj GEMM writes the
+            # region slice. NOTE: the captured name must differ from the
             # gate block's `_orig_o_proj_forward` — closures capture the
             # __init__ local by reference, and reusing the name would rebind it
             # to this wrapper (infinite recursion + nested pool enter).
             _symm_inner_o_proj_forward = self.o_proj.forward
+            _symm_o_proj = self.o_proj
 
             def _symm_o_proj_forward(x, *args, **kwargs):
-                with k3_ar_fusion.symm_alloc():
-                    return _symm_inner_o_proj_forward(x, *args, **kwargs)
+                return _symm_inner_o_proj_forward(
+                    x,
+                    *args,
+                    output_tensor=_k3_symm_o_proj_out(_symm_o_proj, x),
+                    **kwargs,
+                )
 
             self.o_proj.forward = _symm_o_proj_forward
         else:
@@ -1931,6 +1996,10 @@ class KimiK3DecoderLayer(nn.Module):
                 gate_alt_stream=alt_streams[2] if alt_streams is not None else None,
             )
 
+        # the attention drops the fusion when its o_proj cannot write into
+        # caller-owned storage; the layer's own AR call-site must agree
+        self.all_reduce_fusion = self.self_attn.all_reduce_fusion
+
         # MLP / MoE
         if self._is_moe_layer:
             self.mlp = KimiK3MoE(
@@ -1988,18 +2057,15 @@ class KimiK3DecoderLayer(nn.Module):
             o_proj.reduce_results = False
             if k3_sp_collective.enabled():
                 # The table selects NVLS pull RS for larger token buckets.
-                # Allocate only those o_proj outputs in multicast symmetric
-                # memory; small push RS keeps the regular graph allocator.
+                # Only those o_proj outputs come from the persistent symmetric
+                # buffer; small push RS keeps the regular graph allocator.
                 _sp_inner_o_proj_forward = o_proj.forward
 
                 def _sp_o_proj_forward(x, *args, **kwargs):
                     output_rows = k3_sp_collective.get_o_proj_output_rows(x.shape[0])
                     if k3_sp_collective.requires_symmetric_rs(output_rows, x.device):
                         output = k3_sp_collective.get_o_proj_output_buffer(
-                            output_rows,
-                            x.dtype,
-                            x.device,
-                            o_proj.output_size,
+                            output_rows, x.dtype, o_proj.output_size
                         )
                         result = _sp_inner_o_proj_forward(
                             x, *args, output_tensor=output[: x.shape[0]], **kwargs

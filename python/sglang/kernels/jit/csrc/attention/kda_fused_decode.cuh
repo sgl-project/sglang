@@ -40,17 +40,102 @@
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
 #include <sgl_kernel/warp.cuh>   // For device::warp::reduce_sum
 
-#include <sgl_kernel/ptx/cp_async.cuh>
-#include <sgl_kernel/ptx/mbarrier.cuh>
-#include <sgl_kernel/ptx/sync.cuh>
-#include <sgl_kernel/ptx/tma.cuh>
-
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
 #include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+
+// ----------------------------------------------------------------------------
+// Local PTX primitives (cp.async / mbarrier / async-proxy fence)
+// ----------------------------------------------------------------------------
+
+namespace ptx {
+
+// Generic ptr -> 32-bit `.shared` address: inline-PTX `.shared` instructions
+// take a byte offset in the shared window, not a generic pointer.
+template <typename T>
+static SGL_DEVICE uint32_t to_shared(T* ptr) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+}
+
+// ---- non-bulk cp.async (PTX ISA §9.7.9.24) ---------------------------------
+
+// One 16-byte cache-global segment, global -> shared. Both pointers must be
+// 16-byte aligned.
+static SGL_DEVICE void cp_async_cg_16b(void* smem_dst, const void* gmem_src) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(to_shared(smem_dst)), "l"(gmem_src) : "memory");
+}
+
+static SGL_DEVICE void cp_async_commit_group() {
+  asm volatile("cp.async.commit_group;");
+}
+
+// Wait until at most N committed cp.async groups remain pending.
+template <int N>
+static SGL_DEVICE void cp_async_wait_group() {
+  static_assert(N >= 0 && N <= 7, "cp.async wait-group count must be in [0, 7]");
+  asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory");
+}
+
+static SGL_DEVICE void cp_async_wait_all() {
+  asm volatile("cp.async.wait_all;" ::: "memory");
+}
+
+// ---- bulk 1D TMA (PTX ISA §9.7.9.25) ---------------------------------------
+
+// global -> shared::cluster, completed by an smem mbarrier. Arm `bar` with
+// `mbar_arrive_expect_tx(bar, bytes)` before issuing; `bytes` and both
+// endpoints must be 16-byte aligned.
+static SGL_DEVICE void cp_async_bulk_1d_load(void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* bar) {
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+      " [%0], [%1], %2, [%3];" ::"r"(to_shared(smem_dst)),
+      "l"(gmem_src),
+      "r"(bytes),
+      "r"(to_shared(bar))
+      : "memory");
+}
+
+// ---- mbarrier (PTX ISA §9.7.13.15) -----------------------------------------
+//
+// Only the `try_wait.parity` waiter is wrapped; the caller owns the phase
+// counter and flips it at the stage wrap. After `mbar_init` the bar is at
+// parity 0 and each full cycle (count arrivals -> fire -> reset) flips it, so a
+// consumer-first waiter starts at 0 and a producer-first waiter (whose first
+// wait must be a no-op skip) starts at 1. Getting this backwards deadlocks on
+// the second wait.
+static SGL_DEVICE void mbar_init(uint64_t* bar, uint32_t count) {
+  asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(to_shared(bar)), "r"(count));
+}
+
+// Combined arrive + set tx-count, for TMA-load completion.
+static SGL_DEVICE void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
+  asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" ::"r"(to_shared(bar)), "r"(bytes));
+}
+
+// Wait for phase `parity` to complete. Looped because the spec allows spurious
+// early wakeups. The default `.acquire` semantics make prior `cp.async.bulk`
+// writes tracked by this mbarrier visible to later generic-proxy reads on this
+// thread with no `fence.proxy.async` (spec §9.7.13.15.16 point 3).
+static SGL_DEVICE void mbar_wait_parity(uint64_t* bar, uint32_t parity) {
+  asm volatile(
+      "{\n\t.reg .pred p;\n\t"
+      "WAIT_%=: mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t"
+      "@!p bra WAIT_%=;\n\t}\n" ::"r"(to_shared(bar)),
+      "r"(parity));
+}
+
+// ---- async-proxy fence (PTX ISA §9.7.13) -----------------------------------
+
+// Make generic-proxy smem writes visible to the async proxy. Required before
+// any bulk store that reads smem written by regular ld/st.
+static SGL_DEVICE void fence_async_smem() {
+  asm volatile("fence.proxy.async.shared::cta;");
+}
+
+}  // namespace ptx
 
 namespace {
 
@@ -928,9 +1013,8 @@ struct KdaFusedDecodeKernel {
       // Full-state staging (4 stages, 64KB, sync-free) wins while the grid
       // is small enough that occupancy isn't the limiter; past that the
       // 48KB 3-stage variant (one sync for the single stage reuse) benches
-      // fastest. Mirrors the KDA_decode standalone-kernel dispatch on
-      // chunan/kda.
-      tma_stages = B * static_cast<int>(kH) >= 1024 ? 3 : 4;
+      // fastest.
+      tma_stages = B * static_cast<int>(kH) >= 512 ? 3 : 4;
     }
     auto kernel = kH == 3 ? select_kda_fused_decode_k3_kernel<3, kUsePDL>(use_lower_bound, tma_stages)
                           : (kH == 6 ? select_kda_fused_decode_k3_kernel<6, kUsePDL>(use_lower_bound, tma_stages)

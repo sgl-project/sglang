@@ -2,6 +2,14 @@ import inspect
 import re
 from typing import Dict, List, Optional, Tuple, Type
 
+from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
+from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
+from sglang.srt.entrypoints.openai.encoding_dsv4 import (
+    thinking_end_token as dsv4_thinking_end_token,
+)
+from sglang.srt.entrypoints.openai.encoding_dsv4 import (
+    thinking_start_token as dsv4_thinking_start_token,
+)
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.function_call.kimik3_detector import (
@@ -412,6 +420,9 @@ class KimiK2Detector(BaseReasoningFormatDetector):
         )
 
 
+_THINK_CLOSE_WITHOUT_SEP = THINK_CLOSE.split("<|sep|>")[0]
+
+
 class KimiK3Detector(BaseReasoningFormatDetector):
     """Detector for the Kimi K3 XTML think channel.
 
@@ -461,6 +472,18 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             return _strip_response_wrappers(text[:tools_idx]) + text[tools_idx:]
         return _strip_response_wrappers(text)
 
+    def _next_channel_idx(self, text: str, start: int = 0) -> int:
+        found = [
+            idx
+            for token in (RESPONSE_OPEN, self.tool_start_token)
+            if (idx := text.find(token, start)) != -1
+        ]
+        return min(found) if found else -1
+
+    @staticmethod
+    def _strip_dangling_think_close(text: str) -> str:
+        return text.removesuffix(_THINK_CLOSE_WITHOUT_SEP)
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         in_reasoning = self._in_reasoning or self.think_start_token in text
         if not in_reasoning and self.think_end_token not in text:
@@ -470,13 +493,17 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         start = open_idx + len(self.think_start_token) if open_idx != -1 else 0
         close_idx = text.find(self.think_end_token, start)
         if close_idx == -1:
-            tools_idx = text.find(self.tool_start_token, start)
-            if tools_idx != -1:
+            channel_idx = self._next_channel_idx(text, start)
+            if channel_idx != -1:
                 return StreamingParseResult(
-                    reasoning_text=text[start:tools_idx],
-                    normal_text=text[tools_idx:],
+                    reasoning_text=self._strip_dangling_think_close(
+                        text[start:channel_idx]
+                    ),
+                    normal_text=self._clean_content(text[channel_idx:]),
                 )
-            return StreamingParseResult(reasoning_text=text[start:])
+            return StreamingParseResult(
+                reasoning_text=self._strip_dangling_think_close(text[start:])
+            )
 
         reasoning_text = text[start:close_idx]
         rest = text[close_idx + len(self.think_end_token) :]
@@ -518,13 +545,15 @@ class KimiK3Detector(BaseReasoningFormatDetector):
                     normal_text=self._drain_content() or None,
                 )
 
-            tools_idx = buf.find(self.tool_start_token)
-            if tools_idx != -1:
-                reasoning_text = buf[:tools_idx]
-                self._buffer = buf[tools_idx:]
+            channel_idx = self._next_channel_idx(buf)
+            if channel_idx != -1:
+                reasoning_text = self._strip_dangling_think_close(buf[:channel_idx])
+                self._buffer = buf[channel_idx:]
                 self._in_reasoning = False
                 self._reasoning_done = True
-                self._tools_passthrough = True
+                self._tools_passthrough = buf.startswith(
+                    self.tool_start_token, channel_idx
+                )
                 return StreamingParseResult(
                     reasoning_text=reasoning_text or None,
                     normal_text=self._drain_content() or None,
@@ -532,11 +561,12 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
             if not self.stream_reasoning:
                 return StreamingParseResult()
-            markers = [self.think_end_token, self.tool_start_token]
+            markers = [self.think_end_token, self.tool_start_token, RESPONSE_OPEN]
             if not self.stripped_think_start:
                 markers.append(self.think_start_token)
             holdback = _partial_suffix_len(buf, markers)
             emit = buf[: len(buf) - holdback] if holdback else buf
+            emit = self._strip_dangling_think_close(emit)
             self._buffer = buf[len(emit) :]
             return StreamingParseResult(reasoning_text=emit)
 
@@ -1066,6 +1096,29 @@ class _DeepSeekV3Detector(Qwen3Detector):
         self.reasoning_default = "explicit_thinking"
 
 
+class DeepSeekV4Detector(BaseReasoningFormatDetector):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            dsv4_thinking_start_token,
+            dsv4_thinking_end_token,
+            think_excluded_tokens=[dsv4_eos_token, dsv4_dsml_token],
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            thinks_internally=True,
+            reasoning_default="explicit_thinking",
+            force_nonempty_content=force_nonempty_content,
+        )
+
+
 class _MimoDetector(Qwen3Detector):
     """MIMO reuses Qwen3 tokens but requires explicit enable_thinking=True to enable."""
 
@@ -1554,7 +1607,7 @@ class ReasoningParser:
         "apertus2509": Apertus2509Detector,
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": _DeepSeekV3Detector,
-        "deepseek-v4": _DeepSeekV3Detector,
+        "deepseek-v4": DeepSeekV4Detector,
         "glm45": Glm45Detector,
         "hunyuan": HunyuanDetector,
         "gpt-oss": GptOssDetector,

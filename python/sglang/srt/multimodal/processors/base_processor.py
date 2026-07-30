@@ -9,7 +9,6 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
-import requests
 import torch
 from PIL import Image
 from transformers import BaseImageProcessor
@@ -23,6 +22,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
+    CLIENT_MEDIA_EXCEPTIONS,
     envs,
     is_cpu,
     is_npu,
@@ -43,8 +43,6 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-
-_IPC_POOL_HANDLE_CACHE = envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
 
 
 @dataclasses.dataclass
@@ -204,6 +202,9 @@ class BaseMultimodalProcessor(ABC):
             else "cpu"
         )
         self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
+        self.use_ipc_pool_handle_cache = (
+            self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
+        )
         self.disable_fast_image_processor = server_args.disable_fast_image_processor
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
 
@@ -491,6 +492,7 @@ class BaseMultimodalProcessor(ABC):
         videos=None,
         audios=None,
         processor=None,
+        processor_video_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> dict:
         """
@@ -505,8 +507,13 @@ class BaseMultimodalProcessor(ABC):
                 kwargs.setdefault("images_kwargs", {}).update(self.image_config)
         if videos:
             kwargs["videos"] = videos
-            if self.video_config:
-                kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
+            video_config = (
+                self.video_config
+                if processor_video_config is None
+                else processor_video_config
+            )
+            if video_config:
+                kwargs.setdefault("videos_kwargs", {}).update(video_config)
         if audios:
             if processor.__class__.__name__ in {
                 "Gemma3nProcessor",
@@ -646,8 +653,7 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
-        except (ValueError, OSError, requests.RequestException) as e:
-            # Invalid or unavailable user-provided media -> 400, not 500.
+        except CLIENT_MEDIA_EXCEPTIONS as e:
             data_str = str(data)
             if len(data_str) > 100:
                 data_str = data_str[:100] + "..."
@@ -1013,13 +1019,17 @@ class BaseMultimodalProcessor(ABC):
         for modality, idx, future in futures:
             try:
                 result = await asyncio.wrap_future(future)
-            except ValueError:
-                logger.exception(
-                    "[load_mm_data(simple)] error loading %s data at index=%d",
+            except ValueError as e:
+                logger.info(
+                    "[load_mm_data(simple)] invalid %s data at index=%d: %s",
                     modality.name,
                     idx,
+                    e,
                 )
-                raise
+                raise ValueError(
+                    f"An exception occurred while loading {modality.name} data "
+                    f"at index {idx}: {e}"
+                ) from e
             except Exception as e:
                 logger.exception(
                     "[load_mm_data(simple)] error loading %s data at index=%d",
@@ -1348,7 +1358,7 @@ class BaseMultimodalProcessor(ABC):
                 sync_buffer_meta=sync_flag,
                 pool_ipc_handle=(
                     self.cudaipc_mmfeature_pool._pool_ipc_handle
-                    if _IPC_POOL_HANDLE_CACHE
+                    if self.use_ipc_pool_handle_cache
                     else None
                 ),
                 pool_byte_offset=byte_offset,

@@ -15,7 +15,7 @@
 
 namespace device::distributed {
 
-inline constexpr uint32_t kMaxWorldSize = 8;
+inline constexpr uint32_t kMaxWorldSize = 16;
 
 SGL_DEVICE uint32_t load_relaxed_sys(const uint32_t* ptr) {
   uint32_t val;

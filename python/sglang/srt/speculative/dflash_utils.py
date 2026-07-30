@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.utils import is_cuda, is_musa
+from sglang.srt.utils import is_cuda, is_hip, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -45,6 +45,12 @@ if is_cuda() or is_musa():
         top_k_renorm_prob = None
         top_p_renorm_prob = None
         tree_speculative_sampling_target_only = None
+elif is_hip():
+    from sglang.kernels.ops.sampling.top_p_renorm_triton import (
+        top_p_renorm_probs_triton as top_p_renorm_prob,
+    )
+
+    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
 else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None
@@ -145,7 +151,7 @@ def apply_dflash_verify_logits_adjustments(
 
     acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
-    vocab_mask = getattr(sampling_info, "vocab_mask", None)
+    grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
     logits_3d: Optional[torch.Tensor] = None
@@ -161,7 +167,7 @@ def apply_dflash_verify_logits_adjustments(
     # broadcast over the verify block without materializing a repeated buffer.
     if (
         penalizer is not None and penalizer.is_required and acc_linear_penalties is None
-    ) or vocab_mask is not None:
+    ) or grammar_mask is not None:
         linear_penalty = torch.zeros(
             (bs, next_token_logits.shape[1]),
             dtype=torch.float32,

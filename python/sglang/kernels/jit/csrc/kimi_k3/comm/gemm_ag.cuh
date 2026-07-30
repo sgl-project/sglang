@@ -83,7 +83,11 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
   }
 
   PDLWaitPrimary<kUsePDL>();
-  const uint32_t phase = params.counter[bx].get() & 1;
+  // Every push-workspace consumer flips the WHOLE counter array each round
+  // (each has a tail loop up to num_counters), so all counters hold the same
+  // phase at this point and counter[0] is equivalent to counter[bx]. Reading a
+  // single counter is what frees the producer grid from num_push_blocks.
+  const uint32_t phase = params.counter[0].get() & 1;
 
   vec_t input_vec[M];
 #pragma unroll
@@ -225,7 +229,16 @@ template <uint32_t K, uint32_t N, uint32_t kMaxM, bool kUsePDL>
 struct GEMMAGKernel {
   using TensorView = tvm::ffi::TensorView;
 
-  static constexpr uint32_t N_SPLIT = 8;
+  // Columns of this rank's slice per producer block; sets the grid to
+  // kNLocal / N_SPLIT. Measured on 2x4 GB300 TP8 at bs=1 (three reps each,
+  // mean TPOT): 8 -> grid 112, 8.36 ms; 4 -> 224, 8.29 ms; 2 -> 448, 8.21 ms.
+  // Standalone GEMV at the same shape: 4.15 / 3.20 / 2.56 us, and 16 -> 4.42 us,
+  // so the trend is monotonic and 2 is the floor (the epilogue stores column
+  // pairs, so N_SPLIT must stay even). 8 used to be the largest grid that fit
+  // the old kNumProducerBlocks <= num_push_blocks bound; the producer now reads
+  // a single phase counter, so the grid is free and 112 blocks did not even
+  // fill one per SM.
+  static constexpr uint32_t N_SPLIT = 2;
   static constexpr uint32_t kNLocal = N / gemm_ag::kWorld;
   static constexpr uint32_t kGemvBlock = K / gemm_ag::kVecSize;
   static constexpr uint32_t kNumProducerBlocks = kNLocal / N_SPLIT;
@@ -266,7 +279,8 @@ struct GEMMAGKernel {
     CHECK_HOST(ws_mc_base != 0) << "requires a multicast-capable workspace";
     CHECK_HOST(int64_t(num_tokens) * kNLocal * 2 <= data.push_bytes)
         << "staging slice exceeds the push slot size " << data.push_bytes;
-    CHECK_HOST(kNumProducerBlocks <= data.num_push_blocks);
+    // The producer grid is no longer bound to the counter array: it reads only
+    // counter[0] (see gemm_ag_gemv_kernel). The consumer grid still is.
     CHECK_HOST(data.num_push_blocks > 0) << "no push blocks available";
     // producer: GEMV
     const auto producer_params = gemm_ag::ProducerParams{

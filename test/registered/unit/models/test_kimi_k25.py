@@ -242,9 +242,7 @@ def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
         (2, torch.randn(3, 28, 20)),
     ]
     expected = [
-        F.interpolate(
-            image.unsqueeze(0), size=(16, 12), mode="bicubic", align_corners=False
-        )
+        _resize_bicubic_if_needed(image.unsqueeze(0), 16, 12)
         for _, image in indexed_images
     ]
     real_interpolate = F.interpolate
@@ -511,6 +509,9 @@ def test_dp_helper_can_lazily_load_kimi_features_on_tp1():
 
 def test_dp_helper_uses_config_hidden_size_for_empty_moonvit3d_rank():
     class _GatherGroup:
+        def broadcast(self, tensor, src):
+            tensor.fill_(1)
+
         def all_gather(self, tensor, dim):
             return torch.cat([torch.ones_like(tensor), tensor], dim=dim)
 
@@ -562,6 +563,30 @@ def test_dp_helper_lazily_loads_only_its_local_image_shard():
 
     loader.assert_called_once_with([0])
     assert output.shape == (2, 4, 2)
+
+
+def test_dp_helper_keeps_packed_grid_metadata_on_cpu_for_tp2():
+    class _GatherGroup:
+        def all_gather(self, tensor, dim):
+            return torch.cat([tensor, torch.zeros_like(tensor)], dim=dim)
+
+    tower = _MoonViT3dTower()
+    pixel_values = torch.empty(8, 2, device="meta")
+    parallel = SimpleNamespace(
+        attn_tp_size=2,
+        attn_tp_rank=0,
+        attn_tp_group=_GatherGroup(),
+    )
+
+    with patch("sglang.srt.multimodal.mm_utils.get_parallel", return_value=parallel):
+        run_dp_sharded_mrope_vision_model(
+            tower,
+            pixel_values,
+            [[1, 2, 2], [1, 2, 2]],
+            rope_type="rope_2d_packed",
+        )
+
+    assert tower.grid_thws.device.type == "cpu"
 
 
 def test_kimi_k25_encoder_dp_selects_packed_moonvit_contract():
