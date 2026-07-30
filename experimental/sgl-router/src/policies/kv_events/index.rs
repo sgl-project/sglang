@@ -39,8 +39,8 @@ use tracing::{debug, info, warn};
 
 use super::block_size_oracle::BlockSizeOracle;
 use super::bootstrap::{
-    fetch_snapshot, BootstrapState, BootstrapTracker, PeerRegistry, PeerSnapshot, RankOutcome,
-    SnapshotOutcome, VettedSnapshot, WireWorker, SNAPSHOT_FORMAT,
+    fetch_cursors, fetch_snapshot, BootstrapState, BootstrapTracker, PeerRegistry, PeerSnapshot,
+    RankOutcome, SnapshotOutcome, VettedSnapshot, WireWorker, SNAPSHOT_FORMAT,
 };
 use super::discovery::{fetch_event_config, EventConfig};
 use super::subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
@@ -171,6 +171,41 @@ struct PendingProof {
     since: Instant,
     /// Consecutive probes that found no witness; see [`MAX_UNKNOWN_PROBES`].
     unknown_probes: u32,
+    /// When the outstanding probe was launched, if one is.
+    ///
+    /// A fresh outstanding probe blocks relaunch; past the timeout it is
+    /// presumed lost — its verdict may never land — and asked again. Strictly
+    /// better than a bare bool latch, on which any lost verdict (a panicked
+    /// probe task, say) would freeze the rank in Recovered forever with no
+    /// [`RankOutcome`] recorded. Honest accounting, verified against the code
+    /// in review: because `launch_probe` arms both clocks from one instant,
+    /// the presumed-lost cadence today equals what `since` alone would give —
+    /// the second field's payoff is making "never probed" and "verdict lost"
+    /// distinguishable states, not a different retry schedule. Cleared, as
+    /// `None`, by whichever verdict arrives.
+    probe_launched: Option<Instant>,
+}
+
+impl PendingProof {
+    /// Whether the sweep should launch a probe for this rank now: never while
+    /// one is outstanding and fresh; yes once the last probe — or the graft
+    /// itself, if none has run yet — is older than `timeout`. The pump's sweep
+    /// filter uses this single definition so the guard cannot drift from its
+    /// tests.
+    fn due_for_probe(&self, timeout: Duration) -> bool {
+        match self.probe_launched {
+            Some(launched) => launched.elapsed() >= timeout,
+            None => self.since.elapsed() >= timeout,
+        }
+    }
+
+    /// Arm both clocks from one instant: re-start the retry spacing and mark
+    /// the new probe outstanding. One method so the two writes cannot drift
+    /// apart the way two statements at the call site gradually could.
+    fn launch_probe(&mut self, now: Instant) {
+        self.since = now;
+        self.probe_launched = Some(now);
+    }
 }
 
 /// Control-plane messages for the pump task.
@@ -805,6 +840,121 @@ impl KvEventIndex {
     /// caller who just wants to read a field.
     pub async fn peer_snapshot_body(&self, max_age: Duration) -> Bytes {
         self.snapshot_entry(max_age).await.1
+    }
+
+    /// Build this replica's cursor table for a peer's splice probe.
+    ///
+    /// Deliberately NOT a smaller `peer_snapshot_body`. A probe asks one
+    /// question — "is your cursor for this rank above my watermark?" — and the
+    /// cursors live in their own map, which `snapshot_entry` already reads
+    /// independently of, and before, the tree walk. Serving them therefore costs
+    /// a read of that map, where answering the same question from a full export
+    /// costs a walk, a multi-megabyte serialise, and a compress.
+    ///
+    /// Every observed rank is reported, including ones whose blocks this
+    /// replica no longer holds (`BlockRemoved`-only history, `AllBlocksCleared`,
+    /// eviction). The full export's cursor table is narrower — it is filtered
+    /// to ranks that still carry a node in the tree, because a graft recipient
+    /// needs a block source, not a witness. The witness question does not have
+    /// that constraint: having SEEN the publisher's stream at seq N is evidence
+    /// even after the blocks themselves are gone. So this table is a superset
+    /// of the full export's, and callers comparing the two bodies must not
+    /// expect set equality. (One consequence: witnesses the full export's
+    /// table omits still answer here, so proving splices this way reports
+    /// marginally more `RankOutcome::Gap`.)
+    ///
+    /// Takes no `max_age` and touches no cache: the cursors are read live, so the
+    /// answer is strictly fresher than any freshness a caller could request.
+    /// Reading live also removes the accuracy cost the cached path carried, where
+    /// a cursor stale by up to the producer TTL could miss advancement that had
+    /// just happened and report a splice as continuous when it was not. The body
+    /// is one small entry per rank — nothing like the tree export the producer
+    /// cache exists for — and the endpoint serves the internal fleet, so the
+    /// uncached live read is the deliberate design rather than a missing
+    /// throttle.
+    ///
+    /// `nodes` is always empty, which makes this body ungraftable by
+    /// construction rather than by discipline: `VettedSnapshot::from_wire`
+    /// rejects an empty node list as `VetError::ProducerCold`, so a bootstrap
+    /// fetch can never be silently satisfied by a cursors-only answer.
+    pub fn peer_cursors_body(&self) -> Bytes {
+        let hash_config = self.block_size_oracle.hash_config();
+        let (block_size, is_bigram) = hash_config.unwrap_or((0, false));
+        // One pass under one short lock: worker `i` of the table and cursor
+        // entry `i` are pushed from the same map entry, so the pairing
+        // `cursors[i].0 == i` is structural rather than comment-enforced, and
+        // the nothing-in-between ordering cannot drift the way two separately
+        // collected vectors could. `apply_batch` holds this lock twice per
+        // batch on the single-writer pump, so keep the hold itself cheap.
+        let (workers, cursors) = {
+            let guard = self.cursors.lock();
+            let mut workers: Vec<WireWorker> = Vec::with_capacity(guard.len());
+            let mut cursors: Vec<(u32, i64)> = Vec::with_capacity(guard.len());
+            for (i, (w, seq)) in guard.iter().enumerate() {
+                workers.push(WireWorker {
+                    url: w.url.clone(),
+                    dp_rank: w.dp_rank,
+                });
+                cursors.push((i as u32, *seq));
+            }
+            (workers, cursors)
+        };
+        let snap = PeerSnapshot {
+            format: SNAPSHOT_FORMAT,
+            block_size,
+            is_bigram,
+            // Same question `snapshot_entry` answers — "am I worth copying?" —
+            // read off the tree directly because this path never exports a
+            // `nodes` vec to measure instead.
+            producer_ready: hash_config.is_some()
+                && self.bootstrap.settled()
+                && self.tree.node_count() > 0,
+            workers,
+            cursors,
+            nodes: Vec::new(),
+        };
+        // Encoded inline, unlike the tree export: this body is one entry per
+        // rank, so a blocking-pool hop would cost more than the serialise.
+        encode_snapshot(&snap)
+    }
+
+    /// (test-only) Apply one stored block directly, bypassing the pump, so
+    /// server/route tests get an index whose cursors-only and full exports
+    /// actually differ — on an empty index the two bodies are indistinguishable,
+    /// which is what makes tests built on one unable to fail when the
+    /// cursors-only branch breaks. Production applies events only through the
+    /// pump channel; this exists because seeding from outside `kv_events`
+    /// cannot reach the internals, by design.
+    #[cfg(test)]
+    pub(crate) fn seed_stored_block_for_test(
+        &self,
+        worker: &KvWorkerId,
+        seq: i64,
+        block_hash: i64,
+    ) {
+        let block_size = self
+            .block_size_oracle
+            .hash_config()
+            .map(|(size, _)| size)
+            .unwrap_or(0);
+        apply_batch(
+            &self.tree,
+            &self.cursors,
+            worker,
+            seq,
+            &KvEventBatch {
+                ts: 0.0,
+                events: vec![KvCacheEvent::BlockStored(super::wire::BlockStored {
+                    parent_block_hash: None,
+                    block_hashes: vec![block_hash],
+                    token_ids: vec![],
+                    block_size,
+                    lora_id: None,
+                    medium: None,
+                })],
+                attn_dp_rank: None,
+            },
+        );
     }
 
     /// A snapshot that declares itself useless, for the paths that must answer
@@ -1674,6 +1824,22 @@ async fn pump_loop(
                         }
                     }
                     Some(PumpControl::SpliceProbe { rank, epoch, verdict }) => {
+                        // Whatever else happens to this verdict, the probe that
+                        // produced it is no longer outstanding. Clearing the
+                        // marker HERE — before the gate below, not per-arm —
+                        // keeps a verdict the gate drops (superseded epoch while
+                        // the entry survives) from looking like a running probe
+                        // until the presumed-lost timeout releases the rank.
+                        // That drop does occur: remove_worker forgets the epoch
+                        // BEFORE its ForgetRanks lands on this channel, so a
+                        // verdict queued ahead of that ForgetRanks arrives with
+                        // its epoch already gone and its entry still present.
+                        // The entry cannot outlive the drop — the already-queued
+                        // ForgetRanks removes it — but the marker must not
+                        // linger even that long.
+                        if let Some(proof) = awaiting_splice_proof.get_mut(&rank) {
+                            proof.probe_launched = None;
+                        }
                         // The rank may have proven itself, been forgotten, or been
                         // re-registered while the probe was in flight; the epoch
                         // and the map entry together say whether the answer is
@@ -1681,6 +1847,12 @@ async fn pump_loop(
                         if bootstrap.epoch_of(&rank) != Some(epoch)
                             || !awaiting_splice_proof.contains_key(&rank)
                         {
+                            debug!(
+                                worker = ?rank,
+                                epoch,
+                                "kv-bootstrap: dropping a probe verdict that no longer \
+                                 addresses live state",
+                            );
                             continue;
                         }
                         match verdict {
@@ -1700,6 +1872,13 @@ async fn pump_loop(
                             SpliceVerdict::Unknown => {
                                 if let Some(proof) = awaiting_splice_proof.get_mut(&rank) {
                                     proof.unknown_probes += 1;
+                                    debug!(
+                                        worker = ?rank,
+                                        watermark = proof.watermark,
+                                        probes = proof.unknown_probes,
+                                        max_unknown_probes = MAX_UNKNOWN_PROBES,
+                                        "kv-bootstrap: no witness answered this probe",
+                                    );
                                     if proof.unknown_probes >= MAX_UNKNOWN_PROBES {
                                         info!(
                                             worker = ?rank,
@@ -1730,12 +1909,14 @@ async fn pump_loop(
             _ = proof_sweep.tick(), if !awaiting_splice_proof.is_empty() => {
                 let expired: Vec<(KvWorkerId, i64)> = awaiting_splice_proof
                     .iter_mut()
-                    .filter(|(_, p)| p.since.elapsed() >= SPLICE_PROOF_TIMEOUT)
+                    .filter(|(_, p)| p.due_for_probe(SPLICE_PROOF_TIMEOUT))
                     .map(|(rank, p)| {
-                        // Re-arm before probing so a slow or unanswerable probe
-                        // spaces its retries by the timeout instead of firing on
-                        // every sweep.
-                        p.since = Instant::now();
+                        // Re-arm both clocks before probing so retries are
+                        // spaced by the timeout, never by the sweep tick. A
+                        // probe still running past that window is presumed
+                        // lost — its verdict may never land — and asked again
+                        // once per timeout.
+                        p.launch_probe(Instant::now());
                         (rank.clone(), p.watermark)
                     })
                     .collect();
@@ -1980,11 +2161,14 @@ fn fail_rank(
 /// the old watermark, reading as `NoAdvance`. The `PublisherReset` arm handles
 /// the case where the event does arrive.
 ///
-/// Asks for no particular freshness, unlike a bootstrap fetch. A cursor read
-/// from the peer's cached export is still positive evidence that the publisher
-/// moved — the question is whether it EVER passed the watermark, not whether it
-/// has by this instant — so forcing a rebuild here would buy a fleet-wide tree
-/// walk per unproven rank and answer no better.
+/// Asks the peer for its cursor table alone, not a snapshot. The question is
+/// whether the publisher's sequence EVER passed the watermark, which one integer
+/// per rank answers completely; fetching a tree to read it made the proof cost
+/// scale with the tree, so a fleet large enough to need bootstrap was also the
+/// fleet that could not afford to prove it. Reading cursors live rather than from
+/// a cached export also removes the false-continuous risk the cached path
+/// carried, where a cursor stale by up to the producer TTL could miss
+/// advancement that had just happened.
 fn spawn_splice_probe(
     http: reqwest::Client,
     peers: Arc<PeerRegistry>,
@@ -1997,10 +2181,17 @@ fn spawn_splice_probe(
         let mut answered = false;
         let mut verdict = SpliceVerdict::Unknown;
         for peer in peers.candidates() {
-            match fetch_snapshot(&http, &peer, None).await {
+            match fetch_cursors(&http, &peer).await {
                 Ok(Some(snap)) => {
-                    answered = true;
+                    // A decodable body is NOT a witness: only a peer whose
+                    // cursor table NAMES this rank has ever observed its
+                    // publisher. Latching `answered` on the fetch alone would
+                    // manufacture NoAdvance out of ignorance — a peer that
+                    // never saw this rank cannot say its publisher has not
+                    // moved, yet the verdict would resolve Warm as if
+                    // continuity had been proven.
                     if let Some(seq) = snap.wire_cursor_for(&rank.url, rank.dp_rank) {
+                        answered = true;
                         if seq > watermark {
                             warn!(
                                 worker = ?rank,
@@ -2016,7 +2207,20 @@ fn spawn_splice_probe(
                         }
                     }
                 }
-                Ok(None) | Err(_) => continue,
+                // Non-200 is already logged inside fetch_body; a read failure
+                // gets one line here, so a peer serving corrupt bodies is not
+                // indistinguishable from a peer that never saw the rank. Either
+                // way this peer is not a witness for this pass.
+                Ok(None) => continue,
+                Err(e) => {
+                    debug!(
+                        worker = ?rank,
+                        peer = %peer,
+                        error = %format_args!("{e:#}"),
+                        "kv-bootstrap: splice probe could not read this peer",
+                    );
+                    continue;
+                }
             }
         }
         if answered && verdict != SpliceVerdict::Advanced {
@@ -2028,13 +2232,21 @@ fn spawn_splice_probe(
             );
             verdict = SpliceVerdict::NoAdvance;
         }
-        let _ = ctrl_tx
+        if let Err(e) = ctrl_tx
             .send(PumpControl::SpliceProbe {
                 rank,
                 epoch,
                 verdict,
             })
-            .await;
+            .await
+        {
+            // Only the pump's shutdown closes the receiver, and a gone pump has
+            // no proof state left to care about — but say so for forensics.
+            debug!(
+                error = %e,
+                "kv-bootstrap: control channel closed; dropping probe verdict",
+            );
+        }
     });
 }
 
@@ -2199,6 +2411,7 @@ fn apply_snapshot(
                         watermark: peer_cursor,
                         since: Instant::now(),
                         unknown_probes: 0,
+                        probe_launched: None,
                     },
                 );
             }
@@ -2229,6 +2442,7 @@ fn apply_snapshot(
 mod tests {
     use super::*;
     use crate::policies::engine_load::LoadStat;
+    use crate::policies::kv_events::bootstrap::{CURSORS_ONLY_PARAM, SNAPSHOT_PATH};
     use crate::policies::kv_events::wire::{BlockRemoved, BlockStored, KvEventBatch};
 
     fn worker_id(url: &str, rank: u32) -> KvWorkerId {
@@ -2510,6 +2724,294 @@ mod tests {
         assert!(
             exported_at >= before && exported_at <= after,
             "the stamp must sit inside the build, at its start",
+        );
+    }
+
+    /// The whole point: a probe wants one integer per rank, so this body must
+    /// carry the cursors and NOT the tree. Asserting `nodes` is empty is also
+    /// what keeps the body ungraftable — `from_wire` rejects an empty node list.
+    #[tokio::test]
+    async fn cursors_only_body_carries_cursors_and_no_nodes() {
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(256).expect("first set establishes");
+        oracle.set_bigram(false);
+        let index =
+            KvEventIndex::new_with_http_and_oracle(reqwest::Client::new(), Arc::clone(&oracle));
+        let w = worker_id("http://w1:30000", 0);
+        apply_batch(
+            &index.tree,
+            &index.cursors,
+            &w,
+            42,
+            &batch(vec![KvCacheEvent::BlockStored(BlockStored {
+                block_hashes: vec![111],
+                parent_block_hash: None,
+                token_ids: vec![],
+                block_size: 256,
+                lora_id: None,
+                medium: None,
+            })]),
+        );
+
+        let body = index.peer_cursors_body();
+        let snap: PeerSnapshot = serde_json::from_slice(&body).expect("valid JSON");
+
+        assert!(snap.nodes.is_empty(), "the tree must not be exported");
+        assert_eq!(
+            snap.wire_cursor_for("http://w1:30000", 0),
+            Some(42),
+            "the probe's one question must be answerable from this body",
+        );
+        assert_eq!(snap.block_size, 256);
+        assert!(!snap.is_bigram);
+        assert!(
+            snap.producer_ready,
+            "a settled replica holding nodes is a valid witness",
+        );
+    }
+
+    /// A replica with an empty tree must not claim to be worth believing, for the
+    /// same reason `snapshot_entry` checks it: a replica whose own bootstrap timed
+    /// out is settled while holding nothing.
+    #[tokio::test]
+    async fn cursors_only_body_reports_not_ready_with_an_empty_tree() {
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(256).expect("first set establishes");
+        oracle.set_bigram(false);
+        let index =
+            KvEventIndex::new_with_http_and_oracle(reqwest::Client::new(), Arc::clone(&oracle));
+
+        let snap: PeerSnapshot =
+            serde_json::from_slice(&index.peer_cursors_body()).expect("valid JSON");
+        assert!(!snap.producer_ready, "an empty tree is not a source");
+    }
+
+    /// The cost claim, asserted structurally rather than by timing: serving cursors
+    /// must leave the snapshot cache untouched, because populating it is the
+    /// expensive walk this path exists to avoid.
+    #[tokio::test]
+    async fn cursors_only_body_never_populates_the_snapshot_cache() {
+        let index = KvEventIndex::new();
+        index.peer_cursors_body();
+        assert!(
+            index.snapshot_cache.lock().await.is_none(),
+            "cursors-only must not walk or cache the tree",
+        );
+    }
+
+    /// A launched probe must block relaunch inside its timeout window —
+    /// otherwise one slower than the timeout accumulates one duplicate per
+    /// sweep, each re-asking every peer — but it must NOT block past it: a
+    /// verdict that never lands would freeze the rank in Recovered forever.
+    /// Both halves live in one predicate, [`PendingProof::due_for_probe`],
+    /// which the pump's sweep filter shares, so this pins the production
+    /// guard rather than a copy of it.
+    #[test]
+    fn a_launched_probe_blocks_relaunch_until_it_is_presumed_lost() {
+        let past = Instant::now() - SPLICE_PROOF_TIMEOUT - Duration::from_secs(1);
+        let mut proof = PendingProof {
+            watermark: 10,
+            since: Instant::now(),
+            unknown_probes: 0,
+            probe_launched: Some(Instant::now()),
+        };
+        assert!(
+            !proof.due_for_probe(SPLICE_PROOF_TIMEOUT),
+            "an outstanding probe still inside its timeout must not be relaunched",
+        );
+
+        // The defining state of the guard: graft-age EXPIRED, probe FRESH.
+        // Production arms both clocks together (see `launch_probe`), so this
+        // combination is not a reachable state — pinned because only the
+        // Some-arm's precedence over `since` makes it hold, which is exactly
+        // what a simplification back to a since-only predicate would lose.
+        proof.since = past;
+        assert!(
+            !proof.due_for_probe(SPLICE_PROOF_TIMEOUT),
+            "an expired graft with a fresh outstanding probe still waits",
+        );
+
+        proof.probe_launched = Some(past);
+        assert!(
+            proof.due_for_probe(SPLICE_PROOF_TIMEOUT),
+            "a probe older than the timeout is presumed lost and asked again",
+        );
+
+        proof.probe_launched = None;
+        assert!(
+            proof.due_for_probe(SPLICE_PROOF_TIMEOUT),
+            "once the verdict clears the probe, the graft's own age makes it due",
+        );
+    }
+
+    /// The two producer answers are intentionally NOT set-equal. A rank that
+    /// observed a publisher and then lost the blocks (cleared here) keeps its
+    /// cursor in the cursors-only body — that observation is still a valid
+    /// witness — while the full export drops it, because its cursor table only
+    /// covers ranks carrying tree nodes. The full side uses a SECOND rank that
+    /// still carries a block, so the export is a real one (not the not-ready
+    /// body an empty tree would fetch) and the assertion genuinely pins the
+    /// carrier filtering. See [`KvEventIndex::peer_cursors_body`].
+    #[tokio::test]
+    async fn the_cursors_only_table_keeps_witnesses_the_full_export_loses() {
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(256).expect("first set establishes");
+        oracle.set_bigram(false);
+        let index =
+            KvEventIndex::new_with_http_and_oracle(reqwest::Client::new(), Arc::clone(&oracle));
+        let cleared = worker_id("http://w1:30000", 0);
+        let holding = worker_id("http://w2:30000", 0);
+        index.seed_stored_block_for_test(&holding, 7, 999);
+        index.seed_stored_block_for_test(&cleared, 42, 111);
+        // Observed-then-cleared: the cursor survives where the blocks do not.
+        apply_batch(
+            &index.tree,
+            &index.cursors,
+            &cleared,
+            43,
+            &batch(vec![KvCacheEvent::AllBlocksCleared]),
+        );
+
+        let thin: PeerSnapshot =
+            serde_json::from_slice(&index.peer_cursors_body()).expect("valid JSON");
+        assert_eq!(
+            thin.wire_cursor_for("http://w1:30000", 0),
+            Some(43),
+            "a cleared rank is still a witness to its publisher's stream",
+        );
+
+        let full: PeerSnapshot =
+            serde_json::from_slice(&index.peer_snapshot_body(Duration::ZERO).await)
+                .expect("valid JSON");
+        assert!(
+            !full.nodes.is_empty(),
+            "the held block keeps this a real export, not the not-ready body",
+        );
+        assert_eq!(
+            full.wire_cursor_for("http://w1:30000", 0),
+            None,
+            "carriers only: the cleared rank's cursor is dropped from the export",
+        );
+        assert_eq!(
+            full.wire_cursor_for("http://w2:30000", 0),
+            Some(7),
+            "the rank still carrying blocks keeps its cursor in the export",
+        );
+    }
+
+    /// A witness body: no nodes, just a cursor table. Structurally it is what
+    /// the cursors-only producer serves, which is all the probe ever reads.
+    fn witness_snapshot(entries: &[(&str, u32, i64)]) -> PeerSnapshot {
+        PeerSnapshot {
+            format: SNAPSHOT_FORMAT,
+            block_size: 64,
+            is_bigram: false,
+            producer_ready: false,
+            workers: entries
+                .iter()
+                .map(|(url, dp_rank, _)| WireWorker {
+                    url: (*url).to_string(),
+                    dp_rank: *dp_rank,
+                })
+                .collect(),
+            cursors: entries
+                .iter()
+                .enumerate()
+                .map(|(i, (_, _, seq))| (i as u32, *seq))
+                .collect(),
+            nodes: Vec::new(),
+        }
+    }
+
+    /// Serve one canned body on the real snapshot path, recording the query
+    /// strings it is sent: what the probe puts on the wire is part of the
+    /// contract, since the producer only skips its tree when actually ASKED.
+    async fn serve_snapshot_recording_queries(
+        snap: PeerSnapshot,
+    ) -> (String, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+        let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&queries);
+        let app = axum::Router::new().route(
+            SNAPSHOT_PATH,
+            axum::routing::get(move |uri: axum::http::Uri| {
+                let seen = Arc::clone(&seen);
+                let snap = snap.clone();
+                async move {
+                    seen.lock()
+                        .expect("queries lock")
+                        .push(uri.query().map(str::to_string));
+                    axum::Json(snap)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), queries)
+    }
+
+    /// Run one probe against a one-peer fleet serving `snap`, returning the
+    /// verdict the probe posts to the pump-control channel — the same path a
+    /// verdict takes in production. Asserts along the way that every request
+    /// asked for the cursor table alone.
+    async fn probe_once(snap: PeerSnapshot, probed: &KvWorkerId, watermark: i64) -> SpliceVerdict {
+        let (base, queries) = serve_snapshot_recording_queries(snap).await;
+        let peers = Arc::new(PeerRegistry::new());
+        peers.replace(vec![base]);
+        let (tx, mut rx) = mpsc::channel(1);
+        spawn_splice_probe(
+            reqwest::Client::new(),
+            peers,
+            tx,
+            probed.clone(),
+            watermark,
+            0,
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a live one-peer fleet always gets an answer")
+            .expect("the control channel outlives the probe");
+        assert!(
+            queries.lock().expect("queries lock").iter().all(|q| q
+                .as_deref()
+                .unwrap_or_default()
+                .contains(CURSORS_ONLY_PARAM)),
+            "every probe request must ask for the cursor table alone",
+        );
+        match outcome {
+            PumpControl::SpliceProbe { verdict, .. } => verdict,
+            other => panic!("expected a splice-probe verdict, got {other:?}"),
+        }
+    }
+
+    /// Pin for the decodable-body-is-not-a-witness guard documented at
+    /// [`spawn_splice_probe`]: a peer whose cursor table does not NAME the
+    /// probed rank has never observed its publisher, and its body alone must
+    /// not resolve the verdict to NoAdvance.
+    #[tokio::test]
+    async fn probe_ignores_a_body_that_does_not_name_the_rank() {
+        let snap = witness_snapshot(&[("http://other:30000", 0, 999)]);
+        assert_eq!(
+            probe_once(snap, &worker_id("http://w1:30000", 0), 10).await,
+            SpliceVerdict::Unknown,
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_reports_no_advance_when_the_best_witness_is_at_the_watermark() {
+        let snap = witness_snapshot(&[("http://w1:30000", 0, 10)]);
+        assert_eq!(
+            probe_once(snap, &worker_id("http://w1:30000", 0), 10).await,
+            SpliceVerdict::NoAdvance,
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_reports_advance_when_a_witness_is_past_the_watermark() {
+        let snap = witness_snapshot(&[("http://w1:30000", 0, 11)]);
+        assert_eq!(
+            probe_once(snap, &worker_id("http://w1:30000", 0), 10).await,
+            SpliceVerdict::Advanced,
         );
     }
 

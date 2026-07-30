@@ -396,10 +396,10 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 //
                 // Gzip only — the consumer asks with an explicit
                 // `Accept-Encoding: gzip` on its snapshot request (see
-                // `fetch_snapshot`, which also explains why reqwest's crate-wide
-                // `gzip` feature is deliberately NOT enabled). Offering
-                // algorithms nothing asks for just widens the negotiation
-                // surface.
+                // `fetch_body` in the bootstrap module, which also explains why
+                // reqwest's crate-wide `gzip` feature is deliberately NOT
+                // enabled). Offering algorithms nothing asks for just widens
+                // the negotiation surface.
                 //
                 // `Fastest` on purpose. The body is a large, highly repetitive
                 // JSON document — the compressibility is in the per-node

@@ -108,6 +108,10 @@ const MAX_INFLATED_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// will accept, in milliseconds. See [`PRODUCER_CACHE_TTL`].
 pub const MAX_AGE_PARAM: &str = "max_age_ms";
 
+/// Query parameter by which a consumer asks for the cursor table alone, with no
+/// tree. See [`fetch_cursors`].
+pub const CURSORS_ONLY_PARAM: &str = "cursors_only";
+
 /// How long a producer may reuse an already-built snapshot for a request that
 /// states no freshness requirement of its own.
 ///
@@ -128,10 +132,12 @@ pub const MAX_AGE_PARAM: &str = "max_age_ms";
 /// for an export strictly after its own subscribe. Gap by staleness then cannot
 /// happen rather than merely happening less.
 ///
-/// So this constant is now only the DEFAULT for callers with no such
-/// requirement — a splice probe, which wants one cursor and does not care how
-/// old it is, and an older router image that does not send the parameter. It can
-/// be generous again, which is what keeps a boot herd sharing one walk.
+/// So this constant is only the DEFAULT for requests that state no
+/// requirement, sent by an older router image that does not send the parameter.
+/// A splice probe is not such a caller: it asks for the cursor table alone
+/// ([`CURSORS_ONLY_PARAM`]), which the producer reads live with no cache
+/// involved. The default can be generous, which is what keeps a boot herd
+/// sharing one walk.
 pub const PRODUCER_CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// Per-rank bootstrap outcome.
@@ -217,10 +223,13 @@ pub enum RankOutcome {
     /// grafted state was discarded.
     Gap,
     /// Grafted, kept, but never witnessed: no batch arrived to prove the splice
-    /// and no peer could be reached to say whether the publisher moved past the
-    /// watermark. Distinct from `Warm` on purpose — the state is being trusted on
-    /// the absence of contrary evidence rather than on proof, and an operator
-    /// seeing this label persistently has a peer-reachability problem.
+    /// and no peer produced a cursor table naming the rank. Distinct from
+    /// `Warm` on purpose — the state is being trusted on the absence of
+    /// contrary evidence rather than on proof. An operator seeing this label
+    /// persistently has one of two problems: peers are unreachable, or the
+    /// fleet is mid-rollout with every peer on an older image — an old
+    /// producer's full export omits ranks whose blocks it no longer carries,
+    /// so only a patched peer can witness them.
     WarmUnwitnessed,
     /// The accepted snapshot tracked no cursor for this rank, so there was no
     /// watermark to splice against.
@@ -1142,14 +1151,76 @@ fn snapshot_url(peer_base_url: &str, max_age: Option<Duration>) -> String {
     }
 }
 
+/// The URL a splice probe goes to. Carries no freshness requirement: the
+/// producer reads its cursors live on this path, so there is no cached
+/// generation to negotiate against.
+///
+/// `pub(crate)` so route tests can drive the wire through the same builder —
+/// passing an empty base yields a path-relative URI usable in-process.
+pub(crate) fn cursors_url(peer_base_url: &str) -> String {
+    format!(
+        "{}{}?{CURSORS_ONLY_PARAM}=true",
+        peer_base_url.trim_end_matches('/'),
+        SNAPSHOT_PATH,
+    )
+}
+
 /// Fetch one peer's snapshot. `Ok(None)` means "peer reachable but has no
 /// snapshot to give" (non-200, including an older image's 404).
 ///
-/// `max_age` is the oldest export the caller can use. `None` accepts whatever
-/// the peer has cached, which is right for a splice probe reading one cursor and
-/// wrong for a bootstrap — see [`PRODUCER_CACHE_TTL`]. An older router image
-/// ignores the parameter and answers from its own cache, so a mixed-version
-/// fleet degrades to the pre-parameter behaviour rather than failing.
+/// `max_age` is the oldest export the caller can use — a correctness input for
+/// a bootstrap, since only the consumer knows when its ranks began holding; see
+/// [`PRODUCER_CACHE_TTL`]. `None` accepts whatever the peer has cached; no
+/// production path asks for that — it is the behaviour of an older router
+/// image, kept because a mixed-version fleet's old consumer asks exactly this
+/// (and component tests exercise it). An older PRODUCER ignores the parameter
+/// and answers from its own cache, so the fleet degrades to the pre-parameter
+/// behaviour rather than failing.
+pub async fn fetch_snapshot(
+    http: &reqwest::Client,
+    peer_base_url: &str,
+    max_age: Option<Duration>,
+) -> Result<Option<PeerSnapshot>, anyhow::Error> {
+    fetch_body(http, &snapshot_url(peer_base_url, max_age), peer_base_url).await
+}
+
+/// Fetch one peer's cursor table for a splice probe.
+///
+/// Asks the producer to omit the tree. The probe reads a single sequence number
+/// through [`PeerSnapshot::wire_cursor_for`] and has no use for nodes, so on a
+/// large fleet fetching a full export per unproven rank per peer is the dominant
+/// cost of the whole bootstrap path — and it scales with the tree, which is the
+/// one thing that grows without bound.
+///
+/// A producer that does not recognise the parameter ignores it and answers with
+/// a full snapshot. That decodes to the same type, and its cursor table answers
+/// the same witness question — though it is a SUBSET of the cursors-only one:
+/// the full export filters its table to ranks still carrying tree nodes, while
+/// the dedicated path reports every observed rank (see
+/// `KvEventIndex::peer_cursors_body`). A mixed-version fleet therefore degrades
+/// to the old transfer cost — and to observing only the witnesses an old
+/// producer would have reported — rather than to a false or missing witness.
+/// This is also why the shared decode still hands off to the blocking pool: on
+/// that fallback the body really can be hundreds of megabytes.
+///
+/// Never gate the answer on `producer_ready`: in this body it means "worth
+/// COPYING", and is gated on holding nodes, while the probe's question is "did
+/// you OBSERVE this publisher". A peer with an empty tree can still report the
+/// one cursor entry that proves advance, which is why the probe consults
+/// [`PeerSnapshot::wire_cursor_for`] unconditionally.
+pub async fn fetch_cursors(
+    http: &reqwest::Client,
+    peer_base_url: &str,
+) -> Result<Option<PeerSnapshot>, anyhow::Error> {
+    fetch_body(http, &cursors_url(peer_base_url), peer_base_url).await
+}
+
+/// Shared transport for both fetch shapes: send, branch on what the peer
+/// actually encoded, and decode off the runtime.
+///
+/// `peer_base_url` is carried separately from `url` only so the log names the
+/// peer rather than a URL with a query string on it.
+///
 /// # Compression
 ///
 /// The snapshot body is the largest thing this router ever transfers — it carries
@@ -1162,14 +1233,13 @@ fn snapshot_url(peer_base_url: &str, max_age: Option<Duration>) -> String {
 /// EVERY client in the process would start advertising gzip and auto-decoding
 /// responses — including the proxy client carrying SSE on the hot path. Asking
 /// on this one request keeps the behaviour change where it belongs.
-pub async fn fetch_snapshot(
+async fn fetch_body(
     http: &reqwest::Client,
+    url: &str,
     peer_base_url: &str,
-    max_age: Option<Duration>,
 ) -> Result<Option<PeerSnapshot>, anyhow::Error> {
-    let url = snapshot_url(peer_base_url, max_age);
     let resp = http
-        .get(&url)
+        .get(url)
         .header(reqwest::header::ACCEPT_ENCODING, "gzip")
         .send()
         .await?;
@@ -1177,7 +1247,7 @@ pub async fn fetch_snapshot(
         debug!(
             peer = %peer_base_url,
             status = %resp.status(),
-            "kv-bootstrap: peer returned no snapshot",
+            "kv-bootstrap: peer returned no usable body for the snapshot request",
         );
         return Ok(None);
     }
@@ -1198,8 +1268,9 @@ pub async fn fetch_snapshot(
     // Inflating and parsing a multi-megabyte tree is seconds of CPU with no await
     // point, and this runs on the runtime that also proxies requests — including
     // the SSE hot path. Hand it to the blocking pool instead of occupying a worker
-    // for the whole decode. The splice probe makes this load-bearing: it spawns one
-    // task per expired rank, each fetching from every candidate.
+    // for the whole decode. A cursors-only body does not need this, but the
+    // fallback against an unpatched peer does, and one transport path is worth
+    // more than saving a task hop on the cheap case.
     tokio::task::spawn_blocking(move || decode_snapshot(&body, gzipped))
         .await?
         .map(Some)
@@ -1271,8 +1342,7 @@ mod tests {
     }
 
     /// A caller with no freshness requirement must send a bare path, so an older
-    /// router image — and this crate's own splice probe — sees the request it
-    /// has always seen.
+    /// router image sees the request it has always seen.
     #[test]
     fn snapshot_url_omits_the_parameter_when_any_age_will_do() {
         assert_eq!(
@@ -1283,6 +1353,27 @@ mod tests {
         assert_eq!(
             snapshot_url("http://peer:3000/", None),
             format!("http://peer:3000{SNAPSHOT_PATH}"),
+        );
+    }
+
+    /// The splice probe asks for the cursor table alone. The parameter is what
+    /// makes the producer skip its tree; without this the change ships a dead
+    /// producer branch.
+    #[test]
+    fn cursors_url_asks_for_the_cursor_table_alone() {
+        assert_eq!(
+            cursors_url("http://peer:3000"),
+            format!("http://peer:3000{SNAPSHOT_PATH}?{CURSORS_ONLY_PARAM}=true"),
+        );
+        // Trailing slash on the base must not produce a doubled separator.
+        assert_eq!(
+            cursors_url("http://peer:3000/"),
+            format!("http://peer:3000{SNAPSHOT_PATH}?{CURSORS_ONLY_PARAM}=true"),
+        );
+        // An empty base yields the path-relative URI, for in-process routers.
+        assert_eq!(
+            cursors_url(""),
+            format!("{SNAPSHOT_PATH}?{CURSORS_ONLY_PARAM}=true"),
         );
     }
 

@@ -20,9 +20,10 @@ use std::sync::Arc;
 
 use axum::{routing::get, Json, Router};
 use sgl_router::policies::kv_events::bootstrap::{
-    fetch_snapshot, PeerSnapshot, VetError, VettedSnapshot, SNAPSHOT_PATH,
+    fetch_cursors, fetch_snapshot, PeerSnapshot, VetError, VettedSnapshot, CURSORS_ONLY_PARAM,
+    SNAPSHOT_PATH,
 };
-use sgl_router::policies::kv_events::{HashTree, KvWorkerId};
+use sgl_router::policies::kv_events::{HashTree, KvWorkerId, SnapshotNode, WireWorker};
 use tokio::net::TcpListener;
 use tower_http::compression::{CompressionLayer, CompressionLevel};
 
@@ -80,6 +81,40 @@ async fn serve_snapshot_gzip(snap: PeerSnapshot) -> (String, tokio::task::JoinHa
 
 fn worker(url: &str, dp_rank: u32) -> KvWorkerId {
     KvWorkerId::new(url.to_string(), dp_rank)
+}
+
+/// Serve a body chosen by whether the request asked for cursors only, so one
+/// server can stand in for both a patched and an unpatched peer.
+async fn serve_by_shape(
+    full: PeerSnapshot,
+    cursors_only: Option<PeerSnapshot>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let full = Arc::new(full);
+    let thin = cursors_only.map(Arc::new);
+    let app = Router::new().route(
+        SNAPSHOT_PATH,
+        get(move |uri: axum::http::Uri| {
+            let full = Arc::clone(&full);
+            let thin = thin.clone();
+            async move {
+                let asked_thin = uri
+                    .query()
+                    .is_some_and(|q| q.contains(&format!("{CURSORS_ONLY_PARAM}=true")));
+                match (asked_thin, thin) {
+                    // A patched peer honours the parameter.
+                    (true, Some(t)) => Json((*t).clone()),
+                    // An unpatched peer ignores it and answers in full.
+                    _ => Json((*full).clone()),
+                }
+            }
+        }),
+    );
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), handle)
 }
 
 /// A tree shaped like a real one: shared prefixes across workers, divergent
@@ -159,7 +194,7 @@ fn snapshot_of(tree: &HashTree, cursors: &[(KvWorkerId, i64)]) -> PeerSnapshot {
         producer_ready: !nodes.is_empty(),
         workers: worker_table
             .iter()
-            .map(|w| sgl_router::policies::kv_events::WireWorker {
+            .map(|w| WireWorker {
                 url: w.url.clone(),
                 dp_rank: w.dp_rank,
             })
@@ -483,4 +518,130 @@ async fn mismatched_block_size_is_refused() {
             local: 64
         }
     );
+}
+
+/// The cheap path must answer the probe's question over the real transport.
+#[tokio::test]
+async fn fetch_cursors_reads_a_cursor_without_any_nodes() {
+    let thin = PeerSnapshot {
+        format: 1,
+        block_size: 256,
+        is_bigram: false,
+        producer_ready: true,
+        workers: vec![WireWorker {
+            url: "http://w1:30000".into(),
+            dp_rank: 0,
+        }],
+        cursors: vec![(0, 99)],
+        nodes: Vec::new(),
+    };
+    // The full arm shares the cursor but carries a tree. Serving the same body
+    // for both shapes would make the empty-nodes assert below blind to which
+    // arm answered — i.e. to whether the parameter ever reached the peer.
+    let full = PeerSnapshot {
+        nodes: vec![SnapshotNode {
+            parent: None,
+            block_hash: 111,
+            workers: vec![0],
+        }],
+        ..thin.clone()
+    };
+    let (base, handle) = serve_by_shape(full, Some(thin)).await;
+
+    let got = fetch_cursors(&reqwest::Client::new(), &base)
+        .await
+        .expect("transport ok")
+        .expect("peer answered");
+    assert!(
+        got.nodes.is_empty(),
+        "the answer must come from the cursors-only arm",
+    );
+    assert_eq!(got.wire_cursor_for("http://w1:30000", 0), Some(99));
+    handle.abort();
+}
+
+/// A peer running an older image ignores the parameter and answers in full.
+/// That must still yield the cursor — the mixed-version fleet keeps its witness
+/// and merely pays the old transfer cost.
+#[tokio::test]
+async fn fetch_cursors_still_works_against_a_peer_that_ignores_the_parameter() {
+    let full = PeerSnapshot {
+        format: 1,
+        block_size: 256,
+        is_bigram: false,
+        producer_ready: true,
+        workers: vec![WireWorker {
+            url: "http://w1:30000".into(),
+            dp_rank: 0,
+        }],
+        cursors: vec![(0, 7)],
+        nodes: vec![SnapshotNode {
+            parent: None,
+            block_hash: 111,
+            workers: vec![0],
+        }],
+    };
+    // `None` = this peer has no cursors-only behaviour at all.
+    let (base, handle) = serve_by_shape(full, None).await;
+
+    let got = fetch_cursors(&reqwest::Client::new(), &base)
+        .await
+        .expect("transport ok")
+        .expect("peer answered");
+    assert_eq!(
+        got.wire_cursor_for("http://w1:30000", 0),
+        Some(7),
+        "a full body from an old peer must still answer the probe",
+    );
+    assert!(
+        !got.nodes.is_empty(),
+        "the old peer really did send its tree"
+    );
+    handle.abort();
+}
+
+/// The cursor `fetch_cursors` returns must not depend on the witness's body
+/// shape — the probe's verdict derives from that cursor alone. Both bodies
+/// come from ONE source of truth here: the thin one is the same export with
+/// the tree stripped, which for this fixture coincides with what the
+/// producer's cursors-only branch emits (the one observed rank still carries
+/// a node; the real branch builds its table live and ALSO reports observed
+/// ranks the full export filters out). Two independently hand-built bodies
+/// would prove only that `wire_cursor_for` ignores nodes, not that the
+/// shapes agree in practice.
+#[tokio::test]
+async fn a_cursors_only_witness_answers_the_same_as_a_full_one() {
+    let tree = HashTree::new();
+    let w = worker("http://w1:30000", 0);
+    tree.insert(&w, None, &[111]);
+    let full = snapshot_of(&tree, &[(w, 500)]);
+    let thin = PeerSnapshot {
+        nodes: Vec::new(),
+        ..full.clone()
+    };
+
+    // One server standing in for a patched peer: honour the parameter...
+    let (patched, h1) = serve_by_shape(full.clone(), Some(thin)).await;
+    // ...and one for an unpatched peer: ignore it.
+    let (unpatched, h2) = serve_by_shape(full, None).await;
+
+    let client = reqwest::Client::new();
+    let from_thin = fetch_cursors(&client, &patched).await.unwrap().unwrap();
+    let from_full = fetch_cursors(&client, &unpatched).await.unwrap().unwrap();
+
+    assert!(
+        from_thin.nodes.is_empty(),
+        "the patched peer really did answer with cursors alone",
+    );
+    assert!(
+        !from_full.nodes.is_empty(),
+        "the unpatched peer really did send its tree",
+    );
+    assert_eq!(
+        from_thin.wire_cursor_for("http://w1:30000", 0),
+        from_full.wire_cursor_for("http://w1:30000", 0),
+        "the witness's answer must not depend on the body shape",
+    );
+    h1.abort();
+    h2.abort();
 }

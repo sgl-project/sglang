@@ -81,6 +81,22 @@ pub struct SnapshotParams {
     /// Oldest export the caller can use, in milliseconds. Named to match
     /// [`crate::policies::kv_events::bootstrap::MAX_AGE_PARAM`].
     max_age_ms: Option<u64>,
+    /// When true, answer with the cursor table alone and omit the tree.
+    ///
+    /// A splice probe reads one sequence number per rank and has no use for
+    /// nodes, so serving it a full export is the dominant cost of the bootstrap
+    /// path on a large fleet. Named to match
+    /// [`crate::policies::kv_events::bootstrap::CURSORS_ONLY_PARAM`].
+    ///
+    /// An older router image does not send this and is unaffected; an older
+    /// PRODUCER ignores it and answers with a full snapshot, so a mixed-version
+    /// fleet pays the old transfer cost instead of failing. Note its cursor
+    /// table is narrower than this path's — the full export filters it to
+    /// ranks still carrying tree nodes (see
+    /// `KvEventIndex::peer_cursors_body`) — so an old producer loses exactly
+    /// the witnesses the new path would uniquely know, never the ones an old
+    /// fleet could report.
+    cursors_only: Option<bool>,
 }
 
 /// `GET /internal/kv_snapshot` — serve this replica's cache-aware tree so a
@@ -99,8 +115,9 @@ pub struct SnapshotParams {
 /// `?max_age_ms=N` states how stale an export the caller can use, which is a
 /// correctness input for a bootstrapping consumer rather than a preference —
 /// see [`PRODUCER_CACHE_TTL`]. Omitting it accepts whatever is cached within
-/// that default, which is what an older router image does and what a splice
-/// probe wants.
+/// that default, which is what an older router image does. A splice probe sends
+/// neither: `?cursors_only=true` is answered from the live cursor map and never
+/// goes near the export cache.
 ///
 /// # Exposure
 ///
@@ -114,6 +131,20 @@ pub async fn kv_snapshot(
 ) -> Response {
     match ctx.kv_index() {
         Some(index) => {
+            if params.cursors_only.unwrap_or(false) {
+                // No `max_age_ms` negotiation on this path: the cursors are
+                // read live, so the answer beats any freshness a caller could
+                // state. Both parameters sent → the live read wins, silently.
+                // (`?cursors_only` with no value never reaches here: serde
+                // rejects a valueless bool as a 400 — the probe always sends
+                // `=true`.)
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    axum::body::Body::from(index.peer_cursors_body()),
+                )
+                    .into_response();
+            }
             let max_age = params
                 .max_age_ms
                 .map_or(PRODUCER_CACHE_TTL, Duration::from_millis);
@@ -425,6 +456,176 @@ mod tests {
             serde_json::from_slice::<PeerSnapshot>(&body)
                 .unwrap_or_else(|e| panic!("{uri} must yield a PeerSnapshot: {e}"));
         }
+    }
+
+    /// The route must reach the cheap producer path, not serve a full export
+    /// under a different name.
+    #[tokio::test]
+    async fn kv_snapshot_route_serves_cursors_only_when_asked() {
+        use crate::policies::kv_events::bootstrap::{PeerSnapshot, SNAPSHOT_PATH};
+        let ctx = Arc::new(AppContext::stub());
+        ctx.attach_kv_index(crate::policies::kv_events::KvEventIndex::new());
+        let app = crate::server::app::build_router(Arc::clone(&ctx));
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    // A hand-written literal on purpose, unlike the builder in
+                    // the seeded test: this pins the wire contract itself, so a
+                    // thoughtless parameter rename fails here.
+                    .uri(format!("{SNAPSHOT_PATH}?cursors_only=true"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let snap: PeerSnapshot = serde_json::from_slice(&body).expect("valid snapshot JSON");
+        assert!(snap.nodes.is_empty(), "cursors-only must omit the tree");
+    }
+
+    /// On an EMPTY index the two bodies are indistinguishable — no nodes and no
+    /// cursors either way — so the test above cannot fail if the parameter is
+    /// unwired. Seed one block so the full export genuinely differs, then hold
+    /// both answers side by side: same witness question answered by both, tree
+    /// carried by no more than one.
+    #[tokio::test]
+    async fn cursors_only_route_serves_the_cursor_alone_on_a_seeded_index() {
+        use crate::policies::kv_events::bootstrap::{cursors_url, PeerSnapshot, SNAPSHOT_PATH};
+        use crate::policies::kv_events::{BlockSizeOracle, KvWorkerId};
+
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(256).expect("first set establishes");
+        oracle.set_bigram(false);
+        let index = crate::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
+            Client::new(),
+            Arc::clone(&oracle),
+        );
+        index.seed_stored_block_for_test(
+            &KvWorkerId::new("http://w1:30000".to_string(), 0),
+            42,
+            111,
+        );
+        let ctx = Arc::new(AppContext::stub());
+        ctx.attach_kv_index(index);
+        let app = crate::server::app::build_router(Arc::clone(&ctx));
+
+        // Drive the URI through the same builder the probe uses — asserting on
+        // a hand-written query string would leave the builder free to drift.
+        let thin_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(cursors_url(""))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(thin_res.status(), StatusCode::OK);
+        let thin_body = thin_res.into_body().collect().await.unwrap().to_bytes();
+        let thin: PeerSnapshot = serde_json::from_slice(&thin_body).expect("valid snapshot JSON");
+
+        let full_res = app
+            .oneshot(
+                Request::builder()
+                    .uri(SNAPSHOT_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(full_res.status(), StatusCode::OK);
+        let full_body = full_res.into_body().collect().await.unwrap().to_bytes();
+        let full: PeerSnapshot = serde_json::from_slice(&full_body).expect("valid snapshot JSON");
+
+        // Both bodies answer the witness question...
+        assert_eq!(thin.wire_cursor_for("http://w1:30000", 0), Some(42));
+        assert_eq!(full.wire_cursor_for("http://w1:30000", 0), Some(42));
+        // ...and only now, with a seeded tree, is the difference between them
+        // something an assertion can actually see.
+        assert!(thin.nodes.is_empty(), "cursors-only must omit the tree");
+        assert!(
+            !full.nodes.is_empty(),
+            "the full export must carry the seeded block",
+        );
+    }
+
+    /// Guards the one way this parameter could become dangerous: a cursors-only
+    /// body reaching the graft path. `from_wire` must refuse it — and the
+    /// refusal must come from the empty node list specifically, so the index is
+    /// seeded until `producer_ready` and the block size would PASS, leaving
+    /// `nodes.is_empty()` as the only reason left to fire.
+    #[tokio::test]
+    async fn a_cursors_only_body_can_never_be_grafted() {
+        use crate::policies::kv_events::bootstrap::{
+            PeerSnapshot, VetError, VettedSnapshot, SNAPSHOT_PATH,
+        };
+        use crate::policies::kv_events::{BlockSizeOracle, KvWorkerId};
+
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(256).expect("first set establishes");
+        oracle.set_bigram(false);
+        let index = crate::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
+            Client::new(),
+            Arc::clone(&oracle),
+        );
+        index.seed_stored_block_for_test(
+            &KvWorkerId::new("http://w1:30000".to_string(), 0),
+            42,
+            111,
+        );
+        let ctx = Arc::new(AppContext::stub());
+        ctx.attach_kv_index(index);
+        let app = crate::server::app::build_router(Arc::clone(&ctx));
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{SNAPSHOT_PATH}?cursors_only=true"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let snap: PeerSnapshot = serde_json::from_slice(&body).unwrap();
+        // Sanity: everything BUT the node list now vouches for this body, so
+        // the error below can only be the empty-nodes refusal.
+        assert!(snap.producer_ready);
+        assert_eq!(snap.block_size, 256);
+        assert!(snap.nodes.is_empty());
+
+        let live = std::collections::HashSet::new();
+        assert_eq!(
+            VettedSnapshot::from_wire(snap, &live, Some(256), false).unwrap_err(),
+            VetError::ProducerCold,
+            "an empty node list must be refused as a graft source",
+        );
+    }
+
+    /// Omitting the parameter must keep the full-export behaviour intact, which
+    /// is what an unpatched consumer relies on.
+    #[tokio::test]
+    async fn kv_snapshot_route_still_serves_a_full_snapshot_by_default() {
+        use crate::policies::kv_events::bootstrap::{PeerSnapshot, SNAPSHOT_PATH};
+        let ctx = Arc::new(AppContext::stub());
+        ctx.attach_kv_index(crate::policies::kv_events::KvEventIndex::new());
+        let app = crate::server::app::build_router(Arc::clone(&ctx));
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri(SNAPSHOT_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<PeerSnapshot>(&body).expect("valid snapshot JSON");
     }
 
     /// Spawn a fake worker that answers `POST /flush_cache` with `status`.
