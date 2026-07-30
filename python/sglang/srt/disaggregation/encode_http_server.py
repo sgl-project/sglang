@@ -501,13 +501,13 @@ async def handle_encode_request(request: dict):
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Unexpected error in encoder logic for {req_id}: {error_msg}")
-        encode_server_module.rid_to_err_msg[req_id] = error_msg
         # Ensure metadata waiters are unblocked on unexpected errors
         if encoder.server_args.encoder_transfer_backend == "mooncake":
             await encode_server_module.meta_registry.publish(
                 req_id, 0, 0, 0, error=error_msg
             )
-            encoder.discard_embedding(req_id)
+        # All backends: drop any staged embedding, or it pins /health as busy.
+        encoder.discard_embedding(req_id)
         if encode_server_module.encoder_metrics_collector is not None:
             encode_server_module.encoder_metrics_collector.inc_requests_total(
                 modality=modality_str, status="error"

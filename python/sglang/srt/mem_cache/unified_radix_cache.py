@@ -41,17 +41,10 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     ReplaceWriteThroughOnNodeSplit,
 )
-from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
-    NodeId,
-    UnifiedLRUList,
-    UnifiedTreeCore,
-    UnifiedTreeNode,
-)
 
 # UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
 # because other modules and tests import them from this module.
-from sglang.srt.mem_cache.unified_cache_components import (
+from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
@@ -60,6 +53,13 @@ from sglang.srt.mem_cache.unified_cache_components import (
     PrepareLoadBackResult,
     SWAComponent,
     TreeComponent,
+)
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
+    NodeId,
+    UnifiedLRUList,
+    UnifiedTreeCore,
+    UnifiedTreeNode,
 )
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
@@ -588,7 +588,7 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_len_to_handle
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
@@ -619,10 +619,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
 
-            # Truncate if needed
+            # Truncate if needed; the tail free is deferred and batched with
+            # the unaligned tail below so a shared boundary page is emitted once.
+            kv_indices_full = kv_indices
+            tail_free_start = None
             if effective_cache_len < len(token_ids):
-                free_start = max(effective_cache_len, req.cache_protected_len)
-                self.token_to_kv_pool_allocator.free(kv_indices[free_start:])
+                tail_free_start = max(effective_cache_len, req.cache_protected_len)
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
 
@@ -636,10 +638,16 @@ class UnifiedRadixCache(BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
-            # Free unaligned tail
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            # Free unaligned tail (+ deferred truncation tail)
+            segments = [(kv_indices[page_aligned_len:], page_aligned_len)]
+            if tail_free_start is not None:
+                segments.append((kv_indices_full[tail_free_start:], tail_free_start))
+            self.token_to_kv_pool_allocator.free_segments(segments)
         else:
-            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
+            self.token_to_kv_pool_allocator.free_segment(
+                kv_indices[req.cache_protected_len :],
+                start_pos=req.cache_protected_len,
+            )
 
         self.dec_lock_ref(
             req.last_node,
@@ -784,8 +792,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 [action.new_node_id, action.new_child_node_id],
             )
         elif isinstance(action, FreeDeviceKV):
+            # tree values are page-aligned copies of a kv row: page-exact segments
             for indices in action.indices:
-                self.token_to_kv_pool_allocator.free(indices)
+                self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             self._execute_and_commit_kv_backup(action)
         else:
@@ -1281,39 +1290,51 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Apply the host-insert walk's actions before the transfer commit.
         self._apply_cache_actions(insert_result.cache_actions)
-        commit_actions: list[CacheAction | ComponentAction] = []
-        self.tree_core.commit_hicache_transfers(
-            last_host_node_id,
-            CacheTransferPhase.PREFETCH,
-            comp_xfers,
-            cache_actions=commit_actions,
-            insert_result=insert_result,
-            pool_storage_result=operation.pool_storage_result,
-        )
-        self._apply_cache_actions(commit_actions)
-        # The commit emits via commit_actions only; the walk's were applied above.
-        assert not insert_result.cache_actions
 
-        self.cache_controller.mem_pool_host.free(
-            host_indices[: insert_result.prefix_len]
-        )
-        self.cache_controller.append_host_mem_release(
-            host_indices[min_completed_tokens:completed_tokens]
-        )
+        if insert_result.host_insert_dropped:
+            self.cache_controller.append_host_mem_release(
+                host_indices=host_indices[:completed_tokens],
+                extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
+            )
+            loaded_from_storage = 0
+            released_tokens = completed_tokens
+        else:
+            commit_actions: list[CacheAction | ComponentAction] = []
+            self.tree_core.commit_hicache_transfers(
+                last_host_node_id,
+                CacheTransferPhase.PREFETCH,
+                comp_xfers,
+                cache_actions=commit_actions,
+                insert_result=insert_result,
+                pool_storage_result=operation.pool_storage_result,
+            )
+            self._apply_cache_actions(commit_actions)
+            # The commit emits via commit_actions only; the walk's were applied above.
+            assert not insert_result.cache_actions
+
+            self.cache_controller.mem_pool_host.free(
+                host_indices[: insert_result.prefix_len]
+            )
+            self.cache_controller.append_host_mem_release(
+                host_indices[min_completed_tokens:completed_tokens]
+            )
+            loaded_from_storage = min_completed_tokens - insert_result.prefix_len
+            released_tokens = completed_tokens - min_completed_tokens
+
         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
-        loaded_from_storage = min_completed_tokens - insert_result.prefix_len
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
         logger.info(
-            "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
+            "HiCache prefetch %s req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d released=%d occupied=%d",
+            "dropped" if insert_result.host_insert_dropped else "success",
             req_id,
             completed_tokens,
             min_completed_tokens,
             insert_result.prefix_len,
             loaded_from_storage,
-            completed_tokens - min_completed_tokens,
+            released_tokens,
             self.cache_controller.prefetch_tokens_occupied,
         )
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:

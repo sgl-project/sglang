@@ -513,8 +513,11 @@ class EncoderPreprocessor:
 
     def _get_grid_dims(self, mm_inputs: dict, modality: Modality):
         attrs = _MM_GRID_ATTRS[modality]
-        if self.model_type in ("kimi_k25", "kimi_vl") and modality == Modality.IMAGE:
-            attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
+        if modality == Modality.IMAGE:
+            if self.model_type == "kimi_k25":
+                attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
+            elif self.model_type == "kimi_vl":
+                attrs = ("image_grid_hws", "image_grid_thw", "grid_thws")
         for attr in attrs:
             if attr in mm_inputs and mm_inputs[attr] is not None:
                 return mm_inputs[attr]

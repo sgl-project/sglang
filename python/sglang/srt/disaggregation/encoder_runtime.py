@@ -125,6 +125,8 @@ class EncoderScheduler:
             if not pending.future.done():
                 pending.future.cancel()
             req_id = request.get("req_id")
+            # Free anything the abandoned batch may still stage for this rid.
+            self.encoder.discard_embedding(req_id)
             logger.error(
                 f"EncoderScheduler.submit timed out after {self.request_timeout}s "
                 f"for req_id={req_id}"

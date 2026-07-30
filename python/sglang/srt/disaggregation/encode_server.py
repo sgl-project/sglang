@@ -64,7 +64,6 @@ def is_health_check_request(rid: Optional[str]) -> bool:
 rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, Set[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
-rid_to_err_msg: Dict[str, str] = dict()
 cond_dict_lock = asyncio.Lock()
 rid_to_cond: Dict[str, asyncio.Condition] = {}
 
@@ -291,17 +290,17 @@ _mm_feature_attrs = {
 
 
 def _get_mm_grid_dim(mm_inputs, modality, model_type: Optional[str] = None):
-    # Kimi K2.5 vision processor only emits `grid_thws`; prefer it over generic keys
-    # so we never pick a mis-typed or stale `image_grid_hws` field from kwargs.
     attrs = _mm_grid_attrs[modality]
-    if (model_type or "").lower() in [
-        "kimi_k25",
-        "kimi_vl",
-    ] and modality == Modality.IMAGE:
-        attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
+    model_type = (model_type or "").lower()
+    if modality == Modality.IMAGE:
+        # Kimi K2.5 emits grid_thws, while Kimi-VL emits image_grid_hws.
+        if model_type == "kimi_k25":
+            attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
+        elif model_type == "kimi_vl":
+            attrs = ("image_grid_hws", "image_grid_thw", "grid_thws")
     for attr in attrs:
         if attr in mm_inputs and mm_inputs[attr] is not None:
-            return mm_inputs[attr]
+            return _convert(mm_inputs[attr])
     raise ValueError(f"Grid dim ({_mm_grid_attrs[modality]}) not found in {mm_inputs}")
 
 
@@ -570,13 +569,59 @@ class MMEncoder:
         """Calculate number of raw patches (before merge/sampling). Used for pixel_values slicing."""
         if modality == Modality.AUDIO:
             return int(grid.item())
+        if self.model_type == "kimi_vl" and modality == Modality.IMAGE:
+            h, w = self._kimi_hw_from_patch_grid(grid)
+            return h * w
+        return int(grid[0] * grid[1] * grid[2])
+
+    @staticmethod
+    def _kimi_hw_from_patch_grid(
+        grid: Union[torch.Tensor, np.ndarray, List[int], Tuple[int, ...]],
+    ) -> Tuple[int, int]:
+        """Extract (height, width) from Kimi 2D or 3D patch-grid metadata."""
+        if isinstance(grid, torch.Tensor):
+            values = grid.flatten().tolist()
+        elif isinstance(grid, np.ndarray):
+            values = grid.reshape(-1).tolist()
         else:
-            return int(grid[0] * grid[1] * grid[2])
+            values = np.asarray(grid).reshape(-1).tolist()
+
+        if len(values) not in (2, 3):
+            raise ValueError(
+                f"Invalid Kimi image grid metadata: {values}; "
+                "expected [h, w] or [t, h, w]"
+            )
+        return int(values[-2]), int(values[-1])
+
+    def _kimi_tokens_from_patch_grid(self, grid: Union[torch.Tensor, List[int]]) -> int:
+        """Calculate Kimi image tokens from either 2D or 3D patch metadata."""
+        h, w = self._kimi_hw_from_patch_grid(grid)
+        merge_h, merge_w = self.model_config.hf_config.vision_config.merge_kernel_size
+        return (h * w) // (merge_h * merge_w)
+
+    def get_num_tokens(
+        self, grid: Union[torch.Tensor, List[int]], modality: Modality
+    ) -> int:
+        """Compatibility helper for callers that still provide patch grids."""
+        if modality == Modality.AUDIO:
+            input_length = self.get_num_patches(grid, modality)
+            return self.preprocessor._get_feat_extract_output_lengths(input_length)
+        if self.model_type in ("kimi_k25", "kimi_vl") and modality == Modality.IMAGE:
+            return self._kimi_tokens_from_patch_grid(grid)
+        merge_size = getattr(self.preprocessor.image_processor, "merge_size", 2)
+        return self.get_num_patches(grid, modality) // (merge_size**2)
 
     def slice_embedding(
-        self, mm_embedding: torch.Tensor, token_counts: Iterable[int]
+        self,
+        mm_embedding: torch.Tensor,
+        token_counts: Iterable[int],
+        modality: Optional[Modality] = None,
     ) -> List[torch.Tensor]:
-        """Slice a concatenated embedding tensor using preprocessor metadata."""
+        """Slice embeddings using token counts or legacy patch-grid metadata."""
+        if modality is not None:
+            token_counts = (
+                self.get_num_tokens(grid, modality) for grid in token_counts
+            )
         slices, offset = [], 0
         for count in token_counts:
             slices.append(mm_embedding[offset : offset + count])
@@ -1253,7 +1298,7 @@ class MMEncoder:
             if not mr_already_registered:
                 self.engine.register(embedding.data_ptr(), embedding.nbytes)
             _t_xfer_start = time.monotonic()
-            await asyncio.to_thread(
+            xfer_ret = await asyncio.to_thread(
                 self.engine.transfer_sync,
                 session_id,
                 embedding.data_ptr(),
@@ -1267,6 +1312,12 @@ class MMEncoder:
                 )
             if not mr_already_registered:
                 self.engine.deregister(embedding.data_ptr())
+            if xfer_ret < 0:
+                raise InternalError(
+                    f"Mooncake transfer_sync failed for {req_id} "
+                    f"(session={session_id}, nbytes={embedding.nbytes}, "
+                    f"ret={xfer_ret})"
+                )
             # Emit at INFO for slow transfers or per-send registrations.
             if xfer_ms > 200.0 or not mr_already_registered:
                 logger.info(
