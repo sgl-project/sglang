@@ -41,6 +41,7 @@ fn config(_worker_url: &str) -> Config {
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
+            fused: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],

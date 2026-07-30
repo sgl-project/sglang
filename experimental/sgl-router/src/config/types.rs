@@ -70,7 +70,8 @@ impl Default for ActiveLoadConfig {
 /// policy factory.
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
-/// `power_of_two` / `load_based` / `cache_aware_zmq` / `sticky`.
+/// `power_of_two` / `load_based` / `prefix_cache` / `fused_score` /
+/// `cache_aware_zmq` / `sticky`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -83,6 +84,17 @@ pub enum PolicyKind {
     /// Selects the currently least-loaded worker.
     #[value(name = "load_based")]
     LoadBased,
+    /// Continuous prefix-cache affinity: scores each worker by its own
+    /// contiguous cached depth in the KV-event `HashTree`. Usable
+    /// standalone, and the first default term of `fused_score`.
+    #[value(name = "prefix_cache")]
+    PrefixCache,
+    /// Weighted sum of the policies named by `--fuse`, defaulting to
+    /// [`DEFAULT_FUSE`]. Unlike `cache_aware_zmq` — which vetoes the cache
+    /// signal outright on load imbalance — every term here always
+    /// contributes, so the terms trade off continuously.
+    #[value(name = "fused_score")]
+    FusedScore,
     /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.
@@ -95,6 +107,17 @@ pub enum PolicyKind {
     /// `ModelConfig::sticky`.
     #[value(name = "sticky")]
     Sticky,
+}
+
+impl std::fmt::Display for PolicyKind {
+    /// The `--policy` / `--fuse` spelling, read out of clap's own table so a
+    /// diagnostic cannot name a variant differently from the flag that
+    /// accepts it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = <Self as clap::ValueEnum>::to_possible_value(self)
+            .expect("PolicyKind skips no variants");
+        f.write_str(v.get_name())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +178,62 @@ pub struct ModelConfig {
     /// The chat handler reads `sticky.header_name` to populate
     /// [`crate::policies::SelectionContext::routing_key`].
     pub sticky: Option<StickyConfig>,
+    /// Terms the fused-score policy sums. `Some` exactly when
+    /// `policy = "fused_score"` (built by
+    /// [`crate::config::cli::Cli::into_config`]), defaulting to
+    /// [`DEFAULT_FUSE`] when `--fuse` is omitted.
+    pub fused: Option<Vec<FusedTerm>>,
+}
+
+/// The pair `--policy fused_score` composes when `--fuse` is omitted, so the
+/// default is the useful one rather than an empty sum.
+pub const DEFAULT_FUSE: [PolicyKind; 2] = [PolicyKind::PrefixCache, PolicyKind::LoadBased];
+
+/// One `--fuse` term: a policy name, optionally `=weight`
+/// (`prefix_cache` or `prefix_cache=2.0`).
+///
+/// The name resolves through `PolicyKind`'s own `ValueEnum` table rather
+/// than a second hand-kept list, so anything nameable via `--policy` is
+/// nameable here the moment it exists. Whether it may actually be fused is
+/// not decided by name: the factory builds it and asks `can_fuse()`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FusedTerm {
+    pub kind: PolicyKind,
+    /// Weight override; `None` keeps the term's own `ScoringPolicy::weight()`.
+    pub weight: Option<f32>,
+}
+
+impl std::str::FromStr for FusedTerm {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let (name, weight) = match s.split_once('=') {
+            Some((n, w)) => (n, Some(parse_fuse_weight(n, w)?)),
+            None => (s, None),
+        };
+        let kind = <PolicyKind as clap::ValueEnum>::from_str(name, false)
+            .map_err(|_| format!("--fuse: `{name}` is not a policy name"))?;
+        Ok(FusedTerm { kind, weight })
+    }
+}
+
+/// Parse and bound-check one term's weight.
+///
+/// The guard is `!is_finite()`, deliberately NOT a bare `< 0.0`:
+/// `str::parse::<f32>` accepts `nan` and `inf`, and every ordered comparison
+/// against NaN is false, so `< 0.0` waves `nan` straight through. A single
+/// NaN weight makes every worker's fused total NaN, argmax discards them all
+/// and falls through to its tiebreak — the router silently degrades to
+/// least-load with no error anywhere. That bug shipped once.
+fn parse_fuse_weight(name: &str, raw: &str) -> Result<f32, String> {
+    let w: f32 = raw
+        .parse()
+        .map_err(|_| format!("--fuse: `{name}` weight `{raw}` is not a number"))?;
+    if !w.is_finite() || w < 0.0 {
+        return Err(format!(
+            "--fuse: `{name}` weight `{raw}` must be finite and >= 0"
+        ));
+    }
+    Ok(w)
 }
 
 /// Per-model cache-aware-ZMQ tuning.

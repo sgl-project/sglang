@@ -12,8 +12,8 @@ use std::num::NonZeroU32;
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
-    DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    DiscoveryBackend, FusedTerm, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig, DEFAULT_FUSE,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -69,6 +69,15 @@ pub struct Cli {
     /// Multiplicative load spread gating the absolute balance check.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
+
+    // ---- fused-score composition (only used by `--policy fused_score`) ----
+    /// Policies to sum, spelled exactly as `--policy` spells them and each
+    /// optionally weighted: `--fuse prefix_cache=2.0,load_based=0.3`. An
+    /// omitted weight keeps that policy's own default. Requires `--policy
+    /// fused_score`; when that policy is set and this flag is omitted, the
+    /// terms default to `prefix_cache,load_based`.
+    #[arg(long, value_delimiter = ',')]
+    pub fuse: Vec<FusedTerm>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -165,6 +174,40 @@ impl Cli {
             ));
         }
 
+        if !self.fuse.is_empty() && self.policy != PolicyKind::FusedScore {
+            return Err(anyhow!("--fuse requires --policy fused_score"));
+        }
+        // Resolve the term list here so a malformed composition fails at
+        // startup. Note what is deliberately NOT checked: whether a named
+        // policy can actually be fused. That question is asked of the policy
+        // itself (`Policy::can_fuse`) in the factory, never of a list of names
+        // here — a name list drifts silently the moment a policy is added.
+        let fused = if self.policy == PolicyKind::FusedScore {
+            let terms = if self.fuse.is_empty() {
+                DEFAULT_FUSE
+                    .iter()
+                    .map(|&kind| FusedTerm { kind, weight: None })
+                    .collect()
+            } else {
+                self.fuse.clone()
+            };
+            for (i, t) in terms.iter().enumerate() {
+                // There is no CLI syntax for a nested group, so a self-
+                // reference is only ever unbounded recursion in the factory.
+                if t.kind == PolicyKind::FusedScore {
+                    return Err(anyhow!("--fuse: `fused_score` cannot fuse itself"));
+                }
+                // A repeat silently doubles that term's weight instead of
+                // doing nothing, which is the surprising reading.
+                if terms[..i].iter().any(|p| p.kind == t.kind) {
+                    return Err(anyhow!("--fuse: `{}` is listed more than once", t.kind));
+                }
+            }
+            Some(terms)
+        } else {
+            None
+        };
+
         let tuned_sticky = self.routing_key_header.is_some()
             || self.sticky_fallback_policy.is_some()
             || self.sticky_idle_secs.is_some()
@@ -188,13 +231,20 @@ impl Cli {
                 anyhow!("--routing-key-header {header_name:?} is not a valid HTTP header name: {e}")
             })?;
             let fallback_policy = self.sticky_fallback_policy.unwrap_or(d.fallback_policy);
-            if matches!(
+            // An ALLOW-list, not a deny-list: `build_sticky_fallback` answers
+            // anything outside this set with `unreachable!()`, so a deny-list
+            // turns every policy added later into a startup panic instead of
+            // this message.
+            if !matches!(
                 fallback_policy,
-                PolicyKind::Sticky | PolicyKind::CacheAwareZmq
+                PolicyKind::RoundRobin
+                    | PolicyKind::Random
+                    | PolicyKind::PowerOfTwo
+                    | PolicyKind::LoadBased
             ) {
                 return Err(anyhow!(
                     "--sticky-fallback-policy must be one of round_robin / random / \
-                     power_of_two / load_based; cache_aware_zmq and sticky are not allowed"
+                     power_of_two / load_based; `{fallback_policy}` is not allowed"
                 ));
             }
             let idle_secs = self.sticky_idle_secs.unwrap_or(d.idle_secs);
@@ -267,6 +317,7 @@ impl Cli {
                 circuit_breaker,
                 cache_aware,
                 sticky,
+                fused,
             },
             discovery,
             proxy: ProxyConfig {
@@ -958,5 +1009,104 @@ mod tests {
             err.contains("--sticky-idle-secs must be greater than 0"),
             "got: {err}"
         );
+    }
+
+    /// `argv` is space-split, so a case reads as the command line an operator
+    /// would type. Model + worker URL are supplied.
+    fn cfg_of(argv: &str) -> Result<Config> {
+        let extra: Vec<&str> = argv.split_whitespace().collect();
+        into_config_owned(with_model(
+            &[&["--worker-urls", "http://10.0.0.1:30000"], &extra[..]].concat(),
+        ))
+    }
+
+    fn fuse_err(argv: &str) -> String {
+        cfg_of(argv).unwrap_err().to_string()
+    }
+
+    /// Resolved terms as `(kind, weight)` pairs; `None` when the policy is
+    /// not `fused_score` and so builds no term list at all.
+    fn fused_of(argv: &str) -> Option<Vec<(PolicyKind, Option<f32>)>> {
+        let ts = cfg_of(argv).unwrap().model.fused?;
+        Some(ts.iter().map(|t| (t.kind, t.weight)).collect())
+    }
+
+    fn fuse_ok(argv: &str) -> Vec<(PolicyKind, Option<f32>)> {
+        fused_of(argv).expect("fused_score builds a term list")
+    }
+
+    /// `--policy fused_score` alone composes the useful pair, and `--fuse`
+    /// overrides it with names + optional per-term weights.
+    #[test]
+    fn fuse_defaults_to_the_useful_pair_and_parses_weights() {
+        use PolicyKind::{LoadBased, PrefixCache, Random};
+        let pair = [(PrefixCache, None), (LoadBased, None)];
+        assert_eq!(fuse_ok("--policy fused_score"), pair);
+        // Comma-separated, order preserved, weight optional per term.
+        assert_eq!(
+            fuse_ok("--policy fused_score --fuse load_based=0.3,random"),
+            [(LoadBased, Some(0.3)), (Random, None)],
+        );
+        assert!(fused_of("").is_none(), "round_robin builds no term list");
+    }
+
+    /// Non-finite and negative weights are refused, naming the term.
+    ///
+    /// `nan`/`inf` matter more than they look: `str::parse::<f32>` accepts
+    /// both, and a NaN weight makes every worker's fused total NaN, so argmax
+    /// discards them all and the router silently degrades to least-load.
+    #[test]
+    fn fuse_rejects_non_finite_and_negative_weights() {
+        for bad in ["nan", "NaN", "inf", "-inf", "-0.5", "banana"] {
+            let err = fuse_err(&format!("--policy fused_score --fuse load_based={bad}"));
+            assert!(err.contains("load_based"), "{bad}: names the term: {err}");
+            assert!(
+                err.contains("must be finite and >= 0") || err.contains("is not a number"),
+                "{bad}: {err}",
+            );
+        }
+        // Not "reject every weight": the finite non-negative ones pass, and 0
+        // is legal (it mutes a term without removing it from the sum).
+        for good in ["0", "0.3", "2", "1e3"] {
+            let got = fuse_ok(&format!("--policy fused_score --fuse load_based={good}"))[0].1;
+            assert_eq!(got, Some(good.parse::<f32>().unwrap()));
+        }
+    }
+
+    /// The compositions that are malformed rather than merely non-fusable.
+    /// (Fusability itself is the factory's question, asked of `can_fuse()`.)
+    ///
+    /// The last case is the allow-list regression: as a deny-list of {sticky,
+    /// cache_aware_zmq} the fallback check admitted every newly added policy,
+    /// and `build_sticky_fallback` answers those with `unreachable!()` — so
+    /// that argv PANICKED at startup instead of producing a message.
+    #[test]
+    fn fuse_rejects_malformed_compositions() {
+        // Every case must NAME the offending token, not just complain.
+        let cases: [(&str, &[&str]); 5] = [
+            ("--fuse load_based", &["--fuse requires", "fused_score"]),
+            (
+                "--policy fused_score --fuse fused_score,load_based",
+                &["fused_score", "cannot fuse itself"],
+            ),
+            (
+                "--policy fused_score --fuse load_based,load_based",
+                &["load_based", "listed more than once"],
+            ),
+            (
+                "--policy fused_score --fuse not_a_policy",
+                &["not_a_policy", "is not a policy name"],
+            ),
+            (
+                "--policy sticky --sticky-fallback-policy prefix_cache",
+                &["prefix_cache", "must be one of round_robin"],
+            ),
+        ];
+        for (argv, wants) in cases {
+            let err = fuse_err(argv);
+            for want in wants {
+                assert!(err.contains(want), "{argv}: want {want:?}, got: {err}");
+            }
+        }
     }
 }

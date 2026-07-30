@@ -10,11 +10,12 @@ use crate::policies::{
     power_of_two::PowerOfTwoChoicesPolicy,
     random::RandomPolicy,
     round_robin::RoundRobinPolicy,
+    scoring::{prefix_cache, prefix_cache::PrefixCachePolicy, FusedScorePolicy},
     sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
 use crate::tokenizer::TokenizerRegistry;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,7 +29,10 @@ fn build_sticky_fallback(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
-        PolicyKind::CacheAwareZmq | PolicyKind::Sticky => {
+        PolicyKind::CacheAwareZmq
+        | PolicyKind::Sticky
+        | PolicyKind::PrefixCache
+        | PolicyKind::FusedScore => {
             unreachable!("sticky fallback is validated to be dependency-free in Cli::into_config")
         }
     }
@@ -53,13 +57,16 @@ fn build_sticky(model: &ModelConfig) -> Arc<dyn Policy> {
 /// cache-aware-zmq variant; other policies ignore them. Callers building
 /// all policies for the same process pass the same instances to every
 /// model.
+///
+/// Fallible because `--policy fused_score` can name a term that turns out not
+/// to be fusable — a startup error rather than a request-time surprise.
 pub fn build_policy(
     model: &ModelConfig,
     tree: Arc<HashTree>,
     tokenizers: Arc<TokenizerRegistry>,
     block_size_oracle: Arc<BlockSizeOracle>,
-) -> Arc<dyn Policy> {
-    match model.policy {
+) -> Result<Arc<dyn Policy>> {
+    Ok(match model.policy {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
@@ -74,7 +81,53 @@ pub fn build_policy(
             ))
         }
         PolicyKind::Sticky => build_sticky(model),
+        PolicyKind::FusedScore => build_fused(model, &tree, &tokenizers, &block_size_oracle)?,
+        PolicyKind::PrefixCache => Arc::new(PrefixCachePolicy::new(
+            tree,
+            block_size_oracle,
+            prefix_cache::DEFAULT_WEIGHT,
+        )),
+    })
+}
+
+/// Build the composer for `--policy fused_score`.
+///
+/// Each term is built by `build_policy` itself, so terms get the same
+/// dependencies real policies get and there is no second name table. A term
+/// naming `fused_score` recurses once into an empty spec and stops there.
+fn build_fused(
+    model: &ModelConfig,
+    tree: &Arc<HashTree>,
+    tokenizers: &Arc<TokenizerRegistry>,
+    oracle: &Arc<BlockSizeOracle>,
+) -> Result<Arc<dyn Policy>> {
+    let spec = model.fused.as_deref().unwrap_or_default();
+    if spec.is_empty() {
+        return Err(anyhow!(
+            "--policy fused_score needs at least one --fuse term"
+        ));
     }
+    let mut terms: Vec<(Arc<dyn Policy>, Option<f32>)> = Vec::with_capacity(spec.len());
+    for t in spec {
+        let mut m = model.clone();
+        (m.policy, m.fused) = (t.kind, None);
+        let inner = build_policy(
+            &m,
+            Arc::clone(tree),
+            Arc::clone(tokenizers),
+            Arc::clone(oracle),
+        )?;
+        // Fusability is asked of the BUILT policy via `can_fuse()`, never
+        // matched on `kind`: a name list here would be a second source of
+        // truth and would go stale the first time someone adds a policy.
+        // `FusedScorePolicy::new` re-checks; this one exists only to name the
+        // CLI term, which its `{p:?}` message cannot.
+        if !inner.can_fuse() {
+            return Err(anyhow!("--fuse: `{}` does not support fusion", t.kind));
+        }
+        terms.push((inner, t.weight));
+    }
+    Ok(Arc::new(FusedScorePolicy::new(terms)?))
 }
 
 /// Compatibility shim used by tests + non-cache-aware code paths. Builds
@@ -82,8 +135,8 @@ pub fn build_policy(
 /// `CacheAwareZmq` to keep the call sites that don't have a `HashTree` /
 /// `TokenizerRegistry` to hand from accidentally compiling.
 #[cfg(test)]
-pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
-    match kind {
+pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
+    Ok(match kind {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
@@ -108,7 +161,17 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
                 build_sticky_fallback(s.fallback_policy),
             ))
         }
-    }
+        PolicyKind::PrefixCache => Arc::new(PrefixCachePolicy::new(
+            Arc::new(HashTree::new()),
+            BlockSizeOracle::new(),
+            prefix_cache::DEFAULT_WEIGHT,
+        )),
+        // The only genuinely dependency-BOUND kind: its terms live on
+        // `ModelConfig`, which this constructor by definition does not have.
+        PolicyKind::FusedScore => {
+            return Err(anyhow!("--policy {kind} needs --fuse terms from the model"))
+        }
+    })
 }
 
 pub fn build_registry(
@@ -126,7 +189,7 @@ pub fn build_registry(
             Arc::clone(&tree),
             Arc::clone(&tokenizers),
             Arc::clone(&block_size_oracle),
-        ),
+        )?,
     );
     Ok(reg)
 }
@@ -172,6 +235,7 @@ mod tests {
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,
+                fused: None,
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://placeholder:0".into()],
@@ -184,12 +248,70 @@ mod tests {
     #[test]
     fn build_policy_kind_only_covers_all_variants() {
         // Trivially total — the match is exhaustive over `PolicyKind`.
-        let _ = build_policy_kind_only(PolicyKind::RoundRobin);
-        let _ = build_policy_kind_only(PolicyKind::Random);
-        let _ = build_policy_kind_only(PolicyKind::PowerOfTwo);
-        let _ = build_policy_kind_only(PolicyKind::LoadBased);
-        let _ = build_policy_kind_only(PolicyKind::CacheAwareZmq);
-        let _ = build_policy_kind_only(PolicyKind::Sticky);
+        for kind in [
+            PolicyKind::RoundRobin,
+            PolicyKind::Random,
+            PolicyKind::PowerOfTwo,
+            PolicyKind::LoadBased,
+            PolicyKind::CacheAwareZmq,
+            PolicyKind::Sticky,
+            // INVERTED (was asserted is_err): the `not_wired_yet` refusal it
+            // pinned was a temporary state, not the contract. PLAN requires
+            // prefix_cache usable standalone via `--policy prefix_cache`.
+            PolicyKind::PrefixCache,
+        ] {
+            assert!(build_policy_kind_only(kind).is_ok(), "{kind:?}");
+        }
+        // FusedScore stays refused here permanently, and for a different
+        // reason: its terms live on `ModelConfig`, which this constructor
+        // does not take. `build_policy` is the door for it.
+        assert!(build_policy_kind_only(PolicyKind::FusedScore).is_err());
+    }
+
+    /// The standalone path PLAN requires, exercised through `build_policy`
+    /// rather than the dependency-free constructor, so the real `tree` and
+    /// `oracle` are the ones threaded in.
+    #[test]
+    fn prefix_cache_builds_standalone_and_is_fusable() {
+        let p = build_policy(
+            &cfg_with_model("m", PolicyKind::PrefixCache).model,
+            Arc::new(HashTree::new()),
+            Arc::new(TokenizerRegistry::default()),
+            BlockSizeOracle::new(),
+        )
+        .expect("--policy prefix_cache must build");
+        // Not decoration: a `--fuse prefix_cache=W` term is admitted by
+        // exactly this flag, so standalone-but-unfusable would be a silent
+        // half-wiring that the is_ok() above cannot see.
+        assert!(p.can_fuse(), "prefix_cache must be usable as a --fuse term");
+    }
+
+    /// The refusal must land while the registry is being built, not on the
+    /// first request that happens to route.
+    #[test]
+    fn fused_score_refuses_a_non_fusable_term_at_startup() {
+        let mut cfg = cfg_with_model("m", PolicyKind::FusedScore);
+        let term = |kind, weight| crate::config::FusedTerm { kind, weight };
+
+        // Positive half, from W3's `e864459d8d`: without it a gate that
+        // refused EVERY term would pass the negative half below. `Some(2.5)`
+        // is the only end-to-end cover of the `--fuse name=weight` override.
+        for weight in [None, Some(2.5)] {
+            cfg.model.fused = Some(vec![term(PolicyKind::PrefixCache, weight)]);
+            assert!(build_registry_with_defaults(&cfg).is_ok(), "{weight:?}");
+        }
+
+        cfg.model.fused = Some(vec![term(PolicyKind::RoundRobin, None)]);
+        let err = build_registry_with_defaults(&cfg).unwrap_err().to_string();
+        assert!(err.contains("round_robin"), "{err}");
+        assert!(err.contains("does not support fusion"), "{err}");
+
+        // And an empty spec is refused too, rather than summing nothing.
+        cfg.model.fused = Some(vec![]);
+        assert!(build_registry_with_defaults(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("at least one --fuse term"));
     }
 
     #[test]

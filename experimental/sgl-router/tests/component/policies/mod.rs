@@ -4,6 +4,7 @@
 mod zmq_helpers;
 
 mod cache_aware_zmq;
+mod fused_score;
 mod kv_events_hash_parity;
 mod kv_events_tree_concurrent;
 mod kv_events_two_subscribers;
