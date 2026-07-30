@@ -26,7 +26,7 @@ register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-large-amd")
 # replaced: the auto-derived fraction left too little room for the ViT
 # activations plus the piecewise graph private pools, and the server died under
 # the 1024-thread gsm8k load.
-AMD_MEM_FRACTION_STATIC = 0.75
+AMD_MEM_FRACTION_STATIC = 0.6
 
 
 class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
