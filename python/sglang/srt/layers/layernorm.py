@@ -159,7 +159,11 @@ logger = logging.getLogger(__name__)
 
 if _is_npu:
     import torch_npu
-    from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
+
+    from sglang.kernels.ops.layernorm import (
+        gemma_fused_add_rmsnorm as npu_gemma_fused_add_rmsnorm,
+    )
+    from sglang.kernels.ops.layernorm import gemma_rmsnorm as npu_gemma_rmsnorm
 
 
 @lru_cache(maxsize=1)
@@ -995,13 +999,10 @@ class GemmaRMSNorm(MultiPlatformOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            norm_out, residual = add_gemma_rms_norm(
-                x, self.weight, residual, self.variance_epsilon
-            )
-            return norm_out, residual
+            npu_gemma_fused_add_rmsnorm(x, residual, self.weight, self.variance_epsilon)
+            return x, residual
 
-        x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
-        return x
+        return npu_gemma_rmsnorm(x, self.weight, self.variance_epsilon)
 
     def forward_xpu(
         self,
@@ -1093,10 +1094,12 @@ class Gemma3RMSNorm(MultiPlatformOp):
         return self.forward_native(x, residual)
 
     def forward_npu(self, x, residual: Optional[torch.Tensor] = None):
-        if residual is not None:
+        if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
             return self.forward_native(x, residual)
-        output, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.eps)
-        return output
+        if residual is not None:
+            npu_gemma_fused_add_rmsnorm(x, residual, self.weight, self.eps)
+            return x, residual
+        return npu_gemma_rmsnorm(x, self.weight, self.eps)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
