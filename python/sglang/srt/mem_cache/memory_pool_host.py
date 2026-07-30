@@ -245,6 +245,48 @@ class MambaPoolHost(HostKVCache):
             )
         return None
 
+    @classmethod
+    def _state_component_unavailable_reason(
+        cls,
+        device_state: torch.Tensor,
+        host_state: torch.Tensor,
+        component: int,
+    ) -> Optional[str]:
+        if device_state.device.type != "npu":
+            return (
+                f"device component {component} is on "
+                f"{device_state.device.type}, expected npu"
+            )
+        if host_state.device.type != "cpu":
+            return (
+                f"host component {component} is on "
+                f"{host_state.device.type}, expected cpu"
+            )
+        try:
+            is_pinned = bool(host_state.is_pinned())
+        except Exception as error:
+            return (
+                f"host component {component} pinned-memory query failed: "
+                f"{type(error).__name__}"
+            )
+        if not is_pinned:
+            return f"host component {component} is not pinned"
+        if not host_state.is_contiguous():
+            return f"host component {component} is not contiguous"
+        if device_state.dtype != host_state.dtype:
+            return f"component {component} has different device/host dtypes"
+        if device_state.dim() < 3 or host_state.dim() != device_state.dim() + 1:
+            return f"component {component} has an unsupported rank"
+        if (
+            device_state.shape[0] != host_state.shape[1]
+            or host_state.shape[2] != 1
+            or tuple(device_state.shape[2:]) != tuple(host_state.shape[3:])
+        ):
+            return f"component {component} has an unsupported layout"
+        return cls._dense_device_slot_payload_unavailable_reason(
+            device_state, component
+        )
+
     def _ascend_async_unavailable_reason(self) -> Optional[str]:
         if transfer_state_dim_exchange is None or not hasattr(
             torch.ops.npu, "transfer_state_dim_exchange"
@@ -262,42 +304,11 @@ class MambaPoolHost(HostKVCache):
         for component, (device_state, host_state) in enumerate(
             zip(device_states, host_states)
         ):
-            if device_state.device.type != "npu":
-                return (
-                    f"device component {component} is on "
-                    f"{device_state.device.type}, expected npu"
-                )
-            if host_state.device.type != "cpu":
-                return (
-                    f"host component {component} is on "
-                    f"{host_state.device.type}, expected cpu"
-                )
-            try:
-                is_pinned = bool(host_state.is_pinned())
-            except Exception as error:
-                return (
-                    f"host component {component} pinned-memory query failed: "
-                    f"{type(error).__name__}"
-                )
-            if not is_pinned:
-                return f"host component {component} is not pinned"
-            if not host_state.is_contiguous():
-                return f"host component {component} is not contiguous"
-            if device_state.dtype != host_state.dtype:
-                return f"component {component} has different device/host dtypes"
-            if device_state.dim() < 3 or host_state.dim() != device_state.dim() + 1:
-                return f"component {component} has an unsupported rank"
-            if (
-                device_state.shape[0] != host_state.shape[1]
-                or host_state.shape[2] != 1
-                or tuple(device_state.shape[2:]) != tuple(host_state.shape[3:])
-            ):
-                return f"component {component} has an unsupported layout"
-            payload_reason = self._dense_device_slot_payload_unavailable_reason(
-                device_state, component
+            unavailable_reason = self._state_component_unavailable_reason(
+                device_state, host_state, component
             )
-            if payload_reason is not None:
-                return payload_reason
+            if unavailable_reason is not None:
+                return unavailable_reason
         return None
 
     def _configure_ascend_mamba_io(self) -> None:
