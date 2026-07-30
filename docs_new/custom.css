@@ -168,7 +168,7 @@ html.dark table tbody tr:nth-child(even) td,
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  margin: 2px 0 0;
+  margin: -2.75rem 0 0;
 }
 
 .sgd-model-tags .sgd-chip {
