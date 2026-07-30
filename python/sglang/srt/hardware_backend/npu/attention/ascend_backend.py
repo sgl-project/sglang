@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_flags
-from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
 
 if TYPE_CHECKING:
@@ -42,6 +42,13 @@ from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
+
+
+def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
+    return (
+        spec_info is not None
+        and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+    )
 
 
 def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
@@ -480,7 +487,9 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
-        if forward_batch.forward_mode.is_target_verify():
+        if forward_batch.forward_mode.is_target_verify() and not _is_dflash_verify(
+            forward_batch.spec_info
+        ):
             self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -667,7 +676,7 @@ class AscendAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
         max_len = seq_lens_cpu[:bs].max().item()
-        if forward_mode.is_target_verify():
+        if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
             max_len += self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             max_len += self.speculative_step_id + 1
@@ -684,11 +693,11 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables_swa[bs:, :].fill_(0)
 
             # Update SWA mask: True = masked out (don't attend), False = attend
-            seq_lens_int = seq_lens_cpu[:bs].int()
+            seq_lens_int = seq_lens[:bs].int()
             starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
             indices = self.graph_metadata["swa_indices"]
-            start_exp = starts.unsqueeze(1).to(self.device)
-            seq_exp = seq_lens_int.unsqueeze(1).to(self.device)
+            start_exp = starts.unsqueeze(1)
+            seq_exp = seq_lens_int.unsqueeze(1)
             mask = (indices.unsqueeze(0) < start_exp) | (
                 indices.unsqueeze(0) >= seq_exp
             )
@@ -849,7 +858,10 @@ class AscendAttnBackend(AttentionBackend):
         q_nope_next = q_nope_next.contiguous()
         q_rope_prev = q_rope_prev.contiguous()
         q_rope_next = q_rope_next.contiguous()
-        topk_indices_prev, topk_indices_next = topk_indices
+        topk_indices = _expand_dsa_sparse_indices(topk_indices)
+        topk_indices_prev, topk_indices_next = torch.split(
+            topk_indices, split_len, dim=0
+        )
 
         actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
