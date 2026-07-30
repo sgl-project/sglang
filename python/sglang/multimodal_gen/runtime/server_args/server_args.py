@@ -1563,9 +1563,12 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.dit_cuda_graph,
             help="DiT CUDA-graph mode. 'breakable' captures graph segments "
             "split at attention (dynamic shapes via text buckets; see "
-            "--bcg-text-buckets). 'full' captures the whole forward, SP "
-            "collectives included, as one graph: model-agnostic, and any "
-            "tensor-signature change falls back to eager permanently.",
+            "--bcg-text-buckets). 'full' captures the whole forward as one "
+            "graph: model-agnostic, and any signature change falls back to "
+            "eager permanently. 'full' needs a forward with no NCCL "
+            "collectives in it (those hang on replay), so it stays eager when "
+            "tp/sp is sharded, when Cache-DiT is on, or under a sparse "
+            "attention backend.",
         )
         parser.add_argument(
             "--enable-breakable-cuda-graph",

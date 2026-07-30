@@ -52,6 +52,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_sp_world_size,
     get_tp_group,
+    get_tp_world_size,
     get_world_group,
     get_world_size,
     model_parallel_is_initialized,
@@ -2203,7 +2204,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         Sparse backends (STA/VSA/SVG2/VMoBA/block-sparse/rain-fusion) rebuild
         their attention metadata every step — a replay would reuse step 0's
         block layout — and Cache-DiT decides per step whether to skip blocks,
-        which cannot be baked into one graph. Both keep eager."""
+        which cannot be baked into one graph. A sharded run puts NCCL
+        collectives inside the captured region, which hang on replay. All three
+        keep eager."""
         if self.server_args.dit_cuda_graph != "full" or self._bcg_is_warmup():
             return False
         if self._cache_dit_enabled:
@@ -2213,6 +2216,20 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             self._fcg_log_skip(
                 f"attention backend {self.attn_backend.get_enum()} rebuilds "
                 "per-step metadata"
+            )
+            return False
+        if get_sp_world_size() > 1 or get_tp_world_size() > 1:
+            # A NCCL collective recorded into the graph deadlocks on replay:
+            # ProcessGroupNCCL bakes its per-op sequence number into the
+            # capture, so replayed kernels no longer match the peer's. (This is
+            # why BCG splits its segments at attention instead.) Whole-forward
+            # capture therefore needs every in-forward collective to come from a
+            # capture-safe transport; until one is wired up, sharded runs stay
+            # eager. Measured on 2xH100 Ulysses: both ranks hang in
+            # graph.replay() with the NCCL all-to-all captured.
+            self._fcg_log_skip(
+                f"sp={get_sp_world_size()} tp={get_tp_world_size()}: NCCL "
+                "collectives inside the forward are not replay-safe"
             )
             return False
         return True
