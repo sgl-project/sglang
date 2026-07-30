@@ -118,13 +118,15 @@ elif [ "$PHASE" = "evidence" ]; then
   run_bench_one_batch uniform "$UNIFORM_BS" "$ISL"
   run_bench_one_batch skew 1 "$SKEW_ISL"
 elif [ "$PHASE" = "profile" ]; then
-  # osl=1 never reaches the decode stage, so --profile-by-stage leaves the profiler
-  # armed; clear it explicitly around every profiled run.
+  # No --profile-by-stage: with osl=1 the decode stage never arrives, so the stage
+  # splitter leaves the profiler armed and only ranks that ran an extend forward
+  # ever dump. A fixed step count dumps one trace per rank instead.
+  PROFILE_STEPS=${PROFILE_STEPS:-24}
   curl -s -X POST "$BASE/stop_profile" > /dev/null 2>&1
-  run_bench_one_batch uniform_prof "$UNIFORM_BS" "$ISL" --profile --profile-activities GPU --profile-by-stage
+  run_bench_one_batch uniform_prof "$UNIFORM_BS" "$ISL" --profile --profile-activities GPU --profile-steps "$PROFILE_STEPS"
   curl -s -X POST "$BASE/stop_profile" > /dev/null 2>&1
   sleep 20
-  run_bench_one_batch skew_prof 1 "$SKEW_ISL" --profile --profile-activities GPU --profile-by-stage
+  run_bench_one_batch skew_prof 1 "$SKEW_ISL" --profile --profile-activities GPU --profile-steps "$PROFILE_STEPS"
   curl -s -X POST "$BASE/stop_profile" > /dev/null 2>&1
   sleep 20
 fi
