@@ -661,8 +661,29 @@ class ModelConfig:
             self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoeForCausalLM":
-            self.hf_config.architectures[0] = "ExaoneMoeForCausalLMMTP"
-            self.hf_config.num_nextn_predict_layers = 1
+            from sglang.srt.speculative.dspark_components.dspark_config import (
+                checkpoint_bundles_dspark_draft,
+            )
+
+            if self.speculative_algorithm in (
+                None,
+                "DSPARK",
+            ) and checkpoint_bundles_dspark_draft(self.hf_config):
+                cfg = self.hf_config
+                cfg.architectures[0] = "ExaoneMoeDSparkModel"
+                cfg.num_hidden_layers = cfg.dspark_num_hidden_layers
+                cfg.num_target_layers = cfg.dspark_num_target_layers
+                cfg.block_size = cfg.dspark_block_size
+                cfg.target_layer_ids = cfg.dspark_target_layer_ids
+                cfg.markov_rank = cfg.dspark_markov_rank
+                cfg.markov_head_type = cfg.dspark_markov_head_type
+                cfg.mask_token_id = cfg.dspark_noise_token_id
+                cfg.enable_confidence_head = cfg.dspark_enable_confidence_head
+                cfg.confidence_head_with_markov = cfg.dspark_confidence_head_with_markov
+                cfg.layer_types = cfg.mtp_layer_types
+            else:
+                self.hf_config.architectures[0] = "ExaoneMoeForCausalLMMTP"
+                self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] in [
             "NemotronHForCausalLM",
