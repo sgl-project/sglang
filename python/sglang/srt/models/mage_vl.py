@@ -1,4 +1,5 @@
 """Inference-only Mage-VL model for sglang."""
+
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -46,17 +47,20 @@ class VisionRotaryEmbedding(nn.Module):
         self.base = base
         self.register_buffer(
             "inv_freq_t",
-            1.0 / (base ** (torch.arange(self.t_size, dtype=torch.float32) / self.t_size)),
+            1.0
+            / (base ** (torch.arange(self.t_size, dtype=torch.float32) / self.t_size)),
             persistent=False,
         )
         self.register_buffer(
             "inv_freq_h",
-            1.0 / (base ** (torch.arange(self.h_size, dtype=torch.float32) / self.h_size)),
+            1.0
+            / (base ** (torch.arange(self.h_size, dtype=torch.float32) / self.h_size)),
             persistent=False,
         )
         self.register_buffer(
             "inv_freq_w",
-            1.0 / (base ** (torch.arange(self.w_size, dtype=torch.float32) / self.w_size)),
+            1.0
+            / (base ** (torch.arange(self.w_size, dtype=torch.float32) / self.w_size)),
             persistent=False,
         )
 
@@ -211,9 +215,9 @@ class MageVLVisionEmbeddings(nn.Module):
         hidden_states = hidden_states.view(
             -1, self.in_channels, self.patch_size, self.patch_size
         )
-        hidden_states = self.patch_embedding(
-            hidden_states.to(dtype=target_dtype)
-        ).view(-1, self.embed_dim)
+        hidden_states = self.patch_embedding(hidden_states.to(dtype=target_dtype)).view(
+            -1, self.embed_dim
+        )
         return hidden_states
 
 
@@ -237,7 +241,7 @@ class MageVLVisionPatchMerger(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size ** 2)
+        self.hidden_size = context_dim * (spatial_merge_size**2)
         self.spatial_merge_size = spatial_merge_size
         self.use_patch_position_encoding = use_patch_position_encoding
         self.ln_q = nn.LayerNorm(context_dim, eps=layer_norm_eps)
@@ -281,7 +285,7 @@ class MageVLVisionPatchMerger(nn.Module):
         x = act(x)
         x, _ = fc2(x)
         if self.use_patch_position_encoding and patch_positions is not None:
-            pp = patch_positions.view(-1, self.spatial_merge_size ** 2, 3)[:, 0, :]
+            pp = patch_positions.view(-1, self.spatial_merge_size**2, 3)[:, 0, :]
             pp = (pp // self.spatial_merge_size).long()
             x = x + self.pos_emb_h(pp[:, 1]) + self.pos_emb_w(pp[:, 2])
         return x
@@ -373,7 +377,9 @@ class MageVLVisionBlock(nn.Module):
         # for FA varlen backends that can consume it (current backends recompute
         # it from cu_seqlens, so this is a forward-compatible pass-through).
         attn = self.attn(
-            h, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings,
+            h,
+            cu_seqlens=cu_seqlens,
+            position_embeddings=position_embeddings,
             max_seqlen=max_seqlen,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
@@ -389,17 +395,25 @@ class MageVLVisionEncoder(nn.Module):
     ``encoder.layers.{i}.*`` load directly into our sglang port.
     """
 
-    def __init__(self, config, quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = "", qkv_backend: Optional[str] = None):
+    def __init__(
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        qkv_backend: Optional[str] = None,
+    ):
         super().__init__()
-        self.layers = nn.ModuleList([
-            MageVLVisionBlock(
-                config, quant_config=quant_config,
-                prefix=add_prefix(f"layers.{i}", prefix),
-                qkv_backend=qkv_backend,
-            )
-            for i in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                MageVLVisionBlock(
+                    config,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{i}", prefix),
+                    qkv_backend=qkv_backend,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
     def forward(
         self,
@@ -455,7 +469,8 @@ class MageVLVisionTransformer(nn.Module):
         self.video_rope = VisionRotaryEmbedding(config)
 
         self.encoder = MageVLVisionEncoder(
-            config, quant_config=quant_config,
+            config,
+            quant_config=quant_config,
             prefix=add_prefix("encoder", prefix),
             qkv_backend=qkv_backend,
         )
@@ -470,8 +485,12 @@ class MageVLVisionTransformer(nn.Module):
             context_dim=config.hidden_size,
             spatial_merge_size=config.spatial_merge_size,
             layer_norm_eps=config.layer_norm_eps,
-            use_patch_position_encoding=getattr(config, "use_patch_position_encoding", False),
-            patch_position_encoding_type=getattr(config, "patch_position_encoding_type", "absolute"),
+            use_patch_position_encoding=getattr(
+                config, "use_patch_position_encoding", False
+            ),
+            patch_position_encoding_type=getattr(
+                config, "patch_position_encoding_type", "absolute"
+            ),
             max_position_embeddings=getattr(config, "max_position_embeddings", 8192),
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
@@ -496,7 +515,7 @@ class MageVLVisionTransformer(nn.Module):
         if patch_positions.dim() == 3:
             patch_positions = patch_positions.squeeze(0)
         freqs = self.video_rope.forward_from_positions(patch_positions)  # [N, half]
-        freqs = torch.cat([freqs, freqs], dim=-1)                         # [N, head_dim]
+        freqs = torch.cat([freqs, freqs], dim=-1)  # [N, head_dim]
         cos = freqs.cos().to(h.dtype)
         sin = freqs.sin().to(h.dtype)
 
@@ -546,7 +565,12 @@ class MageVLForConditionalGeneration(nn.Module):
 
     # BitsAndBytes scaffolding (matches OneVision 1.5; harmless if BnB unused)
     default_bitsandbytes_target_modules = [
-        ".fc2.", ".fc1.", ".q_proj.", ".k_proj.", ".v_proj.", ".o_proj.",
+        ".fc2.",
+        ".fc1.",
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
     ]
     bitsandbytes_stacked_params_mapping = {
         "q_proj": ("qkv_proj", 0),
@@ -583,13 +607,12 @@ class MageVLForConditionalGeneration(nn.Module):
         )
         if getattr(config, "tie_word_embeddings", False):
             import logging
+
             logging.warning("tied word embeddings is not supported in Mage-VL.")
 
         # mrope is enabled when the text config has ``rope_scaling`` with ``mrope_section``
         text_rope = getattr(config.text_config, "rope_scaling", None)
-        self.is_mrope_enabled = (
-            text_rope is not None and "mrope_section" in text_rope
-        )
+        self.is_mrope_enabled = text_rope is not None and "mrope_section" in text_rope
 
         self.logits_processor = LogitsProcessor(config.text_config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -598,7 +621,8 @@ class MageVLForConditionalGeneration(nn.Module):
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
-            input_ids, mm_inputs,
+            input_ids,
+            mm_inputs,
         )
 
     # ---- vision feature path (image-only; video aliases) ----
@@ -674,7 +698,10 @@ class MageVLForConditionalGeneration(nn.Module):
         )
         if not get_embedding:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch,
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
             )
         return self.pooler(hidden_states, forward_batch)
 

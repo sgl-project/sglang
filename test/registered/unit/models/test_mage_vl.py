@@ -126,7 +126,9 @@ class TestRotateHalfInterleaved(unittest.TestCase):
 
 class TestVisionRotaryEmbeddingSplit(unittest.TestCase):
     def test_computes_4_6_6_split_of_half_head_dim(self):
-        config = SimpleNamespace(hidden_size=64, num_attention_heads=1, rope_theta=10000.0)
+        config = SimpleNamespace(
+            hidden_size=64, num_attention_heads=1, rope_theta=10000.0
+        )
         rope = VisionRotaryEmbedding(config)
         self.assertEqual(rope.head_dim, 64)
         self.assertEqual(rope.half, 32)
@@ -135,7 +137,9 @@ class TestVisionRotaryEmbeddingSplit(unittest.TestCase):
     def test_invalid_head_dim_raises(self):
         # half = head_dim // 2 = 24 is not divisible by 16, so the 4:6:6 unit
         # split is undefined for this head_dim.
-        config = SimpleNamespace(hidden_size=48, num_attention_heads=1, rope_theta=10000.0)
+        config = SimpleNamespace(
+            hidden_size=48, num_attention_heads=1, rope_theta=10000.0
+        )
         with self.assertRaises(AssertionError):
             VisionRotaryEmbedding(config)
 
@@ -217,7 +221,12 @@ class TestLoadWeightsStackedMerge(unittest.TestCase):
         model = self._make_model({})
         with self.assertRaises(KeyError):
             model.load_weights(
-                [("model.language_model.layers.0.some_new_param.weight", torch.tensor([1.0]))]
+                [
+                    (
+                        "model.language_model.layers.0.some_new_param.weight",
+                        torch.tensor([1.0]),
+                    )
+                ]
             )
 
 

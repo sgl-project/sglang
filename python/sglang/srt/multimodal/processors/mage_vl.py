@@ -1,4 +1,5 @@
 """sglang multimodal processor for Mage-VL."""
+
 import re
 from typing import List, Union
 
@@ -10,7 +11,9 @@ from sglang.srt.models.mage_vl import (
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 
 
 class MageVLImageProcessor(SGLangBaseProcessor):
@@ -76,7 +79,8 @@ class MageVLImageProcessor(SGLangBaseProcessor):
         # The HF processor handles PIL directly via Qwen2VLImageProcessor;
         # no smart_resize step is needed here.
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens,
+            base_output,
+            self.mm_tokens,
         )
 
         input_ids = input_ids.flatten()
@@ -87,7 +91,9 @@ class MageVLImageProcessor(SGLangBaseProcessor):
             vision_start_token_id=self.IM_START_TOKEN_ID,
             model_type="qwen2_vl",
             tokens_per_second=getattr(
-                self.hf_config.vision_config, "tokens_per_second", None,
+                self.hf_config.vision_config,
+                "tokens_per_second",
+                None,
             ),
             input_ids=input_ids.unsqueeze(0),
             image_grid_thw=getattr(ret, "image_grid_thw", None),
