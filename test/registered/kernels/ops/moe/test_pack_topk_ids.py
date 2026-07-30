@@ -23,11 +23,12 @@ def test_pack_topk_ids_matches_reference(dtype: torch.dtype, shape: tuple) -> No
     assert actual.dtype == torch.int32
 
 
-def test_pack_topk_ids_int64_cuda_graph() -> None:
-    topk_ids = torch.randint(0, 384, (32, 8), dtype=torch.int64, device="cuda")
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_pack_topk_ids_cuda_graph(dtype: torch.dtype) -> None:
+    topk_ids = torch.randint(0, 384, (32, 8), dtype=dtype, device="cuda")
     topk_weights = torch.rand((32, 8), dtype=torch.float32, device="cuda")
 
-    # Warm the int64 Triton specialization before CUDA-graph capture.
+    # Warm the dtype-specific Triton specialization before CUDA-graph capture.
     PackTopkIds.execute(topk_ids, topk_weights)
     torch.cuda.synchronize()
 
