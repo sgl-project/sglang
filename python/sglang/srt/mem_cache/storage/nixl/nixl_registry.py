@@ -1,11 +1,15 @@
-"""NIXL memory-registration helpers, exposed as context managers.
+"""NIXL memory-registration helpers.
 
 A ``NixlRegistry`` instance bundles the agent, the memory type, and
-(optionally) the file manager.  Its ``storage(...)`` method is a context
-manager that performs the entire register-and-build-descs sequence for
-the storage side of a transfer on entry, yields the ``xfer_descs`` (or
-None on failure), and unwinds ``agent.deregister_memory`` plus any
-``os.close(fd)`` on exit.
+(optionally) the file manager.  ``acquire_storage(...)`` performs the
+entire open-register-build-descs sequence for the storage side of a
+transfer and returns a live ``StorageRegistration`` (or None on failure,
+with any partially acquired resources released).  ``release_storage(...)``
+unwinds ``agent.deregister_memory`` plus any ``os.close(fd)``.  The
+``storage(...)`` context manager wraps the pair for callers whose
+registration lifetime matches one ``with`` block; an asynchronous caller
+can instead hold the ``StorageRegistration`` for the lifetime of its
+transfer handle and release on completion.
 
 The host side is pre-registered up front by ``HiCacheNixl`` and is not
 touched per transfer.
@@ -14,7 +18,9 @@ touched per transfer.
 import logging
 import threading
 from contextlib import contextmanager
-from typing import List, Optional
+from typing import Any, List, Optional
+
+import msgspec
 
 from .nixl_utils import NixlFileManager
 
@@ -28,9 +34,23 @@ def _buffer_sizes(buffers) -> Optional[List[int]]:
     return [b[1] for b in buffers]
 
 
+class StorageRegistration(msgspec.Struct):
+    """Live storage-side registration for one transfer.
+
+    Returned by ``NixlRegistry.acquire_storage``; release with
+    ``NixlRegistry.release_storage`` exactly once, after the last use of
+    ``descs``.  For fd-mode FILE registrations the fds backing ``descs``
+    stay open until release.
+    """
+
+    descs: Any
+    reg: Any = None
+    fds: List[int] = []
+
+
 class NixlRegistry:
-    """Owns the (agent, mem_type, file_manager) triple and provides a
-    context manager for the storage side of a transfer.
+    """Owns the (agent, mem_type, file_manager) triple and manages the
+    storage-side registration lifetime of transfers.
 
     A single instance is created once per HiCacheNixl in __init__ and
     reused for every transfer.
@@ -62,49 +82,6 @@ class NixlRegistry:
                 "fd registration."
             )
 
-    @contextmanager
-    def _open_files(self, paths: List[str], create: bool):
-        """Open fds for ``paths``; close all of them on exit.
-
-        Yields the list of fds, or None if any open fails (already-opened
-        fds are closed before returning by the same ``finally``).
-        """
-        fds: List[int] = []
-        try:
-            for path in paths:
-                fd = self.file_manager.open_file(path, create=create)
-                if fd is None:
-                    yield None
-                    return
-                fds.append(fd)
-            yield fds
-        finally:
-            for fd in fds:
-                self.file_manager.close_file(fd)
-
-    @contextmanager
-    def _registered(self, items: List[tuple], mem_type: str):
-        """Register ``items`` with NIXL; deregister on exit.
-
-        Yields the registration handle, or None if registration fails.
-        """
-        reg = None
-        if items:
-            reg_descs = self.agent.get_reg_descs(items, mem_type)
-            if reg_descs is not None:
-                try:
-                    reg = self.agent.register_memory(reg_descs)
-                except Exception as e:
-                    logger.error(f"Failed to register memory of type {mem_type}: {e}")
-        try:
-            yield reg
-        finally:
-            if reg is not None:
-                try:
-                    self.agent.deregister_memory(reg)
-                except Exception as e:
-                    logger.debug("deregister_memory skipped: %s", e)
-
     def _probe_path_mode(self) -> bool:
         """Probe whether NIXL honours path-mode metaInfo.
 
@@ -130,64 +107,128 @@ class NixlRegistry:
         except Exception:
             return True
 
-    @contextmanager
-    def storage(self, buffers, keys, direction):
-        """Open + register the storage side; deregister and close fds on exit.
+    def _register(self, items: List[tuple], mem_type: str):
+        """Register ``items`` with NIXL; returns the handle or None."""
+        if not items:
+            return None
+        reg_descs = self.agent.get_reg_descs(items, mem_type)
+        if reg_descs is None:
+            return None
+        try:
+            return self.agent.register_memory(reg_descs)
+        except Exception as e:
+            logger.error(f"Failed to register memory of type {mem_type}: {e}")
+            return None
 
-        Yields the storage xfer_descs, or None on failure.  For the FILE
-        backend, files are created (O_CREAT) when ``direction == "WRITE"``.
+    def _close_fds(self, fds: List[int]) -> None:
+        for fd in fds:
+            self.file_manager.close_file(fd)
+
+    def _acquire_file_path_mode(
+        self, *, keys: List[str], sizes: List[int], direction: str
+    ) -> Optional[StorageRegistration]:
+        parts = ["rw", "create"] if direction == "WRITE" else ["ro"]
+        if self.file_manager.use_direct_io:
+            parts.append("direct")
+        spec = ",".join(parts)
+        tuples = [(0, sizes[i], i + 1, f"{spec}:{keys[i]}") for i in range(len(keys))]
+        reg = self._register(tuples, "FILE")
+        if reg is None:
+            return None
+        return StorageRegistration(descs=reg.trim(), reg=reg)
+
+    def _acquire_file_fd_mode(
+        self, *, keys: List[str], sizes: List[int], direction: str
+    ) -> Optional[StorageRegistration]:
+        fds: List[int] = []
+        for path in keys:
+            fd = self.file_manager.open_file(path, create=(direction == "WRITE"))
+            if fd is None:
+                self._close_fds(fds)
+                return None
+            fds.append(fd)
+        tuples = [(0, sizes[i], fds[i], keys[i]) for i in range(len(keys))]
+        reg = self._register(tuples, "FILE")
+        if reg is None:
+            self._close_fds(fds)
+            return None
+        descs = self.agent.get_xfer_descs(
+            [(0, sizes[i], fds[i]) for i in range(len(fds))], "FILE"
+        )
+        return StorageRegistration(descs=descs, reg=reg, fds=fds)
+
+    def _acquire_obj(
+        self, *, keys: List[str], sizes: List[int]
+    ) -> Optional[StorageRegistration]:
+        # Reg tuple: (addr=0, size, devId, metaInfo=key).
+        # Xfer tuple: (addr=0, size, devId). devId links each xfer desc
+        # back to its registered object's metaInfo, so devIds must be
+        # unique within the list AND globally unique across concurrent
+        # acquire_storage() calls (the OBJ plugin's devIdToObjKey_ map is
+        # shared and unlocked). NIXL's pybind layer requires position 3 to
+        # be int, hence the key goes in metaInfo (position 4).
+        n = len(keys)
+        with self._obj_devid_lock:
+            base = self._obj_devid_next
+            self._obj_devid_next += n
+        dev_ids = list(range(base, base + n))
+        tuples = [(0, sizes[i], dev_ids[i], keys[i]) for i in range(n)]
+        reg = self._register(tuples, "OBJ")
+        if reg is None:
+            return None
+        descs = self.agent.get_xfer_descs(
+            [(0, sizes[i], dev_ids[i]) for i in range(n)],
+            self.mem_type,
+        )
+        return StorageRegistration(descs=descs, reg=reg)
+
+    def acquire_storage(
+        self, buffers, keys: List[str], direction: str
+    ) -> Optional[StorageRegistration]:
+        """Open + register the storage side of one transfer.
+
+        For the FILE backend, files are created (O_CREAT) when
+        ``direction == "WRITE"``.  Returns None on failure, with any
+        partially acquired resources (fds) released.  ``descs`` on the
+        returned registration may be None if descriptor construction
+        failed; the registration must still be released.
         """
         sizes = _buffer_sizes(buffers)
         if sizes is None:
-            yield None
-            return
+            return None
 
         if self.mem_type == "FILE":
             if self.path_mode:
-                parts = ["rw", "create"] if direction == "WRITE" else ["ro"]
-                if self.file_manager.use_direct_io:
-                    parts.append("direct")
-                spec = ",".join(parts)
-                tuples = [
-                    (0, sizes[i], i + 1, f"{spec}:{keys[i]}") for i in range(len(keys))
-                ]
-                with self._registered(tuples, "FILE") as reg:
-                    if reg is None:
-                        yield None
-                        return
-                    yield reg.trim()
-            else:
-                with self._open_files(keys, create=(direction == "WRITE")) as fds:
-                    if fds is None:
-                        yield None
-                        return
-                    tuples = [(0, sizes[i], fds[i], keys[i]) for i in range(len(keys))]
-                    with self._registered(tuples, "FILE") as reg:
-                        if reg is None:
-                            yield None
-                            return
-                        yield self.agent.get_xfer_descs(
-                            [(0, sizes[i], fds[i]) for i in range(len(fds))], "FILE"
-                        )
-        else:  # OBJ
-            # Reg tuple: (addr=0, size, devId, metaInfo=key).
-            # Xfer tuple: (addr=0, size, devId). devId links each xfer desc
-            # back to its registered object's metaInfo, so devIds must be
-            # unique within the list AND globally unique across concurrent
-            # storage() calls (the OBJ plugin's devIdToObjKey_ map is shared
-            # and unlocked). NIXL's pybind layer requires position 3 to be
-            # int, hence the key goes in metaInfo (position 4).
-            n = len(keys)
-            with self._obj_devid_lock:
-                base = self._obj_devid_next
-                self._obj_devid_next += n
-            dev_ids = list(range(base, base + n))
-            tuples = [(0, sizes[i], dev_ids[i], keys[i]) for i in range(n)]
-            with self._registered(tuples, "OBJ") as reg:
-                if reg is None:
-                    yield None
-                    return
-                yield self.agent.get_xfer_descs(
-                    [(0, sizes[i], dev_ids[i]) for i in range(n)],
-                    self.mem_type,
+                return self._acquire_file_path_mode(
+                    keys=keys, sizes=sizes, direction=direction
                 )
+            return self._acquire_file_fd_mode(
+                keys=keys, sizes=sizes, direction=direction
+            )
+        return self._acquire_obj(keys=keys, sizes=sizes)
+
+    def release_storage(self, registration: StorageRegistration) -> None:
+        """Deregister and close any fds. Exception-safe; call exactly once,
+        after the last use of ``registration.descs`` (fds must outlive the
+        registration, so deregister happens before the fds close)."""
+        if registration.reg is not None:
+            try:
+                self.agent.deregister_memory(registration.reg)
+            except Exception as e:
+                logger.debug("deregister_memory skipped: %s", e)
+        self._close_fds(registration.fds)
+
+    @contextmanager
+    def storage(self, buffers, keys: List[str], direction: str):
+        """Acquire + release around one ``with`` block.
+
+        Yields the storage xfer_descs, or None on failure.  Kept for
+        callers whose registration lifetime matches the block; async
+        callers should use acquire_storage/release_storage directly.
+        """
+        registration = self.acquire_storage(buffers, keys, direction)
+        try:
+            yield registration.descs if registration is not None else None
+        finally:
+            if registration is not None:
+                self.release_storage(registration)
