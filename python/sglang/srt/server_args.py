@@ -1951,10 +1951,10 @@ class ServerArgs:
         Arg(
             help=(
                 "Enable FlashInfer allreduce fusion and choose backend. "
-                "Requires SM90 or SM10X NVIDIA GPUs. "
+                "Requires SM90, SM10X, or SM120 NVIDIA GPUs. "
                 "Defaults to auto. "
                 "'auto': choose mnnvl on Blackwell (SM100/SM103) systems "
-                "(single- and multi-node) and trtllm on SM90 single-node systems. "
+                "(single- and multi-node) and trtllm on SM90/SM120 single-node systems. "
                 "'trtllm': available on single-node systems only. "
                 "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
                 "single-node or multi-node systems via MNNVL fabric. "
