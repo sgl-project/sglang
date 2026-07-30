@@ -719,9 +719,9 @@ def _merge_topk_append_local_impl(
     scalars (instead of a global [QH,B,topk] round trip) drops one kernel
     launch per layer.
     """
-    seq_len = tl.load(
-        seq_lens_ptr + pid_b * stride_sl_b + pid_h * stride_sl_h
-    ).to(tl.int32)
+    seq_len = tl.load(seq_lens_ptr + pid_b * stride_sl_b + pid_h * stride_sl_h).to(
+        tl.int32
+    )
     query_pos = tl.maximum(seq_len - 1, 0)
     local_blk = tl.minimum(query_pos // block_size, num_blocks - 1)
 
@@ -1316,7 +1316,9 @@ def _decode_bnsd_score_topk_chunk_kernel(
     req_pool_indices_ptr,  # [B] in direct-map mode
     candidate_scores_ptr,  # [C, QH, B, topk]
     candidate_indices_ptr,  # [C, QH, B, topk]
-    seq_lens,  # [B]
+    seq_lens,  # [B] per-request, or [B*gqa] per-row (packed draft queries)
+    stride_sl_b,  # row-0 seq_lens stride per batch (1, or gqa when packed)
+    stride_sl_h,  # per-row seq_lens stride (0 = shared per-request, 1 = packed)
     # shape
     batch_size,
     gqa_group_size,
@@ -1324,8 +1326,8 @@ def _decode_bnsd_score_topk_chunk_kernel(
     # block/scaling
     block_size: tl.constexpr,
     sm_scale,
-    init_blocks,
-    local_blocks,
+    init_blocks: tl.constexpr,
+    local_blocks: tl.constexpr,
     num_score_chunks,
     # strides
     stride_q_b,
@@ -1374,10 +1376,23 @@ def _decode_bnsd_score_topk_chunk_kernel(
     pid_c = pid_bc // batch_size
     pid_h = pid_kh * gqa_group_size
 
-    seq_len = tl.load(seq_lens + pid_b).to(tl.int32)
-    num_blocks = tl.cdiv(seq_len, block_size)
-
     off_h = tl.arange(0, BLOCK_SIZE_H)
+    # Per-row seq_lens: for a shared per-request length stride_sl_h == 0
+    # broadcasts one scalar to all gqa rows (identical to the old scalar path);
+    # for packed draft queries stride_sl_h == 1 gives each row its own causal
+    # length. Rows may then differ in num_blocks (packed rows differ by <=1
+    # block); chunking/loop bounds below use the row MAX, and every per-row
+    # use (pos/local/init masks, candidate stores) keeps its own row value so
+    # packed results are row-exact vs the unpacked per-query launches.
+    seq_len_rows = tl.load(
+        seq_lens + pid_b * stride_sl_b + off_h * stride_sl_h,
+        mask=off_h < gqa_group_size,
+        other=0,
+    ).to(tl.int32)
+    seq_len_max = tl.max(seq_len_rows, axis=0)
+    num_blocks_rows = tl.cdiv(seq_len_rows, block_size)
+    num_blocks = tl.max(num_blocks_rows, axis=0)
+
     off_t = tl.arange(0, BLOCK_SIZE_T)
     candidate_mask = (off_h[:, None] < gqa_group_size) & (off_t[None, :] < topk)
     candidate_offsets = (
@@ -1397,7 +1412,7 @@ def _decode_bnsd_score_topk_chunk_kernel(
     top_indices = tl.full((BLOCK_SIZE_H, BLOCK_SIZE_T), -1, tl.int32)
     if num_blocks <= topk:
         top_indices = tl.where(
-            (pid_c == 0) & (off_t[None, :] < num_blocks),
+            (pid_c == 0) & (off_t[None, :] < num_blocks_rows[:, None]),
             off_t[None, :] + tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_T), tl.int32),
             top_indices,
         )
@@ -1451,7 +1466,7 @@ def _decode_bnsd_score_topk_chunk_kernel(
     )
 
     sm_scale_log2e = sm_scale * 1.4426950409
-    local_start = tl.maximum(0, num_blocks - local_blocks)
+    local_start_rows = tl.maximum(0, num_blocks_rows - local_blocks)
     num_steps = chunk_end_block - chunk_start_block
     # F5: req_idx is loop-invariant (pid_b is the program id, constant) -- hoist
     # the scalar load out of the per-step loop instead of reloading it each iter.
@@ -1476,7 +1491,10 @@ def _decode_bnsd_score_topk_chunk_kernel(
                 block_table_ptr + pid_b * stride_bt_b + logical_block * stride_bt_n
             ).to(tl.int64)
         pos = logical_block * block_size + off_n
-        pos_mask = pos < seq_len
+        # K is shared by all rows: load it with the row-max length, then apply
+        # each row's own causal mask to qk so shorter packed rows keep -inf.
+        pos_mask_k = pos < seq_len_max
+        pos_mask = pos[None, :] < seq_len_rows[:, None]
         k_offsets = (
             physical_block * stride_k_block
             + off_n[None, :] * stride_k_offset
@@ -1485,11 +1503,11 @@ def _decode_bnsd_score_topk_chunk_kernel(
         )
         k = tl.load(
             k_cache_ptr + k_offsets,
-            mask=(off_d[:, None] < head_dim) & pos_mask[None, :],
+            mask=(off_d[:, None] < head_dim) & pos_mask_k[None, :],
             other=0.0,
         )
         qk = tl.dot(q, k) * sm_scale_log2e
-        qk = tl.where(pos_mask[None, :], qk, float("-inf"))
+        qk = tl.where(pos_mask, qk, float("-inf"))
         sub_max = tl.max(qk, axis=1)
         if SCORE_TYPE == "max":
             score = sub_max
@@ -1993,6 +2011,9 @@ def flash_decode_bnsd_with_topk_idx(
     # fewer programs (less scheduling) but longer serial loop; smaller -> more
     # parallelism. Tuned via bench_sparse_decode / bench_scale.
     score_blocks_per_chunk: int = 16,
+    # Cap on the chunk count (power-of-two rounded). Raise for small packed
+    # batches (few programs) to keep the vector cores busy at long context.
+    score_max_chunks: int = 32,
     # Direct request-map page source. This is intentionally an alternative to a
     # materialized block table so graph replay cannot reuse a stale layer buffer.
     req_to_token: Optional[torch.Tensor] = None,
@@ -2072,7 +2093,14 @@ def flash_decode_bnsd_with_topk_idx(
     assert block_size_from_cache == block_size
     assert cache_head_dim == head_dim
     assert num_q_heads % num_kv_heads == 0
-    assert seq_lens.shape[0] == batch_size
+    gqa_group_size = num_q_heads // num_kv_heads
+    if packed_seq_lens:
+        assert disable_index_value, "packed_seq_lens is score-only"
+        assert seq_lens.shape[0] == batch_size * gqa_group_size
+        stride_sl_b, stride_sl_h = gqa_group_size, 1
+    else:
+        assert seq_lens.shape[0] == batch_size
+        stride_sl_b, stride_sl_h = 1, 0
     if use_direct_page_lookup:
         assert req_pool_indices.shape[0] == batch_size
         assert max_num_blocks * block_size <= req_to_token.shape[1]
@@ -2086,8 +2114,6 @@ def flash_decode_bnsd_with_topk_idx(
         # arguments. seq_lens is never read as an index in this legacy branch.
         page_source_rows = seq_lens
         direct_num_pages = 1
-
-    gqa_group_size = num_q_heads // num_kv_heads
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -2103,6 +2129,7 @@ def flash_decode_bnsd_with_topk_idx(
         num_score_chunks = _choose_num_score_chunks(
             max_seqblock,
             blocks_per_chunk=score_blocks_per_chunk,
+            max_chunks=score_max_chunks,
             all_seqblock_q=batch_size,
             num_kv_heads=num_kv_heads,
         )
@@ -2143,6 +2170,8 @@ def flash_decode_bnsd_with_topk_idx(
             candidate_scores,
             candidate_indices,
             seq_lens,
+            stride_sl_b,
+            stride_sl_h,
             batch_size,
             gqa_group_size,
             head_dim,

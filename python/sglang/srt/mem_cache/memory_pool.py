@@ -4603,12 +4603,6 @@ class MHATokenToKOnlyPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self._get_key_buffer(layer_id)
 
-    def get_value_buffer(self, layer_id: int) -> torch.Tensor:
-        raise NotImplementedError("MHATokenToKOnlyPool does not allocate V")
-
-    def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError("MHATokenToKOnlyPool does not allocate V")
-
     def set_k_buffer(
         self,
         layer_id: int,
@@ -4620,6 +4614,12 @@ class MHATokenToKOnlyPool(KVCache):
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
         self.k_buffer[layer_id][loc] = cache_k
+
+    def get_value_buffer(self, layer_id: int) -> torch.Tensor:
+        raise NotImplementedError("MHATokenToKOnlyPool does not allocate V")
+
+    def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError("MHATokenToKOnlyPool does not allocate V")
 
     def set_kv_buffer(
         self,
@@ -4880,10 +4880,7 @@ class MiniMaxSparseKVPool(KVCache):
         if cache_idx_k.dtype != sub_pool.dtype:
             if k_scale is not None:
                 cache_idx_k = cache_idx_k / k_scale
-            cache_idx_k = cache_idx_k.to(sub_pool.dtype)
-        if sub_pool.store_dtype != sub_pool.dtype:
-            cache_idx_k = cache_idx_k.view(sub_pool.store_dtype)
-        sub_pool.k_buffer[mapped_id][loc] = cache_idx_k
+        sub_pool.set_k_buffer(mapped_id, loc, cache_idx_k)
 
     def _can_fuse_kv_index_store(
         self,

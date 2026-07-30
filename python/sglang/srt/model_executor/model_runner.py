@@ -188,7 +188,6 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.speculative import spec_cycle_profiler
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.state_capturer.base import TopkCaptureOutput
@@ -999,13 +998,6 @@ class ModelRunner:
             # would overwrite the target's process-global one.
             return
 
-        if not self.server_args.disable_shared_experts_fusion and hasattr(
-            self.model, "num_fused_shared_experts"
-        ):
-            num_fused_shared_experts = self.model.num_fused_shared_experts
-        else:
-            num_fused_shared_experts = 0
-
         # Under speculative decoding the decode cuda-graph captures
         # TARGET_VERIFY with `num_verify_tokens_per_seq` (= speculative_num_draft_tokens,
         # e.g. 4) draft tokens per sequence; size the routed-experts capture
@@ -1648,17 +1640,10 @@ class ModelRunner:
 
             # Replay cuda graph if applicable
             if can_run_graph:
-                verify_ctx = (
-                    spec_cycle_profiler.verify_phase(forward_batch)
-                    if forward_batch.forward_mode.is_target_verify()
-                    and spec_cycle_profiler.enabled()
-                    else contextlib.nullcontext()
+                ret = self.decode_cuda_graph_runner.execute(
+                    forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
                 )
-                with verify_ctx:
-                    ret = self.decode_cuda_graph_runner.execute(
-                        forward_batch,
-                        pp_proxy_tensors=pp_proxy_tensors,
-                    )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
@@ -1710,16 +1695,9 @@ class ModelRunner:
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
-                verify_ctx = (
-                    spec_cycle_profiler.verify_phase(forward_batch)
-                    if forward_batch.forward_mode.is_target_verify()
-                    and spec_cycle_profiler.enabled()
-                    else contextlib.nullcontext()
+                ret = self.eager_runner.execute(
+                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
                 )
-                with verify_ctx:
-                    ret = self.eager_runner.execute(
-                        forward_batch, pp_proxy_tensors=pp_proxy_tensors
-                    )
 
             if (
                 forward_batch.global_num_tokens_cpu is not None

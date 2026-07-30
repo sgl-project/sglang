@@ -852,15 +852,7 @@ class KVCacheConfigurator:
             PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
         )
 
-        # MiniMax sparse-attention models need their dedicated sparse KV pool
-        # regardless of attention backend — without this early check the
-        # ascend/oout-of-tree/MLA branches below would route them to a generic
-        # MHA pool, which the MiniMax sparse backend rejects.
-        if is_minimax_sparse(self.model_config.hf_config):
-            token_to_kv_pool = self._build_minimax_sparse_kv_pool(
-                max_total_num_tokens=sizes.max_total_num_tokens,
-            )
-        elif is_dsv4_model:
+        if is_dsv4_model:
             token_to_kv_pool = self._build_dsv4_kv_pool(
                 max_running_requests=sizes.max_running_requests,
                 swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
@@ -894,6 +886,10 @@ class KVCacheConfigurator:
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                 )
+            elif is_minimax_sparse(self.model_config.hf_config):
+                token_to_kv_pool = self._build_ascend_minimax_sparse_kv_pool(
+                    max_total_num_tokens=sizes.max_total_num_tokens,
+                )
             elif self.use_mla_backend:
                 token_to_kv_pool = self._build_ascend_mla_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
@@ -923,6 +919,10 @@ class KVCacheConfigurator:
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                     mha_pool_class=mha_pool_class,
+                )
+            elif is_minimax_sparse(self.model_config.hf_config):
+                token_to_kv_pool = self._build_minimax_sparse_kv_pool(
+                    max_total_num_tokens=sizes.max_total_num_tokens,
                 )
             elif self.mambaish_config:
                 token_to_kv_pool = self._build_hybrid_linear_kv_pool(
@@ -1133,6 +1133,37 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _build_ascend_minimax_sparse_kv_pool(
+        self, *, max_total_num_tokens: int
+    ) -> KVCache:
+        _hf_config = self.model_config.hf_config
+        sparse_cfg = get_minimax_sparse_attention_config(_hf_config)
+        dense_layer_ids, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_cfg)
+        disable_value_sparse_layer_ids = get_minimax_sparse_disable_value_layer_ids(
+            sparse_cfg
+        )
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMiniMaxSparseKVPool,
+        )
+
+        token_to_kv_pool = NPUMiniMaxSparseKVPool(
+            size=max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            index_dtype=self.model_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
+            head_dim=self.model_config.head_dim,
+            idx_head_dim=sparse_cfg["sparse_index_dim"],
+            dense_layer_ids=dense_layer_ids,
+            sparse_layer_ids=sparse_layer_ids,
+            disable_value_sparse_layer_ids=disable_value_sparse_layer_ids,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+        )
+        return token_to_kv_pool
+
     def _build_ascend_mla_kv_pool(
         self, *, max_total_num_tokens: int, is_dsa_model: bool
     ) -> KVCache:
@@ -1325,18 +1356,7 @@ class KVCacheConfigurator:
         disable_value_sparse_layer_ids = get_minimax_sparse_disable_value_layer_ids(
             sparse_cfg
         )
-        # On NPU the wrapper must inject the NPU paged pool classes, whose
-        # _create_buffers builds data_ptrs without the uint64 cat that aclnnCat
-        # does not support.
-        if _is_npu:
-            from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                NPUMiniMaxSparseKVPool,
-            )
-
-            pool_cls = NPUMiniMaxSparseKVPool
-        else:
-            pool_cls = MiniMaxSparseKVPool
-        token_to_kv_pool = pool_cls(
+        token_to_kv_pool = MiniMaxSparseKVPool(
             size=max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,

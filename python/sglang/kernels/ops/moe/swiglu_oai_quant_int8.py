@@ -1,15 +1,10 @@
 """swiglu_oai + optional quantization for Ascend NPU.
 
-Adapted from: sgl_kernel_npu package (swiglu_quant.py)
-
-Implements swiglu_oai (MiniMax-M3 variant) fused with optional per-row int8 quant:
-
-    gate = x1.clamp(-inf, limit)
-    up   = x2.clamp(-limit, limit)
+Implements swiglu_oai (MiniMax-M3) fused with optional per-row int8 quant:
+    gate = x1.clamp(-inf, limit); up = x2.clamp(-limit, limit)
     out  = gate * sigmoid(gate * alpha) * (up + 1)
-
-where x = [gate | up] is concatenated along the last dimension.
-When quantization is enabled, each row is scaled to int8 with per-row scale.
+where x = [gate | up] is concatenated along the last dim; when quant is enabled
+each row is scaled to int8 with a per-row scale.
 """
 
 import torch
@@ -153,28 +148,10 @@ def _swiglu_oai_quant_kernel_dense(
 def swiglu_oai_quant(
     x, alpha, limit, need_quant=True, group_list=None, group_list_type=None
 ):
-    """swiglu_oai activation with optional int8 quantization.
-
-    Supports two dispatch modes:
-
-    **Dense MLP mode** (``group_list`` is ``None``, default):
-        All rows are processed as a single group. No CPU-device sync for group_list.
-
-    **MoE grouped mode** (``group_list`` is provided):
-        Tokens are routed per-expert. ``group_list`` holds per-expert token counts
-        (or cumsum), and ``group_list_type`` specifies the encoding (0=cusum, 1=count).
-
-    Args:
-        x: Input tensor [..., 2d], concatenated [gate | up] layout.
-        alpha: Sigmoid scaling parameter.
-        limit: Clamp limit.
-        need_quant: If True, quantize output to int8 with per-row scale.
-        group_list: Optional tensor of expert token counts/cumsum.
-        group_list_type: Required if group_list is given (0=cusum, 1=count).
-
-    Returns:
-        (out, scale) — out shape [..., d], scale shape [num_rows].
-    """
+    """swiglu_oai activation with optional int8 quantization; returns (out [..., d], scale [num_rows]).
+    Dense MLP mode (group_list None) -> all rows one group; MoE mode routes per-expert via group_list
+    (counts or cumsum; group_list_type: 0=cusum, 1=count). Args: x [...,2d]=[gate|up], alpha, limit,
+    need_quant (int8 per-row scale when True)."""
     orig_shape = x.shape
     x = x.reshape(-1, x.shape[-1])
     s, h = x.shape

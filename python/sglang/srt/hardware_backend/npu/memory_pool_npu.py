@@ -1,4 +1,3 @@
-import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -10,7 +9,6 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
     get_tensor_size_bytes,
-    maybe_detect_oob,
     unwrap_write_loc,
 )
 from sglang.srt.utils import get_bool_env_var
@@ -21,16 +19,6 @@ if TYPE_CHECKING:
 
 if is_npu():
     import torch_npu
-
-logger = logging.getLogger(__name__)
-
-
-def _minimax_npu_debug_sync(tag: str) -> None:
-    if not get_bool_env_var("SGLANG_MINIMAX_NPU_DEBUG_SYNC", "False"):
-        return
-    logger.warning("[MiniMax/NPU debug] synchronize before: %s", tag)
-    torch.npu.synchronize()
-    logger.warning("[MiniMax/NPU debug] synchronize after: %s", tag)
 
 
 def _init_npu_conv_state(
@@ -200,12 +188,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
-        flat_k_slots = (
-            self.k_buffer[layer_id - self.start_layer]
-            .view(-1, self.head_num, self.head_dim)
-            .shape[0]
-        )
-        maybe_detect_oob(loc, 0, flat_k_slots, "NPU set_kv_buffer")
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -218,7 +200,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        loc = loc.to(device=cache_k.device, dtype=torch.int32).contiguous()
         if self.use_fia:
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
             v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
@@ -234,6 +215,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 cache_v.view(-1, 1, self.head_num, self.v_head_dim),
             )
         else:
+            loc = loc.to(torch.int32)
             torch_npu._npu_reshape_and_cache(
                 key=cache_k,
                 value=cache_v,
@@ -245,7 +227,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 ),
                 slot_indices=loc,
             )
-        _minimax_npu_debug_sync(f"NPU set_kv_buffer layer_id={layer_id}")
 
     def _chunk_copy_npu_to_cpu(self, buf_of_layers, indices):
         chunk_size = self.cpu_offloading_chunk_size
@@ -377,14 +358,12 @@ class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
         k_buffer_layer = self.k_buffer[layer_id - self.start_layer].view(
             -1, self.head_num, self.head_dim
         )
-        maybe_detect_oob(loc, 0, k_buffer_layer.shape[0], "NPU set_index_k_buffer")
         loc = loc.to(device=cache_k.device, dtype=torch.int32).contiguous()
         torch_npu.npu_scatter_nd_update_(
             k_buffer_layer,
             loc.view(-1, 1),
             cache_k.contiguous().view(-1, self.head_num, self.head_dim),
         )
-        _minimax_npu_debug_sync(f"NPU set_index_k_buffer layer_id={layer_id}")
 
     def get_contiguous_buf_infos(self):
         data_ptrs = [

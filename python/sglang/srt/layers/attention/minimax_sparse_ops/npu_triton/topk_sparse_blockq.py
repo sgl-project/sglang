@@ -10,18 +10,6 @@ recomputes the per-block page/address math. Profiling
 shows the kernel is scalar/address-bound on the paged topk gather, not
 compute-bound.
 
-The fix mirrors the GPU ground-truth ``_gqa_share_sparse_fwd_kernel``
-(``minimax_sparse_ops/prefill/topk_sparse.py``): one program processes a *pack
-group* of ``PACK_Q`` consecutive in-request tokens that **share one topk block
-list**. Each selected K/V block is loaded once and reused across all
-``PACK_Q * gqa`` Q rows of the pack group, amortising the per-block address
-scalar and the K/V HBM traffic by roughly ``PACK_Q``. There are NO membership
-bits: every selected block contributes to every row, exactly like the GPU
-kernel. (The earlier "union decode" / kimi PACK_Q+bits designs either regressed
-1.71x at 64K or hit Ascend union-kernel bugs; this design avoids both by
-sharing the topk at the indexer granularity instead of unioning per-token
-topk.)
-
 The per-pack-group topk is derived on the host from the already-computed
 per-query topk by taking the latest-in-pack token's list (its causal window is
 a superset of the earlier tokens'; the earlier rows mask the few extra near-tail
@@ -388,11 +376,19 @@ def _scatter_blockq_out_kernel(
     head_dim,
     num_pack_groups,
     # strides
-    stride_sc_g, stride_sc_kh, stride_sc_r, stride_sc_d,
-    stride_o_n, stride_o_h, stride_o_d,
-    stride_qstart_g, stride_qend_g,
+    stride_sc_g,
+    stride_sc_kh,
+    stride_sc_r,
+    stride_sc_d,
+    stride_o_n,
+    stride_o_h,
+    stride_o_d,
+    stride_qstart_g,
+    stride_qend_g,
     # meta
-    GQA: tl.constexpr, PACK_Q: tl.constexpr, BLOCK_D: tl.constexpr,
+    GQA: tl.constexpr,
+    PACK_Q: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     """Scatter scratch -> o with a per-pack-token CONTIGUOUS store.
 
@@ -425,12 +421,18 @@ def _scatter_blockq_out_kernel(
         # safe value avoids the OOB address entirely.
         qtok_safe = tl.where(valid_q, qtok, 0)
         src = tl.load(
-            scratch_ptr + sc_base + (q * GQA + off_h)[:, None] * stride_sc_r + off_d[None, :] * stride_sc_d,
+            scratch_ptr
+            + sc_base
+            + (q * GQA + off_h)[:, None] * stride_sc_r
+            + off_d[None, :] * stride_sc_d,
             mask=valid_q & dim_mask[None, :],
             other=0.0,
         )
         tl.store(
-            o_ptr + qtok_safe * stride_o_n + (pid_h_base + off_h)[:, None] * stride_o_h + off_d[None, :] * stride_o_d,
+            o_ptr
+            + qtok_safe * stride_o_n
+            + (pid_h_base + off_h)[:, None] * stride_o_h
+            + off_d[None, :] * stride_o_d,
             src,
             mask=valid_q & dim_mask[None, :],
         )
@@ -569,7 +571,8 @@ def flash_prefill_bnsd_blockq_sparse(
     # the per-pid_kh programs racing on the same scratch slots.
     scratch = torch.empty(
         (num_pack_groups, num_kv_heads, block_rows, head_dim),
-        dtype=q.dtype, device=q.device,
+        dtype=q.dtype,
+        device=q.device,
     )
     _gqa_share_sparse_prefill_blockq_kernel[grid](
         q,
@@ -668,9 +671,9 @@ def flash_prefill_bnsd_blockq_sparse(
         # Reuse the validated decode merge kernel: online LSE merge across the
         # topk chunks. Import lazily to keep this module importable standalone.
         from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
-            _merge_topk_attn_out_bnsd_kernel,
-            _MERGE_NW,
             _MERGE_NS,
+            _MERGE_NW,
+            _merge_topk_attn_out_bnsd_kernel,
         )
 
         merge_grid = (total_q, num_q_heads)

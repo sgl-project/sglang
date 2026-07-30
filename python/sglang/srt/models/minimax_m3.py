@@ -127,10 +127,16 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
         split_qkv_rmsnorm_rope_pos_cache_half_npu,
     )
+
     # Per-layer qk-norm + partial RoPE + q|k|v split fallback (used by the
     # non-fused branch of forward_prepare_npu for dense per_layer layers).
     from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import (
         split_qkv_tp_rmsnorm_rope,
+    )
+
+    from sglang.srt.hardware_backend.npu.utils import (
+        process_shared_expert,
+        wait_share_stream,
     )
 
 logger = logging.getLogger(__name__)
@@ -237,7 +243,7 @@ class MiniMaxM3MLP(nn.Module):
     @staticmethod
     def _swigluoai_fused(x: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
         """swiglu_oai using fused Triton kernel (sgl_kernel_npu), no quant."""
-        from sglang.kernels.ops.activation.npu_swiglu_oai_quant import swiglu_oai_quant
+        from sglang.kernels.ops.moe.swiglu_oai_quant_int8 import swiglu_oai_quant
 
         out, _ = swiglu_oai_quant(x, alpha, limit, need_quant=False)
         return out
@@ -453,16 +459,21 @@ class MiniMaxM3MoE(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         shared_output = None
-        enable_npu_dual_stream = (
-            _is_npu
-            and (
-                forward_batch.forward_mode.is_extend()
-                or forward_batch.forward_mode.is_target_verify()
-            )
+        enable_npu_dual_stream = _is_npu and (
+            forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_decode()
         )
         if hidden_states.shape[0] > 0:
-            shared_output = self._forward_shared_experts(hidden_states)
             router_logits = self._compute_router_logits(hidden_states)
+            if enable_npu_dual_stream:
+                # Overlap the shared-expert MLP with the router/experts on a
+                # separate stream; wait_share_stream() re-syncs before the add.
+                shared_output = process_shared_expert(
+                    hidden_states, self._forward_shared_experts
+                )
+            else:
+                shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -477,6 +488,9 @@ class MiniMaxM3MoE(nn.Module):
         # DeepEP returns the complete per-token routed result (no TP all-reduce here);
         # shared experts are replicated (tp_size=1), so both add directly.
         final_hidden_states = self.experts(hidden_states, topk_output)
+
+        if enable_npu_dual_stream:
+            wait_share_stream()
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -1062,8 +1076,7 @@ class MiniMaxM3Attention(nn.Module):
             # (tl.load(...).to(fp32)), so bf16 is accepted -- it reads the same
             # cos/sin values the unfused rope path already uses (no precision
             # regression, only sub-ULP rotation-arithmetic noise vs that path).
-            and self.rotary_emb.cos_sin_cache.dtype
-            in (torch.float32, torch.bfloat16)
+            and self.rotary_emb.cos_sin_cache.dtype in (torch.float32, torch.bfloat16)
         )
 
     def _can_use_npu_fused_index_qkv_norm_rope(self) -> bool:

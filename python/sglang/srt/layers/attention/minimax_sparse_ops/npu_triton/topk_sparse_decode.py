@@ -6,55 +6,68 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
-
-# --- Native Ascend block-sparse attention (npu_sparse_attention_score) for decode ---
-# Experimental gate: route decode-main attention through the vllm-ascend native cube
-# kernel (built per cc_docs/triton_opt/minimax_m3_npu_vllm_attention_borrow_20260728.md
-# §2.4) instead of the Triton split-K kernel. On Ascend910_9362 (ascend910_93) microbench
-# (bf16, B=48, KV=16384, topk=17) the native cube kernel is ~3.3x FASTER than the
-# Triton decode main (0.35ms vs 1.14ms) -- the Triton path is scalar-bound/MAC-idle on
-# the small decode workload while the native cube kernel has far better MAC utilisation.
-# Correctness: allclose(atol=2e-2, rtol=2e-2) vs the Triton path. Enable by setting both
-# SGLANG_MINIMAX_NPU_NATIVE_DECODE=1 and SGLANG_MINIMAX_NPU_NATIVE_SPARSE_LIB=<path to
-# vllm_ascend_C.so>; ASCEND_CUSTOM_OPP_PATH + LD_LIBRARY_PATH must also point at the
-# installed _cann_ops_custom vendor + torch_npu/lib (see the doc).
+# --- Native Ascend block-sparse attention (npu_sparse_attention_score) ---
+# Auto-detection: prefer the sgl-kernel-npu attentions plugin op
+# torch.ops.attentions.npu_sparse_attention_score. It is engaged when the op is
+# already registered, or when a lazy `import attentions` (which loads
+# libPTAExtensionOPS.so and registers the op) succeeds. If unavailable the validated
+# Triton split-K kernel is used.
 _NATIVE_SPARSE_LOADED = False
-
-
-def _native_sparse_decode_enabled() -> bool:
-    return envs.SGLANG_MINIMAX_NPU_NATIVE_DECODE.get() and bool(
-        envs.SGLANG_MINIMAX_NPU_NATIVE_SPARSE_LIB.get()
-    )
-
-
-def _native_verify_enabled() -> bool:
-    """Native Ascend op on the EAGLE3 TARGET_VERIFY cuda-graph path.
-
-    Independent of NATIVE_DECODE so verify can go native while decode stays
-    Triton (set NATIVE_VERIFY=1 + NATIVE_SPARSE_LIB). The op is cuda-graph
-    replay-safe (standard EXEC_NPU_CMD workspace via the caching allocator); the
-    verify OOB that previously crashed replay (score-phase topk >= num_blocks) is
-    handled by the per-query sanitize in _native_decode_main (skip OOB slots).
-    """
-    return bool(envs.SGLANG_MINIMAX_NPU_NATIVE_SPARSE_LIB.get()) and envs.SGLANG_MINIMAX_NPU_NATIVE_VERIFY.get()
+# Resolved op handle: torch.ops.attentions.npu_sparse_attention_score (sgl-kernel-npu
+# attentions plugin). None -> fall back to the Triton path.
+_npu_sparse_attention_score_op = None
 
 
 def _ensure_native_sparse_loaded():
-    global _NATIVE_SPARSE_LOADED
+    """Lazily resolve the native op handle once.
+
+    Order: already-registered torch.ops.attentions op -> attempt `import attentions`
+    (loads libPTAExtensionOPS.so and registers torch.ops.attentions.*) -> leave
+    unresolved so the Triton path is used. Any failure is swallowed; the Triton path
+    takes over with no side effects.
+    """
+    global _NATIVE_SPARSE_LOADED, _npu_sparse_attention_score_op
     if _NATIVE_SPARSE_LOADED:
         return
-    torch.ops.load_library(envs.SGLANG_MINIMAX_NPU_NATIVE_SPARSE_LIB.get())
+    # 1. Already registered by some other import (e.g. a prior plugin load).
+    try:
+        _npu_sparse_attention_score_op = (
+            torch.ops.attentions.npu_sparse_attention_score
+        )
+        _NATIVE_SPARSE_LOADED = True
+        return
+    except Exception:
+        pass
+    # 2. Lazy: import the sgl-kernel-npu attentions plugin, which loads
+    #    libPTAExtensionOPS.so and registers torch.ops.attentions.*.
+    try:
+        import attentions  # noqa: F401
+
+        _npu_sparse_attention_score_op = (
+            torch.ops.attentions.npu_sparse_attention_score
+        )
+    except Exception:
+        # Plugin absent or failed to load -> fall back to the Triton path.
+        _npu_sparse_attention_score_op = None
     _NATIVE_SPARSE_LOADED = True
+
+
+def _is_native_sparse_available() -> bool:
+    """Auto-detect whether the native Ascend block-sparse attention op is usable."""
+    _ensure_native_sparse_loaded()
+    return _npu_sparse_attention_score_op is not None
 
 
 @triton.jit
 def _native_sanitize_topk_kernel(
-    sel_ptr,            # [num_kv_heads, batch, SLOTS] int32 (in-place OUT)
+    sel_ptr,  # [num_kv_heads, batch, SLOTS] int32 (in-place OUT)
     select_num_idx_ptr,  # [num_kv_heads, batch] int32 (OUT)
-    seq_lens_ptr,        # [batch] int32
-    stride_sel_h, stride_sel_b, stride_sel_s,
-    stride_sn_h, stride_sn_b,
+    seq_lens_ptr,  # [batch] int32
+    stride_sel_h,
+    stride_sel_b,
+    stride_sel_s,
+    stride_sn_h,
+    stride_sn_b,
     block_size: tl.constexpr,
     SLOTS: tl.constexpr,
 ):
@@ -75,19 +88,28 @@ def _native_sanitize_topk_kernel(
     nblocks = tl.cdiv(seq_len, block_size)
     off = tl.arange(0, SLOTS)
     base = pid_h * stride_sel_h + pid_b * stride_sel_b
-    sel = tl.load(sel_ptr + base + off * stride_sel_s)            # [SLOTS]
-    sel = tl.where(sel >= nblocks, -1, sel)                       # sanitize OOB
-    count = tl.sum((sel >= 0).to(tl.int32), axis=0)               # scalar
+    sel = tl.load(sel_ptr + base + off * stride_sel_s)  # [SLOTS]
+    sel = tl.where(sel >= nblocks, -1, sel)  # sanitize OOB
+    count = tl.sum((sel >= 0).to(tl.int32), axis=0)  # scalar
     tl.store(sel_ptr + base + off * stride_sel_s, sel)
     tl.store(select_num_idx_ptr + pid_h * stride_sn_h + pid_b * stride_sn_b, count)
 
 
 def _native_decode_main(
-    q, k, v, topk_idx, seq_lens, block_size, sm_scale,
-    block_table, req_to_token, req_pool_indices, max_num_blocks,
-    num_kv_heads, head_dim,
+    q,
+    k,
+    v,
+    topk_idx,
+    seq_lens,
+    block_size,
+    sm_scale,
+    block_table,
+    req_to_token,
+    req_pool_indices,
+    max_num_blocks,
+    num_kv_heads,
+    head_dim,
 ):
-    _ensure_native_sparse_loaded()
     device = q.device
     batch_size = q.shape[0]
     if block_table is not None:
@@ -102,24 +124,24 @@ def _native_decode_main(
             (bidx * block_size)[None, :].to(torch.int64),
         ]
         bt = (slots // block_size).to(torch.int32)
-    num_kv_heads = topk_idx.shape[0]
-    batch_size = q.shape[0]
     num_pages = k.shape[0]
-    # Sanitize (skip OOB select_idx beyond per-query KV) in ONE triton kernel,
-    # replacing ~7 torch ops (where/sum/cat/clamp) whose launch overhead ate the
-    # native op's win. sel is cloned (in-place kernel write); select_num_idx is
-    # computed in-kernel. Pure device ops (no host sync -> cuda-graph safe).
-    # No fold/cap: the native op's kernel array is now [32] (OOB bug fixed in the
-    # recompiled .o), so it safely handles up to 32 attended blocks.
     sel = topk_idx.to(torch.int32).clone()
     select_num_idx = torch.empty(
         (num_kv_heads, batch_size), dtype=torch.int32, device=q.device
     )
     _native_sanitize_topk_kernel[(num_kv_heads, batch_size)](
-        sel, select_num_idx, seq_lens.to(torch.int32),
-        sel.stride(0), sel.stride(1), sel.stride(2),
-        select_num_idx.stride(0), select_num_idx.stride(1),
-        block_size=block_size, SLOTS=sel.shape[-1], num_warps=1, num_stages=1,
+        sel,
+        select_num_idx,
+        seq_lens.to(torch.int32),
+        sel.stride(0),
+        sel.stride(1),
+        sel.stride(2),
+        select_num_idx.stride(0),
+        select_num_idx.stride(1),
+        block_size=block_size,
+        SLOTS=sel.shape[-1],
+        num_warps=1,
+        num_stages=1,
     )
     # bt is already valid for attended slots (sel < per-query nblocks after sanitize
     # -> bt from the req_to_token gather is a valid page id in [0, num_pages));
@@ -140,16 +162,24 @@ def _native_decode_main(
     # error (507011). The workspace itself comes through the standard EXEC_NPU_CMD
     # NPU caching allocator (graph memory pool), which is what makes replay safe.
     actual_kv = seq_lens.to(torch.int32)
-    out = torch.ops._C_ascend.npu_sparse_attention_score(
-        q, k, v, sel, bt,
+    _ensure_native_sparse_loaded()
+    out = _npu_sparse_attention_score_op(
+        q,
+        k,
+        v,
+        sel,
+        bt,
         select_num_idx=select_num_idx,
         actual_seq_lengths=torch.ones(batch_size, dtype=torch.int32, device=device),
         actual_seq_lengths_kv=actual_kv,
         num_key_value_heads=num_kv_heads,
-        scale_value=sm_scale if sm_scale is not None else head_dim ** -0.5,
-        block_size=block_size, top_k=topk_idx.shape[-1], inner_precise=0,
+        scale_value=sm_scale if sm_scale is not None else head_dim**-0.5,
+        block_size=block_size,
+        top_k=topk_idx.shape[-1],
+        inner_precise=0,
     )
     return out
+
 
 # =============================================================================
 # Utilities
@@ -160,6 +190,31 @@ def _floor_power_of_2(x: int) -> int:
     if x <= 1:
         return 1
     return 1 << (int(x).bit_length() - 1)
+
+
+# ---------------------------------------------------------------------------
+# Tunable launch configs for the served decode kernels.
+#
+# Defaults are the validated (num_warps=4, num_stages=2). The bench/tuning
+# scripts override these module globals before the first launch to sweep configs
+# and land the winners here. They are NOT triton.autotune so that each shape
+# bucket compiles to a single deterministic artifact (cuda-graph capture safe).
+# ---------------------------------------------------------------------------
+# NOTE: swept num_warps∈{2,4,8} × num_stages∈{2,3} via sweep_cfg.py on the real
+# captured decode workload (mostly short seqs -> launch-bound). No config beat the
+# validated (4,2) outside run-to-run noise, so 4/2 is kept. The hooks remain for
+# re-tuning if the served batch/context-length profile shifts to compute-bound.
+_SPARSE_DECODE_NW = 4
+_SPARSE_DECODE_NS = 2
+_MERGE_NW = 4
+_MERGE_NS = 2
+
+# MiniMax-M3 selects 16 scored blocks and appends one forced local block.  On
+# Ascend, the resulting short TopK list is launch/merge bound for C1 decode and
+# target verification.  Keep small batches in the single-chunk fast path, which
+# avoids the partial-output allocation and merge-kernel launch entirely.
+_MINIMAX_SINGLE_CHUNK_MAX_TOPK = 17
+_MINIMAX_SINGLE_CHUNK_MAX_BATCH = 4
 
 
 def _get_vectorcore_num_safe() -> int:
@@ -187,6 +242,13 @@ def _choose_num_topk_chunks(
 ) -> int:
     """Choose split-topk chunks in an SGLang-like but Ascend-conservative way."""
     if max_topk <= 1:
+        return 1
+
+    if (
+        num_kv_heads == 1
+        and batch_size <= _MINIMAX_SINGLE_CHUNK_MAX_BATCH
+        and max_topk <= _MINIMAX_SINGLE_CHUNK_MAX_TOPK
+    ):
         return 1
 
     num_vectorcore = _get_vectorcore_num_safe()
@@ -292,7 +354,9 @@ def _append_local_block_to_topk_idx_kernel(
         mask=q_valid[:, None] & (off_t[None, :] < topk),
         other=-1,
     ).to(tl.int32)
-    valid = (cand >= 0) & (cand < num_blocks) & (cand * block_size <= query_pos[:, None])
+    valid = (
+        (cand >= 0) & (cand < num_blocks) & (cand * block_size <= query_pos[:, None])
+    )
     cand_out = tl.where(valid, cand, -1)
 
     # Store validated candidates [BSQ, topk].
@@ -301,7 +365,9 @@ def _append_local_block_to_topk_idx_kernel(
         + q_tok[:, None] * stride_out_b
         + off_t[None, :] * stride_out_t
     )
-    tl.store(out_ptr + out_off, cand_out, mask=q_valid[:, None] & (off_t[None, :] < topk))
+    tl.store(
+        out_ptr + out_off, cand_out, mask=q_valid[:, None] & (off_t[None, :] < topk)
+    )
 
     # Append local block at slot topk: -1 if already present (dedup).
     local_present = tl.sum((cand_out == local_blk[:, None]).to(tl.int32), axis=1) > 0
@@ -443,6 +509,19 @@ def _gqa_share_sparse_decode_bnsd_kernel(
     BLOCK_SIZE_T: tl.constexpr,
     NUM_TOPK_CHUNKS: tl.constexpr,
     CHUNK_SIZE_T: tl.constexpr,
+    # Number of selected (topk) blocks gathered into one K/V tile + one dot per
+    # loop step. 1 == the original per-block path (bit-identical). 2/4 amortise
+    # the per-step scalar overhead (idx gather, page lookup, address math,
+    # softmax update) that leaves the prefill main-attention launch
+    # overhead-bound at total_q~3072. Same block set per query -> same math,
+    # only the online-softmax grouping changes (fp-tail level).
+    BLOCKS_PER_STEP: tl.constexpr,
+    # Hoist the whole chunk's topk-idx load + page-id gather into a vectorized
+    # prologue ([BLOCK_SIZE_T] lanes, one memory round trip) and recover the
+    # per-step scalars with a where+sum select, instead of the per-step serial
+    # idx-load -> page-gather -> K-load dependency chain. Same blocks, same
+    # order, same math -- only address generation is restructured.
+    PREFETCH_IDX: tl.constexpr,
     HAS_SINK: tl.constexpr,
     USE_DIRECT_PAGE_LOOKUP: tl.constexpr,
     SANITIZE_PAGE_IDS: tl.constexpr,
@@ -513,74 +592,124 @@ def _gqa_share_sparse_decode_bnsd_kernel(
     # in-loop (simpler; no benefit to hoist).
     # Iterate over the fixed topk slice assigned to this chunk. The actual valid
     # length is encoded by -1 sentinels in topk_idx.
-    for step in tl.range(CHUNK_SIZE_T):
-        topk_pos = chunk_start_topk + step
-        in_topk_range = topk_pos < max_topk
-
-        logical_block = tl.load(
-            idx_base + topk_pos * stride_ti_t,
-            mask=in_topk_range,
-            other=-1,
-        ).to(tl.int32)
-        valid_block = logical_block >= 0
-
-        if USE_DIRECT_PAGE_LOOKUP:
-            req_idx = tl.load(req_pool_indices_ptr + pid_b).to(tl.int64)
-            safe_logical_block = tl.maximum(logical_block, 0)
-            token_col = tl.minimum(
-                safe_logical_block * block_size, max_req_to_token_cols - 1
-            )
-            token_slot = tl.load(
-                req_to_token_ptr
-                + req_idx * stride_rtt_r
-                + token_col * stride_rtt_t,
-                mask=valid_block,
-                other=0,
-            ).to(tl.int64)
-            physical_block = token_slot // block_size
-            if SANITIZE_PAGE_IDS:
-                physical_block = tl.minimum(
-                    tl.maximum(physical_block, 0), num_pages - 1
+    if BLOCKS_PER_STEP == 1:
+        off_t_pf = tl.arange(0, BLOCK_SIZE_T)
+        if PREFETCH_IDX:
+            # Vectorized prologue: one gather for all of this chunk's selected
+            # blocks, one for their physical page ids. Afterwards the K/V loads
+            # in the loop depend only on register data, so the memory pipeline
+            # can run ahead instead of serializing idx->page->K per step.
+            chunk_end_topk_pf = tl.minimum(chunk_start_topk + CHUNK_SIZE_T, max_topk)
+            topk_pos_all = chunk_start_topk + off_t_pf
+            logical_all = tl.load(
+                idx_base + topk_pos_all * stride_ti_t,
+                mask=topk_pos_all < chunk_end_topk_pf,
+                other=-1,
+            ).to(tl.int32)
+            valid_pf = logical_all >= 0
+            safe_pf = tl.maximum(logical_all, 0)
+            if USE_DIRECT_PAGE_LOOKUP:
+                req_idx_pf = tl.load(req_pool_indices_ptr + pid_b).to(tl.int64)
+                token_cols_pf = tl.minimum(
+                    safe_pf * block_size, max_req_to_token_cols - 1
                 )
-        else:
-            physical_block = tl.load(
-                block_table_ptr + pid_b * stride_bt_b + logical_block * stride_bt_n,
-                mask=valid_block,
-                other=0,
-            ).to(tl.int64)
+                token_slots_pf = tl.load(
+                    req_to_token_ptr
+                    + req_idx_pf * stride_rtt_r
+                    + token_cols_pf * stride_rtt_t,
+                    mask=valid_pf,
+                    other=0,
+                ).to(tl.int64)
+                phys_pf = token_slots_pf // block_size
+                if SANITIZE_PAGE_IDS:
+                    phys_pf = tl.minimum(tl.maximum(phys_pf, 0), num_pages - 1)
+            else:
+                phys_pf = tl.load(
+                    block_table_ptr + pid_b * stride_bt_b + safe_pf * stride_bt_n,
+                    mask=valid_pf,
+                    other=0,
+                ).to(tl.int64)
+            phys_pf32 = phys_pf.to(tl.int32)
+        for step in tl.range(CHUNK_SIZE_T):
+            if PREFETCH_IDX:
+                # Dynamic register-vector index via where+sum ([T] int ops).
+                logical_block = tl.sum(
+                    tl.where(off_t_pf == step, logical_all, 0), axis=0
+                )
+                physical_block = tl.sum(
+                    tl.where(off_t_pf == step, phys_pf32, 0), axis=0
+                ).to(tl.int64)
+                valid_block = logical_block >= 0
+            else:
+                topk_pos = chunk_start_topk + step
+                in_topk_range = topk_pos < max_topk
 
-        pos = logical_block * block_size + off_n
-        pos_mask = valid_block & (pos < seq_len)
+                logical_block = tl.load(
+                    idx_base + topk_pos * stride_ti_t,
+                    mask=in_topk_range,
+                    other=-1,
+                ).to(tl.int32)
+                valid_block = logical_block >= 0
 
-        # K: [D, N]
-        k_offsets = (
-            physical_block * stride_k_block
-            + off_n[None, :] * stride_k_offset
-            + pid_kh * stride_k_h
-            + off_d[:, None] * stride_k_d
-        )
-        k = tl.load(
-            k_cache_ptr + k_offsets,
-            mask=dim_mask[:, None] & pos_mask[None, :],
-            other=0.0,
-        )
+                if USE_DIRECT_PAGE_LOOKUP:
+                    req_idx = tl.load(req_pool_indices_ptr + pid_b).to(tl.int64)
+                    safe_logical_block = tl.maximum(logical_block, 0)
+                    token_col = tl.minimum(
+                        safe_logical_block * block_size, max_req_to_token_cols - 1
+                    )
+                    token_slot = tl.load(
+                        req_to_token_ptr
+                        + req_idx * stride_rtt_r
+                        + token_col * stride_rtt_t,
+                        mask=valid_block,
+                        other=0,
+                    ).to(tl.int64)
+                    physical_block = token_slot // block_size
+                    if SANITIZE_PAGE_IDS:
+                        physical_block = tl.minimum(
+                            tl.maximum(physical_block, 0), num_pages - 1
+                        )
+                else:
+                    physical_block = tl.load(
+                        block_table_ptr
+                        + pid_b * stride_bt_b
+                        + logical_block * stride_bt_n,
+                        mask=valid_block,
+                        other=0,
+                    ).to(tl.int64)
 
-        # V: [N, D]
-        v_offsets = (
-            physical_block * stride_v_block
-            + off_n[:, None] * stride_v_offset
-            + pid_kh * stride_v_h
-            + off_d[None, :] * stride_v_d
-        )
-        v = tl.load(
-            v_cache_ptr + v_offsets,
-            mask=pos_mask[:, None] & dim_mask[None, :],
-            other=0.0,
-        )
+            pos = logical_block * block_size + off_n
+            pos_mask = valid_block & (pos < seq_len)
 
-        # [H, D] @ [D, N] -> [H, N]
-        qk = tl.dot(q, k) * sm_scale
-        qk = tl.where(pos_mask[None, :], qk, float("-inf"))
+            # K: [D, N]
+            k_offsets = (
+                physical_block * stride_k_block
+                + off_n[None, :] * stride_k_offset
+                + pid_kh * stride_k_h
+                + off_d[:, None] * stride_k_d
+            )
+            k = tl.load(
+                k_cache_ptr + k_offsets,
+                mask=dim_mask[:, None] & pos_mask[None, :],
+                other=0.0,
+            )
+
+            # V: [N, D]
+            v_offsets = (
+                physical_block * stride_v_block
+                + off_n[:, None] * stride_v_offset
+                + pid_kh * stride_v_h
+                + off_d[None, :] * stride_v_d
+            )
+            v = tl.load(
+                v_cache_ptr + v_offsets,
+                mask=pos_mask[:, None] & dim_mask[None, :],
+                other=0.0,
+            )
+
+            # [H, D] @ [D, N] -> [H, N]
+            qk = tl.dot(q, k) * sm_scale
+            qk = tl.where(pos_mask[None, :], qk, float("-inf"))
 
             m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
             # Direct path (no valid_block guard): m_ij is finite (finite-floor
@@ -823,13 +952,18 @@ def flash_decode_bnsd_with_gqa_share_sparse(
     max_num_blocks: Optional[int] = None,
     num_pages: Optional[int] = None,
     sanitize_page_ids: bool = False,
+    # Selected blocks fused into one K/V tile + dot per loop step (prefill
+    # main-attention anti-overhead lever; 1 keeps the validated per-block
+    # path). Must be a power of two so BLOCK_SIZE_N stays aligned.
+    topk_blocks_per_step: int = 1,
+    # Hoist the chunk's topk-idx + page-id gathers into a vectorized prologue
+    # (breaks the per-step idx->page->K load dependency chain). A/B lever for
+    # the latency/issue-bound prefill main-attention launch.
+    prefetch_idx: bool = False,
     num_warps: Optional[int] = None,
     num_stages: Optional[int] = None,
-    # Native Ascend aclnn op gate. True -> route to npu_sparse_attention_score;
-    # False -> fall through to the Triton split-K path below. Caller decides per
-    # path (decode passes _native_sparse_decode_enabled(), verify passes
-    # _native_verify_enabled()), so the two cuda-graph paths are independently
-    # switchable.
+    # Native Ascend aclnn op gate (auto-detected via _is_native_sparse_available).
+    # True -> route to npu_sparse_attention_score; False -> Triton split-K path.
     use_native: bool = False,
 ) -> torch.Tensor:
     """Sparse decode attention using BNSD KV cache and precomputed topk blocks.
@@ -882,9 +1016,19 @@ def flash_decode_bnsd_with_gqa_share_sparse(
             block_table is not None or req_to_token is not None
         ):
             return _native_decode_main(
-                q, k_cache_bnsd, v_cache_bnsd, topk_idx, seq_lens, block_size, sm_scale,
-                block_table, req_to_token, req_pool_indices, max_num_blocks,
-                _nkvh, q.shape[2],
+                q,
+                k_cache_bnsd,
+                v_cache_bnsd,
+                topk_idx,
+                seq_lens,
+                block_size,
+                sm_scale,
+                block_table,
+                req_to_token,
+                req_pool_indices,
+                max_num_blocks,
+                _nkvh,
+                q.shape[2],
             )
 
     use_direct_page_lookup = req_to_token is not None
@@ -960,11 +1104,29 @@ def flash_decode_bnsd_with_gqa_share_sparse(
     # This keeps correctness unchanged while avoiding the backend corner case.
     chunk_size_topk = max(2, chunk_size_topk)
 
-    o_partial = torch.empty(
-        (num_topk_chunks, batch_size, num_q_heads, head_dim),
-        dtype=q.dtype,
-        device=q.device,
-    )
+    blocks_per_step = max(1, int(topk_blocks_per_step))
+    assert (blocks_per_step & (blocks_per_step - 1)) == 0
+    # When several topk blocks are fused per step, the static loop width must
+    # cover at least one fused tile so every selected block is visited.
+    chunk_size_topk = max(chunk_size_topk, blocks_per_step)
+
+    # Single-chunk fast path: with NUM_TOPK_CHUNKS==1 the decode kernel writes the
+    # already-final-normalized output (it applies the final exp(m_i - lse_i) scale
+    # before storing), so the merge kernel would be a no-op copy. Alias o_partial
+    # to the final output buffer (pid_c is always 0 -> pid_c*stride_o_c == 0) and
+    # skip the merge launch + the [C,B,QH,D] temp allocation.
+    single_chunk = num_topk_chunks == 1
+    out = torch.empty_like(q)
+    if single_chunk:
+        o_partial = out.view(1, batch_size, num_q_heads, head_dim)
+    else:
+        o_partial = torch.empty(
+            (num_topk_chunks, batch_size, num_q_heads, head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+    # lse_partial is always written by the kernel; unused on the single-chunk path
+    # but required as a store target (small, [C,B,QH]).
     lse_partial = torch.empty(
         (num_topk_chunks, batch_size, num_q_heads),
         dtype=torch.float32,
@@ -1025,9 +1187,11 @@ def flash_decode_bnsd_with_gqa_share_sparse(
         lse_partial.stride(0),
         lse_partial.stride(1),
         lse_partial.stride(2),
-        BLOCK_SIZE_N=block_size,
+        BLOCK_SIZE_N=block_size * blocks_per_step,
         NUM_TOPK_CHUNKS=num_topk_chunks,
         CHUNK_SIZE_T=chunk_size_topk,
+        BLOCKS_PER_STEP=blocks_per_step,
+        PREFETCH_IDX=prefetch_idx and blocks_per_step == 1,
         HAS_SINK=sink is not None,
         USE_DIRECT_PAGE_LOOKUP=use_direct_page_lookup,
         SANITIZE_PAGE_IDS=sanitize_page_ids,
@@ -1035,27 +1199,26 @@ def flash_decode_bnsd_with_gqa_share_sparse(
         num_stages=_SPARSE_DECODE_NS if num_stages is None else num_stages,
     )
 
-    out = torch.empty_like(q)
-
-    merge_grid = (batch_size, num_q_heads)
-    _merge_topk_attn_out_bnsd_kernel[merge_grid](
-        o_partial,
-        lse_partial,
-        out,
-        head_dim,
-        o_partial.stride(0),
-        o_partial.stride(1),
-        o_partial.stride(2),
-        o_partial.stride(3),
-        lse_partial.stride(0),
-        lse_partial.stride(1),
-        lse_partial.stride(2),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        NUM_TOPK_CHUNKS=num_topk_chunks,
-        num_warps=4,
-        num_stages=2,
-    )
+    if not single_chunk:
+        merge_grid = (batch_size, num_q_heads)
+        _merge_topk_attn_out_bnsd_kernel[merge_grid](
+            o_partial,
+            lse_partial,
+            out,
+            head_dim,
+            o_partial.stride(0),
+            o_partial.stride(1),
+            o_partial.stride(2),
+            o_partial.stride(3),
+            lse_partial.stride(0),
+            lse_partial.stride(1),
+            lse_partial.stride(2),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            NUM_TOPK_CHUNKS=num_topk_chunks,
+            num_warps=_MERGE_NW,
+            num_stages=_MERGE_NS,
+        )
 
     return out

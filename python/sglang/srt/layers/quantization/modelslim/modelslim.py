@@ -2,18 +2,7 @@ from __future__ import annotations
 
 import logging
 from types import MappingProxyType
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Dict,
-    Iterable,
-    List,
-    Mapping,
-    Optional,
-    Tuple,
-    Union,
-    cast,
-)
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 
@@ -52,29 +41,6 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
-
-
-_DEFAULT_PACKED_MODULES_MAPPING: Mapping[str, Mapping[str, List[str]]] = {
-    "model": {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "gate_up_proj": ["gate_proj", "up_proj"],
-        # MiniMax-M3's sparse index branch has no index_v_proj in current
-        # ModelSlim W8A8 checkpoints; value-enabled checkpoints can still load
-        # index_v_proj weights via the model weight loader when present.
-        "index_qkv_proj": ["index_q_proj", "index_k_proj"],
-    }
-}
-
-
-def _require_modelslim_scheme(layer: torch.nn.Module, layer_kind: str):
-    scheme = getattr(layer, "scheme", None)
-    if scheme is None:
-        raise ValueError(
-            f"ModelSlim {layer_kind} quantization scheme is missing. "
-            "Check quant_model_description.json and packed_modules_mapping for "
-            "this layer prefix."
-        )
-    return scheme
 
 
 # func refers to RMSNorm.__init__
@@ -137,6 +103,20 @@ class ModelSlimConfig(QuantizationConfig):
                 for k, v in quant_config.items()
             }
 
+        # Normalize block_sparse_moe -> mlp so quant_description keys
+        # match the model's module names (some checkpoints use the
+        # block_sparse_moe prefix; the model uses mlp).
+        for k in list(quant_config.keys()):
+            if not isinstance(k, str):
+                continue
+            if "block_sparse_moe" in k:
+                v = quant_config.pop(k)
+                quant_config[
+                    k.replace("block_sparse_moe.experts", "mlp.experts").replace(
+                        "block_sparse_moe.shared_experts", "mlp.shared_experts"
+                    )
+                ] = v
+
         self.quant_description = quant_config
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
@@ -158,9 +138,7 @@ class ModelSlimConfig(QuantizationConfig):
                     [npu_wrapper_rmsnorm_forward],
                 )
 
-    def update_packed_modules_mapping(
-        self, mapping: Mapping[str, Mapping[str, List[str]]]
-    ) -> None:
+    def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)
 
     def get_linear_method(self) -> ModelSlimLinearMethod:
@@ -205,7 +183,7 @@ class ModelSlimConfig(QuantizationConfig):
             if "vision_tower" in prefix or "mm_projector" in prefix:
                 prefix = prefix.replace(r"attn.qkv_proj", r"wqkv")
                 prefix = prefix.replace(r"attn.proj", r"wo")
-            packed_modules_mapping_subset = self.get_packed_modules_mapping_subset(key)
+            packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
             if proj_name in packed_modules_mapping_subset:
@@ -220,9 +198,9 @@ class ModelSlimConfig(QuantizationConfig):
                 prefix, packed_modules_mapping_subset
             ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
                 return UnquantizedLinearMethod()
-            layer.scheme = self.get_linear_scheme(
-                layer, prefix, packed_modules_mapping_subset
-            )
+            layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
+            if layer.scheme is None:
+                return UnquantizedLinearMethod()
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             moe_schemes = self.get_moe_scheme(layer, prefix)
@@ -236,53 +214,8 @@ class ModelSlimConfig(QuantizationConfig):
             return ModelSlimFusedMoEMethod(self)
         return None
 
-    def get_packed_modules_mapping_subset(self, key: str) -> Mapping[str, List[str]]:
-        default_mapping = _DEFAULT_PACKED_MODULES_MAPPING.get(key, {})
-        configured_mapping = self.packed_modules_mapping.get(key, {})
-        if not default_mapping:
-            return configured_mapping
-        if not configured_mapping:
-            return default_mapping
-        return {**default_mapping, **configured_mapping}
-
-    @staticmethod
-    def iter_packed_linear_prefixes(
-        prefix: str,
-        packed_modules_mapping_subset: Mapping[str, List[str]],
-    ) -> Iterable[str]:
-        for linear_prefix in ModelSlimConfig.iter_linear_prefix_aliases(prefix):
-            yield linear_prefix
-            proj_name = linear_prefix.split(".")[-1]
-            if proj_name not in packed_modules_mapping_subset:
-                continue
-            for shard_proj_name in packed_modules_mapping_subset[proj_name]:
-                yield linear_prefix.replace(proj_name, shard_proj_name)
-
-    @staticmethod
-    def iter_linear_prefix_aliases(prefix: str) -> Iterable[str]:
-        yield prefix
-        if ".mlp.shared_experts" in prefix:
-            yield prefix.replace(
-                ".mlp.shared_experts", ".block_sparse_moe.shared_experts"
-            )
-        if ".block_sparse_moe.shared_experts" in prefix:
-            yield prefix.replace(
-                ".block_sparse_moe.shared_experts", ".mlp.shared_experts"
-            )
-
-    @staticmethod
-    def iter_moe_prefix_aliases(prefix: str) -> Iterable[str]:
-        yield prefix
-        if ".mlp.experts" in prefix:
-            yield prefix.replace(".mlp.experts", ".block_sparse_moe.experts")
-        if ".block_sparse_moe.experts" in prefix:
-            yield prefix.replace(".block_sparse_moe.experts", ".mlp.experts")
-
     def get_linear_scheme(
-        self,
-        layer: torch.nn.Module,
-        prefix: Optional[str] = None,
-        packed_modules_mapping_subset: Mapping[str, List[str]] = MappingProxyType({}),
+        self, layer: torch.nn.Module, prefix: Optional[str] = None
     ) -> Optional[ModelSlimLinearScheme]:
         """
         get_scheme method adjusted for modelslim, taken from
@@ -298,27 +231,16 @@ class ModelSlimConfig(QuantizationConfig):
             ("W4A4_MXFP4", ModelSlimMXFP4Scheme),
         ]
 
-        quant_prefixes = list(
-            dict.fromkeys(
-                self.iter_packed_linear_prefixes(prefix, packed_modules_mapping_subset)
-            )
-        )
-        quant_schemes = [
-            self.quant_description.get(quant_prefix + ".weight", "")
-            for quant_prefix in quant_prefixes
-        ]
+        quant_schemes = [self.quant_description.get(prefix + ".weight", "")]
 
         for scheme_name, scheme_class in linear_quant_schemes:
-            for quant_prefix, quant_scheme in zip(quant_prefixes, quant_schemes):
-                if quant_scheme == scheme_name:
-                    logger.info_once(f"Using {scheme_class.__name__}")
-                    return scheme_class(
-                        quant_config=self.quant_description, prefix=quant_prefix
-                    )
+            if any(s == scheme_name for s in quant_schemes):
+                logger.info_once(f"Using {scheme_class.__name__}")
+                return scheme_class(quant_config=self.quant_description, prefix=prefix)
 
         logger.warning(
             f"Unsupported Linear modelslim scheme: "
-            f"{quant_schemes} in layer: {prefix}, candidates: {quant_prefixes}"
+            f"{quant_schemes} in layer: {prefix}"
         )
         return None
 
@@ -344,34 +266,28 @@ class ModelSlimConfig(QuantizationConfig):
 
         w13_scheme_name = None
         w2_scheme_name = None
-        # The model exposes experts under ``mlp.experts`` while many checkpoints
-        # (incl. MiniMax-M3) store them under ``block_sparse_moe.experts``; try
-        # both aliases via iter_moe_prefix_aliases.
-        for quant_prefix in dict.fromkeys(self.iter_moe_prefix_aliases(prefix)):
-            for gate_name, up_name, down_name in naming_conventions:
-                w13_keys = [
-                    f"{quant_prefix}.0.{gate_name}.weight",
-                    f"{quant_prefix}.0.{up_name}.weight",
-                ]
-                w2_key = f"{quant_prefix}.0.{down_name}.weight"
-                w13_entries = {
-                    key: self.quant_description[key]
-                    for key in w13_keys
-                    if key in self.quant_description
-                }
-                if w13_entries and w2_key in self.quant_description:
-                    w13_names = list(w13_entries.values())
-                    # For w13, both projections must agree on the scheme
-                    unique_w13 = set(w13_names)
-                    if len(unique_w13) > 1:
-                        raise ValueError(
-                            f"Mismatched ModelSlim quantization for W13 in layer {prefix}: "
-                            f"{w13_entries}"
-                        )
-                    w13_scheme_name = w13_names[0]
-                    w2_scheme_name = self.quant_description[w2_key]
-                    break
-            if w13_scheme_name is not None:
+        for gate_name, up_name, down_name in naming_conventions:
+            w13_keys = [
+                f"{prefix}.0.{gate_name}.weight",
+                f"{prefix}.0.{up_name}.weight",
+            ]
+            w2_key = f"{prefix}.0.{down_name}.weight"
+            w13_entries = {
+                key: self.quant_description[key]
+                for key in w13_keys
+                if key in self.quant_description
+            }
+            if w13_entries and w2_key in self.quant_description:
+                w13_names = list(w13_entries.values())
+                # For w13, both projections must agree on the scheme
+                unique_w13 = set(w13_names)
+                if len(unique_w13) > 1:
+                    raise ValueError(
+                        f"Mismatched ModelSlim quantization for W13 in layer {prefix}: "
+                        f"{w13_entries}"
+                    )
+                w13_scheme_name = w13_names[0]
+                w2_scheme_name = self.quant_description[w2_key]
                 break
 
         if w13_scheme_name is None:
@@ -425,33 +341,31 @@ class ModelSlimConfig(QuantizationConfig):
     ):
         # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
         proj_name = prefix.split(".")[-1]
-        for linear_prefix in self.iter_linear_prefix_aliases(prefix):
-            if proj_name in fused_mapping:
-                shard_prefixes = [
-                    linear_prefix.replace(proj_name, shard_proj_name)
-                    for shard_proj_name in fused_mapping[proj_name]
-                ]
-            else:
-                shard_prefixes = [linear_prefix]
-
-            present_schemes = [
-                self.quant_description[shard_prefix + ".weight"]
-                for shard_prefix in shard_prefixes
-                if shard_prefix + ".weight" in self.quant_description
+        if proj_name in fused_mapping:
+            shard_prefixes = [
+                prefix.replace(proj_name, shard_proj_name)
+                for shard_proj_name in fused_mapping[proj_name]
             ]
-            if not present_schemes:
-                continue
 
-            is_skipped = present_schemes[0] == "FLOAT"
-            if any((scheme == "FLOAT") != is_skipped for scheme in present_schemes):
-                raise ValueError(
-                    f"Detected some but not all shards of {prefix} "
-                    "are quantized. All shards of fused layers "
-                    "to have the same precision."
+            is_skipped = None
+            for shard_prefix in shard_prefixes:
+                is_shard_skipped = (
+                    self.quant_description.get(shard_prefix + ".weight", "") == "FLOAT"
                 )
-            return is_skipped
 
-        return False
+                if is_skipped is None:
+                    is_skipped = is_shard_skipped
+                elif is_shard_skipped != is_skipped:
+                    raise ValueError(
+                        f"Detected some but not all shards of {prefix} "
+                        "are quantized. All shards of fused layers "
+                        "to have the same precision."
+                    )
+        else:
+            is_skipped = self.quant_description.get(prefix + ".weight", "") == "FLOAT"
+
+        assert is_skipped is not None
+        return is_skipped
 
     def get_scaled_act_names(self) -> List[str]:
         return []
@@ -463,7 +377,7 @@ class ModelSlimLinearMethod(_NPULinearMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        _require_modelslim_scheme(layer, "Linear").process_weights_after_loading(layer)
+        layer.scheme.process_weights_after_loading(layer)
 
     def create_weights(
         self,
@@ -481,7 +395,7 @@ class ModelSlimLinearMethod(_NPULinearMethodBase):
         details
         """
         weight_loader = extra_weight_attrs.get("weight_loader")
-        _require_modelslim_scheme(layer, "Linear").create_weights(
+        layer.scheme.create_weights(
             layer=layer,
             input_size=input_size,
             input_size_per_partition=input_size_per_partition,
@@ -535,8 +449,9 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         """
-        Use the w13/w2 ModelSlimMoESchemes on the layer to create the
-        parameters for each projection group. See FusedMoEMethodBase for details.
+        Use the ModelSlimMoEScheme associated with the layer to create
+        the necessary parameters for the layer. See FusedMoEMethodBase for param
+        details
         """
         layer.w13_scheme.create_weights(
             layer=layer,
@@ -565,6 +480,9 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             backend = MoeRunnerBackend.ASCEND
         self.runner = MoeRunner(backend, moe_runner_config)
 
+    # ------------------------------------------------------------------
+    # Main apply()
+    # ------------------------------------------------------------------
     def apply(
         self,
         layer,

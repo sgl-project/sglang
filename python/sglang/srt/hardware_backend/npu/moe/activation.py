@@ -22,7 +22,7 @@ class BaseActivation(ABC):
 
 
 # =============================================================================
-# Concrete activation implementations (unchanged except removed 8.)
+# Concrete activation implementations
 # =============================================================================
 class NPUSwiglu(BaseActivation):
     def _apply_activation(self, hidden_states: torch.Tensor):
@@ -65,15 +65,10 @@ class NPUSwigluQuantWithScales(BaseActivation):
 
 
 class NPUSwigluDeepEPKernel(BaseActivation):
-    """DeepEP grouped SwiGLU activation for the Ascend MoE runner.
-
-    Selects between the standard SwiGLU (``swiglu_quant``) and the MiniMax
-    SwiGLU-OAI variant (``swiglu_oai_quant``) based on whether the OAI
-    parameters (``alpha``/``limit``) are provided. MiniMax-M3 uses SwiGLU-OAI,
-    ``gate * sigmoid(gate * alpha) * (up + 1)`` with clamping, so the runner
-    must forward ``gemm1_alpha``/``gemm1_clamp_limit`` here — otherwise the
-    experts fall back to plain SwiGLU and produce wrong outputs.
-    """
+    """DeepEP grouped SwiGLU for the Ascend MoE runner; picks ``swiglu_quant`` vs the MiniMax
+    SwiGLU-OAI variant (``swiglu_oai_quant``: ``gate*sigmoid(gate*alpha)*(up+1)`` w/ clamping)
+    based on whether ``alpha``/``limit`` are given. The runner must forward
+    ``gemm1_alpha``/``gemm1_clamp_limit`` here or experts fall back to wrong SwiGLU."""
 
     def __init__(
         self,
@@ -86,7 +81,7 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         self.limit = limit
         self._use_oai = alpha is not None and limit is not None
         if self._use_oai:
-            from sglang.kernels.ops.activation.npu_swiglu_oai_quant import (
+            from sglang.kernels.ops.moe.swiglu_oai_quant_int8 import (
                 swiglu_oai_quant,
             )
 

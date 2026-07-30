@@ -347,10 +347,6 @@ class Envs:
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
-    # Per-cycle wall-clock split (draft / target_verify / overhead) of the EAGLE3
-    # verify cycle. Diagnostic only: uses torch.<device>.synchronize() barriers,
-    # so absolute TPOT is perturbed; the relative phase split stays valid.
-    SGLANG_DEBUG_SPEC_CYCLE = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
@@ -380,51 +376,9 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
-    # MiniMax M3 NPU sparse-attention PREFILL (extend) path OVERRIDE. The default
-    # behavior is now ADAPTIVE: prefill uses the block-sparse triton path
-    # (`_forward_npu_triton_prefill`) only when max KV length >=
-    # MINIMAX_NPU_TRITON_PREFILL_AUTO_MIN_SEQLEN (~12K, the measured crossover
-    # where sparse beats PyTorch's full-dense O(seq^2) main attention), else the
-    # validated PyTorch masked-full path. Set this flag=True to force the triton
-    # path for ALL prefill lengths (long AND short); respects the master kill-
-    # switch SGLANG_MINIMAX_NPU_TRITON. E2e (dp4/ctx32768): triton wins >=16K
-    # (1.45x @16K, >7x @24K), loses <=8K -- hence the adaptive default.
-    SGLANG_MINIMAX_NPU_TRITON_PREFILL = EnvBool(True)
 
-    # MiniMax M3 NPU prefill MAIN-attention PACK_Q shared-topk kernel
-    # (`_gqa_share_sparse_prefill_blockq_kernel`). The blockq path is engaged
-    # AUTOMATICALLY by the size-based `_choose_prefill_pack_q` policy whenever
-    # the triton prefill path is active and the input size warrants PACK_Q>1
-    # (PACK_Q=1 falls back to the validated per-query `_decode_main`). This is an
-    # EXPERT A/B / kill-switch only -- force PACK_Q=1 to disable blockq and use
-    # the per-query path; 2/4 to override the adaptive pick. None = adaptive.
-    # UB cap is PACK_Q=4 (gqa=16, D=128, bf16); larger overflows the 192KB UB.
-    SGLANG_MINIMAX_NPU_PREFILL_PACKQ = EnvInt(None)
-
-    # MiniMax M3 NPU prefill MAIN-attention: A/B kill-switch to route the sparse
-    # main attention through the native Ascend FA op
-    # `torch.ops.npu.npu_fused_infer_attention_score` (FIA) with a per-query CUSTOM
-    # block_table, instead of the hand-written triton `_gqa_share_sparse_prefill_blockq_kernel`.
-    # The triton kernel is scalar/fixpipe-bound (aic_mac=3.2%, 9.3ms/call @ production
-    # shape); FIA hits native cube efficiency (~3x faster per token-pair). The native
-    # *sparse* op `npu_sparse_flash_attention` is MLA-only (qk_head_dim=512) and
-    # unusable for MiniMax GQA, so this uses the dense paged FA (FIA) with a custom
-    # block_table listing only each query's selected top-k blocks.
-    # Single pass: per-query reorder puts the own (causal) block last, actual_kvlen
-    # length-limits it (sparse_mode=0 full-attends the fully-past score blocks).
-    # Default OFF (triton is the validated baseline); set =1 to A/B the FIA path.
-    SGLANG_MINIMAX_NPU_PREFILL_FIA = EnvBool(True)
-
-    # MiniMax M3 NPU native Ascend block-sparse attention (aclnn
-    # npu_sparse_attention_score) for the DECODE/VERIFY main attention, replacing
-    # the Triton split-K kernel. DECODE is cuda-graph replay-safe; VERIFY needs a
-    # defensive clamp (see topk_sparse_decode._native_decode_main) and is WIP.
-    # Both default OFF (Triton is the validated baseline).
-    SGLANG_MINIMAX_NPU_NATIVE_DECODE = EnvBool(False)
-    SGLANG_MINIMAX_NPU_NATIVE_VERIFY = EnvBool(False)
-    # Path to the vllm_ascend_C.so build of the aclnn op wrapper; required when
-    # either NATIVE_DECODE or NATIVE_VERIFY is on.
-    SGLANG_MINIMAX_NPU_NATIVE_SPARSE_LIB = EnvStr("")
+    # size the KV pool after CUDA-graph capture
+    SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
@@ -1298,6 +1252,15 @@ class Envs:
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
+
+    # MiniMax M3 NPU prefill MAIN-attention PACK_Q shared-topk kernel
+    # (`_gqa_share_sparse_prefill_blockq_kernel`).
+    SGLANG_MINIMAX_NPU_PREFILL_PACKQ = EnvInt(None)
+
+    # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
+    # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
+    # with a per-query CUSTOM block_table
+    SGLANG_MINIMAX_NPU_PREFILL_FIA = EnvBool(True)
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

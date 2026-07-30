@@ -54,19 +54,22 @@ import triton.language as tl
 
 @triton.jit
 def _fia_prep_kernel(
-    topk_idx_ptr,       # [T, TOPK1] int32, -1-padded logical blocks (kvh==1)
-    seq_lens_ptr,       # [T] int32 per-query CAUSAL KV len (abs_pos+1)
-    req_pool_ptr,       # [T] int32 request index per query
-    req_to_token_ptr,   # [num_req, max_ctx] int32 page slot table
-    block_table_ptr,    # [T, TOPK1] int32 OUT (physical pages; own last, 0 pads)
-    actual_kvlen_ptr,   # [T] int32 OUT
+    topk_idx_ptr,  # [T, TOPK1] int32, -1-padded logical blocks (kvh==1)
+    seq_lens_ptr,  # [T] int32 per-query CAUSAL KV len (abs_pos+1)
+    req_pool_ptr,  # [T] int32 request index per query
+    req_to_token_ptr,  # [num_req, max_ctx] int32 page slot table
+    block_table_ptr,  # [T, TOPK1] int32 OUT (physical pages; own last, 0 pads)
+    actual_kvlen_ptr,  # [T] int32 OUT
     max_req_to_token_cols,
     # strides
-    stride_ti_t, stride_ti_k,
+    stride_ti_t,
+    stride_ti_k,
     stride_sl,
     stride_req,
-    stride_rtt_r, stride_rtt_t,
-    stride_bt_t, stride_bt_k,
+    stride_rtt_r,
+    stride_rtt_t,
+    stride_bt_t,
+    stride_bt_k,
     # meta
     TOPK1: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -76,8 +79,8 @@ def _fia_prep_kernel(
     pid = tl.program_id(0)
     seq_len = tl.load(seq_lens_ptr + pid * stride_sl).to(tl.int32)
     abs_pos = tl.maximum(seq_len - 1, 0)
-    own = abs_pos // BLOCK_SIZE                 # own logical block id (contains abs_pos)
-    own_offset = abs_pos % BLOCK_SIZE           # causal offset within own block
+    own = abs_pos // BLOCK_SIZE  # own logical block id (contains abs_pos)
+    own_offset = abs_pos % BLOCK_SIZE  # causal offset within own block
     req = tl.load(req_pool_ptr + pid * stride_req).to(tl.int64)
 
     off = tl.arange(0, TOPK1)
@@ -86,8 +89,8 @@ def _fia_prep_kernel(
     real_nonown = (log_blk >= 0) & (log_blk != own)
     rn = real_nonown.to(tl.int32)
     # exclusive scan -> output rank for each non-own real slot (0..count_real-1)
-    rank = tl.cumsum(rn, axis=0) - rn           # [TOPK1]
-    count_real = tl.sum(rn, axis=0)             # scalar
+    rank = tl.cumsum(rn, axis=0) - rn  # [TOPK1]
+    count_real = tl.sum(rn, axis=0)  # scalar
     own_present = tl.sum(is_own.to(tl.int32), axis=0) > 0
 
     # physical-page gather (in-kernel, vector-core): phys[i] = req_to_token[req,
@@ -96,13 +99,16 @@ def _fia_prep_kernel(
     token_col = tl.minimum(safe_blk * BLOCK_SIZE, max_req_to_token_cols - 1)
     slots = tl.load(
         req_to_token_ptr + req * stride_rtt_r + token_col * stride_rtt_t,
-        mask=log_blk >= 0, other=0,
+        mask=log_blk >= 0,
+        other=0,
     ).to(tl.int32)
-    phys = slots // BLOCK_SIZE                   # [TOPK1]
+    phys = slots // BLOCK_SIZE  # [TOPK1]
 
     # own block's physical page (scalar gather)
     own_col = tl.minimum(own * BLOCK_SIZE, max_req_to_token_cols - 1)
-    own_slot = tl.load(req_to_token_ptr + req * stride_rtt_r + own_col * stride_rtt_t).to(tl.int32)
+    own_slot = tl.load(
+        req_to_token_ptr + req * stride_rtt_r + own_col * stride_rtt_t
+    ).to(tl.int32)
     own_phys = own_slot // BLOCK_SIZE
 
     # zero-fill all slots (pads), then scatter non-own real -> [rank], own -> [count_real].
@@ -121,11 +127,15 @@ def _fia_prep_kernel(
     tl.store(bt_base + count_real * stride_bt_k, own_phys)
 
     # actual_kvlen: real blocks full + own causal (offset+1)
-    kvl = tl.where(own_present, count_real * BLOCK_SIZE + own_offset + 1, count_real * BLOCK_SIZE)
+    kvl = tl.where(
+        own_present, count_real * BLOCK_SIZE + own_offset + 1, count_real * BLOCK_SIZE
+    )
     tl.store(actual_kvlen_ptr + pid, kvl.to(tl.int32))
 
 
-def _fia_prep_torch(topk_idx, seq_lens, per_query_req, req_to_token, block_size, num_pages, device):
+def _fia_prep_torch(
+    topk_idx, seq_lens, per_query_req, req_to_token, block_size, num_pages, device
+):
     """Torch-op FIA prep (A/B reference). Returns (block_table [T, topk+1], actual_kvlen [T]).
     Bit-identical to _fia_prep_kernel; kept for A/B + correctness cross-check."""
     total_q = topk_idx.shape[1]
@@ -156,19 +166,21 @@ def _fia_prep_torch(topk_idx, seq_lens, per_query_req, req_to_token, block_size,
 
 @torch.no_grad()
 def flash_prefill_bnsd_blockq_sparse_fia(
-    q: torch.Tensor,                # [total_q, num_q_heads, head_dim]
-    k_cache_bnsd: torch.Tensor,     # [num_pages, block_size, num_kv_heads, head_dim]
-    v_cache_bnsd: torch.Tensor,     # same shape
-    topk_idx: torch.Tensor,         # [num_kv_heads, total_q, topk+1] int32, -1-padded
-    seq_lens: torch.Tensor,         # [total_q] int32 -- per-query CAUSAL KV length (abs_pos+1)
-    per_query_req: torch.Tensor,    # [total_q] int32/int64 -- request index per query
-    req_to_token: torch.Tensor,     # [num_requests, max_ctx] int32 -- page slot table
+    q: torch.Tensor,  # [total_q, num_q_heads, head_dim]
+    k_cache_bnsd: torch.Tensor,  # [num_pages, block_size, num_kv_heads, head_dim]
+    v_cache_bnsd: torch.Tensor,  # same shape
+    topk_idx: torch.Tensor,  # [num_kv_heads, total_q, topk+1] int32, -1-padded
+    seq_lens: torch.Tensor,  # [total_q] int32 -- per-query CAUSAL KV length (abs_pos+1)
+    per_query_req: torch.Tensor,  # [total_q] int32/int64 -- request index per query
+    req_to_token: torch.Tensor,  # [num_requests, max_ctx] int32 -- page slot table
     block_size: int,
     sm_scale: Optional[float],
     num_pages: int,
     max_num_blocks: int,
-    use_prep_kernel: bool = True,   # False -> torch prep (A/B / correctness cross-check)
-    block_table_out: Optional[torch.Tensor] = None,  # reuse buffer (skip per-call empty)
+    use_prep_kernel: bool = True,  # False -> torch prep (A/B / correctness cross-check)
+    block_table_out: Optional[
+        torch.Tensor
+    ] = None,  # reuse buffer (skip per-call empty)
     actual_kvlen_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Single-pass FIA sparse+causal prefill attention. Returns [total_q, QH, D]."""
@@ -212,20 +224,35 @@ def flash_prefill_bnsd_blockq_sparse_fia(
         # _build_prefill_meta as per_query_seq_lens / per_query_req_i32, shared
         # across all 57 sparse layers) -- no per-layer cast here.
         _fia_prep_kernel[(total_q,)](
-            ti, seq_lens, per_query_req, req_to_token,
-            block_table, actual_kvlen,
+            ti,
+            seq_lens,
+            per_query_req,
+            req_to_token,
+            block_table,
+            actual_kvlen,
             max_req_to_token_cols,
-            ti.stride(0), ti.stride(1),
+            ti.stride(0),
+            ti.stride(1),
             seq_lens.stride(0) if seq_lens.dim() > 0 else 0,
             per_query_req.stride(0) if per_query_req.dim() > 0 else 0,
-            req_to_token.stride(0), req_to_token.stride(1),
-            block_table.stride(0), block_table.stride(1),
-            TOPK1=topk1, BLOCK_SIZE=block_size,
-            num_warps=1, num_stages=1,
+            req_to_token.stride(0),
+            req_to_token.stride(1),
+            block_table.stride(0),
+            block_table.stride(1),
+            TOPK1=topk1,
+            BLOCK_SIZE=block_size,
+            num_warps=1,
+            num_stages=1,
         )
     else:
         block_table, actual_kvlen = _fia_prep_torch(
-            topk_idx, seq_lens, per_query_req, req_to_token, block_size, num_pages, device
+            topk_idx,
+            seq_lens,
+            per_query_req,
+            req_to_token,
+            block_size,
+            num_pages,
+            device,
         )
 
     # KV 3D [num_pages, block_size, kvh*D]; layout TND.
@@ -238,7 +265,9 @@ def flash_prefill_bnsd_blockq_sparse_fia(
     # plain host list -- a device arange + .tolist() would cost a kernel launch
     # plus a D2H sync per layer.
     out, _ = torch.ops.npu.npu_fused_infer_attention_score(
-        q, k_paged, v_paged,
+        q,
+        k_paged,
+        v_paged,
         block_table=block_table,
         block_size=block_size,
         num_heads=num_q_heads,
