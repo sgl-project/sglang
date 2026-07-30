@@ -95,16 +95,50 @@ class EncoderMetaRegistry:
         # None value = claimed but not yet published, so waiters keep waiting.
         self._rid_to_meta: Dict[str, Optional[dict]] = {}
         self._rid_to_send_done: Dict[str, int] = {}
-        self._sweep_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_at: Dict[str, float] = {}
+        self._sweeper_task: Optional[asyncio.Task] = None
         # Set only where the embedding also lives; None in the DP main process.
         self.on_release: Optional[Callable[[str], None]] = None
+
+    def _touch(self, req_id: str) -> None:
+        self._pending_at[req_id] = time.monotonic()
+        self._ensure_sweeper()
+
+    def _ensure_sweeper(self) -> None:
+        if self._sweeper_task is not None and not self._sweeper_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._sweeper_task = loop.create_task(self._sweep_loop())
+
+    async def _sweep_loop(self) -> None:
+        # Same idiom as DPDispatcher._cleanup_stale_mappings: one eternal
+        # scanner; interval re-read each pass so the MMEncoder override applies.
+        while True:
+            await asyncio.sleep(max(self.sweep_timeout / 4, 0.01))
+            now = time.monotonic()
+            stale = [
+                rid
+                for rid, ts in self._pending_at.items()
+                if now - ts > self.sweep_timeout
+            ]
+            for rid in stale:
+                await self._release(rid)
 
     async def claim(self, req_id: str) -> bool:
         """True if this caller owns the encode, False if someone already does."""
         async with rid_lock:
             if req_id in self._rid_to_meta:
-                return False
+                existing = self._rid_to_meta[req_id]
+                if not (
+                    isinstance(existing, dict) and existing.get("error") is not None
+                ):
+                    return False
+                self._rid_to_send_done.pop(req_id, None)
             self._rid_to_meta[req_id] = None
+            self._touch(req_id)
             return True
 
     async def publish(
@@ -127,13 +161,15 @@ class EncoderMetaRegistry:
         )
         async with rid_lock:
             self._rid_to_meta[req_id] = meta
-        self._schedule_sweep(req_id)
+            self._touch(req_id)
         cond = await _get_receive_condition(req_id)
         async with cond:
             cond.notify_all()
 
     async def wait(self, req_id: str) -> Optional[dict]:
-        """Block until req_id's metadata is published; TimeoutError past wait_timeout."""
+        """Block until req_id's metadata is published; TimeoutError past wait_timeout.
+        No _touch here: a pull-first timestamp would let the sweeper pop the very
+        Condition this waiter holds, stranding it when publish notifies a new one."""
         cond = await _get_receive_condition(req_id)
         async with cond:
             await asyncio.wait_for(
@@ -160,21 +196,9 @@ class EncoderMetaRegistry:
         async with rid_lock:
             self._rid_to_meta.pop(req_id, None)
             self._rid_to_send_done.pop(req_id, None)
+            self._pending_at.pop(req_id, None)
         async with cond_dict_lock:
             rid_to_cond.pop(req_id, None)
-        task = self._sweep_tasks.pop(req_id, None)
-        if task is not None and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-
-    def _schedule_sweep(self, req_id: str) -> None:
-        async def _sweep_later():
-            await asyncio.sleep(self.sweep_timeout)
-            await self._release(req_id)
-
-        old_task = self._sweep_tasks.pop(req_id, None)
-        if old_task is not None and not old_task.done():
-            old_task.cancel()
-        self._sweep_tasks[req_id] = asyncio.create_task(_sweep_later())
 
 
 meta_registry = EncoderMetaRegistry(
@@ -1569,9 +1593,6 @@ class MMEncoder:
                 get_feat,
                 keep_on_gpu=keep_on_gpu,
             )
-            if keep_on_gpu and final_slices and final_slices[0].is_cuda:
-                # transfer_sync bypasses CUDA streams, so GPU writes must land first.
-                torch.cuda.current_stream(final_slices[0].device).synchronize()
 
             if self.profiler is not None:
                 for _ in requests:
@@ -1581,6 +1602,7 @@ class MMEncoder:
             # video-meta fields — which never appear in image/audio mm_inputs.
             results = []
             offset = 0
+            staged_device = None
             for req, n in zip(requests, items_per_req):
                 slices = final_slices[offset : offset + n]
                 if n > 1:
@@ -1600,8 +1622,12 @@ class MMEncoder:
                     if keep_on_gpu:
                         self._register_shared_mr(mm_data, emb)
                     self.embedding_to_send[req["req_id"]] = mm_data
+                if keep_on_gpu and emb.is_cuda:
+                    staged_device = emb.device
                 results.append((emb.nbytes, emb.shape[0], emb.shape[1], None, None))
                 offset += n
+            if staged_device is not None:
+                torch.cuda.current_stream(staged_device).synchronize()
             return results
         except Exception as e:
             return self._batch_set_error(
@@ -1631,7 +1657,15 @@ class MMEncoder:
     async def send(
         self, req_id, prefill_host, embedding_port, session_id=None, buffer_address=None
     ):
-        mm_data: EmbeddingData = self.embedding_to_send[req_id]
+        mm_data = self.embedding_to_send.get(req_id)
+        if mm_data is None:
+            # False = nothing transferred: callers must not count this send
+            # nor report success, or the decoder waits on an ack never coming.
+            logger.warning(
+                f"MMEncoder.send: no embedding for req_id={req_id} "
+                f"(already released or unknown)"
+            )
+            return False
         await self._send(
             mm_data.embedding,
             mm_data,
@@ -1640,6 +1674,7 @@ class MMEncoder:
             prefill_host=prefill_host,
             embedding_port=embedding_port,
         )
+        return True
 
     # For zmq_to_scheduler
     async def send_with_url(

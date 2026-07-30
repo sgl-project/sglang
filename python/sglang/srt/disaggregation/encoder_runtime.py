@@ -330,7 +330,7 @@ class DPDispatcher:
         self.dispatch_sockets = dispatch_sockets
         self.result_socket = result_socket
         self.worker_processes = worker_processes
-        # Key = req_id for encode/broadcast, req_id + "_send" for mooncake /send.
+        # Key = req_id for encode/broadcast, _send_req_key for mooncake /send.
         self.pending_futures: List[Dict[str, asyncio.Future]] = [
             {} for _ in range(dp_size)
         ]
@@ -391,15 +391,26 @@ class DPDispatcher:
         self.req_id_to_rank.pop(req_id, None)
         self._update_pending_gauge()
 
+    @staticmethod
+    def _send_req_key(req_id: str, request: dict) -> str:
+        """One in-flight /send future per decoder TP rank, keyed by the rank's
+        ZMQ-ack endpoint; a retry from the same rank reuses the key."""
+        endpoint = NetworkAddress(
+            request["prefill_host"], request["embedding_port"]
+        ).to_host_port_str()
+        return f"{req_id}_send_{endpoint}"
+
     def _fail_pending_for_rank(self, rank: int, reason: str, error_type: str) -> None:
         # Resolve a rank's outstanding futures with 503 so awaiters don't hang.
         pending = self.pending_futures[rank]
         for key, future in list(pending.items()):
             if not future.done():
+                # /send keys are _send_req_key's shape; the rest are req_id.
+                marker = key.rfind("_send_")
                 future.set_result(
                     {
-                        "req_id": key.removesuffix("_send"),
-                        "_dp_type": "send" if key.endswith("_send") else "encode",
+                        "req_id": key[:marker] if marker >= 0 else key,
+                        "_dp_type": "send" if marker >= 0 else "encode",
                         "content": None,
                         "_error": reason,
                         "_error_type": error_type,
@@ -493,13 +504,15 @@ class DPDispatcher:
                 "_error": f"DP worker rank={rank} died before /send for req_id={req_id}",
                 "_error_code": int(HTTPStatus.SERVICE_UNAVAILABLE),
             }
-        key = req_id + "_send"
+        key = self._send_req_key(req_id, request)
         future = asyncio.get_running_loop().create_future()
         self.pending_futures[rank][key] = future
+        self._update_pending_gauge()
         request["_dp_type"] = "send"
+        request["_dp_send_key"] = key
         logger.info(
             f"MM-Encoder DP dispatch_send: req_id={req_id}, "
-            f"dp_rank={rank}, pending={self.pending_counts}"
+            f"dp_rank={rank}, send_key={key}, pending={self.pending_counts}"
         )
         try:
             await async_sock_send(self.dispatch_sockets[rank], wrap_as_pickle(request))
@@ -508,7 +521,9 @@ class DPDispatcher:
             )
         except asyncio.TimeoutError:
             self.pending_futures[rank].pop(key, None)
-            self.req_id_to_rank.pop(req_id, None)
+            self._update_pending_gauge()
+            # Siblings still route via req_id_to_rank; the stale sweep evicts it.
+            self._pending_send_at[req_id] = time.monotonic()
             return self._timeout_envelope(
                 req_id,
                 "send",
@@ -516,7 +531,8 @@ class DPDispatcher:
             )
         except BaseException:
             self.pending_futures[rank].pop(key, None)
-            self.req_id_to_rank.pop(req_id, None)
+            self._update_pending_gauge()
+            self._pending_send_at[req_id] = time.monotonic()
             raise
 
     async def broadcast(
@@ -651,12 +667,23 @@ class DPDispatcher:
                 continue
             req_id = msg.get("req_id", "")
             dp_type = msg.get("_dp_type", "encode")
-            key = (req_id + "_send") if dp_type == "send" else req_id
+            if dp_type == "send":
+                key = msg.get("_dp_send_key")
+                if key is None:
+                    # Workers always echo the key; never fall back to req_id,
+                    # which would wrongly resolve the encode future.
+                    logger.warning(
+                        f"_result_listener: send envelope without _dp_send_key "
+                        f"for req_id={req_id}, dropping"
+                    )
+                    continue
+            else:
+                key = req_id
             rank = self.req_id_to_rank.get(req_id)
             if rank is None or key not in self.pending_futures[rank]:
                 logger.warning(
                     f"_result_listener: no pending future for "
-                    f"req_id={req_id}, dp_type={dp_type}, dropping"
+                    f"req_id={req_id}, dp_type={dp_type}, key={key}, dropping"
                 )
                 continue
             future = self.pending_futures[rank].pop(key)
@@ -677,7 +704,7 @@ class DPDispatcher:
             except asyncio.InvalidStateError:
                 logger.warning(
                     f"_result_listener: future already done for "
-                    f"req_id={req_id}, dp_type={dp_type}"
+                    f"req_id={req_id}, dp_type={dp_type}, key={key}"
                 )
 
     async def _cleanup_stale_mappings(self) -> None:
@@ -901,13 +928,20 @@ async def _dp_worker_handle_request(
             content = await _dp_worker_health_encode(enc)
         elif dp_type == "send":
             req_id = request["req_id"]
-            await enc.send(
+            sent = await enc.send(
                 req_id=req_id,
                 prefill_host=request["prefill_host"],
                 embedding_port=request["embedding_port"],
                 session_id=request["session_id"],
                 buffer_address=request["buffer_address"],
             )
+            if not sent:
+                # Error envelope, not 200 + phantom count: the decoder must
+                # fail fast instead of waiting for a ZMQ ack that never comes.
+                raise MMError(
+                    f"no staged embedding for /send req_id={req_id} "
+                    f"(already released)"
+                )
             # Releasing on the first /send breaks decoder TP > 1. No count means
             # a pre-refcount decoder: stay eager rather than pin until the sweep.
             receive_count = request.get("receive_count")
@@ -936,6 +970,8 @@ async def _dp_worker_handle_request(
             "_dp_type": dp_type,
             "content": content,
         }
+        if dp_type == "send" and request.get("_dp_send_key") is not None:
+            envelope["_dp_send_key"] = request["_dp_send_key"]
     except Exception as e:
         logger.error(
             f"DP worker {dp_rank} error on {dp_type} "
@@ -955,6 +991,8 @@ async def _dp_worker_handle_request(
             "_error_type": type(e).__name__,
             "_error_code": err_code,
         }
+        if dp_type == "send" and request.get("_dp_send_key") is not None:
+            envelope["_dp_send_key"] = request["_dp_send_key"]
 
     # pyzmq async send isn't safe for concurrent senders.
     try:

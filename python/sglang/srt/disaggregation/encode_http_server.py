@@ -274,6 +274,10 @@ async def handle_encode_request(request: dict):
             # Surface MMError.code (503 when all workers dead) instead of
             # FastAPI's default 500.
             logger.error(f"DP dispatch refused req_id={req_id}: {e}")
+            if encoder_transfer_backend == "mooncake":
+                await encode_server_module.meta_registry.publish(
+                    req_id, 0, 0, 0, error=str(e)
+                )
             return ORJSONResponse(
                 status_code=int(e.code),
                 content={"status": "error", "message": str(e), "req_id": req_id},
@@ -549,13 +553,23 @@ async def handle_send_request(request: dict):
                 req_id, receive_count
             )
         return ORJSONResponse(content=result.get("content"))
-    await encoder.send(
+    sent = await encoder.send(
         req_id=req_id,
         prefill_host=request["prefill_host"],
         embedding_port=request["embedding_port"],
         session_id=request["session_id"],
         buffer_address=request["buffer_address"],
     )
+    if not sent:
+        # No transfer happened: fail fast rather than 200 + a phantom count.
+        return ORJSONResponse(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            content={
+                "status": "error",
+                "message": f"no staged embedding for req_id={req_id} (already released)",
+                "req_id": req_id,
+            },
+        )
     # Sibling ranks share this embedding, so free it only once all have sent.
     # No count means a pre-refcount decoder: leave it to the sweep, as when
     # some rank never sends at all.
