@@ -111,6 +111,7 @@ GROK_2_WEIGHTS_TOKENIZER_PATH = os.path.join(
 INTERNLM2_7B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Shanghai_AI_Laboratory/internlm2-7b"
 )
+JET_NEMOTRON_2B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "jet-ai/Jet-Nemotron-2B")
 KIMI_K2_THINKING_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Kimi/Kimi-K2-Thinking")
 KIMI_K2_5_W4A8_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Eco-Tech/Kimi-K2.5-w4a8")
 KIMI_K2_5_EAGLE3_MODEL_PATH = os.path.join(

@@ -5,9 +5,6 @@ import einops
 import torch
 import torch.nn as nn
 
-from sglang.kernels.ops.attention.fla.fused_recurrent import (
-    fused_recurrent_gated_delta_rule_update,
-)
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.configs.jet_nemotron import JetBlockConfig, JetNemotronConfig
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -31,7 +28,19 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+_is_npu = is_npu()
+
+if _is_npu:
+    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
+        fused_sigmoid_gating_delta_rule_update_npu,
+    )
+else:
+    from sglang.kernels.ops.attention.fla.fused_recurrent import (
+        fused_recurrent_gated_delta_rule_update,
+    )
 
 
 class DynamicShortConvolutionKernelGenerator(nn.Module):
@@ -286,13 +295,18 @@ class JetBlock(nn.Module):
         k = nn.functional.silu(k)
         k = einops.rearrange(k, "l (h d) -> l h d", h=self.num_heads, d=self.head_k_dim)
 
-        conv_cache = layer_cache.conv
+        conv_cache = layer_cache.conv[0]
         assert isinstance(conv_cache, torch.Tensor)
+        conv_state = conv_cache[
+            forward_metadata.mamba_cache_indices, :, -self.total_v_dim :
+        ].transpose(1, 2)
+        assert conv_state.shape[1:] == (
+            self.total_v_dim,
+            self.conv_size - 1,
+        ), (conv_cache.shape, conv_state.shape)
         v, new_conv_state = self.dynamic_conv1d(
             v,
-            conv_state=conv_cache[
-                forward_metadata.mamba_cache_indices, -self.total_v_dim :, :
-            ],
+            conv_state=conv_state,
             generator_input=hidden_states,
             seq_lens=(
                 forward_batch.extend_seq_lens
@@ -303,30 +317,52 @@ class JetBlock(nn.Module):
                 )
             ),
         )
-        conv_cache[forward_metadata.mamba_cache_indices, -self.total_v_dim :, :] = (
-            new_conv_state
+        conv_cache[forward_metadata.mamba_cache_indices, :, -self.total_v_dim :] = (
+            new_conv_state.transpose(1, 2)
         )
         v = einops.rearrange(v, "l (h d) -> l h d", h=self.num_heads, d=self.head_v_dim)
 
-        g = -self.A_log.float().exp() * nn.functional.softplus(a.float() + self.dt_bias)
+        if _is_npu:
+            o = fused_sigmoid_gating_delta_rule_update_npu(
+                A_log=self.A_log,
+                a=a,
+                dt_bias=self.dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=q.unsqueeze(0),
+                k=k.unsqueeze(0),
+                v=v.unsqueeze(0),
+                b=beta,
+                initial_state_source=layer_cache.temporal,
+                initial_state_indices=forward_metadata.mamba_cache_indices,
+                cu_seqlens=cast(torch.LongTensor, forward_metadata.query_start_loc),
+                use_qk_l2norm_in_kernel=True,
+            ).squeeze(0)
+        else:
+            g = -self.A_log.float().exp() * nn.functional.softplus(
+                a.float() + self.dt_bias
+            )
+            beta = nn.functional.sigmoid(beta)
 
-        beta = nn.functional.sigmoid(beta)
-
-        o = fused_recurrent_gated_delta_rule_update(
-            q=q.unsqueeze(0),
-            k=k.unsqueeze(0),
-            v=v.unsqueeze(0),
-            g=g.unsqueeze(0),
-            beta=beta.unsqueeze(0),
-            initial_state_source=layer_cache.temporal,
-            initial_state_indices=forward_metadata.mamba_cache_indices,
-            cu_seqlens=cast(torch.LongTensor, forward_metadata.query_start_loc),
-            use_qk_l2norm_in_kernel=True,
-        ).squeeze(0)
+            o = fused_recurrent_gated_delta_rule_update(
+                q=q.unsqueeze(0),
+                k=k.unsqueeze(0),
+                v=v.unsqueeze(0),
+                g=g.unsqueeze(0),
+                beta=beta.unsqueeze(0),
+                initial_state_source=layer_cache.temporal,
+                initial_state_indices=forward_metadata.mamba_cache_indices,
+                cu_seqlens=cast(torch.LongTensor, forward_metadata.query_start_loc),
+                use_qk_l2norm_in_kernel=True,
+            ).squeeze(0)
 
         z = einops.rearrange(z, "l (h d) -> l h d", h=self.num_heads)
 
-        o = self.o_norm(o, z)
+        if _is_npu:
+            o, _ = torch.ops.npu.npu_rms_norm(o, self.o_norm.weight, self.o_norm.eps)
+            o = o * nn.functional.silu(z)
+        else:
+            o = self.o_norm(o, z)
 
         o = einops.rearrange(o, "l h d -> l (h d)")
 
@@ -369,12 +405,13 @@ class JetNemotronAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
+        rope_theta, rope_scaling = get_rope_config(self.config)
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=self.config.max_position_embeddings,
-            base=int(self.config.rope_parameters["rope_theta"]),
-            rope_scaling=self.config.rope_parameters,
+            base=int(rope_theta),
+            rope_scaling=rope_scaling,
         )
 
         match self.config.layer_types[layer_id]:
@@ -420,10 +457,12 @@ class JetNemotronDecoderLayer(nn.Module):
         config: JetNemotronConfig,
         alt_stream: torch.cuda.Stream | None = None,
         layer_id: int = 0,
+        start_layer: int = 0,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.start_layer = start_layer
 
         match config.layer_types[layer_id]:
             case "attn" | "swa":
