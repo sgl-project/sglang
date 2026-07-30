@@ -33,7 +33,14 @@ class TestModeloptFP8(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--quantization", "modelopt_fp8"],
+            other_args=[
+                "--quantization",
+                "modelopt_fp8",
+                "--tokenizer-worker-num",
+                "2",
+                "--detokenizer-worker-num",
+                "2",
+            ],
             env=cls.env,
         )
 
