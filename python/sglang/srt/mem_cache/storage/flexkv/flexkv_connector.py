@@ -1875,7 +1875,7 @@ class FlexKVConnector:
             kv_caches[0].ndim == 3
         ), f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
 
-        is_mla = self.model_config.use_mla
+        is_mla = self.model_config.is_layout_mla()
         num_blocks, num_kv_heads, head_size = kv_caches[0].shape
 
         gpu_layout = KVCacheLayout(
