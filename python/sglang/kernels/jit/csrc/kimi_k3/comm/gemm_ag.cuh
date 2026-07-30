@@ -8,6 +8,8 @@
 
 #include <sgl_kernel/distributed/communicator.cuh>
 
+#include "ptx_sys.cuh"
+
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/extra/stl.h>
 

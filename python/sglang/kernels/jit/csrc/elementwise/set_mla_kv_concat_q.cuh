@@ -41,6 +41,22 @@
 
 namespace {
 
+// One elected lane, via elect.sync. Local on purpose: cute::elect_one_sync would
+// pull the whole CuTe include path into an elementwise JIT module, and
+// cuda::ptx has no elect_sync in CUDA 13.0.
+SGL_DEVICE bool elect_one_lane() {
+  uint32_t pred;
+  asm volatile(
+      "{\n"
+      "  .reg .pred p;\n"
+      "  .reg .b32  r;\n"
+      "  elect.sync r|p, 0xFFFFFFFF;\n"
+      "  selp.b32 %0, 1, 0, p;\n"
+      "}\n"
+      : "=r"(pred));
+  return pred != 0;
+}
+
 struct SetMlaKVConcatQParams {
   // KV scatter side (byte-typed: dtype-agnostic row copies).
   const void* __restrict__ k_nope;
@@ -92,14 +108,16 @@ __global__ void set_mla_kv_concat_q_kernel(const __grid_constant__ SetMlaKVConca
     const auto rope_src = pointer::offset(params.k_rope, item_id * params.stride_rope_bytes);
     void* const gmem_dst = pointer::offset(params.kv_buffer, loc * params.stride_buffer_bytes);
 
-    warp::g2s_copy<kNopeBytes>(nope_src, &smem[warp_in_cta][0]);
-    warp::g2s_copy<kRopeBytes>(rope_src, &smem[warp_in_cta][kNopeBytes]);
+    warp::copy_bytes<kNopeBytes>(nope_src, &smem[warp_in_cta][0]);
+    warp::copy_bytes<kRopeBytes>(rope_src, &smem[warp_in_cta][kNopeBytes]);
 
     // TMA reads smem via the async proxy; fence so it can't observe stale sts.
     __syncwarp();
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
-    if (lane_id == 0) {
+    // elect.sync rather than `lane_id == 0`: the TMA issue must not sit
+    // behind a lane-index predicate (see PR review).
+    if (elect_one_lane()) {
       cuda::ptx::cp_async_bulk(
           cuda::ptx::space_global,
           cuda::ptx::space_shared,

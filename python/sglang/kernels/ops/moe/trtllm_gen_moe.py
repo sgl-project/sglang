@@ -52,6 +52,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     override_jit_cuda_arch,
 )
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -110,7 +111,7 @@ logger = logging.getLogger(__name__)
 
 
 def cubin_pool_dir() -> Optional[pathlib.Path]:
-    p = os.environ.get("SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL")
+    p = envs.SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL.get()
     if not p:
         return None
     pool = pathlib.Path(p)

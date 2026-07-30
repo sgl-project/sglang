@@ -13,6 +13,8 @@
 
 #include <sgl_kernel/distributed/communicator.cuh>
 
+#include "ptx_sys.cuh"
+
 #include <cute/arch/cluster_sm90.hpp>
 #include <cutlass/cuda_host_adapter.hpp>
 
@@ -32,15 +34,6 @@
 // exactly one consumer. Anything cute already provides goes through cute
 // (`set_block_rank` below, the tensor-map driver wrapper in `w_maps`).
 
-#define CUDA_CHECK(expr)                                                                                             \
-  do {                                                                                                               \
-    cudaError_t _e = (expr);                                                                                         \
-    if (_e != cudaSuccess) {                                                                                         \
-      std::fprintf(                                                                                                  \
-          stderr, "CUDA error %s at %s:%d: %s\n", cudaGetErrorName(_e), __FILE__, __LINE__, cudaGetErrorString(_e)); \
-      std::abort();                                                                                                  \
-    }                                                                                                                \
-  } while (0)
 
 namespace ptx {
 
@@ -1324,9 +1317,9 @@ struct Launcher3 {
   static constexpr int kGrid = kTiles < 152 ? kTiles : 152;
   static constexpr size_t kSmem = size_t(d3_ns(kBN)) * (kD3ABytes + kBN * kD3BK * 2);
   static void set_smem_attr() {
-    CUDA_CHECK(cudaFuncSetAttribute(
+    CHECK_CUDA(cudaFuncSetAttribute(
         oproj_dense_ar_kernel<M, K, R, COMM>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(kSmem)));
-    CUDA_CHECK(cudaFuncSetAttribute(
+    CHECK_CUDA(cudaFuncSetAttribute(
         oproj_dense_ar_kernel<M, K, R, COMM>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
   }
   static void
@@ -1345,7 +1338,7 @@ struct Launcher3 {
     cfg.stream = stream;
     cfg.attrs = attr;
     cfg.numAttrs = unsigned(na);
-    CUDA_CHECK(cudaLaunchKernelEx(&cfg, oproj_dense_ar_kernel<M, K, R, COMM>, x_tmap, w_tmap, prm));
+    CHECK_CUDA(cudaLaunchKernelEx(&cfg, oproj_dense_ar_kernel<M, K, R, COMM>, x_tmap, w_tmap, prm));
   }
 };
 
@@ -1367,12 +1360,12 @@ struct Launcher {
                                       : 4096;  // AR-only path never touches the feed ring
   // once per device, before first launch
   static void set_smem_attr() {
-    CUDA_CHECK(cudaFuncSetAttribute(
+    CHECK_CUDA(cudaFuncSetAttribute(
         oproj_ar_kernel<M, K, R, COMM, GEMM_ON, S, CH, C>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(kSmem)));
     // 100% carveout → the SM smem config fits TWO CTAs (this grid's tail
     // + the next PDL grid's feed); the default config blocks dual
     // residency and with it the whole tail-hiding scheme.
-    CUDA_CHECK(cudaFuncSetAttribute(
+    CHECK_CUDA(cudaFuncSetAttribute(
         oproj_ar_kernel<M, K, R, COMM, GEMM_ON, S, CH, C>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
   }
   // pdl=false = the NON-COOPERATIVE-neighbor regime: no programmatic
@@ -1408,7 +1401,7 @@ struct Launcher {
     cfg.stream = stream;
     cfg.attrs = attr;
     cfg.numAttrs = unsigned(na);
-    CUDA_CHECK(cudaLaunchKernelEx(&cfg, oproj_ar_kernel<M, K, R, COMM, GEMM_ON, S, CH, C>, w_map, x_map, prm));
+    CHECK_CUDA(cudaLaunchKernelEx(&cfg, oproj_ar_kernel<M, K, R, COMM, GEMM_ON, S, CH, C>, w_map, x_map, prm));
   }
 };
 

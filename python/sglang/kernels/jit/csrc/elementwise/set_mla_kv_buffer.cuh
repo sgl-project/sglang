@@ -71,8 +71,8 @@ __global__ void set_mla_kv_buffer_kernel(const __grid_constant__ SetMlaKVBufferP
   void* const gmem_dst = pointer::offset(params.kv_buffer, loc * params.stride_buffer_bytes);
 
   // Warp-cooperative load (nope, rope) into the per-warp smem slot.
-  warp::g2s_copy<kNopeBytes>(nope_src, &smem[warp_in_cta][0]);
-  warp::g2s_copy<kRopeBytes>(rope_src, &smem[warp_in_cta][kNopeBytes]);
+  warp::copy_bytes<kNopeBytes>(nope_src, &smem[warp_in_cta][0]);
+  warp::copy_bytes<kRopeBytes>(rope_src, &smem[warp_in_cta][kNopeBytes]);
 
   // Fence required: TMA reads smem via the async proxy, normal sts writes
   // through the generic proxy. Without this the TMA engine can observe stale
