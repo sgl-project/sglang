@@ -23,6 +23,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.unified_kv_allocator import UnifiedInt2HPKVAllocator
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     ceil_align,
@@ -98,6 +99,13 @@ class SchedulerInvariantChecker:
                 protected = self.tree_cache.full_protected_size()
             else:
                 protected = self.tree_cache.protected_size()
+            session_held = self.pool_stats_observer.session_held_tokens()
+            total = self.token_to_kv_pool_allocator.size
+        elif isinstance(self.token_to_kv_pool_allocator, UnifiedInt2HPKVAllocator):
+            # Mixed HP+int2 KV: the allocator's ``size`` includes the shared
+            # HP-prefix pool, which max_total_num_tokens (quant tokens only)
+            # does not cover.
+            protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
             total = self.token_to_kv_pool_allocator.size
         else:

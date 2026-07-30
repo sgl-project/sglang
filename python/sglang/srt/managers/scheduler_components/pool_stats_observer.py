@@ -216,8 +216,19 @@ class SchedulerPoolStatsObserver:
     def _get_token_info(self) -> PoolStats:
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
-        num_used = self.max_total_num_tokens - (available_size + evictable_size)
-        token_usage = num_used / self.max_total_num_tokens
+        from sglang.srt.mem_cache.unified_kv_allocator import (
+            UnifiedInt2HPKVAllocator,
+        )
+
+        allocator = self.token_to_kv_pool_allocator
+        if isinstance(allocator, UnifiedInt2HPKVAllocator):
+            # Mixed HP+int2 KV: allocator.size includes the shared HP-prefix
+            # pool; max_total_num_tokens counts quant tokens only.
+            total_capacity = allocator.size
+        else:
+            total_capacity = self.max_total_num_tokens
+        num_used = total_capacity - (available_size + evictable_size)
+        token_usage = num_used / total_capacity if total_capacity else 0.0
         return PoolStats(
             full_num_used=num_used,
             full_token_usage=token_usage,

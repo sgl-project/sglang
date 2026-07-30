@@ -13,6 +13,10 @@ from sglang.kernels.ops.memory.common import (
     get_last_loc_triton_safe,
     write_req_to_token_pool_triton,
 )
+from sglang.QuantKernel.gpu_flush_int2 import (
+    gpu_flush_int2_apply,
+    gpu_flush_int2_plan,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
@@ -26,6 +30,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.unified_kv_pool import UnifiedInt2HPKVPool
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     is_cpu,
@@ -35,7 +40,7 @@ from sglang.srt.utils import (
     next_power_of_2,
     support_triton,
 )
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -300,6 +305,488 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     return batch.tree_cache.page_size
 
 
+def _is_mixed_kv_enabled(batch: ScheduleBatch) -> bool:
+    kvcache = batch.token_to_kv_pool_allocator.get_kvcache()
+    return isinstance(kvcache, UnifiedInt2HPKVPool) and kvcache.mixed_kv_enabled()
+
+
+def _mixed_window_lengths(
+    seq_len: int, hp_prefix_tokens: int, hp_recent_tokens: int
+) -> tuple[int, int, int]:
+    prefix_len = min(seq_len, hp_prefix_tokens)
+    recent_len = min(max(seq_len - prefix_len, 0), hp_recent_tokens)
+    quant_len = seq_len - prefix_len - recent_len
+    return prefix_len, recent_len, quant_len
+
+
+def _mixed_extend_layout_counts(
+    pre_len: int,
+    seq_len: int,
+    hp_prefix_tokens: int,
+    hp_recent_tokens: int,
+    n_q: int,
+    is_final_chunk: bool = True,
+) -> tuple[int, int, int, int, int]:
+    """Return per-request mixed-KV extend counts.
+
+    Default (final chunk) layout: ``[HP-prefix][quant-middle][HP-recent]``.
+    Non-final chunks collapse to ``[HP-prefix][quant-all]`` and skip
+    HP-recent — chunk N's trailing positions are never the request's final
+    HP-recent window, so allocating HP-recent there only wraps the
+    per-request ring and recycles slots whose K/V is still referenced via
+    ``req_to_token`` at earlier chunk N positions.
+    """
+    if is_final_chunk:
+        prefix_keep, recent_keep, _ = _mixed_window_lengths(
+            seq_len, hp_prefix_tokens, hp_recent_tokens
+        )
+        recent_start = seq_len - recent_keep
+        hp_prefix_count = max(0, min(prefix_keep, seq_len) - pre_len)
+        quant_count = max(0, recent_start - max(pre_len, prefix_keep))
+        hp_recent_count = max(0, seq_len - max(pre_len, recent_start))
+    else:
+        prefix_keep = min(seq_len, hp_prefix_tokens)
+        hp_prefix_count = max(0, min(prefix_keep, seq_len) - pre_len)
+        quant_count = max(0, seq_len - max(pre_len, prefix_keep))
+        hp_recent_count = 0
+    quant_alloc_count = ceil_align(quant_count, n_q)
+
+    # Per-request flush counter: count steps until this request's next flush.
+    # ``H_0`` is the current HP-recent size after this extend chunk is admitted.
+    # For non-final chunks we skip HP-recent entirely (``hp_recent_count=0``),
+    # and for chunked-prefill final chunks the actual HP-recent count is
+    # ``hp_recent_count`` (positions newly admitted in this chunk), NOT the
+    # ``hp_recent_tokens`` target. If we use the target as ``H_0`` while the
+    # actual count is small, ``counter_init`` underestimates how many decode
+    # steps must elapse before the flush kernel's demote range
+    # ``[seq_len - hp_recent - flush_overflow : seq_len - hp_recent]`` falls
+    # entirely inside HP-recent. Early flushes hit the chunk-1 quant region
+    # (valid=0 for all 8 slots → whole-page return). Worse, at the *last*
+    # premature flush before the demote range crosses into HP-recent, the
+    # 8-position window straddles the boundary: 3-5 valid=0 and 3-5 valid=1
+    # → page partially used + partially returned. The used slots get written
+    # to ``req_to_token``; the returned slots go to the free pool. When the
+    # request finishes, ``cache_finished_req`` frees the used slots → same
+    # page added to the free pool TWICE. That is the +N quant-page duplicate
+    # the strict idle leak check trips on.
+    h0_total = hp_recent_count
+    counter_init = max(0, (hp_recent_tokens + n_q - 1) - h0_total)
+    return (
+        hp_prefix_count,
+        hp_recent_count,
+        quant_count,
+        quant_alloc_count,
+        counter_init,
+    )
+
+
+def _alloc_for_extend_mixed(
+    batch: ScheduleBatch,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    kv_pool = batch.token_to_kv_pool_allocator.get_kvcache()
+    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
+    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
+    prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
+    extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
+
+    req_pool_indices = alloc_req_slots(
+        batch.req_to_token_pool, batch.reqs, batch.tree_cache
+    )
+    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+    req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+
+    n_q = int(kv_pool.N_Q)
+    hp_recent_target = int(kv_pool.hp_recent_tokens)
+
+    hp_prefix_counts: list[int] = []
+    hp_recent_counts: list[int] = []
+    quant_counts: list[int] = []
+    quant_alloc_counts: list[int] = []
+    flush_counter_inits: list[int] = []
+    seq_lens_cpu_list = batch.seq_lens_cpu.tolist()
+    is_final_chunk_list = [
+        int(seq_lens_cpu_list[i]) >= len(batch.reqs[i].origin_input_ids)
+        for i in range(len(batch.reqs))
+    ]
+    for i, (pre_len, seq_len) in enumerate(zip(batch.prefix_lens, seq_lens_cpu_list)):
+        (
+            hp_prefix_count,
+            hp_recent_count,
+            quant_count,
+            quant_alloc_count,
+            counter_init,
+        ) = _mixed_extend_layout_counts(
+            int(pre_len),
+            int(seq_len),
+            int(kv_pool.hp_prefix_tokens),
+            hp_recent_target,
+            n_q,
+            is_final_chunk=bool(is_final_chunk_list[i]),
+        )
+
+        hp_prefix_counts.append(hp_prefix_count)
+        hp_recent_counts.append(hp_recent_count)
+        quant_counts.append(quant_count)
+        quant_alloc_counts.append(quant_alloc_count)
+        flush_counter_inits.append(counter_init)
+
+    total_quant_alloc = sum(quant_alloc_counts)
+    # HP-prefix is N_Q-paged in the shared pool; round each per-req count up.
+    hp_prefix_alloc_counts = [ceil_align(int(c), n_q) for c in hp_prefix_counts]
+    total_hp_prefix_alloc = sum(hp_prefix_alloc_counts)
+
+    allocator = batch.token_to_kv_pool_allocator
+    pooled_need = total_quant_alloc + total_hp_prefix_alloc
+    if pooled_need > 0:
+        evict_from_tree_cache(batch.tree_cache, pooled_need)
+
+    # ``evict_from_tree_cache`` checks total free (quant + HP-prefix). A
+    # single call asking for ``pooled_need`` tokens may free mostly HP-prefix
+    # when leaves happen to be prefix-heavy, leaving the quant tier short.
+    # Loop with a small bound to converge on enough quant pages.
+    if (
+        total_quant_alloc > 0
+        and batch.tree_cache is not None
+        and not batch.tree_cache.is_chunk_cache()
+    ):
+        for _ in range(4):
+            free_quant_slots = (
+                allocator.free_pages.numel() + allocator.release_pages.numel()
+            ) * allocator.N_Q
+            if free_quant_slots >= total_quant_alloc:
+                break
+            result = batch.tree_cache.evict(EvictParams(num_tokens=total_quant_alloc))
+            if result.num_tokens_evicted == 0:
+                break
+
+    quant_alloc = (
+        allocator.alloc_quant(total_quant_alloc)
+        if total_quant_alloc > 0
+        else torch.empty((0,), dtype=torch.int64, device=batch.device)
+    )
+    if total_quant_alloc > 0 and quant_alloc is None:
+        raise RuntimeError(
+            "Mixed KV windows failed to allocate quant slots after eviction. "
+            f"{allocator.debug_print()}"
+        )
+    hp_prefix_alloc = allocator.alloc_hp_prefix(
+        req_pool_indices_device, hp_prefix_alloc_counts
+    )
+    hp_recent_alloc = allocator.alloc_hp_recent(
+        req_pool_indices_device, hp_recent_counts
+    )
+
+    per_req_locs = []
+    hp_prefix_pt = 0
+    hp_recent_pt = 0
+    quant_pt = 0
+    for i_req, (
+        req,
+        pre_len,
+        hp_prefix_count,
+        hp_prefix_alloc_count,
+        hp_recent_count,
+        quant_count,
+        quant_alloc_count,
+    ) in enumerate(
+        zip(
+            batch.reqs,
+            batch.prefix_lens,
+            hp_prefix_counts,
+            hp_prefix_alloc_counts,
+            hp_recent_counts,
+            quant_counts,
+            quant_alloc_counts,
+        )
+    ):
+        # Non-final chunked-prefill chunk: cap insert at the start of the
+        # request-owned tail so cache_unfinished_req / cache_finished_req
+        # don't insert the tail into the radix tree.
+        if not is_final_chunk_list[i_req]:
+            non_final_tail_start = max(
+                0, int(seq_lens_cpu_list[i_req]) - int(kv_pool.hp_recent_tokens)
+            )
+            existing_cutoff = req.mixed_kv_quant_slack_cutoff_len
+            req.mixed_kv_quant_slack_cutoff_len = (
+                non_final_tail_start
+                if existing_cutoff is None
+                else min(existing_cutoff, non_final_tail_start)
+            )
+        req_parts = []
+        req_hp_prefix = None
+        req_hp_recent = None
+        if hp_prefix_count > 0:
+            req_hp_prefix = hp_prefix_alloc[
+                hp_prefix_pt : hp_prefix_pt + hp_prefix_count
+            ]
+        if hp_prefix_alloc_count > hp_prefix_count:
+            # HP-prefix slack: trailing slots of a partially-filled page;
+            # request-owned until release, freed by tier-routing in `free`.
+            req_hp_prefix_slack = hp_prefix_alloc[
+                hp_prefix_pt + hp_prefix_count : hp_prefix_pt + hp_prefix_alloc_count
+            ]
+            req.mixed_kv_quant_slack_indices = torch.cat(
+                [
+                    req.mixed_kv_quant_slack_indices.to(batch.device),
+                    req_hp_prefix_slack,
+                ]
+            )
+            slack_page_start = int(pre_len) + (hp_prefix_count // n_q) * n_q
+            existing_cutoff = req.mixed_kv_quant_slack_cutoff_len
+            req.mixed_kv_quant_slack_cutoff_len = (
+                slack_page_start
+                if existing_cutoff is None
+                else min(existing_cutoff, slack_page_start)
+            )
+        hp_prefix_pt += hp_prefix_alloc_count
+
+        if hp_recent_count > 0:
+            req_hp_recent = hp_recent_alloc[
+                hp_recent_pt : hp_recent_pt + hp_recent_count
+            ]
+            hp_recent_pt += hp_recent_count
+        if quant_count > 0:
+            req_quant = quant_alloc[quant_pt : quant_pt + quant_count]
+        else:
+            req_quant = None
+        if quant_alloc_count > quant_count:
+            req_quant_slack = quant_alloc[
+                quant_pt + quant_count : quant_pt + quant_alloc_count
+            ]
+            req.mixed_kv_quant_slack_indices = torch.cat(
+                [req.mixed_kv_quant_slack_indices.to(batch.device), req_quant_slack]
+            )
+            quant_start = max(int(pre_len), int(kv_pool.hp_prefix_tokens))
+            slack_page_start = quant_start + (quant_count // n_q) * n_q
+            existing_cutoff = req.mixed_kv_quant_slack_cutoff_len
+            req.mixed_kv_quant_slack_cutoff_len = (
+                slack_page_start
+                if existing_cutoff is None
+                else min(existing_cutoff, slack_page_start)
+            )
+        quant_pt += quant_alloc_count
+
+        # Reconstruct logical order: [hp-prefix][quant-middle][hp-recent].
+        if req_hp_prefix is not None:
+            req_parts.append(req_hp_prefix)
+        if req_quant is not None:
+            req_parts.append(req_quant)
+        if req_hp_recent is not None:
+            req_parts.append(req_hp_recent)
+        valid_parts = [part for part in req_parts if part is not None]
+        per_req_locs.append(
+            torch.cat(valid_parts)
+            if valid_parts
+            else torch.empty((0,), dtype=torch.int64, device=batch.device)
+        )
+
+    out_cache_loc = (
+        torch.cat(per_req_locs)
+        if per_req_locs
+        else torch.empty((0,), dtype=torch.int64, device=batch.device)
+    )
+    prefix_tensors = [r.prefix_indices for r in batch.reqs]
+    write_cache_indices(
+        out_cache_loc,
+        req_pool_indices_device,
+        req_pool_indices_cpu,
+        prefix_lens_device,
+        prefix_lens_cpu,
+        batch.seq_lens,
+        batch.seq_lens_cpu,
+        extend_lens_device,
+        extend_lens_cpu,
+        prefix_tensors,
+        batch.req_to_token_pool,
+    )
+
+    # Seed each request's per-request flush counter. This is overwritten on
+    # every chunk of a chunked extend (the latest H_0 is what matters), and
+    # on the first chunk for a fresh admission. We do a single async H2D
+    # copy + scatter so the decode hot path sees the counter without a
+    # later sync.
+    counter_inits_cpu = torch.tensor(flush_counter_inits, dtype=torch.int32)
+    counter_inits_device = counter_inits_cpu.to(batch.device, non_blocking=True)
+    kv_pool._flush_counter[req_pool_indices_device] = counter_inits_device
+
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+    for req, seq_len in zip(batch.reqs, seq_lens_cpu_list):
+        seq_len = int(seq_len)
+        if req.kv is None:
+            req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
+        else:
+            req.kv.kv_allocated_len = seq_len
+
+    return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
+
+
+def _alloc_for_decode_mixed(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+    # One HP-recent slot per req per step; over-provision bs*N_Q quant slots
+    # per step and let the per-req flush counter decide which use them as
+    # demote targets vs return them via ``returned_slot_ids``.
+    if token_per_req != 1:
+        raise NotImplementedError(
+            "Mixed KV decode currently supports token_per_req=1 only."
+        )
+
+    allocator = batch.token_to_kv_pool_allocator
+    kv_pool = allocator.get_kvcache()
+    bs = batch.seq_lens.shape[0]
+    # ``flush_interval`` is hardcoded to ``N_Q`` in ``UnifiedInt2HPKVPool``.
+    flush_interval = int(kv_pool.N_Q)
+    assert kv_pool.flush_interval == flush_interval
+
+    req_pool_indices_int64 = batch.req_pool_indices.to(torch.int64)
+
+    # Per-request flush gating: shape-static RMW, no host sync.
+    counters = kv_pool._flush_counter[req_pool_indices_int64]
+    flush_mask = counters == 0
+    new_counters = torch.where(
+        flush_mask,
+        torch.full_like(counters, flush_interval - 1),
+        counters - 1,
+    )
+    kv_pool._flush_counter[req_pool_indices_int64] = new_counters
+
+    # Worst case: every req flushes -> bs*N_Q quant slots needed.
+    quant_need = bs * flush_interval
+    # ``evict_from_tree_cache`` gates on ``allocator.available_size()`` which
+    # for the unified pool sums quant + HP-prefix free slots. When quant is
+    # drained but HP-prefix has slack, the combined check skips eviction and
+    # ``alloc_quant`` below crashes. Force quant-tier-specific eviction here.
+    quant_pages_have = allocator.free_pages.numel() + allocator.release_pages.numel()
+    if (
+        quant_pages_have < bs
+        and batch.tree_cache is not None
+        and not batch.tree_cache.is_chunk_cache()
+    ):
+        # Tree leaves may be quant or HP-prefix; some leaves are big. Loop a
+        # few times in case the first leaves popped are HP-prefix, but cap
+        # work so we don't spin if everything left is pinned.
+        for attempt in range(8):
+            prev_quant = quant_pages_have
+            prev_hp = (
+                allocator.hp_prefix_free_pages.numel()
+                + allocator.hp_prefix_release_pages.numel()
+            )
+            # Ramp up the budget each attempt: 1x, 2x, 4x ... up to 16x.
+            mult = 1 << min(attempt, 4)
+            evict_slots = max(bs - quant_pages_have, 1) * flush_interval * mult
+            batch.tree_cache.evict(EvictParams(num_tokens=evict_slots))
+            quant_pages_have = (
+                allocator.free_pages.numel() + allocator.release_pages.numel()
+            )
+            if quant_pages_have >= bs:
+                break
+            cur_hp = (
+                allocator.hp_prefix_free_pages.numel()
+                + allocator.hp_prefix_release_pages.numel()
+            )
+            if quant_pages_have == prev_quant and cur_hp == prev_hp:
+                # Tree had nothing to evict — leaves all pinned. Stop.
+                break
+
+    out_cache_loc = allocator.alloc_hp_recent(
+        req_pool_indices_int64, [token_per_req] * bs
+    )
+
+    dst_quant_slots = allocator.alloc_quant(quant_need)
+    if dst_quant_slots is None:
+        raise RuntimeError(
+            "Mixed KV windows failed to allocate quant flush slots. "
+            f"{allocator.debug_print()}"
+        )
+
+    # Build the protected boundary on device in one go.  This is the
+    # tree-owned prefix that flush must not overwrite; ``prefix_indices`` may
+    # additionally contain request-owned tail slots for chunk continuation.
+    prefix_lens_cpu = torch.tensor(
+        [int(r.cache_protected_len) for r in batch.reqs], dtype=torch.int32
+    )
+    prefix_lens_gpu = prefix_lens_cpu.to(batch.device, non_blocking=True)
+    seq_lens_int32 = batch.seq_lens.to(torch.int32)
+
+    # Phase 1 (no-race with previous forward): plan kernel reads
+    # ``req_to_token`` and produces ``returned_slot_ids`` etc. Followed by
+    # ``allocator.free``, whose ``torch.unique`` host-syncs only against this
+    # short pre-wait prefix instead of the previous forward.
+    plan = gpu_flush_int2_plan(
+        seq_lens=seq_lens_int32,
+        prefix_lens=prefix_lens_gpu,
+        req_pool_indices=req_pool_indices_int64,
+        dst_quant_slots=dst_quant_slots,
+        req_to_token=batch.req_to_token_pool.req_to_token,
+        flush_mask=flush_mask,
+        hp_prefix_tokens=kv_pool.hp_prefix_tokens,
+        hp_recent_tokens=kv_pool.hp_recent_tokens,
+        hp_global_offset=kv_pool.hp_global_offset,
+        flush_interval=flush_interval,
+    )
+
+    if plan is not None:
+        # Free everything returned by the kernel in one call: flushed HP
+        # slots (freed from HP tier) and unused quant slots from
+        # non-flushing requests (whole pages, since per-request
+        # all-or-nothing). The allocator decodes tier from each global slot
+        # id.
+        allocator.free(plan.returned_slot_ids)
+
+    # Phase 2 (must wait): the apply kernels write ``req_to_token`` at
+    # positions inside the previous forward's read range. Order
+    # schedule_stream after ``forward_done`` here, not at the top of the
+    # event loop, so the host syncs above and any retract/eviction frees
+    # don't stall behind the previous forward.
+    kv_pool.wait_pending_forward()
+
+    if plan is not None:
+        gpu_flush_int2_apply(
+            plan,
+            req_pool_indices=req_pool_indices_int64,
+            req_to_token=batch.req_to_token_pool.req_to_token,
+            hp_k_ptrs=kv_pool._flush_hp_k_ptrs,
+            hp_v_ptrs=kv_pool._flush_hp_v_ptrs,
+            quant_k_ptrs=kv_pool._flush_quant_k_ptrs,
+            quant_v_ptrs=kv_pool._flush_quant_v_ptrs,
+            k_sz_ptrs=kv_pool._flush_k_sz_ptrs,
+            v_sz_ptrs=kv_pool._flush_v_sz_ptrs,
+            hp_k_sample=kv_pool.hp_k_buffer[0],
+            hp_v_sample=kv_pool.hp_v_buffer[0],
+            quant_k_sample=kv_pool.k_buffer[0],
+            quant_v_sample=kv_pool.v_buffer[0],
+            k_sz_sample=kv_pool.k_scales_zeros[0],
+            v_sz_sample=kv_pool.v_scales_zeros[0],
+            hp_k_strides=kv_pool._flush_hp_k_stride,
+            hp_v_strides=kv_pool._flush_hp_v_stride,
+            quant_k_strides=kv_pool._flush_quant_k_stride,
+            quant_v_strides=kv_pool._flush_quant_v_stride,
+            k_sz_strides=kv_pool._flush_k_sz_stride,
+            v_sz_strides=kv_pool._flush_v_sz_stride,
+            num_heads=kv_pool.head_num,
+            head_dim=kv_pool.head_dim,
+            v_head_dim=kv_pool.v_head_dim,
+            k_num_scale_groups=kv_pool.k_num_scale_groups,
+            v_num_scale_groups=kv_pool.v_num_scale_groups,
+            num_layers=kv_pool.layer_num,
+            k_clip_ratio=kv_pool._k_clip_ratio,
+            v_clip_ratio=kv_pool._v_clip_ratio,
+        )
+
+    if batch.model_config.is_encoder_decoder:
+        locs = batch.encoder_lens + batch.seq_lens
+    else:
+        locs = batch.seq_lens.clone()
+
+    batch.req_to_token_pool.write(
+        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+    )
+
+    for req in batch.reqs:
+        req.kv.kv_allocated_len += token_per_req
+
+    return out_cache_loc
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -312,6 +799,9 @@ def alloc_for_extend(
     """
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
+
+    if _is_mixed_kv_enabled(batch):
+        return _alloc_for_extend_mixed(batch)
 
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
@@ -545,6 +1035,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
 
     batch.maybe_evict_swa()
+
+    if _is_mixed_kv_enabled(batch):
+        return _alloc_for_decode_mixed(batch, token_per_req)
 
     seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
