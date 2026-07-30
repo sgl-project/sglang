@@ -1008,23 +1008,3 @@ def akk_inv_host(
         smem=smem_bytes,
         stream=stream,
     )
-
-
-# Input preparation: block-transpose lower triangle to upper triangle
-def prepare_input(M):
-    """Take unit lower-triangular M [batch,64,64] and produce the
-    block-transposed layout expected by the kernel."""
-    B = M.shape[0]
-    M_in = torch.zeros_like(M)
-    for i in range(4):
-        r0, r1 = i * SB, (i + 1) * SB
-        M_in[:, r0:r1, r0:r1] = M[:, r0:r1, r0:r1]
-    for i in range(4):
-        for j in range(i):
-            ir0, ir1 = i * SB, (i + 1) * SB
-            jr0, jr1 = j * SB, (j + 1) * SB
-            M_in[:, jr0:jr1, ir0:ir1] = M[:, ir0:ir1, jr0:jr1]
-    return M_in
-
-
-# Test
