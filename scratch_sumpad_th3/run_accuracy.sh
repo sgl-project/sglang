@@ -10,7 +10,10 @@
 # configuration where num_token_non_padded is not None).
 set -uo pipefail
 
-MODEL=${MODEL:-/cluster-storage/models/models--Qwen--Qwen3-30B-A3B-Instruct-2507-FP8/snapshots/5a5a776300a41aaa681dd7ff0106608ef2bc90db}
+# DeepSeek-V2-Lite-Chat is MLA + MoE, which matches the production shape the original
+# accuracy report came from, and its weights are actually present in the cluster cache
+# (the Qwen3-30B-A3B-FP8 entry there is a config-only stub).
+MODEL=${MODEL:-/cluster-storage/models/models--deepseek-ai--DeepSeek-V2-Lite-Chat/snapshots/85864749cd611b4353ce1decdb286193298f64c7}
 OUT_ROOT=${OUT_ROOT:-/scratch/sumpad_acc}
 PORT=${PORT:-32100}
 BASE="http://127.0.0.1:${PORT}"
