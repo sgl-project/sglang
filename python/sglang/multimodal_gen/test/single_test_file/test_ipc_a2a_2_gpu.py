@@ -100,12 +100,24 @@ def _worker() -> int:
             failures.append(f"eviction path returned None at s_local={s_local}")
     envs.SGLANG_DIFFUSION_IPC_A2A = False
 
+    # A comparison where both arms quietly fell back to NCCL would pass while
+    # testing nothing, so require evidence the transport actually ran.
+    if not IPC_A2A.inited or IPC_A2A.failed or not IPC_A2A.staging:
+        failures.append(
+            f"IPC never engaged (inited={IPC_A2A.inited} failed={IPC_A2A.failed} "
+            f"staged={len(IPC_A2A.staging)})"
+        )
+
     verdict = torch.tensor([len(failures)], device="cuda")
     dist.all_reduce(verdict)
     if failures:
         print(f"rank{rank} MISMATCH: {failures}", flush=True)
     if rank == 0:
-        print(f"IPC_A2A_PARITY {'FAIL' if verdict.item() else 'PASS'}", flush=True)
+        print(
+            f"IPC_A2A_PARITY {'FAIL' if verdict.item() else 'PASS'} "
+            f"(staged keys={len(IPC_A2A.staging)})",
+            flush=True,
+        )
     dist.barrier()
     dist.destroy_process_group()
     return 1 if verdict.item() else 0
