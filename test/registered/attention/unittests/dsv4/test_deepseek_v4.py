@@ -370,6 +370,7 @@ class TestDSV4VerifyTreeMaskContract(CustomTestCase):
         default_backend = SimpleNamespace(
             max_context_len=16,
             get_verify_buffers_to_fill_after_draft=lambda: (default_mask, None),
+            target_verify_reads_custom_mask=lambda: True,
         )
 
         for backend, expected_mode, expected_mask in (
