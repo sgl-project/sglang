@@ -59,6 +59,12 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
     SWARebuild,
 )
+from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+    CacheTransferPhase,
+    ComponentType,
+    EvictLayer,
+    TreeComponent,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
     DemoteResult,
@@ -66,12 +72,6 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DropSubtreeNoHostResult,
     EvictDeviceLeafResult,
     EvictDeviceNextNodeResult,
-)
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
-    CacheTransferPhase,
-    ComponentType,
-    EvictLayer,
-    TreeComponent,
 )
 from sglang.srt.mem_cache.unified_radix_cache import (
     COMPONENT_REGISTRY,

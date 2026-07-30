@@ -305,7 +305,7 @@ struct QuantTrait {
     } else {
       // fp32 scale: multiply in fp32 (hmul2 brings too much precision loss)
       scale_inv = raw_scale;
-      const float quant_scale = kMaxValue * __frcp_rn(amax);
+      const float quant_scale = kMaxValue / amax;
       const float2 quant_scale2 = {quant_scale, quant_scale};
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
