@@ -113,6 +113,17 @@ def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
     return scale.t().contiguous().t() if scale.dim() == 2 else scale
 
 
+def view_aiter_fused_rms_transposed_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Expose AITER fused-RMS ``transpose_scale=True`` storage logically.
+
+    The fused-RMS op returns transposed physical bytes through a row-major-looking
+    view. Restore logical ``[M, G]`` indexing without copying those bytes.
+    """
+    if scale.dim() != 2:
+        return scale
+    return torch.as_strided(scale, scale.shape, (1, scale.shape[0]))
+
+
 def materialize_bpreshuffle_fp8_scale_tuple(
     value: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, ...]:
