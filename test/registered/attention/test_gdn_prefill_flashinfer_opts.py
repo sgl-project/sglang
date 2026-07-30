@@ -12,8 +12,8 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 if not torch.cuda.is_available():
     pytest.skip("requires CUDA", allow_module_level=True)
@@ -229,9 +229,11 @@ def _make_fused_inputs(total_tokens: int, seed: int, strided_ab: bool = False):
 
 def _fused_ref_chain(mixed_qkv, a, b, A_log, dt_bias):
     """The established split, gating, and two-normalization chain."""
-    from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
     from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
     from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+    from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+        fused_qkv_split_gdn_prefill,
+    )
 
     q, k, v = fused_qkv_split_gdn_prefill(mixed_qkv, 4, 4, 16, 128, 128, 128)
     g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
@@ -277,8 +279,10 @@ def test_gdn_prefill_fused_bitexact(total_tokens: int):
 
 def test_flashinfer_extend_fused_matches_extend():
     """The fused route must match the canonical log-g ``extend`` API."""
-    from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
     from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+    from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+        fused_qkv_split_gdn_prefill,
+    )
 
     kernel = FlashInferGDNKernel()
     T = 940
@@ -341,6 +345,76 @@ def test_flashinfer_extend_fused_matches_extend():
     assert _bits_equal(pool_p, pool_e)
     assert _bits_equal(out_p[0], o_e[0])
     assert o_p.data_ptr() == out_p.data_ptr()  # direct-write preserved
+
+
+def test_warm_initial_state_variant_precompiles_gathered_path():
+    """The first prefix-free extend must eagerly compile FlashInfer's
+    ``use_initial_state=True`` variant.
+
+    ``initial_state=None`` selects a different entry in FlashInfer's CuTe
+    compile cache than the gathered-state path, and only the prefix-free one is
+    exercised by warmup/capture. Without the warm, the gathered variant compiles
+    on the first chunked continuation *during serving* (~3.6 s stall).
+    """
+    kernel = FlashInferGDNKernel()
+    inp = _build_extend_inputs(kernel, 2)
+    real_prefill, calls = kernel._prefill_fn, []
+
+    def _spy(**kw):
+        calls.append(kw)
+        return real_prefill(**kw)
+
+    kernel._prefill_fn = _spy
+
+    _run_fused(kernel, inp, no_prefix=True)
+    assert len(calls) == 2, "expected the warm-up call plus the real call"
+    warm, serve = calls
+    assert serve["initial_state"] is None
+    assert warm["initial_state"] is not None
+    # Every component of FlashInfer's compile-cache key must match, or the warm
+    # populates an entry serving never asks for.
+    assert warm["q"].dtype == serve["q"].dtype
+    assert warm["q"].shape[1:] == serve["q"].shape[1:]
+    assert warm["v"].shape[1:] == serve["v"].shape[1:]
+    assert warm["initial_state"].dtype == inp["ssm_states"].dtype
+    assert warm["cu_seqlens"].dtype == serve["cu_seqlens"].dtype
+    assert ("output_state" in warm) == ("output_state" in serve)
+    assert warm["output_final_state"] == serve["output_final_state"]
+
+    calls.clear()
+    _run_fused(kernel, inp, no_prefix=True)
+    assert len(calls) == 1, "warm-up must run once per kernel instance"
+
+    if kernel.use_state_pool:  # SM100: the compile cache is introspectable
+        from flashinfer.gdn_kernels.blackwell import gdn_prefill as fi
+
+        misses = fi._get_compiled_cache.cache_info().misses
+        _run_fused(kernel, inp, no_prefix=False)
+        assert fi._get_compiled_cache.cache_info().misses == misses
+
+
+def test_warm_initial_state_variant_skipped_during_graph_capture(monkeypatch):
+    """cute.compile allocates and does host work, so it must never run under a
+    CUDA graph capture; the attempt has to survive to be retried afterwards."""
+    kernel = FlashInferGDNKernel()
+    inp = _build_extend_inputs(kernel, 1)
+    real_prefill, calls = kernel._prefill_fn, []
+
+    def _spy(**kw):
+        calls.append(kw)
+        return real_prefill(**kw)
+
+    kernel._prefill_fn = _spy
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    _run_fused(kernel, inp, no_prefix=True)
+    assert len(calls) == 1, "the warm must not run while capturing"
+    assert kernel._warmed_initial_state_variant is False
+
+    monkeypatch.undo()
+    calls.clear()
+    _run_fused(kernel, inp, no_prefix=True)
+    assert len(calls) == 2, "the warm must still run once capture is over"
+    assert kernel._warmed_initial_state_variant is True
 
 
 if __name__ == "__main__":

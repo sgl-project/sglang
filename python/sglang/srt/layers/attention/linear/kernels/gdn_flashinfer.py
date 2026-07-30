@@ -113,6 +113,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         sm_major = torch.cuda.get_device_capability()[0]
         self.use_state_pool = sm_major >= 10
         self.supports_target_verify = sm_major in (9, 10)
+        # See _warm_initial_state_variant: the prefix-free fast path selects a
+        # different CuTe compile-cache entry than the gathered-state path, and
+        # only the former is exercised before traffic starts.
+        self._warmed_initial_state_variant = False
 
         if sm_major == 9 and self._prefill_fn is None:
             raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
@@ -332,6 +336,81 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             and num_v_heads & (num_v_heads - 1) == 0
         )
 
+    def _warm_initial_state_variant(
+        self,
+        q_fi: torch.Tensor,
+        k_fi: torch.Tensor,
+        v_fi: torch.Tensor,
+        alpha_fi: torch.Tensor,
+        beta_fi: torch.Tensor,
+        ssm_states: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> None:
+        """Compile FlashInfer's ``use_initial_state=True`` CuTe variant early.
+
+        ``initial_state=None`` (the prefix-free fast path) is a kernel-codegen
+        parameter, so it selects a different entry in FlashInfer's compile
+        cache than the gathered-state path. Server warmup and prefill-graph
+        capture only ever build prefix-free batches (capture pins
+        ``extend_prefix_lens_cpu`` to zeros, and prefix-bearing extends are
+        forced eager when the model has MHA companion layers), so without this
+        the gathered-state variant would compile on the first chunked
+        continuation *during serving* - a ~3.6 s stall that lands in the middle
+        of a benchmark or a production ramp.
+
+        The token extent is compile-dynamic, so one short slice is enough to
+        populate the entry; every other key component (dtypes, head counts,
+        ``store_final_state``) is taken from the real tensors so the warmed key
+        matches the one serving will ask for.
+
+        Note: on SM90/SM120 FlashInfer additionally routes between a CP and a
+        non-CP kernel on ``num_seqs * num_v_heads`` vs. SM count, and both key
+        on the initial state. The single-sequence warm below populates the CP
+        entry (what a B=1 chunked continuation uses); large-batch continuations
+        still compile their non-CP entry on first use. SM100 has no such
+        routing.
+        """
+        if self._warmed_initial_state_variant:
+            return
+        # cute.compile does host-side work and allocates: it must never run
+        # while a CUDA graph capture is in progress.
+        if torch.cuda.is_current_stream_capturing():
+            return
+        self._warmed_initial_state_variant = True
+        try:
+            n = min(int(q_fi.shape[0]), 64)
+            state = ssm_states.new_zeros((1,) + ssm_states.shape[1:])
+            extra = {}
+            if self.use_state_pool:
+                extra["output_state"] = torch.empty_like(state)
+            else:
+                state = state.to(torch.float32)
+            # The dtype must follow query_start_loc: cu_seqlens' element type is
+            # baked into the compiled artifact but is NOT part of FlashInfer's
+            # cache key, so a literal dtype here would silently warm the wrong
+            # entry.
+            cu = n * torch.arange(
+                2, device=query_start_loc.device, dtype=query_start_loc.dtype
+            )
+            self._prefill_fn(
+                q=q_fi[:n],
+                k=k_fi[:n],
+                v=v_fi[:n],
+                g=alpha_fi[:n],
+                beta=beta_fi[:n],
+                scale=None,
+                initial_state=state,
+                output_final_state=True,
+                cu_seqlens=cu if self.use_state_pool else cu.to(torch.int64),
+                use_qk_l2norm_in_kernel=False,
+                **extra,
+            )
+        except Exception as exc:  # pragma: no cover - warm-only, non-fatal
+            logger.warning(
+                "FlashInfer GDN initial-state variant warm-up failed "
+                f"({exc}); it will compile on first use instead."
+            )
+
     def extend_fused(
         self,
         mixed_qkv: torch.Tensor,
@@ -403,6 +482,16 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # pool slots are cleared, so the gather would materialize zeros anyway
         # (and this also insulates fresh prefills from any stale slot content).
         if no_prefix:
+            if not self._warmed_initial_state_variant:
+                self._warm_initial_state_variant(
+                    q_fi=q_fi,
+                    k_fi=k_fi,
+                    v_fi=v_fi,
+                    alpha_fi=alpha_fi,
+                    beta_fi=beta_fi,
+                    ssm_states=ssm_states,
+                    query_start_loc=query_start_loc,
+                )
             initial_state_fi = None
         else:
             gathered = ssm_states[ssm_cache_indices]
