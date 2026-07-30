@@ -362,10 +362,7 @@ class TestInklingDetector(unittest.TestCase):
         self.assertEqual(result.normal_text, "Here you go.")
 
     def test_empty_name_is_allowed_on_the_canonical_path(self):
-        source = (
-            "<|content_invoke_tool_json|>"
-            '{"name":"","args":{}}<|end_message|>'
-        )
+        source = "<|content_invoke_tool_json|>" '{"name":"","args":{}}<|end_message|>'
         result = InklingDetector().detect_and_parse(source, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "")
@@ -427,7 +424,9 @@ class TestInklingDetector(unittest.TestCase):
         source = "<|content_invoke_tool_text|>search the web<|end_message|>"
         result = InklingDetector().detect_and_parse(source, self.tools)
         self.assertEqual(len(result.calls), 1)
-        self.assertEqual(json.loads(result.calls[0].parameters), {"text": "search the web"})
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"text": "search the web"}
+        )
 
 
 class TestPythonicDetector(unittest.TestCase):

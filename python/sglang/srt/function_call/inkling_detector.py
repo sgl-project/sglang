@@ -104,9 +104,7 @@ class InklingDetector(BaseFormatDetector):
 
         return self._clean_normal_text("".join(normal_parts)), calls
 
-    def _next_tool_marker(
-        self, text: str, start: int
-    ) -> tuple[int | None, str, bool]:
+    def _next_tool_marker(self, text: str, start: int) -> tuple[int | None, str, bool]:
         """Earliest json/text tool marker at or after ``start`` (is_json flag)."""
         json_pos = text.find(self.bot_token, start)
         text_pos = text.find(CONTENT_INVOKE_TOOL_TEXT, start)
@@ -120,9 +118,7 @@ class InklingDetector(BaseFormatDetector):
         self, body: str, tools: List[Tool], call_index: int
     ) -> ToolCallItem | None:
         try:
-            payload = json.loads(
-                body.strip(), parse_constant=_reject_nonfinite_number
-            )
+            payload = json.loads(body.strip(), parse_constant=_reject_nonfinite_number)
         except (json.JSONDecodeError, ValueError):
             return None
         if not isinstance(payload, Mapping):
