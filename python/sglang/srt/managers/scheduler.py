@@ -1027,6 +1027,11 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        # Fairness state for bounding decode starvation under sustained prefill load.
+        self.max_consecutive_prefill_batches = (
+            self.server_args.max_consecutive_prefill_batches
+        )
+        self.consecutive_prefill_batches = 0
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -2853,8 +2858,25 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
+        prefill_decode_fairness_enabled = (
+            self.dllm_config is None and self.max_consecutive_prefill_batches > 0
+        )
+        decode_is_runnable = (
+            prefill_decode_fairness_enabled
+            and not running_batch.is_empty()
+            and not running_batch.is_prefill_only
+        )
+        force_decode = (
+            decode_is_runnable
+            # A partially processed request must continue its next chunk.
+            and self.chunked_req is None
+            and self.consecutive_prefill_batches >= self.max_consecutive_prefill_batches
+        )
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
+        elif force_decode:
+            new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
@@ -2876,13 +2898,21 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
+            if prefill_decode_fairness_enabled:
+                if decode_is_runnable and not new_batch.decoding_reqs:
+                    self.consecutive_prefill_batches += 1
+                else:
+                    self.consecutive_prefill_batches = 0
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
                 running_batch = self.update_running_batch(running_batch)
                 ret = running_batch if not running_batch.is_empty() else None
+                if ret is not None:
+                    self.consecutive_prefill_batches = 0
             else:
                 ret = None
+                self.consecutive_prefill_batches = 0
 
         # Handle DP attention and log stats
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(

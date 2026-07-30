@@ -105,6 +105,8 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.tree_cache = tree_cache
     s.chunked_req = chunked_req
     s._pending_chunked_abort_req = None
+    s.max_consecutive_prefill_batches = 0
+    s.consecutive_prefill_batches = 0
     return s
 
 
