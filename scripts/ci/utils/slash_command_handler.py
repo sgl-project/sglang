@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from datetime import datetime, timezone
 
 import requests
@@ -247,6 +248,18 @@ def get_env_var(name):
     return val
 
 
+def _strip_format_chars(s):
+    """Remove Unicode format characters (category Cf: LRM/RLM U+200E/200F,
+    zero-width space/joiners U+200B-200D, word joiner U+2060, BOM U+FEFF).
+
+    GitHub's copy-path button and rich-text copy inject these invisibly;
+    a pasted `/rerun-test foo.py<U+200E>` then never matches any test file
+    (see PR #31059). They are display hints and never legitimate in a
+    command or path, so dropping them is always safe.
+    """
+    return "".join(c for c in s if unicodedata.category(c) != "Cf")
+
+
 def load_permissions(user_login):
     """
     Reads the permissions JSON from the local file system and returns
@@ -276,14 +289,14 @@ def load_permissions(user_login):
 
 def has_sgl_kernel_changes(pr):
     """
-    Check if the PR has changes to the sgl-kernel directory.
+    Check if the PR has changes to the AOT kernel directory.
     This is used to determine if we need a full workflow rerun
     (to rebuild the kernel) vs just rerunning failed jobs.
     """
     try:
         files = pr.get_files()
         for f in files:
-            if f.filename.startswith("sgl-kernel/"):
+            if f.filename.startswith("python/sglang/kernels/aot/"):
                 return True
         return False
     except Exception as e:
@@ -449,6 +462,7 @@ MULTIMODAL_TEST_DIR = "python/sglang/multimodal_gen/test"
 MULTIMODAL_PATH_TO_RUNNER = {
     "2_gpu": "2-gpu-h100",
     "2-gpu": "2-gpu-h100",
+    "b200": _B200_DEFAULT_RUNNER,
 }
 MULTIMODAL_DEFAULT_RUNNER = "1-gpu-h100"
 
@@ -1348,7 +1362,7 @@ def main():
     repo_name = get_env_var("REPO_FULL_NAME")
     pr_number = int(get_env_var("PR_NUMBER"))
     comment_id = int(get_env_var("COMMENT_ID"))
-    comment_body = get_env_var("COMMENT_BODY").strip()
+    comment_body = _strip_format_chars(get_env_var("COMMENT_BODY")).strip()
     user_login = get_env_var("USER_LOGIN")
 
     # 2. Load Permissions (local file check first to avoid unnecessary API calls)

@@ -37,6 +37,7 @@ class TestDSAChoicesAndFields(unittest.TestCase):
     def test_dsa_choices_is_canonical(self):
         self.assertIn("fa3", self.DSA_CHOICES)
         self.assertIn("tilelang", self.DSA_CHOICES)
+        self.assertIn("flashinfer_sparse_mla", self.DSA_CHOICES)
 
     def test_nsa_choices_is_alias(self):
         self.assertIs(
@@ -202,8 +203,6 @@ class TestEnvVarAliases(unittest.TestCase):
             "SGLANG_NSA_FUSE_TOPK",
             "SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
             "SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
-            "SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA",
-            "SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA",
         ]:
             os.environ.pop(key, None)
         # Re-import to reset descriptor state

@@ -7,7 +7,7 @@ from deep_gemm import ceil_div
 from flashinfer.gemm import gemm_fp8_nt_groupwise
 
 from sglang.benchmark.bench_utils import run_bench
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     w8a8_block_fp8_matmul_deepgemm,
 )

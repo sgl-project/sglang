@@ -402,6 +402,10 @@
       "destination": "/docs/sglang-diffusion/ring_sp_performance"
     },
     {
+      "source": "/diffusion/performance/encoder_parallel.html",
+      "destination": "/docs/sglang-diffusion/encoder_parallel"
+    },
+    {
       "source": "/diffusion/quantization.html",
       "destination": "/docs/sglang-diffusion/quantization"
     },
@@ -896,9 +900,11 @@
                     "pages": [
                       "docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_r1",
                       "docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_v3_2",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/glm_5_2",
                       "docs/hardware-platforms/ascend-npus/model-tutorials/glm_5_1",
                       "docs/hardware-platforms/ascend-npus/model-tutorials/kimi_k2_6",
                       "docs/hardware-platforms/ascend-npus/model-tutorials/minimax_m2_5",
+                      "docs/hardware-platforms/ascend-npus/model-tutorials/mimo_v2_flash",
                       "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3-8b",
                       "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_32b",
                       "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_30b_a3b",
@@ -936,7 +942,8 @@
                   "docs/hardware-platforms/ascend-npus/ascend_npu_faq",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_operator_performance_optimizing",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_profiling",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_operator_development"
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_operator_development",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_reference"
                 ]
               },
               "docs/hardware-platforms/cpu_server",
@@ -967,6 +974,39 @@
                 "pages": [
                   "cookbook/autoregressive/intro",
                   {
+                    "group": "Kimi (Moonshot AI)",
+                    "pages": [
+                      "cookbook/autoregressive/Moonshotai/Kimi-K3",
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2.7-Code",
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2.5",
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2",
+                      "cookbook/autoregressive/Moonshotai/Kimi-Linear"
+                    ]
+                  },
+                  {
+                    "group": "Thinking Machines",
+                    "pages": [
+                      "cookbook/autoregressive/ThinkingMachines/Inkling"
+                    ]
+                  },
+                  {
+                    "group": "GLM",
+                    "pages": [
+                      "cookbook/autoregressive/GLM/GLM-5.2",
+                      "cookbook/autoregressive/GLM/GLM-5.1",
+                      "cookbook/autoregressive/GLM/GLM-5",
+                      "cookbook/autoregressive/GLM/GLM-OCR",
+                      "cookbook/autoregressive/GLM/GLM-Glyph",
+                      "cookbook/autoregressive/GLM/GLM-4.7",
+                      "cookbook/autoregressive/GLM/GLM-4.7-Flash",
+                      "cookbook/autoregressive/GLM/GLM-4.6",
+                      "cookbook/autoregressive/GLM/GLM-4.6V",
+                      "cookbook/autoregressive/GLM/GLM-4.5",
+                      "cookbook/autoregressive/GLM/GLM-4.5V"
+                    ]
+                  },
+                  {
                     "group": "Qwen",
                     "pages": [
                       "cookbook/autoregressive/Qwen/Qwen3.6",
@@ -993,6 +1033,12 @@
                     ]
                   },
                   {
+                    "group": "DeepReinforce",
+                    "pages": [
+                      "cookbook/autoregressive/DeepReinforce/Ornith-1.0"
+                    ]
+                  },
+                  {
                     "group": "Llama",
                     "pages": [
                       "cookbook/autoregressive/Llama/Llama4",
@@ -1001,24 +1047,15 @@
                     ]
                   },
                   {
-                    "group": "GLM",
+                    "group": "Meituan",
                     "pages": [
-                      "cookbook/autoregressive/GLM/GLM-5.2",
-                      "cookbook/autoregressive/GLM/GLM-5.1",
-                      "cookbook/autoregressive/GLM/GLM-5",
-                      "cookbook/autoregressive/GLM/GLM-OCR",
-                      "cookbook/autoregressive/GLM/GLM-Glyph",
-                      "cookbook/autoregressive/GLM/GLM-4.7",
-                      "cookbook/autoregressive/GLM/GLM-4.7-Flash",
-                      "cookbook/autoregressive/GLM/GLM-4.6",
-                      "cookbook/autoregressive/GLM/GLM-4.6V",
-                      "cookbook/autoregressive/GLM/GLM-4.5",
-                      "cookbook/autoregressive/GLM/GLM-4.5V"
+                      "cookbook/autoregressive/Meituan/LongCat-2.0"
                     ]
                   },
                   {
                     "group": "Google",
                     "pages": [
+                      "cookbook/autoregressive/Google/EmbeddingGemma",
                       "cookbook/autoregressive/Google/Gemma4",
                       "cookbook/autoregressive/Google/DiffusionGemma"
                     ]
@@ -1033,16 +1070,6 @@
                     "group": "OpenAI",
                     "pages": [
                       "cookbook/autoregressive/OpenAI/GPT-OSS"
-                    ]
-                  },
-                  {
-                    "group": "Moonshotai",
-                    "pages": [
-                      "cookbook/autoregressive/Moonshotai/Kimi-K2.7-Code",
-                      "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
-                      "cookbook/autoregressive/Moonshotai/Kimi-K2.5",
-                      "cookbook/autoregressive/Moonshotai/Kimi-K2",
-                      "cookbook/autoregressive/Moonshotai/Kimi-Linear"
                     ]
                   },
                   {
@@ -1144,12 +1171,15 @@
                   {
                     "group": "Tencent",
                     "pages": [
+                      "cookbook/autoregressive/Tencent/Hy3",
                       "cookbook/autoregressive/Tencent/Hunyuan3-Preview"
                     ]
                   },
                   {
                     "group": "Poolside",
                     "pages": [
+                      "cookbook/autoregressive/Poolside/Laguna-S-2.1",
+                      "cookbook/autoregressive/Poolside/Laguna-XS-2.1",
                       "cookbook/autoregressive/Poolside/Laguna-M.1",
                       "cookbook/autoregressive/Poolside/Laguna-XS.2"
                     ]
@@ -1162,7 +1192,6 @@
                   "cookbook/diffusion/intro",
                   {
                     "group": "Cosmos",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Cosmos/Cosmos3"
                     ]
@@ -1175,7 +1204,6 @@
                   },
                   {
                     "group": "Ideogram",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Ideogram/Ideogram4"
                     ]
@@ -1188,14 +1216,19 @@
                     ]
                   },
                   {
+                    "group": "LongLive",
+                    "pages": [
+                      "cookbook/diffusion/LongLive/LongLive-2.0"
+                    ]
+                  },
+                  {
                     "group": "LTX",
                     "pages": [
                       "cookbook/diffusion/LTX/LTX2 & LTX2.3"
                     ]
                   },
                   {
-                    "group": "JoyEcho",
-                    "tag": "NEW",
+                    "group": "JoyAI-Echo",
                     "pages": [
                       "cookbook/diffusion/JoyEcho/JoyEcho"
                     ]
@@ -1215,7 +1248,6 @@
                   },
                   {
                     "group": "Krea",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Krea/Krea-2"
                     ]
@@ -1234,16 +1266,28 @@
                   },
                   {
                     "group": "LingBot World",
-                    "tag": "NEW",
                     "pages": [
-                      "cookbook/diffusion/LingBot-World/LingBot-World"
+                      "cookbook/diffusion/LingBot-World/LingBot-World",
+                      "cookbook/diffusion/LingBot-World/LingBot-World-2.0"
                     ]
                   },
                   {
                     "group": "SANA-WM",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/SANA-WM/SANA-WM"
+                    ]
+                  }
+                ]
+              },
+              {
+                "group": "VLA (Vision-Language-Action) Models",
+                "pages": [
+                  "cookbook/vla/intro",
+                  {
+                    "group": "OpenPI",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/vla/OpenPI/Pi0.5"
                     ]
                   }
                 ]
@@ -1282,6 +1326,8 @@
                 "pages": [
                   "docs/sglang-diffusion/api/cli",
                   "docs/sglang-diffusion/api/openai_api",
+                  "docs/sglang-diffusion/models_with_ar",
+                  "docs/sglang-diffusion/models_with_pe",
                   "docs/sglang-diffusion/api/post_processing"
                 ]
               },
@@ -1292,6 +1338,7 @@
                   "docs/sglang-diffusion/deployment_cookbook",
                   "docs/sglang-diffusion/attention_backends",
                   "docs/sglang-diffusion/ring_sp_performance",
+                  "docs/sglang-diffusion/encoder_parallel",
                   "docs/sglang-diffusion/dynamic_batching",
                   {
                     "group": "Caching Acceleration",

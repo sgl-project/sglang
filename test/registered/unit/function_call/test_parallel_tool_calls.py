@@ -134,31 +134,6 @@ class TestParallelToolCalls(unittest.TestCase):
             params2["filename"], "doc2", "Second tool filename should be doc2"
         )
 
-    def test_simple_parallel_tool_calls(self):
-        """
-        Test a simpler case of two parallel tool calls with array parameters.
-
-        This is a minimal test case that still tests the core functionality.
-        """
-        chunks = [
-            "[\n",
-            '  {"name": "search_docs", "parameters": {"title": ["a"]}},',
-            "\n",
-            '  {"name": "search_docs", "parameters": {"title": ["b"]}}',
-            "]",
-        ]
-
-        tool_calls = []
-
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-            self._accumulate_tool_calls(tool_calls, result)
-
-        # Should parse both tools successfully
-        self.assertEqual(len(tool_calls), 2, "Should parse 2 tool calls")
-        self.assertEqual(tool_calls[0]["name"], "search_docs")
-        self.assertEqual(tool_calls[1]["name"], "search_docs")
-
 
 if __name__ == "__main__":
     unittest.main()

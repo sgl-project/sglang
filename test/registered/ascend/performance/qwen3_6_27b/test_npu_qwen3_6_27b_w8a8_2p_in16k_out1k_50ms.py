@@ -16,7 +16,6 @@ register_npu_ci(
 )
 
 QWEN3_6_27B_16K_1k_ENVS = {
-    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
@@ -25,7 +24,8 @@ QWEN3_6_27B_16K_1k_ENVS = {
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "30",
+    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "50",
+    "GDN_ATTN_BACKEND_TRITON": "1",
     "ASCEND_USE_FIA": "1",
 }
 
@@ -41,28 +41,43 @@ QWEN3_6_27B_16K_1k_OTHER_ARGS = [
     "--chunked-prefill-size",
     -1,
     "--max-prefill-tokens",
-    50000,
+    58000,
     "--disable-radix-cache",
     "--trust-remote-code",
     "--max-running-requests",
-    28,
+    37,
     "--max-mamba-cache-size",
-    50,
+    74,
     "--mem-fraction-static",
-    0.7,
+    0.70,
     "--cuda-graph-bs",
+    1,
     2,
+    3,
+    4,
+    6,
     8,
+    10,
     12,
+    14,
     16,
+    18,
     20,
+    21,
+    23,
     24,
+    25,
+    26,
+    27,
     28,
-    "--enable-multimodal",
+    29,
+    30,
+    31,
+    33,
+    35,
+    37,
     "--quantization",
     "modelslim",
-    "--mm-attention-backend",
-    "ascend_attn",
     "--dtype",
     "bfloat16",
     "--mamba-ssm-dtype",
@@ -70,11 +85,15 @@ QWEN3_6_27B_16K_1k_OTHER_ARGS = [
     "--speculative-algorithm",
     "NEXTN",
     "--speculative-num-steps",
-    3,
+    4,
     "--speculative-eagle-topk",
     1,
     "--speculative-num-draft-tokens",
-    4,
+    5,
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
 ]
 
 
@@ -82,16 +101,18 @@ class TestNPUQwen3_6_27B_2P_In16k_Out1k_50ms(TestNpuPerformanceTestCaseBase):
     """Test NPU performance for Qwen3.6-27B-w8a8 2p in16k out1k 50ms"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    aisbench_dataset_type = AISBENCHMARK_DATASET_DEFAULT
+    dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model = QWEN3_6_27B_W8A8_MODEL_PATH
     other_args = QWEN3_6_27B_16K_1k_OTHER_ARGS
     envs = QWEN3_6_27B_16K_1k_ENVS
     dataset_name = "random"
-    max_concurrency = 28
-    num_prompts = 112
+    max_concurrency = 37
+    warmup_requests = 4
+    num_prompts = 37
     input_len = 16000
     output_len = 1000
     random_range_ratio = 1
+    seed = 1
     tpot = 50
     output_token_throughput = 426.1
 

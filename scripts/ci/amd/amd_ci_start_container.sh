@@ -23,7 +23,7 @@ fi
 ROCM_VERSION="rocm700"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
-LOCAL_DOCKER_REGISTRY="10.245.143.50:5000"
+LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
@@ -57,7 +57,7 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Environment:"
       echo "  ENABLE_CACHE_HOST=1|0"
-      echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 0."
+      echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -162,7 +162,7 @@ find_latest_image() {
   # We intentionally do not probe ${LOCAL_DOCKER_REGISTRY} here with
   # `docker manifest inspect --insecure` because that command runs in the
   # runner pod's network namespace, which on every observed AMD scale set
-  # cannot reach 10.245.143.50:5000 (every probe either fast-fails with TLS
+  # cannot reach 10.44.14.109:5000 (every probe either fast-fails with TLS
   # reject or hits a 30s TCP timeout, multiplied across 7 daily candidates).
   # The actual local-registry pull still happens in the call site below via
   # `docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"`, which goes through the
@@ -288,15 +288,24 @@ else
 fi
 
 CACHE_HOST=/home/runner/sglang-data
-ENABLE_CACHE_HOST="${ENABLE_CACHE_HOST:-0}"
+if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
+  RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
+  RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"
+  if [[ "${RUNNER_NAME_LOWER}" == *300* || "${RUNNER_NAME_LOWER}" == *35x* ]]; then
+    ENABLE_CACHE_HOST="1"
+  else
+    ENABLE_CACHE_HOST="0"
+  fi
+fi
 case "${ENABLE_CACHE_HOST,,}" in
   1|true|yes|on|pvc|persistent)
-    if [[ ! -d "$CACHE_HOST" ]]; then
-      echo "Error: ENABLE_CACHE_HOST=1 but ${CACHE_HOST} does not exist." >&2
-      exit 1
+    if [[ -d "$CACHE_HOST" ]]; then
+      CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
+      echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
+    else
+      CACHE_VOLUME=""
+      echo "Warning: ${CACHE_HOST} does not exist; using container-local /sgl-data." >&2
     fi
-    CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
-    echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
     ;;
   0|false|no|off|"")
     CACHE_VOLUME=""
@@ -332,8 +341,7 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
 docker exec ci_sglang mkdir -p \
   /sgl-data/hf-cache/hub \
   /sgl-data/pip-cache \
-  /sgl-data/miopen-cache \
-  /sgl-data/aiter-kernels
+  /sgl-data/miopen-cache
 
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so

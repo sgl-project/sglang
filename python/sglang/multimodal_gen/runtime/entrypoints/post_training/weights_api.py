@@ -72,6 +72,9 @@ async def update_weights_from_tensor(request: Request):
         serialized_named_tensors=serialized_named_tensors,
         load_format=body.get("load_format"),
         target_modules=body.get("target_modules"),
+        weight_update_mode=body.get("weight_update_mode"),
+        lora_alpha=body.get("lora_alpha"),
+        lora_rank=body.get("lora_rank"),
     )
 
     try:
