@@ -55,6 +55,7 @@ from sglang.srt.utils.common import (
     get_eager_max_batch_size,
     require_mlp_sync,
 )
+from sglang.srt.utils.device_timer import device_timer_ctx
 
 logger = logging.getLogger(__name__)
 
@@ -237,11 +238,7 @@ class EagerRunner(BaseRunner):
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
 
-        ctx = (
-            model_runner.device_timer.wrap(metadata={"category": "decode"})
-            if model_runner.device_timer
-            else contextlib.nullcontext()
-        )
+        ctx = device_timer_ctx(model_runner.device_timer, "decode")
 
         with ctx, pdmux_ctx:
             return model_runner.model.forward(
@@ -297,12 +294,7 @@ class EagerRunner(BaseRunner):
             if forward_batch.forward_mode.is_target_verify()
             else "extend"
         )
-        ctx = (
-            model_runner.device_timer.wrap(metadata={"category": category})
-            if model_runner.device_timer
-            else contextlib.nullcontext()
-        )
-        with ctx:
+        with device_timer_ctx(model_runner.device_timer, category):
             pcg_runner = model_runner.prefill_cuda_graph_runner
             if (
                 _is_hip
@@ -401,12 +393,7 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.forward_metadata = None
 
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
-        ctx = (
-            model_runner.device_timer.wrap(metadata={"category": "idle"})
-            if model_runner.device_timer
-            else contextlib.nullcontext()
-        )
-        with ctx:
+        with device_timer_ctx(model_runner.device_timer, "idle"):
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
