@@ -13,11 +13,10 @@ Per-chunk flow, driven by the endpoint::
     -> transcript delta
     commit event -> process(is_last=True), or finalize() if no new audio
 
-Mode lifecycle: every item starts cumulative (identical to the pre-existing
-behavior). Past the adapter's activation gate it switches to windowed --
-encoder-aligned audio windows reused through the embedding cache plus a
-bounded decoder prefix -- and stays there for the rest of the item.
-No-whitespace CJK disables windowed; the item stays cumulative.
+Mode lifecycle: requests remain cumulative until the adapter's activation
+gate is crossed. Eligible items then switch to encoder-aligned audio windows,
+embedding-cache reuse, and a bounded decoder prefix for the rest of the item.
+No-whitespace CJK remains cumulative.
 """
 
 from __future__ import annotations
@@ -61,14 +60,11 @@ _MAX_DECODER_SUFFIX_TOKENS_PER_SECOND = 16
 def decoder_suffix_token_budget(
     new_audio_bytes: int, bytes_per_second: int, pending_suffix: str
 ) -> int:
-    """Bound suffix decoding without truncating text pending confirmation.
+    """Estimate an intermediate suffix budget from new audio and pending text.
 
-    A degenerate decode (e.g. looping on repetitive audio) must not spend the
-    final-commit budget, so intermediate requests are capped. The cap must
-    still cover everything a correct decode may emit: 16 tokens/s over-covers
-    real speech for the new audio, and because the pending suffix is
-    re-decoded on every request it gets ~2 tokens per word plus one per CJK
-    char (BPE upper bounds). The floor keeps tiny audio increments decodable.
+    This limits repeated work from a looping intermediate decode; final commits
+    still use the adapter's full budget. The speech rate and pending-text
+    allowances are conservative heuristics, not tokenizer-level guarantees.
     """
     new_audio_tokens = math.ceil(
         new_audio_bytes / bytes_per_second * _MAX_DECODER_SUFFIX_TOKENS_PER_SECOND
@@ -134,8 +130,8 @@ class _TranscriptionOutcome(msgspec.Struct, frozen=True):
 
 
 class _WindowedPolicy(msgspec.Struct, frozen=True):
-    """Windowed-mode knobs, resolved once per connection because every input
-    (adapter config, model window geometry) is fixed for its lifetime."""
+    """Windowed-mode settings resolved from connection-invariant adapter
+    configuration and model geometry."""
 
     window_config: AudioEncoderWindowConfig
     decoder_prefix_max_tokens: int
@@ -150,7 +146,7 @@ class _WindowedPolicy(msgspec.Struct, frozen=True):
 
 
 class RealtimeASRProcessor:
-    """Plan and execute realtime ASR requests for explicit stream state."""
+    """Build and execute realtime ASR steps against explicit stream state."""
 
     def __init__(
         self,
@@ -185,8 +181,7 @@ class RealtimeASRProcessor:
     def _resolve_windowed_policy(
         self, state: StreamingASRState
     ) -> Optional[_WindowedPolicy]:
-        """Resolve the windowed policy, or None to keep the cumulative path;
-        an invalid or missing config must degrade the connection, not fail it."""
+        """Return a validated windowed policy, or keep cumulative inference."""
         declared = self.adapter.realtime_long_audio_config
         if not isinstance(declared, dict):
             return None
@@ -240,10 +235,8 @@ class RealtimeASRProcessor:
     ) -> str:
         """Run one transcription step and return its publishable delta.
 
-        Windowed inference previews without mutating transcript state, so when
-        its first decode reveals no-whitespace CJK the same audio is simply
-        redone on the cumulative path with nothing to roll back."""
-        # No-whitespace CJK cannot use the word-based decoder-prefix path.
+        The first windowed result is previewed so unsupported no-whitespace CJK
+        can retry cumulatively before transcript state changes."""
         if (
             self._windowed_policy is not None
             and not state.windowed_disabled
@@ -344,8 +337,7 @@ class RealtimeASRProcessor:
         step: _TranscriptionStep,
         sampling_params: Dict[str, Any],
     ) -> _TranscriptionOutcome:
-        """Re-transcribe the whole buffer and reconcile it against emitted
-        text -- main's behavior, kept byte-identical below the gate."""
+        """Re-transcribe accumulated audio and reconcile its cumulative text."""
         samples = await self._snapshot_samples(
             state.audio, step.start_offset_bytes, step.end_offset_bytes
         )
@@ -363,13 +355,7 @@ class RealtimeASRProcessor:
         step: _TranscriptionStep,
         sampling_params: Dict[str, Any],
     ) -> _TranscriptionOutcome:
-        """Decode only the transcript continuation for the rolling window.
-
-        Flow: budget the intermediate decode by new-audio length (so one stuck
-        decode cannot spend the final-commit budget) -> generate with the
-        decoder prefix -> the first windowed decode adopts the cumulative
-        tail; a later voiced-but-empty decode is deferred at most one window
-        -> preview the suffix delta for _commit."""
+        """Generate continuation text from encoder-aligned rolling context."""
         policy = self._windowed_policy
         assert policy is not None
         if step.start_offset_bytes % policy.window_bytes:
@@ -378,8 +364,9 @@ class RealtimeASRProcessor:
             state.audio, step.start_offset_bytes, step.end_offset_bytes
         )
 
-        # Intermediate requests decode only the new suffix; the final commit
-        # may replay the prefix, so it keeps the adapter's full budget.
+        # Intermediate requests use the heuristic suffix budget above. The
+        # final commit keeps the adapter budget so pending text is not limited
+        # by that estimate.
         if not step.is_last:
             max_suffix_tokens = decoder_suffix_token_budget(
                 step.end_offset_bytes - state.audio.accepted_offset_bytes,
