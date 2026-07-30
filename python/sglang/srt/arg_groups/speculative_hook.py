@@ -275,6 +275,33 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     return checkpoint_bundles_dspark_draft(server_args.get_model_config().hf_config)
 
 
+def _route_kimi_k3_fp8_dspark_verify_to_decode(server_args: ServerArgs) -> None:
+    """Avoid materializing the full FP8 KV cache as BF16 for every verify step."""
+    from sglang.srt.arg_groups.overrides import (
+        attention_backends_of,
+        resolved_view,
+    )
+
+    view = resolved_view(server_args)
+    prefill_backend, decode_backend = attention_backends_of(view)
+    architectures = getattr(
+        server_args.get_model_config().hf_config, "architectures", ()
+    )
+    if (
+        "KimiK3ForConditionalGeneration" in architectures
+        and view.kv_cache_dtype == "fp8_e4m3"
+        and view.speculative_attention_mode == "prefill"
+        and prefill_backend == "fa3"
+        and decode_backend == "flashmla"
+    ):
+        server_args.speculative_attention_mode = "decode"
+        logger.warning(
+            "Kimi-K3 DSPARK with an FP8 KV cache routes target verification "
+            "to FlashMLA decode attention. FA3 prefill attention otherwise "
+            "converts the full KV cache to BF16 on every verify step."
+        )
+
+
 def _handle_dspark(server_args: ServerArgs) -> None:
     if not server_args.device.startswith("cuda"):
         raise ValueError("DSpark speculative decoding only supports CUDA device.")
@@ -430,6 +457,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "scheduler, which is off under SGLANG_RAGGED_VERIFY_MODE=static; it "
             "will be a no-op."
         )
+
+    _route_kimi_k3_fp8_dspark_verify_to_decode(server_args)
 
 
 def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
