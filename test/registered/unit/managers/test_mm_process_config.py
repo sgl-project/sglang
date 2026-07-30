@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -201,7 +202,7 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
         # transport policy must still resolve from the instance's ServerArgs.
         from sglang.srt.multimodal.processors import base_processor
 
-        with patch.object(
+        with envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(True), patch.object(
             base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
         ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
             processor = base_processor.BaseMultimodalProcessor(
@@ -213,12 +214,30 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
 
         self.assertEqual(processor.mm_feature_transport, "cuda_ipc")
         self.assertTrue(processor.use_cuda_ipc)
+        self.assertTrue(processor.use_ipc_pool_handle_cache)
+        memory_pool.assert_called_once()
+
+    def test_cuda_ipc_pool_handle_cache_can_be_disabled(self):
+        from sglang.srt.multimodal.processors import base_processor
+
+        with envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(False), patch.object(
+            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
+            processor = base_processor.BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=self._server_args("cuda_ipc"),
+                _processor=self._processor(),
+                transport_mode=None,
+            )
+
+        self.assertTrue(processor.use_cuda_ipc)
+        self.assertFalse(processor.use_ipc_pool_handle_cache)
         memory_pool.assert_called_once()
 
     def test_cpu_transport_does_not_allocate_ipc_pool(self):
         from sglang.srt.multimodal.processors import base_processor
 
-        with patch.object(
+        with envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(True), patch.object(
             base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
         ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
             processor = base_processor.BaseMultimodalProcessor(
@@ -230,6 +249,7 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
 
         self.assertEqual(processor.mm_feature_transport, "cpu")
         self.assertFalse(processor.use_cuda_ipc)
+        self.assertFalse(processor.use_ipc_pool_handle_cache)
         memory_pool.assert_not_called()
 
 
@@ -435,6 +455,37 @@ class TestProcessMmDataKwargs(unittest.TestCase):
             call_kwargs.kwargs.get("videos_kwargs"), {"fps": 3, "max_frames": 60}
         )
 
+    def test_preprocessed_video_config_is_filtered_before_single_call(self):
+        config = {
+            "video": {
+                "fps": 3,
+                "max_frames": 60,
+                "do_normalize": False,
+            }
+        }
+        proc, mock_proc, _ = self._make_base_processor(config)
+
+        proc.process_mm_data(
+            "test",
+            videos=["vid1"],
+            processor_video_config={"do_normalize": False},
+        )
+
+        self.assertEqual(mock_proc.__call__.call_count, 1)
+        self.assertEqual(
+            mock_proc.__call__.call_args.kwargs.get("videos_kwargs"),
+            {"do_normalize": False},
+        )
+
+    def test_processor_error_is_not_retried(self):
+        proc, mock_proc, _ = self._make_base_processor({"video": {"max_frames": 60}})
+        mock_proc.__call__.side_effect = ValueError("processor failure")
+
+        with self.assertRaisesRegex(ValueError, "processor failure"):
+            proc.process_mm_data("test", videos=["vid1"])
+
+        self.assertEqual(mock_proc.__call__.call_count, 1)
+
     def test_no_collision_with_overlapping_keys(self):
         """Core test: image and video both have max_pixels but stay separate."""
         config = {
@@ -563,6 +614,35 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         audio_kw = call_kwargs.kwargs.get("audio_kwargs", {})
         # User config can override truncation if they explicitly set it
         self.assertTrue(audio_kw.get("truncation"))
+
+
+class TestQwenVideoConfigRouting(unittest.TestCase):
+    def test_preprocessed_video_drops_sglang_owned_config(self):
+        from sglang.srt.multimodal.processors.qwen_vl import (
+            _get_processor_video_config,
+        )
+
+        video_config = {
+            "fps": 3,
+            "nframes": 12,
+            "max_frames": 60,
+            "max_pixels": 500000,
+            "do_normalize": False,
+        }
+
+        processor_config = _get_processor_video_config(video_config, [{"fps": 30.0}])
+
+        self.assertEqual(processor_config, {"do_normalize": False})
+
+    def test_unprocessed_video_uses_original_config(self):
+        from sglang.srt.multimodal.processors.qwen_vl import (
+            _get_processor_video_config,
+        )
+
+        video_config = {"fps": 3, "max_frames": 60}
+
+        self.assertIsNone(_get_processor_video_config(video_config, None))
+        self.assertIsNone(_get_processor_video_config(video_config, [None]))
 
 
 class TestDoubleBosGuard(unittest.TestCase):

@@ -30,8 +30,12 @@ def test_fused_qk_complex_rope_matches_native(tokens, dtype):
     expected_q, expected_k = native_complex_rope(q, k, freqs_cis)
     actual_q, actual_k = apply_fused_qk_complex_rope(q, k, freqs_cis)
 
-    assert torch.equal(actual_q, expected_q)
-    assert torch.equal(actual_k, expected_k)
+    # Blackwell may round a small number of FMA tie cases differently from
+    # PyTorch's complex multiply. Keep the bound at two destination ULPs so
+    # indexing or frequency-layout errors still fail loudly.
+    atol = 2 * torch.finfo(dtype).eps
+    torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=atol)
+    torch.testing.assert_close(actual_k, expected_k, rtol=0, atol=atol)
     assert actual_q.is_contiguous()
     assert actual_k.is_contiguous()
 
@@ -52,8 +56,9 @@ def test_fused_qk_complex_rope_cuda_graph_replay():
         actual_q, actual_k = apply_fused_qk_complex_rope(q, k, freqs_cis)
     graph.replay()
 
-    assert torch.equal(actual_q, expected_q)
-    assert torch.equal(actual_k, expected_k)
+    atol = 2 * torch.finfo(torch.bfloat16).eps
+    torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=atol)
+    torch.testing.assert_close(actual_k, expected_k, rtol=0, atol=atol)
 
 
 if __name__ == "__main__":

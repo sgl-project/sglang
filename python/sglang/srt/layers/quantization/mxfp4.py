@@ -72,7 +72,6 @@ has_triton_kernels = is_triton_kernels_available()
 
 if is_flashinfer_available():
     from flashinfer import (
-        mxfp8_quantize,
         nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
     )
@@ -340,15 +339,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.flashinfer_mxfp4_moe_precision = (
             get_server_args().flashinfer_mxfp4_moe_precision
         )
-        # When `flashinfer_mxfp4` is enabled, dispatch to one of two FlashInfer
+        # When `flashinfer_mxfp4` is enabled, dispatch to one of three FlashInfer
         # entry points depending on the GPU:
         #   - SM100 (Blackwell)  -> trtllm_fp4_block_scale_moe (existing)
+        #   - SM120 (Blackwell)  -> cutlass_fused_moe(MXFP8 x MXFP4)
         #   - SM90  (Hopper)     -> cutlass_fused_moe(use_w4_group_scaling=True)
         #                           (FlashInfer PR #3084, post-0.6.10)
         self._fi_kernel: Optional[str] = None
         if self.use_flashinfer:
             if is_sm100_supported():
                 self._fi_kernel = "trtllm_sm100"
+            elif is_sm120_supported():
+                self._fi_kernel = "cutlass_sm120"
             elif is_sm90_supported():
                 if not _FI_HAS_SM90_CUTLASS_MXFP4:
                     raise RuntimeError(
@@ -360,7 +362,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self._fi_kernel = "cutlass_sm90"
             else:
                 raise NotImplementedError(
-                    "moe_runner_backend=flashinfer_mxfp4 requires SM90 or SM100."
+                    "moe_runner_backend=flashinfer_mxfp4 requires SM90, SM100, "
+                    "or SM120."
                 )
 
     def create_weights(
@@ -412,12 +415,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad = round_up(
                     intermediate_size_per_partition, triton_kernels_padding_alignment
                 )
-        elif self._fi_kernel == "cutlass_sm90":
-            # cutlass mixed-input GEMM contraction dim K must be % 128 == 0
-            # (interleave factor for MXFP4 group_size=32 is 4). The kernel
-            # also expects ``fc1_expert_weights`` in halved ``[up; gate]``
-            # layout, which means the padding boundary must fall on the
-            # gate / up split.
+        elif self._fi_kernel in ("cutlass_sm90", "cutlass_sm120"):
+            # CUTLASS mixed-input GEMM dimensions must be % 128 == 0. The
+            # kernels also expect ``fc1_expert_weights`` in halved
+            # ``[up; gate]`` layout, which means the padding boundary must
+            # fall on the gate / up split.
             #
             # The mxfp4 weight loader (FusedMoE.weight_loader fast path) does
             # a NAIVE copy of HF's ``[2*intermediate_size, hidden_packed]``
@@ -425,8 +427,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # buffer here would push the gate/up boundary, so HF's "up"
             # rows would land in the buffer's "gate" half and vice versa.
             # Marlin sidesteps this by not padding; we do the same and
-            # rebuild a properly-padded buffer in
-            # ``_process_weights_for_sm90_cutlass`` after the load completes.
+            # rebuild a properly-padded buffer in the architecture-specific
+            # CUTLASS post-load processor after the load completes.
             self._padded_intermediate = round_up(intermediate_size_per_partition, 128)
             self._padded_hidden = round_up(hidden_size, 128)
             # create_weights below uses the *unpadded* sizes so the loader's
@@ -608,6 +610,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self._fi_kernel == "cutlass_sm90":
             self._process_weights_for_sm90_cutlass(layer)
+            return
+        if self._fi_kernel == "cutlass_sm120":
+            self._process_weights_for_sm120_cutlass(layer)
             return
         if self.use_flashinfer:
             # Per-expert buffers are local (create_weights uses num_local_experts);
@@ -1131,6 +1136,99 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         torch.cuda.empty_cache()
 
+    def _process_weights_for_sm120_cutlass(self, layer):
+        """Prepare GPT-OSS MXFP4 experts for FlashInfer CUTLASS on SM120.
+
+        GPT-OSS stores gate/up rows pair-wise as
+        ``[gate_0, up_0, gate_1, up_1, ...]``. FlashInfer's fused MoE consumes
+        two contiguous halves in ``[up; gate]`` order. Build that layout after
+        checkpoint loading so padding cannot move the split, pad both GEMMs to
+        CUTLASS's 128-element alignment, and swizzle the native E8M0 scales for
+        the SM120 MXFP8-by-MXFP4 kernels. Packed FP4 weight bytes themselves do
+        not need an SM120 permutation.
+        """
+        from flashinfer import block_scale_interleave
+
+        sf_block_size = 32
+        N_un = layer.w13_weight.shape[1] // 2
+        K_un = layer.w13_weight.shape[2] * 2
+        N_pad = self._padded_intermediate
+        K_pad = self._padded_hidden
+        E = layer.num_local_experts
+        device = layer.w13_weight.device
+
+        def _stack_up_gate_w13(unpadded, last_pad, last_un):
+            gate_rows = unpadded[:, 0::2, :]
+            up_rows = unpadded[:, 1::2, :]
+            out = torch.zeros(
+                E, 2 * N_pad, last_pad, dtype=unpadded.dtype, device=device
+            )
+            out[:, :N_un, :last_un] = up_rows
+            out[:, N_pad : N_pad + N_un, :last_un] = gate_rows
+            return out
+
+        w13_padded = _stack_up_gate_w13(layer.w13_weight.data, K_pad // 2, K_un // 2)
+        w13_scale_padded = _stack_up_gate_w13(
+            layer.w13_weight_scale.data,
+            K_pad // sf_block_size,
+            K_un // sf_block_size,
+        )
+
+        bias_dtype = layer.w13_weight_bias.dtype
+        w13_bias_padded = torch.zeros(E, 2 * N_pad, dtype=bias_dtype, device=device)
+        w13_bias_padded[:, :N_un] = layer.w13_weight_bias.data[:, 1::2]
+        w13_bias_padded[:, N_pad : N_pad + N_un] = layer.w13_weight_bias.data[:, 0::2]
+
+        def _pad_w2_3d(unpadded, last_pad, last_un):
+            out = torch.zeros(E, K_pad, last_pad, dtype=unpadded.dtype, device=device)
+            out[:, :K_un, :last_un] = unpadded[:, :K_un, :]
+            return out
+
+        w2_padded = _pad_w2_3d(layer.w2_weight.data, N_pad // 2, N_un // 2)
+        w2_scale_padded = _pad_w2_3d(
+            layer.w2_weight_scale.data,
+            N_pad // sf_block_size,
+            N_un // sf_block_size,
+        )
+        w2_bias_padded = torch.zeros(E, K_pad, dtype=bias_dtype, device=device)
+        w2_bias_padded[:, :K_un] = layer.w2_weight_bias.data
+
+        w13_scale_interleaved = block_scale_interleave(w13_scale_padded)
+        w2_scale_interleaved = block_scale_interleave(w2_scale_padded)
+
+        layer.w13_weight = Parameter(w13_padded, requires_grad=False)
+        layer.w2_weight = Parameter(w2_padded, requires_grad=False)
+        layer.w13_weight_scale = Parameter(
+            w13_scale_interleaved.reshape_as(w13_scale_padded),
+            requires_grad=False,
+        )
+        layer.w2_weight_scale = Parameter(
+            w2_scale_interleaved.reshape_as(w2_scale_padded),
+            requires_grad=False,
+        )
+        layer.w13_weight_bias = Parameter(w13_bias_padded, requires_grad=False)
+        layer.w2_weight_bias = Parameter(w2_bias_padded, requires_grad=False)
+
+        layer.swiglu_alpha = Parameter(
+            torch.full((E,), 1.702, dtype=torch.float32, device=device),
+            requires_grad=False,
+        )
+        layer.swiglu_beta = Parameter(
+            torch.ones(E, dtype=torch.float32, device=device),
+            requires_grad=False,
+        )
+        layer.swiglu_limit = Parameter(
+            torch.full((E,), 7.0, dtype=torch.float32, device=device),
+            requires_grad=False,
+        )
+        # The MXFP4 ABI uses a neutral global weight scale for each GEMM.
+        layer.mxfp4_weight_global_scale = Parameter(
+            torch.ones(E, dtype=torch.float32, device=device),
+            requires_grad=False,
+        )
+        layer._mxfp4_backend = "flashinfer_cutlass_sm120"
+        torch.cuda.empty_cache()
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -1154,9 +1252,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_deep_gemm()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
-        elif (
-            moe_runner_backend.is_flashinfer_mxfp4()
-            and self._fi_kernel == "cutlass_sm90"
+        elif moe_runner_backend.is_flashinfer_mxfp4() and self._fi_kernel in (
+            "cutlass_sm90",
+            "cutlass_sm120",
         ):
             # Register the fused func at runner construction so the FusedOpPool
             # lookup at `MoeRunner.__init__` finds it.
@@ -1216,6 +1314,31 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         return self.runner.run(
             dispatch_output._replace(hidden_states=x_padded), quant_info
         )
+
+    def _apply_sm120_cutlass(self, layer, dispatch_output):
+        """SM120 GPT-OSS MXFP8 x MXFP4 MoE via FlashInfer CUTLASS."""
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+            FlashInferCutlassMxfp4MoeQuantInfo,
+        )
+
+        quant_info = FlashInferCutlassMxfp4MoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_weight_scale=layer.w13_weight_scale,
+            w2_weight_scale=layer.w2_weight_scale,
+            mxfp4_weight_global_scale=layer.mxfp4_weight_global_scale,
+            w13_bias=layer.w13_weight_bias,
+            w2_bias=layer.w2_weight_bias,
+            swiglu_alpha=layer.swiglu_alpha,
+            swiglu_beta=layer.swiglu_beta,
+            swiglu_limit=layer.swiglu_limit,
+            moe_tp_size=layer.moe_tp_size,
+            moe_tp_rank=layer.moe_tp_rank,
+            moe_ep_size=layer.moe_ep_size,
+            moe_ep_rank=layer.moe_ep_rank,
+            padded_hidden=self._padded_hidden,
+        )
+        return self.runner.run(dispatch_output, quant_info)
 
     def apply(
         self,
@@ -1290,11 +1413,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self._fi_kernel == "cutlass_sm90":
             return self._apply_sm90_cutlass(layer, dispatch_output)
+        if self._fi_kernel == "cutlass_sm120":
+            return self._apply_sm120_cutlass(layer, dispatch_output)
         if self.use_flashinfer:
             # When bf16 mode is enabled, we don't need to quantize the input,
             # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
             # which can theoretically improve performance
             origin_hidden_states_dim = x.shape[-1]
+            # Filled by the staged K3 route+pack+quant fusion below; the pack
+            # site further down falls back to PackTopkIds when it is None.
+            prepared_packed_topk = None
             if self.flashinfer_mxfp4_moe_precision == "bf16":
                 assert x.dtype == torch.bfloat16
                 x_quant = x
@@ -1310,18 +1438,34 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
             elif self.flashinfer_mxfp4_moe_precision == "default":
                 if x.shape[-1] == self.hidden_size:
-                    from sglang.kernels.ops.quantization.per_token_group_quant import (
-                        per_token_group_quant,
-                    )
-
                     if x.dim() > 2:
                         x = x.view(-1, x.shape[-1])
-                    x_quant, x_scale = per_token_group_quant(
-                        x, group_size=32, scale_ue8m0=True
-                    )
-                    x_scale = x_scale.view(torch.float8_e4m3fn)
+                    # K3 staged fusion (route_quant_handoff): the routing
+                    # dispatch already quantized these rows and packed the
+                    # topk ids in the fused route launch — consume both and
+                    # skip the two standalone kernels. Identity-verified;
+                    # a miss runs the unfused chain below.
+                    from sglang.srt.layers.moe import route_quant_handoff
+
+                    prepared = route_quant_handoff.take(x)
+                    if prepared is not None:
+                        prepared_packed_topk, x_quant, x_scale = prepared
+                        x_scale = x_scale.view(torch.float8_e4m3fn)
+                    else:
+                        from sglang.kernels.ops.quantization.per_token_group_quant import (
+                            per_token_group_quant,
+                        )
+
+                        x_quant, x_scale = per_token_group_quant(
+                            x, group_size=32, scale_ue8m0=True
+                        )
+                        x_scale = x_scale.view(torch.float8_e4m3fn)
                 else:
-                    x_quant, x_scale = mxfp8_quantize(
+                    from sglang.srt.layers.quantization.fp8_utils import (
+                        flashinfer_mxfp8_quantize,
+                    )
+
+                    x_quant, x_scale = flashinfer_mxfp8_quantize(
                         x, False, alignment=self.hidden_size
                     )
                     x_scale = x_scale.view(torch.float8_e4m3fn).reshape(
@@ -1393,11 +1537,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     # in-op routing kernels entirely. At small T the in-op
                     # single-CTA routing costs ~22 us/layer vs ~6 us for the
                     # external radix router.
-                    from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
+                    if prepared_packed_topk is not None:
+                        packed_topk = prepared_packed_topk
+                    else:
+                        from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
 
-                    packed_topk = PackTopkIds.execute(
-                        topk_output.topk_ids, topk_output.topk_weights
-                    )
+                        packed_topk = PackTopkIds.execute(
+                            topk_output.topk_ids, topk_output.topk_weights
+                        )
                     # Deferred finalize (K3 forward_deferred_finalize): return
                     # the finalize inputs instead of the finalized output.
                     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (

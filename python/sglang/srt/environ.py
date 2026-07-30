@@ -524,6 +524,7 @@ class Envs:
     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
+    MOONCAKE_TENANT_ID = EnvStr("default")
 
     # MoRI KV Transfer
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
@@ -761,11 +762,6 @@ class Envs:
     # kernel computes the TP-local o_proj partial and the cross-rank sum over
     # a P2P comm region, replacing the GEMM + NCCL AR pair at M <= 512.
     SGLANG_K3_GEMM_AR = EnvBool(False)
-    # Directory holding the prebuilt gemm_ar cubins (the kernels are not in
-    # this tree; only the host shim is). Files are looked up as
-    # gemm_ar_k{K}_r{R}_pdl{0,1}_sm{arch}.cubin — see
-    # kernels/ops/kimi_k3/gemm_ar.py and scripts/playground/gemm_ar_cubin.py.
-    SGLANG_K3_GEMM_AR_CUBIN = EnvStr(None)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
@@ -885,7 +881,9 @@ class Envs:
 
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
-    SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(False)
+    # Reuse the mapping for the already-allocated bounded CUDA IPC pool. This
+    # has no effect unless CUDA IPC feature transport is explicitly selected.
+    SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(True)
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(1 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
@@ -900,9 +898,10 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
-
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
+    # Registered TreeCore backend serving the unified radix cache.
+    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
 
     # CUDA Graph
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)

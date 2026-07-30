@@ -8,6 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
+PreparedInplaceComplexRoPE = Tuple[torch.Tensor, torch.Tensor]
+
 
 @triton.jit(do_not_specialize=["n_pairs"])
 def _fused_qk_complex_rope_kernel(
@@ -49,10 +51,26 @@ def _fused_qk_complex_rope_kernel(
     k_imag = tl.load(k_ptr + k_base + k_stride_dim, mask=mask).to(tl.float32)
 
     out_base = row * head_dim + pair * 2
-    tl.store(q_out_ptr + out_base, q_real * cos - q_imag * sin, mask=mask)
-    tl.store(q_out_ptr + out_base + 1, q_real * sin + q_imag * cos, mask=mask)
-    tl.store(k_out_ptr + out_base, k_real * cos - k_imag * sin, mask=mask)
-    tl.store(k_out_ptr + out_base + 1, k_real * sin + k_imag * cos, mask=mask)
+    tl.store(
+        q_out_ptr + out_base,
+        tl.fma(-q_imag, sin, q_real * cos),
+        mask=mask,
+    )
+    tl.store(
+        q_out_ptr + out_base + 1,
+        tl.fma(q_real, sin, q_imag * cos),
+        mask=mask,
+    )
+    tl.store(
+        k_out_ptr + out_base,
+        tl.fma(-k_imag, sin, k_real * cos),
+        mask=mask,
+    )
+    tl.store(
+        k_out_ptr + out_base + 1,
+        tl.fma(k_real, sin, k_imag * cos),
+        mask=mask,
+    )
 
 
 def can_use_fused_qk_complex_rope(
@@ -136,6 +154,47 @@ def apply_fused_qk_complex_rope(
         num_warps=4,
     )
     return q_out.view(original_shape), k_out.view(original_shape)
+
+
+def prepare_fused_qk_complex_rope_inplace(
+    freqs_cis: torch.Tensor,
+) -> PreparedInplaceComplexRoPE:
+    """Prepare the cache and positions used by the contiguous in-place kernel."""
+
+    if freqs_cis.dtype != torch.complex64:
+        raise ValueError(
+            "In-place vision RoPE requires complex64 frequencies, got "
+            f"{freqs_cis.dtype}/{freqs_cis.device}"
+        )
+    return (
+        torch.cat((freqs_cis.real, freqs_cis.imag), dim=-1),
+        torch.arange(
+            freqs_cis.size(0),
+            dtype=torch.long,
+            device=freqs_cis.device,
+        ),
+    )
+
+
+def apply_fused_qk_complex_rope_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    prepared_rope: PreparedInplaceComplexRoPE,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Rotate contiguous Q/K tensors in place with the shared JIT kernel."""
+
+    from sglang.jit_kernel.rope import apply_rope_inplace
+
+    cos_sin_cache, positions = prepared_rope
+    apply_rope_inplace(
+        q,
+        k,
+        cos_sin_cache,
+        positions,
+        is_neox=False,
+        rope_dim=cos_sin_cache.size(-1),
+    )
+    return q, k
 
 
 def precompile_fused_qk_complex_rope(

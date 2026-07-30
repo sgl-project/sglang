@@ -11,20 +11,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""The baseclass of a backend for grammar-guided constrained decoding."""
+"""The base class of a backend for grammar-guided constrained decoding."""
 
 import logging
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.runtime_context import get_resources
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+GRAMMAR_BACKEND_REGISTRY = {}
 
 
 @dataclass
@@ -37,6 +40,13 @@ class GrammarStats:
     tree_traversal_time: List[float] = field(default_factory=list)
     dispatch_type: Optional[str] = None
     num_timeout: int = 0
+
+
+class GrammarRow(NamedTuple):
+    """Grammar and destination row for a batched vocab-mask fill."""
+
+    row: int
+    grammar: "BaseGrammarObject"
 
 
 class BaseGrammarObject:
@@ -67,6 +77,19 @@ class BaseGrammarObject:
         raise NotImplementedError()
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        raise NotImplementedError()
+
+    @staticmethod
+    def fill_vocab_mask_batched(
+        entries: List[GrammarRow], vocab_mask: torch.Tensor
+    ) -> None:
+        """Fill listed rows, leaving unlisted rows untouched."""
+        for entry in entries:
+            entry.grammar.fill_vocab_mask(vocab_mask, entry.row)
+
+    @staticmethod
+    def reset_vocab_mask(vocab_mask: torch.Tensor) -> None:
+        """Restore a reusable mask to the backend's unconstrained state."""
         raise NotImplementedError()
 
     @staticmethod
@@ -117,6 +140,19 @@ class BaseGrammarObject:
         raise NotImplementedError()
 
 
+class GrammarMask(NamedTuple):
+    """A filled vocab_mask plus the backend that applies it.
+
+    The grammar is any one of the batch's -- a handle, not per-request state.
+    """
+
+    grammar: BaseGrammarObject
+    vocab_mask: torch.Tensor
+
+    def apply(self, logits: torch.Tensor) -> None:
+        self.grammar.apply_vocab_mask(logits=logits, vocab_mask=self.vocab_mask)
+
+
 class InvalidGrammarObject(BaseGrammarObject):
     """Represents a grammar that failed to compile, carrying the original error message."""
 
@@ -134,6 +170,16 @@ class BaseGrammarBackend:
     def __init__(self):
         self.executor = ThreadPoolExecutor()
         self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
+
+    def initialize_vocab_mask_buffer(
+        self,
+        name: str,
+        vocab_size: int,
+        max_rows: int,
+        device,
+    ) -> Optional[torch.Tensor]:
+        """Initialize a reusable mask buffer when supported by the backend."""
+        return None
 
     def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
         logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
@@ -213,7 +259,49 @@ class BaseGrammarBackend:
         self.cache.clear()
 
 
-GRAMMAR_BACKEND_REGISTRY = {}
+def register_vocab_mask_buffer(
+    name: str, vocab_mask: torch.Tensor, max_rows: int
+) -> torch.Tensor:
+    """Register a fixed-capacity mask buffer, preserving an equivalent one."""
+    if max_rows <= 0:
+        raise ValueError(f"Grammar mask max_rows must be positive, got {max_rows}")
+    if vocab_mask.ndim == 0 or vocab_mask.shape[0] != max_rows:
+        raise ValueError(
+            f"Grammar mask buffer {name!r} must have {max_rows} rows, "
+            f"got shape {tuple(vocab_mask.shape)}"
+        )
+
+    buffers = get_resources().buffers
+    existing = buffers.get(name)
+    if existing is not None:
+        if (
+            existing.shape != vocab_mask.shape
+            or existing.dtype != vocab_mask.dtype
+            or existing.device != vocab_mask.device
+        ):
+            raise RuntimeError(
+                f"Grammar mask buffer {name!r} was already initialized as "
+                f"{tuple(existing.shape)}, {existing.dtype}, {existing.device}; "
+                f"new buffer is {tuple(vocab_mask.shape)}, {vocab_mask.dtype}, "
+                f"{vocab_mask.device}"
+            )
+        return existing
+
+    buffers[name] = vocab_mask
+    return vocab_mask
+
+
+def get_vocab_mask_buffer(name: str, rows: int) -> Optional[torch.Tensor]:
+    """Return the active rows of a registered mask buffer, if available."""
+    vocab_mask = get_resources().buffers.get(name)
+    if vocab_mask is None:
+        return None
+    if rows > vocab_mask.shape[0]:
+        raise ValueError(
+            f"Grammar batch needs {rows} mask rows, exceeding initialized "
+            f"capacity {vocab_mask.shape[0]} for {name!r}"
+        )
+    return vocab_mask[:rows]
 
 
 def register_grammar_backend(name, init_func):

@@ -1626,6 +1626,25 @@ def biased_grouped_topk_gpu(
                 if gating_output.dtype == torch.bfloat16
                 else gating_output.to(dtype=torch.float32)
             )
+            # K3 staged fusion: when the model layer staged the routed
+            # activations (route_quant_handoff), the radix route, the trtllm id
+            # pack and the mxfp8 quant run as one launch. Bit-identical
+            # (weights, ids); a miss falls through to the unfused router.
+            from sglang.srt.layers.moe import route_quant_handoff
+
+            fused = route_quant_handoff.try_route_quant_fused(
+                _gating,
+                correction_bias.to(dtype=torch.float32),
+                topk,
+                num_fused_shared_experts=num_fused_shared_experts,
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=bool(
+                    apply_routed_scaling_factor_on_output
+                ),
+            )
+            if fused is not None:
+                return fused
             return jit_gate(
                 _gating,
                 correction_bias.to(dtype=torch.float32),

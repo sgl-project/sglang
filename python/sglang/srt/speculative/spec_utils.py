@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
@@ -32,6 +32,7 @@ from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     patch_tensor_parallel_group,
@@ -72,8 +73,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.speculative.eagle_info import EagleVerifyInput
-    from sglang.srt.speculative.spec_info import SpecInput
 
 
 if _is_cuda:
@@ -502,12 +501,11 @@ def traverse_tree(
 
 def generate_token_bitmask(
     reqs: List[Req],
-    verify_input: EagleVerifyInput,
     retrieve_next_token_cpu: torch.Tensor,
     retrieve_next_sibling_cpu: torch.Tensor,
     draft_tokens_cpu: torch.Tensor,
     vocab_size: int,
-):
+) -> Tuple[Optional[torch.Tensor], Optional[BaseGrammarObject]]:
     """
     Generate the logit mask for structured output.
     Draft model's token can be either valid or invalid with respect to the grammar.
@@ -548,8 +546,7 @@ def generate_token_bitmask(
                     f"grammar: {req.grammar}"
                 )
 
-    verify_input.grammar = grammar
-    return allocate_token_bitmask
+    return allocate_token_bitmask, grammar
 
 
 class GrammarTree:
@@ -613,32 +610,33 @@ class GrammarTree:
 def build_grammar_vocab_mask(
     *,
     reqs: List[Req],
-    verify_input: SpecInput,
     tree: GrammarTree,
     sampling_info: SamplingBatchInfo,
     device,
-) -> Optional[torch.Tensor]:
+    barrier: Optional[Callable[[], None]],
+) -> Optional[GrammarMask]:
     """Build the constrained-decoding bitmask over a verify tree and stage it on device.
 
-    Call it after the target verify launch: resolving the tree and traversing it are
-    both host work, so both overlap that forward.
+    Call it after the target verify launch -- every step here is host work, so it all
+    overlaps that forward. ``barrier`` advances the previous batch's FSM over its
+    committed tokens, which the traversal then reads, so it has to run first.
     """
-    vocab_mask = generate_token_bitmask(
+    if barrier is not None:
+        barrier()
+    vocab_mask, grammar = generate_token_bitmask(
         reqs,
-        verify_input,
         *tree.resolve(),
         sampling_info.vocab_size,
     )
     if vocab_mask is None:
         return None
 
-    assert verify_input.grammar is not None
     # non_blocking is safe: the bitmask is pinned (see xgrammar_backend), and stream
     # order keeps the copy ahead of the sampler's apply_vocab_mask.
     vocab_mask = vocab_mask.to(device, non_blocking=True)
     # Otherwise the extend stage's leftover mask is applied instead.
-    sampling_info.vocab_mask = None
-    return vocab_mask
+    sampling_info.grammar_mask = None
+    return GrammarMask(grammar, vocab_mask)
 
 
 def load_token_map(token_map_path: str) -> List[int]:

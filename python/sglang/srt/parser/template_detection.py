@@ -26,6 +26,7 @@ from typing import Callable, Optional, Tuple
 
 import jinja2
 import jinja2.ext
+import jinja2.nodes
 import jinja2.sandbox
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,72 @@ class ReasoningToggleConfig:
         return self.special_case == "always"
 
 
+class _GenerationTagExtension(jinja2.ext.Extension):
+    """Parse-only support for the ``{% generation %}`` blocks emitted by
+    transformers chat templates (assistant token masking). Needed so the
+    toggle-default parser below can build an AST for templates that use it."""
+
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return jinja2.nodes.Scope(body).set_lineno(lineno)
+
+
+def _has_toggle_default_assignment(
+    ctx: TemplateDetectionContext, param: str, default: bool
+) -> bool:
+    """True if the template applies Jinja's ``default`` filter (or its ``d``
+    alias) to ``param`` with working-toggle semantics and the given default,
+    e.g. ``{%- set enable_thinking = enable_thinking | default(false) -%}``
+    (Laguna-XS-2.1) or ``default(true)`` (Laguna-S-2.1).
+
+    Matches on the parsed ``Filter`` node, so comments, ``{% raw %}`` blocks,
+    and string literals cannot shadow a live assignment. Boolean-mode handling:
+    ``default(x, false)`` is equivalent to ``default(x)``; ``default(false,
+    true)`` still maps False -> False and True -> True, so it is a working
+    default-off toggle; only ``default(true, true)`` collapses the toggle
+    (an explicit False is replaced by True) and is not matched.
+    """
+    try:
+        env = jinja2.Environment(
+            extensions=[jinja2.ext.loopcontrols, _GenerationTagExtension]
+        )
+        tree = env.parse(ctx.template)
+    except jinja2.TemplateError:
+        return False
+    except Exception:
+        # e.g. RecursionError on a pathologically nested template; detection
+        # must never take down server startup (mirrors
+        # detect_inline_system_support).
+        return False
+    for node in tree.find_all(jinja2.nodes.Filter):
+        if node.name not in ("default", "d") or node.dyn_args or node.dyn_kwargs:
+            continue
+        if not isinstance(node.node, jinja2.nodes.Name) or node.node.name != param:
+            continue
+        args = list(node.args)
+        kwargs = {kw.key: kw.value for kw in node.kwargs}
+        if not args or not isinstance(args[0], jinja2.nodes.Const):
+            continue
+        default_value = args[0].value
+        if not isinstance(default_value, bool):
+            continue
+        boolean_arg = args[1] if len(args) > 1 else kwargs.get("boolean")
+        if boolean_arg is not None and not isinstance(boolean_arg, jinja2.nodes.Const):
+            continue
+        boolean_mode = bool(boolean_arg.value) if boolean_arg is not None else False
+        if boolean_mode and default_value:
+            # default(true, true): any falsy value is replaced by True, so an
+            # explicit enable_thinking=false still renders thinking on -- the
+            # assignment is not a working toggle.
+            continue
+        if default_value is default:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Reasoning mode rules (detect toggle config from template)
 # ---------------------------------------------------------------------------
@@ -103,7 +170,8 @@ REASONING_MODE_RULES = (
             r"{%\s*if\s+not\s+enable_thinking\s+is\s+defined\s*%}.*?"
             r"{%\s*set\s+enable_thinking\s*=\s*(?:false|False)\s*%}",
             re.DOTALL,
-        ),
+        )
+        or _has_toggle_default_assignment(ctx, "enable_thinking", False),
     ),
     DetectionRule(
         name="nemotron_3_super_low_effort",
@@ -134,7 +202,8 @@ REASONING_MODE_RULES = (
         or ctx.has_pattern(
             r"enable_thinking\s+is\s+not\s+defined\s+or\s+enable_thinking"
         )
-        or ctx.has_pattern(r"namespace\([^)]*enable_thinking\s*=\s*true"),
+        or ctx.has_pattern(r"namespace\([^)]*enable_thinking\s*=\s*true")
+        or _has_toggle_default_assignment(ctx, "enable_thinking", True),
     ),
     DetectionRule(
         name="explicit_thinking_default_false",
@@ -143,7 +212,8 @@ REASONING_MODE_RULES = (
             r"{%\s*if\s+not\s+thinking\s+is\s+defined\s*%}.*?"
             r"{%\s*set\s+thinking\s*=\s*(?:false|False)\s*%}",
             re.DOTALL,
-        ),
+        )
+        or _has_toggle_default_assignment(ctx, "thinking", False),
     ),
     DetectionRule(
         name="thinking_default_true",
@@ -160,7 +230,8 @@ REASONING_MODE_RULES = (
             r"thinking\s+is\s+defined\s+and\s+(?:thinking\s+is\s+false|not\s+thinking)"
         )
         or ctx.has_pattern(r"thinking\s+is\s+not\s+defined\s+or\s+thinking")
-        or ctx.has_pattern(r"namespace\([^)]*thinking\s*=\s*true"),
+        or ctx.has_pattern(r"namespace\([^)]*thinking\s*=\s*true")
+        or _has_toggle_default_assignment(ctx, "thinking", True),
     ),
 )
 
@@ -269,10 +340,16 @@ def _is_hunyuan(ctx):
 
 def _is_poolside_v1(ctx):
     has_poolside_tool_format = (
-        ctx.has_text("unescaped XML-like object")
-        and ctx.has_text("<tool_call>function-name")
-        and ctx.has_text("<arg_key>")
+        ctx.has_text("<arg_key>")
         and ctx.has_text("<arg_value>")
+        and (
+            # Laguna-XS.2 spells out the tool-call format in prose;
+            # Laguna-S-2.1 does not, so also key on the tool preamble both
+            # template families share. The Poolside identity must not depend
+            # on the enable_thinking default, which differs between families.
+            ctx.has_text("unescaped XML-like object")
+            or ctx.has_text("All available function signatures are listed below")
+        )
     )
     return has_poolside_tool_format or (
         ctx.reasoning_config
@@ -600,8 +677,11 @@ def _resolve_architecture_auto_parsers(server_args) -> None:
     )
     architectures = getattr(config, "architectures", None) or []
     arch = architectures[0] if architectures else ""
+    model_type = getattr(config, "model_type", "")
 
-    if "DeepseekV4" in arch:
+    if "KimiK3" in arch or model_type == "kimi_k3":
+        reasoning_parser, tool_call_parser = "kimi_k3", "kimi_k3"
+    elif "DeepseekV4" in arch:
         reasoning_parser, tool_call_parser = "deepseek-v4", "deepseekv4"
     elif "DeepseekV3" in arch:
         reasoning_parser, tool_call_parser = "deepseek-v3", "deepseekv32"

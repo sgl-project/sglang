@@ -50,10 +50,14 @@ struct RouteRadixParams {
   const fp32_t* __restrict__ bias;
   fp32_t* __restrict__ out_w;
   int32_t* __restrict__ out_i;
+  // Optional trtllm-gen routed-MoE packing: (id << 16) | bf16(weight) bits,
+  // bit-identical to the standalone triton pack. nullptr skips the store.
+  int32_t* __restrict__ out_packed;
   int M;
   long long scores_stride;
   long long out_w_stride;
   long long out_i_stride;
+  long long out_packed_stride;
   float routed_scaling_factor;
   int renormalize;
   int apply_scale;
@@ -105,15 +109,16 @@ SGL_DEVICE uint32_t block_exclusive_sum(uint32_t cnt, uint32_t lane_id, uint32_t
   return base + inc - cnt;
 }
 
+// Whole-CTA routing body, callable from other kernels (the fused
+// route+quant launch runs it on its first M CTAs). Routes row `blockIdx.x`;
+// every thread of the 224-wide CTA must enter (block barriers inside).
 template <bool kUsePDL, typename TScore>
-__global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
-    void route_radix_kernel(const __grid_constant__ RouteRadixParams params) {
+SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename LargeRouterRadixTrait::Smem& smem) {
   using namespace device;
   using T = LargeRouterRadixTrait;
   constexpr uint32_t kVecSize = T::kVecSize;
   constexpr uint32_t kRadixLanes = T::kRadixSize / 2;  // 128: 2 bins per thread
   enum { BAR_RESERVED = 0, BAR_SUM = 1 };
-  __shared__ typename T::Smem smem;
 
   const auto bx = blockIdx.x;
   const auto tx = threadIdx.x;
@@ -304,7 +309,20 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
     if (params.apply_scale) w = w * params.routed_scaling_factor;
     params.out_w[bx * params.out_w_stride + rank] = w;
     params.out_i[bx * params.out_i_stride + rank] = id;
+    if (params.out_packed != nullptr) {
+      // (id << 16) | bf16(w) bits — RN float->bf16 matches the triton pack.
+      const auto bits = static_cast<uint32_t>(__bfloat16_as_ushort(__float2bfloat16_rn(w)));
+      params.out_packed[bx * params.out_packed_stride + rank] =
+          static_cast<int32_t>((static_cast<uint32_t>(id) << 16) | bits);
+    }
   }
+}
+
+template <bool kUsePDL, typename TScore>
+__global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
+    void route_radix_kernel(const __grid_constant__ RouteRadixParams params) {
+  __shared__ typename LargeRouterRadixTrait::Smem smem;
+  route_radix_block<kUsePDL, TScore>(params, smem);
 }
 
 }  // namespace sglang
@@ -354,10 +372,12 @@ struct RouteRadixKernel {
         static_cast<const fp32_t*>(bias.data_ptr()),
         static_cast<fp32_t*>(out_w.data_ptr()),
         static_cast<int32_t*>(out_i.data_ptr()),
+        /*out_packed=*/nullptr,
         static_cast<int>(M),
         static_cast<long long>(scores.stride(0)),
         static_cast<long long>(out_w.stride(0)),
         static_cast<long long>(out_i.stride(0)),
+        /*out_packed_stride=*/0,
         static_cast<float>(routed_scaling_factor),
         renormalize ? 1 : 0,
         apply_scale ? 1 : 0,

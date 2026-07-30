@@ -15,7 +15,7 @@ from sglang.srt.parser.template_detection import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(2.0, "base-a-test-cpu")
+register_cpu_ci(est_time=2.0, suite="base-a-test-cpu")
 
 
 class _DummyTokenizer:
@@ -89,6 +89,126 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
             ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=True),
         )
         self.assertEqual(parser, "interns1")
+
+    def test_poolside_v1_detects_variant_template_defaults(self):
+        tool_format = """
+        return an unescaped XML-like object with function name and arguments
+        within '<tool_call>' and '</tool_call>' tags
+        <tool_call>function-name
+        <arg_key>argument-key</arg_key>
+        <arg_value>value-of-argument-key</arg_value>
+        </tool_call>
+        """
+        for default, expected in (("false", False), ("true", True)):
+            with self.subTest(default=default):
+                template = (
+                    "{%- set enable_thinking = enable_thinking | default("
+                    f"{default}) -%}}\n{tool_format}"
+                )
+                _, config, parser = self._detect(template, ["<tool_call>"])
+
+                self.assertEqual(
+                    config,
+                    ReasoningToggleConfig(
+                        toggle_param="enable_thinking", default_enabled=expected
+                    ),
+                )
+                self.assertEqual(parser, "poolside_v1")
+
+    def test_poolside_v1_laguna_s21_shaped_template(self):
+        # Laguna-S-2.1's real template defaults enable_thinking on and lacks
+        # the XS-style prose describing the tool-call format; only the tool
+        # preamble and the <arg_key>/<arg_value> markup identify the family.
+        template = (
+            "{%- set enable_thinking = enable_thinking | default(true) -%}\n"
+            "You may call functions to assist with the user query.\n"
+            "All available function signatures are listed below:\n"
+            "{{- '<tool_call>' + function_data.name -}}\n"
+            '{{- "<arg_key>" ~ k ~ "</arg_key>" -}}'
+            '{{- "<arg_value>" ~ v ~ "</arg_value>" -}}\n'
+            "{{- '</tool_call>' -}}"
+        )
+        _, config, parser = self._detect(template, ["<tool_call>"])
+        self.assertEqual(
+            config,
+            ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=True),
+        )
+        self.assertEqual(parser, "poolside_v1")
+
+    def test_enable_thinking_default_filter_variants(self):
+        cases = [
+            # Jinja's documented alias for the default filter.
+            ("{%- set enable_thinking = enable_thinking | d(true) -%}", True),
+            # No whitespace around the pipe.
+            ("{% set enable_thinking = enable_thinking|default(false) %}", False),
+            # An explicit boolean=false second argument is equivalent to the
+            # one-argument form.
+            (
+                "{%- set enable_thinking = enable_thinking"
+                " | default(true, false) -%}",
+                True,
+            ),
+            # Boolean mode with a false default still maps False -> False and
+            # True -> True, so it is a working default-off toggle.
+            (
+                "{%- set enable_thinking = enable_thinking"
+                " | default(false, true) -%}",
+                False,
+            ),
+            (
+                "{%- set enable_thinking = enable_thinking"
+                " | default(false, boolean=true) -%}",
+                False,
+            ),
+            # The filter also counts outside a set-assignment (gemma-4 style).
+            ("{%- if enable_thinking | default(false) -%}x{%- endif -%}", False),
+            # A commented-out assignment must not shadow the live one.
+            (
+                "{# {%- set enable_thinking = enable_thinking | default(false) -%} #}\n"
+                "{%- set enable_thinking = enable_thinking | default(true) -%}",
+                True,
+            ),
+            # Neither must a raw block or a string literal.
+            (
+                "{% raw %}{% set enable_thinking = enable_thinking"
+                " | default(false) %}{% endraw %}\n"
+                "{%- set enable_thinking = enable_thinking | default(true) -%}",
+                True,
+            ),
+        ]
+        for template, expected in cases:
+            with self.subTest(template=template):
+                _, config, _ = self._detect(template, [])
+                self.assertEqual(
+                    config,
+                    ReasoningToggleConfig(
+                        toggle_param="enable_thinking", default_enabled=expected
+                    ),
+                )
+
+    def test_pathological_template_does_not_raise(self):
+        # A template jinja cannot parse (RecursionError from deep nesting) must
+        # degrade to no detection, not crash template loading.
+        template = (
+            "{% if a %}" * 5000 + "x" + "{% endif %}" * 5000 + "\n"
+            "{%- set enable_thinking = enable_thinking | default(true) -%}"
+        )
+        _, config = detect_reasoning_pattern(template)
+        self.assertIsNone(config)
+
+    def test_enable_thinking_collapsing_default_not_a_toggle(self):
+        # default(true, true) / default(true, boolean=true) replace any falsy
+        # value with True, so an explicit enable_thinking=false still renders
+        # thinking on; the assignment is not a working toggle and must stay
+        # undetected.
+        for template in (
+            "{%- set enable_thinking = enable_thinking | default(true, true) -%}",
+            "{%- set enable_thinking = enable_thinking"
+            " | default(true, boolean=true) -%}",
+        ):
+            with self.subTest(template=template):
+                _, config, _ = self._detect(template, [])
+                self.assertIsNone(config)
 
     def test_nemotron_detects_uppercase_true_assignment(self):
         template = """
@@ -225,7 +345,7 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
             "</tool_call>",
             ["<tool_call>"],
             "poolside_v1",
-            None,
+            "enable_thinking",
         ),
         (
             "lfm2_not_deepseek_r1_from_history_cleanup",
@@ -378,6 +498,20 @@ class TestToolCallParserDetection(unittest.TestCase):
         rp = detect_reasoning_parser(template, tok, config, force)
         tcp = detect_tool_call_parser(template, tok, config, force)
         return rp, tcp
+
+    def test_poolside_s21_shape_resolves_poolside_tool_call_parser(self):
+        # Regression: with default(true) the S-2.1 shape must not fall through
+        # to the qwen tool-call parser, which cannot read Poolside's XML-KV
+        # tool format.
+        template = (
+            "{%- set enable_thinking = enable_thinking | default(true) -%}\n"
+            "All available function signatures are listed below:\n"
+            "<tool_call>{{ name }}<arg_key>{{ k }}</arg_key>"
+            "<arg_value>{{ v }}</arg_value></tool_call>"
+        )
+        force, config = detect_reasoning_pattern(template)
+        result = detect_tool_call_parser(template, _DummyTokenizer([]), config, force)
+        self.assertEqual(result, "poolside_v1")
 
     def test_qwen3_detects_qwen_tool_call_parser(self):
         rp, tcp = self._detect_all("Qwen/Qwen3-0.6B")
@@ -737,6 +871,34 @@ class TestResolveAutoParsers(unittest.TestCase):
 
         self.assertEqual(args.reasoning_parser, "deepseek-v4")
         self.assertEqual(args.tool_call_parser, "deepseekv4")
+
+    def test_kimi_k3_arch_without_chat_template_uses_custom_encoder(self):
+        args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
+        tokenizer = _DummyTokenizer([])
+        config = SimpleNamespace(
+            architectures=["KimiK3ForConditionalGeneration"], model_type="kimi_k3"
+        )
+
+        with _patch_hf_transformers_utils(
+            Mock(return_value=tokenizer), Mock(return_value=config)
+        ):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(args.reasoning_parser, "kimi_k3")
+        self.assertEqual(args.tool_call_parser, "kimi_k3")
+
+    def test_kimi_k3_model_type_without_architecture_uses_custom_encoder(self):
+        args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
+        tokenizer = _DummyTokenizer([])
+        config = SimpleNamespace(architectures=None, model_type="kimi_k3")
+
+        with _patch_hf_transformers_utils(
+            Mock(return_value=tokenizer), Mock(return_value=config)
+        ):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(args.reasoning_parser, "kimi_k3")
+        self.assertEqual(args.tool_call_parser, "kimi_k3")
 
     def test_deepseek_arch_fallback_runs_when_tokenizer_load_fails(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
