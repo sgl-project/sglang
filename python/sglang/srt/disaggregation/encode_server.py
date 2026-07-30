@@ -123,6 +123,7 @@ ENCODER_REQ_TIMEOUT = envs.SGLANG_ENCODER_REQ_TIMEOUT.get()
 # off ``image_processing_queue``, loads/decodes their images off the GPU path,
 # and pushes the loaded payload onto ``image_processed_queue`` so a separate
 # event-loop thread can run the GPU encode while the next batch is still loading.
+IMAGE_LOADER_ENABLED = envs.SGLANG_ENCODER_ENABLE_IMAGE_LOADER.get()
 IMAGE_LOADER_NUM_WORKERS = envs.SGLANG_ENCODER_IMAGE_LOADER_WORKERS.get()
 image_processing_queue: "Queue" = Queue(maxsize=65535)
 image_processed_queue: "Queue" = Queue(maxsize=65535)
@@ -2556,25 +2557,29 @@ class EncoderScheduler:
 
     def start(self) -> None:
         if self._worker_task is None:
-            # Spawn the loader process pool that decodes images off the GPU path.
-            self.image_loader = _MultiImageProcessingLoader(
-                IMAGE_LOADER_NUM_WORKERS,
-                _image_loader_worker,
-                image_processing_queue,
-                image_processed_queue,
-            )
+            if IMAGE_LOADER_ENABLED:
+                # Spawn the loader process pool that decodes images off the GPU
+                # path.
+                self.image_loader = _MultiImageProcessingLoader(
+                    IMAGE_LOADER_NUM_WORKERS,
+                    _image_loader_worker,
+                    image_processing_queue,
+                    image_processed_queue,
+                )
+                # Run the GPU-encode stage on its own event loop in a worker
+                # thread so that the next batch's images keep loading (in the
+                # loader processes) while the current batch is encoding on the
+                # GPU.
+                loop = asyncio.get_running_loop()
+                loop.run_in_executor(
+                    None, self.preprocess_batch_thread, image_processed_queue
+                )
             self._worker_task = asyncio.create_task(
                 self._batch_worker(image_processing_queue)
             )
-            # Run the GPU-encode stage on its own event loop in a worker thread so
-            # that the next batch's images keep loading (in the loader processes)
-            # while the current batch is encoding on the GPU.
-            loop = asyncio.get_running_loop()
-            loop.run_in_executor(
-                None, self.preprocess_batch_thread, image_processed_queue
-            )
             logger.info(
                 f"EncoderScheduler started with max_batch_size={self.max_batch_size}, "
+                f"image_loader_enabled={IMAGE_LOADER_ENABLED}, "
                 f"image_loader_workers={IMAGE_LOADER_NUM_WORKERS}"
             )
 
@@ -2629,7 +2634,7 @@ class EncoderScheduler:
                         Modality.from_str(p.request.get("modality", "image"))
                     ].append(p)
                 for modality, group in groups.items():
-                    if modality == Modality.IMAGE:
+                    if modality == Modality.IMAGE and IMAGE_LOADER_ENABLED:
                         # Offload image decoding to the loader processes; the GPU
                         # encode runs later on process_batch_separate's loop.
                         self._enqueue_for_loading(loader_queue, group, modality)
