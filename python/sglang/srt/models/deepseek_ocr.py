@@ -1423,6 +1423,8 @@ def build_qwen2_decoder_as_encoder(
 
 
 class DeepseekOCRForCausalLM(nn.Module):
+    verify_weights_on_load = True
+
     def __init__(
         self,
         *,
@@ -1855,12 +1857,8 @@ class DeepseekOCRForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            raise RuntimeError(
-                f"Some weights are not initialized from checkpoints: {unloaded_params}"
-            )
         self.post_load_weights()
+        return loaded_params
 
     def post_load_weights(self):
         if _is_cpu and _is_cpu_amx_available:

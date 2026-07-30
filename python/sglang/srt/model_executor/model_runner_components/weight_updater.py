@@ -178,7 +178,18 @@ class WeightUpdater:
             return iter
 
         def model_load_weights(model, iter):
-            loader.load_weights_and_postprocess(model, iter, target_device)
+            # Elastic-EP refills may select only expert tensors, while FLASH_RL
+            # refits may arrive in batches even with another disk load format.
+            # Neither establishes model-wide checkpoint completeness.
+            is_full_checkpoint = weight_name_filter is None and not getattr(
+                model, "flash_rl_initial_load_complete", False
+            )
+            loader.load_weights_and_postprocess(
+                model,
+                iter,
+                target_device,
+                is_full_checkpoint=is_full_checkpoint,
+            )
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):

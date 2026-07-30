@@ -32,7 +32,6 @@ bidirectional-image ``prepare_attn_masks`` and PP/embed plumbing), overriding
 only construction, per-modality feature extraction and weight loading.
 """
 
-import logging
 import re
 from typing import Iterable, List, Optional, Set, Tuple
 
@@ -54,8 +53,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
 from sglang.srt.utils import add_prefix
-
-logger = logging.getLogger(__name__)
 
 
 class Gemma4UnifiedVisionEmbedder(nn.Module):
@@ -342,12 +339,6 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
 
         params_dict = dict(self.named_parameters())
         params_dict.update(dict(self.named_buffers()))
-        non_persistent_buffers: Set[str] = set()
-        for mod_name, mod in self.named_modules():
-            for buf_name in getattr(mod, "_non_persistent_buffers_set", set()):
-                full = f"{mod_name}.{buf_name}" if mod_name else buf_name
-                non_persistent_buffers.add(full)
-
         text_tie = getattr(self.config.text_config, "tie_word_embeddings", True)
         start_layer = self.language_model.start_layer
         end_layer = self.language_model.end_layer
@@ -411,27 +402,6 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            param_names = set(dict(self.named_parameters()).keys())
-            buckets = {
-                logging.WARNING: (
-                    "Some weights are not initialized from checkpoints",
-                    lambda p: p in param_names,
-                ),
-                logging.INFO: (
-                    "Persistent buffers not in checkpoint (using default init)",
-                    lambda p: p not in param_names and p not in non_persistent_buffers,
-                ),
-                logging.DEBUG: (
-                    "Non-persistent buffers not in checkpoint (expected)",
-                    lambda p: p in non_persistent_buffers,
-                ),
-            }
-            for level, (msg, pred) in buckets.items():
-                names = sorted(p for p in unloaded_params if pred(p))
-                if names:
-                    logger.log(level, "%s: %s", msg, names)
         return loaded_params
 
 
