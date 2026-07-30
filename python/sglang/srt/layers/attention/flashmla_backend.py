@@ -18,10 +18,7 @@ from sglang.kernels.ops.attention.utils import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
-from sglang.srt.layers.attention.verify_tree_mask import (
-    VerifyTreeMask,
-    maybe_create_verify_tree_mask,
-)
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
 
@@ -106,7 +103,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_num_splits_view = None
         # Static K-lens buffer bound by the draft-extend graph kernel.
         self.cuda_graph_draft_extend_seq_lens_k = None
-        self._verify_tree_mask = None
+        self._verify_mask = None
         self._eager_kv_indices_buf = None
         # The worker fetches the tree-mask scratch from the target backend
         # only; draft-side instances must not allocate it.
@@ -288,10 +285,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.cuda_graph_draft_extend_seq_lens_k = torch.ones(
                 max_bs, dtype=torch.int32, device="cuda"
             )
-            self._verify_tree_mask = maybe_create_verify_tree_mask(
+            self._verify_mask = maybe_create_verify_mask(
                 is_draft_runner=self.is_draft_runner,
                 skip_prefill=self.skip_prefill,
-                max_num_tokens=max_num_tokens,
+                max_bs=max_bs,
                 max_context_len=self.max_context_len,
                 num_draft_tokens=self.num_draft_tokens,
                 device=self.device,
@@ -299,8 +296,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
 
     @property
-    def verify_tree_mask(self) -> Optional[VerifyTreeMask]:
-        return self._verify_tree_mask
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     def _apply_decode_target_verify_metadata(
         self,

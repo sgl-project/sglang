@@ -57,10 +57,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
 )
-from sglang.srt.layers.attention.verify_tree_mask import (
-    VerifyTreeMask,
-    maybe_create_verify_tree_mask,
-)
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -575,7 +572,7 @@ class DeepseekV4AttnBackend(
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
-        self._verify_tree_mask = None
+        self._verify_mask = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1515,10 +1512,10 @@ class DeepseekV4AttnBackend(
         )
         # Verify metadata never extracts the mask, but the tree kernel still
         # writes it. No skip_prefill notion here.
-        self._verify_tree_mask = maybe_create_verify_tree_mask(
+        self._verify_mask = maybe_create_verify_mask(
             is_draft_runner=self.is_draft_runner,
             skip_prefill=False,
-            max_num_tokens=max_num_tokens,
+            max_bs=max_bs,
             max_context_len=self.max_context_len,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
@@ -1526,8 +1523,8 @@ class DeepseekV4AttnBackend(
         )
 
     @property
-    def verify_tree_mask(self) -> Optional[VerifyTreeMask]:
-        return self._verify_tree_mask
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     def replay_cuda_graph_metadata_from(
         self,

@@ -186,7 +186,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
                 worker.draft_forward = MagicMock(return_value=graph_result)
                 attn_backend = SimpleNamespace(
-                    verify_tree_mask=None,
+                    verify_mask=None,
                     max_context_len=1,
                 )
                 worker.target_worker = SimpleNamespace(

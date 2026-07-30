@@ -18,10 +18,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.verify_tree_mask import (
-    VerifyTreeMask,
-    maybe_create_verify_tree_mask,
-)
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import AttentionType
@@ -183,13 +180,13 @@ class FlashAttentionBackend(AttentionBackend):
             self.max_context_len + self.page_size - 1
         ) // self.page_size
         # Page table is built on-device (build_trtllm_mha_page_table) and the
-        # tree-mask scratch is preallocated (see VerifyTreeMask), so no
+        # tree-mask scratch is preallocated (see VerifyMask), so no
         # seq_lens_cpu / seq_lens_sum D2H sync is ever needed.
         self.needs_cpu_seq_lens = False
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.ps.attn_cp_size
-        self._verify_tree_mask = None
+        self._verify_mask = None
         # The worker fetches the tree-mask scratch from the target backend
         # only; draft-side instances must not allocate it.
         self.is_draft_runner = model_runner.is_draft_worker
@@ -2202,10 +2199,10 @@ class FlashAttentionBackend(AttentionBackend):
             }
 
             # topk<=1 never extracts the mask; both metadata paths gate on topk > 1.
-            self._verify_tree_mask = maybe_create_verify_tree_mask(
+            self._verify_mask = maybe_create_verify_mask(
                 is_draft_runner=self.is_draft_runner,
                 skip_prefill=self.skip_prefill,
-                max_num_tokens=max_num_tokens,
+                max_bs=max_bs,
                 max_context_len=self.max_context_len,
                 num_draft_tokens=self.speculative_num_draft_tokens,
                 device=self.device,
@@ -2559,8 +2556,8 @@ class FlashAttentionBackend(AttentionBackend):
         return metadata, metadata_expand
 
     @property
-    def verify_tree_mask(self) -> Optional[VerifyTreeMask]:
-        return self._verify_tree_mask
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     @staticmethod
     def _host_max_seq_len(

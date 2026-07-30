@@ -688,9 +688,9 @@ class TestGetCudaGraphSeqLenFillValue(unittest.TestCase):
 
 
 class TestGetVerifyBuffers(unittest.TestCase):
-    def test_no_verify_tree_mask(self):
+    def test_no_verify_mask(self):
         backend = object.__new__(AscendAttnBackend)
-        self.assertIsNone(backend.verify_tree_mask)
+        self.assertIsNone(backend.verify_mask)
 
     def test_update_is_noop(self):
         backend = object.__new__(AscendAttnBackend)

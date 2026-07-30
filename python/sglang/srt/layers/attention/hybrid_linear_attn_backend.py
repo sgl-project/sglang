@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -18,7 +18,6 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
 )
-from sglang.srt.layers.attention.verify_tree_mask import VerifyTreeMask
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -26,6 +25,9 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.verify_mask import VerifyMask
 
 logger = logging.getLogger(__name__)
 
@@ -922,9 +924,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             attn_backend.on_after_cuda_graph_warmup()
 
     @property
-    def verify_tree_mask(self) -> Optional[VerifyTreeMask]:
+    def verify_mask(self) -> Optional["VerifyMask"]:
         # The scratch lives on the full-attn child; the linear side reads no mask.
-        return self.full_attn_backend.verify_tree_mask
+        return self.full_attn_backend.verify_mask
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]

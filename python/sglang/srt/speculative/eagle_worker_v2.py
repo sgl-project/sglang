@@ -1238,9 +1238,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         retrieve_next_sibling = torch.full((bs, 1), -1, dtype=torch.long, device=device)
 
         attn_backend = self._target_worker.model_runner.attn_backend
-        verify_tree_mask = attn_backend.verify_tree_mask
-        if verify_tree_mask is not None:
-            custom_mask = verify_tree_mask.buffer
+        verify_mask = attn_backend.verify_mask
+        # This 1-node tree is one token per request, and every position is
+        # visible, so an all-True fill is correct under either layout.
+        if verify_mask is not None and verify_mask.fits(
+            bs, 1, attn_backend.max_context_len
+        ):
+            custom_mask = verify_mask.buffer
             custom_mask.fill_(True)
         else:
             if batch.seq_lens_sum is not None:

@@ -6,11 +6,11 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.layers.attention.verify_tree_mask import VerifyTreeMask
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+    from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.speculative.spec_info import SpecInput
@@ -168,8 +168,8 @@ class AttentionBackend(ABC):
         pass
 
     @property
-    def verify_tree_mask(self) -> Optional[VerifyTreeMask]:
-        """The scratch the draft stage fills in place, if this backend has one."""
+    def verify_mask(self) -> Optional[VerifyMask]:
+        """The mask the draft stage fills in place, if this backend has one."""
         return None
 
     def update_verify_buffers_to_fill_after_draft(

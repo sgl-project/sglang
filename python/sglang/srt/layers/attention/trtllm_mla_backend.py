@@ -35,10 +35,7 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.verify_tree_mask import (
-    VerifyTreeMask,
-    maybe_create_verify_tree_mask,
-)
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -245,7 +242,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
-        self._verify_tree_mask = None
+        self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
@@ -360,10 +357,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
-        self._verify_tree_mask = maybe_create_verify_tree_mask(
+        self._verify_mask = maybe_create_verify_mask(
             is_draft_runner=self.is_draft_runner,
             skip_prefill=self.skip_prefill,
-            max_num_tokens=max_num_tokens,
+            max_bs=max_bs,
             max_context_len=self.max_context_len,
             num_draft_tokens=self.num_draft_tokens,
             device=self.device,
@@ -373,8 +370,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 
     @property
-    def verify_tree_mask(self) -> Optional[VerifyTreeMask]:
-        return self._verify_tree_mask
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     def _init_cuda_graph_metadata(
         self,

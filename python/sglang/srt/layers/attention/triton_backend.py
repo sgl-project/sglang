@@ -21,10 +21,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.verify_tree_mask import (
-    VerifyTreeMask,
-    maybe_create_verify_tree_mask,
-)
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
@@ -297,7 +294,7 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         self.forward_metadata: ForwardMetadata = None
-        self._verify_tree_mask = None
+        self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
@@ -497,9 +494,7 @@ class TritonAttnBackend(AttentionBackend):
                 )
             )
         custom_mask = (
-            self._verify_tree_mask.buffer
-            if self._verify_tree_mask is not None
-            else None
+            self._verify_mask.buffer if self._verify_mask is not None else None
         )
         if (
             spec_info is not None
@@ -997,10 +992,10 @@ class TritonAttnBackend(AttentionBackend):
 
         # Layout is draft * (seq_len + draft) per request (seq_mask_len cumsum
         # below) -- the same bound the shared sizing covers. Read as uint8.
-        self._verify_tree_mask = maybe_create_verify_tree_mask(
+        self._verify_mask = maybe_create_verify_mask(
             is_draft_runner=self.is_draft_runner,
             skip_prefill=self.skip_prefill,
-            max_num_tokens=max_num_tokens,
+            max_bs=max_bs,
             max_context_len=self.max_context_len,
             num_draft_tokens=self.num_draft_tokens,
             device=self.device,
@@ -1089,8 +1084,8 @@ class TritonAttnBackend(AttentionBackend):
             )
         elif forward_mode.is_target_verify():
             custom_mask = (
-                self._verify_tree_mask.buffer
-                if self._verify_tree_mask is not None
+                self._verify_mask.buffer
+                if self._verify_mask is not None
                 and spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
                 else None
@@ -1186,8 +1181,8 @@ class TritonAttnBackend(AttentionBackend):
         return 1
 
     @property
-    def verify_tree_mask(self) -> Optional[VerifyTreeMask]:
-        return self._verify_tree_mask
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]

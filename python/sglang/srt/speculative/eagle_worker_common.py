@@ -342,18 +342,28 @@ def build_eagle_verify_input(
             device,
         )
 
-    # Build tree mask
-    # Directly write to the verify attn scratch when the backend owns one
-    verify_tree_mask = target_worker.model_runner.attn_backend.verify_tree_mask
-    tree_mask_buf = verify_tree_mask.buffer if verify_tree_mask is not None else None
+    # Build tree mask. Write straight into the backend's buffer when it owns one
+    # and this batch fits it; a batch past the captured max_bs (eager path) falls
+    # back to a fresh allocation in the same layout.
+    target_attn_backend = target_worker.model_runner.attn_backend
+    verify_mask = target_attn_backend.verify_mask
+    if verify_mask is None:
+        tree_mask_buf, mask_mode, fill_mask = None, tree_mask_mode, True
+    else:
+        mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
+        fits = verify_mask.fits(
+            batch.seq_lens.shape[0],
+            num_draft_tokens,
+            target_attn_backend.max_context_len,
+        )
+        tree_mask_buf = verify_mask.buffer if fits else None
 
     # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
     # tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
     seq_lens_sum = batch.seq_lens_sum
     if seq_lens_sum is None:
         if tree_mask_buf is None:
-            max_context_len = target_worker.model_runner.attn_backend.max_context_len
-            seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
+            seq_lens_sum = batch.seq_lens.shape[0] * target_attn_backend.max_context_len
         else:
             # tree_mask_buf preallocated -> kernel ignores seq_lens_sum.
             seq_lens_sum = 0
@@ -375,9 +385,9 @@ def build_eagle_verify_input(
         topk,
         num_steps,
         num_draft_tokens,
-        tree_mask_mode,
+        mask_mode,
         tree_mask_buf,
-        fill_prefix_mask=verify_tree_mask is None or verify_tree_mask.is_read,
+        fill_prefix_mask=fill_mask,
     )
 
     return EagleVerifyInput(
