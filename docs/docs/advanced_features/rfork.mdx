@@ -100,3 +100,20 @@ python -m sglang.launch_server [args] \
 ```
 
 All SGLang instances use the same command shape. If no ready source exists, the instance loads weights natively and publishes metadata to ModelExpress. If a compatible source exists, it loads weights through ModelExpress P2P transfer. Set <code>"transport": "transfer_engine"</code> to use Mooncake TransferEngine instead of the default NIXL transport.
+
+### Choosing the NCCL group ports
+
+--remote-instance-weight-loader-send-weights-group-ports takes exactly one port per TP rank, and the seed *listens* on them. Pick ports **below** the kernel's ephemeral range (cat /proc/sys/net/ipv4/ip_local_port_range, commonly 32768-60999) — inside that range the kernel may already have handed the port to an unrelated outbound connection, so the bind races and fails with EADDRINUSE only some of the time. SGLang rejects overlapping ports at startup.
+
+### With speculative decoding
+
+R-Fork only transfers the target model. A seed never exports its draft model, so a client running speculative decoding must give the draft its own load format — otherwise the draft tries to pull weights that the seed does not serve:
+
+```shell Command
+python -m sglang.launch_server [args] \
+  --load-format remote_instance \
+  --speculative-draft-load-format auto \
+  [remote-instance-weight-loader args]
+```
+
+The draft model is small enough that loading it from disk costs seconds, while the target still comes over the wire.

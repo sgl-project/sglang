@@ -592,6 +592,7 @@ class ModelRunner:
             get_model=lambda: self.model,
             tp_rank=self.ps.tp_rank,
             gpu_id=self.gpu_id,
+            is_draft_worker=self.is_draft_worker,
         )
 
     def init_ngram_embedding_manager(self):
