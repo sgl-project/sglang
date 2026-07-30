@@ -32,7 +32,11 @@ def _qwen3vl_postprocess_text(
 
 @dataclass
 class LingBotVideoMoEPipelineConfig(PipelineConfig):
-    task_type: ModelTaskType = ModelTaskType.T2V
+    # TI2V accepts an optional image, so one pipeline serves T2V, I2V and T2I.
+    task_type: ModelTaskType = ModelTaskType.TI2V
+    # The condition frame is cropped to the requested size and kept as a PIL image
+    # for Qwen3-VL, so the generic TI2V geometry rewrite must not run.
+    skip_input_image_preprocess: bool = True
     dit_config: DiTConfig = field(default_factory=LingBotVideoMoEConfig)
     vae_config: VAEConfig = field(default_factory=WanVAEConfig)
     vae_tiling: bool = False
@@ -52,10 +56,23 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
     vae_precision: str = "bf16"
     should_use_guidance: bool = True
     embedded_cfg_scale: float = 6.0
+    # Second-pass settings, used only by LingBotVideoRefinerPipeline.
+    refiner_height: int = 1088
+    refiner_width: int = 1920
+    refiner_num_inference_steps: int = 8
+    refiner_guidance_scale: float = 3.0
+    refiner_flow_shift: float = 3.0
+    refiner_t_thresh: float = 0.85
+    refiner_sigma_tail_steps: int = 2
 
     def __post_init__(self):
-        self.vae_config.load_encoder = False
+        self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
+
+    def supports_dynamic_batching(self) -> bool:
+        # The base class excludes TI2V; the image is optional here, so keep the
+        # T2V behaviour.
+        return True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(auto_dit_layerwise_offload=True)
