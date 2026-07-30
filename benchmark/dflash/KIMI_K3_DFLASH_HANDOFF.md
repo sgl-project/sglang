@@ -1,6 +1,7 @@
 # Kimi-K3 DFlash optimization handoff
 
 Status snapshot: 2026-07-29
+Fresh-server stability update: 2026-07-30
 
 ## Branch state
 
@@ -49,10 +50,12 @@ numerical/acceptance discrepancy. The fused CuTe kernel had skipped BF16
 materialization boundaries that exist in the reference Triton composition.
 Those boundaries are now explicit.
 
-A smaller unresolved issue remains: separate fresh-server CuTe runs can
-produce different greedy token streams, verify counts, and acceptance
-histograms. Two fresh-server runs using the Triton KDA verify path were exactly
-identical on the isolated three-request set. The CuTe drift reproduces in both
+A broader unresolved issue remains: separate fresh-server runs can produce
+different greedy token streams, verify counts, and acceptance histograms with
+either the CuTe or Triton KDA verify backend. Two Triton runs were exactly
+identical on the original isolated three-request set, but four subsequent
+full-HumanEval Triton runs at draft step 117500 all differed. Triton is
+therefore not a stable end-to-end control. CuTe drift also reproduces in both
 the optimized split-V path and the serial CuTe path, so the split-V
 optimization itself is not the root cause.
 
@@ -154,7 +157,7 @@ pre-RMSNorm recurrent output: FP32 -> BF16 -> FP32
 
 This removed the large systematic CuTe-versus-Triton acceptance bias observed
 during the port. The remaining differences are much smaller and are described
-under “Open CuTe run-to-run drift.”
+under “Open fresh-server run-to-run drift.”
 
 The exact pre/post end-to-end aggregate from that early porting run was not
 saved as a durable artifact. The code-level boundary, later kernel-reference
@@ -229,42 +232,48 @@ the added bookkeeping is small relative to target verify. DFlash with
 `extra_buffer_lazy` remains explicitly unsupported pending lifecycle
 validation.
 
-## Open CuTe run-to-run drift
+## Open fresh-server run-to-run drift
 
 ### What is established
 
-The current Triton KDA verify path is the best numerical reference available in
-this repository:
+The current Triton KDA verify path remains the best kernel-level numerical
+reference available in this repository, but it is not a stable end-to-end
+fresh-server reference:
 
 - it is the unfused composition of the existing Triton convolution,
   recurrent, and gated-norm kernels;
 - ReplaySSM’s exact-fold commit intentionally follows the Triton recurrent
   operation order;
 - it exposes the BF16 tensor boundaries that the fused kernel must preserve;
-- on the isolated three-request test, two fresh servers produced identical
-  output token IDs, completion lengths, verify counts, correct/proposed draft
-  counts, and complete acceptance histograms.
+- on the original isolated three-request test, two fresh servers happened to
+  produce identical output token IDs, completion lengths, verify counts,
+  correct/proposed draft counts, and complete acceptance histograms;
+- on the expanded 164-request test, four fresh-server Triton runs produced four
+  different aggregate/mean acceptance pairs and no output token stream matched
+  across any pair of runs.
 
 Higher acceptance is useful evidence but is not itself a correctness
 criterion. One serial CuTe diagnostic run had higher aggregate acceptance than
 Triton while still producing different tokens and histograms. Reference status
-comes from semantics and repeatability, not from maximizing acceptance.
+comes from the kernel semantics and operation ordering, not from maximizing
+acceptance or from the now-disproved assumption that Triton is end-to-end
+repeatable.
 
 The aggregate acceptance difference and the difference in mean per-request
-acceptance between CuTe and Triton cannot be evaluated properly until CuTe is
-exactly stable across fresh-server runs. The current between-provider
-comparison is confounded by CuTe's within-provider run-to-run variation. Do not
-claim that either backend has higher or lower acceptance from these runs.
+acceptance between CuTe and Triton cannot be evaluated properly while both
+providers vary across fresh-server runs. The current between-provider
+comparison is confounded by within-provider variation. Do not claim that
+either backend has higher or lower acceptance from these runs.
 
 ### Initial draft-attention observation
 
 The investigation started with one HumanEval run per DFlash **draft attention**
 backend:
 
-| Draft backend | Overall output TPS | Aggregate acceptance | Mean request acceptance |
-| --- | ---: | ---: | ---: |
-| `trtllm_mha` | 357.33 | 7.663 | 8.211 |
-| FA4 | 361.72 | 7.904 | 8.279 |
+| Draft backend | Overall output TPS |
+| --- | ---: |
+| `trtllm_mha` | 357.33 |
+| FA4 | 361.72 |
 
 These single runs were not enough to distinguish numerical drift from
 fresh-server variation. They motivated repeat runs and exact request tracing.
@@ -278,20 +287,41 @@ Default split CuTe, 164 HumanEval requests, two fresh servers:
 | --- | ---: | ---: |
 | Completion tokens | 170,408 | 163,877 |
 | Verify calls | 22,001 | 20,855 |
-| Aggregate acceptance | 7.745466 | 7.857924 |
-| Mean request acceptance | 8.264764 | 8.283244 |
 
 - Prompts were identical.
 - All 164 output token streams differed.
 - 161/164 verify counts differed.
-- All 164 acceptance histograms differed.
+- Every acceptance histogram differed.
 - Median first output-token divergence was token 28; range was 0–537.
 
-The aggregate acceptance difference looks modest, but a tiny numerical change
-near an argmax boundary can alter one greedy token and then amplify through the
-rest of a long continuation.
+A tiny numerical change near an argmax boundary can alter one greedy token and
+then amplify through the rest of a long continuation.
 
-### Three-request provider isolation
+### Expanded Triton HumanEval stability check
+
+Four fresh-server runs used Triton target KDA verify, draft step 117500,
+HumanEval's 164 requests, block 16, ReplaySSM, and concurrency 1:
+
+| Run | Verify calls |
+| --- | ---: |
+| 1 | 22,308 |
+| 2 | 20,950 |
+| 3 | 22,426 |
+| 4 | 21,656 |
+
+The prompt hashes were identical for all 164 requests in every pairwise
+comparison. Nevertheless, every one of the six run pairs had:
+
+- 0/164 matching output-token hashes;
+- no matching complete acceptance histograms;
+- only 1–4/164 matching completion lengths;
+- only 1–6/164 matching verify counts.
+
+This supersedes the earlier inference that Triton was stable. The small
+three-request repeat below remains valid as an observation, but it was not
+representative of full HumanEval behavior.
+
+### Earlier three-request provider isolation
 
 All rows below used HumanEval/0–2, block 16, ReplaySSM, concurrency 1, and a
 fresh server for each run.
@@ -302,12 +332,11 @@ Triton target KDA verify:
 | --- | ---: | ---: |
 | Completion tokens | 1,450 | 1,450 |
 | Verify calls | 182 | 182 |
-| Aggregate acceptance | 7.967033 | 7.967033 |
-| Mean request acceptance | 7.974949 | 7.974949 |
 | Decode-only TPS | 438.143 | 438.806 |
 
 The exact output IDs, output lengths, verify counts, correct/proposed counts,
-and full histograms were identical.
+and full histograms were identical in this limited pair of runs. The expanded
+test above shows that this does not establish Triton stability.
 
 Split CuTe during the subsequently reverted PDL ordering experiment:
 
@@ -315,8 +344,6 @@ Split CuTe during the subsequently reverted PDL ordering experiment:
 | --- | ---: | ---: |
 | Completion tokens | 1,536 | 1,536 |
 | Verify calls | 194 | 213 |
-| Aggregate acceptance | 7.917526 | 7.211268 |
-| Mean request acceptance | 8.061883 | 7.273088 |
 | Decode-only TPS | 501.957 | 458.597 |
 
 All three output streams and histograms differed. The first-divergence
@@ -328,8 +355,6 @@ Serial CuTe during the same reverted experiment:
 | --- | ---: | ---: |
 | Completion tokens | 1,468 | 1,536 |
 | Verify calls | 176 | 197 |
-| Aggregate acceptance | 8.340909 | 7.796954 |
-| Mean request acceptance | 8.364193 | 7.813757 |
 | Decode-only TPS | 516.417 | 484.113 |
 
 All three output streams and histograms also differed. This rules out the
@@ -346,8 +371,8 @@ or state trajectories, not random execution of a fixed captured kernel input.
 Fixed TP all-reduce ordering, `--enable-deterministic-inference`, and a coarse
 WAR-ordering control did not remove the CuTe drift. A three-request target-only
 baseline also differed across fresh servers, so the wider K3/TP8/B300 target
-stack is not globally bitwise deterministic. The exact two-run Triton result
-is nevertheless a strong path-specific control, not a proof for every prompt.
+stack is not globally bitwise deterministic. The expanded Triton result now
+shows that the Triton DFlash path is not globally repeatable either.
 
 ### Kernel-level numerical evidence
 
@@ -413,16 +438,19 @@ After that, isolate convolution and output norm independently. Whole-output
 bitwise equality will require matching operation and reduction order at every
 stage; it is not a one-line fast-math change.
 
-Only after two or more fresh-server CuTe runs are exact in output tokens,
-verify counts, and acceptance histograms should aggregate acceptance and mean
-per-request acceptance be compared with Triton.
+Only after repeated fresh-server runs for each backend are exact in output
+tokens, verify counts, and acceptance histograms—or after the common source of
+variation is isolated and controlled—should aggregate acceptance and mean
+per-request acceptance be compared between CuTe and Triton.
 
-If correctness must take priority immediately, the narrow safe fallback is in
+If matching the repository's numerical reference must take priority
+immediately, the narrow fallback is in
 `KDAAttnBackend._can_run_dspark_cutedsl_mtp()`: bypass CuTe only for DFlash,
 16-token, ReplaySSM verify. The `nv_cutedsl` dispatcher already installs the
 Triton verify kernel as its fallback, and the normal external output norm is
-used when CuTe does not consume it. This fallback was investigated but has not
-been implemented because it gives up the block-16 CuTe performance work.
+used when CuTe does not consume it. This does not make fresh-server execution
+stable. The fallback was investigated but has not been implemented because it
+gives up the block-16 CuTe performance work.
 
 ## Current uncommitted changes
 
@@ -533,6 +561,10 @@ These paths are under `/tmp` and are not durable:
   `/tmp/k3-dflash-accept-default-20260729`;
 - Triton two-run control:
   `/tmp/k3-dflash-triton-verify-20260729`;
+- expanded Triton step-117500 runs 1–2:
+  `/tmp/k3-dflash-triton-step117500-repeat2-20260729`;
+- expanded Triton step-117500 runs 3–4:
+  `/tmp/k3-dflash-triton-step117500-additional2-20260730`;
 - split CuTe during the reverted PDL ordering experiment:
   `/tmp/k3-dflash-cute-pdl-fix-20260729`;
 - serial CuTe during the reverted PDL ordering experiment:
