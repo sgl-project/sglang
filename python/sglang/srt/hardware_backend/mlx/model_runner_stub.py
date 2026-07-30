@@ -106,8 +106,20 @@ class MlxModelRunnerStub(ModelRunner):
     # that path working instead of raising AttributeError.
     prefill_aware_swa = False
 
-    def __init__(self, *args, mlx_pool_size: int | None = None, **kwargs):
+    # initialize() reads this unconditionally. Tests construct the stub via
+    # __new__ (bypassing __init__), so default it as a class attribute to keep
+    # those harnesses working instead of raising AttributeError.
+    _mlx_max_running_requests = None
+
+    def __init__(
+        self,
+        *args,
+        mlx_pool_size: int | None = None,
+        mlx_max_running_requests: int | None = None,
+        **kwargs,
+    ):
         self._mlx_pool_size = mlx_pool_size
+        self._mlx_max_running_requests = mlx_max_running_requests
         super().__init__(*args, **kwargs)
 
     def load_model(self):
@@ -248,7 +260,16 @@ class MlxModelRunnerStub(ModelRunner):
             self.max_total_num_tokens = self._mlx_pool_size
         else:
             self.max_total_num_tokens = self.model_config.context_len
+        # Scheduler concurrency cap. _resolve_max_running_requests honors
+        # --max-running-requests and the auxiliary-state bound; additionally
+        # cap it to the MLX runner's memory-safe value (set when the runner
+        # auto-sizes the pool) so the scheduler never admits more concurrent
+        # requests than the working set can hold.
         self.max_running_requests = self._resolve_max_running_requests()
+        if self._mlx_max_running_requests is not None:
+            self.max_running_requests = min(
+                self.max_running_requests, self._mlx_max_running_requests
+            )
         self.is_hybrid_swa = False
 
         # Create minimal pools

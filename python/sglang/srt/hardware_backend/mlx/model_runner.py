@@ -43,6 +43,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     clear_context,
     find_attention_layers,
     get_head_dim,
+    get_num_heads,
     get_num_kv_heads,
     patch_model_attention,
     set_context,
@@ -111,6 +112,48 @@ _MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
 }
 _MLX_KV_FLOAT_DTYPES = {mx.float16, mx.bfloat16, mx.float32}
 
+# Memory-safe chunked prefill on Apple Silicon. A long prefill whose activation peak
+# exceeds the Metal working set aborts the scheduler with an uncatchable command-buffer
+# OOM, so the chunk is sized to keep that peak below the limit.
+#
+# These are conservative startup estimates, not tuned constants: the in-server probe
+# (_calibrate_prefill_chunk) measures the real per-token transient at runtime and revises
+# the chunk down before serving, so they only have to over-estimate safely. Baselines come
+# from the original repro -- M5 Pro 24GB, Qwen3-30B-A3B-4bit, radix off: 17.76 GiB working
+# set, ~17.12 GiB steady-state baseline after the first prefill; a 256-token chunk peaked
+# at 17.43 GiB and held while a 398-token chunk peaked at 17.58 GiB and crashed (the limit
+# is soft, so a sub-limit peak can still abort). How the chunk-sizing values below feed
+# _safe_prefill_chunk_tokens (chunk = headroom * SAFETY / (ACT_BYTES * n_q_heads * ctx)):
+#   ACT_BYTES_PER_QHEAD -- conservative estimate of the (chunk x ctx) attention
+#     scores/softmax bytes per q-head; the probe overwrites it with the measured cost.
+#   SAFETY -- commit only 60% of headroom to the transient; in the repro ~0.72 of headroom
+#     crashed while ~0.48 held, so 0.6 stays in the stable band with margin.
+#   MIN_PREFILL_CHUNK -- chunk floor: below this prefill is too slow to serve, so fail
+#     loudly. Also inverted in _memory_safe_max_running so the cap and chunk stay aligned.
+_MLX_PREFILL_ACT_BYTES_PER_QHEAD = 32  # conservative per-(token x ctx) cost per q-head
+_MLX_PREFILL_SAFETY = 0.6  # fraction of headroom the chunk's transient may use
+_MLX_MIN_PREFILL_CHUNK = 256  # chunk floor (tokens); see block comment above
+# Minimum KV-pool size in tokens, so the pool never collapses to something unusable (the
+# radix-off no-context-length branch and the radix-on auto-sizer). A pool floor, distinct
+# from the equal-valued _MLX_MIN_PREFILL_CHUNK (a chunk floor).
+_MLX_MIN_POOL_SLOTS = 256
+# Cap the KV pool at context x running x this (25% slack), not greedily.
+_MLX_POOL_SLOTS_SLACK = 1.25
+# Startup probe (_calibrate_prefill_chunk): replay a small prefill to measure the real
+# resident baseline + transient, then revise the chunk down. PROBE_CHUNK / PROBE_MAX_CONTEXT
+# keep the replay small so it never nears the edge yet still shows the linear-in-ctx trend.
+# PROBE_FLOOR_CHUNK is the post-measurement floor: having measured the true cost the probe
+# may trust a chunk below the conservative MIN_PREFILL_CHUNK, but below this prefill is
+# impractical (fail loudly). PROBE_HEADROOM_BYTES is the live margin kept below the limit
+# while probing, so the probe never triggers the OOM it measures for. PIPELINE_CACHE_SLACK
+# is the extra private caches the overlap pipeline / pool keep resident beyond the running
+# set (in-flight next step + pooled finished).
+_MLX_PROBE_CHUNK = 128
+_MLX_PROBE_MAX_CONTEXT = 2048
+_MLX_PROBE_FLOOR_CHUNK = 32
+_MLX_PROBE_HEADROOM_BYTES = 256 * 1024 * 1024
+_MLX_PIPELINE_CACHE_SLACK = 2
+
 
 class MlxModelRunner:
     """MLX model runner with radix-cache prefix sharing."""
@@ -123,12 +166,27 @@ class MlxModelRunner:
         pool_size: int | None = None,
         mem_fraction_static: float = 0.8,
         quantization: str | None = None,
+        context_length: int | None = None,
+        max_running_requests: int | None = None,
     ):
         self.model_path = model_path
         self.trust_remote_code = trust_remote_code
         self.model = None
         self.disable_radix_cache = disable_radix_cache
         self._mem_fraction_static = mem_fraction_static
+        # Used to size the KV pool and a safe prefill chunk; None skips chunk sizing.
+        self._context_length = context_length
+        self._max_running_requests = max_running_requests
+        # Safe prefill chunk cap and its per-(token x ctx) cost; set during sizing/probe
+        # and reused by the runtime admission gate.
+        self._max_safe_prefill_chunk: int | None = None
+        self._prefill_act_per_tok_ctx: int = 0
+        # Memory-safe scheduler concurrency cap (read by the stub) and the per-request
+        # resident cache cost (radix off). Set in _compute_pool_size; the cache cost is
+        # refined by the probe. A None cap means the stub's pool-derived heuristic decides
+        # (radix-on / no-context path, where private caches are not the resident cost).
+        self._effective_max_running: int | None = None
+        self._radix_off_cache_bytes: int = 0
         # Counter used to trigger periodic mx.clear_cache() calls.
         self._decode_step_ct: int = 0
         self._clear_steps = envs.SGLANG_MLX_CLEAR_CACHE_STEPS.get()
@@ -179,6 +237,8 @@ class MlxModelRunner:
 
         self._pool_size = self._compute_pool_size(pool_size)
         self._aot_kernels = self._build_aot_kernels()
+        # Refine the chunk cap with a real prefill measurement, before the worker reads it.
+        self._calibrate_prefill_chunk()
 
     @staticmethod
     def _extract_logits(model_output):
@@ -547,7 +607,184 @@ class MlxModelRunner:
         return first_config
 
     def _compute_pool_size(self, explicit_size: int | None) -> int:
-        """Determine pool slot count (auto-size from available memory if needed)."""
+        """Size the KV pool and (radix off only) a memory-safe prefill chunk cap.
+
+        Radix off (the default MLX config and the path this prefill-OOM fix targets):
+        clamp the budget to real free memory, cap the pool at the running set's context
+        need so the rest stays as prefill headroom, and derive a chunk cap that keeps the
+        prefill below the Metal working-set edge; raise if even a minimum prefill cannot
+        fit. The startup chunk is a conservative estimate; the probe refines it.
+
+        Radix on: a single greedy, pre-allocated shared pool backs prefix reuse, so the
+        radix-off private-cache resident model below does not apply -- modelling the whole
+        greedy pool as coexisting with the prefill would structurally starve the headroom
+        and wrongly refuse startup. Keep the prior simple auto-sizing and leave the chunk
+        uncapped (admission gate inactive), so radix-on behaviour is unchanged by this fix.
+        """
+        if not self.disable_radix_cache:
+            # See docstring: the chunk-sizing model is radix-off-specific. Leave the cap
+            # unset (no worker cap, no admission gate) and keep prior pool auto-sizing.
+            self._max_safe_prefill_chunk = None
+            self._prefill_act_per_tok_ctx = 0
+            # None concurrency cap: defer to the stub's pool-derived heuristic (the radix-on
+            # shared pool, not per-request private caches, governs its memory profile).
+            self._effective_max_running = None
+            return self._auto_pool_size(explicit_size)
+
+        n_kv_heads, head_dim, dtype = self._get_attn_config()
+        first_attn = self._attention_module_for_layer(
+            self._cache_layout.first_attention_layer_index
+        )
+        n_q_heads = get_num_heads(first_attn) or n_kv_heads
+        num_layers = self._cache_layout.num_attention_layers
+        sys_available = psutil.virtual_memory().available
+        mlx_limit = mx.device_info().get(
+            "max_recommended_working_set_size",
+            mx.device_info().get("memory_size", 0),
+        )
+        mlx_used = mx.get_active_memory()
+        gib = 1024**3
+        context_length = self._context_length
+        bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * dtype.size
+
+        # Headroom above weights, clamped to real free memory (working-set limit alone is
+        # only a no-pressure recommendation). Shared with the admission gate.
+        dynamic_budget = self._gpu_headroom_bytes(mlx_limit, mlx_used, sys_available)
+        mem_fraction_budget = max(
+            int(mlx_limit * self._mem_fraction_static) - mlx_used, 0
+        )
+        kv_budget = min(dynamic_budget, mem_fraction_budget)
+
+        # Conservative startup estimate of the per-(token x ctx) activation cost; the probe
+        # overwrites it with the measured value for the admission gate.
+        per_tok_ctx = _MLX_PREFILL_ACT_BYTES_PER_QHEAD * n_q_heads
+        self._prefill_act_per_tok_ctx = per_tok_ctx
+
+        # Radix off: each request owns a private ContiguousAttentionKVCache pre-allocated to
+        # its full power-of-two span, so its resident cost is span x bytes_per_slot,
+        # independent of the prompt length. Record it for the resident model, the concurrency
+        # cap, and the admission gate; the probe refines it with a real measurement.
+        if context_length is not None:
+            cache_tokens = self._max_seq_len
+            while cache_tokens < context_length:
+                cache_tokens *= 2
+        else:
+            cache_tokens = self._max_seq_len
+        per_cache_bytes = cache_tokens * bytes_per_slot
+        self._radix_off_cache_bytes = per_cache_bytes
+
+        # Scheduler concurrency cap: honor an explicit --max-running-requests, else default to
+        # the most requests whose private caches still leave a usable prefill. This becomes the
+        # scheduler's real running cap (the stub reads it) and the chunk sizing below assumes
+        # it, so capping concurrency here is what keeps coexisting caches from overflowing the
+        # working set; the admission gate is the live-memory backstop on top.
+        running = self._memory_safe_max_running(
+            dynamic_budget, per_cache_bytes, per_tok_ctx, context_length
+        )
+        self._effective_max_running = running
+
+        # Radix off: the pool can never exceed the running set's contexts, so cap it there
+        # and leave the rest as prefill headroom.
+        if context_length is not None:
+            need_slots = int(context_length * running * _MLX_POOL_SLOTS_SLACK)
+        else:
+            need_slots = None
+
+        if explicit_size is not None:
+            pool_size = explicit_size
+        else:
+            pool_size = kv_budget // bytes_per_slot if bytes_per_slot else 0
+            # need_slots is set iff context_length is, so these are mutually exclusive:
+            # a known context caps the pool at its slot need, an unknown one only floors it.
+            if need_slots is not None:
+                pool_size = min(pool_size, need_slots)
+            else:
+                pool_size = max(pool_size, _MLX_MIN_POOL_SLOTS)
+
+        # Resident KV the prefill coexists with: span x running private caches (see
+        # per_cache_bytes above). Using pool_size here would undercount the baseline and
+        # oversize the chunk.
+        if context_length is not None:
+            resident_kv_bytes = running * per_cache_bytes
+        else:
+            resident_kv_bytes = (pool_size + 1) * bytes_per_slot  # +1 padding slot 0
+        activation_headroom = max(dynamic_budget - resident_kv_bytes, 0)
+        safe_chunk = self._safe_prefill_chunk_tokens(
+            activation_headroom, per_tok_ctx, context_length
+        )
+
+        if context_length is not None:
+            if explicit_size is None and (
+                pool_size < context_length or safe_chunk < _MLX_MIN_PREFILL_CHUNK
+            ):
+                remedies = []
+                # Raising mem-fraction only helps when the pool itself is too small;
+                # a starved prefill (pool ok but chunk too small) needs real free
+                # memory, since activation headroom is drawn from the whole budget.
+                needed_mf = (
+                    (mlx_used + context_length * bytes_per_slot) / mlx_limit
+                    if mlx_limit
+                    else 1.0
+                )
+                if pool_size < context_length and needed_mf <= 0.99:
+                    hint = (int(needed_mf * 100) + 1) / 100  # round up to 0.01
+                    remedies.append(
+                        f"raise --mem-fraction-static to ~{hint:.2f} (now "
+                        f"{self._mem_fraction_static:.2f})"
+                    )
+                remedies.append(
+                    "use a smaller / more-quantized model, a shorter --context-length, "
+                    "or a machine with more unified memory"
+                )
+                remedy_text = "".join(f"    * {r}\n" for r in remedies)
+                raise RuntimeError(
+                    "MLX cannot fit both the KV cache and a safe prefill in the GPU "
+                    "working set.\n"
+                    f"  KV pool = {pool_size} tokens (need >= {context_length}); "
+                    f"safe prefill chunk = {safe_chunk} tokens "
+                    f"(need >= {_MLX_MIN_PREFILL_CHUNK}).\n"
+                    f"  Budget (mem-fraction-static={self._mem_fraction_static:.2f}):\n"
+                    f"    Metal working-set limit : {mlx_limit / gib:.2f} GiB\n"
+                    f"    model weights resident  : {mlx_used / gib:.2f} GiB\n"
+                    f"    free above weights      : {dynamic_budget / gib:.2f} GiB "
+                    f"(system free {sys_available / gib:.2f} GiB)\n"
+                    f"    KV cache resident       : {resident_kv_bytes / gib:.2f} GiB "
+                    f"(leaves {activation_headroom / gib:.2f} GiB for prefill)\n"
+                    f"    KV per token slot       : {bytes_per_slot} B "
+                    f"({num_layers}L x {n_kv_heads}kv x {head_dim}d x 2 x {dtype.size}B)\n"
+                    "  Options:\n"
+                    f"{remedy_text}"
+                    "  Or set --max-total-tokens explicitly (advanced)."
+                )
+            # Clamp to the context: a chunk larger than the context never chunks.
+            self._max_safe_prefill_chunk = min(
+                max(safe_chunk, _MLX_MIN_PREFILL_CHUNK), context_length
+            )
+        else:
+            self._max_safe_prefill_chunk = None
+
+        logger.info(
+            f"Auto-sized attention KV pool: "
+            f"sys_available={sys_available / gib:.2f} GB, "
+            f"mlx_limit={mlx_limit / gib:.1f} GB, mlx_used={mlx_used / gib:.2f} GB, "
+            f"dynamic_budget={dynamic_budget / gib:.2f} GB, "
+            f"bytes_per_slot={bytes_per_slot}, pool_size={pool_size}, "
+            f"resident_kv={resident_kv_bytes / gib:.2f} GB, "
+            f"activation_headroom={activation_headroom / gib:.2f} GB, "
+            f"act_cost={per_tok_ctx}B/tok-ctx, need_slots={need_slots}, "
+            f"startup_safe_prefill_chunk={self._max_safe_prefill_chunk} "
+            f"(refined by in-server probe)"
+        )
+        return pool_size
+
+    def _auto_pool_size(self, explicit_size: int | None) -> int:
+        """Prior radix-on pool sizing: auto-size from available memory, no chunk cap.
+
+        Retained unchanged for the radix-on path (see ``_compute_pool_size``): the greedy
+        shared pool's memory profile differs from the radix-off private caches the
+        chunk-sizing model assumes, so radix-on keeps its original behaviour and is not
+        gated by the prefill-chunk cap.
+        """
         if explicit_size is not None:
             return explicit_size
         n_kv_heads, head_dim, dtype = self._get_attn_config()
@@ -564,9 +801,9 @@ class MlxModelRunner:
             int(sys_available * self._mem_fraction_static),
         )
         bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * dtype.size
-        pool_size = max(kv_budget // bytes_per_slot, 256)
+        pool_size = max(kv_budget // bytes_per_slot, _MLX_MIN_POOL_SLOTS)
         logger.info(
-            f"Auto-sized attention KV pool: "
+            f"Auto-sized attention KV pool (radix on): "
             f"sys_available={sys_available / (1024**3):.2f} GB, "
             f"mlx_limit={mlx_limit / (1024**3):.1f} GB, "
             f"mlx_used={mlx_used / (1024**3):.2f} GB, "
@@ -578,6 +815,324 @@ class MlxModelRunner:
     @property
     def pool_size(self) -> int:
         return self._pool_size
+
+    @property
+    def max_running_requests(self) -> int | None:
+        """Memory-safe scheduler concurrency cap, read by the stub so the scheduler never
+        admits more concurrent requests than the working set can hold. None means defer to
+        the stub's pool-derived heuristic (radix-on / no auto-sizing)."""
+        return self._effective_max_running
+
+    @property
+    def max_safe_prefill_chunk(self) -> int | None:
+        """Largest prefill chunk (tokens) that keeps activations within the Metal
+        working set, or None when not auto-derived (radix on, or no context length)."""
+        return self._max_safe_prefill_chunk
+
+    @staticmethod
+    def _safe_prefill_chunk_tokens(
+        activation_headroom_bytes: int,
+        per_tok_ctx: int,
+        context_length: int | None,
+        safety: float = _MLX_PREFILL_SAFETY,
+    ) -> int:
+        """Largest chunk whose worst-case transient fits the activation headroom.
+
+        The worst forward is the last chunk of a full-context prompt (its tokens attend to
+        ~context_length resident), so transient ~= per_tok_ctx * chunk * context_length.
+        Shared by the startup estimate and the probe.
+        """
+        per_token = per_tok_ctx * max(context_length or 0, 0)
+        if per_token <= 0:
+            return 0
+        return int(max(activation_headroom_bytes, 0) * safety / per_token)
+
+    def _memory_safe_max_running(
+        self,
+        dynamic_budget: int,
+        per_cache_bytes: int,
+        per_tok_ctx: int,
+        context_length: int | None,
+    ) -> int:
+        """Resolve the radix-off scheduler concurrency cap.
+
+        Honors an explicit ``--max-running-requests``. Otherwise defaults to the most
+        requests whose private caches (plus the overlap pipeline's ``_MLX_PIPELINE_CACHE_SLACK``
+        spare caches) still leave a ``_MLX_MIN_PREFILL_CHUNK`` prefill's activation headroom --
+        the inverse of the chunk-sizing math, so the cap and the chunk stay consistent. Each
+        radix-off cache is a fixed ``per_cache_bytes`` regardless of prompt length, so this is
+        what stops many short concurrent requests from overflowing the working set. Floors at 1.
+        """
+        if self._max_running_requests is not None:
+            return max(self._max_running_requests, 1)
+        if context_length is None or per_cache_bytes <= 0 or per_tok_ctx <= 0:
+            return 1
+        # Activation a minimum useful chunk needs (inverse of _safe_prefill_chunk_tokens).
+        act_min = (
+            _MLX_MIN_PREFILL_CHUNK * per_tok_ctx * context_length / _MLX_PREFILL_SAFETY
+        )
+        fit = (
+            int((dynamic_budget - act_min) // per_cache_bytes)
+            - _MLX_PIPELINE_CACHE_SLACK
+        )
+        return max(fit, 1)
+
+    @staticmethod
+    def _gpu_headroom_bytes(mlx_limit: int, mlx_used: int, sys_available: int) -> int:
+        """GPU bytes allocatable above current usage: the working-set limit, but never
+        more than real free system memory (the limit is only a no-pressure recommendation,
+        so budgeting against it alone lets a prefill overflow under external pressure).
+        Shared by startup sizing and the runtime admission gate.
+        """
+        return max(min(mlx_limit, mlx_used + sys_available) - mlx_used, 0)
+
+    def _live_prefill_headroom_bytes(self) -> int:
+        """GPU headroom for prefill activations right now, from live device + system
+        memory (reflects pressure that appeared after startup; live active already counts
+        the resident KV)."""
+        mlx_limit = mx.device_info().get(
+            "max_recommended_working_set_size",
+            mx.device_info().get("memory_size", 0),
+        )
+        return self._gpu_headroom_bytes(
+            mlx_limit, mx.get_active_memory(), psutil.virtual_memory().available
+        )
+
+    def _prefill_new_cache_bytes(self) -> int:
+        """Bytes a newly admitted radix-off prefill will allocate for its private full-span
+        cache. Zero when radix is on (shared pool) or when a finished cache can be reused (it
+        is already resident, hence already counted in live active memory). For short prompts
+        this fixed cost dominates the activation transient, so the admission gate must include
+        it or it will admit a request whose cache allocation then overflows the working set.
+        """
+        if not self.disable_radix_cache or self._cache_pool:
+            return 0
+        return self._radix_off_cache_bytes
+
+    def prefill_fits_live_memory(
+        self, new_tokens: int, resident_ctx: int
+    ) -> tuple[bool, int, int]:
+        """Whether a prefill chunk fits the live GPU headroom, re-checked at the last
+        instant before a forward so external pressure that eroded the startup margin turns
+        into an up-front rejection instead of an uncatchable OOM. Uses the probe-measured
+        per-(token x ctx) cost plus the fixed per-request cache the prefill will allocate.
+
+        Returns ``(fits, estimate_bytes, headroom_bytes)``; admits when the cost is unknown
+        (no calibration to act on).
+        """
+        per_tok_ctx = self._prefill_act_per_tok_ctx
+        if per_tok_ctx <= 0:
+            return True, 0, 0
+        estimate = (
+            per_tok_ctx * max(new_tokens, 0) * max(resident_ctx, 0)
+            + self._prefill_new_cache_bytes()
+        )
+        headroom = self._live_prefill_headroom_bytes()
+        return estimate <= headroom, estimate, headroom
+
+    def live_safe_prefill_chunk(self) -> int | None:
+        """Largest prefill chunk that fits live GPU headroom now (None if no auto-derived
+        cap: radix on / uncalibrated). Same formula, measured cost, and full-context span as
+        the startup cap and the gate, so it stays safe; exceeds the static cap only under
+        light load. Floors at ``_MLX_MIN_PREFILL_CHUNK``, caps at ``context_length``.
+        """
+        context_length = self._context_length
+        if (
+            self._max_safe_prefill_chunk is None
+            or self._prefill_act_per_tok_ctx <= 0
+            or not context_length
+        ):
+            return None
+        # TODO: a per-request prompt-length span would be tighter (needs per-request sizing).
+        # Subtract the cache a fresh prefill allocates, like the admission gate does.
+        headroom = self._live_prefill_headroom_bytes() - self._prefill_new_cache_bytes()
+        dyn = self._safe_prefill_chunk_tokens(
+            headroom, self._prefill_act_per_tok_ctx, context_length
+        )
+        return min(max(dyn, _MLX_MIN_PREFILL_CHUNK), context_length)
+
+    def _calibrate_prefill_chunk(self) -> None:
+        """Measure the real prefill footprint in-server and refine the chunk cap.
+
+        Startup sizing snapshots memory before any forward runs, so it undercounts the
+        steady-state resident KV: with radix off each request holds a private cache and
+        finished caches stay pooled, so the resident set is the running set plus the
+        overlap pipeline's caches (several hundred MiB the snapshot cannot see). That
+        undercount is what lets the chunk grow large enough to overflow the working set.
+
+        After load but before serving, allocate that steady-state cache set and read the
+        resident baseline, then replay a chunked prefill on the last cache to read the
+        worst single-forward peak. Size the chunk against the measured baseline (the fix)
+        using the conservative cost (max of startup model and measured transient) so a
+        baseline error cannot push the peak over the edge; store the measured transient
+        for the admission gate so it does not over-reject.
+
+        Safety: caches are materialised incrementally and stop if active nears the limit
+        (the box cannot hold the resident set -> fail loudly); the replay uses a small
+        chunk far from the edge; the wired limit is untouched; any measurement failure
+        keeps the startup estimate (the probe degrades, never wedges startup).
+        """
+        context_length = self._context_length
+        if (
+            context_length is None
+            or self.model is None
+            or self._max_safe_prefill_chunk is None
+        ):
+            return  # no auto-derived chunk cap to refine (e.g. radix on / explicit pool)
+
+        mlx_limit = mx.device_info().get(
+            "max_recommended_working_set_size",
+            mx.device_info().get("memory_size", 0),
+        )
+        if mlx_limit <= 0:
+            logger.warning(
+                "MLX prefill probe skipped: no device working-set limit reported; "
+                "keeping startup chunk estimate %s.",
+                self._max_safe_prefill_chunk,
+            )
+            return
+
+        running = max(self._effective_max_running or 1, 1)
+        target_caches = running + _MLX_PIPELINE_CACHE_SLACK
+        chunk_probe = max(min(_MLX_PROBE_CHUNK, context_length), 1)
+        ctx_target = min(context_length, _MLX_PROBE_MAX_CONTEXT)
+        try:
+            baseline, peak, ctx_reached, held = self._run_prefill_probe(
+                chunk_probe, ctx_target, target_caches, mlx_limit
+            )
+        except Exception as exc:  # GPU / model error -> keep the startup estimate
+            logger.warning(
+                "MLX prefill probe failed (%s: %s); keeping startup chunk estimate %s.",
+                type(exc).__name__,
+                exc,
+                self._max_safe_prefill_chunk,
+            )
+            return
+
+        gib = 1024**3
+        transient = max(peak - baseline, 0)
+        score_cells = chunk_probe * max(ctx_reached, 1)
+        # A real prefill must show a positive, non-trivial transient; if it does not, the
+        # lazy graph likely was not forced -> distrust the measurement, keep the estimate.
+        if transient < (1 << 20) or score_cells <= 0:
+            logger.warning(
+                "MLX prefill probe inconclusive (transient=%.3f GB over %d cells); "
+                "keeping startup chunk estimate %s.",
+                transient / gib,
+                score_cells,
+                self._max_safe_prefill_chunk,
+            )
+            return
+
+        # Ceil; measuring at ctx_reached (<= context_length) over-estimates the full-context
+        # cost, so extrapolation below stays conservative.
+        measured_per_tok_ctx = -(-transient // score_cells)
+        # Sizing uses the conservative cost; admission uses the measured one.
+        startup_per_tok_ctx = self._prefill_act_per_tok_ctx
+        sizing_per_tok_ctx = max(startup_per_tok_ctx, measured_per_tok_ctx)
+        sys_available = psutil.virtual_memory().available
+        headroom = self._gpu_headroom_bytes(mlx_limit, baseline, sys_available)
+        safe = self._safe_prefill_chunk_tokens(
+            headroom, sizing_per_tok_ctx, context_length
+        )
+
+        if held < target_caches or safe < _MLX_PROBE_FLOOR_CHUNK:
+            raise RuntimeError(
+                "MLX cannot serve this context: the measured resident footprint leaves "
+                "too little GPU working set for even a minimum prefill.\n"
+                f"  measured baseline ({held} resident KV cache(s) + runtime): "
+                f"{baseline / gib:.2f} GiB\n"
+                f"  Metal working-set limit                  : {mlx_limit / gib:.2f} GiB\n"
+                f"  live headroom for prefill                : {headroom / gib:.2f} GiB\n"
+                f"  largest safe prefill chunk               : {safe} tokens "
+                f"(need >= {_MLX_PROBE_FLOOR_CHUNK}; held {held}/{target_caches} caches)\n"
+                "  Use a smaller / more-quantized model, a shorter --context-length, or "
+                "a machine with more unified memory."
+            )
+
+        startup_chunk = self._max_safe_prefill_chunk
+        refined = min(max(safe, _MLX_PROBE_FLOOR_CHUNK), context_length)
+        # Never relax above the conservative startup estimate (the probe grows only its
+        # last cache, so it can under-count for context_length beyond the cache span).
+        if startup_chunk is not None:
+            refined = min(refined, startup_chunk)
+        self._max_safe_prefill_chunk = refined
+        self._prefill_act_per_tok_ctx = int(measured_per_tok_ctx)
+        logger.info(
+            "MLX prefill probe: baseline=%.3f GB (%d caches) peak=%.3f GB "
+            "(chunk_probe=%d x ctx=%d) measured_act=%dB/tok-ctx "
+            "(startup model %dB/tok-ctx; sizing used %dB) limit=%.2f GB headroom=%.2f GB; "
+            "max_safe_prefill_chunk %s -> %d",
+            baseline / gib,
+            held,
+            peak / gib,
+            chunk_probe,
+            ctx_reached,
+            measured_per_tok_ctx,
+            startup_per_tok_ctx,
+            sizing_per_tok_ctx,
+            mlx_limit / gib,
+            headroom / gib,
+            startup_chunk,
+            refined,
+        )
+
+    def _run_prefill_probe(
+        self, chunk_probe: int, ctx_target: int, target_caches: int, mlx_limit: int
+    ) -> tuple[int, int, int, int]:
+        """Measure the steady-state resident baseline and worst prefill transient.
+
+        Allocates ``target_caches`` private caches (the resident KV the overlap scheduler /
+        pool hold at steady state) via one-token forwards, then replays a chunked prefill
+        on the last cache up to ``ctx_target`` for the worst single-forward peak. Returns
+        ``(baseline, peak, ctx_reached, caches_held)``.
+
+        Allocation stops if active reaches within ``_MLX_PROBE_HEADROOM_BYTES`` of the
+        limit, so the probe never risks the OOM; ``caches_held < target_caches`` then means
+        the box cannot hold the resident set (the caller fails loudly). Probe caches are
+        discarded afterwards.
+        """
+        safe_ceiling = max(mlx_limit - _MLX_PROBE_HEADROOM_BYTES, 0)
+        caches: list[list[Any]] = []
+
+        def forward_chunk(cache: list[Any], start: int, n: int) -> None:
+            # Varied (valid) ids so MoE routing exercises many experts, not just one.
+            input_ids = mx.array(
+                [[(start + i) % 1024 for i in range(n)]], dtype=mx.int32
+            )
+            logits = self._extract_logits(self.model(input_ids, cache=cache))
+            self._eval_with_cache(mx.argmax(logits[:, -1, :], axis=-1), cache)
+
+        try:
+            mx.reset_peak_memory()
+            weights_before = mx.get_active_memory()
+            # 1. Materialise the steady-state resident cache set.
+            for _ in range(target_caches):
+                cache = self._new_native_cache()
+                forward_chunk(cache, 0, 1)  # 1 token -> allocates the full-span cache
+                caches.append(cache)
+                if mx.get_active_memory() >= safe_ceiling:
+                    break  # cannot hold the full resident set on this box
+            baseline = mx.get_active_memory()
+            # Refine the per-request cache cost from the real allocation (the analytic
+            # bytes_per_slot is conservative); the admission gate uses the measured value.
+            if self.disable_radix_cache and caches:
+                measured_cache = int((baseline - weights_before) / len(caches))
+                if measured_cache > 0:
+                    self._radix_off_cache_bytes = measured_cache
+            # 2. Worst single-forward transient: grow the last cache to ctx_target.
+            last = caches[-1]
+            mx.reset_peak_memory()
+            offset = self._first_attention_cache(last).offset
+            while offset < ctx_target and mx.get_peak_memory() < safe_ceiling:
+                n = min(chunk_probe, ctx_target - offset)
+                forward_chunk(last, offset, n)
+                offset += n
+            peak = max(mx.get_peak_memory(), baseline)
+            return baseline, peak, offset, len(caches)
+        finally:
+            del caches
+            mx.clear_cache()
 
     def _build_aot_kernels(self) -> MlxAOTKernelSet:
         """Build model-level set of optional registered AOT kernels."""
