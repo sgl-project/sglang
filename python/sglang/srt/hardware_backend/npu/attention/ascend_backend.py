@@ -19,10 +19,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
-from sglang.srt.layers.attention.base_attn_backend import (
-    AttentionBackend,
-    VerifyBuffersToFill,
-)
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
@@ -399,14 +396,6 @@ class AscendAttnBackend(AttentionBackend):
         d = layer.qk_head_dim
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
-
-    def get_verify_buffers_to_fill_after_draft(self) -> VerifyBuffersToFill:
-        """
-        Return buffers for verify attention kernels that needs to be filled after draft.
-
-        Typically, these are tree mask and position buffers.
-        """
-        return VerifyBuffersToFill()
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]

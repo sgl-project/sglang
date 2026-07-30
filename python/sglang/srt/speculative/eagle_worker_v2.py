@@ -1238,10 +1238,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         retrieve_next_sibling = torch.full((bs, 1), -1, dtype=torch.long, device=device)
 
         attn_backend = self._target_worker.model_runner.attn_backend
-        verify_buffers = attn_backend.get_verify_buffers_to_fill_after_draft()
-        mask_buf, position_buf = verify_buffers.tree_mask, verify_buffers.positions
-        if mask_buf is not None:
-            custom_mask = mask_buf
+        verify_tree_mask = attn_backend.verify_tree_mask
+        if verify_tree_mask is not None:
+            custom_mask = verify_tree_mask.buffer
             custom_mask.fill_(True)
         else:
             if batch.seq_lens_sum is not None:
@@ -1252,11 +1251,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 seq_lens_sum = bs * attn_backend.max_context_len
             custom_mask = torch.ones(seq_lens_sum + bs, dtype=torch.bool, device=device)
 
-        if position_buf is not None:
-            positions = position_buf
-            positions[:bs].copy_(batch.seq_lens)
-        else:
-            positions = batch.seq_lens.to(torch.int64)
+        positions = batch.seq_lens.to(torch.int64)
 
         return EagleVerifyInput(
             draft_token=draft_input.bonus_tokens,

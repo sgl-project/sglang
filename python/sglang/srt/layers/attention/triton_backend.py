@@ -20,9 +20,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import (
-    AttentionBackend,
-    VerifyBuffersToFill,
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.verify_tree_mask import (
+    VerifyTreeMask,
+    maybe_create_verify_tree_mask,
 )
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
@@ -297,7 +298,8 @@ class TritonAttnBackend(AttentionBackend):
 
         self.forward_metadata: ForwardMetadata = None
 
-        self.cuda_graph_custom_mask = None
+        # Allocated in init_cuda_graph_state; see VerifyTreeMask.
+        self._verify_tree_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
@@ -496,7 +498,11 @@ class TritonAttnBackend(AttentionBackend):
                     window_kv_indices=window_kv_indices,
                 )
             )
-        custom_mask = self.cuda_graph_custom_mask
+        custom_mask = (
+            self._verify_tree_mask.buffer
+            if self._verify_tree_mask is not None
+            else None
+        )
         if (
             spec_info is not None
             and getattr(spec_info, "custom_mask", None) is not None
@@ -991,12 +997,19 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
-        if not self.skip_prefill and not self.is_draft_runner:
-            self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.uint8,
-                device=self.device,
-            )
+        # Triton's mask layout is num_draft_tokens * (seq_len + num_draft_tokens)
+        # per request (see the seq_mask_len cumsum below), i.e. the same bound
+        # the shared FULL_MASK sizing covers. It reads the mask via uint8.
+        self._verify_tree_mask = maybe_create_verify_tree_mask(
+            is_draft_runner=self.is_draft_runner,
+            skip_prefill=self.skip_prefill,
+            max_num_tokens=max_num_tokens,
+            max_context_len=self.max_context_len,
+            num_draft_tokens=self.num_draft_tokens,
+            device=self.device,
+            is_read=True,
+            dtype=torch.uint8,
+        )
 
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             if kv_indices_buf is None:
@@ -1079,8 +1092,9 @@ class TritonAttnBackend(AttentionBackend):
             )
         elif forward_mode.is_target_verify():
             custom_mask = (
-                self.cuda_graph_custom_mask
-                if spec_info is not None
+                self._verify_tree_mask.buffer
+                if self._verify_tree_mask is not None
+                and spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
                 else None
             )
@@ -1174,13 +1188,9 @@ class TritonAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
-    def get_verify_buffers_to_fill_after_draft(self) -> VerifyBuffersToFill:
-        """
-        Return buffers for verify attention kernels that needs to be filled after draft.
-
-        Typically, these are tree mask and position buffers.
-        """
-        return VerifyBuffersToFill(tree_mask=self.cuda_graph_custom_mask)
+    @property
+    def verify_tree_mask(self) -> Optional[VerifyTreeMask]:
+        return self._verify_tree_mask
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]

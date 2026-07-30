@@ -343,11 +343,9 @@ def build_eagle_verify_input(
         )
 
     # Build tree mask
-    # Directly write to cuda graph buffers for verify attn
-    verify_buffers = (
-        target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
-    )
-    tree_mask_buf, position_buf = verify_buffers.tree_mask, verify_buffers.positions
+    # Directly write to the verify attn scratch when the backend owns one
+    verify_tree_mask = target_worker.model_runner.attn_backend.verify_tree_mask
+    tree_mask_buf = verify_tree_mask.buffer if verify_tree_mask is not None else None
 
     # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
     # tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
@@ -379,8 +377,7 @@ def build_eagle_verify_input(
         num_draft_tokens,
         tree_mask_mode,
         tree_mask_buf,
-        position_buf,
-        fill_prefix_mask=verify_buffers.tree_mask_is_read,
+        fill_prefix_mask=verify_tree_mask is None or verify_tree_mask.is_read,
     )
 
     return EagleVerifyInput(

@@ -2,11 +2,9 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.layers.attention.base_attn_backend import (
-    AttentionBackend,
-    VerifyBuffersToFill,
-)
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.verify_tree_mask import VerifyTreeMask
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -109,10 +107,9 @@ class HybridAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
 
-    def get_verify_buffers_to_fill_after_draft(self) -> VerifyBuffersToFill:
-        return self._select_backend(
-            ForwardMode.TARGET_VERIFY
-        ).get_verify_buffers_to_fill_after_draft()
+    @property
+    def verify_tree_mask(self) -> Optional[VerifyTreeMask]:
+        return self._select_backend(ForwardMode.TARGET_VERIFY).verify_tree_mask
 
     def forward(
         self,

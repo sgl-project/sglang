@@ -31,10 +31,13 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import VerifyBuffersToFill
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
+)
+from sglang.srt.layers.attention.verify_tree_mask import (
+    VerifyTreeMask,
+    maybe_create_verify_tree_mask,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -242,7 +245,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
-        self.cuda_graph_custom_mask = None
+        # Allocated in init_cuda_graph_state; see VerifyTreeMask.
+        self._verify_tree_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
@@ -357,19 +361,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
-        if self.num_draft_tokens and not self.skip_prefill and not self.is_draft_runner:
-            # Worst-case FULL_MASK tree-mask scratch (bool); build_tree writes it
-            # in-place so the gpu_only path needs no seq_lens_sum.
-            self.cuda_graph_custom_mask = torch.zeros(
-                max_num_tokens * (self.max_context_len + self.num_draft_tokens),
-                dtype=torch.bool,
-                device=self.device,
-            )
+        self._verify_tree_mask = maybe_create_verify_tree_mask(
+            is_draft_runner=self.is_draft_runner,
+            skip_prefill=self.skip_prefill,
+            max_num_tokens=max_num_tokens,
+            max_context_len=self.max_context_len,
+            num_draft_tokens=self.num_draft_tokens,
+            device=self.device,
+            is_read=True,
+        )
 
         super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 
-    def get_verify_buffers_to_fill_after_draft(self) -> VerifyBuffersToFill:
-        return VerifyBuffersToFill(tree_mask=self.cuda_graph_custom_mask)
+    @property
+    def verify_tree_mask(self) -> Optional[VerifyTreeMask]:
+        return self._verify_tree_mask
 
     def _init_cuda_graph_metadata(
         self,
