@@ -418,16 +418,13 @@ def mhc_pre_gemm_sqrsum_tilelang(
 def _mhc_pre_gemm_sqrsum_dispatch():
     """SM120's TileLang pipeline cannot warp-specialize this kernel (the role
     marker fails on tirx.Bind), so re-wrap it there with warp specialization
-    and TMA lowering disabled. Other archs keep the original compiled form."""
+    disabled. Other archs keep the original compiled form."""
     from sglang.srt.utils import is_sm120_supported
 
     if not is_sm120_supported():
         return mhc_pre_gemm_sqrsum_tilelang
     _tl = _load_tilelang()
-    cfg = {
-        _tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        _tl.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-    }
+    cfg = {_tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
     return _tl.jit(pass_configs=cfg)(mhc_pre_gemm_sqrsum_tilelang.__wrapped__)
 
 
@@ -457,10 +454,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
     # See _mhc_pre_gemm_sqrsum_dispatch: SM120 cannot compile the
     # warp-specialized form of these kernels.
     _cfg = (
-        {
-            _tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-            _tl.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        }
+        {_tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
         if is_sm120_supported()
         else None
     )
