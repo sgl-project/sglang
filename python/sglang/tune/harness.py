@@ -14,10 +14,11 @@ are what home-grown benchmarks get wrong:
 Mock path: a deterministic, GPU-free latency model with a realistic crossover, so the
 whole selection pipeline is testable and the picks are assertable.
 """
+
 from __future__ import annotations
 
 import dataclasses
-from typing import Callable, Optional
+from typing import Callable
 
 from .shapes import AttnProfile, DecodeShape, PrefillShape
 
@@ -30,15 +31,21 @@ class BenchResult:
     p80_us: float
 
     @classmethod
-    def constant(cls, us: float) -> "BenchResult":
+    def constant(cls, us: float) -> BenchResult:
         return cls(us, us, us, us)
 
 
-L2_FLUSH_BYTES = 256 * 1024 * 1024  # Triton do_bench convention (a knob; NVBench queries actual L2)
+L2_FLUSH_BYTES = (
+    256 * 1024 * 1024
+)  # Triton do_bench convention (a knob; NVBench queries actual L2)
 
 
-def do_bench(fn: Callable[[], None], warmup_ms: float = 25.0, rep_ms: float = 100.0,
-             use_cuda_graph: bool = False) -> BenchResult:  # pragma: no cover - real GPU only
+def do_bench(
+    fn: Callable[[], None],
+    warmup_ms: float = 25.0,
+    rep_ms: float = 100.0,
+    use_cuda_graph: bool = False,
+) -> BenchResult:  # pragma: no cover - real GPU only
     """do_bench-faithful timing. Only runs on a real CUDA device."""
     import torch
 
@@ -67,11 +74,11 @@ def do_bench(fn: Callable[[], None], warmup_ms: float = 25.0, rep_ms: float = 10
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(n_rep)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(n_rep)]
     for i in range(n_rep):
-        flush.zero_()                 # cold inputs each run
+        flush.zero_()  # cold inputs each run
         starts[i].record()
         fn()
         ends[i].record()
-    torch.cuda.synchronize()          # single trailing sync
+    torch.cuda.synchronize()  # single trailing sync
     times = sorted(s.elapsed_time(e) * 1000.0 for s, e in zip(starts, ends))  # -> us
     return _quantiles(times)
 
@@ -79,15 +86,20 @@ def do_bench(fn: Callable[[], None], warmup_ms: float = 25.0, rep_ms: float = 10
 def _quantiles(times_us: list) -> BenchResult:
     n = len(times_us)
     pick = lambda q: times_us[min(n - 1, int(q * n))]
-    return BenchResult(median_us=pick(0.5), min_us=times_us[0], p20_us=pick(0.2), p80_us=pick(0.8))
+    return BenchResult(
+        median_us=pick(0.5), min_us=times_us[0], p20_us=pick(0.2), p80_us=pick(0.8)
+    )
 
 
-GRAPH_ITERS = 32   # unrolled calls captured per graph — amortizes the replay-launch cost
-GRAPH_SANITY_FLOOR_US = 0.5   # below this per-iter median, graph timing is fantasy — fall back
+GRAPH_ITERS = 32  # unrolled calls captured per graph — amortizes the replay-launch cost
+GRAPH_SANITY_FLOOR_US = (
+    0.5  # below this per-iter median, graph timing is fantasy — fall back
+)
 
 
-def _do_bench_cudagraph(fn: Callable[[], None], rep_ms: float = 100.0
-                        ) -> BenchResult:  # pragma: no cover - real GPU only
+def _do_bench_cudagraph(
+    fn: Callable[[], None], rep_ms: float = 100.0
+) -> BenchResult:  # pragma: no cover - real GPU only
     """do_bench_cudagraph-style timing for launch-overhead-bound kernels (tiny decode).
 
     Captures GRAPH_ITERS unrolled calls into one CUDA graph, then times whole-graph
@@ -98,7 +110,7 @@ def _do_bench_cudagraph(fn: Callable[[], None], rep_ms: float = 100.0
     """
     import torch
 
-    fn()                                  # warm: JIT/backend selection settles pre-capture
+    fn()  # warm: JIT/backend selection settles pre-capture
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
@@ -107,9 +119,11 @@ def _do_bench_cudagraph(fn: Callable[[], None], rep_ms: float = 100.0
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    start.record(); g.replay(); end.record()
+    start.record()
+    g.replay()
+    end.record()
     torch.cuda.synchronize()
-    est = max(1e-3, start.elapsed_time(end))          # ms per replay
+    est = max(1e-3, start.elapsed_time(end))  # ms per replay
     n_rep = max(1, int(rep_ms / est))
 
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(n_rep)]
@@ -118,18 +132,21 @@ def _do_bench_cudagraph(fn: Callable[[], None], rep_ms: float = 100.0
         starts[i].record()
         g.replay()
         ends[i].record()
-    torch.cuda.synchronize()              # single trailing sync
-    times = sorted(s.elapsed_time(e) * 1000.0 / GRAPH_ITERS
-                   for s, e in zip(starts, ends))     # -> us per iteration
+    torch.cuda.synchronize()  # single trailing sync
+    times = sorted(
+        s.elapsed_time(e) * 1000.0 / GRAPH_ITERS for s, e in zip(starts, ends)
+    )  # -> us per iteration
     result = _quantiles(times)
     if result.median_us < GRAPH_SANITY_FLOOR_US:
         # Physically implausible: no attention kernel completes in sub-half-microsecond.
         # Seen on virtualized/intercepted CUDA stacks (GPU-over-TCP) where graph replay
         # returns without observably executing the captured work. Discard and cross-check
         # with the eager path rather than report fantasy numbers.
-        print(f"[attune] WARNING: graph-mode timing implausible "
-              f"({result.median_us:.4f} us/iter < {GRAPH_SANITY_FLOOR_US}); "
-              "falling back to eager do_bench for this shape.")
+        print(
+            f"[attune] WARNING: graph-mode timing implausible "
+            f"({result.median_us:.4f} us/iter < {GRAPH_SANITY_FLOOR_US}); "
+            "falling back to eager do_bench for this shape."
+        )
         return do_bench(fn, use_cuda_graph=False)
     return result
 
@@ -142,13 +159,22 @@ def _do_bench_cudagraph(fn: Callable[[], None], rep_ms: float = 100.0
 #     FlashInfer wins low-batch decode and FA3 only catches up at large batch.
 #   * prefill is compute-bound; FA3 wins on Hopper, FlashInfer wins very-long-seq.
 #   * triton is a correct-but-slow floor.
-_BASE = {"fa3": 40.0, "fa4": 38.0, "flashinfer": 44.0, "trtllm_mha": 39.0,
-         "flashmla": 41.0, "cutlass_mla": 43.0, "trtllm_mla": 40.0,
-         "triton": 90.0, "torch_native": 300.0}
+_BASE = {
+    "fa3": 40.0,
+    "fa4": 38.0,
+    "flashinfer": 44.0,
+    "trtllm_mha": 39.0,
+    "flashmla": 41.0,
+    "cutlass_mla": 43.0,
+    "trtllm_mla": 40.0,
+    "triton": 90.0,
+    "torch_native": 300.0,
+}
 
 
-def mock_decode_latency(backend: str, shape: DecodeShape, profile: AttnProfile,
-                        bandwidth_divergent: bool) -> float:
+def mock_decode_latency(
+    backend: str, shape: DecodeShape, profile: AttnProfile, bandwidth_divergent: bool
+) -> float:
     base = _BASE.get(backend, 100.0)
     us = base + 0.12 * shape.batch + 0.0009 * shape.ctx_len
     # Compute-tile kernels (FA3/FA4) round a decode query up to a 128-row tile, wasting work
@@ -164,13 +190,15 @@ def mock_decode_latency(backend: str, shape: DecodeShape, profile: AttnProfile,
     return us
 
 
-def mock_prefill_latency(backend: str, shape: PrefillShape, profile: AttnProfile) -> float:
+def mock_prefill_latency(
+    backend: str, shape: PrefillShape, profile: AttnProfile
+) -> float:
     base = _BASE.get(backend, 100.0)
     us = base + 0.02 * shape.seq_len * shape.batch
     if backend == "fa3":
-        us *= 0.90                                   # compute-bound Hopper win
+        us *= 0.90  # compute-bound Hopper win
         if shape.seq_len >= 32768:
-            us *= 1.25                               # loses at very long seq
+            us *= 1.25  # loses at very long seq
     if backend == "flashinfer" and shape.seq_len >= 32768:
         us *= 0.85
     return us

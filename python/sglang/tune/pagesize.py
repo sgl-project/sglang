@@ -13,6 +13,7 @@ those backends, not as a global axis.
 
 Values mirror SGLang main (verify against the current ``overrides.py`` before landing).
 """
+
 from __future__ import annotations
 
 from typing import List
@@ -25,8 +26,8 @@ PAGE_SIZE_TABLE = {
     "tokenspeed_mla": [32, 64],
     "cutedsl_mla": [32, 64],
     "trtllm_mha": [16, 32, 64],
-    "fa4": [128],          # non-MLA fa4 path
-    "hpc_ops": [64],       # SM90 only
+    "fa4": [128],  # non-MLA fa4 path
+    "hpc_ops": [64],  # SM90 only
 }
 # Backends with no hard snap fall back to the engine default (commonly 1 for paged decode).
 DEFAULT_PAGE_SIZE = 1

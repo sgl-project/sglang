@@ -5,6 +5,7 @@ Attune's per-device files are byte-compatible with the existing MoE tuned-config
 ecosystem. In ``--mock`` mode the device is supplied by flag/env so the whole flow
 runs with no GPU.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -16,6 +17,7 @@ from typing import Optional
 def _driver_version() -> str:  # pragma: no cover - real GPU only
     try:
         import pynvml
+
         pynvml.nvmlInit()
         return pynvml.nvmlSystemGetDriverVersion()
     except Exception:
@@ -24,8 +26,8 @@ def _driver_version() -> str:  # pragma: no cover - real GPU only
 
 @dataclasses.dataclass(frozen=True)
 class DeviceInfo:
-    name: str          # canonical, e.g. "NVIDIA_H100_80GB_HBM3"
-    sm: int            # major*10 + minor, e.g. 90 for Hopper, 100 Blackwell, 120 RTX 5090
+    name: str  # canonical, e.g. "NVIDIA_H100_80GB_HBM3"
+    sm: int  # major*10 + minor, e.g. 90 for Hopper, 100 Blackwell, 120 RTX 5090
     is_hip: bool = False
     is_mps: bool = False
     # --- extended fingerprint inputs (guardrail #1) --------------------------------
@@ -35,11 +37,15 @@ class DeviceInfo:
     # NOT the committed-corpus filename key (which stays coarse and human-readable).
     cuda_version: str = "unknown"
     driver_version: str = "unknown"
-    sm_clock_max_mhz: int = 0          # max supported SM clock
-    sm_clock_limit_mhz: int = 0        # currently-applied/locked SM clock (changes when throttled)
-    power_limit_mw: int = 0            # applied power cap in milliwatts (changes with `nvidia-smi -pl`)
+    sm_clock_max_mhz: int = 0  # max supported SM clock
+    sm_clock_limit_mhz: int = (
+        0  # currently-applied/locked SM clock (changes when throttled)
+    )
+    power_limit_mw: int = (
+        0  # applied power cap in milliwatts (changes with `nvidia-smi -pl`)
+    )
     pcie_gen: int = 0
-    pcie_width: int = 0                # lanes, e.g. 16
+    pcie_width: int = 0  # lanes, e.g. 16
     l2_cache_bytes: int = 0
 
     @property
@@ -68,7 +74,9 @@ def _canonical(name: str) -> str:
     return re.sub(r"[\s/]+", "_", name.strip())
 
 
-def detect_device(mock_name: Optional[str] = None, mock_sm: Optional[int] = None) -> DeviceInfo:
+def detect_device(
+    mock_name: Optional[str] = None, mock_sm: Optional[int] = None
+) -> DeviceInfo:
     """Return the current device, or a mock one for CPU-only runs.
 
     Real path (guarded): torch.cuda.get_device_name / get_device_capability, plus
@@ -76,9 +84,15 @@ def detect_device(mock_name: Optional[str] = None, mock_sm: Optional[int] = None
     """
     mock_name = mock_name or os.environ.get("SGLANG_ATTUNE_MOCK_DEVICE")
     if mock_name is not None:
-        sm = mock_sm if mock_sm is not None else int(os.environ.get("SGLANG_ATTUNE_MOCK_SM", "90"))
+        sm = (
+            mock_sm
+            if mock_sm is not None
+            else int(os.environ.get("SGLANG_ATTUNE_MOCK_SM", "90"))
+        )
         return DeviceInfo(
-            name=_canonical(mock_name), sm=sm, is_hip=False,
+            name=_canonical(mock_name),
+            sm=sm,
+            is_hip=False,
             cuda_version=os.environ.get("SGLANG_ATTUNE_MOCK_CUDA", "12.4"),
             driver_version=os.environ.get("SGLANG_ATTUNE_MOCK_DRIVER", "550.00"),
             sm_clock_max_mhz=int(os.environ.get("SGLANG_ATTUNE_MOCK_SMCLK", "1980")),
@@ -100,17 +114,23 @@ def detect_device(mock_name: Optional[str] = None, mock_sm: Optional[int] = None
         sm_clk = sm_clk_limit = pwr_limit = pcie_gen = pcie_w = 0
         try:
             import pynvml
+
             pynvml.nvmlInit()
             h = pynvml.nvmlDeviceGetHandleByIndex(0)
             sm_clk = pynvml.nvmlDeviceGetMaxClockInfo(h, pynvml.NVML_CLOCK_SM)
             # Applied/locked clock and power cap — these MOVE when the GPU is throttled,
             # so the fingerprint re-tunes a power-limited box (guardrail #1).
             try:
-                mn, mx = pynvml.nvmlDeviceGetGpcClkVfOffset(h), None  # best-effort; not all drivers
+                mn, mx = (
+                    pynvml.nvmlDeviceGetGpcClkVfOffset(h),
+                    None,
+                )  # best-effort; not all drivers
             except Exception:
                 pass
             try:
-                sm_clk_limit = pynvml.nvmlDeviceGetApplicationsClock(h, pynvml.NVML_CLOCK_SM)
+                sm_clk_limit = pynvml.nvmlDeviceGetApplicationsClock(
+                    h, pynvml.NVML_CLOCK_SM
+                )
             except Exception:
                 sm_clk_limit = sm_clk
             try:
@@ -122,10 +142,16 @@ def detect_device(mock_name: Optional[str] = None, mock_sm: Optional[int] = None
         except Exception:
             pass
         return DeviceInfo(
-            name=_canonical(name), sm=major * 10 + minor, is_hip=False,
-            cuda_version=str(torch.version.cuda), driver_version=_driver_version(),
-            sm_clock_max_mhz=int(sm_clk), sm_clock_limit_mhz=int(sm_clk_limit),
-            power_limit_mw=int(pwr_limit), pcie_gen=int(pcie_gen), pcie_width=int(pcie_w),
+            name=_canonical(name),
+            sm=major * 10 + minor,
+            is_hip=False,
+            cuda_version=str(torch.version.cuda),
+            driver_version=_driver_version(),
+            sm_clock_max_mhz=int(sm_clk),
+            sm_clock_limit_mhz=int(sm_clk_limit),
+            power_limit_mw=int(pwr_limit),
+            pcie_gen=int(pcie_gen),
+            pcie_width=int(pcie_w),
             l2_cache_bytes=int(getattr(props, "l2_cache_size", 0)),
         )
     except Exception as e:  # no torch / no CUDA -> force mock

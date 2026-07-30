@@ -12,12 +12,13 @@
 Both carry ``schema_version`` in the body and are validated on load; both are size-neutral
 JSON written with ``json.dump(indent=2)`` — matching the MoE ``save_configs`` house style.
 """
+
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-from typing import Dict, Optional
+from typing import Dict
 
 from .device import DeviceInfo, _canonical
 from .shapes import AttnProfile
@@ -32,9 +33,14 @@ def config_filename(dev: DeviceInfo, profile: AttnProfile) -> str:
         f"device_name={_canonical(dev.name)}",
         f"sm={dev.sm}",
         f"family={k['family']}",
-        f"qo={k['qo']}", f"kv={k['kv']}", f"hd={k['hd']}",
-        f"dtype={k['dtype']}", f"kv_dtype={k['kv_dtype']}",
-        f"tp={k['tp']}", f"ep={k['ep']}", f"dp={k['dp']}",
+        f"qo={k['qo']}",
+        f"kv={k['kv']}",
+        f"hd={k['hd']}",
+        f"dtype={k['dtype']}",
+        f"kv_dtype={k['kv_dtype']}",
+        f"tp={k['tp']}",
+        f"ep={k['ep']}",
+        f"dp={k['dp']}",
     ]
     return "attn," + ",".join(parts) + ".json"
 
@@ -52,9 +58,14 @@ def fingerprint(dev: DeviceInfo, profile: AttnProfile) -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
-def build_config(dev: DeviceInfo, profile: AttnProfile,
-                 decode_body: Dict[str, dict], prefill_body: Dict[str, dict],
-                 skipped: Dict[str, str], provenance: dict) -> dict:
+def build_config(
+    dev: DeviceInfo,
+    profile: AttnProfile,
+    decode_body: Dict[str, dict],
+    prefill_body: Dict[str, dict],
+    skipped: Dict[str, str],
+    provenance: dict,
+) -> dict:
     """Assemble the schema-versioned config object (identical for both artifacts;
     only the on-disk key differs)."""
     return {
@@ -62,14 +73,16 @@ def build_config(dev: DeviceInfo, profile: AttnProfile,
         "fingerprint": fingerprint(dev, profile),
         "device": dev.fingerprint_inputs(),
         "profile": profile.key_fields(),
-        "provenance": provenance,          # git sha, attune version, measured_at (stamped by caller)
-        "decode": decode_body,             # "batch:ctxlen" -> {backend, page_size, latency_us}
-        "prefill": prefill_body,           # "batch:seqlen" -> {backend, latency_us}
-        "skipped": skipped,                # backend -> failure reason (self-documenting)
+        "provenance": provenance,  # git sha, attune version, measured_at (stamped by caller)
+        "decode": decode_body,  # "batch:ctxlen" -> {backend, page_size, latency_us}
+        "prefill": prefill_body,  # "batch:seqlen" -> {backend, latency_us}
+        "skipped": skipped,  # backend -> failure reason (self-documenting)
     }
 
 
-def save_committed(config_dir: str, dev: DeviceInfo, profile: AttnProfile, config: dict) -> str:
+def save_committed(
+    config_dir: str, dev: DeviceInfo, profile: AttnProfile, config: dict
+) -> str:
     os.makedirs(config_dir, exist_ok=True)
     path = os.path.join(config_dir, config_filename(dev, profile))
     with open(path, "w") as f:
@@ -87,5 +100,5 @@ def save_local_cache(cache_dir: str, config: dict) -> str:
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(config, f, indent=2)
-    os.replace(tmp, path)                  # atomic
+    os.replace(tmp, path)  # atomic
     return path

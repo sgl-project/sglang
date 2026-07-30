@@ -1,8 +1,11 @@
 import unittest
 
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.tune.candidates import candidate_backends
 from sglang.tune.device import DeviceInfo
 from sglang.tune.shapes import AttnProfile
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 MHA = AttnProfile(32, 8, 128, "bfloat16")
 MLA = AttnProfile(128, 128, 576, "bfloat16", is_mla=True)

@@ -18,6 +18,7 @@ Two guardrails are load-bearing:
     default. It never raises. A bad/stale/absent config only ever costs performance,
     never correctness.
 """
+
 from __future__ import annotations
 
 import functools
@@ -29,8 +30,13 @@ from typing import Dict, List, Optional, Tuple
 
 from .device import DeviceInfo
 from .pagesize import default_page_size
-from .shapes import (AttnProfile, DecodeShape, PrefillShape, parse_decode_key,
-                     parse_prefill_key)
+from .shapes import (
+    AttnProfile,
+    DecodeShape,
+    PrefillShape,
+    parse_decode_key,
+    parse_prefill_key,
+)
 from .writer import SCHEMA_VERSION, config_filename, fingerprint
 
 logger = logging.getLogger("sglang.attune")
@@ -46,14 +52,22 @@ def _load_json(path: str) -> Optional[dict]:
     except (OSError, json.JSONDecodeError):
         return None
     if cfg.get("schema_version") != SCHEMA_VERSION:
-        logger.warning("[attune] ignoring config with schema %s (expected %s): %s",
-                       cfg.get("schema_version"), SCHEMA_VERSION, path)
+        logger.warning(
+            "[attune] ignoring config with schema %s (expected %s): %s",
+            cfg.get("schema_version"),
+            SCHEMA_VERSION,
+            path,
+        )
         return None
     return cfg
 
 
-def get_attune_config(dev: DeviceInfo, profile: AttnProfile,
-                      packaged_dir: str, local_cache_dir: Optional[str] = None) -> Optional[dict]:
+def get_attune_config(
+    dev: DeviceInfo,
+    profile: AttnProfile,
+    packaged_dir: str,
+    local_cache_dir: Optional[str] = None,
+) -> Optional[dict]:
     """Return the tuned config for (device, profile), or None on miss (loud warning)."""
     fname = config_filename(dev, profile)
 
@@ -65,7 +79,9 @@ def get_attune_config(dev: DeviceInfo, profile: AttnProfile,
 
     if local_cache_dir:
         fp = fingerprint(dev, profile)
-        cfg = _load_json(os.path.join(local_cache_dir, SCHEMA_VERSION, dev.sm_tag, fp + ".json"))
+        cfg = _load_json(
+            os.path.join(local_cache_dir, SCHEMA_VERSION, dev.sm_tag, fp + ".json")
+        )
         if cfg:
             return cfg
 
@@ -73,9 +89,12 @@ def get_attune_config(dev: DeviceInfo, profile: AttnProfile,
     if cfg:
         return cfg
 
-    logger.warning("[attune] no tuned attention config for %s / %s. Using the built-in "
-                   "heuristic (performance may be sub-optimal). Run `sglang tune` to generate one.",
-                   dev.name, profile.family())
+    logger.warning(
+        "[attune] no tuned attention config for %s / %s. Using the built-in "
+        "heuristic (performance may be sub-optimal). Run `sglang tune` to generate one.",
+        dev.name,
+        profile.family(),
+    )
     return None
 
 
@@ -93,15 +112,20 @@ def _nearest(body: Dict[str, dict], want, keyparse) -> Optional[dict]:
     best, best_d = None, None
     for k, v in body.items():
         sh = keyparse(k)
-        d = (abs(math.log2(max(1, sh.batch)) - math.log2(max(1, want.batch)))
-             + abs(math.log2(max(1, _length_of(sh))) - math.log2(max(1, _length_of(want)))))
+        d = abs(math.log2(max(1, sh.batch)) - math.log2(max(1, want.batch))) + abs(
+            math.log2(max(1, _length_of(sh))) - math.log2(max(1, _length_of(want)))
+        )
         if best_d is None or d < best_d:
             best, best_d = v, d
     return best
 
 
-def pick_backends(cfg: dict, eligible_prefill: List[str], eligible_decode: List[str],
-                  workload_hint: Optional[dict] = None) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+def pick_backends(
+    cfg: dict,
+    eligible_prefill: List[str],
+    eligible_decode: List[str],
+    workload_hint: Optional[dict] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     """Collapse the fine grid to one (prefill_backend, decode_backend, page_size) for init.
 
     Default (no hint): per phase, the backend that wins the most buckets AMONG the
@@ -112,47 +136,64 @@ def pick_backends(cfg: dict, eligible_prefill: List[str], eligible_decode: List[
     (None, None, None) if no eligible winner exists — the fail-safe: engine keeps its
     default.
     """
+
     def vote(body: Dict[str, dict], eligible: List[str]) -> Optional[str]:
         tally: Dict[str, int] = {}
         for v in body.values():
             b = v.get("backend")
-            if b in eligible:                       # double-duty: never pick a non-survivor
+            if b in eligible:  # double-duty: never pick a non-survivor
                 tally[b] = tally.get(b, 0) + 1
         if not tally:
             return None
         return max(tally, key=tally.get)
 
-    def choose(phase: str, body: Dict[str, dict], eligible: List[str],
-               keyparse, shape_cls) -> Optional[str]:
+    def choose(
+        phase: str, body: Dict[str, dict], eligible: List[str], keyparse, shape_cls
+    ) -> Optional[str]:
         hint = (workload_hint or {}).get(phase)
         if hint:
             cell = _nearest(body, shape_cls(**hint), keyparse)
             if cell and cell.get("backend") in eligible:
-                return cell["backend"]              # hinted nearest bucket, still gated
+                return cell["backend"]  # hinted nearest bucket, still gated
         return vote(body, eligible)
 
-    prefill = choose("prefill", cfg.get("prefill", {}), eligible_prefill,
-                     parse_prefill_key, PrefillShape)
-    decode = choose("decode", cfg.get("decode", {}), eligible_decode,
-                    parse_decode_key, DecodeShape)
+    prefill = choose(
+        "prefill",
+        cfg.get("prefill", {}),
+        eligible_prefill,
+        parse_prefill_key,
+        PrefillShape,
+    )
+    decode = choose(
+        "decode", cfg.get("decode", {}), eligible_decode, parse_decode_key, DecodeShape
+    )
     page = default_page_size(decode) if decode else None
     return prefill, decode, page
 
 
-def attune_select(dev: DeviceInfo, profile: AttnProfile, packaged_dir: str,
-                  eligible_prefill: List[str], eligible_decode: List[str],
-                  local_cache_dir: Optional[str] = None,
-                  workload_hint: Optional[dict] = None) -> Optional[dict]:
+def attune_select(
+    dev: DeviceInfo,
+    profile: AttnProfile,
+    packaged_dir: str,
+    eligible_prefill: List[str],
+    eligible_decode: List[str],
+    local_cache_dir: Optional[str] = None,
+    workload_hint: Optional[dict] = None,
+) -> Optional[dict]:
     """The engine-init hook. Returns a dict of overrides to splice into ServerArgs, or
     None (keep the heuristic). NEVER raises."""
     try:
         cfg = get_attune_config(dev, profile, packaged_dir, local_cache_dir)
         if not cfg:
             return None
-        prefill, decode, page = pick_backends(cfg, eligible_prefill, eligible_decode, workload_hint)
+        prefill, decode, page = pick_backends(
+            cfg, eligible_prefill, eligible_decode, workload_hint
+        )
         if not prefill and not decode:
-            logger.warning("[attune] tuned config found but its winners are not currently "
-                           "eligible; keeping the heuristic default.")
+            logger.warning(
+                "[attune] tuned config found but its winners are not currently "
+                "eligible; keeping the heuristic default."
+            )
             return None
         out = {}
         if prefill:
@@ -161,9 +202,15 @@ def attune_select(dev: DeviceInfo, profile: AttnProfile, packaged_dir: str,
             out["decode_attention_backend"] = decode
             if page:
                 out["page_size"] = page
-        logger.info("[attune] tuned selection: prefill=%s decode=%s page_size=%s",
-                    prefill, decode, page)
+        logger.info(
+            "[attune] tuned selection: prefill=%s decode=%s page_size=%s",
+            prefill,
+            decode,
+            page,
+        )
         return out
-    except Exception as e:  # pragma: no cover - defensive; ingestion must never crash boot
+    except (
+        Exception
+    ) as e:  # pragma: no cover - defensive; ingestion must never crash boot
         logger.warning("[attune] selection failed (%s); keeping heuristic default.", e)
         return None

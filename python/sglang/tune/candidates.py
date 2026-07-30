@@ -14,6 +14,7 @@ doomed candidates), empirical probe second (catches what static checks structura
 Returns, per backend, either eligible or a human-readable reason it was pruned — the
 vLLM ``validate_configuration`` "reasons list" pattern.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -27,7 +28,7 @@ from .shapes import AttnProfile
 class Candidate:
     name: str
     eligible: bool
-    reason: str = ""   # why pruned, when not eligible
+    reason: str = ""  # why pruned, when not eligible
 
 
 # Minimal, CUDA-only v1 backend set (ROCm/AITER is v2 — its integration is gated by an
@@ -37,7 +38,9 @@ _MHA_POOL = ["fa3", "fa4", "flashinfer", "trtllm_mha", "triton", "torch_native"]
 _MLA_POOL = ["fa3", "flashmla", "cutlass_mla", "trtllm_mla", "flashinfer", "triton"]
 
 
-def _supported(backend: str, dev: DeviceInfo, profile: AttnProfile, phase: str) -> Tuple[bool, str]:
+def _supported(
+    backend: str, dev: DeviceInfo, profile: AttnProfile, phase: str
+) -> Tuple[bool, str]:
     """Declarative per-backend capability predicate (mirror of SGLang's gate).
 
     NOTE: these predicates are illustrative and must be reconciled with the current
@@ -55,9 +58,14 @@ def _supported(backend: str, dev: DeviceInfo, profile: AttnProfile, phase: str) 
         return (sm == 90, "" if sm == 90 else "fa3 is Hopper-only (sm90)")
     if backend == "fa4":
         # Hopper + Blackwell.
-        return (sm in (90, 100, 103), "" if sm in (90, 100, 103) else "fa4 requires Hopper/Blackwell")
+        return (
+            sm in (90, 100, 103),
+            "" if sm in (90, 100, 103) else "fa4 requires Hopper/Blackwell",
+        )
     if backend == "trtllm_mha":
-        ok = (phase == "prefill" and sm == 100) or (phase == "decode" and sm in (90, 100, 120))
+        ok = (phase == "prefill" and sm == 100) or (
+            phase == "decode" and sm in (90, 100, 120)
+        )
         return ok, "" if ok else f"trtllm_mha {phase} unsupported on sm{sm}"
     if backend in ("flashmla", "cutlass_mla", "trtllm_mla"):
         if not profile.is_mla:

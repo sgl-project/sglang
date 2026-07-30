@@ -1,9 +1,12 @@
 import tempfile
 import unittest
 
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.tune.device import DeviceInfo
 from sglang.tune.orchestrate import run_tune, summarize
 from sglang.tune.shapes import AttnProfile
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 MHA = AttnProfile(40, 8, 128, "bfloat16")
 
@@ -13,8 +16,14 @@ class TestEndToEndMock(unittest.TestCase):
         with tempfile.TemporaryDirectory() as cfg, tempfile.TemporaryDirectory() as cache:
             dev = DeviceInfo("NVIDIA H20", 90, cuda_version="12.4")
             # in-process (isolate=False) keeps the test fast and deterministic
-            config = run_tune(dev, MHA, packaged_dir=cfg, local_cache_dir=cache,
-                              mock=True, isolate=False)
+            config = run_tune(
+                dev,
+                MHA,
+                packaged_dir=cfg,
+                local_cache_dir=cache,
+                mock=True,
+                isolate=False,
+            )
             self.assertTrue(config["decode"])
             self.assertTrue(config["prefill"])
             # every decode cell carries a derived page_size
@@ -29,10 +38,18 @@ class TestEndToEndMock(unittest.TestCase):
         # decode on a bandwidth-divergent SKU. A shape-blind SM heuristic picks one and is
         # wrong on the other end; Attune keys to the shape.
         with tempfile.TemporaryDirectory() as cfg:
-            h20 = run_tune(DeviceInfo("NVIDIA H20", 90), MHA, packaged_dir=cfg,
-                           mock=True, isolate=False, phases=("decode",))
+            h20 = run_tune(
+                DeviceInfo("NVIDIA H20", 90),
+                MHA,
+                packaged_dir=cfg,
+                mock=True,
+                isolate=False,
+                phases=("decode",),
+            )
             winners = {v["backend"] for v in h20["decode"].values()}
-            self.assertGreater(len(winners), 1, "expected a decode crossover across shapes")
+            self.assertGreater(
+                len(winners), 1, "expected a decode crossover across shapes"
+            )
             # the small-batch decode winner must NOT be a 128-row-tile kernel on H20
             small = h20["decode"]["1:1024"]["backend"]
             self.assertNotIn(small, ("fa3", "fa4"))
@@ -43,6 +60,7 @@ class TestEndToEndMock(unittest.TestCase):
         # the fact the SM heuristic cannot see (it keys only on sm90) and Attune measures.
         from sglang.tune.harness import mock_decode_latency
         from sglang.tune.shapes import DecodeShape
+
         sh = DecodeShape(1, 1024)
         fa4_h20 = mock_decode_latency("fa4", sh, MHA, bandwidth_divergent=True)
         fa4_h100 = mock_decode_latency("fa4", sh, MHA, bandwidth_divergent=False)

@@ -17,5 +17,5 @@ in when this package sits inside a live SGLang tree.
 
 __version__ = "0.1.0-prototype"
 
-from .shapes import AttnProfile, DecodeShape, PrefillShape  # noqa: F401
 from .loader import get_attune_config, pick_backends  # noqa: F401
+from .shapes import AttnProfile, DecodeShape, PrefillShape  # noqa: F401

@@ -3,11 +3,24 @@ import os
 import tempfile
 import unittest
 
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.tune.device import DeviceInfo
-from sglang.tune.loader import ENV_FOLDER, attune_select, get_attune_config, pick_backends
+from sglang.tune.loader import (
+    ENV_FOLDER,
+    attune_select,
+    get_attune_config,
+    pick_backends,
+)
 from sglang.tune.shapes import AttnProfile
-from sglang.tune.writer import (SCHEMA_VERSION, build_config, config_filename,
-                                fingerprint, save_committed)
+from sglang.tune.writer import (
+    SCHEMA_VERSION,
+    build_config,
+    config_filename,
+    fingerprint,
+    save_committed,
+)
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 DEV = DeviceInfo("NVIDIA H20", 90, cuda_version="12.4", sm_clock_max_mhz=1980)
 PROF = AttnProfile(40, 8, 128, "bfloat16", tp_size=1)
@@ -15,12 +28,16 @@ PROF = AttnProfile(40, 8, 128, "bfloat16", tp_size=1)
 
 def _mini_config():
     return build_config(
-        DEV, PROF,
-        decode_body={"1:1024": {"backend": "flashinfer", "page_size": 1, "latency_us": 41.0},
-                     "256:1024": {"backend": "fa4", "page_size": 128, "latency_us": 90.0}},
+        DEV,
+        PROF,
+        decode_body={
+            "1:1024": {"backend": "flashinfer", "page_size": 1, "latency_us": 41.0},
+            "256:1024": {"backend": "fa4", "page_size": 128, "latency_us": 90.0},
+        },
         prefill_body={"1:512": {"backend": "fa3", "latency_us": 88.0}},
         skipped={"prefill/trtllm_mha": "trtllm_mha prefill unsupported on sm90"},
-        provenance={"attune_version": "test"})
+        provenance={"attune_version": "test"},
+    )
 
 
 class TestWriter(unittest.TestCase):
@@ -33,8 +50,14 @@ class TestWriter(unittest.TestCase):
         # Guardrail #1: CUDA version and clock state change the LOCAL fingerprint,
         # so a throttled or CUDA-bumped box gets its own re-tune.
         base = fingerprint(DEV, PROF)
-        bumped_cuda = fingerprint(DeviceInfo("NVIDIA H20", 90, cuda_version="13.0", sm_clock_max_mhz=1980), PROF)
-        throttled = fingerprint(DeviceInfo("NVIDIA H20", 90, cuda_version="12.4", sm_clock_max_mhz=1200), PROF)
+        bumped_cuda = fingerprint(
+            DeviceInfo("NVIDIA H20", 90, cuda_version="13.0", sm_clock_max_mhz=1980),
+            PROF,
+        )
+        throttled = fingerprint(
+            DeviceInfo("NVIDIA H20", 90, cuda_version="12.4", sm_clock_max_mhz=1200),
+            PROF,
+        )
         self.assertNotEqual(base, bumped_cuda)
         self.assertNotEqual(base, throttled)
 
@@ -58,19 +81,31 @@ class TestLoader(unittest.TestCase):
         cfg = _mini_config()
         # A hint near the big-batch bucket must pick that bucket's winner (fa4), which
         # a plain equal-weight vote over {flashinfer, fa4} would not guarantee.
-        _, decode_big, _ = pick_backends(cfg, ["fa3"], ["flashinfer", "fa4"],
-                                         workload_hint={"decode": {"batch": 128, "ctx_len": 1024}})
+        _, decode_big, _ = pick_backends(
+            cfg,
+            ["fa3"],
+            ["flashinfer", "fa4"],
+            workload_hint={"decode": {"batch": 128, "ctx_len": 1024}},
+        )
         self.assertEqual(decode_big, "fa4")
-        _, decode_small, _ = pick_backends(cfg, ["fa3"], ["flashinfer", "fa4"],
-                                           workload_hint={"decode": {"batch": 1, "ctx_len": 1024}})
+        _, decode_small, _ = pick_backends(
+            cfg,
+            ["fa3"],
+            ["flashinfer", "fa4"],
+            workload_hint={"decode": {"batch": 1, "ctx_len": 1024}},
+        )
         self.assertEqual(decode_small, "flashinfer")
 
     def test_workload_hint_ineligible_winner_falls_back_to_vote(self):
         cfg = _mini_config()
         # Nearest bucket says fa4, but fa4 is not currently eligible -> the hint must
         # NOT bypass the gate; fall back to the vote among eligible candidates.
-        _, decode, _ = pick_backends(cfg, ["fa3"], ["flashinfer"],
-                                     workload_hint={"decode": {"batch": 256, "ctx_len": 1024}})
+        _, decode, _ = pick_backends(
+            cfg,
+            ["fa3"],
+            ["flashinfer"],
+            workload_hint={"decode": {"batch": 256, "ctx_len": 1024}},
+        )
         self.assertEqual(decode, "flashinfer")
 
     def test_failsafe_never_picks_ineligible(self):
@@ -90,7 +125,11 @@ class TestLoader(unittest.TestCase):
             save_committed(d, DEV, PROF, _mini_config())
             os.environ[ENV_FOLDER] = d
             try:
-                get_attune_config.__wrapped__ if hasattr(get_attune_config, "__wrapped__") else None
+                (
+                    get_attune_config.__wrapped__
+                    if hasattr(get_attune_config, "__wrapped__")
+                    else None
+                )
                 cfg = get_attune_config(DEV, PROF, "/nonexistent-packaged-dir")
                 self.assertIsNotNone(cfg)
             finally:

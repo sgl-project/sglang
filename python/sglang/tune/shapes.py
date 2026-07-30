@@ -14,11 +14,11 @@ Two axes, kept deliberately separate (this separation is the heart of the design
   wrong; a full cross-product would explode. Buckets are ~power-of-two so runtime
   nearest-match interpolates sanely, exactly like MoE's M-key set.
 """
+
 from __future__ import annotations
 
 import dataclasses
 from typing import List, Tuple
-
 
 # ---- the fine grid (body axis) ------------------------------------------------
 # Decode is memory-bound -> sweep batch and KV length. Prefill is compute-bound ->
@@ -38,12 +38,12 @@ class AttnProfile:
     file emitted by ``sglang tune`` is guaranteed key-compatible with the runtime lookup.
     """
 
-    num_qo_heads: int          # query/output heads AFTER tensor-parallel sharding
-    num_kv_heads: int          # KV heads after TP (GQA factor = qo/kv)
+    num_qo_heads: int  # query/output heads AFTER tensor-parallel sharding
+    num_kv_heads: int  # KV heads after TP (GQA factor = qo/kv)
     head_dim: int
-    dtype: str                 # e.g. "bfloat16"
+    dtype: str  # e.g. "bfloat16"
     kv_cache_dtype: str = "auto"
-    is_mla: bool = False       # DeepSeek-style Multi-head Latent Attention
+    is_mla: bool = False  # DeepSeek-style Multi-head Latent Attention
     tp_size: int = 1
     ep_size: int = 1
     dp_size: int = 1

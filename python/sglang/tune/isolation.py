@@ -21,6 +21,7 @@ Failure taxonomy the parent classifies (never crashes on):
 Every classified failure becomes a structured note in the emitted config, so the corpus
 is self-documenting — the opposite of vLLM's per-scenario skip-lists that "just hid it."
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -30,7 +31,6 @@ from typing import Dict, List, Optional
 
 from .harness import mock_decode_latency, mock_prefill_latency
 from .shapes import AttnProfile, parse_decode_key, parse_prefill_key
-
 
 # failure kinds
 IMPORT_ERROR = "import_error"
@@ -43,8 +43,8 @@ CRASH = "crash"
 @dataclasses.dataclass
 class CandidateResult:
     backend: str
-    latencies: Dict[str, float]        # bucket_key -> median_us (may be PARTIAL on failure)
-    failure: Optional[str] = None      # one of the failure kinds, else None
+    latencies: Dict[str, float]  # bucket_key -> median_us (may be PARTIAL on failure)
+    failure: Optional[str] = None  # one of the failure kinds, else None
     # per-shape skips (e.g. a bucket whose working set OOMs on this GPU) — the shape is
     # dropped and the sweep continues, per the documented taxonomy "skip shape, keep smaller"
     skipped_shapes: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -70,8 +70,15 @@ def classify_exit(exitcode: Optional[int]) -> str:
     return CRASH
 
 
-def _worker(backend: str, phase: str, bucket_keys: List[str], profile: AttnProfile,
-            bandwidth_divergent: bool, mock: bool, out: mp.Queue) -> None:
+def _worker(
+    backend: str,
+    phase: str,
+    bucket_keys: List[str],
+    profile: AttnProfile,
+    bandwidth_divergent: bool,
+    mock: bool,
+    out: mp.Queue,
+) -> None:
     """Runs in the child process. In mock mode, computes synthetic latencies; a backend
     whose name starts with 'crash' simulates an uncatchable abort (SIGABRT)."""
     try:
@@ -82,20 +89,28 @@ def _worker(backend: str, phase: str, bucket_keys: List[str], profile: AttnProfi
             # on every test run. The live validator's __abort__ below keeps a true SIGABRT.
             import os
             import signal
+
             os.kill(os.getpid(), signal.SIGKILL)
         if mock and backend.startswith("oom"):
             raise RuntimeError("CUDA out of memory")
         if mock and backend.startswith("nokernel"):
-            raise RuntimeError("no kernel image is available for execution on the device")
+            raise RuntimeError(
+                "no kernel image is available for execution on the device"
+            )
         # --- real-hardware deliberate failures, for the live crash-recovery validation ---
-        if not mock and backend == "__oom__":           # pragma: no cover - real GPU only
+        if not mock and backend == "__oom__":  # pragma: no cover - real GPU only
             from .realbench import force_oom
+
             force_oom()
-        if not mock and backend == "__abort__":         # pragma: no cover - real GPU only
+        if not mock and backend == "__abort__":  # pragma: no cover - real GPU only
             import os
+
             os.abort()
-        if not mock and backend == "__incompatible__":  # pragma: no cover - real GPU only
+        if (
+            not mock and backend == "__incompatible__"
+        ):  # pragma: no cover - real GPU only
             from .realbench import force_incompatible
+
             force_incompatible()
 
         skipped_shapes: Dict[str, str] = {}
@@ -103,12 +118,18 @@ def _worker(backend: str, phase: str, bucket_keys: List[str], profile: AttnProfi
             try:
                 if phase == "decode":
                     sh = parse_decode_key(key)
-                    us = mock_decode_latency(backend, sh, profile, bandwidth_divergent) if mock \
-                        else _real_bench_decode(backend, sh, profile)   # pragma: no cover
+                    us = (
+                        mock_decode_latency(backend, sh, profile, bandwidth_divergent)
+                        if mock
+                        else _real_bench_decode(backend, sh, profile)
+                    )  # pragma: no cover
                 else:
                     sh = parse_prefill_key(key)
-                    us = mock_prefill_latency(backend, sh, profile) if mock \
-                        else _real_bench_prefill(backend, sh, profile)  # pragma: no cover
+                    us = (
+                        mock_prefill_latency(backend, sh, profile)
+                        if mock
+                        else _real_bench_prefill(backend, sh, profile)
+                    )  # pragma: no cover
             except BaseException as e:  # noqa: BLE001
                 if classify_exception(e) == OOM:
                     # "OOM -> shape too big at this config -> skip shape, keep smaller":
@@ -117,10 +138,13 @@ def _worker(backend: str, phase: str, bucket_keys: List[str], profile: AttnProfi
                     skipped_shapes[key] = OOM
                     if not mock:  # pragma: no cover - real GPU only
                         import torch
+
                         torch.cuda.empty_cache()
                     continue
-                raise                     # import / no-kernel-image / crash: candidate-level
-            out.put(("bucket", key, us))  # stream: a timeout later never loses this bucket
+                raise  # import / no-kernel-image / crash: candidate-level
+            out.put(
+                ("bucket", key, us)
+            )  # stream: a timeout later never loses this bucket
         out.put(("done", skipped_shapes))
     except BaseException as e:  # noqa: BLE001 - we want to report every failure kind
         out.put(("err", classify_exception(e)))
@@ -128,21 +152,24 @@ def _worker(backend: str, phase: str, bucket_keys: List[str], profile: AttnProfi
 
 def _real_bench_decode(backend, sh, profile):  # pragma: no cover - real GPU only
     from .realbench import real_decode_latency
+
     return real_decode_latency(backend, sh, profile)
 
 
 def _real_bench_prefill(backend, sh, profile):  # pragma: no cover - real GPU only
     from .realbench import real_prefill_latency
+
     return real_prefill_latency(backend, sh, profile)
 
 
 class _Fold:
     """Accumulates the worker's streamed messages into a CandidateResult."""
+
     def __init__(self):
         self.lat: Dict[str, float] = {}
         self.shape_skips: Dict[str, str] = {}
         self.failure: Optional[str] = None
-        self.finished = False           # saw "done" or "err" — the stream is complete
+        self.finished = False  # saw "done" or "err" — the stream is complete
 
     def feed(self, msg) -> None:
         if msg[0] == "bucket":
@@ -150,7 +177,7 @@ class _Fold:
         elif msg[0] == "done":
             self.shape_skips = msg[1]
             self.finished = True
-        else:                            # ("err", kind) — candidate-level failure
+        else:  # ("err", kind) — candidate-level failure
             self.failure = msg[1]
             self.finished = True
 
@@ -158,10 +185,16 @@ class _Fold:
         return CandidateResult(backend, self.lat, self.failure, self.shape_skips)
 
 
-def run_candidate_isolated(backend: str, phase: str, bucket_keys: List[str],
-                           profile: AttnProfile, bandwidth_divergent: bool,
-                           mock: bool = True, timeout_s: float = 120.0,
-                           isolate: bool = True) -> CandidateResult:
+def run_candidate_isolated(
+    backend: str,
+    phase: str,
+    bucket_keys: List[str],
+    profile: AttnProfile,
+    bandwidth_divergent: bool,
+    mock: bool = True,
+    timeout_s: float = 120.0,
+    isolate: bool = True,
+) -> CandidateResult:
     """Benchmark one candidate. ``isolate=True`` spawns a subprocess (crash-safe);
     ``isolate=False`` runs in-process (fast path for deterministic mock tests).
 
@@ -170,7 +203,7 @@ def run_candidate_isolated(backend: str, phase: str, bucket_keys: List[str],
     ``failure`` says why the sweep stopped) instead of discarding the candidate.
     """
     if not isolate:
-        q: "mp.Queue" = _InlineQueue()
+        q: mp.Queue = _InlineQueue()
         _worker(backend, phase, bucket_keys, profile, bandwidth_divergent, mock, q)
         fold = _Fold()
         for msg in q.drain():
@@ -179,11 +212,14 @@ def run_candidate_isolated(backend: str, phase: str, bucket_keys: List[str],
 
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
-    p = ctx.Process(target=_worker,
-                    args=(backend, phase, bucket_keys, profile, bandwidth_divergent, mock, q))
+    p = ctx.Process(
+        target=_worker,
+        args=(backend, phase, bucket_keys, profile, bandwidth_divergent, mock, q),
+    )
     p.start()
 
     import time
+
     fold = _Fold()
     deadline = time.monotonic() + timeout_s
     child_gone = False
@@ -191,7 +227,7 @@ def run_candidate_isolated(backend: str, phase: str, bucket_keys: List[str],
         try:
             fold.feed(q.get(timeout=0.2))
         except _queue.Empty:
-            if not p.is_alive():        # child died (possibly aborted) mid-stream
+            if not p.is_alive():  # child died (possibly aborted) mid-stream
                 child_gone = True
                 break
 
@@ -207,16 +243,24 @@ def run_candidate_isolated(backend: str, phase: str, bucket_keys: List[str],
     p.join(timeout=5)
 
     if not fold.finished:
-        if p.is_alive():                # ran out of budget — keep the partial grid
-            p.terminate(); p.join()
+        if p.is_alive():  # ran out of budget — keep the partial grid
+            p.terminate()
+            p.join()
             fold.failure = TIMEOUT
-        else:                           # died mid-stream (SIGABRT/SIGSEGV => crash)
+        else:  # died mid-stream (SIGABRT/SIGSEGV => crash)
             fold.failure = classify_exit(p.exitcode)
     return fold.result(backend)
 
 
 class _InlineQueue:
     """Tiny stand-in so the in-process path shares the worker code path."""
-    def __init__(self): self._items = []
-    def put(self, x): self._items.append(x)
-    def drain(self): items, self._items = self._items, []; return items
+
+    def __init__(self):
+        self._items = []
+
+    def put(self, x):
+        self._items.append(x)
+
+    def drain(self):
+        items, self._items = self._items, []
+        return items
