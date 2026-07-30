@@ -5,7 +5,12 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_gfx95_supported,
+    is_hip,
+    is_sm120_supported,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +30,15 @@ _AITER_MHC_IMPORT_WARNED = False
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
     # The TileLang fused path directly reuses mhc_post/mhc_pre kernels and their
-    # tensor layout assumptions, so keep it disabled when either dependency is off.
+    # tensor layout assumptions, so keep it disabled when the post dependency is
+    # off. SM120 disables the standalone TileLang mhc_pre path while still
+    # dispatching mhc_fused_post_pre independently, so accept the standalone pre
+    # flag OR an SM120 device -- dropping the SM120 case here would silently turn
+    # off cross-layer fusion on the normal SM120 configuration.
     return (
         envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
-        and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
         and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
+        and (envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() or is_sm120_supported())
     )
 
 

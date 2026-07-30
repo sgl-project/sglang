@@ -1683,6 +1683,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 residual, hidden_states, post, comb, norm_fused = fused
                 x_quant = None
             else:
+                # No fused kernel fired (e.g. aiter import/runtime failure
+                # permanently disables the path): close the deferred previous-layer
+                # mHC post before opening this layer's mHC pre, mirroring the
+                # FFN-side fallback below. Skipping hc_post here would discard
+                # prev_residual/prev_post/prev_comb and corrupt every later layer.
+                hidden_states = self.hc_post(
+                    hidden_states, prev_residual, prev_post, prev_comb
+                )
                 residual = hidden_states
                 hidden_states, post, comb, norm_fused = self.hc_pre(
                     hidden_states,
