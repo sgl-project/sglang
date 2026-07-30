@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.model_loader.loader as loader_mod
+import sglang.srt.model_loader.utils as model_loader_utils
 import sglang.srt.model_loader.weight_utils as weight_utils
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -104,6 +105,14 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
         self.assertIsNot(cloned, marked)
         marked.fill_(2)
         self.assertEqual(cloned.item(), 1)
+
+    def test_runai_streamed_tensors_are_not_loaded_asynchronously(self):
+        unmarked = torch.tensor([1], dtype=torch.int32)
+        marked = torch.tensor([1], dtype=torch.int32)
+        setattr(marked, weight_utils.RUNAI_STREAMER_TENSOR_ATTR, True)
+
+        self.assertTrue(model_loader_utils.should_async_load(unmarked))
+        self.assertFalse(model_loader_utils.should_async_load(marked))
 
     def test_get_model_loader_uses_runai_for_prequantized_modelopt(self):
         load_config = LoadConfig(
