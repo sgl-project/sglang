@@ -1011,7 +1011,11 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         num_token_padding = q.shape[0]
-        num_token_non_padded = forward_batch.num_token_non_padded_cpu
+        num_token_non_padded = (
+            forward_batch._original_num_tokens
+            if forward_batch._original_num_tokens is not None
+            else forward_batch.num_token_non_padded_cpu
+        )
         trim_eager_padding = (
             not is_prefill
             and not self.graph_mode
