@@ -285,6 +285,8 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
 import threading  # noqa: E402
 import time  # noqa: E402
 
+import zmq  # noqa: E402
+
 try:
     from sglang.srt.disaggregation.common.utils import FastQueue  # noqa: E402
     from sglang.srt.disaggregation.mori.conn import MoriKVManager  # noqa: E402
@@ -386,6 +388,111 @@ class TestMooncakeTeardownNoThreadLeak(unittest.TestCase):
         self.assertEqual(m._worker_threads, [])
         self.assertEqual(m.transfer_queues, [])
         self.assertEqual(m.executors, [])
+
+
+@unittest.skipUnless(_HAS_MOONCAKE, "mooncake not importable in this environment")
+class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
+    """The prefill bootstrap loop moved from a blocking recv_multipart() to a
+    500ms poll + _stopped check (so teardown, i.e. a runtime role switch, can
+    stop it) and now retries on recv errors instead of dying. That loop runs
+    on every mooncake PD instance, so pin the new contract with real ZMQ
+    traffic driven through the ABORT -> ABORT_ACK path: no message loss while
+    idle or bursting, survival of a transient recv error, and prompt exit
+    once _stopped is set.
+    """
+
+    class _FlakySocket(zmq.Socket):
+        """Real PULL socket whose next recv can be forced to fail once,
+        emulating a transient ZMQ error between poll() and recv()."""
+
+        fail_next_recv = False
+
+        def recv_multipart(self, *args, **kwargs):
+            if type(self).fail_next_recv:
+                type(self).fail_next_recv = False
+                raise RuntimeError("transient recv failure")
+            return super().recv_multipart(*args, **kwargs)
+
+    def setUp(self):
+        self._FlakySocket.fail_next_recv = False
+        self._ctx = zmq.Context()
+        sock = self._FlakySocket(self._ctx, zmq.PULL)
+        port = sock.bind_to_random_port("tcp://127.0.0.1")
+        m = MooncakeKVManager.__new__(MooncakeKVManager)
+        m._stopped = False
+        m._worker_threads = []
+        m.server_socket = sock
+        # ABORT for an unknown room takes the "ignoring" branch and still
+        # ACKs, giving a side-effect-free probe of the receive loop.
+        m.request_status = {}
+        m._connect = MagicMock()
+        self.m = m
+        self._push = self._ctx.socket(zmq.PUSH)
+        self._push.connect(f"tcp://127.0.0.1:{port}")
+
+    def tearDown(self):
+        self.m._stopped = True
+        for t in self.m._worker_threads:
+            t.join(timeout=3.0)
+        self._push.close(linger=0)
+        self.m.server_socket.close(linger=0)
+        self._ctx.destroy(linger=0)
+
+    def _start(self):
+        MooncakeKVManager.start_prefill_thread(self.m)
+        (thread,) = self.m._worker_threads
+        return thread
+
+    def _send_abort(self, room):
+        self._push.send_multipart(
+            [b"ABORT", str(room).encode("ascii"), b"127.0.0.1", b"9999"]
+        )
+
+    def _wait_acks(self, n, timeout=10.0):
+        send = self.m._connect.return_value.send_multipart
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if send.call_count >= n:
+                return
+            time.sleep(0.02)
+        self.fail(f"expected {n} ABORT_ACKs, got {send.call_count}")
+
+    def test_messages_processed_across_idle_poll_timeouts(self):
+        self._start()
+        self._send_abort(1)
+        self._wait_acks(1)
+        # Idle past a full poll timeout, then traffic must still flow: the
+        # empty-poll -> continue path must not disturb the socket.
+        time.sleep(0.8)
+        self._send_abort(2)
+        self._wait_acks(2)
+
+    def test_no_message_loss_under_burst(self):
+        self._start()
+        n = 200
+        for i in range(n):
+            self._send_abort(i)
+        # Two-step poll+recv must consume every queued message exactly once.
+        self._wait_acks(n)
+
+    def test_survives_transient_recv_error(self):
+        thread = self._start()
+        self._FlakySocket.fail_next_recv = True
+        self._send_abort(3)
+        # The first wakeup raises inside recv; the loop must log and retry so
+        # the message is still delivered and the thread stays alive (the old
+        # blocking loop died here, silently killing bootstrap for good).
+        self._wait_acks(1)
+        self.assertTrue(thread.is_alive())
+        self.assertFalse(self._FlakySocket.fail_next_recv)  # fault consumed
+
+    def test_exits_promptly_when_stopped_while_idle(self):
+        thread = self._start()
+        self.m._stopped = True
+        # Poll timeout is 500ms, so the flag must be observed within ~1 cycle
+        # (this is what keeps teardown / role switch from hanging).
+        thread.join(timeout=2.0)
+        self.assertFalse(thread.is_alive(), "bootstrap thread leaked past stop")
 
 
 def _radix_scheduler(disable_radix_cache):
