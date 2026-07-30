@@ -13,11 +13,10 @@
 
 #include <sgl_kernel/distributed/communicator.cuh>
 
-#include "ptx_sys.cuh"
-
 #include <cute/arch/cluster_sm90.hpp>
 #include <cutlass/cuda_host_adapter.hpp>
 
+#include "ptx_sys.cuh"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -33,7 +32,6 @@
 // sglang header wraps, and splitting them out bought a dozen headers with
 // exactly one consumer. Anything cute already provides goes through cute
 // (`set_block_rank` below, the tensor-map driver wrapper in `w_maps`).
-
 
 namespace ptx {
 
