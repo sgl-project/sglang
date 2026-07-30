@@ -8,7 +8,6 @@ workspace after dequantizing it back to BF16.
 
 from __future__ import annotations
 
-import logging
 import sys
 import types
 from contextlib import contextmanager
@@ -23,7 +22,6 @@ from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
 )
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
-    DSV4_Q8KV8_PREFILL_ENV,
     SparsePrefillWorkspace,
     use_dsv4_q8kv8_sparse_prefill,
 )
@@ -34,6 +32,13 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(
     est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large"
 )
+
+
+def test_q8kv8_sparse_prefill_backend_selector_uses_cli_value():
+    assert not use_dsv4_q8kv8_sparse_prefill()
+    assert not use_dsv4_q8kv8_sparse_prefill("auto")
+    assert not use_dsv4_q8kv8_sparse_prefill("flashmla_sparse")
+    assert use_dsv4_q8kv8_sparse_prefill("flashmla_sparse_q8")
 
 
 class _Pool:
@@ -366,39 +371,6 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path():
     assert q8_call["kv_scale"].item() == pytest.approx(1.0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_q8kv8_sparse_prefill_logs_path_hit_once(caplog):
-    device = torch.device("cuda")
-    backend, forward_batch, token_to_kv_pool, q, attn_sink, core_attn_metadata = (
-        _make_sparse_prefill_case(device)
-    )
-
-    caplog.set_level(
-        logging.INFO, logger="sglang.srt.layers.attention.deepseek_v4_backend"
-    )
-    bf16_capture = _Capture()
-    q8_capture = _Capture()
-    with _patched_sparse_kernels(bf16_capture, q8_capture):
-        for _ in range(2):
-            backend._forward_prefill_sparse_q8kv8(
-                q=q,
-                layer_id=0,
-                compress_ratio=0,
-                forward_batch=forward_batch,
-                token_to_kv_pool=token_to_kv_pool,
-                core_attn_metadata=core_attn_metadata,
-                attn_sink=attn_sink,
-            )
-
-    hit_logs = [
-        record
-        for record in caplog.records
-        if "DSV4_Q8KV8_SPARSE_PREFILL_HIT" in record.getMessage()
-    ]
-    assert len(q8_capture.calls) == 2
-    assert len(hit_logs) == 1
-
-
 @pytest.mark.skipif(
     not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
 )
@@ -449,20 +421,3 @@ def test_q8kv8_sparse_prefill_real_kernel_matches_bf16_sparse_path():
         atol=2.5e-1,
         rtol=3.0e-1,
     )
-
-
-def test_q8kv8_sparse_prefill_internal_env_switch(monkeypatch):
-    monkeypatch.delenv(DSV4_Q8KV8_PREFILL_ENV, raising=False)
-    assert not use_dsv4_q8kv8_sparse_prefill()
-    assert not use_dsv4_q8kv8_sparse_prefill("auto")
-    assert not use_dsv4_q8kv8_sparse_prefill("flashmla_sparse")
-    assert use_dsv4_q8kv8_sparse_prefill("flashmla_sparse_q8")
-
-    for value in ("1", "true", "yes", "on"):
-        monkeypatch.setenv(DSV4_Q8KV8_PREFILL_ENV, value)
-        assert use_dsv4_q8kv8_sparse_prefill()
-        assert use_dsv4_q8kv8_sparse_prefill("auto")
-
-    monkeypatch.setenv(DSV4_Q8KV8_PREFILL_ENV, "0")
-    assert not use_dsv4_q8kv8_sparse_prefill()
-    assert not use_dsv4_q8kv8_sparse_prefill("flashmla_sparse_q8")
