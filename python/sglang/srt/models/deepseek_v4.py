@@ -2154,6 +2154,18 @@ class DeepseekV4Model(nn.Module):
         hc_base: torch.Tensor,
     ):
         if x.numel() > 0:
+            if _is_xpu or x.device.type == "xpu":
+                import sgl_kernel  # noqa: F401
+                from sgl_kernel.mhc import fused_hc_head
+
+                return fused_hc_head(
+                    x.contiguous(),
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    norm_eps=self.norm_eps,
+                    hc_eps=self.hc_eps,
+                )
             from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 
             return fused_hc_head(
