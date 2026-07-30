@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.d
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
@@ -294,25 +295,26 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         predictions = []
         for local_index, prompt_emb in enumerate(context):
             kv_cache = kv_caches[local_index]
-            obs_noise_pred, action_noise_pred, updated_kv_caches = self.transformer(
-                x=noisy_input,
-                timestep=timestep,
-                action=action,
-                timestep_action=timestep_action,
-                state=state,
-                embodiment_id=None,
-                context=prompt_emb,
-                seq_len=seq_len,
-                y=y,
-                clip_feature=clip_feature,
-                kv_cache=kv_cache,
-                crossattn_cache=crossattn_caches[local_index],
-                current_start_frame=current_start_frame,
-                enable_sequence_parallel=(
-                    self.server_args.pipeline_config.dreamzero_sequence_parallel_size
-                    > 1
-                ),
-            )
+            with set_forward_context(current_timestep=0, attn_metadata=None):
+                obs_noise_pred, action_noise_pred, updated_kv_caches = self.transformer(
+                    x=noisy_input,
+                    timestep=timestep,
+                    action=action,
+                    timestep_action=timestep_action,
+                    state=state,
+                    embodiment_id=None,
+                    context=prompt_emb,
+                    seq_len=seq_len,
+                    y=y,
+                    clip_feature=clip_feature,
+                    kv_cache=kv_cache,
+                    crossattn_cache=crossattn_caches[local_index],
+                    current_start_frame=current_start_frame,
+                    enable_sequence_parallel=(
+                        self.server_args.pipeline_config.dreamzero_sequence_parallel_size
+                        > 1
+                    ),
+                )
             if update_kv_cache:
                 for block_index, updated in enumerate(updated_kv_caches):
                     kv_cache[block_index] = updated.detach()
@@ -830,7 +832,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         action_scheduler = self._new_unipc_scheduler()
         for rollout_scheduler in (scheduler, action_scheduler):
             rollout_scheduler.set_timesteps(
-                server_args.pipeline_config.default_num_inference_steps,
+                batch.num_inference_steps,
                 device=ctx.inputs.device,
                 shift=server_args.pipeline_config.flow_shift,
             )

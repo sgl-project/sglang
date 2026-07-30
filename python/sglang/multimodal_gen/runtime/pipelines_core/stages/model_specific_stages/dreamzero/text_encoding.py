@@ -216,10 +216,7 @@ class DreamZeroTextEncodingStage(TextEncodingStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         inputs: dict[str, Any] = batch.dreamzero_inputs
-        batch_size = infer_dreamzero_batch_size(
-            inputs,
-            error_message="DreamZero text stage cannot infer batch size",
-        )
+        batch_size = infer_dreamzero_batch_size(inputs)
         self._ensure_prompt_extra(batch, batch_size)
         request_cache = resolve_request_cache(
             batch,
@@ -285,7 +282,6 @@ class DreamZeroTextEncodingStage(TextEncodingStage):
         batch.dreamzero_lifecycle_reset_preserve_text = lifecycle_preserve_text
         batch.dreamzero_session_reset_reason = reset_reasons
         apply_request_lifecycle_resets(batch, self.cache_manager, request_cache)
-        reset_reasons = batch.dreamzero_session_reset_reason
         prompt_reusable = [
             bool(reusable and not (reset and not preserve_text))
             for reusable, reset, preserve_text in zip(
@@ -304,29 +300,20 @@ class DreamZeroTextEncodingStage(TextEncodingStage):
                 strict=True,
             )
         ]
-        # Text stage owns the request cache and lifecycle-adjusted reusable
-        # view. Later stages only consume batch.dreamzero_cache.
         request_cache.prompt_reusable = prompt_reusable
         request_cache.neg_prompt_reusable = neg_prompt_reusable
 
         text_len = server_args.pipeline_config.dit_config.arch_config.text_len
         prompt_texts = batch.extra["dreamzero_prompts"]
         negative_prompt_texts = batch.extra["dreamzero_negative_prompts"]
-        prompt_embs: list[torch.Tensor] = []
 
         def get_branch_prompt(
             branch: int, *, texts: list[str], hashes, reusable
         ) -> torch.Tensor:
             if all(reusable):
-                prompt_pool = state.cached_prompt_embs[branch]
-                if (
-                    prompt_pool is not None
-                    and (not slots or prompt_pool.shape[0] > max(slots))
-                    and all(state.prompt_valid[branch][slot] for slot in slots)
-                ):
-                    cached = state.gather_prompt(branch, slots)
-                    if cached is not None:
-                        return cached
+                cached = state.gather_prompt(branch, slots)
+                if cached is not None:
+                    return cached
             prompt = self._encode_prompt_texts(
                 texts,
                 server_args,

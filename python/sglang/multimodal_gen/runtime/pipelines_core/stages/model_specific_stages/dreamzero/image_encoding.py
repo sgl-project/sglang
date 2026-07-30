@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import types
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -20,17 +21,106 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.loader.component_loaders.image_encoder_loader import (
+    ImageEncoderLoader,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+    ImageEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.utils import (
-    infer_dreamzero_model_input_batch_size,
+    infer_dreamzero_batch_size,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum, current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+
+
+def _dreamzero_non_causal_clip_attention_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+):
+    qkv_states, _ = self.qkv_proj(hidden_states)
+    query_states, key_states, value_states = qkv_states.chunk(3, dim=-1)
+    query_states = query_states.reshape(
+        query_states.shape[0],
+        query_states.shape[1],
+        self.num_heads_per_partition,
+        self.head_dim,
+    )
+    key_states = key_states.reshape(
+        key_states.shape[0],
+        key_states.shape[1],
+        self.num_heads_per_partition,
+        self.head_dim,
+    )
+    value_states = value_states.reshape(
+        value_states.shape[0],
+        value_states.shape[1],
+        self.num_heads_per_partition,
+        self.head_dim,
+    )
+
+    if self.attn.backend == AttentionBackendEnum.TORCH_SDPA:
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+        attn_mask = None
+        if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                attn_mask = attention_mask[:, None, None, :].to(
+                    dtype=query_states.dtype
+                )
+                attn_mask = (1.0 - attn_mask) * torch.finfo(query_states.dtype).min
+            else:
+                attn_mask = attention_mask
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attn_mask,
+            is_causal=False,
+            scale=self.scale,
+        )
+        attn_output = attn_output.transpose(1, 2)
+    else:
+        attn_output = self.attn(query_states, key_states, value_states)
+
+    attn_output = attn_output.reshape(
+        attn_output.shape[0],
+        attn_output.shape[1],
+        self.num_heads_per_partition * self.head_dim,
+    )
+    attn_output, _ = self.out_proj(attn_output)
+    return attn_output, None
+
+
+def _patch_dreamzero_clip_vision_attention(model: torch.nn.Module) -> None:
+    for layer in model.vision_model.encoder.layers:
+        attention = layer.self_attn
+        attention.attn.attn_impl.causal = False
+        attention.forward = types.MethodType(
+            _dreamzero_non_causal_clip_attention_forward,
+            attention,
+        )
+
+
+def load_dreamzero_image_encoder(
+    server_args: ServerArgs,
+    component_model_path: str,
+) -> torch.nn.Module:
+    image_encoder = ImageEncoderLoader().load_customized(
+        component_model_path,
+        server_args,
+        "image_encoder",
+    )
+    _patch_dreamzero_clip_vision_attention(image_encoder)
+    return image_encoder
 
 
 def _module_device(module: torch.nn.Module) -> torch.device:
@@ -51,8 +141,6 @@ def _as_bcthw(videos: torch.Tensor) -> torch.Tensor:
         videos = videos.permute(0, 4, 1, 2, 3)
     elif videos.shape[2] in (1, 3) and videos.shape[1] != 3:
         videos = videos.permute(0, 2, 1, 3, 4)
-    elif videos.shape[1] in (1, 3):
-        pass
     if videos.dtype == torch.uint8:
         videos = videos.float() / 255.0
     return videos
@@ -66,15 +154,9 @@ def _normalize_video_range(videos: torch.Tensor) -> torch.Tensor:
     return videos
 
 
-def _select_image_context(
-    videos_bcthw: torch.Tensor,
-    *,
-    first_frame: bool = False,
-) -> torch.Tensor:
+def _select_image_context(videos_bcthw: torch.Tensor) -> torch.Tensor:
     if videos_bcthw.shape[2] in (4, 9):
         return videos_bcthw[:, :, -1:].transpose(1, 2)
-    if first_frame:
-        return videos_bcthw[:, :, :1].transpose(1, 2)
     return videos_bcthw[:, :, :1].transpose(1, 2)
 
 
@@ -158,7 +240,10 @@ class DreamZeroObsPrepStage(PipelineStage):
                     model_inputs[key] = value.to(dtype=torch.bfloat16)
 
         batch.dreamzero_inputs = model_inputs
-        batch_size = infer_dreamzero_model_input_batch_size(model_inputs)
+        batch_size = infer_dreamzero_batch_size(
+            model_inputs,
+            keys=("images", "videos", "state"),
+        )
         session_ids, reset_mask = normalize_batched_session_fields(
             session_ids=batch.extra.get("dreamzero_session_ids"),
             reset_mask=batch.extra.get("dreamzero_reset_mask"),
@@ -174,8 +259,10 @@ class DreamZeroObsPrepStage(PipelineStage):
         return batch
 
 
-class DreamZeroVisualEncodingStage(PipelineStage):
+class DreamZeroVisualEncodingStage(ImageEncodingStage):
     """Encode DreamZero visual context into CLIP and VAE conditioning tensors."""
+
+    deduplicated_output_fields = ()
 
     def __init__(
         self,
@@ -183,16 +270,9 @@ class DreamZeroVisualEncodingStage(PipelineStage):
         vae: torch.nn.Module | None = None,
         cache_manager: DreamZeroCachePoolManager | None = None,
     ) -> None:
-        super().__init__()
-        self.image_encoder = image_encoder
+        super().__init__(image_processor=None, image_encoder=image_encoder)
         self.vae = vae
         self.cache_manager = cache_manager
-
-    @property
-    def role_affinity(self):
-        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-
-        return RoleType.ENCODER
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -365,13 +445,7 @@ class DreamZeroVisualEncodingStage(PipelineStage):
                     device=device,
                     dtype=dtype,
                 )
-                arch = server_args.pipeline_config.dit_config.arch_config
-                image = _select_image_context(
-                    videos,
-                    first_frame=not bool(
-                        getattr(arch, "concat_first_frame_latent", True)
-                    ),
-                )
+                image = _select_image_context(videos)
             with torch.amp.autocast(
                 dtype=torch.bfloat16,
                 device_type=device.type,
@@ -411,13 +485,7 @@ class DreamZeroVisualEncodingStage(PipelineStage):
                     dtype=dtype,
                 )
             if image is None or image.device != device or image.dtype != dtype:
-                arch = server_args.pipeline_config.dit_config.arch_config
-                image = _select_image_context(
-                    videos,
-                    first_frame=not bool(
-                        getattr(arch, "concat_first_frame_latent", True)
-                    ),
-                )
+                image = _select_image_context(videos)
             image_input = image.transpose(1, 2).contiguous()
             batch_size = image_input.shape[0]
             num_frames = server_args.pipeline_config.num_frames
@@ -516,7 +584,6 @@ class DreamZeroVisualEncodingStage(PipelineStage):
 
         videos = None
         image = None
-        arch = server_args.pipeline_config.dit_config.arch_config
         if device is not None:
             videos = self._videos_for_visual_context(
                 batch,
@@ -524,10 +591,7 @@ class DreamZeroVisualEncodingStage(PipelineStage):
                 device=device,
                 dtype=dtype,
             )
-            image = _select_image_context(
-                videos,
-                first_frame=not bool(getattr(arch, "concat_first_frame_latent", True)),
-            )
+            image = _select_image_context(videos)
 
         current_start_frame = request_cache.uniform_current_start_frame(
             self.cache_manager

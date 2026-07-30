@@ -22,7 +22,7 @@ Validated checkpoint layout:
 
 | Checkpoint | Status | Notes |
 | --- | --- | --- |
-| Local SGLang-format DreamZero WAN2.2 5B LIBERO SFT checkpoints | Validated | Requires `model_index.json` plus `transformer/`, `text_encoder/`, `image_encoder/`, and `vae/` component directories |
+| Local SGLang-format DreamZero WAN2.2 5B LIBERO SFT checkpoints | Validated | Requires `model_index.json` plus `tokenizer/`, `transformer/`, `text_encoder/`, `image_encoder/`, and `vae/` component directories |
 
 References:
 
@@ -58,6 +58,7 @@ The local checkpoint directory must contain the SGLang-native component layout:
 ```text File
 /path/to/dreamzero-wan2.2-5b-libero-sft/
   model_index.json
+  tokenizer/
   transformer/
   text_encoder/
   image_encoder/
@@ -90,7 +91,7 @@ DreamZero uses the shared `/v1/actions/generations` endpoint. Clients should pas
 | --- | --- | --- |
 | `model` | string, optional | Served model name. When omitted, the server uses the currently loaded policy. |
 | `input.prompt` or `input.task` | string or array | Per-row prompt cache key or task text. DreamZero rollout clients usually send stable per-row prompt keys. |
-| `input.observation` | object | Preprocessed DreamZero model input. Typical keys include image/video tensors, state tensors, tokenized text, text masks, negative text tensors, and embodiment IDs. |
+| `input.observation` | object | Preprocessed DreamZero model input. Typical keys include image/video tensors, state tensors, and embodiment IDs. Prompt text is tokenized and encoded inside the SGLang server. |
 | `parameters.session_ids` | array of strings | Stable logical session IDs used by the server-side DreamZero cache. Use one ID per batch row. |
 | `parameters.reset_mask` | array of booleans | Explicit client reset mask for `session_ids`. Normal rollout calls usually send all `false`; model lifecycle resets remain server-owned. |
 | `parameters.negative_prompts` | array of strings, optional | Stable cache keys for the negative prompt branch. |
@@ -122,8 +123,7 @@ import requests
 normalized_observation = {
     "state": np.zeros((1, 1, 7), dtype=np.float32).tolist(),
     "embodiment_id": [0],
-    # Add the image/video tensors and tokenized text fields expected by your
-    # DreamZero checkpoint's data transform.
+    # Add the image/video tensors expected by your DreamZero data transform.
 }
 
 payload = {
@@ -234,7 +234,7 @@ The returned `actions` are DreamZero normalized action chunks. Convert them back
 - Use msgpack for batched rollout requests. JSON is primarily for schema inspection and tiny smoke tests because image/video tensors make JSON payloads large.
 - Configure `default_num_inference_steps`, `cfg_scale`, and `flow_shift` at server startup. DreamZero keeps these policy parameters stable inside one served model instance.
 - `cfg_parallel_degree=2` splits DreamZero conditional and unconditional branches across CFG ranks. The text encoder is kept replicated for this path so positive and negative prompts do not pass through tensor-parallel collectives as if they were one shared prompt.
-- `dreamzero_tensor_parallel_size` and `dreamzero_sequence_parallel_size` control DreamZero model parallelism inside the pipeline config. DreamZero SP is a 14B-oriented Q-sequence sharding path for long video/action sequences; it does not require Ulysses+Ring at the validated sequence length.
+- `dreamzero_tensor_parallel_size` and `dreamzero_sequence_parallel_size` control DreamZero model parallelism inside the pipeline config. DreamZero SP shards the video/action/state sequence path and uses SGLang USP attention for the sharded attention compute.
 - `dreamzero_compile_components` compiles the DreamZero DiT hot path. Disable it when debugging numerical parity or distributed compile issues.
 
 ## 7. Validation Notes

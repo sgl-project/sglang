@@ -17,9 +17,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tp_world_size,
     model_parallel_is_initialized,
 )
-from sglang.multimodal_gen.runtime.loader.component_loaders.image_encoder_loader import (
-    load_dreamzero_image_encoder,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.session_cache import (
     DreamZeroCachePoolManager,
 )
@@ -36,6 +33,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.d
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.image_encoding import (
     DreamZeroObsPrepStage,
     DreamZeroVisualEncodingStage,
+    load_dreamzero_image_encoder,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.text_encoding import (
     DreamZeroTextEncodingStage,

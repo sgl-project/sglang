@@ -495,9 +495,7 @@ def _normalize_optional_bool_list(
 ) -> list[bool]:
     if value is None:
         return [default] * size
-    if isinstance(value, list):
-        values = [bool(item) for item in value]
-    elif isinstance(value, tuple):
+    if isinstance(value, (list, tuple)):
         values = [bool(item) for item in value]
     elif torch.is_tensor(value):
         values = [bool(item) for item in value.flatten().tolist()]
@@ -599,8 +597,6 @@ def resolve_request_cache(
     logical_session_ids, reset_mask = _logical_session_fields(batch, batch_size)
     prompt_hashes, neg_prompt_hashes = _batch_prompt_hashes(batch, batch_size)
     start_time = time.perf_counter()
-    persistent = True
-
     state = cache_manager.pool
     state.local_attn_size = local_attn_size
     slot_indices: list[int] = []
@@ -631,7 +627,7 @@ def resolve_request_cache(
         )
 
     request_cache = DreamZeroRequestCache(
-        cache_id="slot_pool" if persistent else None,
+        cache_id="slot_pool",
         logical_session_ids=logical_session_ids,
         slot_indices=slot_indices,
         reset_mask=reset_mask,
@@ -640,7 +636,7 @@ def resolve_request_cache(
         neg_prompt_hashes=neg_prompt_hashes,
         prompt_reusable=prompt_reusable,
         neg_prompt_reusable=neg_prompt_reusable,
-        persistent=persistent,
+        persistent=True,
     )
     batch.dreamzero_cache = request_cache
     batch.dreamzero_session_ids = logical_session_ids
@@ -658,7 +654,6 @@ def apply_request_lifecycle_resets(
     cache_manager: DreamZeroCachePoolManager | None,
     request_cache: DreamZeroRequestCache,
 ) -> None:
-    """Apply logical request/lifecycle resets to this rank's physical pool."""
     if cache_manager is None:
         raise RuntimeError("DreamZero session cache requires a cache manager")
     size = request_cache.batch_size

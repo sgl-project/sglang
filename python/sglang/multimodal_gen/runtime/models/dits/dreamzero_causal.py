@@ -9,8 +9,6 @@ https://github.com/dreamzero0/dreamzero/blob/main/groot/vla/model/dreamzero/acti
 from __future__ import annotations
 
 import math
-from functools import cache
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,47 +18,40 @@ from sglang.multimodal_gen.configs.models.dits.dreamzero_causal import (
 )
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
-    get_sp_parallel_rank,
     get_tp_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ulysses_parallel_rank,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.usp import (
+    _usp_input_all_to_all_varlen,
+    _usp_output_all_to_all_varlen,
+)
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
+    LayerNormScaleShift,
     RMSNorm,
     tensor_parallel_rms_norm,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.utils import (
-    flatten_dim_sp_into_sequence,
-    gather_full_sequence_parallel_tensor,
-    remove_redundant_action_register,
-    shard_sequence_parallel_sequence,
-    shard_sequence_parallel_time_embedding,
+    gather_sequence_parallel_global_tensor,
+    shard_sequence_parallel_global_sequence,
+    shard_sequence_parallel_global_tensor,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 _DREAMZERO_SUPPORTED_ATTENTION_BACKENDS = {
     AttentionBackendEnum.FA,
     AttentionBackendEnum.TORCH_SDPA,
 }
-
-
-def _residual_add(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    scale: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if scale is None:
-        return x + y
-    return x + (y * scale)
 
 
 def rope_params(max_seq_len: int, dim: int, theta: int = 10000) -> torch.Tensor:
@@ -183,55 +174,6 @@ class MultiEmbodimentActionEncoder(nn.Module):
         return self.W3(x, cat_ids)
 
 
-def _attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    causal: bool = False,
-    attention_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    out_dtype = q.dtype
-    if attention_dtype is None:
-        attention_dtype = q.dtype
-    q = q.to(attention_dtype)
-    k = k.to(attention_dtype)
-    v = v.to(attention_dtype)
-
-    impl = _dreamzero_attention_impl(
-        q.shape[-2],
-        q.shape[-1],
-        causal,
-        attention_dtype,
-    )
-    return impl.forward(q, k, v, attn_metadata=None).contiguous().to(out_dtype)
-
-
-@cache
-def _dreamzero_attention_impl(
-    num_heads: int,
-    head_size: int,
-    causal: bool,
-    dtype: torch.dtype,
-):
-    backend_cls = get_attn_backend(
-        head_size,
-        dtype,
-        supported_attention_backends=_DREAMZERO_SUPPORTED_ATTENTION_BACKENDS,
-    )
-    backend = backend_cls.get_enum()
-    logger.info_once(
-        f"DreamZero attention backend: {backend.name} (causal={causal})"
-    )
-    return backend_cls.get_impl_cls()(
-        num_heads=num_heads,
-        head_size=head_size,
-        num_kv_heads=num_heads,
-        softmax_scale=head_size**-0.5,
-        causal=causal,
-    )
-
-
 def rope_action_apply_polar(
     x: torch.Tensor,
     freqs: torch.Tensor,
@@ -260,43 +202,6 @@ def rope_action_apply_polar(
             chunk_size * num_state_per_block, 1, -1
         )
         freqs = torch.cat([freqs, freqs_action, freqs_state], dim=0)
-
-    freqs = freqs.unsqueeze(0)
-    return torch.view_as_real(x * freqs).flatten(3).to(out_dtype)
-
-
-def causal_rope_action_apply_polar(
-    x: torch.Tensor,
-    freqs: torch.Tensor,
-    freqs_action: torch.Tensor,
-    freqs_state: torch.Tensor,
-    action_register_length: int | None,
-    num_action_per_block: int,
-    num_state_per_block: int,
-    action_state_index: int,
-) -> torch.Tensor:
-    batch, seq_len, num_heads, _ = x.shape
-    out_dtype = x.dtype
-    x = torch.view_as_complex(
-        x.to(torch.float64).reshape(batch, seq_len, num_heads, -1, 2)
-    )
-
-    if action_register_length is not None:
-        assert action_register_length == (num_action_per_block + num_state_per_block)
-        freqs_action = freqs_action[
-            action_state_index
-            * num_action_per_block : (action_state_index + 1)
-            * num_action_per_block
-        ]
-        freqs_state = freqs_state[
-            action_state_index
-            * num_state_per_block : (action_state_index + 1)
-            * num_state_per_block
-        ]
-        freqs_1d = torch.cat([freqs_action, freqs_state], dim=0).view(
-            action_register_length, 1, -1
-        )
-        freqs = torch.cat([freqs, freqs_1d], dim=0)
 
     freqs = freqs.unsqueeze(0)
     return torch.view_as_real(x * freqs).flatten(3).to(out_dtype)
@@ -345,6 +250,13 @@ class DreamZeroT2VCrossAttention(nn.Module):
         self.o = linear_out()
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.attn = USPAttention(
+            num_heads=self.local_num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            supported_attention_backends=_DREAMZERO_SUPPORTED_ATTENTION_BACKENDS,
+            skip_sequence_parallel=True,
+        )
 
     def _project_query(self, x: torch.Tensor, batch: int) -> torch.Tensor:
         return _maybe_qk_norm(
@@ -383,7 +295,7 @@ class DreamZeroT2VCrossAttention(nn.Module):
         batch = x.shape[0]
         q = self._project_query(x, batch)
         k, v = self._project_text_kv(context, batch, crossattn_cache)
-        return _linear(self.o, _attention(q, k, v).flatten(2))
+        return _linear(self.o, self.attn(q, k, v).flatten(2))
 
 
 class DreamZeroI2VCrossAttention(DreamZeroT2VCrossAttention):
@@ -425,7 +337,7 @@ class DreamZeroI2VCrossAttention(DreamZeroT2VCrossAttention):
         batch = x.shape[0]
         q = self._project_query(x, batch)
         k, v = self._project_text_kv(context, batch, crossattn_cache)
-        text_x = _attention(q, k, v).flatten(2)
+        text_x = self.attn(q, k, v).flatten(2)
         k_img = _maybe_qk_norm(
             _linear(self.k_img, context_img),
             self.norm_k_img,
@@ -434,7 +346,7 @@ class DreamZeroI2VCrossAttention(DreamZeroT2VCrossAttention):
         v_img = _linear(self.v_img, context_img).view(
             batch, -1, self.local_num_heads, self.head_dim
         )
-        img_x = _attention(q, k_img, v_img).flatten(2)
+        img_x = self.attn(q, k_img, v_img).flatten(2)
         merged_x = text_x + img_x
         out = _linear(self.o, merged_x)
         return out
@@ -507,323 +419,62 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
         )
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-
-    def _process_clean_image_only(
-        self,
-        clean_image_q: torch.Tensor,
-        clean_image_k: torch.Tensor,
-        clean_image_v: torch.Tensor,
-        clean_frames: int,
-    ) -> torch.Tensor:
-        block_size = self.frame_seqlen * self.num_frame_per_block
-        num_blocks = (clean_frames - 1) // self.num_frame_per_block
-        if num_blocks == 0:
-            return _attention(
-                clean_image_q[:, : self.frame_seqlen],
-                clean_image_k[:, : self.frame_seqlen],
-                clean_image_v[:, : self.frame_seqlen],
-            )
-
-        output = torch.empty_like(clean_image_q)
-        output[:, : self.frame_seqlen] = _attention(
-            clean_image_q[:, : self.frame_seqlen],
-            clean_image_k[:, : self.frame_seqlen],
-            clean_image_v[:, : self.frame_seqlen],
+        self.attn = USPAttention(
+            num_heads=self.local_num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            supported_attention_backends=_DREAMZERO_SUPPORTED_ATTENTION_BACKENDS,
+            skip_sequence_parallel=True,
         )
-        if self.local_attn_size == -1:
-            output[:, self.frame_seqlen :] = _attention(
-                clean_image_q[:, self.frame_seqlen :],
-                clean_image_k,
-                clean_image_v,
-                causal=True,
-            )
-        else:
-            for block_idx in range(num_blocks):
-                block_start = self.frame_seqlen + block_idx * block_size
-                block_end = min(block_start + block_size, clean_image_q.shape[1])
-                kv_start = max(0, block_end - self.local_attn_size * self.frame_seqlen)
-                output[:, block_start:block_end] = _attention(
-                    clean_image_q[:, block_start:block_end],
-                    clean_image_k[:, kv_start:block_end],
-                    clean_image_v[:, kv_start:block_end],
-                )
-        return output
-
-    def _process_state_blocks(
-        self,
-        noisy_state_q: torch.Tensor,
-        noisy_state_k: torch.Tensor,
-        noisy_state_v: torch.Tensor,
-        state_horizon: int,
-    ) -> torch.Tensor:
-        output = torch.empty_like(noisy_state_q)
-        num_blocks = state_horizon // self.num_state_per_block
-        for block_idx in range(num_blocks):
-            start = block_idx * self.num_state_per_block
-            end = start + self.num_state_per_block
-            output[:, start:end] = _attention(
-                noisy_state_q[:, start:end],
-                noisy_state_k[:, start:end],
-                noisy_state_v[:, start:end],
-            )
-        return output
-
-    def _process_noisy_image_blocks(
-        self,
-        noisy_image_q: torch.Tensor,
-        noisy_image_k: torch.Tensor,
-        noisy_image_v: torch.Tensor,
-        clean_image_k: torch.Tensor,
-        clean_image_v: torch.Tensor,
-        noisy_action_k: torch.Tensor,
-        noisy_action_v: torch.Tensor,
-        noisy_state_k: torch.Tensor,
-        noisy_state_v: torch.Tensor,
-        noisy_frames: int,
-        action_horizon: int,
-        state_horizon: int,
-    ) -> torch.Tensor:
-        block_size = self.frame_seqlen * self.num_frame_per_block
-        num_blocks = (noisy_frames - 1) // self.num_frame_per_block
-        output = torch.empty_like(noisy_image_q)
-        output[:, : self.frame_seqlen] = _attention(
-            noisy_image_q[:, : self.frame_seqlen],
-            noisy_image_k[:, : self.frame_seqlen],
-            noisy_image_v[:, : self.frame_seqlen],
+        self.sequence_parallel_attn = USPAttention(
+            num_heads=self.local_num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            supported_attention_backends=_DREAMZERO_SUPPORTED_ATTENTION_BACKENDS,
         )
-        assert action_horizon == num_blocks * self.num_action_per_block
-        assert state_horizon == num_blocks * self.num_state_per_block
-        for block_idx in range(num_blocks):
-            block_start = self.frame_seqlen + block_idx * block_size
-            block_end = min(block_start + block_size, noisy_image_q.shape[1])
-            clean_end = self.frame_seqlen + block_idx * block_size
-            if self.local_attn_size != -1:
-                clean_start = max(
-                    0, clean_end - self.local_attn_size * self.frame_seqlen
-                )
-            else:
-                clean_start = 0
-            action_start = block_idx * self.num_action_per_block
-            action_end = action_start + self.num_action_per_block
-            state_start = block_idx * self.num_state_per_block
-            state_end = state_start + self.num_state_per_block
-            output[:, block_start:block_end] = _attention(
-                noisy_image_q[:, block_start:block_end],
-                torch.cat(
-                    [
-                        clean_image_k[:, clean_start:clean_end],
-                        noisy_image_k[:, block_start:block_end],
-                        noisy_action_k[:, action_start:action_end],
-                        noisy_state_k[:, state_start:state_end],
-                    ],
-                    dim=1,
-                ),
-                torch.cat(
-                    [
-                        clean_image_v[:, clean_start:clean_end],
-                        noisy_image_v[:, block_start:block_end],
-                        noisy_action_v[:, action_start:action_end],
-                        noisy_state_v[:, state_start:state_end],
-                    ],
-                    dim=1,
-                ),
-            )
-        return output
 
-    def _process_noisy_action_blocks(
-        self,
-        noisy_action_q: torch.Tensor,
-        noisy_action_k: torch.Tensor,
-        noisy_action_v: torch.Tensor,
-        clean_image_k: torch.Tensor,
-        clean_image_v: torch.Tensor,
-        noisy_image_k: torch.Tensor,
-        noisy_image_v: torch.Tensor,
-        noisy_state_k: torch.Tensor,
-        noisy_state_v: torch.Tensor,
-        noisy_frames: int,
-        action_horizon: int,
-        state_horizon: int,
-    ) -> torch.Tensor:
-        num_blocks = (noisy_frames - 1) // self.num_frame_per_block
-        output = torch.empty_like(noisy_action_q)
-        assert action_horizon == num_blocks * self.num_action_per_block
-        assert state_horizon == num_blocks * self.num_state_per_block
-        block_size = self.frame_seqlen * self.num_frame_per_block
-        for block_idx in range(num_blocks):
-            action_start = block_idx * self.num_action_per_block
-            action_end = action_start + self.num_action_per_block
-            clean_end = self.frame_seqlen + block_idx * block_size
-            noisy_img_start = self.frame_seqlen + block_idx * block_size
-            noisy_img_end = noisy_img_start + block_size
-            state_start = block_idx * self.num_state_per_block
-            state_end = state_start + self.num_state_per_block
-            output[:, action_start:action_end] = _attention(
-                noisy_action_q[:, action_start:action_end],
-                torch.cat(
-                    [
-                        clean_image_k[:, :clean_end],
-                        noisy_image_k[:, noisy_img_start:noisy_img_end],
-                        noisy_action_k[:, action_start:action_end],
-                        noisy_state_k[:, state_start:state_end],
-                    ],
-                    dim=1,
-                ),
-                torch.cat(
-                    [
-                        clean_image_v[:, :clean_end],
-                        noisy_image_v[:, noisy_img_start:noisy_img_end],
-                        noisy_action_v[:, action_start:action_end],
-                        noisy_state_v[:, state_start:state_end],
-                    ],
-                    dim=1,
-                ),
-            )
-        return output
-
-    def _blockwise_causal_flash_attn(
+    def _attention(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        frame_seqlen: int,
-        num_frame_per_block: int = 1,
-        action_horizon: int | None = None,
-        state_horizon: int | None = None,
-        num_action_per_block: int | None = None,
-        num_state_per_block: int | None = None,
     ) -> torch.Tensor:
-        total_len = q.shape[1]
-        has_action_state = action_horizon is not None and state_horizon is not None
-        if not has_action_state:
-            num_frames = total_len // frame_seqlen
-            block_size = frame_seqlen * num_frame_per_block
-            num_blocks = (num_frames - 1) // num_frame_per_block
-            if num_blocks <= 0:
-                return _attention(q, k, v)
-            if self.local_attn_size == -1:
-                return _attention(q, k, v, causal=True)
-            output = torch.empty_like(q)
-            output[:, :frame_seqlen] = _attention(
-                q[:, :frame_seqlen], k[:, :frame_seqlen], v[:, :frame_seqlen]
-            )
-            for block_idx in range(num_blocks):
-                block_start = frame_seqlen + block_idx * block_size
-                block_end = min(block_start + block_size, total_len)
-                kv_start = max(0, block_end - self.local_attn_size * frame_seqlen)
-                output[:, block_start:block_end] = _attention(
-                    q[:, block_start:block_end],
-                    k[:, kv_start:block_end],
-                    v[:, kv_start:block_end],
-                )
-            return output
+        return self.attn(q, k, v).contiguous()
 
-        assert action_horizon is not None
-        assert state_horizon is not None
-        assert num_action_per_block is not None
-        assert num_state_per_block is not None
-        first_image_len = frame_seqlen
-        image_blocks_len = total_len - first_image_len - action_horizon - state_horizon
-        num_image_blocks = image_blocks_len // (num_frame_per_block * frame_seqlen)
-        num_action_blocks = action_horizon // num_action_per_block
-        num_state_blocks = state_horizon // num_state_per_block
-        assert num_image_blocks == num_action_blocks == num_state_blocks
+    def _sequence_parallel_attention_with_replicated_prefix(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: torch.Tensor,
+        seq_lens: list[int] | None,
+    ) -> torch.Tensor:
+        prefix_k = kv_cache[0]
+        prefix_v = kv_cache[1]
+        if seq_lens is None:
+            return self.sequence_parallel_attn.forward_with_replicated_kv_prefix(
+                q.contiguous(),
+                prefix_k.contiguous(),
+                prefix_v.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+            ).contiguous()
 
-        image_blocks_start = first_image_len
-        action_start = image_blocks_start + image_blocks_len
-        state_start = action_start + action_horizon
-        output = torch.empty_like(q)
-        output[:, :first_image_len] = _attention(
-            q[:, :first_image_len], k[:, :first_image_len], v[:, :first_image_len]
+        q = _usp_input_all_to_all_varlen(q.contiguous(), seq_lens, head_dim=2)
+        k = _usp_input_all_to_all_varlen(k.contiguous(), seq_lens, head_dim=2)
+        v = _usp_input_all_to_all_varlen(v.contiguous(), seq_lens, head_dim=2)
+
+        h_local = k.shape[2]
+        h_start = get_ulysses_parallel_rank() * h_local
+        prefix_k = prefix_k[:, :, h_start : h_start + h_local].contiguous()
+        prefix_v = prefix_v[:, :, h_start : h_start + h_local].contiguous()
+        out = self.sequence_parallel_attn.attn_impl.forward(
+            q,
+            torch.cat([prefix_k, k], dim=1),
+            torch.cat([prefix_v, v], dim=1),
+            get_forward_context().attn_metadata,
         )
-        for block_idx in range(num_image_blocks):
-            block_start = (
-                image_blocks_start + block_idx * num_frame_per_block * frame_seqlen
-            )
-            block_end = (
-                image_blocks_start
-                + (block_idx + 1) * num_frame_per_block * frame_seqlen
-            )
-            image_kv_start = (
-                max(
-                    image_blocks_start,
-                    block_end - self.local_attn_size * frame_seqlen,
-                )
-                if self.local_attn_size != -1
-                else image_blocks_start
-            )
-            action_block_start = action_start + block_idx * num_action_per_block
-            action_block_end = action_block_start + num_action_per_block
-            state_block_start = state_start + block_idx * num_state_per_block
-            state_block_end = state_block_start + num_state_per_block
-            output[:, block_start:block_end] = _attention(
-                q[:, block_start:block_end],
-                torch.cat(
-                    [
-                        k[:, :first_image_len],
-                        k[:, image_kv_start:block_end],
-                        k[:, action_block_start:action_block_end],
-                        k[:, state_block_start:state_block_end],
-                    ],
-                    dim=1,
-                ),
-                torch.cat(
-                    [
-                        v[:, :first_image_len],
-                        v[:, image_kv_start:block_end],
-                        v[:, action_block_start:action_block_end],
-                        v[:, state_block_start:state_block_end],
-                    ],
-                    dim=1,
-                ),
-            )
-        for block_idx in range(num_action_blocks):
-            action_block_start = action_start + block_idx * num_action_per_block
-            action_block_end = action_block_start + num_action_per_block
-            image_block_end = (
-                image_blocks_start
-                + (block_idx + 1) * num_frame_per_block * frame_seqlen
-            )
-            image_kv_start = (
-                max(
-                    image_blocks_start,
-                    image_block_end - self.local_attn_size * frame_seqlen,
-                )
-                if self.local_attn_size != -1
-                else image_blocks_start
-            )
-            state_block_start = state_start + block_idx * num_state_per_block
-            state_block_end = state_block_start + num_state_per_block
-            output[:, action_block_start:action_block_end] = _attention(
-                q[:, action_block_start:action_block_end],
-                torch.cat(
-                    [
-                        k[:, :first_image_len],
-                        k[:, image_kv_start:image_block_end],
-                        k[:, action_block_start:action_block_end],
-                        k[:, state_block_start:state_block_end],
-                    ],
-                    dim=1,
-                ),
-                torch.cat(
-                    [
-                        v[:, :first_image_len],
-                        v[:, image_kv_start:image_block_end],
-                        v[:, action_block_start:action_block_end],
-                        v[:, state_block_start:state_block_end],
-                    ],
-                    dim=1,
-                ),
-            )
-        for block_idx in range(num_state_blocks):
-            state_block_start = state_start + block_idx * num_state_per_block
-            state_block_end = state_block_start + num_state_per_block
-            output[:, state_block_start:state_block_end] = _attention(
-                q[:, state_block_start:state_block_end],
-                k[:, state_block_start:state_block_end],
-                v[:, state_block_start:state_block_end],
-            )
-        return output
+        return _usp_output_all_to_all_varlen(out, seq_lens, head_dim=2).contiguous()
 
     def forward(
         self,
@@ -833,10 +484,14 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
         freqs_state: torch.Tensor,
         action_register_length: int | None,
         kv_cache: torch.Tensor | None = None,
-        current_start_frame: int = 0,
-        is_tf: bool = True,
-        enable_sequence_parallel: bool = False,
+        seq_lens: list[int] | None = None,
+        video_sequence_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if kv_cache is None:
+            raise RuntimeError("DreamZero SGLang inference requires a KV cache")
+        if video_sequence_length is None:
+            video_sequence_length = x.shape[1] - (action_register_length or 0)
+
         batch, seq_len = x.shape[:2]
         q = _maybe_qk_norm(
             _linear(self.q, x), self.norm_q, tensor_parallel=self.use_tensor_parallel
@@ -845,277 +500,50 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
             _linear(self.k, x), self.norm_k, tensor_parallel=self.use_tensor_parallel
         ).view(batch, seq_len, self.local_num_heads, self.head_dim)
         v = _linear(self.v, x).view(batch, seq_len, self.local_num_heads, self.head_dim)
-        updated_kv_cache: torch.Tensor | None = None
 
-        if kv_cache is None:
-            if is_tf:
-                half_seq_len = (
-                    seq_len - (action_register_length if action_register_length else 0)
-                ) // 2
-                q_context = q[:, :half_seq_len]
-                k_context = k[:, :half_seq_len]
-                q_noisy = q[:, half_seq_len:]
-                k_noisy = k[:, half_seq_len:]
-                roped_query = torch.cat(
-                    [
-                        rope_action_apply_polar(
-                            q_context,
-                            freqs,
-                            freqs_action,
-                            freqs_state,
-                            action_register_length=None,
-                        ).type_as(v),
-                        rope_action_apply_polar(
-                            q_noisy,
-                            freqs,
-                            freqs_action,
-                            freqs_state,
-                            action_register_length=action_register_length,
-                            num_action_per_block=self.num_action_per_block,
-                            num_state_per_block=self.num_state_per_block,
-                        ).type_as(v),
-                    ],
-                    dim=1,
-                )
-                roped_key = torch.cat(
-                    [
-                        rope_action_apply_polar(
-                            k_context,
-                            freqs,
-                            freqs_action,
-                            freqs_state,
-                            action_register_length=None,
-                        ).type_as(v),
-                        rope_action_apply_polar(
-                            k_noisy,
-                            freqs,
-                            freqs_action,
-                            freqs_state,
-                            action_register_length=action_register_length,
-                            num_action_per_block=self.num_action_per_block,
-                            num_state_per_block=self.num_state_per_block,
-                        ).type_as(v),
-                    ],
-                    dim=1,
-                )
+        roped_query = rope_action_apply_polar(
+            q,
+            freqs,
+            freqs_action,
+            freqs_state,
+            action_register_length=None,
+        ).type_as(v)
+        roped_key = rope_action_apply_polar(
+            k,
+            freqs,
+            freqs_action,
+            freqs_state,
+            action_register_length=None,
+        ).type_as(v)
 
-                if action_register_length is not None:
-                    clean_image_seq_len = half_seq_len
-                    clean_frames = clean_image_seq_len // self.frame_seqlen
-                    noisy_image_seq_len = half_seq_len
-                    noisy_frames = noisy_image_seq_len // self.frame_seqlen
-                    num_image_blocks = (noisy_frames - 1) // self.num_frame_per_block
-                    action_horizon = num_image_blocks * self.num_action_per_block
-                    state_horizon = num_image_blocks * self.num_state_per_block
-                    expected_len = (
-                        half_seq_len
-                        + noisy_image_seq_len
-                        + action_horizon
-                        + state_horizon
-                    )
-                    if roped_query.shape[1] != expected_len:
-                        raise ValueError(
-                            "Sequence length does not match DreamZero action/state block layout: "
-                            f"got {roped_query.shape[1]}, expected {expected_len}."
-                        )
-
-                    clean_image_outputs = self._process_clean_image_only(
-                        roped_query[:, :clean_image_seq_len],
-                        roped_key[:, :clean_image_seq_len],
-                        v[:, :clean_image_seq_len],
-                        clean_frames,
-                    )
-                    noisy_image_start = half_seq_len
-                    noisy_action_start = noisy_image_start + noisy_image_seq_len
-                    noisy_state_start = noisy_action_start + action_horizon
-                    noisy_image_outputs = self._process_noisy_image_blocks(
-                        roped_query[
-                            :,
-                            noisy_image_start : noisy_image_start + noisy_image_seq_len,
-                        ],
-                        roped_key[
-                            :,
-                            noisy_image_start : noisy_image_start + noisy_image_seq_len,
-                        ],
-                        v[
-                            :,
-                            noisy_image_start : noisy_image_start + noisy_image_seq_len,
-                        ],
-                        roped_key[:, :clean_image_seq_len],
-                        v[:, :clean_image_seq_len],
-                        roped_key[
-                            :,
-                            noisy_action_start : noisy_action_start + action_horizon,
-                        ],
-                        v[:, noisy_action_start : noisy_action_start + action_horizon],
-                        roped_key[:, noisy_state_start:],
-                        v[:, noisy_state_start:],
-                        noisy_frames,
-                        action_horizon,
-                        state_horizon,
-                    )
-                    noisy_action_outputs = self._process_noisy_action_blocks(
-                        roped_query[
-                            :,
-                            noisy_action_start : noisy_action_start + action_horizon,
-                        ],
-                        roped_key[
-                            :,
-                            noisy_action_start : noisy_action_start + action_horizon,
-                        ],
-                        v[:, noisy_action_start : noisy_action_start + action_horizon],
-                        roped_key[:, :clean_image_seq_len],
-                        v[:, :clean_image_seq_len],
-                        roped_key[
-                            :,
-                            noisy_image_start : noisy_image_start + noisy_image_seq_len,
-                        ],
-                        v[
-                            :,
-                            noisy_image_start : noisy_image_start + noisy_image_seq_len,
-                        ],
-                        roped_key[:, noisy_state_start:],
-                        v[:, noisy_state_start:],
-                        noisy_frames,
-                        action_horizon,
-                        state_horizon,
-                    )
-                    noisy_state_outputs = self._process_state_blocks(
-                        roped_query[:, noisy_state_start:],
-                        roped_key[:, noisy_state_start:],
-                        v[:, noisy_state_start:],
-                        state_horizon,
-                    )
-                    out = torch.cat(
-                        [
-                            clean_image_outputs,
-                            noisy_image_outputs,
-                            noisy_action_outputs,
-                            noisy_state_outputs,
-                        ],
-                        dim=1,
-                    )
-                else:
-                    clean_q = roped_query[:, :half_seq_len]
-                    clean_k = roped_key[:, :half_seq_len]
-                    clean_v = v[:, :half_seq_len]
-                    noisy_q = roped_query[:, half_seq_len:]
-                    noisy_k = roped_key[:, half_seq_len:]
-                    noisy_v = v[:, half_seq_len:]
-                    clean_out = self._blockwise_causal_flash_attn(
-                        clean_q,
-                        clean_k,
-                        clean_v,
-                        self.frame_seqlen,
-                        self.num_frame_per_block,
-                    )
-                    noisy_out = _attention(
-                        noisy_q,
-                        torch.cat([clean_k, noisy_k], dim=1),
-                        torch.cat([clean_v, noisy_v], dim=1),
-                    )
-                    out = torch.cat([clean_out, noisy_out], dim=1)
-            else:
-                roped_query = rope_action_apply_polar(
-                    q,
-                    freqs,
-                    freqs_action,
-                    freqs_state,
-                    action_register_length,
-                    self.num_action_per_block,
-                    self.num_state_per_block,
-                ).type_as(v)
-                roped_key = rope_action_apply_polar(
-                    k,
-                    freqs,
-                    freqs_action,
-                    freqs_state,
-                    action_register_length,
-                    self.num_action_per_block,
-                    self.num_state_per_block,
-                ).type_as(v)
-                if action_register_length is not None:
-                    chunk_size = action_register_length // (
-                        self.num_action_per_block + self.num_state_per_block
-                    )
-                    action_horizon = chunk_size * self.num_action_per_block
-                    state_horizon = chunk_size * self.num_state_per_block
-                else:
-                    action_horizon = None
-                    state_horizon = None
-                out = self._blockwise_causal_flash_attn(
-                    roped_query,
-                    roped_key,
-                    v,
-                    self.frame_seqlen,
-                    self.num_frame_per_block,
-                    action_horizon=action_horizon,
-                    state_horizon=state_horizon,
-                    num_action_per_block=(
-                        self.num_action_per_block if action_register_length else None
-                    ),
-                    num_state_per_block=(
-                        self.num_state_per_block if action_register_length else None
-                    ),
-                )
+        if seq_lens is None:
+            current_video_k = roped_key[:, :video_sequence_length]
+            current_video_v = v[:, :video_sequence_length]
+            out = self._attention(
+                roped_query,
+                torch.cat([kv_cache[0], roped_key], dim=1),
+                torch.cat([kv_cache[1], v], dim=1),
+            )
         else:
-            action_state_index = (current_start_frame - 1) // self.num_frame_per_block
-            roped_query = causal_rope_action_apply_polar(
-                q,
-                freqs,
-                freqs_action,
-                freqs_state,
-                action_register_length,
-                self.num_action_per_block,
-                self.num_state_per_block,
-                action_state_index,
-            ).type_as(v)
-            roped_key = causal_rope_action_apply_polar(
-                k,
-                freqs,
-                freqs_action,
-                freqs_state,
-                action_register_length,
-                self.num_action_per_block,
-                self.num_state_per_block,
-                action_state_index,
-            ).type_as(v)
-            if enable_sequence_parallel:
-                roped_key = gather_full_sequence_parallel_tensor(roped_key)
-                v = gather_full_sequence_parallel_tensor(v)
-                if action_register_length is not None:
-                    roped_key = remove_redundant_action_register(
-                        roped_key, action_register_length
-                    )
-                    v = remove_redundant_action_register(v, action_register_length)
-                else:
-                    roped_key = flatten_dim_sp_into_sequence(roped_key)
-                    v = flatten_dim_sp_into_sequence(v)
-            roped_action_query = roped_action_key = action_v = None
-            if action_register_length is not None:
-                roped_action_query = roped_query[:, -action_register_length:]
-                roped_query = roped_query[:, :-action_register_length]
-                roped_action_key = roped_key[:, -action_register_length:]
-                roped_key = roped_key[:, :-action_register_length]
-                action_v = v[:, -action_register_length:]
-                v = v[:, :-action_register_length]
+            current_video_k = gather_sequence_parallel_global_tensor(
+                roped_key, seq_lens
+            )[:, :video_sequence_length]
+            current_video_v = gather_sequence_parallel_global_tensor(
+                v, seq_lens
+            )[:, :video_sequence_length]
+            out = self._sequence_parallel_attention_with_replicated_prefix(
+                roped_query,
+                roped_key,
+                v,
+                kv_cache,
+                seq_lens,
+            )
 
-            updated_k = torch.cat([kv_cache[0], roped_key], dim=1)
-            updated_v = torch.cat([kv_cache[1], v], dim=1)
-            updated_k = updated_k[:, -self.max_attention_size :]
-            updated_v = updated_v[:, -self.max_attention_size :]
-            if action_register_length is not None:
-                assert roped_action_query is not None
-                assert roped_action_key is not None
-                assert action_v is not None
-                out = _attention(
-                    torch.cat([roped_query, roped_action_query], dim=1),
-                    torch.cat([updated_k, roped_action_key], dim=1),
-                    torch.cat([updated_v, action_v], dim=1),
-                )
-            else:
-                out = _attention(roped_query, updated_k, updated_v)
-            updated_kv_cache = torch.stack([updated_k, updated_v], dim=0)
+        updated_k = torch.cat([kv_cache[0], current_video_k], dim=1)
+        updated_v = torch.cat([kv_cache[1], current_video_v], dim=1)
+        updated_k = updated_k[:, -self.max_attention_size :]
+        updated_v = updated_v[:, -self.max_attention_size :]
+        updated_kv_cache = torch.stack([updated_k, updated_v], dim=0)
 
         out = _linear(self.o, out.flatten(2))
         return out, updated_kv_cache
@@ -1147,7 +575,12 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
         self.use_tensor_parallel = use_tensor_parallel
-        self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
+        self.norm1 = LayerNormScaleShift(
+            dim,
+            eps=eps,
+            elementwise_affine=False,
+            dtype=torch.float32,
+        )
         self.self_attn = DreamZeroCausalWanSelfAttention(
             dim=dim,
             num_heads=num_heads,
@@ -1168,7 +601,12 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
         self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](
             dim, num_heads, qk_norm, eps, use_tensor_parallel=use_tensor_parallel
         )
-        self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=False)
+        self.norm2 = LayerNormScaleShift(
+            dim,
+            eps=eps,
+            elementwise_affine=False,
+            dtype=torch.float32,
+        )
         if use_tensor_parallel:
             self.ffn = nn.ModuleList(
                 [
@@ -1209,16 +647,17 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
         context: torch.Tensor,
         kv_cache: torch.Tensor | None = None,
         crossattn_cache: dict | None = None,
-        current_start_frame: int = 0,
-        is_tf: bool = True,
-        enable_sequence_parallel: bool = False,
+        seq_lens: list[int] | None = None,
+        video_sequence_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         e_parts = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
         e_parts = align_modulation(e_parts, x.shape[1])
 
-        self_attn_input = self.norm1(x) * (1 + e_parts[1].squeeze(2)) + e_parts[
-            0
-        ].squeeze(2)
+        self_attn_input = self.norm1(
+            x,
+            e_parts[0].squeeze(2),
+            e_parts[1].squeeze(2),
+        )
         y, updated_kv_cache = self.self_attn(
             x=self_attn_input,
             freqs=freqs,
@@ -1226,31 +665,24 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
             freqs_state=freqs_state,
             action_register_length=action_register_length,
             kv_cache=kv_cache,
-            is_tf=is_tf,
-            current_start_frame=current_start_frame,
-            enable_sequence_parallel=enable_sequence_parallel,
+            seq_lens=seq_lens,
+            video_sequence_length=video_sequence_length,
         )
-        x = _residual_add(
-            x,
-            y,
-            e_parts[2].squeeze(2),
-        )
+        x = x + y * e_parts[2].squeeze(2)
         cross_attn_input = self.norm3(x)
         cross = self.cross_attn(
             cross_attn_input,
             context,
             crossattn_cache=crossattn_cache,
         )
-        x = _residual_add(x, cross)
-        norm2_input = self.norm2(x) * (1 + e_parts[4].squeeze(2)) + e_parts[3].squeeze(
-            2
+        x = x + cross
+        norm2_input = self.norm2(
+            x,
+            e_parts[3].squeeze(2),
+            e_parts[4].squeeze(2),
         )
         y = self._run_ffn(norm2_input)
-        x = _residual_add(
-            x,
-            y,
-            e_parts[5].squeeze(2),
-        )
+        x = x + y * e_parts[5].squeeze(2)
         return x, updated_kv_cache
 
 
@@ -1261,14 +693,19 @@ class DreamZeroCausalHead(nn.Module):
         self.out_dim = out_dim
         self.patch_size = patch_size
         self.eps = eps
-        self.norm = FP32LayerNorm(dim, eps, elementwise_affine=False)
+        self.norm = LayerNormScaleShift(
+            dim,
+            eps=eps,
+            elementwise_affine=False,
+            dtype=torch.float32,
+        )
         self.head = nn.Linear(dim, math.prod(patch_size) * out_dim)
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
     def forward(self, x: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
         e_parts = (self.modulation.unsqueeze(1) + e).chunk(2, dim=2)
         shift, scale = align_modulation(e_parts, x.shape[1])
-        return self.head(self.norm(x) * (1 + scale.squeeze(2)) + shift.squeeze(2))
+        return self.head(self.norm(x, shift.squeeze(2), scale.squeeze(2)))
 
 
 class MLPProj(nn.Module):
@@ -1494,11 +931,6 @@ class DreamZeroCausalWanModel(CachableDiT):
         enable_sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
         x = x.flatten(start_dim=2).transpose(1, 2)
-        if enable_sequence_parallel:
-            x, freqs = shard_sequence_parallel_sequence(x, freqs)
-            sp_seq_len = x.shape[1]
-        else:
-            sp_seq_len = seq_len
         batch = x.shape[0]
         num_timestep_frames = timestep.shape[1]
 
@@ -1516,6 +948,24 @@ class DreamZeroCausalWanModel(CachableDiT):
             action_length = 0
             action_register_length = None
             state_features = None
+
+        if action_register_length is not None:
+            action_state_index = (current_start_frame - 1) // self.num_frame_per_block
+            action_freqs = self.freqs_action[
+                action_state_index
+                * self.num_action_per_block : (action_state_index + 1)
+                * self.num_action_per_block
+            ].view(self.num_action_per_block, 1, -1)
+            state_freqs = self.freqs_state[
+                action_state_index
+                * self.num_state_per_block : (action_state_index + 1)
+                * self.num_state_per_block
+            ].view(self.num_state_per_block, 1, -1)
+            freqs = torch.cat([freqs, action_freqs, state_freqs], dim=0)
+
+        seq_lens = None
+        if enable_sequence_parallel:
+            x, freqs, seq_lens = shard_sequence_parallel_global_sequence(x, freqs)
 
         if num_timestep_frames <= seq_len:
             repeat = (seq_len + num_timestep_frames - 1) // num_timestep_frames
@@ -1546,9 +996,8 @@ class DreamZeroCausalWanModel(CachableDiT):
         e = e.unflatten(dim=0, sizes=(batch, -1))
         e0 = self.time_projection(e).unflatten(dim=2, sizes=(6, self.dim))
         if enable_sequence_parallel:
-            e0 = shard_sequence_parallel_time_embedding(
-                e0, sp_seq_len, action_register_length
-            )
+            assert seq_lens is not None
+            e0 = shard_sequence_parallel_global_tensor(e0, seq_lens)
 
         context = self.text_embedding(context)
         if clip_feature is not None:
@@ -1570,29 +1019,24 @@ class DreamZeroCausalWanModel(CachableDiT):
                     if crossattn_cache is not None
                     else None
                 ),
-                current_start_frame=current_start_frame,
-                enable_sequence_parallel=enable_sequence_parallel,
+                seq_lens=seq_lens,
+                video_sequence_length=seq_len,
             )
             updated_kv_caches.append(updated_kv_cache)
 
+        if enable_sequence_parallel:
+            assert seq_lens is not None
+            x = gather_sequence_parallel_global_tensor(x, seq_lens)
+
         if action is not None:
-            action_noise_pred = x[:, sp_seq_len : sp_seq_len + action_length]
+            action_noise_pred = x[:, seq_len : seq_len + action_length]
             action_noise_pred = self.action_decoder(action_noise_pred, embodiment_id)
         else:
             action_noise_pred = None
 
-        x_video = x[:, :sp_seq_len]
-        if enable_sequence_parallel:
-            video_e = e[:, :seq_len]
-            sp_rank = get_sp_parallel_rank()
-            e_video = video_e[:, sp_rank * sp_seq_len : (sp_rank + 1) * sp_seq_len]
-        else:
-            e_video = e[:, :seq_len]
+        x_video = x[:, :seq_len]
+        e_video = e[:, :seq_len]
         x_video = self.head(x_video, e_video.unsqueeze(2))
-        if enable_sequence_parallel:
-            x_video = flatten_dim_sp_into_sequence(
-                gather_full_sequence_parallel_tensor(x_video)
-            )
         return x_video, action_noise_pred, updated_kv_caches
 
     def _forward_inference(

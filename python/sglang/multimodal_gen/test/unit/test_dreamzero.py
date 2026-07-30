@@ -24,6 +24,8 @@ from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
     action_metadata,
     build_action_sampling_params,
 )
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.attention import layer as attention_layer
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.session_cache import (
     BRANCH_COND,
     BRANCH_UNCOND,
@@ -33,17 +35,33 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.d
     resolve_request_cache,
 )
 from sglang.multimodal_gen.runtime.models.dits.dreamzero_causal import (
+    DreamZeroCausalWanSelfAttention,
     DreamZeroCausalWanModel,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero import (
+    utils as dreamzero_utils,
 )
 from sglang.multimodal_gen.runtime.pipelines.dreamzero_pipeline import (
     DreamZeroPipeline,
-    _disable_text_encoder_folding_for_cfg,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.denoising import (
+    DreamZeroActionOutputStage,
     DreamZeroCausalDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.image_encoding import (
+    DreamZeroVisualEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.text_encoding import (
     DreamZeroTextEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+    ImageEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    TextEncodingStage,
 )
 
 
@@ -52,10 +70,40 @@ class _FakeTextEncoder(torch.nn.Module):
         super().__init__()
         self.calls = 0
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask, output_hidden_states=True):
+        del output_hidden_states
         del attention_mask
         self.calls += 1
         return types.SimpleNamespace(last_hidden_state=input_ids.unsqueeze(-1).float())
+
+
+class _FakeTokenizedText(dict):
+    def __init__(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> None:
+        super().__init__(input_ids=input_ids, attention_mask=attention_mask)
+
+    def to(self, device):
+        return _FakeTokenizedText(
+            self["input_ids"].to(device),
+            self["attention_mask"].to(device),
+        )
+
+
+class _FakeTokenizer:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, texts, **kwargs):
+        texts = list(texts)
+        self.calls.append(texts)
+        max_length = int(kwargs.get("max_length", 4))
+        input_ids = torch.zeros(len(texts), max_length, dtype=torch.long)
+        attention_mask = torch.zeros(len(texts), max_length, dtype=torch.long)
+        for row, text in enumerate(texts):
+            length = min(max(len(str(text).split()), 1), max_length)
+            token = (sum(ord(ch) for ch in str(text)) % 97) + 1
+            input_ids[row, :length] = token
+            attention_mask[row, :length] = 1
+        return _FakeTokenizedText(input_ids, attention_mask)
 
 
 def _make_text_server_args(*, enable_cfg_parallel: bool = False) -> types.SimpleNamespace:
@@ -75,34 +123,39 @@ def _make_text_stage(
 ) -> tuple[DreamZeroTextEncodingStage, types.SimpleNamespace, _FakeTextEncoder]:
     if encoder is None:
         encoder = _FakeTextEncoder()
-    stage = DreamZeroTextEncodingStage(text_encoder=encoder, cache_manager=manager)
+    stage = DreamZeroTextEncodingStage(
+        text_encoder=encoder,
+        tokenizer=_FakeTokenizer(),
+        cache_manager=manager,
+    )
     server_args = _make_text_server_args(enable_cfg_parallel=enable_cfg_parallel)
     stage.server_args = server_args
     return stage, server_args, encoder
 
 
-def _tokenized_text_batch(
+def _patch_uninitialized_usp_ring_group(monkeypatch) -> None:
+    monkeypatch.setattr(attention_layer, "get_ring_parallel_world_size", lambda: 1)
+
+
+def _prompt_text_batch(
     *,
     session_id: str,
     prompt: str,
     negative_prompt: str | None = None,
     reset: bool = False,
-    text_token: int = 1,
 ) -> types.SimpleNamespace:
-    inputs = {
-        "text": torch.full((1, 2), text_token, dtype=torch.long),
-        "text_attention_mask": torch.ones(1, 2, dtype=torch.long),
-    }
-    if negative_prompt is not None:
-        inputs["text_negative"] = torch.zeros(1, 2, dtype=torch.long)
     return types.SimpleNamespace(
+        prompt=prompt,
+        negative_prompt="" if negative_prompt is None else negative_prompt,
         extra={
             "dreamzero_session_ids": [session_id],
             "dreamzero_reset_mask": [reset],
             "dreamzero_prompts": [prompt],
-            "dreamzero_negative_prompts": [negative_prompt],
+            "dreamzero_negative_prompts": [
+                "" if negative_prompt is None else negative_prompt
+            ],
         },
-        dreamzero_inputs=inputs,
+        dreamzero_inputs={"state": torch.zeros(1, 1)},
     )
 
 
@@ -124,7 +177,16 @@ def test_dreamzero_config_and_sampling_defaults_are_action_typed():
 
     assert config.task_type is ModelTaskType.VLA_ACTION
     assert config.task_type.data_type() is DataType.ACTION
+    assert "tokenizer" in DreamZeroPipeline._required_config_modules
+    assert "image_encoder" in DreamZeroPipeline._required_config_modules
+    assert config.image_encoder_config.prefix == "dreamzero_image_encoder"
+    assert config.image_encoder_config.num_hidden_layers_override == 31
+    assert config.action_horizon == config.dit_config.arch_config.num_action_per_block
+    assert config.action_dim == config.dit_config.arch_config.action_dim
+    assert config.output_action_dim == config.dit_config.arch_config.action_dim
     assert params.data_type is DataType.ACTION
+    assert params.num_inference_steps == config.default_num_inference_steps
+    assert not hasattr(params, "guidance_scale")
     extra = params.build_request_extra()
     assert "dreamzero_action_horizon" not in extra
     assert "dreamzero_relative_action_per_horizon" not in extra
@@ -158,7 +220,8 @@ def test_dreamzero_dit_rope_lengths_are_configurable():
     assert model.freqs_state.shape[0] == 11
 
 
-def test_dreamzero_dit_keeps_cross_attention_norm_for_native_loading():
+def test_dreamzero_dit_keeps_cross_attention_norm_for_native_loading(monkeypatch):
+    _patch_uninitialized_usp_ring_group(monkeypatch)
     config = DreamZeroCausalWanConfig(
         arch_config=DreamZeroCausalWanArchConfig(
             model_type="ti2v",
@@ -176,24 +239,145 @@ def test_dreamzero_dit_keeps_cross_attention_norm_for_native_loading():
     assert not isinstance(model.blocks[0].norm3, torch.nn.Identity)
 
 
-def test_dreamzero_cfg_disables_text_encoder_folding():
+def test_dreamzero_dit_uses_native_usp_attention_modules(monkeypatch):
+    _patch_uninitialized_usp_ring_group(monkeypatch)
+    config = DreamZeroCausalWanConfig(
+        arch_config=DreamZeroCausalWanArchConfig(
+            model_type="ti2v",
+            dim=64,
+            ffn_dim=128,
+            num_heads=4,
+            num_layers=1,
+            frame_seqlen=8,
+            text_dim=32,
+            hidden_size=16,
+        )
+    )
+    model = DreamZeroCausalWanModel(config=config)
+    block = model.blocks[0]
+
+    assert isinstance(block.self_attn.attn, USPAttention)
+    assert isinstance(block.self_attn.sequence_parallel_attn, USPAttention)
+    assert isinstance(block.cross_attn.attn, USPAttention)
+    assert block.self_attn.attn.skip_sequence_parallel is True
+    assert block.self_attn.sequence_parallel_attn.skip_sequence_parallel is False
+    assert block.cross_attn.attn.skip_sequence_parallel is True
+
+
+def test_dreamzero_cached_self_attention_attends_prefix_and_current_tokens(monkeypatch):
+    _patch_uninitialized_usp_ring_group(monkeypatch)
+
+    class FakeAttention(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = []
+
+        def forward(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+        ) -> torch.Tensor:
+            self.calls.append((q.shape, k.shape, v.shape))
+            return torch.zeros_like(q)
+
+    stage = DreamZeroCausalWanSelfAttention(dim=8, num_heads=2, frame_seqlen=2)
+    fake_attn = FakeAttention()
+    stage.attn = fake_attn
+
+    x = torch.randn(1, 4, 8)
+    freqs = torch.ones(4, 1, 2, dtype=torch.complex64)
+    freqs_action = torch.ones(8, 2, dtype=torch.complex64)
+    freqs_state = torch.ones(8, 2, dtype=torch.complex64)
+    kv_cache = torch.zeros(2, 1, 0, 2, 4)
+
+    output, updated_cache = stage(
+        x=x,
+        freqs=freqs,
+        freqs_action=freqs_action,
+        freqs_state=freqs_state,
+        action_register_length=None,
+        kv_cache=kv_cache,
+    )
+
+    assert output.shape == x.shape
+    assert updated_cache.shape == (2, 1, 4, 2, 4)
+    assert fake_attn.calls == [
+        (
+            torch.Size([1, 4, 2, 4]),
+            torch.Size([1, 4, 2, 4]),
+            torch.Size([1, 4, 2, 4]),
+        )
+    ]
+
+
+def test_dreamzero_global_sequence_shard_includes_action_state(monkeypatch):
+    seqs = torch.arange(10, dtype=torch.float32).reshape(1, 5, 2)
+    freqs = torch.ones(5, 1, 1, dtype=torch.complex64)
+
+    monkeypatch.setattr(dreamzero_utils, "get_ulysses_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(dreamzero_utils, "get_ulysses_parallel_rank", lambda: 0)
+    local0, freqs0, seq_lens = dreamzero_utils.shard_sequence_parallel_global_sequence(
+        seqs, freqs
+    )
+
+    monkeypatch.setattr(dreamzero_utils, "get_ulysses_parallel_rank", lambda: 1)
+    local1, freqs1, _ = dreamzero_utils.shard_sequence_parallel_global_sequence(
+        seqs, freqs
+    )
+
+    assert seq_lens == [3, 2]
+    assert torch.equal(local0, seqs[:, :3])
+    assert torch.equal(local1, seqs[:, 3:])
+    assert freqs0.shape[0] == 3
+    assert freqs1.shape[0] == 2
+
+
+def test_dreamzero_text_stage_inherits_standard_text_encoding_and_preserves_folding():
     config = DreamZeroPipelineConfig()
     config.text_encoder_configs[0].parallel_folding_mode = "world"
     server_args = types.SimpleNamespace(
         enable_cfg_parallel=True,
         pipeline_config=config,
     )
+    stage = DreamZeroTextEncodingStage(
+        text_encoder=_FakeTextEncoder(),
+        tokenizer=_FakeTokenizer(),
+        cache_manager=DreamZeroCachePoolManager(max_sessions=1),
+    )
+    stage.server_args = server_args
 
-    _disable_text_encoder_folding_for_cfg(server_args)
-
-    assert config.text_encoder_configs[0].parallel_folding_mode is None
-
-    config.text_encoder_configs[0].parallel_folding_mode = "world"
-    server_args.enable_cfg_parallel = False
-
-    _disable_text_encoder_folding_for_cfg(server_args)
-
+    assert isinstance(stage, TextEncodingStage)
+    assert stage.parallelism_type is StageParallelismType.REPLICATED
     assert config.text_encoder_configs[0].parallel_folding_mode == "world"
+
+
+def test_dreamzero_visual_stage_inherits_standard_image_encoding_without_dedup():
+    stage = DreamZeroVisualEncodingStage(
+        image_encoder=torch.nn.Identity(),
+        vae=torch.nn.Identity(),
+        cache_manager=DreamZeroCachePoolManager(max_sessions=1),
+    )
+
+    assert isinstance(stage, ImageEncodingStage)
+    assert stage.deduplicated_output_fields == ()
+
+
+def test_dreamzero_text_stage_requires_string_prompts():
+    assert DreamZeroTextEncodingStage._batched_texts("pick", 2, "prompt") == [
+        "pick",
+        "pick",
+    ]
+    assert DreamZeroTextEncodingStage._batched_texts(
+        None, 2, "negative_prompt", default=""
+    ) == ["", ""]
+
+    with pytest.raises(ValueError, match="prompt is required"):
+        DreamZeroTextEncodingStage._batched_texts(None, 1, "prompt")
+    with pytest.raises(TypeError, match="prompt must be a string or list of strings"):
+        DreamZeroTextEncodingStage._batched_texts(["pick", None], 2, "prompt")
+    with pytest.raises(ValueError, match="prompt batch size mismatch"):
+        DreamZeroTextEncodingStage._batched_texts(["pick"], 2, "prompt")
 
 
 def test_dreamzero_action_response_uses_common_action_contract():
@@ -221,7 +405,7 @@ def test_dreamzero_action_response_uses_common_action_contract():
     assert response_without_parameters["usage"]["denoise_steps"] == 16
 
 
-def test_dreamzero_action_request_builder_uses_fixed_sampling_params():
+def test_dreamzero_action_request_builder_uses_runtime_steps_and_server_stable_scale():
     server_args = types.SimpleNamespace(
         model_path="nvidia/DreamZero-DROID",
         model_id=None,
@@ -258,7 +442,7 @@ def test_dreamzero_action_request_builder_uses_fixed_sampling_params():
     assert params.request_id == "req-1"
     assert params.prompt == "pick the cube"
     assert params.num_inference_steps == 99
-    assert params.guidance_scale == DreamZeroSamplingParams().guidance_scale
+    assert not hasattr(params, "guidance_scale")
     assert extra["dreamzero_session_ids"] == ["session-a"]
     assert extra["dreamzero_reset_mask"] == [True]
     assert extra["dreamzero_prompts"] == ["pick the cube"]
@@ -266,6 +450,67 @@ def test_dreamzero_action_request_builder_uses_fixed_sampling_params():
     assert "dreamzero_action_horizon" not in extra
     assert "dreamzero_relative_action_per_horizon" not in extra
     assert "dreamzero_embodiment_tag" not in extra
+
+
+def test_dreamzero_rollout_schedulers_use_request_num_inference_steps():
+    class FakeScheduler:
+        def __init__(self) -> None:
+            self.calls = []
+            self.timesteps = []
+
+        def set_timesteps(self, steps, *, device, shift):
+            self.calls.append((steps, device, shift))
+            self.timesteps = torch.arange(steps, device=device)
+
+    created_schedulers = [FakeScheduler(), FakeScheduler()]
+    pending_schedulers = list(created_schedulers)
+    stage = object.__new__(DreamZeroCausalDenoisingStage)
+    stage._new_unipc_scheduler = lambda: pending_schedulers.pop(0)
+    stage._prepare_rollout_state = lambda ctx: torch.zeros(1, 1)
+    stage._rollout_step_prediction = lambda **_: (
+        torch.zeros(1, 1, 1),
+        torch.zeros(1, 2),
+    )
+    stage._scheduler_step = (
+        lambda scheduler, model_output, timestep, sample, step_index: sample
+    )
+
+    batch = types.SimpleNamespace(num_inference_steps=7)
+    server_args = types.SimpleNamespace(
+        pipeline_config=types.SimpleNamespace(
+            default_num_inference_steps=16,
+            flow_shift=5.0,
+        )
+    )
+    ctx = types.SimpleNamespace(
+        inputs=types.SimpleNamespace(device=torch.device("cpu")),
+        noise=types.SimpleNamespace(
+            noise_obs=torch.zeros(1, 1, 1),
+            noise_action=torch.zeros(1, 2),
+        ),
+    )
+
+    stage._run_action_rollout(batch, server_args, ctx)
+
+    assert batch.dreamzero_action_pred.shape == (1, 2)
+    assert [scheduler.calls[0][0] for scheduler in created_schedulers] == [7, 7]
+
+
+def test_dreamzero_action_output_reports_request_num_inference_steps():
+    stage = DreamZeroActionOutputStage()
+    batch = types.SimpleNamespace(
+        request_id="req-steps",
+        dreamzero_action_pred=torch.zeros(1, 24, 7),
+        num_inference_steps=7,
+        metrics=None,
+    )
+    server_args = types.SimpleNamespace(
+        pipeline_config=types.SimpleNamespace(default_num_inference_steps=16)
+    )
+
+    output = stage.forward(batch, server_args)
+
+    assert output.output[0]["parameters"]["num_inference_steps"] == 7
 
 
 def test_dreamzero_action_metadata_is_wam_specific():
@@ -284,6 +529,9 @@ def test_dreamzero_action_metadata_is_wam_specific():
 
     assert metadata["object"] == "action.metadata"
     assert metadata["policy_family"] == "dreamzero"
+    assert metadata["output"]["action_horizon"] == 24
+    assert metadata["output"]["action_dim"] == 32
+    assert metadata["output"]["padded_action_dim"] == 32
     assert metadata["defaults"]["num_inference_steps"] == 16
 
 
@@ -495,19 +743,16 @@ def test_dreamzero_session_cache_allocates_reuses_and_resets_slots():
     assert manager.pool.visual_valid == [False, True]
 
 
-def test_dreamzero_tensor_prompt_cache_requires_explicit_hash():
-    manager = DreamZeroCachePoolManager(max_sessions=1)
+def test_dreamzero_prompt_cache_hashes_prompt_strings_and_explicit_hashes():
+    manager = DreamZeroCachePoolManager(max_sessions=2)
     batch = types.SimpleNamespace(
         extra={
             "dreamzero_session_ids": ["session-a"],
             "dreamzero_reset_mask": [False],
-            "dreamzero_prompts": [None],
-            "dreamzero_negative_prompts": [None],
+            "dreamzero_prompts": ["pick"],
+            "dreamzero_negative_prompts": [""],
         },
-        dreamzero_inputs={
-            "text": torch.ones(1, 2, 3),
-            "text_negative": torch.ones(1, 2, 3),
-        },
+        dreamzero_inputs={},
     )
 
     request_cache = resolve_request_cache(
@@ -529,15 +774,18 @@ def test_dreamzero_tensor_prompt_cache_requires_explicit_hash():
         batch_size=1,
     )
 
-    assert request_cache.prompt_hashes == [None]
-    assert second_cache.prompt_reusable == [False]
+    assert request_cache.prompt_hashes[0].startswith("str:")
+    assert second_cache.prompt_reusable == [True]
 
     keyed_batch = types.SimpleNamespace(
         extra={
-            **batch.extra,
+            "dreamzero_session_ids": ["session-b"],
+            "dreamzero_reset_mask": [False],
+            "dreamzero_prompts": [None],
+            "dreamzero_negative_prompts": [None],
             "dreamzero_prompt_hashes": ["prompt-key"],
         },
-        dreamzero_inputs=batch.dreamzero_inputs,
+        dreamzero_inputs={},
     )
     keyed_cache = resolve_request_cache(
         keyed_batch,
@@ -566,17 +814,16 @@ def test_dreamzero_text_stage_does_not_gather_non_reusable_new_slots():
     manager = DreamZeroCachePoolManager(max_sessions=2)
     stage, server_args, _ = _make_text_stage(manager=manager)
 
-    first_batch = _tokenized_text_batch(
+    first_batch = _prompt_text_batch(
         session_id="session-a",
         prompt="pick",
     )
     stage.forward(first_batch, server_args)
     assert manager.pool.cached_prompt_embs[BRANCH_COND].shape[0] == 1
 
-    second_batch = _tokenized_text_batch(
+    second_batch = _prompt_text_batch(
         session_id="session-b",
         prompt="place",
-        text_token=2,
     )
     stage.forward(second_batch, server_args)
 
@@ -584,112 +831,49 @@ def test_dreamzero_text_stage_does_not_gather_non_reusable_new_slots():
     assert manager.pool.cached_prompt_embs[BRANCH_COND].shape[0] == 2
 
 
-def test_dreamzero_cfg_text_stage_keeps_encoder_collectives_aligned():
+def test_dreamzero_cfg_text_stage_is_replicated_and_encodes_both_branches():
     manager = DreamZeroCachePoolManager(max_sessions=1)
     stage, server_args, encoder = _make_text_stage(
         manager=manager,
         enable_cfg_parallel=True,
     )
 
-    cached_neg_batch = _tokenized_text_batch(
-        session_id="session-a",
-        prompt="old prompt",
-        negative_prompt="",
-    )
-    cached_neg = resolve_request_cache(
-        cached_neg_batch,
-        manager,
-        local_attn_size=4,
-        batch_size=1,
-    )
-    stage._forward_cache_manager(
-        cached_neg_batch,
-        server_args,
-        cached_neg,
-        cfg_parallel=True,
-        cfg_rank=1,
-    )
-    assert manager.pool.prompt_hashes[BRANCH_COND][0] == cached_neg.prompt_hashes[0]
-
-    changed_cond_batch = _tokenized_text_batch(
+    changed_cond_batch = _prompt_text_batch(
         session_id="session-a",
         prompt="new prompt",
         negative_prompt="",
     )
-    changed_cond = resolve_request_cache(
-        changed_cond_batch,
-        manager,
-        local_attn_size=4,
-        batch_size=1,
-    )
-    assert changed_cond.prompt_reusable == [False]
-    assert changed_cond.neg_prompt_reusable == [True]
+    stage.forward(changed_cond_batch, server_args)
 
-    stage._forward_cache_manager(
-        changed_cond_batch,
-        server_args,
-        changed_cond,
-        cfg_parallel=True,
-        cfg_rank=1,
+    assert changed_cond_batch.dreamzero_cfg_branch_index is None
+    assert len(changed_cond_batch.dreamzero_prompt_embs) == 2
+    assert torch.equal(
+        changed_cond_batch.negative_prompt_embeds,
+        changed_cond_batch.dreamzero_prompt_embs[1],
     )
-
-    assert changed_cond_batch.dreamzero_lifecycle_reset_mask == [True]
     assert encoder.calls == 2
 
-    stable_cond_batch = _tokenized_text_batch(
+    stable_cond_batch = _prompt_text_batch(
         session_id="session-a",
         prompt="new prompt",
         negative_prompt="",
     )
-    stable_cond = resolve_request_cache(
-        stable_cond_batch,
-        manager,
-        local_attn_size=4,
-        batch_size=1,
-    )
-    assert stable_cond.prompt_reusable == [False]
-    assert stable_cond.neg_prompt_reusable == [True]
-
-    stage._forward_cache_manager(
-        stable_cond_batch,
-        server_args,
-        stable_cond,
-        cfg_parallel=True,
-        cfg_rank=1,
-    )
+    stage.forward(stable_cond_batch, server_args)
 
     assert encoder.calls == 2
 
 
 def test_dreamzero_text_encoding_masks_padding_without_python_seq_len_sync():
-    class FakeEncoder(torch.nn.Module):
-        def forward(self, input_ids, attention_mask):
-            values = torch.arange(
-                input_ids.shape[0] * input_ids.shape[1] * 2,
-                dtype=torch.float32,
-                device=input_ids.device,
-            )
-            return types.SimpleNamespace(
-                last_hidden_state=values.reshape(
-                    input_ids.shape[0], input_ids.shape[1], 2
-                )
-            )
-
     stage = DreamZeroTextEncodingStage()
-    output = stage._encode_prompt(
-        FakeEncoder(),
-        input_ids=torch.ones(2, 4, dtype=torch.long),
-        attention_mask=torch.tensor(
-            [[1, 1, 0, 0], [1, 1, 1, 0]],
-            dtype=torch.long,
-        ),
-        text_len=4,
+    prompt_emb = torch.arange(16, dtype=torch.float32).reshape(2, 4, 2)
+    output = stage._mask_prompt_padding(
+        prompt_emb,
+        torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.long),
     )
 
-    assert output.dtype == torch.bfloat16
     assert torch.equal(output[0, 2:], torch.zeros_like(output[0, 2:]))
     assert torch.equal(output[1, 3:], torch.zeros_like(output[1, 3:]))
     assert torch.equal(
         output[1, :3],
-        torch.tensor([[8, 9], [10, 11], [12, 13]], dtype=torch.bfloat16),
+        torch.tensor([[8, 9], [10, 11], [12, 13]], dtype=torch.float32),
     )
