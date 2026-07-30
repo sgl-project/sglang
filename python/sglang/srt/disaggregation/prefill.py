@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.utils import (
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
+    poll_and_all_reduce_pp,
     prepare_abort,
     setup_state_kv_args,
 )
@@ -64,6 +65,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
@@ -73,6 +75,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 def should_force_retry(req: Req) -> bool:
@@ -362,13 +366,15 @@ class PrefillBootstrapQueue:
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
-        rids_to_check: Optional[List[str]] = None,
-    ) -> List[Req]:
+        pp_good_rids: Optional[List[str]] = None,
+        pp_bad_rids: Optional[List[str]] = None,
+    ) -> List[Req] | tuple[List[Req], List[Req]]:
         """
         pop the reqs which has finished bootstrapping
 
         return_failed_reqs: For PP, on rank 0, also return the failed reqs to notify the next rank
-        rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
+        pp_good_rids: RIDs that PP consensus determined as WaitingForInput.
+        pp_bad_rids: RIDs that PP consensus determined as Failed.
         """
 
         bootstrapped_reqs = []
@@ -381,21 +387,32 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.queue],
-            self.scheduler.attn_cp_cpu_group,
-            self.scheduler.attn_tp_cpu_group,
-        )
+        if self.pp_size > 1:
+            polls = poll_and_all_reduce_pp(
+                (req.rid for req in self.queue),
+                KVPoll.WaitingForInput,
+                pp_good_rids,
+                pp_bad_rids,
+            )
+            uncovered = [i for i, poll in enumerate(polls) if poll is None]
+            if uncovered:
+                local_polls = poll_and_all_reduce_attn_cp_tp_group(
+                    [self.queue[i].disagg_kv_sender for i in uncovered],
+                    self.scheduler.attn_cp_cpu_group,
+                    self.scheduler.attn_tp_cpu_group,
+                )
+                for i, local_poll in zip(uncovered, local_polls):
+                    if local_poll == KVPoll.Failed:
+                        polls[i] = KVPoll.Failed
+        else:
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for req in self.queue],
+                self.scheduler.attn_cp_cpu_group,
+                self.scheduler.attn_tp_cpu_group,
+            )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            if (
-                rids_to_check is not None
-                and req.rid not in rids_to_check
-                and poll != KVPoll.Failed
-            ):
-                # In PP mode, successful bootstrap still requires cross-rank
-                # consensus. Local failures are terminal and must be drained
-                # even if an earlier PP rank has already removed the request.
+            if poll is None:
                 continue
 
             if poll == KVPoll.Failed:
@@ -1180,24 +1197,37 @@ class SchedulerDisaggregationPrefillMixin:
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
-            state_indices = []
-            for st in state_types:
-                if st == StateType.MAMBA:
-                    state_indices.append(_mamba_payload())
-                elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
-                elif st == StateType.DSA:
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.MINIMAX_INDEX_K:
-                    # Index rows live at the same loc as main KV on the same
-                    # page_size, so reuse the full-seq page-ids.
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.SWA_RING:
-                    state_indices.append(_swa_ring_payload())
-                elif st == StateType.C128_STATE:
-                    state_indices.append(_c128_state_payload())
-                else:
-                    state_indices.append(None)
+            # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
+            # as main KV on the same page_size.
+            payloads = {
+                StateType.MAMBA: _mamba_payload,
+                StateType.SWA: _swa_payload,
+                StateType.DSA: _dsa_payload,
+                StateType.MINIMAX_INDEX_K: _dsa_payload,
+                StateType.SWA_RING: _swa_ring_payload,
+                StateType.C128_STATE: _c128_state_payload,
+            }
+            if _is_npu and isinstance(
+                self.token_to_kv_pool_allocator.get_kvcache(),
+                DeepSeekV4TokenToKVPool,
+            ):
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                    dsv4_state_payloads,
+                )
+
+                payloads.update(
+                    dsv4_state_payloads(
+                        self.req_to_token_pool,
+                        req.req_pool_idx,
+                        seq_len,
+                        page_size,
+                        self.sliding_window_size,
+                        prefix_len=0,
+                    )
+                )
+            state_indices = [
+                payloads[st]() if st in payloads else None for st in state_types
+            ]
 
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, start_idx:end_idx
