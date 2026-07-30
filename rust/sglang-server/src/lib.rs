@@ -16,6 +16,9 @@ mod error;
 mod fsm;
 mod ids;
 mod message;
+mod ring;
+mod runtime;
+mod tokenizer_manager;
 mod utils;
 
 use pyo3::prelude::*;
