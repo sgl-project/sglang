@@ -538,11 +538,11 @@ enum class Comm { kNone, kMc, kPeer, kMcPull, kTwoShot, kTwoShotPeer };
 // every bs cell reuses one region). Parity-double-buffered payloads; the flag
 // ring lives on its own 2 MB page. Slot reuse across epochs e / e+2 is safe
 // with 2 parities because each rank's launch e+1 spin-waits epoch e+1 AFTER
-// its own e-reduce (per-rank stream order) — DESIGN §2.
+// its own e-reduce (per-rank stream order).
 // Slots are TILE-MAJOR ([n8-tile][m][8 cols]), NOT [m][n]: a warp's push for
 // one tile is then a CONTIGUOUS 128 B fabric write instead of 32 scattered
 // 4-16 B m-strided writes — lane-scatter runs ~0.26x on this fabric
-// (cross_rank_sync §D) and the scattered form's ack-drain dominated the bs8
+// and the scattered form's ack-drain dominated the bs8
 // boundary (stamped 22 us at idle). The reduce un-transposes locally.
 constexpr size_t kSlotBytes1 = size_t(kMMax) * kN * 2;  // one [M,N] bf16
 constexpr __host__ __device__ size_t slot_off(int parity, int src, int R) {
@@ -663,7 +663,7 @@ __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
   const uint32_t epoch = cta_epoch;
   const int parity = int(epoch & 1);
   const int ring = int(epoch % kRing);
-  // pinned wait-set (§I): flag VA + monotonic targets resolved before any spin
+  // pinned wait-set: flag VA + monotonic targets resolved before any spin
   const size_t foff = flags_off(R) + size_t(prm.fam) * 512;
   const size_t doff2 = done_off(R) + size_t(prm.fam) * kRing * kMaxCTA * 4;
   uint32_t* const flag_local = reinterpret_cast<uint32_t*>(prm.uc_base[prm.my_rank] + foff) + ring;
@@ -834,13 +834,13 @@ __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
     }
   }
 
-  // ---- boundary (§H gather + flag + per-CTA local-replica spin) ----------
+  // ---- boundary (gather + flag + per-CTA local-replica spin) -------------
   __syncthreads();
   if (tid == 0) {
     const uint32_t old = atomic_add_acq_rel_gpu(gather_fam + ring, 1);
     if (old + 1 == gath_target) {
       // ONE completing-CTA fence: publishes every CTA's pushes via the
-      // acq_rel gather chain (§H). Measured 0.9 us better than per-CTA
+      // acq_rel gather chain. Measured 0.9 us better than per-CTA
       // fences at bs1 (11.04 vs 11.97) — the parallel-drain theory lost.
       fence_release_sys();
       {
@@ -1150,7 +1150,7 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
     ptx::tcgen05_relinquish();
   }
 
-  // ---- boundary (§H, fam rings) — verbatim member-1 contract ------------
+  // ---- boundary (fam rings) — verbatim member-1 contract ----------------
   if (tid == 0) {
     const uint32_t old = atomic_add_acq_rel_gpu(gather_fam + ring, 1);
     if (old + 1 == gath_target) {

@@ -309,7 +309,6 @@ def fused_kernel123(
         cgs_per_head = num_chunks // CHUNKS_PER_BLOCK
         total_cgs = cgs_per_head * num_heads * batch_size
 
-    # SMEM allocation
     smem = cutlass.utils.SmemAllocator()
     sQ = smem.allocate_tensor(
         cutlass.BFloat16, qk_smem_layout.outer, 128, swizzle=qk_smem_layout.inner
