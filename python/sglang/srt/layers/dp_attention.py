@@ -89,10 +89,8 @@ class DpPaddingMode(IntEnum):
         dp_size = get_attention_dp_size()
 
         # Hybrid-SSM models materialize idle ranks via the MAX_LEN
-        # fabricated-row conversion, which asserts the rank is empty, so a
-        # non-empty extend batch must not get MAX_LEN. TODO: teach that
-        # conversion to handle non-empty ranks, then drop this branch and let
-        # hybrid-SSM use the communication-cost heuristic below too.
+        # fabricated-row conversion.
+        # TODO drop this branch once that conversion handles non-empty ranks.
         if is_extend_in_batch and dp_size > 1 and get_flags().dp.max_len_with_idle:
             if min(global_num_tokens) == 0:
                 return DpPaddingMode.MAX_LEN
