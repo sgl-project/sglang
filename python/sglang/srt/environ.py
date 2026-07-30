@@ -733,6 +733,11 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Charge the chunked-prefill budget in raw tokens and let the last request of
+    # a prefill batch consume the exact remainder, instead of flooring its length
+    # to a page. Keeps the forward-pass token count at chunked_prefill_size so the
+    # dense GEMMs get an aligned M. gfx95 only — see PrefillAdder.exact_chunk_fill.
+    SGLANG_EXACT_CHUNK_FILL = EnvBool(True)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
