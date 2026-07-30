@@ -8,9 +8,8 @@ skip the epilogue rank-sort entirely.
 
 Dispatched automatically from moe_fused_gate for covered inputs; the production
 dispatch uses sorted=False. It is 3.1-3.5x faster than the Triton router at
-[1..8192, 896] top-16 on B200. Correctness and benchmark coverage against the
-Triton baseline lives in test/registered/jit/test_moe_route_radix.py and
-test/registered/jit/benchmark/bench_moe_route_radix.py.
+[1..8192, 896] top-16 on B200. Correctness coverage against the Triton baseline
+lives in test/registered/kernels/ops/test_moe_route_radix.py.
 """
 
 from __future__ import annotations
