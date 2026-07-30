@@ -42,6 +42,7 @@ repos:
           (?x)^(
           .*/__init__\.py$|
           .*\.ipynb$|
+          python/sglang/kernels/aot/.*|
           python/sglang/srt/grpc/.*_pb2\.py$|
           python/sglang/srt/grpc/.*_pb2_grpc\.py$|
           python/sglang/srt/grpc/.*_pb2\.pyi$|

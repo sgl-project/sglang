@@ -289,14 +289,14 @@ def load_permissions(user_login):
 
 def has_sgl_kernel_changes(pr):
     """
-    Check if the PR has changes to the sgl-kernel directory.
+    Check if the PR has changes to the AOT kernel directory.
     This is used to determine if we need a full workflow rerun
     (to rebuild the kernel) vs just rerunning failed jobs.
     """
     try:
         files = pr.get_files()
         for f in files:
-            if f.filename.startswith("sgl-kernel/"):
+            if f.filename.startswith("python/sglang/kernels/aot/"):
                 return True
         return False
     except Exception as e:
