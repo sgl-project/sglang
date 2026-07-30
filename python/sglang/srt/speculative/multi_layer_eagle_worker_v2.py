@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING, Dict, List, Tuple
+from typing import TYPE_CHECKING, List
 
 import torch
 
@@ -50,6 +50,7 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import (
     default_tree_mask_mode,
     get_draft_recurrent_hidden_state_spec,
+    organize_draft_results,
 )
 from sglang.srt.speculative.eagle_worker_common import (
     build_eagle_verify_input,
@@ -119,10 +120,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        # (bs, k) -> cached [0, .., k-1] rows for draft_forward's identity path.
-        self._selected_index_cache: Dict[Tuple[int, int], torch.Tensor] = {}
-        # bs -> cached [-1, 0, .., S-2] parent rows for the chain fast path.
-        self._chain_parent_cache: Dict[int, torch.Tensor] = {}
         # Leviathan/Chen rejection sampling (temp>0): the draft samples X ~ q and
         # provides q so the verify accepts iff coin*q < p and resamples the residual.
         # Single-CG runner samples in-graph (_sample_draft_proposal); per-step
@@ -136,6 +133,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+
+        # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
+        self._rebuild_topk1_chain_buffers()
 
         # Set constant
         EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
@@ -449,25 +449,28 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Chain-style (topk=1, one token per draft step, all of them selected):
         # the slice/cat organization in _draft_forward_organize is the identity
         # on topk_index, and parent_list is the constant [-1, 0, .., S-2] per
-        # row. Return cached constants and skip every kernel launch here.
-        num_steps = self.speculative_num_steps
+        # row. Return the prealloc'd constants and skip every kernel launch here.
+        parents_prealloc = self._topk1_parents_prealloc
         if (
-            self.topk == 1
-            and num_steps > 1
-            and self.speculative_num_draft_tokens - 1 == num_steps
-            and topk_index.shape[1] == num_steps
+            parents_prealloc is not None
+            and topk_index.shape[1] == self.speculative_num_steps
+            and topk_index.shape[0] <= parents_prealloc.shape[0]
         ):
             bs = topk_index.shape[0]
-            device = topk_index.device
             return (
-                self._chain_parent_list(bs, device),
-                self._identity_selected_index(bs, num_steps, device),
+                parents_prealloc[:bs],
+                self._topk1_score_indices_prealloc[:bs],
                 topk_index,
             )
 
         return self._draft_forward_organize(topk_p, topk_index, hidden_states)
 
-    def _draft_forward_organize(self, topk_p, topk_index, hidden_states):
+    def _draft_forward_organize(
+        self,
+        topk_p: torch.Tensor,
+        topk_index: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ):
         # Return values
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
@@ -500,64 +503,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     )
 
         # Organize the results
-        score_list = torch.cat(score_list, dim=1).flatten(
-            1
-        )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
-        ss_token_list = torch.cat(
-            token_list, dim=1
-        )  # b, (self.topk + (num_steps-1) * self.topk)
-        num_selected = self.speculative_num_draft_tokens - 1
-        if num_selected == score_list.shape[-1]:
-            # topk takes every candidate, so sorting its indices yields
-            # [0, .., k-1] and the gather is the identity. Chain-style EAGLE
-            # (topk=1, num_draft_tokens=num_steps+1) always lands here.
-            top_scores_index = self._identity_selected_index(
-                score_list.shape[0], num_selected, score_list.device
-            )
-            draft_tokens = ss_token_list
-        else:
-            top_scores = torch.topk(score_list, num_selected, dim=-1)
-            top_scores_index = top_scores.indices
-            top_scores_index = torch.sort(top_scores_index).values
-            maybe_detect_oob(
-                top_scores_index,
-                0,
-                ss_token_list.shape[1],
-                "draft_forward: top_scores_index OOB for gather on ss_token_list",
-            )
-            draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
-
-        if len(parents_list) > 1:
-            parent_list = torch.cat(parents_list[:-1], dim=1)
-        else:
-            batch_size = parents_list[0].shape[0]
-            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
-
-        return parent_list, top_scores_index, draft_tokens
-
-    def _identity_selected_index(
-        self, bs: int, k: int, device: torch.device
-    ) -> torch.Tensor:
-        key = (bs, k)
-        cached = self._selected_index_cache.get(key)
-        if cached is None:
-            cached = (
-                torch.arange(k, dtype=torch.long, device=device)
-                .expand(bs, k)
-                .contiguous()
-            )
-            self._selected_index_cache[key] = cached
-        return cached
-
-    def _chain_parent_list(self, bs: int, device: torch.device) -> torch.Tensor:
-        cached = self._chain_parent_cache.get(bs)
-        if cached is None:
-            row = torch.arange(
-                -1, self.speculative_num_steps - 1, dtype=torch.long, device=device
-            )
-            cached = row.expand(bs, -1).contiguous()
-            self._chain_parent_cache[bs] = cached
-        return cached
+        return organize_draft_results(
+            score_list, token_list, parents_list, self.speculative_num_draft_tokens
+        )
 
     def draft_extend(self):
         pass

@@ -103,7 +103,9 @@ def organize_draft_results(
     parents_list: List[torch.Tensor],
     num_draft_token: int,
 ):
+    # b, n, topk; n = 1 + (num_steps-1) * topk
     score_list = torch.cat(score_list, dim=1).flatten(1)
+    # b, (topk + (num_steps-1) * topk)
     ss_token_list = torch.cat(token_list, dim=1)
     top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
     top_scores_index = top_scores.indices
