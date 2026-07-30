@@ -4,6 +4,10 @@ metatags:
     description: "Serve NVIDIA Cosmos3 image, video, sound, and action generation with SGLang Diffusion."
 ---
 
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["image", "video", "sound/action", "world model", "policy"]} />
+
 ## 1. Model Introduction
 
 [NVIDIA Cosmos3](https://huggingface.co/collections/nvidia/cosmos3) is an omnimodal world-model family for image, video, sound, and action generation. SGLang Diffusion serves the public checkpoints with the native `Cosmos3OmniDiffusersPipeline`.
