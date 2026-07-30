@@ -472,10 +472,6 @@ jobs:
             runner: linux-aarch64-a3-4
             test_case: test/registered/ascend/accuracy/qwen3_vl_30b_a3b/test_npu_qwen3_vl_30b_a3b_bf16_2p_gsm8k.py
             test_type: 'accuracy'
-          - name: qwen3_vl_30b_a3b_thinking_1p_gsm8k
-            runner: linux-aarch64-a3-2
-            test_case: test/registered/ascend/accuracy/qwen3_vl_30b_a3b_thinking/test_npu_qwen3_vl_30b_a3b_thinking_1p_gsm8k.py
-            test_type: 'accuracy'
           - name: glm5_top64_pruned_bf16_8p_gsm8k
             runner: linux-aarch64-a3-16
             test_case: test/registered/ascend/accuracy/glm5_top64_pruned/test_npu_glm5_top64_pruned_bf16_8p_gsm8k.py

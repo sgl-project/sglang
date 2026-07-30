@@ -10,12 +10,6 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3600,
-    suite="full-4-npu-a3",
-    nightly=True,
-    disabled="accuracy testcase",
-)
-register_npu_ci(
-    est_time=3600,
     suite="stage-b-test-4-npu-a3",
     nightly=True,
     disabled="accuracy testcase",
