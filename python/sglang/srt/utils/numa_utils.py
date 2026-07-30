@@ -129,6 +129,8 @@ def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional
     """
     if server_args.numa_node is not None:
         return server_args.numa_node[gpu_id]
+    if not envs.SGLANG_AUTO_NUMA_BIND.get():
+        return None
     if _is_numa_available():
         queried_numa_node = _query_numa_node_for_gpu(gpu_id)
         if len(queried_numa_node) == 0:
