@@ -56,7 +56,7 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     def supports_native_grouped_requests(self):
         return True
 
-    def supports_sequential_tail_execution(self):
+    def supports_sequential_dit_inference(self):
         return True
 
     def get_freqs_cis(self, batch, device, rotary_emb, dtype):

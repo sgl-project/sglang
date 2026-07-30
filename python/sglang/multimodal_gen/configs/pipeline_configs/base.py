@@ -397,8 +397,8 @@ class PipelineConfig:
         """Return whether dynamic batches should run as grouped Req lists."""
         return False
 
-    def supports_sequential_tail_execution(self):
-        """Return whether stage 0 is grouped before yielding per-request tails."""
+    def supports_sequential_dit_inference(self):
+        """Return whether batched AR is followed by per-request DiT inference."""
         return False
 
     def estimate_request_cost(self, batch) -> float:

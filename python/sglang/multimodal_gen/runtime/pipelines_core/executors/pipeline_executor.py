@@ -158,7 +158,7 @@ class PipelineExecutor(ABC):
         batches: list[Req],
         server_args: ServerArgs,
     ):
-        """Run stage 0 as a group, then yield each request after its tail completes."""
+        """Run the AR stage as a group, then yield each completed DiT request."""
         with self.profile_execution(batches[0], dump_rank=0):
             with current_platform.inference_mode():
                 yield from self.execute_group_sequentially(
@@ -266,7 +266,7 @@ class PipelineExecutor(ABC):
         batches: list[Req],
         server_args: ServerArgs,
     ):
-        """Yield outputs after grouped stage 0 and per-request tails."""
+        """Yield outputs after batched AR and per-request DiT/VAE inference."""
         batches = self.execute_group(stages[:1], batches, server_args)
 
         remaining_stages = stages[1:]
@@ -275,7 +275,7 @@ class PipelineExecutor(ABC):
                 yield self.execute(remaining_stages, batch, server_args)
             except Exception as e:
                 logger.error(
-                    "Independent grouped tail failed for request %s: %s",
+                    "Per-request DiT/VAE inference failed for request %s: %s",
                     batch.request_id,
                     e,
                     exc_info=True,
