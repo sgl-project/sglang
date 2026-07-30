@@ -1,16 +1,16 @@
-from __future__ import annotations
-
 """
 Support attention backend for TRTLLM MHA kernels from flashinfer.
 The kernel supports sm100 only, with sliding window and attention sink features.
 """
+
+from __future__ import annotations
+
 
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
-
 from sglang.kernels.ops.attention.utils import canonicalize_stride
 from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
     Q_MODE_NONE,
@@ -21,10 +21,8 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.flashinfer_backend import (
-    FlashInferAttnBackend,
-    FlashInferMultiStepDraftBackend,
-)
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.flashinfer_backend import _cuda_graph_capture_max_bs
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -39,7 +37,9 @@ from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import (
+    is_flashinfer_available,
+)
 from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
 logger = logging.getLogger(__name__)
@@ -89,7 +89,7 @@ class TRTLLMMHAMetadata:
     encoder_row_map: torch.Tensor = None
 
 
-class TRTLLMHAAttnBackend(FlashInferAttnBackend):
+class TRTLLMHAAttnBackend(AttentionBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
     # Build the page table on-device from seq_lens (incl. the SWA-translated table
@@ -116,9 +116,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
         )
 
-        super().__init__(
-            model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
-        )
+        super().__init__()
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.skip_prefill = skip_prefill
+
+        self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
         self.decode_kv_access = self.kv_cache_quant_method.resolve_attention_access(
             "decode", "trtllm_mha"
         )
@@ -176,6 +179,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # SWA hybrid models split the KV cache into full and SWA pools with
         # separate index spaces; SWA layers need a translated page_table.
         self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
+        self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
         # Raw full->swa index mapping tensor for the fused cuda-graph
         # metadata kernel (gather + // page_size happen on device).
         if self._swa_kv_pool is not None:
@@ -1028,7 +1032,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         assert self.is_nvfp4_kvcache
         return self.kv_cache_quant_method.get_bmm_scales(layer.layer_id)
 
-    def _get_nvfp4_decode_kv_cache(self, layer: RadixAttention) -> tuple[
+    def _get_nvfp4_decode_kv_cache(
+        self, layer: RadixAttention
+    ) -> tuple[
         tuple[torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor],
     ]:
@@ -1236,8 +1242,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 # run bs*L single-token rows over the full window instead (the
                 # window's K/V are already in the pool).
                 assert not self.forward_metadata.is_ragged_verify, (
-                    "ENCODER_ONLY target_verify does not support ragged "
-                    "verify layouts"
+                    "ENCODER_ONLY target_verify does not support ragged verify layouts"
                 )
                 assert self.forward_metadata.encoder_cache_seqlens is not None, (
                     "ENCODER_ONLY target_verify requires the expanded decode "
@@ -1358,7 +1363,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
 
-class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
+class TRTLLMHAAttnMultiStepDraftBackend:
     """Multi-step TRTLLM MHA attention kernel used by EAGLE."""
 
     # Per-step backends build the page table on-device (sync-free); mirror that so
@@ -1368,7 +1373,26 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
     def __init__(
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
     ):
-        super().__init__(model_runner, topk, speculative_num_steps)
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.page_size = model_runner.page_size
+
+        max_bs = _cuda_graph_capture_max_bs(
+            model_runner.server_args, model_runner.req_to_token_pool.size * self.topk
+        )
+        self.kv_indptr = torch.zeros(
+            (
+                self.speculative_num_steps,
+                max_bs + 1,
+            ),
+            dtype=torch.int32,
+            device=model_runner.device,
+        )
+        self.kv_last_page_len = torch.ones(
+            (max_bs,), dtype=torch.int32, device=model_runner.device
+        )
+        self.attn_backends = [None] * (self.speculative_num_steps - 1)
+
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i] = TRTLLMHAAttnBackend(
                 model_runner,
@@ -1377,6 +1401,8 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
                 kv_last_page_len_buf=self.kv_last_page_len,
                 speculative_step_id=i,
             )
+
+        self.max_context_len = self.attn_backends[0].max_context_len
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
