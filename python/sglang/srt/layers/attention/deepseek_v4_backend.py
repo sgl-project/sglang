@@ -1933,31 +1933,52 @@ class DeepseekV4AttnBackend(
             else (None, {})
         )
 
-        # --- per-head SDPA (lightweight: only torch matmul ops) ---
-        for h in range(N_heads):
-            k_rows = []
+        # --- Check if all heads share the same page set ---
+        first_swa = tuple(per_head_swa[0])
+        first_extra = tuple(per_head_extra[0])
+        all_same = all(
+            tuple(per_head_swa[h]) == first_swa
+            and tuple(per_head_extra[h]) == first_extra
+            for h in range(1, N_heads)
+        )
 
-            for pid in per_head_swa[h]:
+        if all_same:
+            # --- Batched SDPA: single K, single matmul for all heads ---
+            k_segments = []
+            for pid in sorted(unique_swa):
                 start = swa_lookup[pid]
-                k_rows.append(swa_deq[start : start + swa_phys_page_size])
-
+                k_segments.append(swa_deq[start : start + swa_phys_page_size])
             if extra_deq is not None:
-                for pid in per_head_extra[h]:
+                for pid in sorted(unique_extra):
                     start = extra_lookup[pid]
-                    k_rows.append(extra_deq[start : start + extra_page_size])
-
-            if not k_rows:
-                continue
-
-            k_all = torch.cat(k_rows, dim=0).float()  # [T, 512]
-            qi = q_f32[h : h + 1]  # [1, 512]
-            scores = (qi @ k_all.T).squeeze(0) * self.softmax_scale  # [T]
-
-            # Attn_sink: virtual token with V=0
-            sink_val = float(attn_sink[h])
-            scores_aug = torch.cat([scores, torch.tensor([sink_val], device=dev)])
-            weights = torch.softmax(scores_aug, dim=0)[: scores.numel()]
-            out[h] = (weights.unsqueeze(0) @ k_all).squeeze(0)
+                    k_segments.append(extra_deq[start : start + extra_page_size])
+            if k_segments:
+                k_all = torch.cat(k_segments, dim=0).float()  # [T, 512]
+                scores = (q_f32 @ k_all.T) * self.softmax_scale  # [N_heads, T]
+                sink = attn_sink.float().unsqueeze(1)  # [N_heads, 1]
+                scores_aug = torch.cat([scores, sink], dim=1)
+                weights = torch.softmax(scores_aug, dim=1)[:, : scores.shape[1]]
+                out = weights @ k_all
+        else:
+            # --- Per-head SDPA (heads differ, e.g. C4 indexer) ---
+            for h in range(N_heads):
+                k_rows = []
+                for pid in per_head_swa[h]:
+                    start = swa_lookup[pid]
+                    k_rows.append(swa_deq[start : start + swa_phys_page_size])
+                if extra_deq is not None:
+                    for pid in per_head_extra[h]:
+                        start = extra_lookup[pid]
+                        k_rows.append(extra_deq[start : start + extra_page_size])
+                if not k_rows:
+                    continue
+                k_all = torch.cat(k_rows, dim=0).float()  # [T, 512]
+                qi = q_f32[h : h + 1]  # [1, 512]
+                scores = (qi @ k_all.T).squeeze(0) * self.softmax_scale  # [T]
+                sink_val = float(attn_sink[h])
+                scores_aug = torch.cat([scores, torch.tensor([sink_val], device=dev)])
+                weights = torch.softmax(scores_aug, dim=0)[: scores.numel()]
+                out[h] = (weights.unsqueeze(0) @ k_all).squeeze(0)
 
         return out.view(*q_orig_shape[:-1], -1).to(torch.bfloat16)
 
@@ -2005,28 +2026,25 @@ class DeepseekV4AttnBackend(
         ]  # [Tkv, 512]
         k_f32 = k_dq.float()
 
-        out = torch.zeros(N, MXFP4_TOTAL_DIM, dtype=torch.float32, device=dev)
-        for h in range(N):
-            qi = q[h : h + 1].float()
-            topk = int(swa_topk_lengths[h].item())
-            rows = []
-            for pi in range(topk):
-                pid = int(swa_page_indices[h, pi].item())
-                if pid < 0:
-                    continue
-                start = page_to_start[pid]
-                rows.append(k_f32[start : start + swa_page_size])
-            if not rows:
-                continue
-            k_all = torch.cat(rows, dim=0)
-            scores = (qi @ k_all.T).squeeze(0) * sm_scale
-            if attn_sink is not None:
-                sv = float(attn_sink[h])
-                scores_aug = torch.cat([scores, torch.tensor([sv], device=dev)])
-                weights = torch.softmax(scores_aug, dim=0)[: scores.numel()]
-            else:
-                weights = torch.softmax(scores, dim=0)
-            out[h] = (weights.unsqueeze(0) @ k_all).squeeze(0)
+        # Batched SDPA: all heads share the same K pages in the SWA-only path
+        k_segments = [
+            k_f32[page_to_start[pid] : page_to_start[pid] + swa_page_size]
+            for pid in sorted_pages
+        ]
+        if not k_segments:
+            return torch.zeros(
+                *q_orig_shape[:-1], MXFP4_TOTAL_DIM, dtype=torch.bfloat16, device=dev
+            )
+        k_all = torch.cat(k_segments, dim=0).float()  # [T, 512]
+        q_f32 = q.float()
+        scores = (q_f32 @ k_all.T) * sm_scale  # [N, T]
+        if attn_sink is not None:
+            sink = attn_sink.float().unsqueeze(1)  # [N, 1]
+            scores_aug = torch.cat([scores, sink], dim=1)
+            weights = torch.softmax(scores_aug, dim=1)[:, : scores.shape[1]]
+        else:
+            weights = torch.softmax(scores, dim=1)
+        out = weights @ k_all  # [N, 512]
 
         return out.view(*q_orig_shape[:-1], -1).to(torch.bfloat16)
 

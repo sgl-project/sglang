@@ -8,7 +8,6 @@ import torch
 
 from sglang.jit_kernel.utils import (
     cache_once,
-    is_arch_support_pdl,
     load_jit,
     make_cpp_args,
 )
@@ -21,7 +20,8 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_mxfp4_decode_module() -> Module:
-    args = make_cpp_args(is_arch_support_pdl())
+    # NOTE: PDL (Programmatic Dependent Launch) disabled for CUDA graph compat.
+    args = make_cpp_args(False)
     return load_jit(
         make_name("mxfp4_decode"),
         *args,
