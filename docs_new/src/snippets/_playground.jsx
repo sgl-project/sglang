@@ -101,6 +101,11 @@ export const Playground = ({ config }) => {
   }) || cell;
   // Shared with `_deployment.jsx` (HOST/PORT/etc. unified across the page).
   const STORAGE_KEY = "sglang-deploy-env";
+  // ==== MIRROR of DEPLOYMENT_COMPONENT_ID in _deployment.jsx — keep identical ====
+  // Snippets cannot import each other. The Deploy panel puts this id on its
+  // root (carrying its own scrollMarginTop), which is what "jump to the base"
+  // should land on.
+  const DEPLOYMENT_COMPONENT_ID = "deployment-configurator";
 
   const pgFeatures = config.playgroundFeatures || {};
   // Single-host PD runs prefill + decode as two engines on one box. Each derives
@@ -1360,9 +1365,14 @@ export const Playground = ({ config }) => {
     }
     let cmd;
     if (mode === "docker") {
-      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped (matches _deployment.jsx).
+      // Image keyed by `hw|quant|strategy` (most specific), then `hw|quant`, then
+      // `hw`; `:dev` if unmapped (matches _deployment.jsx). The strategy key covers
+      // a tier that needs its own build (e.g. a spec-decoding preview image), so the
+      // playground base must resolve it too or it hands back an image that cannot
+      // run the command.
       const di = config.dockerImages || {};
-      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
+      const image = di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
+        || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const dockerLines = [
@@ -2218,12 +2228,16 @@ export const Playground = ({ config }) => {
         <span style={{ fontWeight: 600 }}>Inherited base from Deployment:</span>
         <code style={{ fontFamily: "Menlo, monospace" }}>{baseSummary}</code>
         {/* scrollIntoView (not hash nav) so the base-cell hash survives.
-            Deploy heading slugs to "deployment" or "deploy". */}
+            Target the configurator ITSELF: the "## Deployment" heading sits
+            above the install accordion and a screenful of prose, so landing on
+            the heading leaves the panel you came for off-screen. The heading
+            slugs stay as fallbacks for a page that renders no configurator. */}
         <button
           type="button"
           style={s.switchBaseBtn}
           onClick={() => {
-            const el = document.getElementById("deployment")
+            const el = document.getElementById(DEPLOYMENT_COMPONENT_ID)
+              || document.getElementById("deployment")
               || document.getElementById("deploy");
             if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
           }}
