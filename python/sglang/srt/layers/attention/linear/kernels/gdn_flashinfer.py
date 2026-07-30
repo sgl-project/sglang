@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
@@ -30,8 +30,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True, slots=True, eq=False)
-class FlashInferGDNExtendPrep:
+class FlashInferGDNExtendPrep(msgspec.Struct, frozen=True, eq=False):
     """FlashInfer metadata shared by all GDN layers in an extend forward."""
 
     ssm_cache_indices: torch.Tensor

@@ -1,6 +1,6 @@
-from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
@@ -36,8 +36,7 @@ if is_cuda() or is_hip():
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 
 
-@dataclass(frozen=True, slots=True, eq=False)
-class _GDNExtendContext:
+class _GDNExtendContext(msgspec.Struct, frozen=True, eq=False):
     has_initial_states: torch.Tensor
     kernel_prep: object | None
 
