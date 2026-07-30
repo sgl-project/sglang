@@ -152,6 +152,7 @@ def build_tree_kernel_efficient(
     tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
     tree_mask_buf: Optional[torch.Tensor] = None,
     position_buf: Optional[torch.Tensor] = None,
+    tree_mask_unread: bool = False,
 ):
     draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
 
@@ -168,7 +169,11 @@ def build_tree_kernel_efficient(
         elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
             tree_mask.fill_(0)
         elif tree_mask_mode == TreeMaskMode.FULL_MASK:
-            tree_mask.fill_(True)
+            # The fill covers the [0, seq_len) prefix columns only; the kernel
+            # below writes every tree cell itself. Skip the (up to 100s of MB)
+            # per-step memset when the verify backend never reads the mask.
+            if not tree_mask_unread:
+                tree_mask.fill_(True)
         else:
             raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
     elif tree_mask_mode == TreeMaskMode.QLEN_ONLY:
