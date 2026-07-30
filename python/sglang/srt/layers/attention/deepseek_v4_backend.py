@@ -1336,6 +1336,18 @@ class DeepseekV4AttnBackend(
                 else None
             )
 
+        # Pre-compute MXFP4 decode params (avoids GPU→CPU .item() in forward,
+        # which breaks CUDA graph capture).
+        if self.token_to_kv_pool.dsv4_kv_cache_store_mxfp4:
+            swa_window = 128
+            if seq_lens_cpu is not None:
+                seq_len = int(seq_lens_cpu.min().item())
+            elif seq_lens is not None and seq_lens.numel() > 0:
+                seq_len = swa_window  # safe default during capture
+            else:
+                seq_len = swa_window
+            self._mx_nv = min(seq_len, swa_window)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
         if self.mtp_enabled and logical_forward_mode.is_idle():
@@ -1794,16 +1806,10 @@ class DeepseekV4AttnBackend(
         assert q.ndim == 2 and q.shape[1] == MXFP4_TOTAL_DIM
         N_heads = q.shape[0]
 
-        # Compute valid token count for SWA window.
-        # For decode, the K cache contains seq_len tokens (prefill + decode so far).
-        # The SWA window is the last min(seq_len, swa_window) tokens.
+        # num_valid is pre-computed in init_forward_metadata_out_graph
+        # (avoids GPU→CPU .item() which breaks CUDA graph capture).
         swa_window = 128
-        seq_lens = getattr(forward_batch, "seq_lens", None)
-        if seq_lens is not None and seq_lens.numel() > 0:
-            seq_len = int(seq_lens.min().item())  # min across batch for safety
-        else:
-            seq_len = swa_window  # conservative: scan full page
-        num_valid = min(seq_len, swa_window)
+        num_valid = getattr(self, "_mx_nv", swa_window)
 
         # Pad indices/attn_sink to match q shape
         def _match(x, value):
@@ -1821,11 +1827,8 @@ class DeepseekV4AttnBackend(
         extra_topk_lengths = _match(extra_topk_lengths, 1)
         attn_sink = _match(attn_sink, 0.0)
 
-        has_extras = (
-            extra_k_cache is not None
-            and extra_indices is not None
-            and bool((extra_topk_lengths > 0).any().item())
-        )
+        # compress_ratio > 0 means C4 or C128 — has extras (FP8 format)
+        has_extras = compress_ratio > 0 and extra_k_cache is not None
 
         if not has_extras:
             # ── SWA-only (compress_ratio=0): use fused decode kernel ────
@@ -1843,10 +1846,10 @@ class DeepseekV4AttnBackend(
             kernel_page_idx = (
                 (swa_start_token // swa_window).to(torch.int32).contiguous()
             )
-            start_offset = swa_start_token % swa_window
-            needs_multi_kpage = bool(
-                (start_offset + num_valid > swa_window).any().item()
-            )
+            # Multi-kernel-page detection: when num_valid exceeds one kernel
+            # page, or when start_offset+num_valid crosses a page boundary.
+            # For graph safety, use num_valid (pre-computed Python int) only.
+            needs_multi_kpage = num_valid > swa_window
             if needs_multi_kpage:
                 return self._mxfp4_decode_sdpa_fallback(
                     q=q,
