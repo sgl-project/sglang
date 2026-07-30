@@ -37,14 +37,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::future::try_join_all;
 use redis::FromRedisValue;
+use tokio::sync::Semaphore;
 use tonic::Status;
 
 use crate::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvActionType,
     ExternalKvNodeMatch, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
-    HitCountEntry, MatchExternalKvRequest, MatchExternalKvResponse, TierHashes,
+    HitCountEntry, MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse,
+    MatchExternalKvRequest, MatchExternalKvResponse, TierHashes,
 };
-use crate::service::KvIndexerBackend;
+use crate::service::{assemble_prefix_response, prefix_limit, KvIndexerBackend};
 
 use conn::{ClusterConn, RedisConn, SingleConn};
 use schema::{
@@ -64,6 +66,24 @@ const REDIS_FANOUT_CHUNK: usize = 256;
 /// `COUNT` hint for reverse-index `SSCAN` iteration. Sized to match the fanout
 /// chunk so one scanned page turns into one round of concurrent cleanup.
 const REVERSE_SCAN_PAGE: usize = 256;
+/// Server-side ceiling on how many blocks a single prefix query scans, on top of
+/// the caller's `max_blocks`. Bounds the Redis command count of one query even
+/// if the caller passes an enormous hash list.
+const PREFIX_SCAN_CAP: usize = 2048;
+/// Process-wide cap on concurrent in-flight prefix queries.
+///
+/// Prefix queries sit on the routing hot path and share the one multiplexed
+/// Redis connection with the apply (event-ingest) path. `max_blocks` and
+/// `PREFIX_SCAN_CAP` bound a single query but not their number, so a burst of
+/// concurrent queries could saturate the connection's request queue and push
+/// apply calls past their response timeout. In this build applies carry no TTL
+/// refresh, so a failed apply simply drops that mutation — placement drifts
+/// stale and never self-heals. This semaphore keeps query fan-out well below the
+/// apply path's per-batch concurrency (`REDIS_FANOUT_CHUNK`) so routing lookups
+/// cannot starve ingestion. Routing queries are latency-sensitive, so excess
+/// queries queueing briefly here is the right trade; applies are batched and
+/// tolerate being a little slower.
+const PREFIX_QUERY_MAX_INFLIGHT: usize = 16;
 
 /// Resolved connection target parsed from the environment.
 enum Target {
@@ -74,6 +94,8 @@ enum Target {
 pub struct RedisKvIndexerBackend {
     conn: Arc<dyn RedisConn>,
     ns: String,
+    /// Bounds concurrent prefix queries; see [`PREFIX_QUERY_MAX_INFLIGHT`].
+    prefix_semaphore: Arc<Semaphore>,
 }
 
 impl RedisKvIndexerBackend {
@@ -81,6 +103,7 @@ impl RedisKvIndexerBackend {
         Self {
             conn,
             ns: ns.into(),
+            prefix_semaphore: Arc::new(Semaphore::new(PREFIX_QUERY_MAX_INFLIGHT)),
         }
     }
 
@@ -376,6 +399,122 @@ impl RedisKvIndexerBackend {
         Ok(MatchExternalKvResponse { matches })
     }
 
+    /// Workers that hold a block hash at any valid tier.
+    async fn placement_holders(&self, hash: &str) -> Result<Vec<String>, Status> {
+        let v = self
+            .conn
+            .invoke(&MATCH_HASH, vec![placement_key(&self.ns, hash)], Vec::new())
+            .await
+            .map_err(to_status)?;
+        let flat = Vec::<String>::from_redis_value(&v).map_err(to_status)?;
+        let mut holders = Vec::new();
+        for pair in flat.chunks(2) {
+            if pair.len() != 2 {
+                continue;
+            }
+            let mask = pair[1].parse::<i64>().unwrap_or(0);
+            if !tiers_from_mask(mask).is_empty() {
+                holders.push(pair[0].clone());
+            }
+        }
+        Ok(holders)
+    }
+
+    /// Three-stage forward scan producing the same prefix semantics as the trait
+    /// default implementation.
+    ///
+    /// 1. Read `hashes[0]`'s placement to get every worker that could hold *any*
+    ///    prefix. If none, one Redis command answers the whole query.
+    /// 2. Read the routing registry once, for that worker set only; the candidate
+    ///    set only shrinks afterwards, so later blocks never re-read the registry.
+    /// 3. From index 1, scan forward in windows, advancing each surviving worker's
+    ///    contiguous prefix and dropping it at its first missing block; stop when
+    ///    no candidate remains or the scan/`max_blocks` cap is reached.
+    ///
+    /// The win here is *fewer Redis commands* — a first-block miss costs one
+    /// command instead of one per block — not lower latency; a fully-cached long
+    /// prefix takes more round-trips than reading every block at once. The
+    /// registry is read as a snapshot: a worker that restarts mid-scan can still
+    /// contribute entries this build never fences, so a prefix may come out longer
+    /// than the worker truly holds (never shorter). The index is advisory, so this
+    /// window is acceptable.
+    async fn do_match_prefix(
+        &self,
+        req: MatchExternalKvPrefixRequest,
+    ) -> Result<MatchExternalKvPrefixResponse, Status> {
+        // Bound concurrent prefix queries so routing lookups cannot starve the
+        // shared connection's ingest path (see PREFIX_QUERY_MAX_INFLIGHT).
+        let _permit = self
+            .prefix_semaphore
+            .acquire()
+            .await
+            .map_err(|_| Status::unavailable("prefix query semaphore closed"))?;
+
+        let limit = prefix_limit(req.hashes.len(), req.max_blocks).min(PREFIX_SCAN_CAP);
+        let hashes = &req.hashes[..limit];
+        if hashes.is_empty() {
+            return Ok(MatchExternalKvPrefixResponse::default());
+        }
+
+        // Stage 1: the first block's holders bound the candidate set.
+        let holders0 = self.placement_holders(&hashes[0]).await?;
+        let mut blocks_read = 1u32;
+        if holders0.is_empty() {
+            return Ok(assemble_prefix_response(Vec::new(), blocks_read));
+        }
+
+        // Stage 2: one registry read for those workers; drop unroutable (empty
+        // address) ones now (see the proto's worker_address contract).
+        let mut addresses = Vec::with_capacity(holders0.len());
+        for chunk in holders0.chunks(REDIS_FANOUT_CHUNK) {
+            let values =
+                try_join_all(chunk.iter().map(|worker| self.worker_address(worker))).await?;
+            addresses.extend(values);
+        }
+        // (worker_id, address, prefix_so_far); every survivor holds block 0.
+        let mut active: Vec<(String, String, u32)> = holders0
+            .into_iter()
+            .zip(addresses)
+            .filter(|(_, addr)| !addr.is_empty())
+            .map(|(worker, addr)| (worker, addr, 1u32))
+            .collect();
+        let mut done: Vec<(String, String, u32)> = Vec::new();
+
+        // Stage 3: scan forward, windowed, until candidates or blocks run out.
+        let mut idx = 1usize;
+        while idx < hashes.len() && !active.is_empty() {
+            let end = (idx + REDIS_FANOUT_CHUNK).min(hashes.len());
+            let window = &hashes[idx..end];
+            let holder_sets = try_join_all(window.iter().map(|hash| async move {
+                Ok::<HashSet<String>, Status>(
+                    self.placement_holders(hash).await?.into_iter().collect(),
+                )
+            }))
+            .await?;
+            blocks_read += window.len() as u32;
+
+            for holders in holder_sets {
+                let mut still = Vec::with_capacity(active.len());
+                for (worker, addr, prefix) in active.drain(..) {
+                    if holders.contains(&worker) {
+                        still.push((worker, addr, prefix + 1));
+                    } else {
+                        done.push((worker, addr, prefix));
+                    }
+                }
+                active = still;
+                if active.is_empty() {
+                    break;
+                }
+            }
+            idx = end;
+        }
+        // Survivors reached the scan limit with an unbroken prefix.
+        done.append(&mut active);
+
+        Ok(assemble_prefix_response(done, blocks_read))
+    }
+
     async fn do_hit_counts(
         &self,
         req: GetExternalKvHitCountsRequest,
@@ -423,6 +562,13 @@ impl KvIndexerBackend for RedisKvIndexerBackend {
         request: MatchExternalKvRequest,
     ) -> Result<MatchExternalKvResponse, Status> {
         self.do_match(request).await
+    }
+
+    async fn match_external_kv_prefix(
+        &self,
+        request: MatchExternalKvPrefixRequest,
+    ) -> Result<MatchExternalKvPrefixResponse, Status> {
+        self.do_match_prefix(request).await
     }
 
     async fn get_external_kv_hit_counts(

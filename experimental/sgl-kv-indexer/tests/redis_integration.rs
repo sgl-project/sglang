@@ -21,12 +21,14 @@ mod test_id;
 mod test_kv;
 
 use sgl_kv_indexer::pb::{
-    ExternalKvActionType, GetExternalKvHitCountsRequest, MatchExternalKvRequest,
-    MatchExternalKvResponse,
+    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvActionType,
+    GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse, MatchExternalKvPrefixRequest,
+    MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse,
 };
 use sgl_kv_indexer::{KvIndexerBackend, RedisKvIndexerBackend};
 use test_id::nanos;
 use test_kv::{action, apply_request as apply_req, dram, hashes, hbm};
+use tonic::Status;
 
 /// Builds a backend against the configured store with a unique namespace, or
 /// returns `None` (skip) when no store env is set.
@@ -615,3 +617,199 @@ itest!(batch_action_order_is_preserved, b, {
 });
 
 // --- server-side seq gate (durable idempotency) -----------------------------
+
+// --- prefix query: Redis fast path vs. the trait's default implementation ----
+//
+// The default `match_external_kv_prefix` (composed from `match_external_kv`) is
+// the written semantics; the Redis override is a command-count optimization. It
+// must stay field-for-field identical on the parts that ARE the contract
+// (per-worker prefix set and best_prefix_blocks); `blocks_read` is observability
+// and legitimately differs, so it is not compared.
+
+/// Delegates every RPC to a Redis backend EXCEPT `match_external_kv_prefix`,
+/// which it leaves to the trait default — giving a reference answer computed from
+/// the same store the fast path reads.
+struct DefaultViaRedis(RedisKvIndexerBackend);
+
+#[tonic::async_trait]
+impl KvIndexerBackend for DefaultViaRedis {
+    async fn apply_external_kv_batch(
+        &self,
+        request: ApplyExternalKvBatchRequest,
+    ) -> Result<ApplyExternalKvBatchResponse, Status> {
+        self.0.apply_external_kv_batch(request).await
+    }
+
+    async fn match_external_kv(
+        &self,
+        request: MatchExternalKvRequest,
+    ) -> Result<MatchExternalKvResponse, Status> {
+        self.0.match_external_kv(request).await
+    }
+
+    async fn get_external_kv_hit_counts(
+        &self,
+        request: GetExternalKvHitCountsRequest,
+    ) -> Result<GetExternalKvHitCountsResponse, Status> {
+        self.0.get_external_kv_hit_counts(request).await
+    }
+}
+
+/// Two backends on one shared namespace, or `None` (skip) with no store.
+async fn shared_ns_pair(test: &str) -> Option<(RedisKvIndexerBackend, RedisKvIndexerBackend)> {
+    let ns = format!("itest:{test}:{}", nanos());
+    let connect = |ns: String| async move {
+        if let Ok(url) = std::env::var("KV_INDEXER_REDIS_URL") {
+            Some(
+                RedisKvIndexerBackend::connect_single(&url, ns)
+                    .await
+                    .expect("connect single"),
+            )
+        } else if let Ok(nodes) = std::env::var("KV_INDEXER_REDIS_CLUSTER_NODES") {
+            let nodes: Vec<String> = nodes
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            Some(
+                RedisKvIndexerBackend::connect_cluster(nodes, ns)
+                    .await
+                    .expect("connect cluster"),
+            )
+        } else {
+            None
+        }
+    };
+    match (connect(ns.clone()).await, connect(ns).await) {
+        (Some(a), Some(b)) => Some((a, b)),
+        _ => {
+            require::skip(
+                test,
+                "neither KV_INDEXER_REDIS_URL nor KV_INDEXER_REDIS_CLUSTER_NODES is set",
+            );
+            None
+        }
+    }
+}
+
+fn prefix_req(hs: &[&str]) -> MatchExternalKvPrefixRequest {
+    MatchExternalKvPrefixRequest {
+        hashes: hashes(hs),
+        max_blocks: 0,
+    }
+}
+
+/// Sorted `(worker_id, matched_prefix_blocks)` — the semantic content of a
+/// prefix response, independent of `blocks_read`.
+fn prefix_pairs(resp: &MatchExternalKvPrefixResponse) -> Vec<(String, u32)> {
+    let mut pairs: Vec<(String, u32)> = resp
+        .matches
+        .iter()
+        .map(|m| (m.worker_id.clone(), m.matched_prefix_blocks))
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+fn report(worker: &str, addr: &str, seq: u64, hs: &[&str]) -> ApplyExternalKvBatchRequest {
+    apply_req(
+        worker,
+        addr,
+        seq,
+        vec![action(ExternalKvActionType::ActionReport, hbm(), hs)],
+    )
+}
+
+#[tokio::test]
+async fn prefix_fast_path_matches_default_impl() {
+    let Some((fast, reference)) = shared_ns_pair("prefix_parity").await else {
+        return;
+    };
+    let reference = DefaultViaRedis(reference);
+
+    // Nested prefixes (hole-free), a diverging branch, and a hole.
+    fast.apply_external_kv_batch(report("w-long", "10.0.0.1:1", 1, &["a", "b", "c", "d"]))
+        .await
+        .unwrap();
+    fast.apply_external_kv_batch(report("w-short", "10.0.0.2:1", 1, &["a", "b"]))
+        .await
+        .unwrap();
+    // w-hole holds a, c, d but not b: strict prefix must be 1.
+    fast.apply_external_kv_batch(report("w-hole", "10.0.0.3:1", 1, &["a", "c", "d"]))
+        .await
+        .unwrap();
+    // w-noaddr is unroutable and must be excluded by both paths.
+    fast.apply_external_kv_batch(report("w-noaddr", "", 1, &["a", "b"]))
+        .await
+        .unwrap();
+
+    let query = ["a", "b", "c", "d"];
+    let fast_resp = fast
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+    let ref_resp = reference
+        .match_external_kv_prefix(prefix_req(&query))
+        .await
+        .unwrap();
+
+    assert_eq!(prefix_pairs(&fast_resp), prefix_pairs(&ref_resp));
+    assert_eq!(fast_resp.best_prefix_blocks, ref_resp.best_prefix_blocks);
+    assert_eq!(fast_resp.best_prefix_blocks, 4);
+    assert_eq!(
+        prefix_pairs(&fast_resp),
+        vec![
+            ("w-hole".to_string(), 1),
+            ("w-long".to_string(), 4),
+            ("w-short".to_string(), 2),
+        ]
+    );
+    assert!(fast_resp
+        .matches
+        .iter()
+        .all(|m| !m.worker_address.is_empty()));
+    // Descending order and first-block read are part of the response contract.
+    assert_eq!(fast_resp.matches[0].matched_prefix_blocks, 4);
+    assert!(fast_resp.blocks_read >= 1);
+}
+
+#[tokio::test]
+async fn prefix_first_block_miss_reads_one_block() {
+    let Some(b) = backend("prefix_first_miss").await else {
+        return;
+    };
+    // No worker holds the first queried block; the scan stops after one read.
+    b.apply_external_kv_batch(report("w1", "10.0.0.1:1", 1, &["y", "z"]))
+        .await
+        .unwrap();
+    let resp = b
+        .match_external_kv_prefix(prefix_req(&["x", "y", "z"]))
+        .await
+        .unwrap();
+    assert!(resp.matches.is_empty());
+    assert_eq!(resp.best_prefix_blocks, 0);
+    assert_eq!(resp.blocks_read, 1);
+}
+
+#[tokio::test]
+async fn prefix_max_blocks_caps_the_scan() {
+    let Some(b) = backend("prefix_max_blocks").await else {
+        return;
+    };
+    b.apply_external_kv_batch(report("w1", "10.0.0.1:1", 1, &["a", "b", "c", "d"]))
+        .await
+        .unwrap();
+    let resp = b
+        .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+            hashes: hashes(&["a", "b", "c", "d"]),
+            max_blocks: 2,
+        })
+        .await
+        .unwrap();
+    // Capped at 2 even though the worker holds all four.
+    assert_eq!(resp.best_prefix_blocks, 2);
+    assert_eq!(resp.blocks_read, 2);
+    assert_eq!(resp.matches.len(), 1);
+    assert_eq!(resp.matches[0].matched_prefix_blocks, 2);
+}

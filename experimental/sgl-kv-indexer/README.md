@@ -150,9 +150,56 @@ The protobuf service in `proto/kv_indexer.proto` provides:
 - `ApplyExternalKvBatch`: ordered placement reports, revocations, and clears.
   The response is empty; the request `seq` is carried for observability only.
 - `MatchExternalKv`: workers and tiers holding requested block hashes.
+- `MatchExternalKvPrefix`: per-worker longest **contiguous** request prefix, for
+  cache-aware routing (see below).
 - `GetExternalKvHitCounts`: per-block hit counters.
 
 There is no gRPC health service in this build.
+
+## Prefix routing query
+
+`MatchExternalKvPrefix` answers, for a request's block-hash chain (prompt order,
+`hashes[0]` first), how long a contiguous prefix each worker holds. A worker's
+`matched_prefix_blocks` is the largest `n` such that it holds `hashes[0..n)` with
+no gap; the count stops at the first missing block. This is intentionally
+*stricter* than sgl-router's in-process `HashTree::match_prefix`, which credits a
+worker for the deepest matched node without checking every ancestor — so the
+indexer only ever under-reports a prefix, never routes a request to a worker that
+cannot serve it.
+
+The indexer does **not** pick a worker. It cannot see the router's health checks,
+circuit breakers, PD-pool split, or in-flight load, so it returns every candidate
+sorted by prefix length and leaves the final choice to the router (intersect the
+cache-hit set with the router's own candidates, then pick by lowest load). It also
+does not return tier information: routing selects on prefix length alone.
+
+The scan reads the first block, then only the registry for that block's holders,
+then walks forward while candidates remain. Its benefit is *fewer Redis commands*
+(a first-block miss costs one command instead of one per block), **not** lower
+latency — a fully-cached long prefix takes more round-trips than reading every
+block at once. Because the registry is read as a snapshot and this build never
+fences restarted workers, a reported prefix can be longer than a worker truly
+holds (never shorter); the index is advisory, so this is acceptable.
+
+### Worker address contract
+
+`ExternalKvPrefixMatch.worker_address` is the worker's **router-facing routing
+identity, not its KV-transfer address**. The router intersects it byte-for-byte
+with the worker URLs it registered, so a mismatch makes the intersection always
+empty and silently disables cache-aware routing — a failure that is hard to
+diagnose. It is populated from the bridge's `KV_INDEXER_WORKER_ADDRESS`; set it to
+exactly the URL the router registers. Workers with an empty address are unroutable
+and are excluded from prefix results.
+
+### Router client
+
+`src/client.rs` is the minimal library the router links against: one trait
+(`PrefixIndex::match_prefix`) taking an ordered `Vec<i64>` and returning
+`PrefixOutcome`. The outcome has **no error variant** — every failure (empty
+result, unreachable, timeout, rejected) becomes `NoSignal`, so an advisory-index
+outage falls back to existing routing instead of failing a request. The connection
+is lazy (the router does not depend on the indexer at startup) and each query has
+its own short deadline (default 10 ms).
 
 ## Tests
 
