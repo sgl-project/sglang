@@ -765,10 +765,12 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
+        enable_gdn_replayssm_spec: bool = False,
     ):
         # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm /
-        # linear_replayssm_cache_len: accepted to match the parent signature but NOT
-        # forwarded — the shared pool's conv/temporal state are fixed-shape views.
+        # linear_replayssm_cache_len / enable_gdn_replayssm_spec: accepted to match
+        # the parent signature but NOT forwarded — the shared pool's conv/temporal
+        # state are fixed-shape views.
         assert mamba_size == self._shared_mamba_size, (
             f"UnifiedHybridReqToTokenPool._init_mamba_pool: mamba_size={mamba_size} "
             f"!= unified_buffer.max_slots({self._mamba_sub_pool_name!r}) - 1 "
