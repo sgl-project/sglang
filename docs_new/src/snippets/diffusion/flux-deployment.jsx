@@ -14,17 +14,26 @@ export const FluxDeployment = () => {
           { id: 'mi355x', label: 'MI355X', default: false },
           { id: 'mi325x', label: 'MI325X', default: false },
           { id: 'mi300x', label: 'MI300X', default: false },
-          { id: 'a2', label: 'A2', default: false },
-          { id: 'a3', label: 'A3', default: false }
+          { id: 'Arc B', label: 'BMG', default: false },
         ]
       },
       version: {
         name: 'version',
         title: 'Model Version',
-        items: [
-          { id: 'flux1-dev', label: 'FLUX.1-dev', subtitle: '12B', default: true },
-          { id: 'flux2-dev', label: 'FLUX.2-dev', subtitle: '32B', default: false }
-        ]
+        getDynamicItems: (values) => {
+          const isArcB = values.hardware === 'Arc B';
+          return [
+            {
+              id: 'flux1-dev',
+              label: 'FLUX.1-dev',
+              subtitle: '12B',
+              default: true,
+              disabled: isArcB,
+              disabledReason: isArcB ? 'Arc B only supports FLUX.2-dev' : '',
+            },
+            { id: 'flux2-dev', label: 'FLUX.2-dev', subtitle: '32B', default: false },
+          ];
+        }
       }
     },
 
@@ -34,34 +43,21 @@ export const FluxDeployment = () => {
     },
 
     generateCommand: function(values) {
-      const { hardware, version } = values;
+      const { version, hardware } = values;
       const config = this.modelConfigs[version];
 
-      if (hardware === 'a2') {
-        if (version === 'flux1-dev') {
-          return `sglang serve \\
-  --model-path ${config.repoId} \\
-  --num-gpus 1`;
-        }
-
+      if (hardware === 'Arc B') {
         return `sglang serve \\
-  --model-path ${config.repoId} \\
-  --tp-size 2 \\
-  --num-gpus 2`;
-      }
-
-      if (hardware === 'a3') {
-        return `#One A3 card has 2 npu chips
-sglang serve \\
-  --tp-size 2 \\
-  --model-path ${config.repoId} \\
-  --num-gpus 2`;
+--model-path ${config.repoId} \\
+--num-gpus 4 \\
+--tp-size 4 \\
+--dit-cpu-offload False`;
       }
 
       return `sglang serve \\
-  --model-path ${config.repoId} \\
-  --ulysses-degree=1 \\
-  --ring-degree=1`;
+--model-path ${config.repoId} \\
+--ulysses-degree=1 \\
+--ring-degree=1`;
     }
   };
 
@@ -131,21 +127,14 @@ sglang serve \\
     return () => observer.disconnect();
   }, []);
 
-  useEffect(() => {
-    const isAscend = values.hardware === 'a2' || values.hardware === 'a3';
-    const targetTabName = isAscend ? 'Ascend A3' : 'NVIDIA B200';
-
-    const allTabs = document.querySelectorAll('button, [role="tab"]');
-    allTabs.forEach((tab) => {
-      const text = tab.textContent.trim();
-      if (text === targetTabName && tab.getAttribute('aria-selected') !== 'true') {
-        tab.click();
-      }
-    });
-  }, [values.hardware]);
-
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      const nextValues = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'Arc B') {
+        nextValues.version = 'flux2-dev';
+      }
+      return nextValues;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {

@@ -24,6 +24,7 @@ export const Qwen35Deployment = () => {
 
   const MOE_MODELS = new Set(['397b', '122b', '35b']);
   const FP8_MODELS = new Set(['397b', '122b', '35b', '27b']);
+  const ARC_B_MODELS = new Set(['9b', '35b', '4b']);
 
   // Maps model id -> HuggingFace model name suffix
   const MODEL_SUFFIX = {
@@ -41,16 +42,29 @@ export const Qwen35Deployment = () => {
     model: {
       name: 'model',
       title: 'Model Variant',
-      items: [
-        { id: '397b',  label: '397B', subtitle: 'MoE', default: true  },
-        { id: '122b',  label: '122B', subtitle: 'MoE', default: false },
-        { id: '35b',   label: '35B',  subtitle: 'MoE', default: false },
-        { id: '27b',   label: '27B',  subtitle: 'Dense', default: false },
-        { id: '9b',    label: '9B',   subtitle: 'Dense', default: false },
-        { id: '4b',    label: '4B',   subtitle: 'Dense', default: false },
-        { id: '2b',    label: '2B',   subtitle: 'Dense', default: false },
-        { id: '0.8b',  label: '0.8B', subtitle: 'Dense', default: false },
-      ]
+      getDynamicItems: (values) => {
+        const isArcB = values.hardware === 'Arc B';
+        const baseItems = [
+          { id: '397b',  label: '397B', subtitle: 'MoE', default: true  },
+          { id: '122b',  label: '122B', subtitle: 'MoE', default: false },
+          { id: '35b',   label: '35B',  subtitle: 'MoE', default: false },
+          { id: '27b',   label: '27B',  subtitle: 'Dense', default: false },
+          { id: '9b',    label: '9B',   subtitle: 'Dense', default: false },
+          { id: '4b',    label: '4B',   subtitle: 'Dense', default: false },
+          { id: '2b',    label: '2B',   subtitle: 'Dense', default: false },
+          { id: '0.8b',  label: '0.8B', subtitle: 'Dense', default: false },
+        ];
+
+        if (!isArcB) {
+          return baseItems;
+        }
+
+        return baseItems.map((item) => ({
+          ...item,
+          disabled: !ARC_B_MODELS.has(item.id),
+          default: item.id === '35b'
+        }));
+      }
     },
     hardware: {
       name: 'hardware',
@@ -65,7 +79,8 @@ export const Qwen35Deployment = () => {
           { id: 'mi300x', label: 'MI300X', default: false,     disabled: isNvfp4 },
           { id: 'mi325x', label: 'MI325X', default: false,     disabled: isNvfp4 },
           { id: 'mi355x', label: 'MI355X', default: false,     disabled: false },
-          { id: 'xeon',   label: 'XEON',   default: false,     disabled: isNvfp4 }
+          { id: 'xeon',   label: 'XEON',   default: false,     disabled: isNvfp4 },
+          { id: 'Arc B',  label: 'BMG',  default: false,     disabled: isNvfp4 },
         ];
       }
     },
@@ -73,15 +88,17 @@ export const Qwen35Deployment = () => {
       name: 'quantization',
       title: 'Quantization',
       getDynamicItems: (values) => {
-        const hasFp8 = FP8_MODELS.has(values.model);
+        const isArcB = values.hardware === 'Arc B';
+        const hasFp8 = FP8_MODELS.has(values.model) && !isArcB;
         const hasFp4 = values.model === '397b';
         const isXeon = values.hardware === 'xeon';
+        const isArcBXpu = values.hardware === 'Arc B';
         return [
           { id: 'bf16', label: 'BF16', default: !hasFp8 || isXeon },
           { id: 'fp8',  label: 'FP8',  default: hasFp8 && !isXeon, disabled: !hasFp8,
             disabledReason: 'No FP8 variant available for this model' },
-          { id: 'fp4',  label: 'FP4',  default: false,   disabled: !hasFp4 || isXeon,
-            disabledReason: isXeon ? 'FP4 is not supported on Xeon' : 'FP4 is only available for Qwen3.5-397B-A17B' }
+          { id: 'fp4',  label: 'FP4',  default: false,   disabled: !hasFp4 || isXeon || isArcBXpu,
+            disabledReason: isXeon || isArcBXpu ? 'FP4 is not supported on this hardware' : 'FP4 is only available for Qwen3.5-397B-A17B' }
         ];
       }
     },
@@ -104,7 +121,7 @@ export const Qwen35Deployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding (MTP)',
-      condition: (values) => values.hardware !== 'xeon',
+      condition: (values) => values.hardware !== 'xeon' && values.hardware !== 'Arc B',
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled',  label: 'Enabled',  default: true  }
@@ -113,7 +130,7 @@ export const Qwen35Deployment = () => {
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
-      condition: (values) => MOE_MODELS.has(values.model) && values.hardware !== 'xeon',
+      condition: (values) => MOE_MODELS.has(values.model) && values.hardware !== 'xeon' && values.hardware !== 'Arc B',
       getDynamicItems: (currentValues) => {
         const amdGpus = ['mi300x', 'mi325x', 'mi355x'];
         const isAmdGpu = amdGpus.includes(currentValues.hardware);
@@ -150,6 +167,7 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 8,  mem: 0.8 }, fp8: { tp: 8, ep: 8, mem: 0.8 } },
       b200:   { bf16: { tp: 8,  mem: 0.8 }, fp8: { tp: 4, mem: 0.8 }, fp4: { tp: 4, mem: 0.85 } },
       b300:   { bf16: { tp: 8,  mem: 0.8 }, fp8: { tp: 4, mem: 0.8 }, fp4: { tp: 4, mem: 0.8 } },
+      'Arc B': { bf16: { tp: 1, mem: 0.8  }, fp8: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 8, mem: 0.8 }, fp8: { tp: 4, mem: 0.8 } },
       mi325x: { bf16: { tp: 4, mem: 0.8 }, fp8: { tp: 2, mem: 0.8 } },
       mi355x: { bf16: { tp: 4, mem: 0.8 }, fp8: { tp: 2, mem: 0.8 }, fp4: { tp: 2, mem: 0.8 } },
@@ -160,6 +178,7 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 4 },            fp8: { tp: 2 } },
       b200:   { bf16: { tp: 2, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b300:   { bf16: { tp: 2 },           fp8: { tp: 1, mem: 0.8 } },
+      'Arc B': { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 2, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
@@ -170,6 +189,7 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b200:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b300:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      'Arc B': { bf16: { tp: 4, mem: 0.8  }, fp8: { tp: 4, mem: 0.8  } },
       mi300x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
@@ -180,6 +200,7 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b200:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b300:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      'Arc B': { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
@@ -190,6 +211,7 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 1, mem: 0.8 } },
       b200:   { bf16: { tp: 1, mem: 0.8 } },
       b300:   { bf16: { tp: 1, mem: 0.8 } },
+      'Arc B': { bf16: { tp: 1, mem: 0.8} },
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 } },
@@ -200,6 +222,7 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 1, mem: 0.8 } },
       b200:   { bf16: { tp: 1, mem: 0.8 } },
       b300:   { bf16: { tp: 1, mem: 0.8 } },
+      'Arc B': { bf16: { tp: 1, mem: 0.8} },
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 } },
@@ -210,6 +233,7 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 1, mem: 0.8 } },
       b200:   { bf16: { tp: 1, mem: 0.8 } },
       b300:   { bf16: { tp: 1, mem: 0.8 } },
+      'Arc B': { bf16: { tp: 1, mem: 0.8} },
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 } },
@@ -220,6 +244,7 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 1, mem: 0.8 } },
       b200:   { bf16: { tp: 1, mem: 0.8 } },
       b300:   { bf16: { tp: 1, mem: 0.8 } },
+      'Arc B': { bf16: { tp: 1, mem: 0.8} },
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 } },
@@ -272,10 +297,19 @@ export const Qwen35Deployment = () => {
       }
       return next;
     });
-  }, [values.hardware, values.model]);
+  }, [values.hardware, values.model, values.quantization]);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'Arc B') {
+        next.quantization = 'bf16';
+        if (!ARC_B_MODELS.has(next.model)) {
+          next.model = '35b';
+        }
+      }
+      return next;
+    });
   };
 
   // Multi-node flag template — mirrors DeepSeek-V4 cookbook's multiNodeFlags.
@@ -297,6 +331,8 @@ export const Qwen35Deployment = () => {
   // config.generateCommand(values) for every valid combination.
   const generateCommand = () => {
     const { model, hardware, quantization, speculative, mambaCache } = values;
+    const isArcB = hardware === 'Arc B';
+    const speculativeEnabled = (!options.speculative.condition || options.speculative.condition(values)) && speculative === 'enabled';
 
     let hwConfig = modelConfigs[model]?.[hardware]?.[quantization];
     if (!hwConfig) {
@@ -308,11 +344,11 @@ export const Qwen35Deployment = () => {
 
     // 35B / 27B H100 BF16 with MTP: bump TP to 2 and skip --mem-fraction-static.
     // Spread the base spec so any future fields (multinode, ep, ...) survive.
-    if ((model === '35b' || model === '27b') && hardware === 'h100' && quantization === 'bf16' && speculative === 'enabled') {
+    if ((model === '35b' || model === '27b') && hardware === 'h100' && quantization === 'bf16' && speculativeEnabled) {
       hwConfig = { ...hwConfig, tp: 2, mem: undefined };
     }
     // 122B H100 FP8 with MTP: bump TP to 4 and skip --mem-fraction-static.
-    if (model === '122b' && hardware === 'h100' && quantization === 'fp8' && speculative === 'enabled') {
+    if (model === '122b' && hardware === 'h100' && quantization === 'fp8' && speculativeEnabled) {
       hwConfig = { ...hwConfig, tp: 4, mem: undefined };
     }
 
@@ -324,7 +360,7 @@ export const Qwen35Deployment = () => {
         : 'nvidia/Qwen3.5-397B-A17B-NVFP4';
     } else {
       const suffix = MODEL_SUFFIX[model];
-      const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
+      const quantSuffix = quantization === 'fp8' && !isArcB ? '-FP8' : '';
       modelName = `Qwen/Qwen3.5-${suffix}${quantSuffix}`;
     }
 
@@ -338,9 +374,15 @@ export const Qwen35Deployment = () => {
     let cmd = `sglang serve --model-path ${modelName}`;
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    } else if (isArcB) {
+        cmd = 'SGLANG_USE_SGL_XPU=1 ' + cmd;
+        cmd += ` \\\n  --device xpu`;
     }
-    if (tpValue > 1) {
+    if ((!isArcB && tpValue > 1) || isArcB) {
       cmd += ` \\\n  --tp ${tpValue}`;
+    }
+    if (isArcB && quantization === 'fp8') {
+        cmd += ` \\\n  --quantization fp8`;
     }
     if (epValue) {
       cmd += ` \\\n  --expert-parallel-size ${epValue}`;
@@ -359,13 +401,13 @@ export const Qwen35Deployment = () => {
     // Dense models with MTP off: force V1 — values.mambaCache is not
     // re-resolved on a speculative toggle (useEffect deps are hardware/model),
     // so it can stay at 'v2' from a prior MTP-on state. Reading it directly
-    // would emit a spurious --mamba-radix-cache-strategy extra_buffer. The UI
+    // would emit a spurious --mamba-scheduler-strategy extra_buffer. The UI
     // radio is hidden for dense models, so users can't manually correct it.
     // MoE keeps the old behavior — the UI radio is the recovery path there.
     const mamba_v1_dev = ['mi300x', 'mi325x', 'mi355x', 'xeon'];
     const actualMambaCache = mamba_v1_dev.includes(hardware)
       ? 'v1'
-      : (speculative === 'enabled' ? 'v2' : (MOE_MODELS.has(model) ? mambaCache : 'v1'));
+      : (isArcB ? 'v1' : (speculativeEnabled ? 'v2' : (MOE_MODELS.has(model) ? mambaCache : 'v1')));
 
     // Apply commandRules from options (reasoning, toolcall, speculative, mambaCache)
     // Skip quantization and model (handled via model name)
@@ -373,7 +415,7 @@ export const Qwen35Deployment = () => {
       reasoning: (value) => value === 'enabled' ? '--reasoning-parser qwen3' : null,
       toolcall: (value) => value === 'enabled' ? '--tool-call-parser qwen3_coder' : null,
       speculative: (value) => value === 'enabled' ? '--speculative-algorithm NEXTN \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4' : null,
-      mambaCache: (value) => value === 'v2' ? '--mamba-radix-cache-strategy extra_buffer' : null,
+      mambaCache: (value) => value === 'v2' ? '--mamba-scheduler-strategy extra_buffer' : null,
     };
 
     // Iterate options in order, applying commandRules
@@ -382,8 +424,8 @@ export const Qwen35Deployment = () => {
       // Skip options that don't pass their condition. mambaCache is special:
       // its condition gates only the UI radio (hidden for dense models), but
       // the rule still fires for dense models on NVIDIA + MTP to emit
-      // --mamba-radix-cache-strategy extra_buffer.
-      if (option.condition && !option.condition(values) && (key !== 'mambaCache' || speculative !== 'enabled')) continue;
+      // --mamba-scheduler-strategy extra_buffer.
+      if (option.condition && !option.condition(values) && (key !== 'mambaCache' || speculativeEnabled)) continue;
       const rule = commandRules[key];
       if (rule) {
         const adjustedValue = key === 'mambaCache' ? actualMambaCache : values[key];
@@ -400,7 +442,7 @@ export const Qwen35Deployment = () => {
     }
 
     // Chunked prefill tuning for H200 FP8 + MTP (validated on H200 only)
-    if (hardware === 'h200' && quantization === 'fp8' && speculative === 'enabled') {
+    if (hardware === 'h200' && quantization === 'fp8' && speculativeEnabled) {
       cmd += ` \\\n  --max-running-requests 128`;
       cmd += ` \\\n  --chunked-prefill-size 16384`;
       cmd += ` \\\n  --tokenizer-worker-num 6`;
@@ -410,7 +452,7 @@ export const Qwen35Deployment = () => {
     // benchmark only enables this for TP>=8). AMD MI GPUs use the AITER allreduce
     // fusion flag instead, handled in the AMD backend block below.
     const amdGpu = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
-    if (quantization !== 'fp4' && hardware !== 'xeon' && !amdGpu) {
+    if (quantization !== 'fp4' && hardware !== 'xeon' && !amdGpu && !isArcB) {
       cmd += ` \\\n  --enable-flashinfer-allreduce-fusion`;
     }
 
@@ -433,22 +475,12 @@ export const Qwen35Deployment = () => {
     // Append AMD GPU-specific backend configurations.
     // All AMD MI GPUs use the AITER unified-attention backend (pair with
     // SGLANG_USE_AITER=1 and SGLANG_USE_AITER_UNIFIED_ATTN=1; see cookbook prose),
-    // which requires --page-size 16. Multi-GPU runs enable AITER allreduce fusion,
-    // except the MXFP4 MI355X recipe, which uses ROCm INT8 quantized quick
-    // all-reduce (ROCM_QUICK_REDUCE_QUANTIZATION=INT8) instead.
+    // which requires --page-size 16. Enable AITER allreduce fusion for multi-GPU.
     if (amdGpu) {
-      const amdFp4 = quantization === 'fp4' && hardware === 'mi355x';
-      let amdEnv = "SGLANG_USE_AITER=1 \\\nSGLANG_USE_AITER_UNIFIED_ATTN=1 \\\nAITER_FLYDSL_FORCE=1 \\\n";
-      if (MOE_MODELS.has(model)) {
-        amdEnv += "SGLANG_MAMBA_SSM_DTYPE=bfloat16 \\\n";
-      }
-      if (amdFp4) {
-        amdEnv += "ROCM_QUICK_REDUCE_QUANTIZATION=INT8 \\\n";
-      }
-      cmd = amdEnv + cmd;
+      cmd = "SGLANG_USE_AITER=1 \\\nSGLANG_USE_AITER_UNIFIED_ATTN=1 \\\n" + cmd;
       cmd += " \\\n  --attention-backend aiter";
       cmd += " \\\n  --page-size 16";
-      if (hwConfig.tp > 1 && !amdFp4) {
+      if (hwConfig.tp > 1) {
         cmd += " \\\n  --enable-aiter-allreduce-fusion";
       }
     }
@@ -470,13 +502,11 @@ export const Qwen35Deployment = () => {
     // FP4-specific backend settings
     if (quantization === 'fp4') {
       if (hardware === 'mi355x') {
-        // AMD MXFP4 on MI355X: backend / --page-size 16 and the INT8 quantized
-        // ROCm quick all-reduce env are emitted by the AMD backend block above
-        // (this recipe uses quick all-reduce instead of AITER allreduce fusion).
-        // Add the FP4-specific flags here.
+        // AMD MXFP4 on MI355X: backend / --page-size 16 / AITER allreduce fusion
+        // are emitted by the AMD backend block above. Add the FP4-specific flags here.
         cmd += ' \\\n  --disable-radix-cache';
         // Cap concurrency under MTP to avoid OOM at tp=2.
-        if (speculative === 'enabled') {
+        if (speculativeEnabled) {
           cmd += ' \\\n  --max-running-requests 128';
         }
       } else {

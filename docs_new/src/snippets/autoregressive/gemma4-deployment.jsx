@@ -1,23 +1,41 @@
 export const Gemma4Deployment = () => {
+  const ARC_B_ALLOWED_MODELS = new Set(['31b', '26b-a4b']);
+
   const options = {
     modelSize: {
       name: 'modelSize',
       title: 'Model Variant',
-      items: [
-        { id: 'e2b', label: 'E2B (~2B)', default: false },
-        { id: 'e4b', label: 'E4B (~4B)', default: true },
-        { id: '12b', label: '12B (Dense)', default: false },
-        { id: '31b', label: '31B (Dense)', default: false },
-        { id: '26b-a4b', label: '26B-A4B (MoE)', default: false },
-      ]
+      getDynamicItems: (values) => {
+        const isArcB = values.hardware === 'Arc B';
+        const baseItems = [
+          { id: 'e2b', label: 'E2B (~2B)', default: false },
+          { id: 'e4b', label: 'E4B (~4B)', default: true },
+          { id: '12b', label: '12B (Dense)', default: false },
+          { id: '31b', label: '31B (Dense)', default: false },
+          { id: '26b-a4b', label: '26B-A4B (MoE)', default: false },
+        ];
+
+        if (!isArcB) {
+          return baseItems;
+        }
+
+        return baseItems.map((item) => ({
+          ...item,
+          disabled: !ARC_B_ALLOWED_MODELS.has(item.id),
+          default: item.id === '31b',
+        }));
+      }
     },
     checkpoint: {
       name: 'checkpoint',
       title: 'Checkpoint',
-      items: [
-        { id: 'standard', label: 'Standard', subtitle: 'BF16', default: true },
-        { id: 'qat', label: 'QAT', subtitle: 'q4_0-unquantized', default: false },
-      ]
+      getDynamicItems: (values) => {
+        const isArcB = values.hardware === 'Arc B';
+        return [
+          { id: 'standard', label: 'Standard', subtitle: 'BF16', default: true },
+          { id: 'qat', label: 'QAT', subtitle: 'q4_0-unquantized', default: false, disabled: isArcB },
+        ];
+      }
     },
     hardware: {
       name: 'hardware',
@@ -30,6 +48,7 @@ export const Gemma4Deployment = () => {
           { id: 'b200', label: 'B200', default: false },
           { id: 'b300', label: 'B300', default: false },
           { id: 'mi300x', label: 'MI300X', default: false, disabled: !showMI300X },
+          { id: 'Arc B', label: 'BMG', default: false },
         ];
       }
     },
@@ -54,7 +73,7 @@ export const Gemma4Deployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding (MTP)',
-      condition: (values) => !['mi300x'].includes(values.hardware),
+      condition: (values) => !['mi300x', 'Arc B'].includes(values.hardware),
       items: [
         { id: 'disabled', label: 'Disabled', subtitle: 'Baseline', default: true },
         { id: 'enabled', label: 'Enabled', subtitle: 'Lower Latency', default: false }
@@ -84,6 +103,13 @@ export const Gemma4Deployment = () => {
       '31b': { tp: 1, mem: 0.9 },
       '26b-a4b': { tp: 1, mem: 0.9 },
     },
+    'Arc B': {
+      e2b: { tp: 2, mem: 0.9},
+      e4b: { tp: 2, mem: 0.9},
+      '12b': { tp: 2, mem: 0.9},
+      '31b': { tp: 4, mem: 0.80},
+      '26b-a4b': { tp: 4, mem: 0.75},
+    },
     mi300x: {
       '31b': { tp: 1, mem: 0.80 },
       '26b-a4b': { tp: 1, mem: 0.80 },
@@ -111,12 +137,16 @@ export const Gemma4Deployment = () => {
     const qatSuffix = values.checkpoint === 'qat' ? '-qat-q4_0-unquantized' : '';
     const modelPath = `${modelNames[modelSize]}${qatSuffix}`;
 
-    const mtpEnabled = values.speculative === 'enabled';
+    const mtpEnabled = (!options.speculative.condition || options.speculative.condition(values)) && values.speculative === 'enabled';
     if (mtpEnabled && modelSize === '26b-a4b' && hardware !== 'mi300x') {
       tp = 2;
     }
 
     let cmd = `sglang serve --model-path ${modelPath}`;
+    if (hardware === 'Arc B') {
+      cmd = 'SGLANG_USE_SGL_XPU=1 ' + cmd;
+      cmd += ` \\\n  --device xpu`;
+    }
     if (tp > 1) {
       cmd += ` \\\n  --tp ${tp}`;
     }
@@ -205,7 +235,16 @@ export const Gemma4Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'Arc B' && !ARC_B_ALLOWED_MODELS.has(next.modelSize)) {
+        next.modelSize = '31b';
+      }
+      if (optionName === 'hardware' && value === 'Arc B') {
+        next.checkpoint = 'standard';
+      }
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {

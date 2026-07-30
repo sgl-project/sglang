@@ -8,7 +8,7 @@ export const Llama33Deployment = () => {
         { id: 'mi300x', label: 'MI300X', default: true },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
-        { id: 'xeon', label: 'XEON', default: false }
+        { id: 'Arc B', label: 'BMG', default: false }
       ]
     },
     quantization: {
@@ -29,22 +29,11 @@ export const Llama33Deployment = () => {
     }
   };
 
-  const getDisplayOptions = (values) => ({
-    ...options,
-    quantization: {
-      ...options.quantization,
-      items: options.quantization.items.map(item => ({
-        ...item,
-        disabled: values.hardware === 'xeon' && item.id === 'fp8'
-      }))
-    }
-  });
-
   // Initialize state
   const getInitialState = () => {
     const initialState = {};
     Object.entries(options).forEach(([key, option]) => {
-      const defaultItem = option.items.find(item => item.default);
+      const defaultItem = option.items.find((item) => item.default);
       initialState[key] = defaultItem ? defaultItem.id : option.items[0].id;
     });
     return initialState;
@@ -58,8 +47,8 @@ export const Llama33Deployment = () => {
     const checkDarkMode = () => {
       const html = document.documentElement;
       const isDarkMode = html.classList.contains('dark') ||
-                         html.getAttribute('data-theme') === 'dark' ||
-                         html.style.colorScheme === 'dark';
+        html.getAttribute('data-theme') === 'dark' ||
+        html.style.colorScheme === 'dark';
       setIsDark(isDarkMode);
     };
     checkDarkMode();
@@ -69,43 +58,41 @@ export const Llama33Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => {
-      const next = { ...prev, [optionName]: value };
-      if (optionName === 'hardware' && value === 'xeon') {
-        next.quantization = 'bf16';
+    setValues((prev) => {
+      if (optionName === 'hardware' && value === 'Arc B') {
+        return { ...prev, hardware: value, quantization: 'bf16' };
       }
-      return next;
+      return { ...prev, [optionName]: value };
     });
   };
 
   // Generate command
   const generateCommand = () => {
     const { hardware, quantization, toolcall } = values;
+    const isArcB = hardware === 'Arc B';
+    const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
 
     // Select model based on quantization
-    const modelPath = quantization === 'fp8' && hardware !== 'xeon'
+    const modelPath = quantization === 'fp8' && isAMD
       ? 'amd/Llama-3.3-70B-Instruct-FP8-KV'
       : 'meta-llama/Llama-3.3-70B-Instruct';
 
-    // Build command
     let cmd = 'python -m sglang.launch_server \\\n';
-    cmd += `  --model-path ${modelPath} \\\n`;
-    if (hardware === 'xeon') {
-      cmd += `  --device cpu \\\n`;
-      cmd += `  --disable-overlap-schedule \\\n`;
-      cmd += `  --tp 6`;
+    cmd += `  --model-path ${modelPath}`;
+
+    if (isArcB) {
+        cmd = 'SGLANG_USE_SGL_XPU=1 ' + cmd;
+        cmd += ' \\\n  --device xpu';
+        cmd += ' \\\n  --tp 8';
     } else {
-      cmd += `  --tp 1`;
+        cmd += ' \\\n  --tp 1';
     }
 
-    // Add tool calling parser
     if (toolcall === 'enabled') {
-      cmd += ' \\\n  --tool-call-parser llama3';
+        cmd += ' \\\n  --tool-call-parser llama3';
     }
 
-    cmd += ' \\\n  --host 0.0.0.0 \\\n';
-    cmd += '  --port 30000';
-
+    cmd += ' \\\n  --host 0.0.0.0 \\\n  --port 30000';
     return cmd;
   };
 
@@ -116,41 +103,27 @@ export const Llama33Deployment = () => {
   const itemsStyle = { display: 'flex', rowGap: '2px', columnGap: '6px', flexWrap: 'wrap', alignItems: 'center', flex: 1 };
   const labelBaseStyle = { padding: '4px 10px', border: `1px solid ${isDark ? '#9ca3af' : '#d1d5db'}`, borderRadius: '3px', cursor: 'pointer', display: 'inline-flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', fontWeight: '500', fontSize: '13px', transition: 'all 0.2s', userSelect: 'none', minWidth: '45px', textAlign: 'center', flex: 1, background: isDark ? '#374151' : '#fff', color: isDark ? '#e5e7eb' : 'inherit' };
   const checkedStyle = { background: '#D45D44', color: 'white', borderColor: '#D45D44' };
-  const disabledStyle = { cursor: 'not-allowed', opacity: 0.5 };
+  const disabledStyle = { cursor: 'not-allowed', opacity: 0.5, background: isDark ? '#1f2937' : '#f3f4f6', borderColor: isDark ? '#4b5563' : '#d1d5db' };
   const subtitleStyle = { display: 'block', fontSize: '9px', marginTop: '1px', lineHeight: '1.1', opacity: 0.7 };
   const commandDisplayStyle = { flex: 1, padding: '12px 16px', background: isDark ? '#111827' : '#f5f5f5', borderRadius: '6px', fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace", fontSize: '12px', lineHeight: '1.5', color: isDark ? '#e5e7eb' : '#374151', whiteSpace: 'pre-wrap', overflowX: 'auto', margin: 0, border: `1px solid ${isDark ? '#374151' : '#e5e7eb'}` };
 
   return (
     <div style={containerStyle} className="not-prose">
-      {Object.entries(getDisplayOptions(values)).map(([key, option]) => (
+      {Object.entries(options).map(([key, option]) => (
         <div key={key} style={cardStyle}>
           <div style={titleStyle}>{option.title}</div>
           <div style={itemsStyle}>
-            {option.type === 'checkbox' ? (
-              option.items.map(item => {
-                const isChecked = (values[option.name] || []).includes(item.id);
-                const isDisabled = item.required;
-                return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
-                    <input type="checkbox" checked={isChecked} disabled={isDisabled} onChange={(e) => handleCheckboxChange(option.name, item.id, e.target.checked)} style={{ display: 'none' }} />
-                    {item.label}
-                    {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
-                  </label>
-                );
-              })
-            ) : (
-              option.items.map(item => {
-                const isChecked = values[option.name] === item.id;
-                const isDisabled = Boolean(item.disabled);
-                return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
-                    <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={isDisabled} onChange={() => !isDisabled && handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
-                    {item.label}
-                    {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
-                  </label>
-                );
-              })
-            )}
+            {option.items.map((item) => {
+              const isChecked = values[option.name] === item.id;
+              const isDisabled = option.name === 'quantization' && values.hardware === 'Arc B' && item.id !== 'bf16';
+              return (
+                <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
+                  <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={isDisabled} onChange={() => handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
+                  {item.label}
+                  {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
+                </label>
+              );
+            })}
           </div>
         </div>
       ))}

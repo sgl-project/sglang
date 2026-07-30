@@ -8,27 +8,33 @@ export const Nemotron3NanoDeployment = () => {
       items: [
         { id: 'h200', label: 'H200', default: false },
         { id: 'b200', label: 'B200', default: true },
-        { id: 'b300', label: 'B300', default: false }
+        { id: 'b300', label: 'B300', default: false },
+        { id: 'Arc B', label: 'BMG', default: false }
       ]
     },
     modelVariant: {
       name: 'modelVariant',
       title: 'Model Variant',
-      items: [
-        { id: 'bf16', label: 'BF16', default: true },
-        { id: 'fp8', label: 'FP8', default: false },
-        { id: 'nvfp4', label: 'NVFP4', default: false }
-      ]
+      getDynamicItems: (values) => {
+        const isArcB = values.hardware === 'Arc B';
+        return [
+          { id: 'bf16', label: 'BF16', default: true },
+          { id: 'fp8', label: 'FP8', default: false, disabled: isArcB },
+          { id: 'nvfp4', label: 'NVFP4', default: false, disabled: isArcB }
+        ];
+      }
     },
     tp: {
       name: 'tp',
       title: 'Tensor Parallel (TP)',
-      items: [
-        { id: '1', label: 'TP=1', default: true },
-        { id: '2', label: 'TP=2', default: false },
-        { id: '4', label: 'TP=4', default: false },
-        { id: '8', label: 'TP=8', default: false }
-      ]
+      getDynamicItems: (values) => values.hardware === 'Arc B'
+        ? [{ id: '4', label: 'TP=4', default: true }]
+        : [
+            { id: '1', label: 'TP=1', default: true },
+            { id: '2', label: 'TP=2', default: false },
+            { id: '4', label: 'TP=4', default: false },
+            { id: '8', label: 'TP=8', default: false }
+          ]
     },
     kvcache: {
       name: 'kvcache',
@@ -58,39 +64,37 @@ export const Nemotron3NanoDeployment = () => {
     }
   };
 
+  const resolveItems = (option, values) =>
+    typeof option.getDynamicItems === 'function' ? option.getDynamicItems(values) : option.items;
+
   const generateCommand = (values) => {
-    const { hardware, modelVariant, tp, kvcache, thinking, toolcall } = values;
+    const { hardware, modelVariant, tp, kvcache } = values;
+    const isArcB = hardware === 'Arc B';
 
     // Default to FP8 if not selected
     const variant = modelVariant || 'fp8';
     const baseName = 'NVIDIA-Nemotron-3-Nano-30B-A3B';
-
     const modelName = `${modelFamily}/${baseName}-${variant.toUpperCase()}`;
 
     let cmd = 'python3 -m sglang.launch_server \\\n';
-    cmd += `  --model-path ${modelName} \\\n`;
-    cmd += `  --trust-remote-code \\\n`;
-    cmd += `  --tp ${tp} \\\n`;
-    cmd += `  --kv-cache-dtype ${kvcache} \\\n`;
+    cmd += `  --model-path ${modelName}`;
+    if (isArcB) {
+      cmd = 'SGLANG_USE_SGL_XPU=1 ' + cmd;
+      cmd += ' \\\n  --device xpu';
+    }
+    cmd += ` \\\n  --tp ${tp}`;
+    cmd += ` \\\n  --kv-cache-dtype ${kvcache}`;
     if (hardware === 'b300') {
-      cmd += `  --attention-backend flashinfer \\\n`;
+      cmd += ' \\\n  --attention-backend flashinfer';
     }
 
-    // Add thinking parser and tool call parser if enabled
-    for (const [key, option] of Object.entries(options)) {
-      if (option.commandRule) {
-        const rule = option.commandRule(values[key]);
-        if (rule) {
-          cmd += `  ${rule}  \\\n`;
-        }
+    Object.entries(options).forEach(([key, option]) => {
+      if (!option.commandRule) return;
+      const rule = option.commandRule(values[key]);
+      if (rule) {
+        cmd += ` \\\n  ${rule}`;
       }
-    }
-
-    // Remove trailing backslash from last option
-    cmd = cmd.trimEnd();
-    if (cmd.endsWith('\\')) {
-      cmd = cmd.slice(0, -1).trimEnd();
-    }
+    });
 
     return cmd;
   };
@@ -98,35 +102,9 @@ export const Nemotron3NanoDeployment = () => {
   const getInitialState = () => {
     const initialState = {};
     Object.entries(options).forEach(([key, option]) => {
-      if (option.type === 'checkbox') {
-        initialState[key] = (option.items || [])
-          .filter((item) => item.default)
-          .map((item) => item.id);
-        return;
-      }
-      if (option.type === 'text') {
-        initialState[key] = option.default || '';
-        return;
-      }
-      let items = option.items || [];
-      if (option.getDynamicItems) {
-        const defaultValues = {};
-        Object.entries(options).forEach(([innerKey, innerOption]) => {
-          if (innerOption.type === 'checkbox') {
-            defaultValues[innerKey] = (innerOption.items || [])
-              .filter((item) => item.default)
-              .map((item) => item.id);
-          } else if (innerOption.type === 'text') {
-            defaultValues[innerKey] = innerOption.default || '';
-          } else if (innerOption.items && innerOption.items.length > 0) {
-            const defaultItem = innerOption.items.find((item) => item.default);
-            defaultValues[innerKey] = defaultItem ? defaultItem.id : innerOption.items[0].id;
-          }
-        });
-        items = option.getDynamicItems(defaultValues);
-      }
-      const defaultItem = items && items.find((item) => item.default);
-      initialState[key] = defaultItem ? defaultItem.id : items && items[0] ? items[0].id : '';
+      const items = resolveItems(option, initialState) || [];
+      const defaultItem = items.find((item) => item.default && !item.disabled) || items.find((item) => !item.disabled);
+      initialState[key] = defaultItem ? defaultItem.id : items[0]?.id || '';
     });
     return initialState;
   };
@@ -152,25 +130,32 @@ export const Nemotron3NanoDeployment = () => {
     return () => observer.disconnect();
   }, []);
 
-  const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
-  };
-
-  const handleCheckboxChange = (optionName, itemId, isChecked) => {
+  useEffect(() => {
     setValues((prev) => {
-      const currentValues = prev[optionName] || [];
-      if (isChecked) {
-        return { ...prev, [optionName]: [...currentValues, itemId] };
-      }
-      return {
-        ...prev,
-        [optionName]: currentValues.filter((id) => id !== itemId),
-      };
+      const next = { ...prev };
+      Object.entries(options).forEach(([key, option]) => {
+        if (typeof option.getDynamicItems !== 'function') return;
+        const items = option.getDynamicItems(next);
+        const current = items.find((item) => item.id === next[key]);
+        if (!current || current.disabled) {
+          const fallback = items.find((item) => item.default && !item.disabled) || items.find((item) => !item.disabled);
+          if (fallback) {
+            next[key] = fallback.id;
+          }
+        }
+      });
+      return next;
     });
-  };
+  }, [values.hardware]);
 
-  const handleTextChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+  const handleRadioChange = (optionName, value) => {
+    setValues((prev) => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'Arc B') {
+        next.modelVariant = 'bf16';
+      }
+      return next;
+    });
   };
 
   const command = generateCommand(values);
@@ -242,15 +227,6 @@ export const Nemotron3NanoDeployment = () => {
     lineHeight: '1.1',
     opacity: 0.7,
   };
-  const textInputStyle = {
-    flex: 1,
-    padding: '8px 10px',
-    borderRadius: '4px',
-    border: `1px solid ${isDark ? '#4b5563' : '#d1d5db'}`,
-    background: isDark ? '#111827' : '#fff',
-    color: isDark ? '#e5e7eb' : '#111827',
-    fontSize: '13px',
-  };
   const commandDisplayStyle = {
     flex: 1,
     padding: '12px 16px',
@@ -269,99 +245,47 @@ export const Nemotron3NanoDeployment = () => {
   return (
     <div style={containerStyle} className="not-prose">
       {Object.entries(options).map(([key, option]) => {
-        if (option.condition && !option.condition(values)) {
-          return null;
-        }
-        const items = option.getDynamicItems ? option.getDynamicItems(values) : option.items || [];
+        const items = resolveItems(option, values) || [];
         return (
           <div key={key} style={cardStyle}>
             <div style={titleStyle}>{option.title}</div>
             <div style={itemsStyle}>
-              {option.type === 'text' ? (
-                <input
-                  type="text"
-                  value={values[option.name] || ''}
-                  placeholder={option.placeholder || ''}
-                  onChange={(event) => handleTextChange(option.name, event.target.value)}
-                  style={textInputStyle}
-                />
-              ) : option.type === 'checkbox' ? (
-                (option.items || []).map((item) => {
-                  const isChecked = (values[option.name] || []).includes(item.id);
-                  const isDisabled =
-                    item.required ||
-                    (typeof item.disabledWhen === 'function' && item.disabledWhen(values));
-                  return (
-                    <label
-                      key={item.id}
-                      title={item.disabledReason || ''}
-                      style={{
-                        ...labelBaseStyle,
-                        ...(isChecked ? checkedStyle : {}),
-                        ...(isDisabled ? disabledStyle : {}),
-                      }}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={isChecked}
-                        disabled={isDisabled}
-                        onChange={(event) =>
-                          handleCheckboxChange(option.name, item.id, event.target.checked)
-                        }
-                        style={{ display: 'none' }}
-                      />
-                      {item.label}
-                      {item.subtitle && (
-                        <small
-                          style={{
-                            ...subtitleStyle,
-                            color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit',
-                          }}
-                        >
-                          {item.subtitle}
-                        </small>
-                      )}
-                    </label>
-                  );
-                })
-              ) : (
-                items.map((item) => {
-                  const isChecked = values[option.name] === item.id;
-                  const isDisabled = Boolean(item.disabled);
-                  return (
-                    <label
-                      key={item.id}
-                      title={item.disabledReason || ''}
-                      style={{
-                        ...labelBaseStyle,
-                        ...(isChecked ? checkedStyle : {}),
-                        ...(isDisabled ? disabledStyle : {}),
-                      }}
-                    >
-                      <input
-                        type="radio"
-                        name={option.name}
-                        value={item.id}
-                        checked={isChecked}
-                        disabled={isDisabled}
-                        onChange={() => !isDisabled && handleRadioChange(option.name, item.id)}
-                        style={{ display: 'none' }}
-                      />
-                      {item.label}
-                      {item.subtitle && (
-                        <small
-                          style={{
-                            ...subtitleStyle,
-                            color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit',
-                          }}
-                        >
-                          {item.subtitle}
-                        </small>
-                      )}
-                    </label>
-                  );
-                })
-              )}
+              {items.map((item) => {
+                const isChecked = values[option.name] === item.id;
+                const isDisabled = Boolean(item.disabled);
+                return (
+                  <label
+                    key={item.id}
+                    title={item.disabledReason || ''}
+                    style={{
+                      ...labelBaseStyle,
+                      ...(isChecked ? checkedStyle : {}),
+                      ...(isDisabled ? disabledStyle : {}),
+                    }}
+                  >
+                    <input
+                      type="radio"
+                      name={option.name}
+                      value={item.id}
+                      checked={isChecked}
+                      disabled={isDisabled}
+                      onChange={() => !isDisabled && handleRadioChange(option.name, item.id)}
+                      style={{ display: 'none' }}
+                    />
+                    {item.label}
+                    {item.subtitle && (
+                      <small
+                        style={{
+                          ...subtitleStyle,
+                          color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit',
+                        }}
+                      >
+                        {item.subtitle}
+                      </small>
+                    )}
+                  </label>
+                );
+              })}
             </div>
           </div>
         );
