@@ -43,6 +43,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
+    SanaVideoPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
 )
@@ -72,6 +75,7 @@ __all__ = [
     "Flux2FinetunedPipelineConfig",
     "PipelineConfig",
     "SanaPipelineConfig",
+    "SanaVideoPipelineConfig",
     "SlidingTileAttnConfig",
     "MOVAPipelineConfig",
     "Pi05PipelineConfig",
