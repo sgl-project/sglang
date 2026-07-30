@@ -249,6 +249,9 @@ class CommonKVManager(BaseKVManager):
             self.max_failures = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
             )
+            # Latch so _start_heartbeat_checker_thread spawns at most one
+            # thread per manager regardless of how often it is called.
+            self._heartbeat_checker_started = False
             # If a timeout happens on the decode side, it means decode instances
             # fail to receive the KV Cache transfer done signal after bootstrapping.
             # These timeout requests should be aborted to release the tree cache.
@@ -904,50 +907,68 @@ class CommonKVManager(BaseKVManager):
         return src_kv_ptrs, sliced_dst
 
     def _start_heartbeat_checker_thread(self):
-        """Start the heartbeat checker thread for Decode worker."""
+        """Start the heartbeat checker thread for Decode worker (at most once).
 
-        def heartbeat_checker():
-            while True:
-                time.sleep(self.heartbeat_interval)
-                with self.connection_lock:
-                    addresses = list(self.prefill_info_table.keys())
+        Runs as a daemon. Wraps the whole per-tick body in a try/except
+        so a bug in ``_handle_node_failure`` or an unexpected exception
+        outside the existing inner request try/except cannot kill the
+        thread and silently stop health monitoring.
 
-                for bootstrap_addr in addresses:
-                    session = None
-                    try:
-                        with self.session_pool_lock:
-                            session = self.session_pool[bootstrap_addr]
-                        response = session.get(
-                            f"http://{bootstrap_addr}/health",
-                            timeout=(2, 3),
-                            headers={"Connection": "keep-alive"},
-                        )
-                        if response.status_code == 200:
-                            self.heartbeat_failures[bootstrap_addr] = 0
-                            self._on_heartbeat_success(bootstrap_addr)
-                        else:
-                            logger.info(
-                                f"Attempting to reconnect to {bootstrap_addr}..."
-                            )
-                            self.heartbeat_failures[bootstrap_addr] = (
-                                self.heartbeat_failures.get(bootstrap_addr, 0) + 1
-                            )
-                    except Exception:
-                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
-                        self.heartbeat_failures[bootstrap_addr] = (
-                            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
-                        )
+        Idempotent by design: this must run once per manager (from
+        ``start_decode_thread``), never from a per-message path. We have
+        measured the failure mode of a misplaced call site (invoked once
+        per KV-status message in a downstream build): decode schedulers
+        accumulated 600-1,600 immortal HTTP-probing threads under abort
+        waves, CPU/GIL starvation stretched ~20 ms decode steps to
+        seconds, and liveness probes killed the pods. The latch makes
+        that class of regression structurally impossible.
+        """
+        if self._heartbeat_checker_started:
+            return
+        self._heartbeat_checker_started = True
+        threading.Thread(target=self._run_heartbeat_checker_loop, daemon=True).start()
 
-                    if (
-                        self.heartbeat_failures.get(bootstrap_addr, 0)
-                        >= self.max_failures
-                    ):
-                        self._handle_node_failure(bootstrap_addr)
-                        with self.session_pool_lock:
-                            if bootstrap_addr in self.session_pool:
-                                del self.session_pool[bootstrap_addr]
+    def _run_heartbeat_checker_loop(self):
+        while True:
+            time.sleep(self.heartbeat_interval)
+            try:
+                self._run_one_heartbeat_pass()
+            except Exception:
+                logger.exception(
+                    "heartbeat_checker outer loop caught unexpected exception; "
+                    "continuing next tick"
+                )
 
-        threading.Thread(target=heartbeat_checker, daemon=True).start()
+    def _run_one_heartbeat_pass(self):
+        with self.connection_lock:
+            addresses = list(self.prefill_info_table.keys())
+
+        for bootstrap_addr in addresses:
+            self._probe_bootstrap_addr(bootstrap_addr)
+            if self.heartbeat_failures.get(bootstrap_addr, 0) >= self.max_failures:
+                self._handle_node_failure(bootstrap_addr)
+                with self.session_pool_lock:
+                    self.session_pool.pop(bootstrap_addr, None)
+
+    def _probe_bootstrap_addr(self, bootstrap_addr: str):
+        try:
+            with self.session_pool_lock:
+                session = self.session_pool[bootstrap_addr]
+            response = session.get(
+                f"http://{bootstrap_addr}/health",
+                timeout=(2, 3),
+                headers={"Connection": "keep-alive"},
+            )
+            if response.status_code == 200:
+                self.heartbeat_failures[bootstrap_addr] = 0
+                self._on_heartbeat_success(bootstrap_addr)
+                return
+            logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+        except Exception:
+            logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+        self.heartbeat_failures[bootstrap_addr] = (
+            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+        )
 
     def _on_heartbeat_success(self, bootstrap_addr: str):
         """Hook called on successful heartbeat. Override for backend-specific cleanup."""
