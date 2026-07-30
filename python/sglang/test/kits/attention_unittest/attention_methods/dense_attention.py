@@ -295,6 +295,9 @@ class TinyModelConfig:
         assert self.num_attention_heads % tp_size == 0
         return self.num_attention_heads // tp_size
 
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
     def get_num_kv_heads(self, tp_size: int) -> int:
         assert self.num_key_value_heads % tp_size == 0
         return self.num_key_value_heads // tp_size
