@@ -25,6 +25,7 @@ from typing import Any, List, Optional, Set, Union
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
@@ -293,6 +294,11 @@ class ModelConfig:
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
+        self.embedding_model_spec = resolve_embedding_model_spec(
+            self.hf_config.architectures,
+            is_embedding_requested=bool(is_embedding),
+            is_embedding_gemma=self.is_embedding_gemma,
+        )
 
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
@@ -1086,6 +1092,14 @@ class ModelConfig:
         # For non-grouped-query attention models, the number of KV heads is
         # equal to the number of attention heads.
         return self.hf_text_config.num_attention_heads
+
+    def get_max_num_attention_heads(self) -> int:
+        """Max per-layer query head count; num_attention_heads unless the
+        model sets num_attention_heads_per_layer."""
+        per_layer = getattr(self.hf_text_config, "num_attention_heads_per_layer", None)
+        if per_layer:
+            return max(per_layer)
+        return self.num_attention_heads
 
     def get_num_kv_heads(self, tensor_parallel_size) -> int:
         """Returns the number of KV heads per GPU."""

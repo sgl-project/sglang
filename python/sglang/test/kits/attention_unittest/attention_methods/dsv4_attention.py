@@ -287,6 +287,9 @@ class TinyDSV4ModelConfig:
         self.hf_text_config = self.hf_config
         self.linear_attn_registry_result = None
 
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
 
 class MockDSV4ModelRunner:
     """Minimal runner exposing what `DeepseekV4AttnBackend.__init__` reads.

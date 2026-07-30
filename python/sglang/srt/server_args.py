@@ -41,6 +41,7 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
+from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
@@ -3626,7 +3627,33 @@ class ServerArgs:
         # whose values depend on later prompt tokens, so both are invalid.
         # Breakable CUDA Graph captures one complete prefill and is the graph
         # mode validated for this encoder-style attention.
-        if getattr(model_config, "is_embedding_gemma", False):
+        # Native encoder architectures declare a pooling-only task and do not
+        # need the legacy --is-embedding intent flag. Decoder checkpoints still
+        # require that explicit opt-in because their architecture alone does
+        # not distinguish embedding from generation serving.
+        #
+        # ``_handle_model_capability_adjustments`` is also exercised directly
+        # by a few focused tests that use a small ModelConfig stand-in. Keep
+        # the old predicate as a compatibility fallback while production
+        # ModelConfig instances use the central capability contract.
+        embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
+        if (
+            embedding_model_spec is not None
+            and embedding_model_spec.auto_enable_embedding
+            and not self.is_embedding
+        ):
+            self.is_embedding = True
+            logger.info(
+                "Embedding architecture detected: enabling embedding mode automatically."
+            )
+
+        is_embedding_gemma = (
+            embedding_model_spec is not None
+            and embedding_model_spec.bcg_prefill_policy == BCGPrefillPolicy.FULL_ENCODER
+        )
+        if embedding_model_spec is None:
+            is_embedding_gemma = getattr(model_config, "is_embedding_gemma", False)
+        if is_embedding_gemma:
             # This is an encoder-only model even though its HF architecture is
             # named Gemma3TextModel. Marking it as embedding mode enables the
             # FlashAttention raw-K/V fast path, which does not write or read
@@ -6184,15 +6211,26 @@ class ServerArgs:
 
     def _handle_context_parallelism(self):
         if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
+            from sglang.srt.configs.model_config import is_deepseek_dsa
             from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
 
             model_config = self.get_model_config()
-            model_arch = model_config.hf_config.architectures[0]
-            if (
-                model_arch in CP_V2_DEFAULT_MODEL_CLASSES
-                and not envs.SGLANG_ENABLE_CP_V2.is_set()
-            ):
-                envs.SGLANG_ENABLE_CP_V2.set(True)
+            hf_config = model_config.hf_config
+            model_arch = hf_config.architectures[0]
+            if model_arch in CP_V2_DEFAULT_MODEL_CLASSES:
+                if getattr(hf_config, "index_share_for_mtp_iteration", False):
+                    # GLM 5.2 (DSA index-share MTP): CP-v2 is not ready for it
+                    # yet, so default the env to off and keep the legacy CP path.
+                    if not envs.SGLANG_ENABLE_CP_V2.is_set():
+                        envs.SGLANG_ENABLE_CP_V2.set(False)
+                else:
+                    is_dsa_default_model = is_deepseek_dsa(hf_config)
+                    # DSA CP-v2 currently supports only the interleave strategy.
+                    enable_default_cp_v2 = not is_dsa_default_model or (
+                        self.enable_prefill_cp and self.cp_strategy == "interleave"
+                    )
+                    if enable_default_cp_v2 and not envs.SGLANG_ENABLE_CP_V2.is_set():
+                        envs.SGLANG_ENABLE_CP_V2.set(True)
 
             if (
                 self.enable_prefill_cp
