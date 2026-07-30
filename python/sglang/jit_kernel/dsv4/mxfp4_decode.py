@@ -1,35 +1,78 @@
-"""Fused MXFP4 decode attention for DeepSeek V4 — Python entry point."""
+"""Fused MXFP4 decode attention for DeepSeek V4 — PyTorch custom op.
+
+Uses a standalone CUDA kernel (no sgl-kernel / TVM-FFI deps) registered
+via TORCH_LIBRARY so the kernel launch is fully CUDA-graph capturable.
+"""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+import hashlib
+import pathlib
+import shutil
+from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.utils import (
-    cache_once,
-    load_jit,
-    make_cpp_args,
+# ---------------------------------------------------------------------------
+# JIT compile + cache
+# ---------------------------------------------------------------------------
+
+_KERNEL_SRC_PATH = (
+    pathlib.Path(__file__).parent.parent
+    / "csrc"
+    / "deepseek_v4"
+    / "mxfp4_decode_standalone.cu"
 )
-
-from .utils import make_name
-
-if TYPE_CHECKING:
-    from tvm_ffi.module import Module
+_CACHE_DIR = pathlib.Path.home() / ".cache" / "sglang_jit" / "mxfp4_decode"
 
 
-@cache_once
-def _jit_mxfp4_decode_module() -> Module:
-    # NOTE: PDL (Programmatic Dependent Launch) disabled for CUDA graph compat.
-    args = make_cpp_args(False)
-    return load_jit(
-        make_name("mxfp4_decode"),
-        *args,
-        cuda_files=["deepseek_v4/mxfp4_decode.cuh"],
-        cuda_wrappers=[
-            ("forward", f"Mxfp4DecodeKernel<{args}>::forward"),
-        ],
+def _source_hash() -> str:
+    digest = hashlib.sha256()
+    digest.update(_KERNEL_SRC_PATH.read_bytes())
+    return digest.hexdigest()[:16]
+
+
+def _ensure_compiled() -> None:
+    """Compile the standalone CUDA op if not already cached."""
+    src_hash = _source_hash()
+    build_dir = _CACHE_DIR / src_hash
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+    marker = build_dir / ".build_done"
+    so_candidates = list(build_dir.glob("*.so"))
+    if marker.exists() and so_candidates:
+        torch.classes.load_library(str(so_candidates[0]))
+        return
+
+    # Copy kernel source into build dir and create a minimal cpp stub.
+    kernel_dst = build_dir / "mxfp4_decode.cu"
+    shutil.copy2(_KERNEL_SRC_PATH, kernel_dst)
+    cpp_stub = build_dir / "stub.cpp"
+    cpp_stub.write_text("// stub — all code is in the .cu file\n")
+
+    import torch.utils.cpp_extension as ext
+
+    ext.load(
+        name="sglang_mxfp4_decode",
+        sources=[str(cpp_stub), str(kernel_dst)],
+        build_directory=str(build_dir),
+        verbose=False,
+        is_python_module=False,
     )
+    marker.touch()
+
+    so_files = list(build_dir.glob("*.so"))
+    if so_files:
+        torch.classes.load_library(str(so_files[0]))
+
+
+# Eagerly compile on import (one-time cost, cached thereafter).
+_ensure_compiled()
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def mxfp4_decode_attention(
@@ -41,15 +84,15 @@ def mxfp4_decode_attention(
     num_valid: int = 0,
     attn_sink: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Fused MXFP4 decode attention.
+    """Fused MXFP4 decode attention — CUDA-graph safe.
 
     Args:
         q:            [N, 512] BF16 — flattened Q (batch * num_heads).
         k_cache:      [*, 368] uint8 — row-major MXFP4 K-cache.
-        page_indices: [N] int32 — page numbers per query.
+        page_indices: [N] int32 — kernel-page indices per query.
         sm_scale:     float — 1/sqrt(head_dim).
-        page_size:    int — tokens per page (128 for DSV4 SWA).
-        num_valid:    int — actual valid tokens (0 = scan all page_size tokens).
+        page_size:    int — tokens per kernel page (128 for DSV4 SWA).
+        num_valid:    int — actual valid tokens (0 = scan all page_size).
         attn_sink:    [N] float32 or None — per-head sink values.
 
     Returns:
@@ -72,8 +115,7 @@ def mxfp4_decode_attention(
 
     o = torch.empty_like(q)
 
-    module = _jit_mxfp4_decode_module()
-    module.forward(
+    torch.ops.sglang_mxfp4.decode(
         q,
         k_cache,
         page_indices,
