@@ -132,12 +132,12 @@ sgl-eval run aime25 \\
     "vl-450m": { mmmu_pct: 30.56 },
   },
 
-  // LFM2.5 support (model classes + the `lfm2` tool-call parser) ships in the
-  // SGLang dev image; not yet in a tagged release.
+  // LFM2.5 support (model classes + the `lfm2` tool-call parser) shipped in
+  // v0.5.15, so lmsysorg/sglang:latest (cu13) carries it.
   dockerImages: {
-    h100: "lmsysorg/sglang:dev-cu13",
-    h200: "lmsysorg/sglang:dev-cu13",
-    b200: "lmsysorg/sglang:dev-cu13",
+    h100: "lmsysorg/sglang:latest",
+    h200: "lmsysorg/sglang:latest",
+    b200: "lmsysorg/sglang:latest",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".

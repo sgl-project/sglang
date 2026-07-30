@@ -35,7 +35,7 @@ Then run the **Python** output of the command panel below in that environment.
 LFM2.5 support ships in the pinned SGLang dev image:
 
 ```bash Command
-docker pull lmsysorg/sglang:dev-cu13
+docker pull lmsysorg/sglang:latest
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). A minimal example (substitute the inner `sglang serve ...` with whatever the command generator below produces):
@@ -47,7 +47,7 @@ docker run --gpus all \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
     --ipc=host \
-    lmsysorg/sglang:dev-cu13 \
+    lmsysorg/sglang:latest \
     sglang serve <use args below>
 ```
 
