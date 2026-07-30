@@ -385,7 +385,8 @@ def make_local_breakable_eligible_fn(
     def local_breakable_eligible(batch: ScheduleBatch) -> bool:
         if not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
             return True
-        return not tp_worker.model_runner.prefill_cuda_graph_runner.replay_ineligible_locally(
+        runner = tp_worker.model_runner.prefill_cuda_graph_runner
+        return not runner.replay_ineligible_locally(
             batch_size=batch.batch_size(),
             num_tokens=batch.extend_num_tokens,
             input_embeds=batch.input_embeds,
@@ -394,6 +395,7 @@ def make_local_breakable_eligible_fn(
             is_target_verify=batch.forward_mode.is_target_verify(),
             capture_hidden_mode=None,
             return_logprob=batch.return_logprob,
+            lora_ineligible=runner.enable_lora,
         )
 
     return local_breakable_eligible
