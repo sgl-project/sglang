@@ -28,7 +28,7 @@ use sgl_kv_indexer::pb::kv_indexer_client::KvIndexerClient;
 use sgl_kv_indexer::pb::kv_indexer_server::KvIndexerServer;
 use sgl_kv_indexer::pb::{
     ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType,
-    GetExternalKvHitCountsRequest, MatchExternalKvRequest,
+    GetExternalKvHitCountsRequest, MatchExternalKvPrefixRequest, MatchExternalKvRequest,
 };
 use sgl_kv_indexer::{KvIndexerService, RedisKvIndexerBackend};
 use test_id::nanos;
@@ -454,4 +454,39 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
         Code::InvalidArgument,
         "bad tier -> InvalidArgument"
     );
+}
+
+#[tokio::test]
+async fn match_prefix_over_grpc() {
+    let Some(mut c) = start("match_prefix").await else {
+        return;
+    };
+    let (w_long, w_short) = (format!("long-{}", nanos()), format!("short-{}", nanos()));
+    let (a, b, d) = ("mp-a", "mp-b", "mp-c");
+
+    c.apply_external_kv_batch(apply_report(&w_long, "10.0.0.1:9000", 1, hbm(), &[a, b, d]))
+        .await
+        .expect("apply long");
+    c.apply_external_kv_batch(apply_report(&w_short, "10.0.0.2:9000", 1, hbm(), &[a]))
+        .await
+        .expect("apply short");
+
+    let resp = c
+        .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+            hashes: vec![a.into(), b.into(), d.into()],
+            max_blocks: 0,
+        })
+        .await
+        .expect("prefix ok")
+        .into_inner();
+
+    assert_eq!(resp.best_prefix_blocks, 3);
+    assert_eq!(resp.blocks_read, 3);
+    // Descending by prefix length: long (3) before short (1).
+    assert_eq!(resp.matches.len(), 2);
+    assert_eq!(resp.matches[0].worker_id, w_long);
+    assert_eq!(resp.matches[0].matched_prefix_blocks, 3);
+    assert_eq!(resp.matches[0].worker_address, "10.0.0.1:9000");
+    assert_eq!(resp.matches[1].worker_id, w_short);
+    assert_eq!(resp.matches[1].matched_prefix_blocks, 1);
 }

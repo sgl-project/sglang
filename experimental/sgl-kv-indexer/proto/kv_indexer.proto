@@ -78,6 +78,47 @@ message MatchExternalKvResponse {
   repeated ExternalKvNodeMatch matches = 1;
 }
 
+message MatchExternalKvPrefixRequest {
+  // Block hashes in prompt order. hashes[0] MUST be the request's first block:
+  // prefix matching starts there and stops at the first block a worker is
+  // missing, so a misordered list silently truncates every match.
+  repeated string hashes = 1;
+
+  // Caller-supplied ceiling on how many leading blocks to consider, so the
+  // caller bounds its own query cost. 0 means "no caller ceiling"; the server
+  // still bounds the scan with its own limit.
+  uint32 max_blocks = 2;
+}
+
+message ExternalKvPrefixMatch {
+  // The worker's router-facing routing identity, NOT its KV-transfer address.
+  // The router intersects this byte-for-byte with the worker URLs it registered,
+  // so a mismatch makes the intersection always empty and silently disables
+  // cache-aware routing. Workers with an empty address are unroutable and are
+  // excluded from this response entirely.
+  string worker_address = 1;
+
+  // Largest n such that this worker holds hashes[0..n) contiguously.
+  uint32 matched_prefix_blocks = 2;
+
+  // Opaque worker id, carried for the caller's logs only; not a routing key.
+  string worker_id = 3;
+}
+
+message MatchExternalKvPrefixResponse {
+  // Matches sorted by matched_prefix_blocks, descending.
+  repeated ExternalKvPrefixMatch matches = 1;
+
+  // The longest contiguous prefix held by any single worker (0 when no match).
+  uint32 best_prefix_blocks = 2;
+
+  // How many blocks the server actually read placement for. Lets early
+  // termination and truncation be observed; it is NOT part of the prefix
+  // semantics, so different backends may report different values for the same
+  // matches.
+  uint32 blocks_read = 3;
+}
+
 message HitCountEntry {
   string hash = 1;
   uint64 hit_count_total = 2;
@@ -96,5 +137,12 @@ service KVIndexer {
   rpc ApplyExternalKvBatch(ApplyExternalKvBatchRequest) returns (ApplyExternalKvBatchResponse);
 
   rpc MatchExternalKv(MatchExternalKvRequest) returns (MatchExternalKvResponse);
+
+  // Answers, per worker, how long a contiguous prefix of the request it holds.
+  // The indexer deliberately does not pick a worker: it cannot see the router's
+  // health checks, circuit breakers, PD-pool split or in-flight load, so the
+  // final choice stays with the router.
+  rpc MatchExternalKvPrefix(MatchExternalKvPrefixRequest) returns (MatchExternalKvPrefixResponse);
+
   rpc GetExternalKvHitCounts(GetExternalKvHitCountsRequest) returns (GetExternalKvHitCountsResponse);
 }

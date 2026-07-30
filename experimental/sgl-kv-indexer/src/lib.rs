@@ -6,6 +6,7 @@
 //! and answers placement-match queries for KV-aware routing.
 
 pub mod bridge;
+pub mod client;
 
 pub mod pb {
     tonic::include_proto!("kv_indexer.v1");
@@ -17,6 +18,9 @@ mod shutdown;
 #[cfg(feature = "redis-backend")]
 pub mod redis_backend;
 
+pub use client::{
+    GrpcPrefixIndex, NoSignalReason, PrefixIndex, PrefixIndexConfig, PrefixMatch, PrefixOutcome,
+};
 pub use service::{KvIndexerBackend, KvIndexerService};
 pub use shutdown::shutdown_signal;
 
