@@ -61,6 +61,50 @@ class TestAsymmetricMHAPoolRowDims(unittest.TestCase):
         pool = _build_pool(128, 128)
         self.assertEqual(pool.v_row_dim, pool.row_dim)
 
+    def test_swa_dims_override_row_dims(self):
+        # A hybrid sliding-window model builds a second pool through the swa_*
+        # parameters, which override head_num/head_dim/v_head_dim wholesale. Both
+        # of MiMoV2's pools are asymmetric, so v_row_dim has to follow
+        # swa_v_head_dim rather than the full pool's v_head_dim.
+        pool = MHATokenToKVPool(
+            size=POOL_SIZE,
+            page_size=1,
+            dtype=DTYPE,
+            head_num=HEAD_NUM,
+            head_dim=512,
+            v_head_dim=256,
+            swa_head_num=1,
+            swa_head_dim=192,
+            swa_v_head_dim=128,
+            layer_num=1,
+            device="cuda",
+            enable_memory_saver=False,
+            enable_alt_stream=False,
+        )
+        self.assertEqual(pool.row_dim, 1 * 192)
+        self.assertEqual(pool.v_row_dim, 1 * 128)
+
+    def test_swa_v_head_dim_falls_back_to_v_head_dim(self):
+        # swa_v_head_dim omitted: head_dim comes from swa_head_dim but v_head_dim
+        # does not, so the two are read from different sources. Pinned because a
+        # pool built this way is asymmetric in a way neither config states.
+        pool = MHATokenToKVPool(
+            size=POOL_SIZE,
+            page_size=1,
+            dtype=DTYPE,
+            head_num=HEAD_NUM,
+            head_dim=512,
+            v_head_dim=256,
+            swa_head_num=1,
+            swa_head_dim=192,
+            layer_num=1,
+            device="cuda",
+            enable_memory_saver=False,
+            enable_alt_stream=False,
+        )
+        self.assertEqual(pool.row_dim, 1 * 192)
+        self.assertEqual(pool.v_row_dim, 1 * 256)
+
 
 @unittest.skipUnless(_HAS_CUDA, "fused store_cache path requires CUDA")
 class TestAsymmetricMHAPoolSetKVBuffer(unittest.TestCase):

@@ -34,8 +34,36 @@ constexpr uint32_t kNumWarps = 4;
 constexpr uint32_t kThreadsPerBlock = kNumWarps * device::kWarpThreads;
 
 /**
+ * \brief How a warp vectorizes one row of kElementBytes: the widest aligned
+ * vector type it can use, and how many full loop iterations that takes.
+ * Shared by the interleaved and single-row copies so the two cannot drift.
+ * kElementBytes == 0 is a valid (empty) plan, so a zero-width tail can be
+ * queried before being branched away.
+ */
+template <int64_t kElementBytes>
+struct RowVecPlan {
+  static constexpr int64_t kAlignment = (kElementBytes % (16 * device::kWarpThreads) == 0) ? 16
+                                        : kElementBytes % (8 * device::kWarpThreads) == 0  ? 8
+                                        : kElementBytes % (4 * device::kWarpThreads) == 0  ? 4
+                                        : kElementBytes % 4 == 0                           ? 4
+                                                                                           : 0;
+
+  static_assert(kAlignment > 0, "Element size must be multiple of 4 bytes");
+
+  using vec_t = device::AlignedStorage<uint32_t, kAlignment / 4>;
+  static constexpr int64_t kLoopBytes = sizeof(vec_t) * device::kWarpThreads;
+  static constexpr int64_t kLoopCount = kElementBytes / kLoopBytes;
+  static constexpr int64_t kElementCount = kElementBytes / sizeof(vec_t);
+  static constexpr bool kHasEpilogue = kLoopCount * kLoopBytes < kElementBytes;
+};
+
+/**
  * \brief Use a single warp to copy key and value data from source to destination.
  * Each thread in the warp copies a portion of the data in a coalesced manner.
+ * Both loads are issued before either store: the two rows live in different
+ * tensors, and the params' __restrict__ does not survive into the kernel body,
+ * so the compiler cannot prove k_dst and v_src disjoint and will not sink the
+ * V load past the K store on its own.
  * \tparam kElementBytes The size of each key/value element in bytes.
  * \param k_src Pointer to the source key data.
  * \param v_src Pointer to the source value data.
@@ -49,17 +77,9 @@ SGL_DEVICE void copy_kv_warp(
     void* __restrict__ k_dst,
     void* __restrict__ v_dst) {
   using namespace device;
-  constexpr int64_t kAlignment = (kElementBytes % (16 * kWarpThreads) == 0) ? 16
-                                 : kElementBytes % (8 * kWarpThreads) == 0  ? 8
-                                 : kElementBytes % (4 * kWarpThreads) == 0  ? 4
-                                 : kElementBytes % 4 == 0                   ? 4
-                                                                            : 0;
-
-  static_assert(kAlignment > 0, "Element size must be multiple of 4 bytes");
-
-  using vec_t = AlignedStorage<uint32_t, kAlignment / 4>;
-  constexpr auto kLoopBytes = sizeof(vec_t) * kWarpThreads;
-  constexpr auto kLoopCount = kElementBytes / kLoopBytes;
+  using plan_t = RowVecPlan<kElementBytes>;
+  using vec_t = typename plan_t::vec_t;
+  constexpr auto kLoopCount = plan_t::kLoopCount;
 
   const auto gmem = tile::Memory<vec_t>::warp();
 
@@ -72,8 +92,8 @@ SGL_DEVICE void copy_kv_warp(
   }
 
   // handle the epilogue if any
-  if constexpr (kLoopCount * kLoopBytes < kElementBytes) {
-    if (gmem.in_bound(kElementBytes / sizeof(vec_t), kLoopCount)) {
+  if constexpr (plan_t::kHasEpilogue) {
+    if (gmem.in_bound(plan_t::kElementCount, kLoopCount)) {
       const auto k = gmem.load(k_src, kLoopCount);
       const auto v = gmem.load(v_src, kLoopCount);
       gmem.store(k_dst, k, kLoopCount);
@@ -84,8 +104,8 @@ SGL_DEVICE void copy_kv_warp(
 
 /**
  * \brief Use a single warp to copy one row from source to destination.
- * Separate from copy_kv_warp because asymmetric K/V rows differ in width, so each
- * needs its own vector alignment and they cannot share one loop.
+ * Serves the width by which asymmetric K/V rows differ, which has no counterpart
+ * row to interleave with.
  * \tparam kElementBytes The size of the row in bytes.
  * \param src Pointer to the source data.
  * \param dst Pointer to the destination data.
@@ -93,17 +113,9 @@ SGL_DEVICE void copy_kv_warp(
 template <int64_t kElementBytes>
 SGL_DEVICE void copy_row_warp(const void* __restrict__ src, void* __restrict__ dst) {
   using namespace device;
-  constexpr int64_t kAlignment = (kElementBytes % (16 * kWarpThreads) == 0) ? 16
-                                 : kElementBytes % (8 * kWarpThreads) == 0  ? 8
-                                 : kElementBytes % (4 * kWarpThreads) == 0  ? 4
-                                 : kElementBytes % 4 == 0                   ? 4
-                                                                            : 0;
-
-  static_assert(kAlignment > 0, "Element size must be multiple of 4 bytes");
-
-  using vec_t = AlignedStorage<uint32_t, kAlignment / 4>;
-  constexpr auto kLoopBytes = sizeof(vec_t) * kWarpThreads;
-  constexpr auto kLoopCount = kElementBytes / kLoopBytes;
+  using plan_t = RowVecPlan<kElementBytes>;
+  using vec_t = typename plan_t::vec_t;
+  constexpr auto kLoopCount = plan_t::kLoopCount;
 
   const auto gmem = tile::Memory<vec_t>::warp();
 
@@ -113,10 +125,53 @@ SGL_DEVICE void copy_row_warp(const void* __restrict__ src, void* __restrict__ d
   }
 
   // handle the epilogue if any
-  if constexpr (kLoopCount * kLoopBytes < kElementBytes) {
-    if (gmem.in_bound(kElementBytes / sizeof(vec_t), kLoopCount)) {
+  if constexpr (plan_t::kHasEpilogue) {
+    if (gmem.in_bound(plan_t::kElementCount, kLoopCount)) {
       gmem.store(dst, gmem.load(src, kLoopCount), kLoopCount);
     }
+  }
+}
+
+/**
+ * \brief Copy a K row of kKBytes and a V row of kVBytes with one warp.
+ * The overlapping prefix goes through the interleaved copy; only the width by
+ * which the rows differ is left as a serial tail. Equal widths degenerate to a
+ * single interleaved copy with no tail.
+ */
+template <int64_t kKBytes, int64_t kVBytes>
+SGL_DEVICE void copy_kv_rows_warp(
+    const void* __restrict__ k_src,
+    const void* __restrict__ v_src,
+    void* __restrict__ k_dst,
+    void* __restrict__ v_dst) {
+  using namespace device;
+  constexpr auto kCommon = kKBytes < kVBytes ? kKBytes : kVBytes;
+  constexpr auto kTail = (kKBytes < kVBytes ? kVBytes : kKBytes) - kCommon;
+
+  // The interleaved copy indexes BOTH rows with kCommon's vector width, so that
+  // width must divide each row's split offset -- the narrower row's alignment
+  // does not imply the wider one's (e.g. 512 picks 16B, but 516 is not 16B
+  // aligned). The tail's own width must likewise divide its kCommon start.
+  // Whatever these gates admit is alignment-safe for the strides too, since a
+  // stride is a whole multiple of its split size.
+  constexpr auto kTailOrCommon = kTail == 0 ? kCommon : kTail;
+  constexpr auto kCommonAlign = RowVecPlan<kCommon>::kAlignment;
+  constexpr auto kTailAlign = RowVecPlan<kTailOrCommon>::kAlignment;
+  constexpr bool kCanInterleave =
+      kKBytes % kCommonAlign == 0 && kVBytes % kCommonAlign == 0 && kCommon % kTailAlign == 0;
+
+  if constexpr (kCanInterleave) {
+    copy_kv_warp<kCommon>(k_src, v_src, k_dst, v_dst);
+    if constexpr (kTail > 0) {
+      if constexpr (kKBytes > kVBytes) {
+        copy_row_warp<kTail>(pointer::offset(k_src, kCommon), pointer::offset(k_dst, kCommon));
+      } else {
+        copy_row_warp<kTail>(pointer::offset(v_src, kCommon), pointer::offset(v_dst, kCommon));
+      }
+    }
+  } else {
+    copy_row_warp<kKBytes>(k_src, k_dst);
+    copy_row_warp<kVBytes>(v_src, v_dst);
   }
 }
 
@@ -158,14 +213,7 @@ __global__ void store_kvcache(const __grid_constant__ StoreKVCacheParams params)
   const auto v_dst = pointer::offset(v_cache, index * stride_v_cache, split_id * kVSplitSize);
 
   if (index != reserved_skip_index) {
-    if constexpr (kKSplitSize == kVSplitSize) {
-      // Equal widths keep the interleaved two-tensor copy: both loads issue
-      // before either store, which hides more latency than two serial rows.
-      copy_kv_warp<kKSplitSize>(k_src, v_src, k_dst, v_dst);
-    } else {
-      copy_row_warp<kKSplitSize>(k_src, k_dst);
-      copy_row_warp<kVSplitSize>(v_src, v_dst);
-    }
+    copy_kv_rows_warp<kKSplitSize, kVSplitSize>(k_src, v_src, k_dst, v_dst);
   }
   PDLTriggerSecondary<kUsePDL>();
 }
