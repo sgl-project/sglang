@@ -2420,13 +2420,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                         )
 
                 # A single delta can carry both text and calls, and the tuple
-                # loses their relative position. Recover it from the calls: a
-                # call that supplies a name is opening a new block, so the text
-                # in this delta preceded it and the message must land first.
-                # Otherwise the calls are only continuing / closing arguments,
-                # whose trailing text is a separator that would truncate the
-                # args if it were emitted first.
-                opens_new_call = any(call.name for call in tool_calls)
+                # loses their relative position. Recover it from the calls: if
+                # one of them opens a new block, the text in this delta preceded
+                # it and the message must land first. Otherwise the calls only
+                # continue / close arguments, whose trailing text is a separator
+                # that would truncate the args if it were emitted first.
+                # Same predicate the emit loop uses to allocate a new item, so
+                # the two cannot disagree (a call may open with an empty name).
+                opens_new_call = any(
+                    (state := tool_call_states.get(call.tool_index)) is None
+                    or state.get("done")
+                    for call in tool_calls
+                )
                 emitters = (
                     (_emit_normal_text, _emit_tool_calls)
                     if opens_new_call
