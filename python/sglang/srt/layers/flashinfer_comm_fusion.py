@@ -48,7 +48,8 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     """Resolve the requested FlashInfer allreduce fusion backend."""
     if not (is_sm90_supported() or is_sm100_supported() or is_sm120_supported()):
         raise ValueError(
-            "FlashInfer allreduce fusion requires SM90, SM10X, or SM120 NVIDIA GPUs."
+            "FlashInfer allreduce fusion requires SM90, SM10X, or SM12X "
+            "(SM120/SM121) NVIDIA GPUs."
         )
 
     if backend == "auto":
@@ -56,8 +57,8 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
             if is_sm100_supported():
                 return "mnnvl"
             raise ValueError(
-                "FlashInfer allreduce fusion does not support multi-node on "
-                "non-Blackwell systems."
+                "FlashInfer allreduce fusion does not support multi-node "
+                "outside SM100/SM103 systems."
             )
         if is_sm100_supported():
             return "mnnvl"
@@ -70,8 +71,8 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
 
     if backend == "mnnvl" and not _mnnvl_supported(is_multi_node):
         raise ValueError(
-            "FlashInfer allreduce fusion mnnvl backend requires a Blackwell "
-            "system, or SM90 single-node."
+            "FlashInfer allreduce fusion mnnvl backend requires SM100/SM103, "
+            "or SM90 single-node."
         )
     return backend
 
@@ -199,16 +200,17 @@ if is_flashinfer_available():
 # FlashInfer allreduce fusion backend support matrix for
 # --flashinfer-allreduce-fusion-backend:
 #
-#   Backend   | SM103 | SM100 | SM90        | Single-Node | Multi-Node |
-#   --------- | ----- | ----- | ----------- | ----------- | ---------- |
-#   trtllm    | Yes   | Yes   | Yes         | Yes         | No         |
-#   mnnvl     | Yes   | Yes   | Single-node | Yes         | Blackwell  |
+#   Backend   | SM103 | SM100 | SM90        | SM12X | Single-Node | Multi-Node  |
+#   --------- | ----- | ----- | ----------- | ----- | ----------- | ----------- |
+#   trtllm    | Yes   | Yes   | Yes         | Yes   | Yes         | No          |
+#   mnnvl     | Yes   | Yes   | Single-node | No    | Yes         | SM100/SM103 |
 #
-# FlashInfer allreduce fusion requires SM90 or SM10X. auto resolves to mnnvl
-# on Blackwell (SM100/SM103) systems (single- and multi-node) and to trtllm on
-# SM90 single-node systems. SM90 multi-node and non-SM90/SM10X configurations
-# are rejected. Either mnnvl or trtllm can be requested explicitly on
-# single-node systems, and mnnvl additionally on Blackwell multi-node.
+# FlashInfer allreduce fusion requires SM90, SM10X, or SM12X (SM120/SM121).
+# auto resolves to mnnvl on SM100/SM103 systems (single- and multi-node) and to
+# trtllm on SM90, SM120, and SM121 single-node systems. Multi-node outside
+# SM100/SM103 systems and non-SM90/SM10X/SM12X configurations are rejected.
+# trtllm can be requested explicitly on any supported single-node system, and
+# mnnvl on SM90 single-node plus SM100/SM103 single- or multi-node.
 
 
 def is_flashinfer_allreduce_unavailable() -> bool:

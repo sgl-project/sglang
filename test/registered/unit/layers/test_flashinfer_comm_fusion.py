@@ -131,7 +131,8 @@ class TestFlashInferCommFusion(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node)
 
-        # SM120: auto uses trtllm on single-node, multi-node is unsupported.
+        # SM12X (SM120/SM121): auto uses trtllm on single-node, multi-node is
+        # unsupported.
         with (
             patch.object(fusion, "is_sm100_supported", return_value=False),
             patch.object(fusion, "is_sm90_supported", return_value=False),
@@ -144,7 +145,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node)
 
-        # Architectures outside SM90/SM10X/SM120 are unsupported.
+        # Architectures outside SM90/SM10X/SM12X (SM120/SM121) are unsupported.
         for arch in ("pre_sm90", "post_sm120"):
             with (
                 self.subTest(arch=arch),
