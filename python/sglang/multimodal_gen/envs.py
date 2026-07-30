@@ -22,7 +22,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_LOGGING_PREFIX: str = ""
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
-    SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     SGLANG_EXTERNAL_MODEL_PACKAGE: str = ""
     MAX_JOBS: str | None = None
@@ -136,11 +135,6 @@ def _lazy_path(
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Installation Time Env Vars ==================
-    # Target device of sglang-diffusion, supporting [cuda (by default),
-    # rocm, neuron, cpu, openvino]
-    "SGLANG_DIFFUSION_TARGET_DEVICE": _lazy_str(
-        "SGLANG_DIFFUSION_TARGET_DEVICE", "cuda"
-    ),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
     "MAX_JOBS": _lazy_str("MAX_JOBS"),
