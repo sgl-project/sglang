@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import torch
 
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_classifier_free_guidance_rank,
-    get_classifier_free_guidance_world_size,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.session_cache import (
     BRANCH_COND,
     BRANCH_UNCOND,
@@ -18,54 +15,33 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.d
     apply_request_lifecycle_resets,
     resolve_request_cache,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentUse,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-    PipelineStage,
-    StageParallelismType,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.utils import (
     infer_dreamzero_batch_size,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    StageValidators as V,
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 
-class DreamZeroTextEncodingStage(PipelineStage):
-    """Custom DreamZero text stage using the local compatible encoder."""
+class DreamZeroTextEncodingStage(TextEncodingStage):
+    """DreamZero text stage with session-cache aware prompt embeddings."""
 
     def __init__(
         self,
         text_encoder: torch.nn.Module | None = None,
+        tokenizer: Any | None = None,
         cache_manager: DreamZeroCachePoolManager | None = None,
     ) -> None:
-        super().__init__()
+        super().__init__([text_encoder], [tokenizer])
         self.text_encoder = text_encoder
+        self.tokenizer = tokenizer
         self.cache_manager = cache_manager
-
-    @property
-    def parallelism_type(self) -> StageParallelismType:
-        if getattr(self.server_args, "enable_cfg_parallel", False):
-            return StageParallelismType.CFG_PARALLEL
-        return StageParallelismType.REPLICATED
-
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        return [
-            ComponentUse(
-                self._component_stage_name(stage_name),
-                "text_encoder",
-                target_dtype=PRECISION_TO_TYPE[
-                    server_args.pipeline_config.text_encoder_precisions[0]
-                ],
-            )
-        ]
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -73,6 +49,11 @@ class DreamZeroTextEncodingStage(PipelineStage):
             "dreamzero_inputs",
             getattr(batch, "dreamzero_inputs", None),
             lambda value: isinstance(value, dict),
+        )
+        result.add_check(
+            "prompt",
+            getattr(batch, "prompt", None),
+            V.string_or_list_strings,
         )
         return result
 
@@ -97,47 +78,118 @@ class DreamZeroTextEncodingStage(PipelineStage):
         return torch.cat([tensor, pad], dim=1)
 
     @staticmethod
-    def _set_prompt_metadata(
-        batch: Req,
-        prompt_embs: list[torch.Tensor],
-        *,
-        cfg_parallel: bool,
-        cfg_rank: int | None,
-    ) -> None:
-        batch.dreamzero_cfg_branch_index = cfg_rank if cfg_parallel else None
-        batch.prompt_embeds = prompt_embs[0]
-        if cfg_parallel and cfg_rank == 1:
-            batch.negative_prompt_embeds = prompt_embs[0]
-        elif len(prompt_embs) > 1:
-            batch.negative_prompt_embeds = prompt_embs[1]
-        batch.dreamzero_prompt_embs = prompt_embs
+    def _fit_mask_len(mask: torch.Tensor, text_len: int) -> torch.Tensor:
+        if mask.shape[1] == text_len:
+            return mask
+        if mask.shape[1] > text_len:
+            return mask[:, :text_len]
+        pad = mask.new_zeros(mask.shape[0], text_len - mask.shape[1])
+        return torch.cat([mask, pad], dim=1)
 
-    def _encode_prompt(
-        self,
-        encoder: torch.nn.Module,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-        *,
-        text_len: int,
+    @staticmethod
+    def _mask_prompt_padding(
+        prompt_emb: torch.Tensor, attention_mask: torch.Tensor | None
     ) -> torch.Tensor:
-        try:
-            device = next(encoder.parameters()).device
-        except StopIteration:
-            device = input_ids.device
-        input_ids = input_ids.to(device=device, dtype=torch.long)
         if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-        else:
-            attention_mask = attention_mask.to(device=device, dtype=torch.long)
-        prompt_output = encoder(input_ids=input_ids, attention_mask=attention_mask)
-        prompt_emb = prompt_output.last_hidden_state
-        prompt_emb = self._fit_text_len(prompt_emb.clone(), text_len)
-        attention_mask = attention_mask[:, : prompt_emb.shape[1]]
+            return prompt_emb
+        attention_mask = attention_mask.to(device=prompt_emb.device, dtype=torch.long)
+        attention_mask = DreamZeroTextEncodingStage._fit_mask_len(
+            attention_mask, prompt_emb.shape[1]
+        )
         seq_lens = attention_mask.gt(0).sum(dim=1).long()
         positions = torch.arange(prompt_emb.shape[1], device=prompt_emb.device)
         valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
-        prompt_emb = prompt_emb.masked_fill(~valid.unsqueeze(-1), 0)
-        return prompt_emb.to(dtype=torch.bfloat16)
+        return prompt_emb.masked_fill(~valid.unsqueeze(-1), 0)
+
+    @staticmethod
+    def _batched_texts(
+        value: Any,
+        batch_size: int,
+        field_name: str,
+        *,
+        default: str | None = None,
+    ) -> list[str]:
+        if value is None:
+            if default is None:
+                raise ValueError(f"DreamZero {field_name} is required")
+            return [default] * batch_size
+        if isinstance(value, str):
+            return [value] * batch_size
+        if not isinstance(value, Sequence) or isinstance(value, bytes | bytearray):
+            raise TypeError(
+                f"DreamZero {field_name} must be a string or list of strings"
+            )
+        texts = list(value)
+        if not all(isinstance(item, str) for item in texts):
+            raise TypeError(
+                f"DreamZero {field_name} must be a string or list of strings"
+            )
+        if len(texts) != batch_size:
+            raise ValueError(
+                f"DreamZero {field_name} batch size mismatch: "
+                f"got {len(texts)}, expected {batch_size}"
+            )
+        return texts
+
+    def _ensure_prompt_extra(self, batch: Req, batch_size: int) -> None:
+        extra = getattr(batch, "extra", None)
+        if extra is None:
+            extra = {}
+            batch.extra = extra
+        if extra.get("dreamzero_prompts") is None:
+            extra["dreamzero_prompts"] = self._batched_texts(
+                getattr(batch, "prompt", None),
+                batch_size,
+                "prompt",
+            )
+        if extra.get("dreamzero_negative_prompts") is None:
+            extra["dreamzero_negative_prompts"] = self._batched_texts(
+                getattr(batch, "negative_prompt", ""),
+                batch_size,
+                "negative_prompt",
+                default="",
+            )
+
+    @staticmethod
+    def _set_prompt_metadata(
+        batch: Req,
+        prompt_embs: list[torch.Tensor],
+    ) -> None:
+        batch.dreamzero_cfg_branch_index = None
+        batch.prompt_embeds = prompt_embs[0]
+        batch.negative_prompt_embeds = (
+            prompt_embs[1] if len(prompt_embs) > 1 else None
+        )
+        batch.dreamzero_prompt_embs = prompt_embs
+
+    def _encode_prompt_texts(
+        self,
+        texts: list[str],
+        server_args: ServerArgs,
+        *,
+        text_len: int,
+    ) -> torch.Tensor:
+        if self.text_encoders[0] is None:
+            raise ValueError("DreamZero text encoder module is not loaded")
+        if self.tokenizers[0] is None:
+            raise ValueError("DreamZero tokenizer module is not loaded")
+        (
+            prompt_embeds_list,
+            prompt_masks_list,
+            _pooler_embeds_list,
+            _prompt_embeds_masks_list,
+            _prompt_seq_lens_list,
+        ) = self.encode_text(
+            texts,
+            server_args,
+            encoder_index=0,
+            return_attention_mask=True,
+            dtype=torch.bfloat16,
+            max_length=text_len,
+        )
+        prompt = self._fit_text_len(prompt_embeds_list[0], text_len)
+        attention_mask = prompt_masks_list[0] if prompt_masks_list else None
+        return self._mask_prompt_padding(prompt, attention_mask).to(dtype=torch.bfloat16)
 
     @staticmethod
     def _local_attn_size(server_args: ServerArgs) -> int:
@@ -164,31 +216,21 @@ class DreamZeroTextEncodingStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         inputs: dict[str, Any] = batch.dreamzero_inputs
-        cfg_parallel = bool(getattr(server_args, "enable_cfg_parallel", False))
-        cfg_rank = 0
-        if cfg_parallel:
-            cfg_world_size = get_classifier_free_guidance_world_size()
-            if cfg_world_size != 2:
-                raise ValueError(
-                    "DreamZero CFG parallel requires cfg_parallel_degree=2, "
-                    f"got {cfg_world_size}"
-                )
-            cfg_rank = get_classifier_free_guidance_rank()
+        batch_size = infer_dreamzero_batch_size(
+            inputs,
+            error_message="DreamZero text stage cannot infer batch size",
+        )
+        self._ensure_prompt_extra(batch, batch_size)
         request_cache = resolve_request_cache(
             batch,
             self.cache_manager,
             local_attn_size=self._local_attn_size(server_args),
-            batch_size=infer_dreamzero_batch_size(
-                inputs,
-                error_message="DreamZero text stage cannot infer batch size",
-            ),
+            batch_size=batch_size,
         )
         return self._forward_cache_manager(
             batch,
             server_args,
             request_cache,
-            cfg_parallel=cfg_parallel,
-            cfg_rank=cfg_rank,
         )
 
     def _forward_cache_manager(
@@ -196,21 +238,12 @@ class DreamZeroTextEncodingStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
         request_cache: DreamZeroRequestCache,
-        *,
-        cfg_parallel: bool = False,
-        cfg_rank: int = 0,
     ):
         if self.cache_manager is None:
             raise RuntimeError("DreamZero text stage requires a cache manager")
         state: DreamZeroCachePool = self.cache_manager.pool
         slots = request_cache.slot_indices
         inputs: dict[str, Any] = batch.dreamzero_inputs
-        input_ids = inputs.get("text")
-        neg_ids = inputs.get("text_negative")
-        if input_ids is not None and not torch.is_tensor(input_ids):
-            raise ValueError("DreamZero batched text input must be a tensor")
-        if neg_ids is not None and not torch.is_tensor(neg_ids):
-            raise ValueError("DreamZero batched negative text input must be a tensor")
         reset_reasons: list[str | None] = [None] * request_cache.batch_size
         lifecycle_reset_mask: list[bool] = [False] * request_cache.batch_size
         lifecycle_preserve_text: list[bool] = [True] * request_cache.batch_size
@@ -273,32 +306,16 @@ class DreamZeroTextEncodingStage(PipelineStage):
         ]
         # Text stage owns the request cache and lifecycle-adjusted reusable
         # view. Later stages only consume batch.dreamzero_cache.
-        if cfg_parallel:
-            # Negative prompts are static for DreamZero eval. Use positive
-            # prompt metadata to keep CFG ranks aligned on encode-vs-cache.
-            prompt_reusable = [
-                bool(
-                    cache_hit
-                    and prompt_hash is not None
-                    and state.prompt_hashes[BRANCH_COND][slot] == prompt_hash
-                )
-                for slot, cache_hit, prompt_hash in zip(
-                    slots,
-                    request_cache.cache_hit,
-                    request_cache.prompt_hashes,
-                    strict=True,
-                )
-            ]
-            neg_prompt_reusable = prompt_reusable
         request_cache.prompt_reusable = prompt_reusable
         request_cache.neg_prompt_reusable = neg_prompt_reusable
 
-        attention_mask = inputs.get("text_attention_mask")
         text_len = server_args.pipeline_config.dit_config.arch_config.text_len
+        prompt_texts = batch.extra["dreamzero_prompts"]
+        negative_prompt_texts = batch.extra["dreamzero_negative_prompts"]
         prompt_embs: list[torch.Tensor] = []
 
         def get_branch_prompt(
-            branch: int, *, ids, mask, hashes, reusable
+            branch: int, *, texts: list[str], hashes, reusable
         ) -> torch.Tensor:
             if all(reusable):
                 prompt_pool = state.cached_prompt_embs[branch]
@@ -310,75 +327,31 @@ class DreamZeroTextEncodingStage(PipelineStage):
                     cached = state.gather_prompt(branch, slots)
                     if cached is not None:
                         return cached
-                if cfg_parallel:
-                    raise RuntimeError(
-                        "DreamZero CFG prompt cache metadata is reusable but "
-                        f"branch {branch} embeddings are missing"
-                    )
-            if ids is None:
-                raise ValueError("DreamZero text stage requires tokenized text")
-            with self.use_declared_component(
-                component_name="text_encoder", module=self.text_encoder
-            ) as encoder:
-                if encoder is None:
-                    raise ValueError("DreamZero text encoder module is not loaded")
-                self.text_encoder = encoder
-                prompt = self._encode_prompt(
-                    encoder,
-                    ids,
-                    mask,
-                    text_len=text_len,
-                )
+            prompt = self._encode_prompt_texts(
+                texts,
+                server_args,
+                text_len=text_len,
+            )
             state.scatter_prompt(branch, slots, prompt, hashes)
             return prompt
 
-        if cfg_parallel:
-            if neg_ids is None:
-                raise ValueError(
-                    "DreamZero CFG parallel requires tokenized text_negative"
-                )
-            if cfg_rank == 0:
-                prompt_embs = [
-                    get_branch_prompt(
-                        BRANCH_COND,
-                        ids=input_ids,
-                        mask=attention_mask,
-                        hashes=request_cache.prompt_hashes,
-                        reusable=prompt_reusable,
-                    )
-                ]
-            else:
-                prompt_embs = [
-                    get_branch_prompt(
-                        BRANCH_UNCOND,
-                        ids=neg_ids,
-                        mask=inputs.get("text_attention_mask_negative"),
-                        hashes=request_cache.neg_prompt_hashes,
-                        reusable=neg_prompt_reusable,
-                    )
-                ]
-        else:
-            prompt_embs = [
+        prompt_embs = [
+            get_branch_prompt(
+                BRANCH_COND,
+                texts=prompt_texts,
+                hashes=request_cache.prompt_hashes,
+                reusable=prompt_reusable,
+            )
+        ]
+        if server_args.pipeline_config.should_use_guidance:
+            prompt_embs.append(
                 get_branch_prompt(
-                    BRANCH_COND,
-                    ids=input_ids,
-                    mask=attention_mask,
-                    hashes=request_cache.prompt_hashes,
-                    reusable=prompt_reusable,
+                    BRANCH_UNCOND,
+                    texts=negative_prompt_texts,
+                    hashes=request_cache.neg_prompt_hashes,
+                    reusable=neg_prompt_reusable,
                 )
-            ]
-            if server_args.pipeline_config.should_use_guidance and (
-                neg_ids is not None
-            ):
-                prompt_embs.append(
-                    get_branch_prompt(
-                        BRANCH_UNCOND,
-                        ids=neg_ids,
-                        mask=inputs.get("text_attention_mask_negative"),
-                        hashes=request_cache.neg_prompt_hashes,
-                        reusable=neg_prompt_reusable,
-                    )
-                )
+            )
         for slot, prompt_hash, neg_prompt_hash in zip(
             slots,
             request_cache.prompt_hashes,
@@ -387,10 +360,5 @@ class DreamZeroTextEncodingStage(PipelineStage):
         ):
             state.prompt_hashes[BRANCH_COND][slot] = prompt_hash
             state.prompt_hashes[BRANCH_UNCOND][slot] = neg_prompt_hash
-        self._set_prompt_metadata(
-            batch,
-            prompt_embs,
-            cfg_parallel=cfg_parallel,
-            cfg_rank=cfg_rank,
-        )
+        self._set_prompt_metadata(batch, prompt_embs)
         return batch

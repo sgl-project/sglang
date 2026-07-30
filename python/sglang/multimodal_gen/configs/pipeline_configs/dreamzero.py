@@ -1,10 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+
+import torch
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits import DreamZeroCausalWanConfig
+from sglang.multimodal_gen.configs.models.encoders import (
+    BaseEncoderOutput,
+    CLIPVisionConfig,
+    T5Config,
+)
+from sglang.multimodal_gen.configs.models.encoders.clip import CLIPVisionArchConfig
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
@@ -12,12 +21,36 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 )
 
 
-def _dreamzero_text_encoder_config() -> EncoderConfig:
-    return EncoderConfig(prefix="dreamzero_text_encoder")
+def _dreamzero_text_encoder_config() -> T5Config:
+    return T5Config(prefix="dreamzero_text_encoder")
 
 
 def _dreamzero_image_encoder_config() -> EncoderConfig:
-    return EncoderConfig(prefix="dreamzero_image_encoder")
+    return CLIPVisionConfig(
+        prefix="dreamzero_image_encoder",
+        num_hidden_layers_override=31,
+        require_post_norm=False,
+        arch_config=CLIPVisionArchConfig(
+            hidden_size=1280,
+            intermediate_size=5120,
+            projection_dim=1024,
+            num_hidden_layers=32,
+            num_attention_heads=16,
+            num_channels=3,
+            image_size=224,
+            patch_size=14,
+            hidden_act="gelu",
+            layer_norm_eps=1e-5,
+            dropout=0.0,
+            attention_dropout=0.0,
+        ),
+    )
+
+
+def dreamzero_t5_postprocess_text(
+    outputs: BaseEncoderOutput, _text_inputs
+) -> torch.Tensor:
+    return outputs.last_hidden_state
 
 
 @dataclass
@@ -35,8 +68,11 @@ class DreamZeroPipelineConfig(PipelineConfig):
     vae_tiling: bool = False
     vae_sp: bool = False
 
-    text_encoder_configs: tuple[EncoderConfig, ...] = field(
+    text_encoder_configs: tuple[T5Config, ...] = field(
         default_factory=lambda: (_dreamzero_text_encoder_config(),)
+    )
+    postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.Tensor], ...] = (
+        field(default_factory=lambda: (dreamzero_t5_postprocess_text,))
     )
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     text_encoder_extra_args: list[dict] = field(default_factory=lambda: [{}])
@@ -59,8 +95,8 @@ class DreamZeroPipelineConfig(PipelineConfig):
     image_size: tuple[int, ...] = ()
     state_dim: int | None = None
     action_horizon: int = 24
-    action_dim: int = 0
-    output_action_dim: int | None = None
+    action_dim: int = 32
+    output_action_dim: int = 32
     default_num_inference_steps: int = 16
     materialize_dtype: str | None = None
     enable_global_prefix_cache: bool = False

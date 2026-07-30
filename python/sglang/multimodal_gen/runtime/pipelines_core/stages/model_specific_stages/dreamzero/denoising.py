@@ -99,7 +99,13 @@ class SchedulerStepState:
 
 
 class DreamZeroCausalDenoisingStage(PipelineStage):
-    """One-shot DreamZero causal video/action denoising stage."""
+    """One-shot DreamZero causal video/action denoising stage.
+
+    DreamZero intentionally stays outside the shared DenoisingStage callback path:
+    measured model behavior depends on a coupled video-latent/action rollout with
+    two synchronized UniPC schedulers, session KV/cross-attention caches, dynamic
+    DiT step skipping, and CFG-parallel branch gathering.
+    """
 
     def __init__(
         self,
@@ -950,9 +956,7 @@ class DreamZeroActionOutputStage(PipelineStage):
         action_payload = {
             "request_id": batch.request_id,
             "actions": normalized_action.detach().cpu().numpy(),
-            "parameters": {
-                "num_inference_steps": server_args.pipeline_config.default_num_inference_steps
-            },
+            "parameters": {"num_inference_steps": batch.num_inference_steps},
         }
 
         return OutputBatch(

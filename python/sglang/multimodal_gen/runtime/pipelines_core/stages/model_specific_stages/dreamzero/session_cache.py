@@ -574,13 +574,12 @@ def _batch_prompt_hashes(
         "dreamzero_negative_prompt_hashes",
     )
     prompt_hashes = [
-        _prompt_hash(prompt, inputs.get("text"), explicit_prompt_hashes[index])
+        _prompt_hash(prompt, explicit_prompt_hashes[index])
         for index, prompt in enumerate(prompts)
     ]
     neg_prompt_hashes = [
         _prompt_hash(
             neg_prompt,
-            inputs.get("text_negative"),
             explicit_neg_prompt_hashes[index],
         )
         for index, neg_prompt in enumerate(neg_prompts)
@@ -696,17 +695,12 @@ def apply_request_lifecycle_resets(
 
 def _prompt_hash(
     prompt: str | None,
-    tensor: Any,
     explicit_hash: str | None,
 ) -> str | None:
     if prompt is not None:
         return "str:" + hashlib.sha1(prompt.encode("utf-8")).hexdigest()
     if explicit_hash is not None:
         return "key:" + explicit_hash
-    # Tensor prompt embeddings may already live on GPU. Do not hash their contents
-    # here because doing so would synchronize the request path.
-    if torch.is_tensor(tensor):
-        return None
     return None
 
 

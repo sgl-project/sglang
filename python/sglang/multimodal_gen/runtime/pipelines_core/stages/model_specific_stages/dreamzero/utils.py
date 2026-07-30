@@ -139,8 +139,6 @@ def infer_dreamzero_model_input_batch_size(model_inputs: Mapping[str, Any]) -> i
         "images",
         "videos",
         "state",
-        "text",
-        "text_negative",
     ):
         value = model_inputs.get(key)
         if torch.is_tensor(value) and value.ndim > 0:

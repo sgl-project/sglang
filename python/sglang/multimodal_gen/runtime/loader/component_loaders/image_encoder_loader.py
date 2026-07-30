@@ -1,8 +1,13 @@
+import types
+
+import torch
+
 from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
     TextEncoderLoader,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import finalize_encoder_folding
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
@@ -10,6 +15,89 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _dreamzero_non_causal_clip_attention_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+):
+    qkv_states, _ = self.qkv_proj(hidden_states)
+    query_states, key_states, value_states = qkv_states.chunk(3, dim=-1)
+    query_states = query_states.reshape(
+        query_states.shape[0],
+        query_states.shape[1],
+        self.num_heads_per_partition,
+        self.head_dim,
+    )
+    key_states = key_states.reshape(
+        key_states.shape[0],
+        key_states.shape[1],
+        self.num_heads_per_partition,
+        self.head_dim,
+    )
+    value_states = value_states.reshape(
+        value_states.shape[0],
+        value_states.shape[1],
+        self.num_heads_per_partition,
+        self.head_dim,
+    )
+
+    if self.attn.backend == AttentionBackendEnum.TORCH_SDPA:
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+        attn_mask = None
+        if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                attn_mask = attention_mask[:, None, None, :].to(
+                    dtype=query_states.dtype
+                )
+                attn_mask = (1.0 - attn_mask) * torch.finfo(query_states.dtype).min
+            else:
+                attn_mask = attention_mask
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attn_mask,
+            is_causal=False,
+            scale=self.scale,
+        )
+        attn_output = attn_output.transpose(1, 2)
+    else:
+        attn_output = self.attn(query_states, key_states, value_states)
+
+    attn_output = attn_output.reshape(
+        attn_output.shape[0],
+        attn_output.shape[1],
+        self.num_heads_per_partition * self.head_dim,
+    )
+    attn_output, _ = self.out_proj(attn_output)
+    return attn_output, None
+
+
+def _patch_dreamzero_clip_vision_attention(model: torch.nn.Module) -> None:
+    for layer in model.vision_model.encoder.layers:
+        attention = layer.self_attn
+        attention.attn.attn_impl.causal = False
+        attention.forward = types.MethodType(
+            _dreamzero_non_causal_clip_attention_forward,
+            attention,
+        )
+
+
+def load_dreamzero_image_encoder(
+    server_args: ServerArgs,
+    component_model_path: str,
+) -> torch.nn.Module:
+    image_encoder = ImageEncoderLoader().load_customized(
+        component_model_path,
+        server_args,
+        "image_encoder",
+    )
+    _patch_dreamzero_clip_vision_attention(image_encoder)
+    return image_encoder
 
 
 class ImageEncoderLoader(TextEncoderLoader):

@@ -14,8 +14,7 @@ class DreamZeroSamplingParams(VLASamplingParams):
     prompt: str | list[str] | None = None
     negative_prompt: str = ""
 
-    num_inference_steps: int = 4
-    guidance_scale: float = 5.0
+    num_inference_steps: int = 16
 
     observation: dict[str, Any] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
