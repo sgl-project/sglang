@@ -447,12 +447,18 @@ def should_use_dp_reduce_scatterv():
     Use reduce_scatterv in the standard dispatcher's combine() for DP attention
     with EP, replacing the default all-reduce + dp_scatter path.
     Only changes the combine (post-kernel) communication; dispatch is unchanged.
+
+    The reduce_scatterv group is the global TP group, while its variable split
+    sizes are one entry per attention-DP rank. Therefore this optimization is
+    valid only when each attention-DP shard has a single rank (attention TP=1).
+    Configurations with partial attention TP fall back to all-reduce + dp_scatter.
     """
     return (
         not should_use_flashinfer_cutlass_moe_fp4_allgather()
         and get_moe_a2a_backend().is_none()
         and is_dp_attention_enabled()
         and get_parallel().attn_dp_size > 1
+        and get_parallel().tp_size == get_parallel().attn_dp_size
         and get_parallel().moe_ep_size == get_parallel().attn_dp_size
     )
 
