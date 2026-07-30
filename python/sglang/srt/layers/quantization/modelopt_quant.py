@@ -64,7 +64,6 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.utils.common import (
-    get_device_capability,
     is_cuda,
     is_flashinfer_available,
     is_sm100_supported,
@@ -1990,10 +1989,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
-            if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
-                moe_runner_backend = MoeRunnerBackend.MARLIN
-            else:
-                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+            raise ValueError(
+                "ModelOpt NVFP4 MoE backend must be resolved before weight creation."
+            )
         self._moe_runner_backend = moe_runner_backend
         use_marlin_fallback = moe_runner_backend.is_marlin()
         if not is_blackwell_supported() and not use_marlin_fallback:

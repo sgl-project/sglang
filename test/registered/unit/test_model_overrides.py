@@ -1618,6 +1618,51 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
+    def test_modelopt_nvfp4_auto_backend_by_capability(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _moe_runner_backend_quant_constraints,
+        )
+
+        def _resolve(quantization, capability):
+            view = ResolvedView(
+                SimpleNamespace(
+                    quantization=quantization,
+                    moe_runner_backend="auto",
+                )
+            )
+            with patch.object(
+                overrides_module, "is_cuda", return_value=True
+            ), patch.object(
+                overrides_module,
+                "get_device_capability",
+                return_value=capability,
+            ), patch.object(
+                overrides_module,
+                "is_sm100_supported",
+                return_value=capability[0] == 10,
+            ), patch.object(
+                overrides_module,
+                "is_sm120_supported",
+                return_value=capability[0] == 12,
+            ):
+                return _moe_runner_backend_quant_constraints(view)
+
+        cases = (
+            ("modelopt_fp4", (8, 0), "marlin"),
+            ("modelopt_mixed", (8, 0), "marlin"),
+            ("modelopt_fp4", (9, 0), "marlin"),
+            ("modelopt_mixed", (9, 0), "marlin"),
+            ("modelopt_fp4", (10, 0), "flashinfer_trtllm"),
+            ("modelopt_mixed", (12, 0), "flashinfer_cutlass"),
+        )
+        for quantization, capability, expected_backend in cases:
+            with self.subTest(quantization=quantization, capability=capability):
+                self.assertEqual(
+                    _resolve(quantization, capability),
+                    {"moe_runner_backend": expected_backend},
+                )
+
     def test_cutlass_moe_env_override_pass(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
