@@ -60,6 +60,11 @@ def covered(
         and K == 128
         and V == 128
         and HV % max(num_q_heads, 1) == 0
+        # Per-K gate layout. A per-head scalar gate ([B, HV] / [HV], the GDN
+        # shape) is a different kernel, not a slower input for this one.
+        and a.dim() == 2
+        and a.shape[1] == HV * K
+        and dt_bias.numel() == HV * K
         and mixed_qkv.dtype == torch.bfloat16
         and a.dtype == torch.bfloat16
         and b.dtype == torch.bfloat16
