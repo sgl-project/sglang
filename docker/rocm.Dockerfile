@@ -311,26 +311,6 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
     fi
 
 # -----------------------
-# FlyDSL
-# The double-sed patch was to workaround TheRock#2484. As TheRock#3250 has fixed
-# the PATH issue of LLVM, this can be removed for ROCm versions later than
-# 0a20260625.  Keep this commented because we may end up pinning earlier versions.
-# RUN if [ "${GPU_ARCH}" = "gfx1250-rocm7_15" ]; then \
-#       apt-get update && apt-get install -y ninja-build patchelf cmake \
-#       && git clone https://github.com/ROCm/FlyDSL.git --branch v0.2.0; \
-#     fi
-# RUN if [ "${GPU_ARCH}" = "gfx1250-rocm7_15" ]; then \
-#       cd FlyDSL \
-#       && sed -i '/-DMLIR_ENABLE_ROCM_RUNNER=ON/a\    -DROCM_TEST_CHIPSET="gfx942" \\' scripts/build_llvm.sh \
-#       && sed -i scripts/build_llvm.sh -e '51i\ls && sed -i mlir/lib/Target/LLVM/ROCDL/Target.cpp -e "s|{\\"ld.lld\\"|{\\"/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld\\"|"' \
-#       && bash -lc 'unset LLVM_COMMIT && source /opt/venv/bin/activate \
-#         && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake bash scripts/build_llvm.sh -j64 \
-#         && CMAKE_PREFIX_PATH=${ROCM_HOME}/lib/cmake LLVM_DIR=/sgl-workspace/llvm-project/mlir_install/lib/cmake/llvm MLIR_PATH=/sgl-workspace/llvm-project/mlir_install bash scripts/build.sh -j64 \
-#         && FLYDSL_RELEASE_TYPE=release pip install . \
-#         && rm -fr /sgl-workspace/llvm-project;'; \
-#     fi
-
-# -----------------------
 # AITER
 # Clear any inherited setuptools_scm override so AITER gets its own version
 # from AITER_COMMIT rather than SGLang's nightly version.
