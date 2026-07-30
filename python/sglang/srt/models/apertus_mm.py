@@ -36,12 +36,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.apertus import ApertusForCausalLM
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import add_prefix, flatten_nested_list
-
 
 _DEFAULT_IMAGE_TOKEN_OFFSET = 131272
 _DEFAULT_AUDIO_TOKEN_OFFSET = 262344
@@ -197,9 +196,7 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
                 image = image.unsqueeze(0)
             with torch.inference_mode():
                 codes = self.vision_tower.encode(image.to(device=device, dtype=dtype))
-            image_ids.append(
-                codes.flatten().to(torch.long) + self.image_token_offset
-            )
+            image_ids.append(codes.flatten().to(torch.long) + self.image_token_offset)
         return self._embed_code_ids(image_ids)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
