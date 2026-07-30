@@ -79,9 +79,7 @@ class TestApertus1p5Server(TestOpenAIMLLMServerBase):
         self.assertIn("yellow", text)
         self.assertTrue(any(word in text for word in ("taxi", "cab", "vehicle")))
         if require_ironing:
-            self.assertTrue(
-                any(word in text for word in ("iron", "clothes", "cloth"))
-            )
+            self.assertTrue(any(word in text for word in ("iron", "clothes", "cloth")))
 
     def _assert_speech_transcript(self, text):
         for phrase in ("thank you", "privilege", "forum", "leaders"):
