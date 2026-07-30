@@ -2,6 +2,9 @@
 
 Uses a standalone CUDA kernel (no sgl-kernel / TVM-FFI deps) registered
 via TORCH_LIBRARY so the kernel launch is fully CUDA-graph capturable.
+
+Returns (output, log_sum_exp) for merging with extra (C4/C128) attention
+via online softmax composition.
 """
 
 from __future__ import annotations
@@ -114,13 +117,15 @@ def mxfp4_decode_attention(
         attn_sink = attn_sink.contiguous().to(torch.float32)
 
     o = torch.empty_like(q)
+    lse = torch.empty(q.shape[0], dtype=torch.float32, device=q.device)
 
-    torch.ops.sglang_mxfp4.decode(
+    o, _lse = torch.ops.sglang_mxfp4.decode(
         q,
         k_cache,
         page_indices,
         attn_sink,
         o,
+        lse,
         sm_scale,
         page_size,
         num_valid,

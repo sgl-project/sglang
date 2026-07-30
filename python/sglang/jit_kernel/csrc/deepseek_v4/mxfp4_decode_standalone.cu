@@ -12,6 +12,7 @@
 #include <torch/all.h>
 
 #include <cstdint>
+#include <tuple>
 
 // ──── constants ──────────────────────────────────────────────────────────────
 
@@ -66,6 +67,7 @@ struct Mxfp4DecodeParams {
   const int32_t* __restrict__ indices;
   const float* __restrict__ attn_sink;
   void* __restrict__ o;
+  float* __restrict__ lse;
   float sm_scale;
   uint32_t page_stride_bytes;
   uint32_t page_size;
@@ -169,18 +171,28 @@ __global__ void mxfp4_decode_kernel(const __grid_constant__ Mxfp4DecodeParams pa
 #pragma unroll
   for (int j = 0; j < kRopeDim / kLanes; ++j)
     o_bf16[kNopeDim + j * kLanes + lane_id] = __float2bfloat16_rn(o_val[kNumGroups + j] * inv_s);
+
+  // ---- log-sum-exp (for merging with extra attention) ----
+  if (params.lse != nullptr) {
+    // LSE = m + log(s)  where m = max score, s = sum(exp(score - m))
+    // This is the log of the softmax normalizer: log(sum(exp(scores)))
+    if (lane_id == 0) {
+      params.lse[gid] = m + logf(s_val > 0.0f ? s_val : 1e-30f);
+    }
+  }
 }
 
 // ──── PyTorch custom op ──────────────────────────────────────────────────────
 
 namespace {
 
-torch::Tensor mxfp4_decode_op(
+std::tuple<torch::Tensor, torch::Tensor> mxfp4_decode_op(
     torch::Tensor q,
     torch::Tensor k_cache,
     torch::Tensor page_indices,
     std::optional<torch::Tensor> attn_sink,
     torch::Tensor o,
+    torch::Tensor lse,
     double sm_scale,
     int64_t page_size,
     int64_t num_valid) {
@@ -188,7 +200,7 @@ torch::Tensor mxfp4_decode_op(
   const at::cuda::CUDAGuard guard(device.index());
 
   const uint32_t nq = static_cast<uint32_t>(q.size(0));
-  if (nq == 0) return o;
+  if (nq == 0) return std::make_tuple(o, lse);
 
   Mxfp4DecodeParams params{};
   params.q = q.data_ptr();
@@ -196,6 +208,7 @@ torch::Tensor mxfp4_decode_op(
   params.indices = page_indices.data_ptr<int32_t>();
   params.attn_sink = attn_sink.has_value() ? attn_sink->data_ptr<float>() : nullptr;
   params.o = o.data_ptr();
+  params.lse = lse.data_ptr<float>();
   params.sm_scale = static_cast<float>(sm_scale);
   params.page_stride_bytes = static_cast<uint32_t>(static_cast<uint32_t>(page_size) * kBytesPerToken);
   params.page_size = static_cast<uint32_t>(page_size);
@@ -207,14 +220,14 @@ torch::Tensor mxfp4_decode_op(
 
   mxfp4_decode_kernel<<<grid, kBlockSize, 0, stream>>>(params);
 
-  return o;
+  return std::make_tuple(o, lse);
 }
 
 TORCH_LIBRARY(sglang_mxfp4, m) {
   m.def(
       "decode(Tensor q, Tensor k_cache, Tensor page_indices, "
-      "Tensor? attn_sink, Tensor o, float sm_scale, int page_size, "
-      "int num_valid) -> Tensor",
+      "Tensor? attn_sink, Tensor o, Tensor lse, float sm_scale, int page_size, "
+      "int num_valid) -> (Tensor, Tensor)",
       mxfp4_decode_op);
 }
 
