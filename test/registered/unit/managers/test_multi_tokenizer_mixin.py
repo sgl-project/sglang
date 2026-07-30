@@ -1,16 +1,23 @@
 import unittest
+from array import array
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import BatchStrOutput
+from sglang.srt.managers.io_struct import (
+    BatchEmbeddingOutput,
+    BatchStrOutput,
+    msgpack_decode,
+    msgpack_encode,
+)
 from sglang.srt.managers.multi_tokenizer_mixin import (
     TokenizerWorker,
     _handle_output_by_index,
     get_tokenizer_worker_class,
 )
+from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -46,7 +53,7 @@ def _make_batch_str_output() -> BatchStrOutput:
         spec_correct_drafts_histogram=[[], []],
         finished_reasons=[None, {"type": "length"}],
         output_strs=["first", "second"],
-        output_ids=[[1], [2]],
+        output_ids=[array("i", [1]), array("i", [2])],
         prompt_tokens=[10, 20],
         completion_tokens=[1, 2],
         reasoning_tokens=[0, 0],
@@ -79,7 +86,7 @@ def _make_batch_str_output() -> BatchStrOutput:
     )
 
 
-class TestMultiTokenizerMixin(unittest.TestCase):
+class TestMultiTokenizerMixin(CustomTestCase):
     def test_batch_str_output_preserves_cached_tokens_details(self):
         output = _make_batch_str_output()
 
@@ -104,6 +111,45 @@ class TestMultiTokenizerMixin(unittest.TestCase):
     def test_get_tokenizer_worker_class_rejects_non_worker(self):
         with self.assertRaisesRegex(TypeError, "TokenizerWorker"):
             get_tokenizer_worker_class(InvalidServerArgs())
+
+    def test_batch_str_output_preserves_time_stats_after_msgpack(self):
+        output = _make_batch_str_output()
+        output.time_stats = [
+            SchedulerReqTimeStats(
+                enable_metrics=True, wait_queue_entry_time=1.0
+            ).to_ipc(),
+            SchedulerReqTimeStats(
+                enable_metrics=True, wait_queue_entry_time=2.0
+            ).to_ipc(),
+        ]
+
+        decoded = msgpack_decode(msgpack_encode(output))
+        single_output = _handle_output_by_index(decoded, 1)
+
+        self.assertEqual(len(single_output.time_stats), 1)
+        self.assertIsInstance(single_output.time_stats[0], SchedulerReqTimeStats)
+        self.assertEqual(single_output.time_stats[0].wait_queue_entry_time, 2.0)
+
+    def test_batch_embedding_output_preserves_time_stats(self):
+        output = BatchEmbeddingOutput(
+            rids=["rid-0", "rid-1"],
+            finished_reasons=[None, None],
+            embeddings=[[1.0], [2.0]],
+            prompt_tokens=[10, 20],
+            cached_tokens=[3, 4],
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
+            time_stats=[
+                SchedulerReqTimeStats(wait_queue_entry_time=1.0),
+                SchedulerReqTimeStats(wait_queue_entry_time=2.0),
+            ],
+        )
+
+        single_output = _handle_output_by_index(output, 1)
+
+        self.assertEqual(len(single_output.time_stats), 1)
+        self.assertIsInstance(single_output.time_stats[0], SchedulerReqTimeStats)
+        self.assertEqual(single_output.time_stats[0].wait_queue_entry_time, 2.0)
 
 
 if __name__ == "__main__":

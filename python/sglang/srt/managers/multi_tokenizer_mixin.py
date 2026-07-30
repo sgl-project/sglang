@@ -124,7 +124,7 @@ def _extract_field_by_index(
     if field is None:
         return None
 
-    should_wrap_result = field_name in ("customized_info", "time_stats")
+    should_wrap_result = field_name == "customized_info"
     if should_wrap_result:
         field = unwrap_from_pickle(field)
         if field is None:
@@ -261,6 +261,7 @@ def _handle_output_by_index(output, i):
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
             rids=[output.rids[i]],
+            time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             embeddings=_extract_field_by_index(output, "embeddings", i),
             prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
