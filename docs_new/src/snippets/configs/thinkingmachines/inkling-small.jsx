@@ -4,11 +4,9 @@
 // `{{MODEL_NAME}}` resolves to `modelNames` below (HF repos under the thinkingmachines org).
 
 export const config = {
-  modelName: "Inkling",
+  modelName: "Inkling-Small",
 
-  // Full platform list. Verified end-to-end: B200, B300, GB300, H200, and AMD
-  // (MI350X / MI355X). The remaining cells (GB200, B200 BF16 multi-node) are
-  // same-arch extrapolations and stay unverified until re-checked.
+  // Platform list inherited from the Inkling recipes (same architecture family).
   supportedHardware: [
     "h200", "b200", "b300", "gb200", "gb300",
     "mi350x", "mi355x",
@@ -34,15 +32,13 @@ export const config = {
     { id: "multi-2", label: "Multi-Nodes" },
   ],
 
-  // Eval set rendered in the benchmark card, keyed to per-cell `accuracy` in
-  // inkling-benchmarks.jsx. All measured at reasoning_effort `max` (0.99).
-  // AIME25 = pass@1 averaged over 8 repeats; NIAH = single-needle retrieval at
-  // that context length; HLE = self-judged on the text-only subset.
   accuracyLabels: [
+    ["gsm8k_pct",     "GSM8K",           "%"],
     ["bfcl_pct",      "BFCL (EXACT)",    "%"],
     ["mmau_pct",      "MMAU",            "%"],
     ["mmmu_pro_pct",  "MMMU-Pro",        "%"],
     ["aime25_pct",    "AIME25 (pass@1)", "%"],
+    ["aime26_pct",    "AIME26 (pass@1)", "%"],
     ["niah_512k_pct", "NIAH @512K",      "%"],
     ["niah_1m_pct",   "NIAH @1M",        "%"],
     ["hle_pct",       "HLE",             "%"],
@@ -50,10 +46,10 @@ export const config = {
 
   // HF repos under the thinkingmachines org.
   modelNames: {
-    "default|nvfp4": "thinkingmachines/Inkling-NVFP4",
-    "default|bf16":  "thinkingmachines/Inkling",
-    "lora|nvfp4":    "thinkingmachines/Inkling-NVFP4",
-    "lora|bf16":     "thinkingmachines/Inkling",
+    "default|nvfp4": "thinkingmachines/Inkling-Small-NVFP4",
+    "default|bf16":  "thinkingmachines/Inkling-Small",
+    "lora|nvfp4":    "thinkingmachines/Inkling-Small-NVFP4",
+    "lora|bf16":     "thinkingmachines/Inkling-Small",
   },
 
   placeholders: {
@@ -87,13 +83,13 @@ export const config = {
   },
 
   github: {
-    cookbookModel: "thinkingmachines/inkling",
+    cookbookModel: "thinkingmachines/inkling-small",
   },
 
   playgroundFeatures: {
 
     // ----- Card: "Attention Parallelism" -----
-    // TP only. Inkling needs TP=8 to hold the 1M-token SWA + Mamba/sconv pools
+    // TP only. Inkling-Small needs TP=8 to hold the 1M-token SWA + Mamba/sconv pools
     // (TP=4 can't fit — see §2). TP=16 is cross-node (multi-node path).
     attention: {
       knobs: [
@@ -138,7 +134,7 @@ export const config = {
       ],
     },
 
-    // ----- Card: "Speculative Decoding" -----  Inkling ships an MTP draft head.
+    // ----- Card: "Speculative Decoding" -----  Inkling-Small ships an MTP draft head.
     speculative: {
       options: [
         { id: "current", label: "Inherited from base" },
@@ -516,7 +512,7 @@ export const config = {
     },
 
     // ====================================================================
-    // MTP (speculative decoding) — Inkling's multi-layer MTP draft head.
+    // MTP (speculative decoding) — Inkling-Small's multi-layer MTP draft head.
     // --enable-multi-layer-eagle is REQUIRED (without it the standard EAGLE
     // worker runs against the multi-layer draft and outputs garbage).
     // B200 / B300 / GB300 / H200 verified end-to-end.
@@ -538,7 +534,7 @@ export const config = {
         "--moe-runner-backend flashinfer_trtllm_routed",
         "--enable-torch-symm-mem",
         "--mamba-radix-cache-strategy extra_buffer",
-        "--mem-fraction-static 0.75",
+        "--mem-fraction-static 0.60",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
         "--enable-multimodal",
@@ -571,7 +567,7 @@ export const config = {
         "--moe-runner-backend flashinfer_trtllm_routed",
         "--enable-torch-symm-mem",
         "--mamba-radix-cache-strategy extra_buffer",
-        "--mem-fraction-static 0.70",
+        "--mem-fraction-static 0.55",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
         "--enable-multimodal",
@@ -636,7 +632,7 @@ export const config = {
         "--moe-runner-backend flashinfer_trtllm_routed",
         "--enable-torch-symm-mem",
         "--mamba-radix-cache-strategy extra_buffer",
-        "--mem-fraction-static 0.75",
+        "--mem-fraction-static 0.60",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
         "--enable-multimodal",
@@ -669,7 +665,7 @@ export const config = {
         "--moe-runner-backend marlin",
         "--enable-torch-symm-mem",
         "--mamba-radix-cache-strategy extra_buffer",
-        "--mem-fraction-static 0.78",
+        "--mem-fraction-static 0.60",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
         "--enable-multimodal",
@@ -686,11 +682,9 @@ export const config = {
       ],
     },
     // ====================================================================
-    // DSpark (speculative decoding) — separate draft checkpoint
-    // (RadixArk/Inkling-DSpark-Preview, served unquantized) instead of Inkling's
-    // own MTP head. The draft weights sit outside the FP4 target, hence
-    // mem-fraction 0.68.
-    // B200 verified end-to-end.
+    // DSpark (speculative decoding) — a separate draft checkpoint served
+    // unquantized, instead of Inkling-Small's own MTP head. The draft weights
+    // sit outside the FP4 target, hence mem-fraction 0.68.
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
@@ -718,7 +712,112 @@ export const config = {
         "--tool-call-parser inkling",
         "--skip-server-warmup",
         "--speculative-algorithm DSPARK",
-        "--speculative-draft-model-path RadixArk/Inkling-DSpark-Preview",
+        "--speculative-draft-model-path RadixArk/Inkling-Small-DSpark-Preview",
+        "--speculative-draft-model-quantization unquant",
+        "--chunked-prefill-size 8192",
+        "--cuda-graph-max-bs-prefill 8192",
+        "--disable-flashinfer-autotune",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
+      verified: true,
+      env: [
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--quantization modelopt_fp4",
+        "--attention-backend fa4",
+        "--page-size 128",
+        "--fp4-gemm-backend flashinfer_trtllm",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--enable-torch-symm-mem",
+        "--mamba-radix-cache-strategy extra_buffer",
+        "--mem-fraction-static 0.68",
+        "--swa-full-tokens-ratio 0.1",
+        "--mamba-full-memory-ratio 0.1",
+        "--enable-multimodal",
+        "--max-running-requests 68",
+        "--reasoning-parser inkling",
+        "--tool-call-parser inkling",
+        "--skip-server-warmup",
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path RadixArk/Inkling-Small-DSpark-Preview",
+        "--speculative-draft-model-quantization unquant",
+        "--chunked-prefill-size 8192",
+        "--cuda-graph-max-bs-prefill 8192",
+        "--disable-flashinfer-autotune",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
+      verified: true,
+      env: [
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--quantization modelopt_fp4",
+        "--attention-backend fa4",
+        "--page-size 128",
+        "--fp4-gemm-backend flashinfer_trtllm",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--enable-torch-symm-mem",
+        "--mamba-radix-cache-strategy extra_buffer",
+        "--mem-fraction-static 0.68",
+        "--swa-full-tokens-ratio 0.1",
+        "--mamba-full-memory-ratio 0.1",
+        "--enable-multimodal",
+        "--max-running-requests 68",
+        "--reasoning-parser inkling",
+        "--tool-call-parser inkling",
+        "--skip-server-warmup",
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path RadixArk/Inkling-Small-DSpark-Preview",
+        "--speculative-draft-model-quantization unquant",
+        "--chunked-prefill-size 8192",
+        "--cuda-graph-max-bs-prefill 8192",
+        "--disable-flashinfer-autotune",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
+      verified: true,
+      env: [
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--quantization modelopt_fp4",
+        "--attention-backend fa4",
+        "--page-size 128",
+        "--fp4-gemm-backend marlin",
+        "--moe-runner-backend marlin",
+        "--enable-torch-symm-mem",
+        "--mamba-radix-cache-strategy extra_buffer",
+        "--mem-fraction-static 0.60",
+        "--swa-full-tokens-ratio 0.1",
+        "--mamba-full-memory-ratio 0.1",
+        "--enable-multimodal",
+        "--max-running-requests 68",
+        "--reasoning-parser inkling",
+        "--tool-call-parser inkling",
+        "--skip-server-warmup",
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path RadixArk/Inkling-Small-DSpark-Preview",
         "--speculative-draft-model-quantization unquant",
         "--chunked-prefill-size 8192",
         "--cuda-graph-max-bs-prefill 8192",
@@ -736,7 +835,6 @@ export const config = {
     // ====================================================================
     {
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "multi-2" },
-      verified: true,
       env: [
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
@@ -766,7 +864,6 @@ export const config = {
     },
     {
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "mtp", nodes: "multi-2" },
-      verified: true,
       env: [
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
@@ -842,9 +939,7 @@ export const config = {
         "--moe-runner-backend flashinfer_trtllm_routed",
         "--enable-torch-symm-mem",
         "--mamba-radix-cache-strategy extra_buffer",
-        // BF16 + MTP is tight on B300: 0.87 boots but caps the token pool near
-        // ~185k; 0.93 fits the full 1M context (matches the Balanced cell).
-        "--mem-fraction-static 0.93",
+        "--mem-fraction-static 0.65",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
         "--enable-multimodal",
@@ -915,14 +1010,13 @@ export const config = {
       ],
     },
     // ====================================================================
-    // LoRA serving. Prefill CUDA graphs auto-disable under --enable-lora.
+    // LoRA serving. LoRA prefill currently requires CUDA graphs to be disabled.
     // Set MAX_LORAS to the number of distinct adapters served (1 is fastest
-    // for single-adapter serving). All cells except GB200 verified end-to-end
-    // (coherence + trainer-logprob parity + throughput).
+    // for single-adapter serving). Verified cells are marked individually
+    // after end-to-end validation.
     // ====================================================================
     {
       match: { hw: "b200", variant: "lora", quant: "nvfp4", strategy: "balanced", nodes: "single" },
-      verified: true,
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
         "SGLANG_EXPERIMENTAL_LORA_OPTI=1",
@@ -957,7 +1051,6 @@ export const config = {
     },
     {
       match: { hw: "b300", variant: "lora", quant: "nvfp4", strategy: "balanced", nodes: "single" },
-      verified: true,
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
         "SGLANG_EXPERIMENTAL_LORA_OPTI=1",
@@ -1038,7 +1131,6 @@ export const config = {
         "--tp 4",
         "--quantization modelopt_fp4",
         "--attention-backend fa4",
-        "--page-size 128",
         "--fp4-gemm-backend marlin",
         "--moe-runner-backend experimental_sgl_marlin",
         "--enable-torch-symm-mem",
@@ -1066,17 +1158,18 @@ export const config = {
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
         "SGLANG_EXPERIMENTAL_LORA_OPTI=1",
         "SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC=1",
+        "SGLANG_OPT_USE_INKLING_SHEARED_BIAS=0",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 8",
+        "--tp 4",
         "--quantization modelopt_fp4",
         "--attention-backend fa4",
         "--page-size 128",
         "--fp4-gemm-backend marlin",
         "--moe-runner-backend experimental_sgl_marlin",
-        "--enable-torch-symm-mem",
+        "--disable-custom-all-reduce",
         "--mamba-radix-cache-strategy extra_buffer",
         "--mem-fraction-static 0.85",
         "--swa-full-tokens-ratio 0.1",
@@ -1095,12 +1188,9 @@ export const config = {
       ],
     },
     {
-      match: { hw: "gb300", variant: "lora", quant: "bf16", strategy: "balanced", nodes: "multi-2" },
+      match: { hw: "gb300", variant: "lora", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [
-        "NCCL_MNNVL_ENABLE=1",
-        "NCCL_NVLS_ENABLE=1",
-        "NCCL_CUMEM_ENABLE=1",
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
         "SGLANG_EXPERIMENTAL_LORA_OPTI=1",
         "SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC=1",
@@ -1109,10 +1199,45 @@ export const config = {
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 8",
+        "--tp 4",
         "--moe-runner-backend experimental_sgl_trtllm",
         "--attention-backend fa4",
+        "--enable-torch-symm-mem",
+        "--mamba-radix-cache-strategy extra_buffer",
+        "--mem-fraction-static 0.87",
+        "--swa-full-tokens-ratio 0.1",
+        "--mamba-full-memory-ratio 0.1",
+        "--enable-multimodal",
+        "--reasoning-parser inkling",
+        "--tool-call-parser inkling",
+        "--enable-lora",
+        "--disable-prefill-cuda-graph",
+        "--lora-backend triton",
+        "--lora-use-virtual-experts",
+        "--max-loras-per-batch {{MAX_LORAS}}",
+        "--lora-paths lora0={{ADAPTER_PATH}}",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "lora", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+        "SGLANG_EXPERIMENTAL_LORA_OPTI=1",
+        "SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC=1",
+        "SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN=1",
+        "SGLANG_OPT_USE_INKLING_SHEARED_BIAS=0",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend triton",
+        "--attention-backend fa4",
         "--page-size 128",
+        "--disable-custom-all-reduce",
         "--enable-torch-symm-mem",
         "--mamba-radix-cache-strategy extra_buffer",
         "--mem-fraction-static 0.87",
