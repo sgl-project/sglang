@@ -136,6 +136,10 @@ class FlashAttentionBackend(AttentionBackend):
     needs_cpu_seq_lens: bool = False
     supports_ragged_verify_graph: bool = True
 
+    # Chunked-prefix attention reads the stable ForwardBatch cu-seqlens and
+    # KV-index buffers directly, so it needs no backend-private replay state.
+    supports_full_cuda_graph_chunked_prefix = True
+
     def __init__(
         self,
         model_runner: ModelRunner,

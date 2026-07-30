@@ -77,6 +77,40 @@ def create_triton_kv_indices_for_dcp_triton(
 # all-gathered dcp_kv_buffer, plus the per-rank shard/compact kernel.
 # ---------------------------------------------------------------------------
 @triton.jit
+def create_mla_kv_page_table_for_dcp(
+    req_to_token_ptr,
+    req_pool_indices_ptr,
+    local_seq_lens_ptr,
+    block_kv_indices_ptr,
+    req_to_token_stride: tl.constexpr,
+    block_table_stride: tl.constexpr,
+    PHYSICAL_PAGE_SIZE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    PAGES_PER_BLOCK: tl.constexpr,
+):
+    req = tl.program_id(0)
+    page_block = tl.program_id(1)
+    page_offsets = page_block * PAGES_PER_BLOCK + tl.arange(0, PAGES_PER_BLOCK)
+    local_len = tl.load(local_seq_lens_ptr + req)
+    local_pages = tl.cdiv(local_len, PHYSICAL_PAGE_SIZE)
+    mask = page_offsets < local_pages
+    global_positions = DCP_RANK + page_offsets * PHYSICAL_PAGE_SIZE * DCP_SIZE
+    req_pool_index = tl.load(req_pool_indices_ptr + req)
+    virtual_locs = tl.load(
+        req_to_token_ptr + req_pool_index * req_to_token_stride + global_positions,
+        mask=mask,
+        other=0,
+    )
+    physical_pages = virtual_locs // DCP_SIZE // PHYSICAL_PAGE_SIZE
+    tl.store(
+        block_kv_indices_ptr + req * block_table_stride + page_offsets,
+        physical_pages,
+        mask=mask,
+    )
+
+
+@triton.jit
 def create_dcp_kv_indices(
     kv_indptr,
     extend_lens_ptr,

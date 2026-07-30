@@ -1087,6 +1087,11 @@ class Gemma3RMSNorm(MultiPlatformOp):
             return gemma_rmsnorm(x, self.weight.data, self.eps)
         return self.forward_native(x)
 
+    def forward_hip(self, x, residual: Optional[torch.Tensor] = None):
+        # sgl_kernel's gemma_rmsnorm/gemma_fused_add_rmsnorm are not available on
+        # ROCm; delegate to the pure-PyTorch implementation.
+        return self.forward_native(x, residual)
+
     def forward_npu(self, x, residual: Optional[torch.Tensor] = None):
         if residual is not None:
             return self.forward_native(x, residual)

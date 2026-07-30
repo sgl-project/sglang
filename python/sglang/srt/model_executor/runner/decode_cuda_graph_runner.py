@@ -99,6 +99,7 @@ from sglang.srt.utils import (
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.profile_utils import export_cuda_graph_capture_trace
 
 try:
@@ -1212,12 +1213,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        timer_ctx = (
-            self.model_runner.device_timer.wrap(
-                metadata={"category": forward_batch.forward_mode.name.lower()}
-            )
-            if self.model_runner.device_timer
-            else contextlib.nullcontext()
+        timer_ctx = device_timer_ctx(
+            self.model_runner.device_timer, forward_batch.forward_mode.name.lower()
         )
         # Publish a read-done event for the WAR barrier: a cuda-graph forward
         # finishes its shared req_to_token / SWA reads at this pre-replay
