@@ -154,6 +154,10 @@ if _use_aiter_gfx95:
         fused_rms_fp8_group_quant,
     )
 
+    from sglang.srt.layers.quantization.rocm_mla_value_mxfp4 import (
+        batched_gemm_a16wfp4_flatten_mxfp4_quant,
+        can_fuse_mla_value_bmm_mxfp4_quant,
+    )
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
         batched_gemm_afp4wfp4_pre_quant,
         fused_flatten_mxfp4_quant,
@@ -331,6 +335,26 @@ class DeepseekMLAForwardMixin:
         if eligible is None or not eligible(forward_batch, self.num_local_heads):
             return None
         return backend
+
+    def _can_fuse_rocm_mla_value_mxfp4_quant(
+        self: DeepseekV2AttentionMLA,
+        forward_batch: ForwardBatch,
+    ) -> bool:
+        return (
+            _is_hip
+            and _use_aiter_gfx95
+            and envs.SGLANG_ROCM_FUSE_MLA_VALUE_MXFP4_QUANT.get()
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and self.current_attention_backend == "aiter"
+            and not self.use_dsa
+            and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+            and not is_kv_b_lora_active(self)
+            and self.w_vc.dtype == torch.uint8
+            and self.w_scale_v is not None
+            and self.o_proj.weight.dtype == torch.uint8
+            and self.kv_lora_rank == 512
+            and self.v_head_dim == 128
+        )
 
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
@@ -1105,25 +1129,40 @@ class DeepseekMLAForwardMixin:
             # TODO(haishaw): add bmm_fp8 to ROCm
             if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
                 x = attn_output.transpose(0, 1)
-                B_heads, M_batch = x.shape[0], x.shape[1]
-                N_vdim = self.w_vc.shape[2]
-                # Allocate in (batch, heads, dim) so the post-GEMM
-                # transpose+flatten is a free view instead of a copy.
-                _bmm_buf = torch.empty(
-                    M_batch,
-                    B_heads,
-                    N_vdim,
-                    device=x.device,
-                    dtype=torch.bfloat16,
-                )
-                attn_bmm_output = _bmm_buf.transpose(0, 1)
-                batched_gemm_afp4wfp4_pre_quant(
-                    x,
-                    self.w_vc.transpose(-2, -1),
-                    self.w_scale_v.transpose(-2, -1),
-                    torch.bfloat16,
-                    attn_bmm_output,
-                )
+                w_vc = self.w_vc.transpose(-2, -1)
+                w_scale_v = self.w_scale_v.transpose(-2, -1)
+                fuse_value_quant = self._can_fuse_rocm_mla_value_mxfp4_quant(
+                    forward_batch
+                ) and can_fuse_mla_value_bmm_mxfp4_quant(x, w_vc, w_scale_v)
+                if fuse_value_quant:
+                    attn_bmm_output = batched_gemm_a16wfp4_flatten_mxfp4_quant(
+                        x, w_vc, w_scale_v
+                    )
+                    _bmm_buf = None
+                    logger.info_once(
+                        "ROCm MLA value projection + MXFP4 output quantization "
+                        "fusion is enabled."
+                    )
+                else:
+                    B_heads, M_batch = x.shape[0], x.shape[1]
+                    N_vdim = self.w_vc.shape[2]
+                    # Allocate in (batch, heads, dim) so the post-GEMM
+                    # transpose+flatten is a free view instead of a copy.
+                    _bmm_buf = torch.empty(
+                        M_batch,
+                        B_heads,
+                        N_vdim,
+                        device=x.device,
+                        dtype=torch.bfloat16,
+                    )
+                    attn_bmm_output = _bmm_buf.transpose(0, 1)
+                    batched_gemm_afp4wfp4_pre_quant(
+                        x,
+                        w_vc,
+                        w_scale_v,
+                        torch.bfloat16,
+                        attn_bmm_output,
+                    )
             else:
                 _bmm_buf = None
                 if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
@@ -1143,7 +1182,9 @@ class DeepseekMLAForwardMixin:
                         self.w_vc.to(torch.bfloat16) * self.w_scale,
                     )
 
-            if _bmm_buf is not None:
+            if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8 and fuse_value_quant:
+                pass
+            elif _bmm_buf is not None:
                 # _bmm_buf is already (batch, heads, dim) contiguous
                 if self.o_proj.weight.dtype == torch.uint8:
                     attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
