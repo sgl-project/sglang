@@ -201,8 +201,9 @@ if _is_cuda or _is_hip or _is_xpu:
             pass
 if _use_aiter:
     try:
-        from aiter import biased_grouped_topk as aiter_biased_grouped_topk
         from aiter.fused_moe import fused_topk as aiter_fused_topk
+
+        from aiter import biased_grouped_topk as aiter_biased_grouped_topk
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 if _is_musa:

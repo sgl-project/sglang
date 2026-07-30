@@ -1955,7 +1955,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         state.hidden_states_after_input_norm = hidden_states
         state.attn_x_quant = x_quant
         # mori's op_output slices final_hidden_states[:num_tokens].
-        if get_moe_a2a_backend().is_mori():
+        if get_moe_a2a_backend().is_mori() or get_moe_a2a_backend().is_flydsl():
             state.num_tokens = attn_residual.shape[0]
         state.update(
             dict(
@@ -2261,6 +2261,21 @@ class DeepseekV4Model(nn.Module):
         operations_strategy = OperationsStrategy.init_new_tbo(
             layers, forward_batch.global_forward_mode
         )
+
+        # DSV4 FlyDSL eager prefill uses one rank-consistent receive-cap input
+        # per child for every MoE layer. Child split/padding is rank-local, so
+        # collect both children's padded row counts once on the host TP group.
+        # CUDA-graph/decode behavior remains on the existing cap path.
+        if get_moe_a2a_backend().is_flydsl() and not get_is_capture_mode():
+            from sglang.srt.layers.moe.token_dispatcher.flydslep import (
+                prepare_tbo_eager_recv_cap_metadata,
+            )
+
+            prepare_tbo_eager_recv_cap_metadata(
+                parent_global_num_tokens=forward_batch.global_num_tokens_cpu,
+                children=forward_batch.tbo_children,
+                group=get_tp_group(),
+            )
 
         # Split the per-rank batch into the 2 ubatches (token-range slice + pad
         # to tbo_padded_len). residual is unused by the DSV4 non-fused layer ops.

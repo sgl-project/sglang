@@ -137,6 +137,8 @@ if _is_hip:
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
     try:
+        from aiter.mla import mla_decode_fwd, mla_prefill_fwd  # noqa: F401
+
         from aiter import (  # noqa: F401
             flash_attn_varlen_func,
             get_mla_metadata_info_v1,
@@ -144,7 +146,6 @@ if _is_hip:
             mha_batch_prefill_func,
             paged_attention_ragged,
         )
-        from aiter.mla import mla_decode_fwd, mla_prefill_fwd  # noqa: F401
     except ImportError:
         print(
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."

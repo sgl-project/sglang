@@ -129,6 +129,7 @@ class RMSNormOp(BaseFusedOp):
         enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
         import torch
+
         from aiter import rmsnorm2d_fwd
 
         # Mirrors production srt/layers/layernorm.py: rmsnorm2d_fwd(out, x, w, eps)
@@ -242,6 +243,7 @@ class FusedAddRMSNormOp(BaseFusedOp):
         enable_pdl: Optional[bool] = None,
     ) -> None:
         import torch
+
         from aiter import rmsnorm2d_fwd_with_add
 
         # aiter writes the normalized value and the new residual into separate

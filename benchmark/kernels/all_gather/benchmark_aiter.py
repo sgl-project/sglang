@@ -238,10 +238,11 @@ def install_aiter_aot_import_shims() -> None:
     if os.getenv("AITER_AOT_IMPORT") != "1":
         return
 
-    import aiter
     from aiter.jit.utils.torch_guard import torch_compile_guard
-    from aiter.ops import custom_all_reduce
     from aiter.ops.quant import get_hip_quant
+
+    import aiter
+    from aiter.ops import custom_all_reduce
 
     aiter.torch_compile_guard = torch_compile_guard
     aiter.get_hip_quant = get_hip_quant

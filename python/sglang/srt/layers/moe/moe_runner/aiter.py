@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -19,6 +20,14 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import get_bool_env_var, get_int_env_var
+from sglang.srt.utils.bounded_telemetry import BoundedTelemetryLogger
+
+logger = logging.getLogger(__name__)
+_flydsl_aiter_telemetry = BoundedTelemetryLogger(
+    logger,
+    "[SGLANG_FLYDSL_TBO_TELEMETRY]",
+    enabled=get_bool_env_var("SGLANG_FLYDSL_TBO_TELEMETRY", "false"),
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
@@ -248,6 +257,22 @@ def _is_mori_dispatch_output(dispatch_output: Any) -> bool:
     return hasattr(dispatch_output, "origin_topk_ids")
 
 
+def _is_flydsl_dispatch_output(dispatch_output: Any) -> bool:
+    cls = type(dispatch_output)
+    return cls.__name__.startswith("FlyDSL") or cls.__module__.endswith(
+        ".token_dispatcher.flydslep"
+    )
+
+
+def _resolve_mori_dispatch_slice_limit(
+    *, is_mori: bool, is_flydsl: bool, configured_max: int
+) -> Optional[int]:
+    """Mori's input limit never applies to FlyDSL's fixed-cap dispatch views."""
+    if is_mori and not is_flydsl and configured_max > 0:
+        return configured_max
+    return None
+
+
 def _resolve_mori_quant_type(
     dispatch_a1_dtype: torch.dtype,
     dispatch_scale: Optional[torch.Tensor],
@@ -290,8 +315,11 @@ def _pre_permute_deepep_to_aiter(
     running_state: dict,
 ) -> AiterRunnerInput:
     is_mori = _is_mori_dispatch_output(dispatch_output)
+    is_flydsl = _is_flydsl_dispatch_output(dispatch_output)
 
     hidden_states = dispatch_output.hidden_states
+    dispatched_rows = hidden_states.shape[0]
+    dispatch_dtype = hidden_states.dtype
     topk_ids = dispatch_output.topk_ids.to(torch.int32)
     topk_weights = dispatch_output.topk_weights.to(torch.float32)
     a1_scale: Optional[torch.Tensor] = None
@@ -305,17 +333,23 @@ def _pre_permute_deepep_to_aiter(
         a1_scale = dispatch_output.hidden_states_scale
         num_local_tokens = dispatch_output.num_recv_tokens_per_expert
         output_dtype = dispatch_output.out_dtype
+        upscale_path = "none"
 
         # Truncate dispatch tensors to the configured cap; mori combine only
         # reads [0, totalRecvTokenNum), so the truncated result needs no
         # padding back.
         mori_max = get_int_env_var("SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0)
-        if mori_max > 0:
-            hidden_states = hidden_states[:mori_max]
+        slice_limit = _resolve_mori_dispatch_slice_limit(
+            is_mori=is_mori,
+            is_flydsl=is_flydsl,
+            configured_max=mori_max,
+        )
+        if slice_limit is not None:
+            hidden_states = hidden_states[:slice_limit]
             if a1_scale is not None:
-                a1_scale = a1_scale[:mori_max]
-            topk_ids = topk_ids[:mori_max]
-            topk_weights = topk_weights[:mori_max]
+                a1_scale = a1_scale[:slice_limit]
+            topk_ids = topk_ids[:slice_limit]
+            topk_weights = topk_weights[:slice_limit]
 
         # Upscale dispatched activations when there is no AITER kernel for the
         # weight/activation dtype pair.
@@ -341,6 +375,7 @@ def _pre_permute_deepep_to_aiter(
                 hidden_states, a1_scale, num_local_tokens, output_dtype
             )
             a1_scale = None
+            upscale_path = "fp8_to_output_dtype"
         elif is_w4a4 and is_fp4_dispatch and a1_scale is not None and swiglu_interleave:
             # W4A4 weights + FP4 dispatch on the clamped-SwiGLU/INTERLEAVE
             # path: AITER expects a bf16/fp8 activation here, not fp4x2.
@@ -349,6 +384,7 @@ def _pre_permute_deepep_to_aiter(
                 hidden_states, a1_scale, num_local_tokens, output_dtype
             )
             a1_scale = None
+            upscale_path = "fp4_to_output_dtype_for_swiglu_interleave"
         elif is_fp8_quant and is_fp4_dispatch and a1_scale is not None:
             # FP8 weights + FP4 dispatch: no kernel for the fp4x2/fp8 pair;
             # dequant FP4->BF16 and let fused_moe re-quantize to FP8.
@@ -356,6 +392,7 @@ def _pre_permute_deepep_to_aiter(
                 hidden_states, a1_scale, num_local_tokens, output_dtype
             )
             a1_scale = None
+            upscale_path = "fp4_to_output_dtype_for_fp8_weights"
 
         quant_type = _resolve_mori_quant_type(
             hidden_states.dtype, a1_scale, weight_quant
@@ -365,6 +402,36 @@ def _pre_permute_deepep_to_aiter(
         running_state["aiter_combine_topk_weights"] = (
             dispatch_output.origin_topk_weights
         )
+        if is_flydsl:
+            telemetry_fields = {}
+            running_state_actual_total_recv = running_state.get(
+                "flydsl_telemetry_actual_total_recv"
+            )
+            if isinstance(running_state_actual_total_recv, int):
+                # Consume only an existing host value. Never inspect a device
+                # tensor or synchronize here to reconstruct this diagnostic.
+                telemetry_fields["actual_total_recv"] = running_state_actual_total_recv
+            _flydsl_aiter_telemetry.log(
+                "aiter_flydsl_mori_path",
+                "aiter_flydsl_mori_path",
+                mori_shaped_path=True,
+                dispatched_rows=dispatched_rows,
+                consumed_hidden_rows=hidden_states.shape[0],
+                consumed_topk_id_rows=topk_ids.shape[0],
+                consumed_topk_weight_rows=topk_weights.shape[0],
+                consumed_scale_rows=(
+                    a1_scale.shape[0] if a1_scale is not None else None
+                ),
+                truncation_limit=slice_limit,
+                truncated=hidden_states.shape[0] < dispatched_rows,
+                dispatch_dtype=dispatch_dtype,
+                consumed_dtype=hidden_states.dtype,
+                upscale_path=upscale_path,
+                weight_quant=weight_quant.value,
+                consumed_quant=quant_type.value,
+                activation_scale_consumed=a1_scale is not None,
+                **telemetry_fields,
+            )
     else:
         # DeepEP marks invalid topk slots with idx == -1; AITER cannot accept
         # negative ids, so reroute them to the sink slot at index

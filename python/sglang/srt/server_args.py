@@ -269,6 +269,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "mooncake",
     "nixl",
     "mori",
+    "flydsl",
     "ascend_fuseep",
     "flashinfer",
     "megamoe",
@@ -2250,6 +2251,7 @@ class ServerArgs:
             "mooncake",
             "nixl",
             "mori",
+            "flydsl",
             "ascend_fuseep",
             "flashinfer",
             "megamoe",
@@ -6656,10 +6658,7 @@ class ServerArgs:
             logger.warning(
                 f"MoRI MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
-
-            # Check chunked prefill for mori
-            # Skip validation if chunked prefill is disabled (i.e., size <= 0).
-            # Skip validation if disaggregation mode is decode.
+            # Skip validation if chunked prefill is disabled or this is decode-only.
             if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
                 assert (
                     self._required_mori_dispatch_tokens_per_rank()
@@ -6668,6 +6667,29 @@ class ServerArgs:
                     "must be >= the per-rank MoRI dispatch tokens "
                     "(chunked_prefill_size by default)"
                 )
+
+        if a2a_backend == "flydsl":
+            if self.deepep_mode == "auto":
+                self.deepep_mode = "normal"
+                logger.warning("auto set deepep_mode=`normal` for FlyDSL EP")
+            logger.warning(
+                "FlyDSL MoE A2A is enabled (intranode, world_size<=8). "
+                f"The expert parallel size is adjusted to match TP[{self.tp_size}]."
+            )
+            if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
+                current = int(
+                    os.environ.get(
+                        "SGLANG_FLYDSL_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "4096"
+                    )
+                )
+                if current < self.chunked_prefill_size:
+                    os.environ["SGLANG_FLYDSL_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = str(
+                        self.chunked_prefill_size
+                    )
+                    logger.warning(
+                        "auto set SGLANG_FLYDSL_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+                        f"{self.chunked_prefill_size} (was {current})"
+                    )
 
     def _required_mori_dispatch_tokens_per_rank(self) -> int:
         """Max tokens a single rank dispatches through MoRI in one forward."""

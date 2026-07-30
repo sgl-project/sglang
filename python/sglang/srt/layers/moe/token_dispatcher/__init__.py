@@ -25,6 +25,11 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     FlashinferDispatcher,
     FlashinferDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.flydslep import (
+    FlyDSLEPDispatcher,
+    FlyDSLEPNormalCombineInput,
+    FlyDSLEPNormalDispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.mooncake import (
     MooncakeCombineInput,
     MooncakeDispatchOutput,
@@ -59,6 +64,9 @@ __all__ = [
     "DispatchOutputChecker",
     "FlashinferDispatchOutput",
     "FlashinferDispatcher",
+    "FlyDSLEPDispatcher",
+    "FlyDSLEPNormalDispatchOutput",
+    "FlyDSLEPNormalCombineInput",
     "MooncakeCombineInput",
     "MooncakeDispatchOutput",
     "MooncakeEPDispatcher",

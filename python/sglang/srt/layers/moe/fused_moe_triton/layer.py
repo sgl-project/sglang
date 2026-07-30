@@ -96,7 +96,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 def _get_deepep_comm_group(a2a_backend):
     group = get_tp_group().device_group
 
-    if a2a_backend.is_mori():
+    if a2a_backend.is_mori() or a2a_backend.is_flydsl():
         group = get_tp_group()
 
     elif _is_npu:
@@ -122,6 +122,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         a2a_backend.is_deepep()
         or a2a_backend.is_mooncake()
         or a2a_backend.is_mori()
+        or a2a_backend.is_flydsl()
         or a2a_backend.is_nixl()
     ):
         return MaybeTboDeepEPDispatcher(

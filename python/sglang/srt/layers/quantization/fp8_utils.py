@@ -146,15 +146,16 @@ def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
 
 
 if _use_aiter:
+    from aiter.ops.triton.gemm_a8w8_blockscale import (
+        gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
+    )
+
     import aiter
     from aiter import gemm_a8w8_blockscale as ck_gemm_a8w8_blockscale
     from aiter import (
         gemm_a8w8_blockscale_bpreshuffle,
         gemm_a8w8_bpreshuffle,
         get_hip_quant,
-    )
-    from aiter.ops.triton.gemm_a8w8_blockscale import (
-        gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
     )
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)

@@ -10,6 +10,7 @@ from sglang.srt.layers.moe.moe_runner.aiter import (
     AiterQuantType,
     AiterRunnerCore,
     AiterRunnerInput,
+    _resolve_mori_dispatch_slice_limit,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -113,6 +114,28 @@ def test_aiter_runner_preserves_no_combine_rank_for_empty_input(monkeypatch):
     output = runner.run(runner_input, _quant_info(), running_state={})
 
     assert output.hidden_states.shape == (0, 2, 4)
+
+
+@pytest.mark.parametrize(
+    ("is_mori", "is_flydsl", "configured_max", "expected"),
+    [
+        (True, False, 64, 64),
+        (True, True, 64, None),
+        (False, False, 64, None),
+        (True, False, 0, None),
+    ],
+)
+def test_mori_input_slicing_never_applies_to_flydsl(
+    is_mori, is_flydsl, configured_max, expected
+):
+    assert (
+        _resolve_mori_dispatch_slice_limit(
+            is_mori=is_mori,
+            is_flydsl=is_flydsl,
+            configured_max=configured_max,
+        )
+        == expected
+    )
 
 
 if __name__ == "__main__":

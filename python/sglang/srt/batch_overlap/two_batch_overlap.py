@@ -27,6 +27,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
+    FlyDSLEPDispatcher,
     MooncakeEPDispatcher,
     MoriEPDispatcher,
     NixlEPDispatcher,
@@ -165,6 +166,12 @@ def _split_array_by_balanced_sum(arr: Sequence[int]) -> int:
             break
 
     return best_index
+
+
+def _tbo_child_token_counts(total_tokens: int, split_token_index: int):
+    child_a_tokens = split_token_index
+    child_b_tokens = total_tokens - split_token_index
+    return child_a_tokens, child_b_tokens, abs(child_a_tokens - child_b_tokens)
 
 
 def _update_device_and_sum_field_from_cpu_field(
@@ -526,11 +533,17 @@ class TboForwardBatchPreparer:
         )
 
         if _tbo_debug:
+            child_a_tokens, child_b_tokens, child_token_imbalance = (
+                _tbo_child_token_counts(batch.input_ids.shape[0], tbo_split_token_index)
+            )
             logger.info(
                 f"TboForwardBatchPreparer.prepare "
                 f"is_enable_two_chunk={is_enable_two_chunk} "
                 f"tbo_split_seq_index={batch.tbo_split_seq_index} "
                 f"tbo_split_token_index={tbo_split_token_index} "
+                f"child_a_tokens={child_a_tokens} "
+                f"child_b_tokens={child_b_tokens} "
+                f"child_token_imbalance={child_token_imbalance} "
                 f"extend_seq_lens={batch.extend_seq_lens_cpu} "
                 f"bs={batch.batch_size} "
                 f"forward_mode={batch.forward_mode}"
@@ -780,6 +793,7 @@ class TboForwardBatchPreparer:
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
+                flydsl_tbo_cluster_dispatch_rows=None,
                 original_global_num_tokens_cpu=None,
                 _original_batch_size=None,
                 _original_forward_mode=None,
@@ -1085,6 +1099,11 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         elif get_moe_a2a_backend().is_mori():
             self._inners = [
                 MoriEPDispatcher(instance_id=i, **kwargs)
+                for i in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_flydsl():
+            self._inners = [
+                FlyDSLEPDispatcher(instance_id=i, **kwargs)
                 for i in range(num_inner_dispatchers)
             ]
         elif get_moe_a2a_backend().is_nixl():

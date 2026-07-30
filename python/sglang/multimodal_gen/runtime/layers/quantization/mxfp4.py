@@ -23,10 +23,11 @@ _is_hip = is_hip()
 
 if _is_hip:
     try:
-        import aiter
         from aiter.ops.gemm_op_a4w4 import gemm_a4w4
         from aiter.ops.shuffle import shuffle_weight
         from aiter.utility.fp4_utils import dynamic_mxfp4_quant
+
+        import aiter
     except ImportError as e:
         logger.warning(f"aiter MXFP4 kernels not available: {e}")
         aiter = None

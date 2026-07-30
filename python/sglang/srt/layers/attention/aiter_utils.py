@@ -23,11 +23,12 @@ try:
     # `aiter/__init__.py` (`from .ops.mha import *`). Note: a bare
     # `from aiter.mha import ...` does NOT work — that module path only
     # exists as `aiter.ops.mha`.
-    from aiter import mha_batch_prefill_func
     from aiter.ops.triton.gluon.pa_decode_gluon import (
         get_recommended_splits,
         pa_decode_gluon,
     )
+
+    from aiter import mha_batch_prefill_func
 except ImportError:  # pragma: no cover - import-time guard mirrors aiter_backend
     mha_batch_prefill_func = None
     pa_decode_gluon = None

@@ -726,6 +726,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_mooncake()
                 or get_moe_a2a_backend().is_nixl()
                 or get_moe_a2a_backend().is_mori()
+                or get_moe_a2a_backend().is_flydsl()
                 or get_moe_a2a_backend().is_ascend_fuseep()
                 or get_moe_a2a_backend().is_flashinfer()
                 or get_moe_a2a_backend().is_megamoe()
@@ -808,6 +809,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_flydsl()
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             # TODO: we will support tp < ep in the future
@@ -829,6 +831,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_flydsl()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
         )
@@ -1649,11 +1652,18 @@ class DeepseekV2MoE(nn.Module):
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
-            self.experts.dispatcher.dispatch_a(
+            dispatch_kwargs = dict(
                 hidden_states=state.hidden_states_mlp_input,
                 topk_output=state.pop("topk_output"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
+            if get_moe_a2a_backend().is_flydsl():
+                dispatch_kwargs["dynamic_recv_cluster_rows"] = getattr(
+                    state.forward_batch,
+                    "flydsl_tbo_cluster_dispatch_rows",
+                    None,
+                )
+            self.experts.dispatcher.dispatch_a(**dispatch_kwargs)
 
     def op_dispatch_b(self, state):
         if self.ep_size > 1:
@@ -1686,7 +1696,7 @@ class DeepseekV2MoE(nn.Module):
     def op_output(self, state):
         final_hidden_states = state.pop("hidden_states_after_combine")
 
-        if get_moe_a2a_backend().is_mori():
+        if get_moe_a2a_backend().is_mori() or get_moe_a2a_backend().is_flydsl():
             num_tokens = state.pop("num_tokens")
             final_hidden_states = final_hidden_states[:num_tokens]
 
@@ -2506,7 +2516,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
         )
-        if get_moe_a2a_backend().is_mori():
+        if get_moe_a2a_backend().is_mori() or get_moe_a2a_backend().is_flydsl():
             state.num_tokens = hidden_states.shape[0]
         state.update(
             dict(

@@ -35,6 +35,7 @@ class MoeA2ABackend(Enum):
     ASCEND_FUSEEP = "ascend_fuseep"
     ASCEND_TP = "ascend_tp"
     FLASHINFER = "flashinfer"
+    FLYDSL = "flydsl"
     MEGAMOE = "megamoe"
     CUSTOMIZED = "customized"
 
@@ -71,6 +72,9 @@ class MoeA2ABackend(Enum):
     def is_mori(self):
         return self == MoeA2ABackend.MORI
 
+    def is_flydsl(self):
+        return self == MoeA2ABackend.FLYDSL
+
     def is_megamoe(self):
         return self == MoeA2ABackend.MEGAMOE
 
@@ -84,6 +88,7 @@ class MoeA2ABackend(Enum):
             MoeA2ABackend.MOONCAKE,
             MoeA2ABackend.NIXL,
             MoeA2ABackend.MORI,
+            MoeA2ABackend.FLYDSL,
         )
 
 
@@ -384,9 +389,9 @@ def is_sbo_enabled() -> bool:
 
 
 def is_deepep_class_backend() -> bool:
-    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
+    """Check if the MoE backend is DeepEP-family."""
     b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori()
+    return b.is_deepep() or b.is_mooncake() or b.is_mori() or b.is_flydsl()
 
 
 def uses_per_rank_fused_shared_slots() -> bool:
