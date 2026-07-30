@@ -499,7 +499,10 @@ class TgvGemmCuteExtKernel:
             # (Xid 13 "CTA Not Present"). All 8 warps (256 threads) of both
             # cluster CTAs arrive here after their dispatch branch returns,
             # so no CTA can exit until the peer's tail work has landed.
-            cute.arch.cluster_arrive()
+            # relaxed arrive (matches the entry barrier at L378): this fence is
+            # only about CTA lifetime, not inter-CTA smem visibility -- every
+            # cross-CTA datum above already flows through mbarrier phases.
+            cute.arch.cluster_arrive_relaxed()
             cute.arch.cluster_wait()
 
     # ====================================================================
