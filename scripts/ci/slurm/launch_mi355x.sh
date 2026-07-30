@@ -543,8 +543,24 @@ docker run $DOCKER_COMMON --name mi355x_bench \
       export PYTHONPATH=/sgl-workspace/sglang/python:\${PYTHONPATH:-}
     fi
     bash \$CIDIR/install_checkout_router.sh
-    echo "[wait] prefill"; for i in \$(seq 1 600); do curl -sf http://\$PIP:$PPORT/health >/dev/null && break; sleep 5; done
-    echo "[wait] decode";  for i in \$(seq 1 600); do curl -sf http://\$DIP:$DPORT/health >/dev/null && break; sleep 5; done
+    # Two things matter in this wait. curl gets explicit timeouts so an
+    # unreachable host cannot stretch each attempt well past the sleep, and a
+    # wait that never succeeds aborts the leg instead of falling through to the
+    # router -- otherwise the router starts with zero healthy workers and an
+    # unreachable node is reported over an hour later as a confusing probe 503.
+    # 900s is ~3x the slowest healthy wait observed, which is the largest model.
+    wait_health() {
+      echo "[wait] \$1"
+      local start=\$SECONDS
+      while [ \$(( SECONDS - start )) -lt 900 ]; do
+        curl -sf --connect-timeout 2 --max-time 5 "\$2" >/dev/null && return 0
+        sleep 5
+      done
+      echo "[wait] \$1 never became healthy at \$2 after \$(( SECONDS - start ))s; aborting"
+      return 1
+    }
+    wait_health prefill http://\$PIP:$PPORT/health || exit 1
+    wait_health decode http://\$DIP:$DPORT/health || exit 1
     python3 -m sglang_router.launch_router \
       --pd-disaggregation \
       --prefill http://\$PIP:$PPORT $PBOOT \
