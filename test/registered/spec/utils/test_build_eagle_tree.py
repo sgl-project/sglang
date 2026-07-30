@@ -315,17 +315,16 @@ class TestBuildEagleTree(unittest.TestCase):
         )
 
     def test_skip_prefix_fill_preserves_tree_blocks(self):
-        """``fill_prefix_mask=False`` must leave every kernel-written cell intact.
+        """fill_prefix_mask=False must leave every kernel-written cell intact.
 
-        The fill only supplies the ``[0, seq_len)`` prefix columns, so a verify
-        backend that never reads the mask can skip it. What must not change is
-        the qlen x qlen tree block, which the kernel writes itself.
+        The fill only supplies the [0, seq_len) prefix columns; the qlen x qlen
+        tree block comes from the kernel and must be identical either way.
         """
         device = get_device()
         bs, topk, spec_steps, num_draft_token = 2, 1, 3, 4
         seq_lens = torch.tensor([5, 10], dtype=torch.int64, device=device)
         seq_lens_sum = int(seq_lens.sum().item())
-        # topk=1 chain: draft token i descends from i-1, and index 0 is the root.
+        # topk=1 chain: token i descends from i-1; index 0 is the root.
         parent_list = torch.tensor([[0, 0, 1]] * bs, dtype=torch.int64, device=device)
         top_scores_index = torch.tensor(
             [[0, 1, 2]] * bs, dtype=torch.int64, device=device
@@ -337,8 +336,8 @@ class TestBuildEagleTree(unittest.TestCase):
         mask_numel = seq_lens_sum * num_draft_token + num_draft_token**2 * bs
 
         def build(fill_prefix_mask):
-            # Start from an all-False buffer: with the fill skipped, a stale
-            # prefix stays False, which is exactly what a reader would see.
+            # All-False start matches the real preallocated scratch: a skipped
+            # fill leaves the prefix stale-False.
             tree_mask_buf = torch.zeros((mask_numel,), dtype=torch.bool, device=device)
             return build_tree_kernel_efficient(
                 bonus_tokens=bonus_tokens,
@@ -380,8 +379,7 @@ class TestBuildEagleTree(unittest.TestCase):
             "Tree blocks diverged: the kernel must write every tree cell "
             "regardless of the prefix fill",
         )
-        # Guards against a vacuous test: the two runs really do differ on the
-        # prefix, so the assertion above is comparing meaningful states.
+        # Anti-vacuous: proves the two runs really differ on the prefix.
         self.assertTrue(filled_prefix.all(), "Fill did not mark the prefix columns")
         self.assertFalse(
             skipped_prefix.any(), "Skipped fill unexpectedly touched the prefix columns"

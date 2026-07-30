@@ -1525,8 +1525,7 @@ class DeepseekV4AttnBackend(
         return [self.cuda_graph_custom_mask, None]
 
     def target_verify_reads_custom_mask(self) -> bool:
-        # DSV4 verify metadata never extracts from custom_mask (see the scratch
-        # allocation above), so the per-step prefix fill has no reader.
+        # DSV4 verify metadata never extracts from custom_mask.
         return False
 
     def replay_cuda_graph_metadata_from(
