@@ -17,7 +17,7 @@ export const config = {
   // merges these in, so a model-specific GPU is config data, not an engine edit.
   // RTX PRO 6000 (SM120 / Blackwell Desktop) is a workstation card, not datacenter.
   hardware: [
-    { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "nvidia" },
+    { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
   ],
 
   variants: [
