@@ -123,7 +123,6 @@ class TestMxfp8LinearMethod(CustomTestCase):
     def _make_method() -> Fp8LinearMethod:
         method = Fp8LinearMethod.__new__(Fp8LinearMethod)
         method.quant_config = Fp8Config.__new__(Fp8Config)
-        method.weight_scale_name = "weight_scale_inv"
         method.use_mxfp8 = True
         method.use_marlin = False
         return method

@@ -2739,7 +2739,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
 
 class ModelOptMxfp8LinearMethod(Fp8LinearMethod):
-    """Shared MXFP8 linear path with ModelOpt checkpoint tensor names."""
+    """Shared MXFP8 linear path with ModelOpt serialization tensor names."""
 
-    def __init__(self, quant_config: Fp8Config):
-        super().__init__(quant_config, weight_scale_name="weight_scale")
+    weight_scale_name = "weight_scale"

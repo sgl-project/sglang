@@ -18,6 +18,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
@@ -762,7 +763,7 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             "FP8",
         )
 
-    def test_mixed_precision_mxfp8_linear_registers_expected_weights(self):
+    def test_mixed_precision_mxfp8_linear_loads_modelopt_scale(self):
         prefix = "model.layers.0.mlp.down_proj"
         selected_backend = object()
         with patch(
@@ -783,6 +784,26 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         self.assertIs(layer.quant_method.w8a8_mxfp8_linear, selected_backend)
         self.assertEqual(layer.weight_scale.shape, (16, 2))
         self.assertEqual(layer.weight_scale.dtype, torch.uint8)
+
+        scale_param = layer.weight_scale
+        loaded_scale = torch.arange(32, dtype=torch.uint8).reshape(16, 2)
+        scale_param.weight_loader(scale_param, loaded_scale)
+        torch.testing.assert_close(scale_param, loaded_scale)
+
+        with patch(
+            "sglang.srt.layers.quantization.fp8.get_fp8_gemm_runner_backend",
+            return_value=Fp8GemmRunnerBackend.FLASHINFER_CUTLASS,
+        ):
+            layer.quant_method.process_weights_after_loading(layer)
+            derived_scale = layer.weight_scale_inv_swizzled
+
+            reloaded_scale = loaded_scale.flip(0)
+            scale_param.weight_loader(scale_param, reloaded_scale)
+            layer.quant_method.process_weights_after_loading(layer)
+
+        self.assertIs(layer.weight_scale, scale_param)
+        self.assertIs(layer.weight_scale_inv_swizzled, derived_scale)
+        torch.testing.assert_close(scale_param, reloaded_scale)
 
     def test_mixed_precision_rejects_mxfp8_routed_fused_moe(self):
         quant_config = self._mixed_config(

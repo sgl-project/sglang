@@ -451,13 +451,10 @@ class Fp8LinearMethod(LinearMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(
-        self,
-        quant_config: Union[Fp8Config, W4AFp8Config],
-        weight_scale_name: str = "weight_scale_inv",
-    ):
+    weight_scale_name = "weight_scale_inv"
+
+    def __init__(self, quant_config: Union[Fp8Config, W4AFp8Config]):
         self.quant_config = quant_config
-        self.weight_scale_name = weight_scale_name
         self.cutlass_fp8_supported = cutlass_fp8_supported()
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
