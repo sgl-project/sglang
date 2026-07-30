@@ -75,10 +75,6 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
     ):
         return
 
-    # Extra-buffer strategies need intermediate state checkpoints.
-    if args.uses_mamba_radix_cache and args.mamba_radix_cache_strategy != "no_buffer":
-        return
-
     cuda_version = torch.version.cuda
     chunk_size = args.chunked_prefill_size
     config = hybrid_gdn_config(model_runner.model_config)
@@ -203,6 +199,10 @@ class GDNKernelDispatcher:
             f"verify={self.verify_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )
+
+    @property
+    def extend_uses_state_checkpoints(self) -> bool:
+        return self.extend_kernel.uses_state_checkpoints
 
     def packed_decode(
         self,
@@ -362,6 +362,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+            if self.kernel_dispatcher.extend_uses_state_checkpoints:
+                from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+                    maybe_build_flashinfer_checkpoint_plan,
+                )
+
+                maybe_build_flashinfer_checkpoint_plan(
+                    forward_batch, self.forward_metadata, self.device
+                )
 
     def forward_decode(
         self,
@@ -649,6 +657,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                state_checkpoint_cu_starts=(
+                    forward_metadata.state_checkpoint_cu_starts
+                ),
+                num_state_checkpoints=forward_metadata.num_state_checkpoints,
+                state_checkpoint_every_n_tokens=(
+                    forward_metadata.state_checkpoint_every_n_tokens
+                ),
             )
 
             if is_npu() and last_recurrent_state is not None:
@@ -663,7 +678,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_states[cache_indices] = conv_states_contig
                 ssm_states[cache_indices] = ssm_states_contig
 
-            if h is not None:
+            if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
                 )
