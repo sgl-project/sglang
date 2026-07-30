@@ -1882,57 +1882,64 @@ class DeepseekV4AttnBackend(
         q_f32 = q.float()  # [N_heads, 512]
         out = torch.zeros(N_heads, MXFP4_TOTAL_DIM, dtype=torch.float32, device=dev)
 
-        # Graph-safe page collection: use tensor ops only, no .tolist().
-        # Dequant all SWA pages referenced by head 0 directly via tensor.
+        # Graph-safe page collection: FIXED SIZE only.
+        # Boolean indexing (tensor[mask]), .unique(), .tolist(), .item()
+        # all produce dynamic shapes / GPU→CPU sync — prohibited during
+        # CUDA graph capture.  Clamp -1→0 instead of filtering, then
+        # zero out invalid tokens after dequant.
         swa_tk = num_valid
-        swa_pids = swa_page_indices[0, :swa_tk].long()  # [swa_tk]
-        swa_mask = swa_pids >= 0
-        swa_valid_pids = swa_pids[swa_mask]  # GPU tensor of valid page IDs
+        swa_pids = swa_page_indices[0, :swa_tk].long()  # fixed [swa_tk]
+        swa_valid_mask = swa_pids >= 0  # fixed [swa_tk]
+        swa_pids_safe = swa_pids.clamp(min=0)  # -1→0, fixed [swa_tk]
 
-        # --- dequant SWA pages (tensor-based, graph-safe) ---
-        swa_deq = None
-        if swa_valid_pids.numel() > 0:
-            # Compute flat token indices: for each page pid, tokens in
-            # [pid*page_size, (pid+1)*page_size). Use unique() to dedup.
-            swa_valid_pids = swa_valid_pids.unique(sorted=False)
-            swa_n_pages = swa_valid_pids.numel()
-            # Build flat_indices = pid*page_sz + offset, broadcasted
-            offsets = torch.arange(swa_phys_page_size, device=dev, dtype=torch.int32)
-            flat_indices = (
-                swa_valid_pids.unsqueeze(1) * swa_phys_page_size + offsets.unsqueeze(0)
-            ).reshape(-1)
-            swa_deq = dequantize_dsv4_mxfp4_k_cache_paged(
-                swa_k_cache, flat_indices, swa_phys_page_size
-            )[
-                :, 0, :
-            ]  # [n_pages * page_sz, 512]
+        # Dequant all SWA entries (fixed size, safe for graph capture).
+        offsets = torch.arange(swa_phys_page_size, device=dev, dtype=torch.int32)
+        swa_flat = (
+            swa_pids_safe.unsqueeze(1) * swa_phys_page_size + offsets.unsqueeze(0)
+        ).reshape(
+            -1
+        )  # [swa_tk * page_sz]
+        swa_deq = dequantize_dsv4_mxfp4_k_cache_paged(
+            swa_k_cache, swa_flat, swa_phys_page_size
+        )[
+            :, 0, :
+        ]  # [swa_tk * page_sz, 512]
+        # Zero out tokens from invalid (-1) pages.
+        swa_tok_mask = (
+            swa_valid_mask.unsqueeze(1).expand(-1, swa_phys_page_size).reshape(-1)
+        )  # [swa_tk*page_sz]
+        swa_deq = swa_deq * swa_tok_mask.unsqueeze(1).float()
 
-        # --- dequant extra pages (FP8, tensor-based, graph-safe) ---
+        # --- dequant extra pages (FP8, fixed-size, graph-safe) ---
         extra_deq = None
         if extra_indices is not None and extra_topk_lengths is not None:
             extra_tk = extra_topk_lengths.shape[-1]
             if extra_tk > 0:
-                extra_pids = extra_indices[0, :extra_tk].long()
-                extra_mask = extra_pids >= 0
-                extra_valid_pids = extra_pids[extra_mask]
-                if extra_valid_pids.numel() > 0:
-                    extra_valid_pids = extra_valid_pids.unique(sorted=False)
-                    offsets = torch.arange(
-                        extra_page_size, device=dev, dtype=torch.int32
-                    )
-                    extra_flat = (
-                        extra_valid_pids.unsqueeze(1) * extra_page_size
-                        + offsets.unsqueeze(0)
-                    ).reshape(-1)
-                    from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
-                        dequantize_k_cache_paged as dequantize_fp8_k_cache_paged,
-                    )
+                extra_pids = extra_indices[0, :extra_tk].long()  # fixed [extra_tk]
+                extra_valid_mask = extra_pids >= 0  # fixed [extra_tk]
+                extra_pids_safe = extra_pids.clamp(min=0)
+                offsets_extra = torch.arange(
+                    extra_page_size, device=dev, dtype=torch.int32
+                )
+                extra_flat = (
+                    extra_pids_safe.unsqueeze(1) * extra_page_size
+                    + offsets_extra.unsqueeze(0)
+                ).reshape(-1)
+                from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+                    dequantize_k_cache_paged as dequantize_fp8_k_cache_paged,
+                )
 
-                    extra_deq = dequantize_fp8_k_cache_paged(
-                        extra_k_cache, extra_flat, extra_page_size
-                    )[
-                        :, 0, :
-                    ]  # [n_extra_pages * extra_page_sz, 512]
+                extra_deq = dequantize_fp8_k_cache_paged(
+                    extra_k_cache, extra_flat, extra_page_size
+                )[
+                    :, 0, :
+                ]  # [extra_tk * extra_page_sz, 512]
+                extra_tok_mask = (
+                    extra_valid_mask.unsqueeze(1)
+                    .expand(-1, extra_page_size)
+                    .reshape(-1)
+                )
+                extra_deq = extra_deq * extra_tok_mask.unsqueeze(1).float()
 
         # --- Batched SDPA: single K tensor, single matmul for all heads ---
         k_segments = []
