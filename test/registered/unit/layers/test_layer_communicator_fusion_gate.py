@@ -2,8 +2,12 @@ import types
 import unittest
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
+from sglang.srt.layers.moe import post_experts_all_reduce
+from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -20,18 +24,69 @@ def _fake_communicator():
     )
 
 
-class TestFuseMlpAllReduceGate(unittest.TestCase):
-    """Hybrid EP+TP must not fuse the post-experts all-reduce away.
+class TestPostExpertsAllReduceMerge(unittest.TestCase):
+    """The two post-experts reductions collapse into one _TP reduction.
 
-    The fused residual+LN reduces over a single group, but with moe_ep_size > 1
-    and moe_tp_size > 1 the post-experts reduction spans two disjoint groups
-    (_MOE_EP then _MOE_TP) and should_skip_post_experts_all_reduce() drops both
-    once fusion is published. The result is activations reduced over only half
-    the peers -- wrong output, no crash. Observed as garbage completions on
-    Qwen3-30B-A3B with --tp-size 4 --ep-size 2.
+    _MOE_EP and _MOE_TP are orthogonal subgroups of _TP, so with
+    moe_dp_size == 1 reducing over each in turn equals one _TP reduction --
+    one collective instead of two. With moe_dp_size > 1 they cover only part of
+    _TP and merging would sum across DP replicas, which hold different tokens.
     """
 
-    def _should_fuse(self, *, moe_ep_size, moe_tp_size):
+    def _calls(self, *, moe_ep_size, moe_tp_size, moe_dp_size=1, skip=False):
+        """Which all-reduce helpers post_experts_all_reduce() invokes."""
+        called = []
+
+        def record(name):
+            return lambda x: called.append(name) or x
+
+        with patch.object(
+            moe_utils, "should_skip_post_experts_all_reduce", return_value=skip
+        ), patch(
+            "sglang.srt.distributed.communication_op.tensor_model_parallel_all_reduce",
+            side_effect=record("tp"),
+        ), patch(
+            "sglang.srt.distributed.communication_op.moe_expert_parallel_all_reduce",
+            side_effect=record("ep"),
+        ), patch(
+            "sglang.srt.distributed.communication_op.moe_tensor_model_parallel_all_reduce",
+            side_effect=record("moe_tp"),
+        ), get_parallel().override(
+            moe_ep_size=moe_ep_size,
+            moe_tp_size=moe_tp_size,
+            moe_dp_size=moe_dp_size,
+            tp_size=moe_ep_size * moe_tp_size * moe_dp_size,
+        ):
+            post_experts_all_reduce(torch.zeros(2, 2))
+        return called
+
+    def test_hybrid_issues_one_tp_reduction(self):
+        self.assertEqual(self._calls(moe_ep_size=2, moe_tp_size=2), ["tp"])
+
+    def test_moe_dp_keeps_the_two_step_form(self):
+        self.assertEqual(
+            self._calls(moe_ep_size=2, moe_tp_size=2, moe_dp_size=2), ["ep", "moe_tp"]
+        )
+
+    def test_single_dimension_issues_one_reduction(self):
+        self.assertEqual(self._calls(moe_ep_size=1, moe_tp_size=4), ["moe_tp"])
+        self.assertEqual(self._calls(moe_ep_size=4, moe_tp_size=1), ["ep"])
+
+    def test_skipped_when_deferred_to_fusion(self):
+        self.assertEqual(self._calls(moe_ep_size=2, moe_tp_size=2, skip=True), [])
+
+
+class TestFuseMlpAllReduceGate(unittest.TestCase):
+    """Fusion is allowed only when one group covers the whole reduction.
+
+    The fused residual+LN reduces over a single group. Hybrid EP+TP produces two
+    reductions over disjoint groups; merging collapses them to one _TP reduction
+    that the fused kernel can absorb. When merging does not apply
+    (moe_dp_size > 1) there is no such group and fusion must stay off --
+    otherwise the fused reduce covers half the peers and silently under-reduces.
+    """
+
+    def _should_fuse(self, *, moe_ep_size, moe_tp_size, moe_dp_size=1):
         forward_batch = types.SimpleNamespace(
             input_ids=types.SimpleNamespace(shape=(8,))
         )
@@ -44,15 +99,21 @@ class TestFuseMlpAllReduceGate(unittest.TestCase):
                 return_value=types.SimpleNamespace(input_scattered=False),
             ),
             get_parallel().override(
-                moe_ep_size=moe_ep_size, moe_tp_size=moe_tp_size, tp_size=4
+                moe_ep_size=moe_ep_size,
+                moe_tp_size=moe_tp_size,
+                moe_dp_size=moe_dp_size,
+                tp_size=4,
             ),
         ):
             return LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer(
                 _fake_communicator(), forward_batch
             )
 
-    def test_hybrid_ep_tp_does_not_fuse(self):
-        self.assertFalse(self._should_fuse(moe_ep_size=2, moe_tp_size=2))
+    def test_hybrid_ep_tp_fuses_when_mergeable(self):
+        self.assertTrue(self._should_fuse(moe_ep_size=2, moe_tp_size=2))
+
+    def test_hybrid_ep_tp_does_not_fuse_when_moe_dp_blocks_the_merge(self):
+        self.assertFalse(self._should_fuse(moe_ep_size=2, moe_tp_size=2, moe_dp_size=2))
 
     def test_pure_tp_still_fuses(self):
         # moe_ep_size == 1: the whole post-experts reduction is the _MOE_TP one,

@@ -55,6 +55,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
+    can_merge_post_experts_all_reduce,
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -611,7 +612,16 @@ class LayerCommunicator:
                             )
                         )
                 else:
-                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                    # Fusion was published but this shape can't use the kernel,
+                    # so run the deferred reduction inline. Under hybrid EP+TP
+                    # it was merged into a single _TP reduction upstream, so a
+                    # MoE-TP-only all-reduce would cover half the peers.
+                    if can_merge_post_experts_all_reduce():
+                        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                    else:
+                        hidden_states = moe_tensor_model_parallel_all_reduce(
+                            hidden_states
+                        )
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
@@ -816,16 +826,19 @@ class LayerCommunicator:
         if is_enable_moe_cp_allgather():
             return False
 
-        # Fusing makes the next layer's residual+LN absorb the post-experts
-        # all-reduce, and that fused kernel reduces over a single group. Under
-        # hybrid EP+TP the post-experts reduction spans two disjoint groups
-        # (moe_expert_parallel_all_reduce over _MOE_EP, then
-        # moe_tensor_model_parallel_all_reduce over _MOE_TP), and
-        # should_skip_post_experts_all_reduce() skips *both* once fusion is
-        # published -- so the fused reduce would cover only half the peers and
-        # silently return under-reduced activations.
+        # The next layer's residual+LN absorbs the post-experts reduction, and
+        # that fused kernel reduces over a single group. Hybrid EP+TP produces
+        # two reductions over disjoint groups; post_experts_all_reduce() merges
+        # them into one _TP reduction when moe_dp_size == 1, which the fused
+        # kernel can absorb. When it can't merge, there is no single group that
+        # covers both, so fusion has to stay off -- otherwise the fused reduce
+        # covers half the peers and silently under-reduces the activations.
         parallel = get_parallel()
-        if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
+        if (
+            parallel.moe_ep_size > 1
+            and parallel.moe_tp_size > 1
+            and not can_merge_post_experts_all_reduce()
+        ):
             return False
 
         if (
