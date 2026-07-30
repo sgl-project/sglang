@@ -90,6 +90,7 @@ MODEL_CONFIG = {
     "node_envs": ENVS,
 }
 
+
 class TestNPUKimiK2_6_W4A8_16P_In64k_Out1k_100ms(TestNpuPerfMultiNodePdMixTestCaseBase):
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     dataset_type = AISBENCHMARK_DATASET_DEFAULT
