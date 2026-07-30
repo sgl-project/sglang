@@ -56,6 +56,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     pad_dsa_cache_seqlens,
     should_use_dsa_fused_topk,
 )
+from sglang.srt.layers.attention.trtllm_mla_backend import (
+    grow_multi_ctas_kv_counter_buffer_if_needed,
+    make_persistent_multi_ctas_kv_counter_buffer,
+)
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_position,
@@ -125,7 +129,7 @@ if _is_hip:
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
 else:
-    from sglang.jit_kernel.flash_attention import (
+    from sglang.kernels.ops.attention.flash_attention import (
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
     )
@@ -327,7 +331,13 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_sparse_q8", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse",
+    "flashmla_sparse_q8",
+    "flashmla_kv",
+    "flashinfer_sparse_mla",
+    "fa3",
+    "tilelang",
+    "trtllm",
 ]
 
 
@@ -486,8 +496,29 @@ class DeepseekSparseAttnBackend(
         self._q8kv8_identity_scale: Optional[torch.Tensor] = None
         self._q8kv8_qpad_buf: Optional[torch.Tensor] = None
 
+        from sglang.kernels.ops.attention.flash_mla_sm120 import (
+            _validate_flashinfer_sparse_mla_backend,
+        )
+
+        uses_flashinfer_sparse_mla = _validate_flashinfer_sparse_mla_backend(
+            model_arch=model_runner.model_config.hf_config.architectures[0],
+            device_sm_major=self.device_sm_major,
+            kv_cache_dtype=self.kv_cache_dtype,
+            prefill_impl=self.dsa_prefill_impl,
+            decode_impl=self.dsa_decode_impl,
+        )
+
+        if uses_flashinfer_sparse_mla:
+            self.workspace_buffer = get_buffer(
+                "dsa_flashinfer_sparse_mla_workspace",
+                lambda: torch.zeros(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                ),
+            )
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
-        if self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
+        elif self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
             self.workspace_buffer = get_buffer(
                 "dsa_trtllm_workspace",
                 lambda: torch.empty(
@@ -496,8 +527,16 @@ class DeepseekSparseAttnBackend(
                     device=model_runner.device,
                 ),
             )
+            self._multi_ctas_kv_counter_buffer = (
+                make_persistent_multi_ctas_kv_counter_buffer(
+                    torch.device(self.device),
+                    self.num_q_heads,
+                    max_batch_size=model_runner.max_running_requests,
+                )
+            )
         else:
             self.workspace_buffer = None
+            self._multi_ctas_kv_counter_buffer = None
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
@@ -686,7 +725,7 @@ class DeepseekSparseAttnBackend(
         # when the fold is disabled; such metadata is never dispatched to v2.
         if not envs.SGLANG_OPT_USE_TOPK_V2.get():
             return None
-        from sglang.jit_kernel.dsv4.topk import plan_topk_v2
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
         return plan_topk_v2(seqlens_expanded)
 
@@ -699,7 +738,7 @@ class DeepseekSparseAttnBackend(
         # nothing to refresh.
         if metadata.topk_v2_plan is None:
             return
-        from sglang.jit_kernel.dsv4.topk import plan_topk_v2
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
         metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
 
@@ -1706,7 +1745,7 @@ class DeepseekSparseAttnBackend(
         # Use fused CUDA kernel for all copy operations
         if not _is_hip:
             try:
-                from sglang.jit_kernel.fused_metadata_copy import (
+                from sglang.kernels.ops.attention.fused_metadata_copy import (
                     fused_metadata_copy_cuda,
                 )
 
@@ -2078,6 +2117,19 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
+        elif dsa_impl == "flashinfer_sparse_mla":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if topk_transform_method == TopkTransformMethod.RAGGED:
+                page_table_1 = topk_indices
+            return self._forward_flashinfer_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                seq_lens=metadata.dsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+            )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2220,6 +2272,17 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+            )
+        elif self.dsa_decode_impl == "flashinfer_sparse_mla":
+            if q_all is None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_flashinfer_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                seq_lens=metadata.dsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             )
         elif self.dsa_decode_impl == "flashmla_kv":
             if q_rope is not None:
@@ -2396,7 +2459,7 @@ class DeepseekSparseAttnBackend(
             (``gather_dequant_requant_fp8_paged``) — no intermediate bf16
             materialization.
         """
-        from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+        from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
             sparse_mla_q8kv8_prefill_fwd,
         )
 
@@ -2489,6 +2552,35 @@ class DeepseekSparseAttnBackend(
         if need_padding:
             o = o[:, :num_heads, :]
         return o
+
+    def _forward_flashinfer_sparse_mla(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        seq_lens: torch.Tensor,
+        sm_scale: float,
+        skip_softmax_threshold_scale_factor: float | None,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.attention.flash_mla_sm120 import (
+            flashinfer_sparse_mla_forward,
+        )
+
+        assert self.workspace_buffer is not None
+        return flashinfer_sparse_mla_forward(
+            q=q_all,
+            kv_cache=kv_cache,
+            indices=page_table_1,
+            seq_lens=seq_lens,
+            workspace_buffer=self.workspace_buffer,
+            page_size=self.real_page_size,
+            kv_cache_dim=self.kv_cache_dim,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            sm_scale=sm_scale,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        )
 
     def _forward_flashmla_kv(
         self,
@@ -2917,6 +3009,15 @@ class DeepseekSparseAttnBackend(
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
 
+        self._multi_ctas_kv_counter_buffer = (
+            grow_multi_ctas_kv_counter_buffer_if_needed(
+                self._multi_ctas_kv_counter_buffer,
+                torch.device(self.device),
+                self.num_q_heads,
+                batch_size,
+            )
+        )
+
         q = q_all.view(batch_size, 1, num_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
@@ -2945,6 +3046,7 @@ class DeepseekSparseAttnBackend(
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
         )
 
         return out
@@ -3165,7 +3267,7 @@ class DeepseekSparseAttnMultiStepBackend:
         # This is 3x faster than calling the single-backend copy 3 times
         if self.speculative_num_steps > 3:
             try:
-                from sglang.jit_kernel.fused_metadata_copy import (
+                from sglang.kernels.ops.attention.fused_metadata_copy import (
                     fused_metadata_copy_multi_cuda,
                 )
 
