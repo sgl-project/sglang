@@ -69,6 +69,9 @@ pub struct Cli {
     /// Multiplicative load spread gating the absolute balance check.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
+    /// External KV indexer gRPC endpoint used as an additional cache-aware signal.
+    #[arg(long)]
+    pub kv_indexer_endpoint: Option<String>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -157,14 +160,13 @@ impl Cli {
         }
         let tuned_cache_aware = self.cache_threshold.is_some()
             || self.balance_abs_threshold.is_some()
-            || self.balance_rel_threshold.is_some();
+            || self.balance_rel_threshold.is_some()
+            || self.kv_indexer_endpoint.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
-                "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold \
-                 require --policy cache_aware_zmq"
+                "cache-aware tuning flags require --policy cache_aware_zmq"
             ));
         }
-
         let tuned_sticky = self.routing_key_header.is_some()
             || self.sticky_fallback_policy.is_some()
             || self.sticky_idle_secs.is_some()
@@ -244,6 +246,7 @@ impl Cli {
                 balance_rel_threshold: self
                     .balance_rel_threshold
                     .unwrap_or(d.balance_rel_threshold),
+                kv_indexer_endpoint: self.kv_indexer_endpoint,
             })
         } else {
             None
@@ -742,6 +745,37 @@ mod tests {
         assert_eq!(ca.cache_threshold, 0.7);
         // Untouched knobs fall back to defaults.
         assert_eq!(ca.balance_abs_threshold, 32);
+    }
+
+    #[test]
+    fn kv_indexer_reuses_cache_aware_policy_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--kv-indexer-endpoint",
+            "http://indexer:50051",
+        ]))
+        .unwrap();
+        let cache = c.model.cache_aware.expect("cache-aware config");
+        assert_eq!(
+            cache.kv_indexer_endpoint.as_deref(),
+            Some("http://indexer:50051")
+        );
+    }
+
+    #[test]
+    fn kv_indexer_requires_cache_aware_policy() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--kv-indexer-endpoint",
+            "http://indexer:50051",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("require --policy cache_aware_zmq"));
     }
 
     #[test]

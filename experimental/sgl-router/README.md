@@ -50,6 +50,22 @@ Omit `--service-discovery-namespace` to watch all namespaces (requires
 cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
 with `--prefill-selector` and `--decode-selector`.
 
+External KV indexer as the cache-aware signal source:
+
+```bash
+sgl-router \
+  --model-id qwen3 \
+  --tokenizer-path /models/qwen3/tokenizer.json \
+  --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
+  --policy cache_aware_zmq \
+  --kv-indexer-endpoint http://10.0.0.10:50051
+```
+
+The existing cache-aware policy and thresholds are reused. Setting
+`--kv-indexer-endpoint` adds the indexer as the preferred routing signal while
+the router-local ZMQ subscription remains active. RPC failures fall through to
+the existing cache-aware policy.
+
 ## License
 
 Apache-2.0.
