@@ -17,7 +17,10 @@ from typing import Any, Callable, Protocol
 import numpy as np
 import torch
 
-from sglang.srt.mem_cache.memory_pool_host import HostTensorAllocator
+from sglang.srt.mem_cache.memory_pool_host import (
+    HostTensorAllocator,
+    PageFirstDirectMhaFormat,
+)
 from sglang.srt.mem_cache.storage.tensorcast_store.config import (
     TensorcastHostAllocatorConfig,
     tensorcast_host_allocator_config_from_extra_config,
@@ -104,6 +107,10 @@ class TensorcastHostTensorAllocator(HostTensorAllocator):
         self._state: _AllocatorRegionState | None = None
         self._lock = threading.Lock()
         atexit.register(self.close)
+
+    @property
+    def page_first_direct_mha_format(self) -> PageFirstDirectMhaFormat:
+        return PageFirstDirectMhaFormat.KV_CONTIGUOUS_PAGE_SLOT
 
     @property
     def binding(self) -> TensorcastHostRegionBinding | None:
@@ -273,8 +280,8 @@ def build_tensorcast_host_allocator_from_extra_config(
     )
     if resolved_config is None:
         return HostTensorAllocator()
-    if layout != "page_blob_direct":
+    if layout != "page_first_direct":
         raise ValueError(
-            "TensorCast allocator-backed host residency requires --hicache-mem-layout=page_blob_direct"
+            "TensorCast allocator-backed host residency requires --hicache-mem-layout=page_first_direct"
         )
     return TensorcastHostTensorAllocator(resolved_config)

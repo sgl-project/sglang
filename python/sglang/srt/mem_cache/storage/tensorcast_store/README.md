@@ -30,7 +30,7 @@ TensorCast serves as a high-performance L3 storage backend for SGLang HiCache. S
 2. **Allocator-backed direct mode** (recommended).
    - The L2 host pool itself is a `HOST_SHARED` region exported by the TensorCast Daemon. SGLang `mmap`s the region as the L2 buffer.
    - Page `put` and `get` skip the staging copy: the Daemon publishes directly from resident slot offsets and fetches directly into reserved destination slots.
-   - Requires `--hicache-mem-layout page_blob_direct` (a page-major host layout introduced for this backend), and is opt-in via `host_allocator_enabled: true` in the backend extra config.
+   - Requires `--hicache-mem-layout page_first_direct`, and is opt-in via `host_allocator_enabled: true` in the backend extra config. The Tensorcast host allocator requests an internal KV-contiguous page-slot format so each MHA page is exported as one descriptor without adding a public layout.
 
 ## Install TensorCast
 
@@ -70,13 +70,19 @@ By default the Global Store listens on `0.0.0.0:50051`. Override with the `serve
 **Step 2: Start the Store Daemon**
 
 ```bash
+export TENSORCAST_CAPABILITY_SECRET_B64="$(openssl rand -base64 32)"
+
 tensorcast-cli daemon start \
     --config=python/sglang/srt/mem_cache/storage/tensorcast_store/configs/store_daemon_config.yaml \
     --global-store-mode connect \
-    --global-store-address 127.0.0.1:50051
+    --global-store-address 127.0.0.1:50051 \
+    --set capability_tokens.active.version=1 \
+    --set capability_tokens.active.secret="${TENSORCAST_CAPABILITY_SECRET_B64}"
 ```
 
 The Daemon's gRPC endpoint defaults to `0.0.0.0:50052`. Each SGLang server will dial this endpoint as its `daemon_address`.
+
+`store_daemoniconfig.yaml` intentionally leaves `capability_tokens.active.secret` empty as a placeholder. Tensorcast daemon must have a non-empty capability token secret at runtime. Use a generated token secret in production.
 
 **Step 3: Verify both services are up**
 
@@ -97,13 +103,13 @@ python -m sglang.launch_server \
     --hicache-storage-backend-extra-config '{"daemon_address": "127.0.0.1:50052"}'
 ```
 
-Allocator-backed direct mode (zero-copy; requires `page_blob_direct`, recommended):
+Allocator-backed direct mode (zero-copy; requires `page_first_direct`, recommended):
 
 ```bash
 python -m sglang.launch_server \
     --model-path <model-path> \
     --enable-hierarchical-cache \
-    --hicache-mem-layout page_blob_direct \
+    --hicache-mem-layout page_first_direct \
     --hicache-storage-backend tensorcast \
     --hicache-storage-backend-extra-config '{
         "daemon_address": "127.0.0.1:50052",
@@ -111,7 +117,7 @@ python -m sglang.launch_server \
     }'
 ```
 
-If `host_allocator_enabled=true` is passed without `page_blob_direct`, SGLang
+If `host_allocator_enabled=true` is passed without `page_first_direct`, SGLang
 fails closed at startup with a clear message rather than silently fall back.
 
 **Step 5: Stop the services when done**
@@ -168,7 +174,7 @@ This subdirectory ships two starter configs under `configs/`:
 - `global_store_config.yaml` — for the Global Store CLI.
 - `store_daemon_config.yaml` — for each Store Daemon CLI.
 
-These are templates. Copy them into your deployment and adjust the field in need.
+These are templates. Copy them into your deployment and adjust the fields in need.
 
 ### `--hicache-storage-backend-extra-config` reference
 
@@ -185,7 +191,7 @@ This is the JSON / YAML payload SGLang reads via
 
 | Key | Purpose |
 |---|---|
-| `host_allocator_enabled: true` | Switches to allocator-backed direct mode. **Must** be paired with `--hicache-mem-layout page_blob_direct`. |
+| `host_allocator_enabled: true` | Switches to allocator-backed direct mode. **Must** be paired with `--hicache-mem-layout page_first_direct`. |
 
 **Optional — multi-tenant / multi-model isolation:**
 

@@ -148,7 +148,13 @@ capability_tokens:
   active:
     # Token version id; rotate by incrementing version and moving old key to previous.
     version: 1
-    # Secret bytes (base64-encoded in YAML/JSON).
+    # Secret bytes (base64-encoded in YAML/JSON). This template keeps the
+    # secret empty so deployments do not accidentally commit production keys.
+    # Inject a non-empty value at runtime, for example:
+    #   --set capability_tokens.active.secret=<base64-secret>
+    # TensorCast HiCache uses byte-artifact payload refs; with
+    # capability_directory.enabled=true, batch_get_into_region requires this
+    # key to issue payload_ref capability tokens.
     secret: ""
   previous: []
 

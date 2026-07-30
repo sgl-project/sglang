@@ -1,11 +1,32 @@
 from __future__ import annotations
 
 import sys
+from enum import Enum
 from types import ModuleType
+from typing import Protocol, runtime_checkable
 
 
 def _noop(*args: object, **kwargs: object) -> None:
     _ = args, kwargs
+
+
+class _StubPageFirstDirectMhaFormat(str, Enum):
+    SPLIT_KV_PLANES = "split_kv_planes"
+    KV_CONTIGUOUS_PAGE_SLOT = "kv_contiguous_page_slot"
+
+
+@runtime_checkable
+class _StubPageFirstDirectMhaFormatProvider(Protocol):
+    @property
+    def page_first_direct_mha_format(self) -> _StubPageFirstDirectMhaFormat: ...
+
+
+def _stub_resolve_page_first_direct_mha_format(
+    allocator: object,
+) -> _StubPageFirstDirectMhaFormat:
+    if isinstance(allocator, _StubPageFirstDirectMhaFormatProvider):
+        return allocator.page_first_direct_mha_format
+    return _StubPageFirstDirectMhaFormat.SPLIT_KV_PLANES
 
 
 def install_memory_pool_host_stub(
@@ -16,6 +37,13 @@ def install_memory_pool_host_stub(
     memory_pool_host_module = ModuleType("sglang.srt.mem_cache.memory_pool_host")
     memory_pool_host_module.HostKVCache = host_kv_cache_cls
     memory_pool_host_module.HostTensorAllocator = host_tensor_allocator_cls
+    memory_pool_host_module.PageFirstDirectMhaFormat = _StubPageFirstDirectMhaFormat
+    memory_pool_host_module.PageFirstDirectMhaFormatProvider = (
+        _StubPageFirstDirectMhaFormatProvider
+    )
+    memory_pool_host_module.resolve_page_first_direct_mha_format = (
+        _stub_resolve_page_first_direct_mha_format
+    )
     sys.modules.setdefault(
         "sglang.srt.mem_cache.memory_pool_host",
         memory_pool_host_module,

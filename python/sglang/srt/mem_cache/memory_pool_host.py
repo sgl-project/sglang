@@ -5,8 +5,9 @@ import logging
 import threading
 from collections import defaultdict
 from dataclasses import dataclass
+from enum import Enum
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -76,6 +77,25 @@ class HostPageSlotLifecycleManager(Protocol):
     def reset(self) -> None: ...
 
     def retire_released_page_slots(self, indices: torch.Tensor) -> None: ...
+
+
+class PageFirstDirectMhaFormat(str, Enum):
+    SPLIT_KV_PLANES = "split_kv_planes"
+    KV_CONTIGUOUS_PAGE_SLOT = "kv_contiguous_page_slot"
+
+
+@runtime_checkable
+class PageFirstDirectMhaFormatProvider(Protocol):
+    @property
+    def page_first_direct_mha_format(self) -> PageFirstDirectMhaFormat: ...
+
+
+def resolve_page_first_direct_mha_format(
+    allocator: object,
+) -> PageFirstDirectMhaFormat:
+    if isinstance(allocator, PageFirstDirectMhaFormatProvider):
+        return allocator.page_first_direct_mha_format
+    return PageFirstDirectMhaFormat.SPLIT_KV_PLANES
 
 
 def synchronized(func):
@@ -475,9 +495,9 @@ class MHATokenToKVPoolHost(HostKVCache):
                 dtype=torch.uint64,
                 device=self.device_pool.device,
             )
-        elif self.layout == "page_blob_direct":
-            # page_blob_direct manages backing memory at the slot level; per-layer
-            # refs are not needed (and not safe to compute as contiguous slices).
+        elif self._uses_kv_contiguous_page_slot():
+            # Allocator-selected page slots manage backing memory at slot level;
+            # per-layer refs are not needed by direct transfer paths.
             self.k_data_refs = []
             self.v_data_refs = []
             self.k_data_ptrs = torch.empty(
@@ -500,6 +520,13 @@ class MHATokenToKVPoolHost(HostKVCache):
                 device=self.device_pool.device,
             )
 
+    def _uses_kv_contiguous_page_slot(self) -> bool:
+        return (
+            self.layout == "page_first_direct"
+            and resolve_page_first_direct_mha_format(self.allocator)
+            == PageFirstDirectMhaFormat.KV_CONTIGUOUS_PAGE_SLOT
+        )
+
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
@@ -516,23 +543,24 @@ class MHATokenToKVPoolHost(HostKVCache):
         elif self.layout == "page_first":
             dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
         elif self.layout == "page_first_direct":
-            dims = (
-                2,
-                self.page_num,
-                self.layer_num,
-                self.page_size,
-                self.head_num,
-                self.head_dim,
-            )
-        elif self.layout == "page_blob_direct":
-            dims = (
-                self.page_num,
-                2,
-                self.layer_num,
-                self.page_size,
-                self.head_num,
-                self.head_dim,
-            )
+            if self._uses_kv_contiguous_page_slot():
+                dims = (
+                    self.page_num,
+                    2,
+                    self.layer_num,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                )
+            else:
+                dims = (
+                    2,
+                    self.page_num,
+                    self.layer_num,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                )
         elif self.layout == "page_head":
             dims = (
                 2,
@@ -559,13 +587,13 @@ class MHATokenToKVPoolHost(HostKVCache):
 
     @property
     def k_buffer(self):
-        if self.layout == "page_blob_direct":
+        if self._uses_kv_contiguous_page_slot():
             return self.kv_buffer.select(1, 0)
         return self.kv_buffer[0]
 
     @property
     def v_buffer(self):
-        if self.layout == "page_blob_direct":
+        if self._uses_kv_contiguous_page_slot():
             return self.kv_buffer.select(1, 1)
         return self.kv_buffer[1]
 
@@ -653,7 +681,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     dst_indices=device_indices,
                     page_size=self.page_size,
                 )
-            elif self.layout in ["page_first_direct", "page_blob_direct"]:
+            elif self.layout == "page_first_direct":
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.k_buffer, self.v_buffer],
                     dst_ptrs=[
@@ -668,7 +696,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
-            if self.layout in ["page_first_direct", "page_blob_direct"]:
+            if self.layout == "page_first_direct":
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
                 if layer_id == 0:
                     transfer_kv_dim_exchange(
@@ -766,7 +794,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     dst_indices=host_indices,
                     page_size=self.page_size,
                 )
-            elif self.layout in ["page_first_direct", "page_blob_direct"]:
+            elif self.layout == "page_first_direct":
                 transfer_kv_all_layer_direct_lf_pf(
                     src_ptrs=device_pool.k_buffer + device_pool.v_buffer,
                     dst_ptrs=[self.k_buffer, self.v_buffer],
@@ -777,7 +805,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
-            if self.layout in ["page_first_direct", "page_blob_direct"]:
+            if self.layout == "page_first_direct":
                 transfer_kv_dim_exchange(
                     device_indices=device_indices,
                     host_indices=host_indices,
@@ -800,10 +828,10 @@ class MHATokenToKVPoolHost(HostKVCache):
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :, :]
         elif self.layout == "page_first_direct":
             real_index = index // self.page_size
-            data_page = self.kv_buffer[:, real_index : real_index + 1, :, :, :, :]
-        elif self.layout == "page_blob_direct":
-            real_index = index // self.page_size
-            data_page = self.kv_buffer[real_index : real_index + 1, :, :, :, :, :]
+            if self._uses_kv_contiguous_page_slot():
+                data_page = self.kv_buffer[real_index : real_index + 1, :, :, :, :, :]
+            else:
+                data_page = self.kv_buffer[:, real_index : real_index + 1, :, :, :, :]
         elif self.layout == "page_head":
             real_index = index // self.page_size
             data_page = self.kv_buffer[:, real_index : real_index + 1, :, :, :, :]
@@ -840,18 +868,28 @@ class MHATokenToKVPoolHost(HostKVCache):
             )
         elif self.layout == "page_first_direct":
             real_index = index // self.page_size
-            self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
-                data_page.reshape(
-                    2, 1, self.layer_num, self.page_size, self.head_num, self.head_dim
+            if self._uses_kv_contiguous_page_slot():
+                self.kv_buffer[real_index : real_index + 1, :, :, :, :, :] = (
+                    data_page.reshape(
+                        1,
+                        2,
+                        self.layer_num,
+                        self.page_size,
+                        self.head_num,
+                        self.head_dim,
+                    )
                 )
-            )
-        elif self.layout == "page_blob_direct":
-            real_index = index // self.page_size
-            self.kv_buffer[real_index : real_index + 1, :, :, :, :, :] = (
-                data_page.reshape(
-                    1, 2, self.layer_num, self.page_size, self.head_num, self.head_dim
+            else:
+                self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
+                    data_page.reshape(
+                        2,
+                        1,
+                        self.layer_num,
+                        self.page_size,
+                        self.head_num,
+                        self.head_dim,
+                    )
                 )
-            )
         elif self.layout == "page_head":
             real_index = index // self.page_size
             self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
@@ -947,24 +985,25 @@ class MHATokenToKVPoolHost(HostKVCache):
                 self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
             )
             element_size_list = [element_size] * len(ptr_list)
-        elif self.layout == "page_blob_direct":
-            element_size = (
-                self.layer_num
-                * self.dtype.itemsize
-                * self.page_size
-                * self.head_num
-                * self.head_dim
-            )
-            page_blob_size = 2 * element_size
-            for index in range(0, len(indices), self.page_size):
-                page_index = indices[index] // self.page_size
-                page_base_ptr = kv_buffer_data_ptr + page_index * page_blob_size
-                k_ptr = page_base_ptr
-                v_ptr = page_base_ptr + element_size
-                ptr_list.append(k_ptr)
-                ptr_list.append(v_ptr)
-            element_size_list = [element_size] * len(ptr_list)
         elif self.layout in ["page_first", "page_first_direct", "page_head"]:
+            if self._uses_kv_contiguous_page_slot():
+                element_size = (
+                    self.layer_num
+                    * self.dtype.itemsize
+                    * self.page_size
+                    * self.head_num
+                    * self.head_dim
+                )
+                page_slot_size = 2 * element_size
+                for index in range(0, len(indices), self.page_size):
+                    page_index = indices[index] // self.page_size
+                    page_base_ptr = kv_buffer_data_ptr + page_index * page_slot_size
+                    k_ptr = page_base_ptr
+                    v_ptr = page_base_ptr + element_size
+                    ptr_list.append(k_ptr)
+                    ptr_list.append(v_ptr)
+                element_size_list = [element_size] * len(ptr_list)
+                return ptr_list, element_size_list
             for index in range(0, len(indices), self.page_size):
                 k_ptr = (
                     kv_buffer_data_ptr
@@ -1056,13 +1095,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 dtype=torch.uint64,
                 device=self.device_pool.device,
             )
-        elif self.layout == "page_blob_direct":
-            # page_blob_direct manages backing memory at the slot level; per-layer
-            # refs are not needed (and not safe to compute as contiguous slices).
-            self.data_refs = []
-            self.data_ptrs = torch.empty(
-                (0,), dtype=torch.uint64, device=self.device_pool.device
-            )
         else:
             self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
             self.data_ptrs = torch.tensor(
@@ -1107,14 +1139,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 self.kv_cache_dim,
             )
         elif self.layout == "page_first_direct":
-            dims = (
-                self.page_num,
-                self.layer_num,
-                self.page_size,
-                1,
-                self.kv_cache_dim,
-            )
-        elif self.layout == "page_blob_direct":
             dims = (
                 self.page_num,
                 self.layer_num,
@@ -1224,7 +1248,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     dst_indices=device_indices,
                     page_size=self.page_size,
                 )
-            elif self.layout in ["page_first_direct", "page_blob_direct"]:
+            elif self.layout == "page_first_direct":
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.kv_buffer],
                     dst_ptrs=[device_pool.kv_buffer[layer_id]],
@@ -1312,7 +1336,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     dst_indices=host_indices,
                     page_size=self.page_size,
                 )
-            elif self.layout in ["page_first_direct", "page_blob_direct"]:
+            elif self.layout == "page_first_direct":
                 transfer_kv_all_layer_direct_lf_pf(
                     src_ptrs=device_pool.kv_buffer,
                     dst_ptrs=[self.kv_buffer],
@@ -1346,7 +1370,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
             data_page = self.kv_buffer[index : index + self.page_size, :, :, :]
-        elif self.layout in ["page_first_direct", "page_blob_direct"]:
+        elif self.layout == "page_first_direct":
             real_index = index // self.page_size
             data_page = self.kv_buffer[real_index : real_index + 1, :, :, :, :]
         else:
@@ -1383,7 +1407,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 1,
                 self.kv_cache_dim,
             )
-        elif self.layout in ["page_first_direct", "page_blob_direct"]:
+        elif self.layout == "page_first_direct":
             real_index = index // self.page_size
             self.kv_buffer[real_index : real_index + 1, :, :, :, :] = data_page.reshape(
                 1,
@@ -1414,7 +1438,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     ptr_list.append(k_ptr)
             element_size = self.dtype.itemsize * self.page_size * self.kv_cache_dim
             element_size_list = [element_size] * len(ptr_list)
-        elif self.layout in ["page_first", "page_first_direct", "page_blob_direct"]:
+        elif self.layout in ["page_first", "page_first_direct"]:
             for index in range(0, len(indices), self.page_size):
                 k_ptr = (
                     kv_buffer_data_ptr

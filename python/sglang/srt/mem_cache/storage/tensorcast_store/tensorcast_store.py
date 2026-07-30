@@ -17,7 +17,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.mem_cache.memory_pool_host import (
+    HostKVCache,
+    PageFirstDirectMhaFormat,
+    resolve_page_first_direct_mha_format,
+)
 from sglang.srt.mem_cache.storage.tensorcast_store.client import (
     DefaultTensorcastPageClient,
     TensorcastBatchExistsResult,
@@ -126,9 +130,17 @@ class TensorcastStore(HiCacheStorage):
         self._ensure_host_slot_manager(mem_pool_host)
         host_region_binding = mem_pool_host.host_region_binding
         if self._tensorcast_config.host_allocator_enabled:
-            if mem_pool_host.layout != "page_blob_direct":
+            if mem_pool_host.layout != "page_first_direct":
                 raise ValueError(
-                    "TensorCast allocator-backed host residency requires mem_pool_host.layout=page_blob_direct"
+                    "TensorCast allocator-backed host residency requires mem_pool_host.layout=page_first_direct"
+                )
+            if (
+                resolve_page_first_direct_mha_format(mem_pool_host.allocator)
+                != PageFirstDirectMhaFormat.KV_CONTIGUOUS_PAGE_SLOT
+            ):
+                raise ValueError(
+                    "TensorCast allocator-backed host residency requires "
+                    "page_first_direct with KV-contiguous page slots"
                 )
             if host_region_binding is None:
                 raise ValueError(
@@ -183,8 +195,7 @@ class TensorcastStore(HiCacheStorage):
             return f"pp{self.pp_rank}of{self.pp_size}"
         if self.pp_size > 1:
             return (
-                f"tp{self.local_rank}of{self.tp_size}_"
-                f"pp{self.pp_rank}of{self.pp_size}"
+                f"tp{self.local_rank}of{self.tp_size}_pp{self.pp_rank}of{self.pp_size}"
             )
         return f"tp{self.local_rank}of{self.tp_size}"
 

@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
+from sglang.srt.mem_cache.memory_pool_host import PageFirstDirectMhaFormat
 from sglang.srt.mem_cache.storage.tensorcast_store.client import (
     TensorcastBatchExistsResult,
     TensorcastBatchTransferResult,
@@ -126,6 +127,7 @@ class FakeHostKVCache:
         layout: str = "page_first",
         host_region_binding: object | None = None,
         size_per_token: int = 4,
+        allocator: object | None = None,
     ) -> None:
         self.page_size = page_size
         self.layout = layout
@@ -135,6 +137,7 @@ class FakeHostKVCache:
         self.page_num = self.kv_buffer.numel() // self.page_size
         self._host_region_binding = host_region_binding
         self.attached_host_page_slot_lifecycle_manager: object | None = None
+        self.allocator = allocator or object()
 
     @property
     def host_region_binding(self) -> object | None:
@@ -175,6 +178,12 @@ class StaleCommitHostSlotManager(HostSharedPageSlotManager):
         raise HostSharedPageSlotStaleTokenError(
             "stale slot token rejected before page becomes visible"
         )
+
+
+class KvContiguousPageFirstDirectAllocator:
+    @property
+    def page_first_direct_mha_format(self) -> PageFirstDirectMhaFormat:
+        return PageFirstDirectMhaFormat.KV_CONTIGUOUS_PAGE_SLOT
 
 
 def build_storage_config(
@@ -352,7 +361,7 @@ class TensorcastStoreTest(unittest.TestCase):
         )
 
     def test_tensorcast_store_rejects_allocator_backed_wrong_layout(self) -> None:
-        with self.assertRaisesRegex(ValueError, "page_blob_direct"):
+        with self.assertRaisesRegex(ValueError, "page_first_direct"):
             TensorcastStore(
                 build_storage_config(
                     extra_config={
@@ -362,6 +371,31 @@ class TensorcastStoreTest(unittest.TestCase):
                     }
                 ),
                 FakeHostKVCache([1.0, 2.0], layout="page_first"),
+                page_client=FakeTensorcastPageClient(),
+            )
+
+    def test_tensorcast_store_rejects_allocator_backed_split_kv_planes(self) -> None:
+        binding = TensorcastHostRegionBinding(
+            region_id="region-split",
+            capacity_bytes=4096,
+            base_ptr=1234,
+            handle=SimpleNamespace(),
+            region_name="test-region",
+        )
+        with self.assertRaisesRegex(ValueError, "KV-contiguous page slots"):
+            TensorcastStore(
+                build_storage_config(
+                    extra_config={
+                        "daemon_address": "127.0.0.1:50052",
+                        "namespace": "unit-test",
+                        "host_allocator_enabled": True,
+                    }
+                ),
+                FakeHostKVCache(
+                    [1.0, 2.0],
+                    layout="page_first_direct",
+                    host_region_binding=binding,
+                ),
                 page_client=FakeTensorcastPageClient(),
             )
 
@@ -375,11 +409,17 @@ class TensorcastStoreTest(unittest.TestCase):
                         "host_allocator_enabled": True,
                     }
                 ),
-                FakeHostKVCache([1.0, 2.0], layout="page_blob_direct"),
+                FakeHostKVCache(
+                    [1.0, 2.0],
+                    layout="page_first_direct",
+                    allocator=KvContiguousPageFirstDirectAllocator(),
+                ),
                 page_client=FakeTensorcastPageClient(),
             )
 
-    def test_tensorcast_store_accepts_allocator_backed_page_blob_layout(self) -> None:
+    def test_tensorcast_store_accepts_allocator_backed_page_first_direct_layout(
+        self,
+    ) -> None:
         binding = TensorcastHostRegionBinding(
             region_id="region-1",
             capacity_bytes=4096,
@@ -387,6 +427,7 @@ class TensorcastStoreTest(unittest.TestCase):
             handle=SimpleNamespace(),
             region_name="test-region",
         )
+        client = FakeTensorcastPageClient()
         store = TensorcastStore(
             build_storage_config(
                 extra_config={
@@ -397,14 +438,16 @@ class TensorcastStoreTest(unittest.TestCase):
             ),
             FakeHostKVCache(
                 [1.0, 2.0],
-                layout="page_blob_direct",
+                layout="page_first_direct",
                 host_region_binding=binding,
+                allocator=KvContiguousPageFirstDirectAllocator(),
             ),
-            page_client=FakeTensorcastPageClient(),
+            page_client=client,
         )
 
-        self.assertEqual(store.layout, "page_blob_direct")
+        self.assertEqual(store.layout, "page_first_direct")
         self.assertIs(store.mem_pool_host.host_region_binding, binding)
+        self.assertEqual(client.activate_stable_local_backing_calls, [("region-1", 8)])
 
     def test_allocator_backed_batch_set_uses_resident_slot_region(self) -> None:
         binding = TensorcastHostRegionBinding(
@@ -425,8 +468,9 @@ class TensorcastStoreTest(unittest.TestCase):
             ),
             FakeHostKVCache(
                 [31.0, 32.0, 33.0, 34.0],
-                layout="page_blob_direct",
+                layout="page_first_direct",
                 host_region_binding=binding,
+                allocator=KvContiguousPageFirstDirectAllocator(),
             ),
             page_client=client,
         )
@@ -455,8 +499,9 @@ class TensorcastStoreTest(unittest.TestCase):
         client = FakeTensorcastPageClient()
         host_cache = FakeHostKVCache(
             [41.0, 42.0, 43.0, 44.0],
-            layout="page_blob_direct",
+            layout="page_first_direct",
             host_region_binding=binding,
+            allocator=KvContiguousPageFirstDirectAllocator(),
         )
         store = TensorcastStore(
             build_storage_config(
@@ -511,8 +556,9 @@ class TensorcastStoreTest(unittest.TestCase):
         client = FakeTensorcastPageClient()
         host_cache = FakeHostKVCache(
             [51.0, 52.0, 0.0, 0.0],
-            layout="page_blob_direct",
+            layout="page_first_direct",
             host_region_binding=binding,
+            allocator=KvContiguousPageFirstDirectAllocator(),
         )
         store = TensorcastStore(
             build_storage_config(
@@ -561,8 +607,9 @@ class TensorcastStoreTest(unittest.TestCase):
         client = FakeTensorcastPageClient()
         host_cache = FakeHostKVCache(
             [61.0, 62.0],
-            layout="page_blob_direct",
+            layout="page_first_direct",
             host_region_binding=binding,
+            allocator=KvContiguousPageFirstDirectAllocator(),
         )
         store = TensorcastStore(
             build_storage_config(

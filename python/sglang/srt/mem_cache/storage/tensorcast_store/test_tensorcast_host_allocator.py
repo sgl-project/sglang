@@ -23,12 +23,14 @@ class _FakeHostTensorAllocator:
 
 install_memory_pool_host_stub(host_tensor_allocator_cls=_FakeHostTensorAllocator)
 
+from sglang.srt.mem_cache.memory_pool_host import PageFirstDirectMhaFormat
 from sglang.srt.mem_cache.storage.tensorcast_store.config import (
     TensorcastHostAllocatorConfig,
     tensorcast_host_allocator_config_from_extra_config,
 )
 from sglang.srt.mem_cache.storage.tensorcast_store.host_allocator import (
     TensorcastHostTensorAllocator,
+    build_tensorcast_host_allocator_from_extra_config,
 )
 
 
@@ -119,6 +121,16 @@ class TensorcastHostAllocatorTest(unittest.TestCase):
             ),
         )
 
+    def test_allocator_factory_rejects_non_page_first_direct_layout(self) -> None:
+        with self.assertRaisesRegex(ValueError, "page_first_direct"):
+            build_tensorcast_host_allocator_from_extra_config(
+                {
+                    "host_allocator_enabled": True,
+                    "daemon_address": "unix:///tmp/tensorcast.sock",
+                },
+                layout="page_first",
+            )
+
     def test_allocator_exports_allocator_backed_host_shared_slab(self) -> None:
         fake_store = _FakeTensorcastStore()
         host_registration_ops = _FakeHostRegistrationOps()
@@ -130,6 +142,10 @@ class TensorcastHostAllocatorTest(unittest.TestCase):
             ),
             store_factory=lambda _: fake_store,
             host_registration_ops=host_registration_ops,
+        )
+        self.assertEqual(
+            allocator.page_first_direct_mha_format,
+            PageFirstDirectMhaFormat.KV_CONTIGUOUS_PAGE_SLOT,
         )
 
         tensor = allocator.allocate((2, 4), torch.float32, "cpu")
