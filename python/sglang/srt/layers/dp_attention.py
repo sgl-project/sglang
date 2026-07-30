@@ -89,10 +89,10 @@ class DpPaddingMode(IntEnum):
         dp_size = get_attention_dp_size()
 
         # Hybrid-SSM models materialize idle ranks via the MAX_LEN
-        # fabricated-row conversion.
+        # fabricated-row conversion, which only accepts an empty rank.
         # TODO drop this branch once that conversion handles non-empty ranks.
-        if is_extend_in_batch and dp_size > 1 and get_flags().dp.max_len_with_idle:
-            if min(global_num_tokens) == 0:
+        if is_extend_in_batch and dp_size > 1 and get_flags().dp.hybrid_ssm:
+            if get_flags().dp.max_len_with_idle and min(global_num_tokens) == 0:
                 return DpPaddingMode.MAX_LEN
             return DpPaddingMode.SUM_LEN
 
@@ -328,8 +328,18 @@ def initialize_dp_attention(
 ):
     global _ATTN_DP_RANK, _ATTN_DP_SIZE
     dp = get_flags().dp
+    # Imported here because sglang.srt.configs pulls in every model config,
+    # which would make this early-imported module part of an import cycle.
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
     dp.max_len_with_idle = (
         getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
+    )
+    dp.hybrid_ssm = (
+        dp.max_len_with_idle
+        or mambaish_config(model_config) is not None
+        or getattr(model_config.hf_config, "mtp_hybrid_override_pattern", None)
+        is not None
     )
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size

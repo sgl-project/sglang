@@ -382,6 +382,9 @@ class DpFlags(_FlagGroupBase):
     # Hybrid-SSM models materialize idle ranks via the MAX_LEN fabricated-row
     # conversion (set when hf_config has hybrid_override_pattern).
     max_len_with_idle: bool = False
+    # Whether the model is any hybrid-SSM / linear-attention family, i.e. the
+    # families whose ranks always take the fabricated-row conversion.
+    hybrid_ssm: bool = False
     # DP gathered-buffer allocation metadata (model hidden size / dtype /
     # device), set by initialize_dp_attention alongside the flags above.
     buffer_hidden_size: Any = None
