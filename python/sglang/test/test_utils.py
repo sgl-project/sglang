@@ -30,7 +30,6 @@ from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
-import psutil
 import requests
 import torch
 import torch.nn.functional as F
@@ -48,7 +47,6 @@ from sglang.srt.utils import (
     kill_process_tree,
     retry,
 )
-from sglang.srt.utils.common import _wait_for_reap_or_raise
 from sglang.srt.utils.network import is_port_available
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback, normalize_base_url
@@ -1051,7 +1049,7 @@ def popen_launch_server(
 def terminate_and_kill_process_tree(
     process,
     terminate_timeout: float = 60,
-    wait_timeout: float = 60,
+    **kill_kwargs,
 ) -> None:
     """Shut a launched server down gracefully, then SIGKILL whatever is left.
 
@@ -1060,29 +1058,13 @@ def terminate_and_kill_process_tree(
     for minutes on a busy host -- long enough to trip the per-class GPU-idle
     gate in the next ``setUpClass``. SIGTERM first so the server releases those
     resources in userspace.
-
-    The launcher exits slightly ahead of its scheduler children, and once it is
-    reaped ``kill_process_tree`` can no longer discover them -- so snapshot the
-    tree up front and wait on that snapshot, not just on the parent.
     """
-    try:
-        descendants = psutil.Process(process.pid).children(recursive=True)
-    except psutil.NoSuchProcess:
-        descendants = []
-
     process.terminate()
     try:
         process.wait(timeout=terminate_timeout)
     except subprocess.TimeoutExpired:
         pass
-
-    for child in descendants:
-        try:
-            child.kill()
-        except psutil.NoSuchProcess:
-            pass
-    kill_process_tree(process.pid, wait_timeout=wait_timeout)
-    _wait_for_reap_or_raise(descendants, wait_timeout)
+    kill_process_tree(process.pid, **kill_kwargs)
 
 
 def popen_launch_pd_server(
