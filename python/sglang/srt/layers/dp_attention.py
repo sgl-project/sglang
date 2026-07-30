@@ -88,6 +88,15 @@ class DpPaddingMode(IntEnum):
     ) -> DpPaddingMode:
         dp_size = get_attention_dp_size()
 
+        # (trangdough) pplx-kernels a2a is a symmetric collective: every EP rank
+        # must dispatch the same number of tokens or the device-side handshake
+        # deadlocks (idle DP ranks with 0 tokens never signal their peers).
+        # Force MAX_LEN so all ranks are padded to equal token counts.
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if get_moe_a2a_backend().is_pplx():
+            return DpPaddingMode.MAX_LEN
+
         # Hybrid-SSM models materialize idle ranks via the MAX_LEN
         # fabricated-row conversion, which only accepts an empty rank.
         # TODO drop this branch once that conversion handles non-empty ranks.
