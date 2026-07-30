@@ -230,8 +230,9 @@ class SpectrumForecaster(nn.Module):
             return self.cheb.predict(t_star)
         elif self.w <= 0.0:
             return self._local_taylor_discrete(t_star)
-        return torch.lerp(self._local_taylor_discrete(t_star), self.cheb.predict(t_star), self.w)
-        
+        return torch.lerp(
+            self._local_taylor_discrete(t_star), self.cheb.predict(t_star), self.w
+        )
 
     def update(self, t, h) -> None:
         self.cheb.update(t, h)

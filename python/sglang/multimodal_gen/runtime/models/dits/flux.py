@@ -1152,7 +1152,9 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         forward_batch = get_forward_context().forward_batch
         spectrum_enabled = forward_batch is not None and forward_batch.enable_spectrum
-        run_transformer_blocks = self.begin_spectrum_step() if spectrum_enabled else True
+        run_transformer_blocks = (
+            self.begin_spectrum_step() if spectrum_enabled else True
+        )
         if run_transformer_blocks:
             for block in self.transformer_blocks:
                 encoder_hidden_states, hidden_states = block(

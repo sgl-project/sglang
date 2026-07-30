@@ -131,7 +131,9 @@ class SD3Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         forward_batch = get_forward_context().forward_batch
         spectrum_enabled = forward_batch is not None and forward_batch.enable_spectrum
-        run_transformer_blocks = self.begin_spectrum_step() if spectrum_enabled else True
+        run_transformer_blocks = (
+            self.begin_spectrum_step() if spectrum_enabled else True
+        )
         if run_transformer_blocks:
             for index_block, block in enumerate(self.transformer_blocks):
                 if index_block not in skip_layer_set:
