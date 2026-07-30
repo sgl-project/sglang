@@ -41,6 +41,7 @@ class _FakeFlashInferComm:
         input,
         workspace,
         pattern,
+        output=None,
         residual_out=None,
         norm_out=None,
         residual_in=None,
@@ -49,7 +50,11 @@ class _FakeFlashInferComm:
         **_kwargs,
     ):
         if pattern is self.AllReduceFusionPattern.kAllReduce:
-            return input * workspace.world_size
+            allreduced = input * workspace.world_size
+            if output is None:
+                return allreduced
+            output.copy_(allreduced)
+            return output
 
         if pattern is not self.AllReduceFusionPattern.kARResidualRMSNorm:
             raise ValueError(f"Unexpected pattern: {pattern}")
@@ -290,8 +295,8 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
             else:
                 buffers[manager_key] = original_manager
 
-    def _allreduce(self, input_, world_size=4, group_key=_GROUP_KEY):
-        return fusion.flashinfer_allreduce(
+    def _can_use(self, input_, world_size=4, group_key=_GROUP_KEY):
+        return fusion.can_use_flashinfer_allreduce(
             input_,
             use_attn_tp_group=True,
             expected_world_size=world_size,
@@ -307,36 +312,36 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
             expected = input_ * world_size
 
             with get_parallel().override(attn_tp_size=world_size):
-                result = self._allreduce(input_, world_size=world_size)
+                self.assertTrue(self._can_use(input_, world_size=world_size))
+                result = fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
 
-            self.assertIsNotNone(result)
             torch.testing.assert_close(result, expected)
 
-    def test_shape_guard_returns_none_for_non_2d(self):
+    def test_shape_guard_rejects_non_2d(self):
         with self._patched_attn_workspace(self._make_manager(4)):
-            self.assertIsNone(self._allreduce(torch.randn(16)))
-            self.assertIsNone(self._allreduce(torch.randn(2, 8, 16)))
+            self.assertFalse(self._can_use(torch.randn(16)))
+            self.assertFalse(self._can_use(torch.randn(2, 8, 16)))
 
-    def test_shape_guard_returns_none_for_non_contiguous(self):
+    def test_shape_guard_rejects_non_contiguous(self):
         with self._patched_attn_workspace(self._make_manager(4)):
             non_contiguous = torch.randn(16, 8).t()
             self.assertFalse(non_contiguous.is_contiguous())
-            self.assertIsNone(self._allreduce(non_contiguous))
+            self.assertFalse(self._can_use(non_contiguous))
 
-    def test_returns_none_when_unavailable(self):
+    def test_rejects_when_unavailable(self):
         original_unavailable = fusion._flashinfer_allreduce_unavailable
         try:
             fusion._flashinfer_allreduce_unavailable = True
-            self.assertIsNone(self._allreduce(torch.randn(8, 16)))
+            self.assertFalse(self._can_use(torch.randn(8, 16)))
         finally:
             fusion._flashinfer_allreduce_unavailable = original_unavailable
 
-    def test_returns_none_when_workspace_uninitialized(self):
+    def test_rejects_when_workspace_uninitialized(self):
         with self._patched_attn_workspace(fusion.FlashInferWorkspaceManager()):
             with get_parallel().override(attn_tp_size=4):
-                self.assertIsNone(self._allreduce(torch.randn(8, 16)))
+                self.assertFalse(self._can_use(torch.randn(8, 16)))
 
-    def test_returns_none_when_workspace_group_differs(self):
+    def test_rejects_when_workspace_group_differs(self):
         """A workspace rendezvoused on other peers must not be reused.
 
         Under hybrid EP+TP (e.g. tp=4, ep=2) the MoE-TP and MoE-EP groups have
@@ -345,15 +350,28 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
         wrong output rather than a crash.
         """
         with self._patched_attn_workspace(self._make_manager(2)):
-            self.assertIsNone(
-                self._allreduce(
+            self.assertFalse(
+                self._can_use(
                     torch.randn(8, 16), world_size=2, group_key=_OTHER_GROUP_KEY
                 )
             )
 
-    def test_returns_none_when_workspace_world_size_differs(self):
+    def test_rejects_when_workspace_world_size_differs(self):
         with self._patched_attn_workspace(self._make_manager(4)):
-            self.assertIsNone(self._allreduce(torch.randn(8, 16), world_size=2))
+            self.assertFalse(self._can_use(torch.randn(8, 16), world_size=2))
+
+    def test_rejects_when_token_num_exceeds_workspace_capacity(self):
+        """Under Dynamo the capacity check replaces is_buffer_size_sufficient().
+
+        _FakeWorkspace.is_buffer_size_sufficient() always says yes, so this only
+        passes if the compiling branch consults the manager's own allocation.
+        """
+        manager = self._make_manager(4)
+        manager.max_token_num = 8
+        with self._patched_attn_workspace(manager):
+            with patch.object(torch.compiler, "is_compiling", return_value=True):
+                self.assertTrue(self._can_use(torch.randn(8, 16)))
+                self.assertFalse(self._can_use(torch.randn(9, 16)))
 
 
 class _FakeGroupCoordinator:

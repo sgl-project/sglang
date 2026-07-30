@@ -185,6 +185,22 @@ def outplace_all_reduce(
     return group._all_reduce_out_place(tensor, outplace_all_reduce_method)
 
 
+@register_custom_op(out_shape="tensor")
+def flashinfer_allreduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    """FlashInfer kAllReduce over ``group_name``.
+
+    Registered as a custom op so it stays opaque under Dynamo and can run inside
+    piecewise CUDA graphs. Applicability is decided by
+    ``GroupCoordinator._can_use_flashinfer_allreduce`` before the call -- this op
+    has no fallback of its own.
+    """
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._flashinfer_allreduce(tensor)
+
+
 @register_custom_op(mutates_args=["output"])
 def reg_all_gather_into_tensor(
     output: torch.Tensor, input: torch.Tensor, group_name: str
@@ -670,6 +686,12 @@ class GroupCoordinator:
             return self.npu_communicator.all_reduce(input_)
 
         if torch.compiler.is_compiling():
+            # kAllReduce is a custom op, so it stays opaque to Dynamo and can be
+            # captured inside a piecewise CUDA graph. Applicability is resolved
+            # here, in plain Python, so nothing data-dependent leaks into the op.
+            if self._can_use_flashinfer_allreduce(input_):
+                return flashinfer_allreduce(input_, group_name=self.unique_name)
+
             # Byte-size thresholds in method selection (e.g. `_pick_algo` or
             # `should_mscclpp_allreduce`) would guard on the symbolic token dim
             # and recompile per shape; defer the selection to runtime inside
@@ -721,17 +743,8 @@ class GroupCoordinator:
                 self.pynccl_comm.all_reduce(input_)
                 return input_
 
-        if self._fi_workspace_hint is not None:
-            from sglang.srt.layers.flashinfer_comm_fusion import flashinfer_allreduce
-
-            result = flashinfer_allreduce(
-                input_,
-                use_attn_tp_group=(self._fi_workspace_hint == "attn_tp"),
-                expected_world_size=self.world_size,
-                expected_group_key=(self.device_group, self.cpu_group),
-            )
-            if result is not None:
-                return result
+        if self._can_use_flashinfer_allreduce(input_):
+            return flashinfer_allreduce(input_, group_name=self.unique_name)
 
         outplace_all_reduce_method = self._resolve_outplace_all_reduce_method(
             input_=input_,
@@ -928,6 +941,29 @@ class GroupCoordinator:
             # For piecewise cuda graph, we use pynccl outplace allreduce
             return "pynccl"
         return None
+
+    def _can_use_flashinfer_allreduce(self, input_: torch.Tensor) -> bool:
+        if self._fi_workspace_hint is None:
+            return False
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            can_use_flashinfer_allreduce,
+        )
+
+        return can_use_flashinfer_allreduce(
+            input_,
+            use_attn_tp_group=(self._fi_workspace_hint == "attn_tp"),
+            expected_world_size=self.world_size,
+            expected_group_key=(self.device_group, self.cpu_group),
+        )
+
+    def _flashinfer_allreduce(self, input_: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            flashinfer_allreduce as _flashinfer_allreduce_impl,
+        )
+
+        return _flashinfer_allreduce_impl(
+            input_, use_attn_tp_group=(self._fi_workspace_hint == "attn_tp")
+        )
 
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str

@@ -860,36 +860,38 @@ def flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
-def flashinfer_allreduce(
+def can_use_flashinfer_allreduce(
     input_: torch.Tensor,
     *,
     use_attn_tp_group: bool,
     expected_world_size: int,
     expected_group_key: Tuple[Optional[ProcessGroup], Optional[ProcessGroup]],
-) -> Optional[torch.Tensor]:
-    """Allreduce-only FlashInfer kAllReduce. Returns None to signal fallback to NCCL.
+) -> bool:
+    """Whether ``flashinfer_allreduce`` can service this all-reduce.
+
+    Split out from the kernel call so the decision happens in plain Python,
+    outside the custom op: the op is opaque to Dynamo and has to return a
+    tensor, so it cannot carry a data-dependent fallback of its own.
 
     ``expected_world_size`` / ``expected_group_key`` describe the calling group;
-    the workspace is only used when it was rendezvoused on exactly those peers.
+    the workspace is only usable when it was rendezvoused on exactly those peers.
 
-    Every bail-out below is rank-invariant by construction, and must stay that
-    way: a rank that quietly falls back to NCCL while its peers enter the kernel
+    Every check here is rank-invariant by construction, and must stay that way:
+    a rank that quietly falls back to NCCL while its peers enter the kernel
     mismatches and hangs. The unavailable flag and workspace initialization are
     cross-rank synced at init time (``_sync_allreduce_unavailable_across_tp``);
     the rest are pure functions of the group identity and of tensor metadata,
-    which is identical on every rank of the group. Kernel errors are
-    deliberately not caught, for the same reason -- they must surface loudly
-    rather than send this rank down a different path than its peers.
+    which is identical on every rank of the group.
     """
     if _flashinfer_allreduce_unavailable or _flashinfer_comm is None:
-        return None
+        return False
 
     if input_.ndim != 2 or not input_.is_contiguous():
-        return None
+        return False
 
     workspace_manager = _get_workspace_manager(use_attn_tp_group)
     if not workspace_manager.initialized or workspace_manager.workspace is None:
-        return None
+        return False
 
     # The two workspaces are keyed by attention-TP vs MoE, but the MoE one
     # rendezvouses on either the EP or the MoE-TP group depending on topology.
@@ -900,15 +902,48 @@ def flashinfer_allreduce(
         workspace_manager.world_size != expected_world_size
         or workspace_manager.group != expected_group_key
     ):
-        return None
+        return False
 
+    # Size checks stay last: they read the token dim, which is symbolic under
+    # Dynamo, so statically-off configs must short-circuit before reaching them
+    # (same ordering rule as apply_flashinfer_allreduce_fusion).
     token_num, hidden_dim = input_.shape
-    if not workspace_manager.is_buffer_size_sufficient(
+    if torch.compiler.is_compiling():
+        # Don't call into the flashinfer workspace object while tracing. The
+        # workspace was allocated for (max_token_num, hidden_dim) and vetted by
+        # is_buffer_size_sufficient() at init; the requirement is monotone in
+        # token_num, so staying within the allocation is sufficient here.
+        return (
+            workspace_manager.max_token_num is not None
+            and workspace_manager.hidden_dim is not None
+            and token_num <= workspace_manager.max_token_num
+            and hidden_dim <= workspace_manager.hidden_dim
+        )
+
+    return workspace_manager.is_buffer_size_sufficient(
         token_num=token_num,
         hidden_dim=hidden_dim,
         dtype=input_.dtype,
-    ):
-        return None
+    )
+
+
+def flashinfer_allreduce(
+    input_: torch.Tensor,
+    *,
+    use_attn_tp_group: bool,
+) -> torch.Tensor:
+    """Allreduce-only FlashInfer kAllReduce.
+
+    Assumes ``can_use_flashinfer_allreduce`` returned True for this call; there
+    is no fallback here. Kernel errors are deliberately not caught -- swallowing
+    one would put this rank on NCCL while its peers stay in the kernel, which
+    mismatch-hangs instead of failing.
+    """
+    workspace_manager = _get_workspace_manager(use_attn_tp_group)
+
+    # Allocate the output rather than letting flashinfer do it, so the tensor
+    # the op returns is the one the fake impl describes.
+    output = torch.empty_like(input_)
 
     # Keep the numerics identical to the fused path: both default to
     # fp32_acc=False, and flashinfer's own trigger_completion_at_end default is
@@ -919,10 +954,12 @@ def flashinfer_allreduce(
         pattern=_flashinfer_comm.AllReduceFusionPattern.kAllReduce,
         launch_with_pdl=True,
         fp32_acc=False,
+        output=output,
     )
     if _flashinfer_allreduce_supports_trigger_completion:
         kwargs["trigger_completion_at_end"] = False
-    return _flashinfer_comm.allreduce_fusion(**kwargs)
+    _flashinfer_comm.allreduce_fusion(**kwargs)
+    return output
 
 
 def pre_initialize_workspaces(
