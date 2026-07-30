@@ -36,6 +36,7 @@ class MoeA2ABackend(Enum):
     ASCEND_TP = "ascend_tp"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
+    NCCL_EP = "nccl_ep"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -76,6 +77,9 @@ class MoeA2ABackend(Enum):
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
+
+    def is_nccl_ep(self):
+        return self == MoeA2ABackend.NCCL_EP
 
     def supports_aiter(self) -> bool:
         return self in (
@@ -201,6 +205,25 @@ class DeepEPMode(Enum):
         return self == DeepEPMode.AUTO
 
 
+class NcclEpMode(Enum):
+    """NCCL EP dispatch algorithm. Only LOW_LATENCY is implemented; HT is a follow-up."""
+
+    LOW_LATENCY = "low_latency"
+    HIGH_THROUGHPUT = "high_throughput"
+    AUTO = "auto"
+
+    def resolve(self, is_extend_in_batch: bool) -> "NcclEpMode":
+        if self == NcclEpMode.HIGH_THROUGHPUT:
+            raise NotImplementedError(
+                "NCCL EP high-throughput (prefill) path is not implemented yet; "
+                "use --nccl-ep-mode low_latency (or auto) for decode."
+            )
+        return NcclEpMode.LOW_LATENCY
+
+    def is_low_latency(self) -> bool:
+        return self == NcclEpMode.LOW_LATENCY
+
+
 class DispatcherOutputDtype(Enum):
     """
     Describes the dispatch output data type for DeepEP.
@@ -307,6 +330,10 @@ def initialize_moe_config(server_args: ServerArgs):
     )
     moe.deepep_mode = DeepEPMode(server_args.deepep_mode)
     moe.deepep_config = server_args.deepep_config or ""
+    moe.nccl_ep_mode = NcclEpMode(server_args.nccl_ep_mode)
+    moe.nccl_ep_num_max_dispatch_tokens_per_rank = int(
+        server_args.nccl_ep_num_max_dispatch_tokens_per_rank or 0
+    )
     moe.tbo_enabled = server_args.enable_two_batch_overlap
     moe.sbo_enabled = server_args.enable_single_batch_overlap
     if moe.sbo_enabled and is_cuda():
@@ -361,6 +388,18 @@ def get_deepep_mode() -> DeepEPMode:
     return moe.deepep_mode
 
 
+def get_nccl_ep_mode() -> NcclEpMode:
+    moe = get_flags().moe
+    if moe.nccl_ep_mode is None:
+        moe.nccl_ep_mode = NcclEpMode.LOW_LATENCY
+    return moe.nccl_ep_mode
+
+
+def get_nccl_ep_num_max_dispatch_tokens_per_rank() -> int:
+    moe = get_flags().moe
+    return moe.nccl_ep_num_max_dispatch_tokens_per_rank or 0
+
+
 def get_deepep_config() -> str:
     moe = get_flags().moe
     if moe.deepep_config is None:
@@ -384,9 +423,9 @@ def is_sbo_enabled() -> bool:
 
 
 def is_deepep_class_backend() -> bool:
-    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
+    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, Mori, NCCL EP)."""
     b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori()
+    return b.is_deepep() or b.is_mooncake() or b.is_mori() or b.is_nccl_ep()
 
 
 def uses_per_rank_fused_shared_slots() -> bool:

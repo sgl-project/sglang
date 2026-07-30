@@ -144,6 +144,13 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
         )
+    elif a2a_backend.is_nccl_ep():
+        from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
+
+        return NcclEpDispatcher(
+            moe_runner_config=moe_runner_config,
+            ep_group=get_tp_group(),
+        )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
 

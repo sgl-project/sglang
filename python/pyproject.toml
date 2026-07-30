@@ -99,6 +99,8 @@ default = true
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
+# NCCL EP MoE A2A backend (low-latency decode); needs NCCL >= 2.29 + sm_90+.
+nccl_ep = ["nccl4py[cu13]"]
 diffusion = [
   "addict==2.4.0",
   "av==16.1.0",
