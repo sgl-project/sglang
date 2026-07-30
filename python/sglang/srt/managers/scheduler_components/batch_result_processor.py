@@ -1000,8 +1000,10 @@ class SchedulerBatchResultProcessor:
     ) -> None:
         """Update mamba track state at ping-pong boundaries.
 
-        Non-lazy: swap the ping-pong index so the next forward writes to
-        the alternate slot.
+        Non-lazy non-spec: swap the ping-pong index so the next forward writes
+        to the alternate slot. Non-lazy spec already performs this swap
+        immediately after committing the accepted mamba state, before overlap
+        can launch the next verify, so it must not be swapped again here.
         Lazy: keep the same index (prealloc handles the swap) and run
         post-decode cleanup to free the temporary second slot.
         """
@@ -1024,7 +1026,7 @@ class SchedulerBatchResultProcessor:
         req.mamba_last_track_seqlen = track_seqlen
         if lazy:
             self.mamba_lazy_post_decode_at_boundary(req, batch)
-        else:
+        elif batch.spec_algorithm.is_none():
             req.mamba_next_track_idx = (
                 batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
                     req.mamba_next_track_idx
