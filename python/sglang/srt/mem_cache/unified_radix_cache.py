@@ -1824,13 +1824,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 f"Cannot attach different backend '{storage_backend}'. Detach first.",
             )
 
-        # Not enabled: update policies before controller attach so storage
-        # threads observe the new values.
-        self._set_runtime_storage_policies(
-            hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
-            hicache_write_policy=hicache_write_policy,
-        )
-
         logger.info(f"Attaching HiCache storage backend: {storage_backend}")
         try:
             (
@@ -1849,6 +1842,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 f"Failed to parse storage_backend_extra_config_json "
                 f"'{storage_backend_extra_config_json}': {e}",
             )
+
+        # Update policies before controller attach so storage threads observe
+        # the new values.
+        self._set_runtime_storage_policies(
+            hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
+            hicache_write_policy=hicache_write_policy,
+        )
 
         try:
             self.cache_controller.attach_storage_backend(
