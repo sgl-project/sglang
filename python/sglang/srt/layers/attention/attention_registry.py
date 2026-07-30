@@ -6,9 +6,9 @@ from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
     hybrid_lightning_config,
     kimi_linear_config,
-    rwkv7_config,
     mamba2_config,
     mambaish_config,
+    rwkv7_config,
 )
 from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
