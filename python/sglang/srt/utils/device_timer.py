@@ -21,17 +21,24 @@ class DeviceTimer:
     def __init__(self, reporter: Callable):
         self._intervals: Deque[_TimingInterval] = deque()
         self._reporters: List[Callable] = [reporter]
+        self._in_wrap = False
 
     def add_reporter(self, reporter: Callable):
         self._reporters.append(reporter)
 
     @contextmanager
     def wrap(self, metadata: Dict):
-        self._intervals.append(_TimingInterval.create())
+        # Not re-entrant: a nested wrap would end the wrong interval and leave
+        # an un-ended one at the head of the queue for _report() to trip over.
+        assert not self._in_wrap, "DeviceTimer.wrap is not re-entrant"
+        interval = _TimingInterval.create()
+        self._intervals.append(interval)
+        self._in_wrap = True
         try:
             yield
         finally:
-            self._intervals[-1].end(metadata=metadata)
+            self._in_wrap = False
+            interval.end(metadata=metadata)
             self._report()
 
     def _report(self):

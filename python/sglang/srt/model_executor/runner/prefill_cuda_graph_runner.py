@@ -112,7 +112,6 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
-from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -1609,32 +1608,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if shape_key.variant_label is not None:
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
 
-            # Timed around the forward only: load_batch and the chunked-prefix
-            # refresh above stay out of the fwd-occupancy numerator.
-            timer_ctx = device_timer_ctx(
-                self.model_runner.device_timer,
-                (
-                    "target_verify"
-                    if forward_batch.forward_mode.is_target_verify()
-                    else "extend"
-                ),
-            )
             if self._uses_eager_prefill_tail():
-                with timer_ctx:
-                    output = self._execute_body_capture(
-                        forward_batch,
-                        static_forward_batch,
-                        static_num_tokens,
-                        raw_num_tokens,
-                        shape_key,
-                        **kwargs,
-                    )
+                output = self._execute_body_capture(
+                    forward_batch,
+                    static_forward_batch,
+                    static_num_tokens,
+                    raw_num_tokens,
+                    shape_key,
+                    **kwargs,
+                )
             else:
-                with timer_ctx:
-                    output = self._execute_tc_piecewise(
-                        static_forward_batch,
-                        static_num_tokens,
-                        raw_num_tokens,
-                        **kwargs,
-                    )
+                output = self._execute_tc_piecewise(
+                    static_forward_batch,
+                    static_num_tokens,
+                    raw_num_tokens,
+                    **kwargs,
+                )
             return self._finalize_execute_output(output)

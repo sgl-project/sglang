@@ -1543,9 +1543,20 @@ class ModelRunner:
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
                 and get_cp_strategy() is None
             ):
-                # Prefill cuda graph (piecewise). Timed inside the runner's execute.
+                # Prefill cuda graph (piecewise).
                 kwargs = self._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
-                ret = self.prefill_cuda_graph_runner.execute(forward_batch, **kwargs)
+                category = (
+                    "target_verify"
+                    if forward_batch.forward_mode.is_target_verify()
+                    else "extend"
+                )
+                # TODO: the timing here is too broad -- it also includes
+                # load_batch time. Move it into the prefill cuda graph runner
+                # to capture only the model.forward part.
+                with device_timer_ctx(self.device_timer, category):
+                    ret = self.prefill_cuda_graph_runner.execute(
+                        forward_batch, **kwargs
+                    )
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
