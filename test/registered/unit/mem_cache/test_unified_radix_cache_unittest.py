@@ -56,6 +56,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
+    ReplaceWriteThroughBatchOnNodeSplit,
     ReplaceWriteThroughOnNodeSplit,
     SWARebuild,
 )
@@ -5358,6 +5359,19 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         UnifiedRadixCache._apply_cache_action(cache, action)
         cache._replace_pending_write_through_node.assert_called_once_with(7, 2, [3, 2])
 
+    def test_apply_cache_action_routes_overlapping_write_throughs(self):
+        cache = mock.MagicMock()
+        action = ReplaceWriteThroughBatchOnNodeSplit(
+            ack_ids=(7, -1),
+            old_node_id=2,
+            new_node_id=3,
+            new_child_node_id=2,
+        )
+        UnifiedRadixCache._apply_cache_action(cache, action)
+        cache._replace_pending_write_through_node.assert_has_calls(
+            [mock.call(7, 2, [3, 2]), mock.call(-1, 2, [3, 2])]
+        )
+
     def test_apply_cache_action_routes_free_device_kv(self):
         cache = mock.MagicMock()
         first, second = torch.tensor([4, 5]), torch.tensor([6])
@@ -5813,8 +5827,8 @@ class TestResumableInsertWalk(_InsertWalkSuite):
         cache.writing_check(write_back=True)
         parent = next(iter(cache.root_node.children.values()))
         (child,) = parent.children.values()
-        self.assertIsNone(parent.write_through_pending_id)
-        self.assertIsNone(child.write_through_pending_id)
+        self.assertFalse(parent.write_through_pending_ids)
+        self.assertFalse(child.write_through_pending_ids)
         cache.sanity_check()
 
 

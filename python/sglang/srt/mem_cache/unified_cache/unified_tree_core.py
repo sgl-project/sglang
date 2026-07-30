@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     CacheAction,
     ComponentAction,
     FreeDeviceKV,
+    ReplaceWriteThroughBatchOnNodeSplit,
     ReplaceWriteThroughOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -122,7 +123,7 @@ class UnifiedTreeNode:
         )
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
-        self.write_through_pending_id: Optional[int] = None
+        self.write_through_pending_ids: set[int] = set()
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -414,6 +415,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def is_backuped(self, node_id: NodeId) -> bool:
         """Whether the node's KV is already backed up to host."""
         return self._node_arena[node_id].backuped
+
+    def needs_hicache_backup(self, node_id: NodeId) -> bool:
+        """Whether the node is missing any policy-required Host state."""
+        return self._node_needs_hicache_backup(self._node_arena[node_id])
 
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
@@ -743,8 +748,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node.hit_count += 1
         return (
             self.enable_hicache
-            and not node.backuped
+            and self._node_needs_hicache_backup(node)
             and node.hit_count >= self.write_through_threshold
+        )
+
+    def _node_needs_hicache_backup(self, node: UnifiedTreeNode) -> bool:
+        """Whether reusable device state is missing from the Host copy."""
+        if not self.enable_hicache:
+            return False
+        base = node.component_data[BASE_COMPONENT_TYPE]
+        if base.value is None:
+            return False
+        if base.host_value is None:
+            return True
+        return any(
+            component.needs_hicache_backup(node)
+            for component in self.components
+            if component.component_type != BASE_COMPONENT_TYPE
         )
 
     def begin_insert(self, params: InsertParams) -> InsertStepResult:
@@ -822,7 +842,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     @staticmethod
     def _is_deferrable_action(action: CacheAction | ComponentAction) -> bool:
         """Fire-and-forget actions safe to batch until the next barrier."""
-        return isinstance(action, (FreeDeviceKV, ReplaceWriteThroughOnNodeSplit))
+        return isinstance(
+            action,
+            (
+                FreeDeviceKV,
+                ReplaceWriteThroughOnNodeSplit,
+                ReplaceWriteThroughBatchOnNodeSplit,
+            ),
+        )
 
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
         """Process one walked node, appending its barrier actions to the state."""
@@ -903,6 +930,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # All hooks run before their emitted actions execute; an action failure
         # fail-stops the process, so partial-commit state is never observed.
         state.result = InsertResult(prefix_len=state.total_prefix_length)
+        component_action_start = len(state.pending_actions)
         for component in self.components:
             component.commit_insert_component_data(
                 node=state.target_node,
@@ -910,6 +938,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 params=state.params,
                 result=state.result,
                 cache_actions=state.pending_actions,
+            )
+        if (
+            not state.is_new_leaf
+            and not state.params.chunked
+            and not self.is_write_back
+            and state.target_node.hit_count >= self.write_through_threshold
+            and self._node_needs_hicache_backup(state.target_node)
+        ):
+            # A branch checkpoint can attach Mamba state after this node's Full
+            # KV was already backed up. Complete that existing Host entry
+            # without incrementing the node's hit count a second time. Run the
+            # backup before component actions such as the Mamba path-cap walk.
+            state.pending_actions.insert(
+                component_action_start,
+                self._build_backup_kv_action(state.target_node),
             )
         state.phase = _InsertPhase.TAIL
 
@@ -954,11 +997,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         # A split of a backuped node tells the cache to fix its publish list.
         action: Optional[CacheAction | ComponentAction] = None
-        if child.write_through_pending_id is not None:
-            ack_id = child.write_through_pending_id
-            new_node.write_through_pending_id = ack_id
-            action = ReplaceWriteThroughOnNodeSplit(
-                ack_id=ack_id,
+        if child.write_through_pending_ids:
+            ack_ids = tuple(sorted(child.write_through_pending_ids))
+            new_node.write_through_pending_ids.update(ack_ids)
+            action = ReplaceWriteThroughBatchOnNodeSplit(
+                ack_ids=ack_ids,
                 old_node_id=child.id,
                 new_node_id=new_node.id,
                 new_child_node_id=child.id,
@@ -1081,8 +1124,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceLeafResult()
         node = self.node_by_id(node_id)
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
-        if not node.backuped:
-            if is_write_back:
+        if self._node_needs_hicache_backup(node):
+            if is_write_back or node.backuped:
                 result.backup_kv = self._build_backup_kv_action(node, write_back=True)
                 return result
             # Write-through: node has no backup, delete entirely.
@@ -1109,9 +1152,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = DropSubtreeNoHostResult(is_dropped=False)
         node = self.node_by_id(node_id)
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+        if node.backuped:
+            # Full KV is already reusable on Host; only an auxiliary backup
+            # failed. Keep the device sidecar for a later retry.
+            return result
         # A failed backup never issues the D->H copy, so the subtree root has
         # no host state and no in-flight DMA reading its device slots.
-        assert not node.backuped and node.write_through_pending_id is None
+        assert not node.backuped and not node.write_through_pending_ids
         if any(cd.host_lock_ref > 0 for cd in node.component_data):
             return result
         descendants: list[UnifiedTreeNode] = []
@@ -1128,7 +1175,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             # Host-only by construction: a device descendant would contradict
             # this node being a D-leaf, and D-leaves evict before ancestors.
             assert desc.evicted and desc.backuped, f"node {desc.id} not host-only"
-            assert desc.write_through_pending_id is None
+            assert not desc.write_through_pending_ids
             self._release_all_component_layers(
                 desc,
                 StorageMedium.CPU,
@@ -1535,12 +1582,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return result
 
     def build_backup_spec(self, node_id: NodeId):
-        """Read a node's device->host backup spec (device value + component transfers) now."""
+        """Read a node's current device/Host KV and component backup spec."""
         return self._build_backup_spec(self.node_by_id(node_id))
 
     def _build_backup_spec(self, node: UnifiedTreeNode):
         """Gather device value backup spec."""
-        device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        base = node.component_data[BASE_COMPONENT_TYPE]
+        device_value = base.value
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self.components:
             if comp.component_type == BASE_COMPONENT_TYPE:
@@ -1548,7 +1596,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
                 comp_xfers[comp.component_type] = t
-        return device_value, comp_xfers
+        return device_value, base.host_value, comp_xfers
 
     def build_storage_backup_spec(
         self, node_id: NodeId, pass_prefix_keys: bool
@@ -1634,7 +1682,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             while (
                 ancestor is not None
                 and ancestor is not self.root_node
-                and not ancestor.backuped
+                and self._node_needs_hicache_backup(ancestor)
             ):
                 chain.append(ancestor)
                 ancestor = ancestor.parent
@@ -1720,18 +1768,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_evictable_leaf_sets(node)
         return cache_actions
 
-    def mark_write_through_pending(self, node_id: NodeId) -> None:
+    def mark_write_through_pending(self, node_id: NodeId, ack_id: int) -> None:
         """Mark a node as having an in-flight write-through backup."""
         node = self.node_by_id(node_id)
-        node.write_through_pending_id = node_id
+        node.write_through_pending_ids.add(ack_id)
 
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the
         host store event for each acked node."""
         for node_id in node_ids:
             node = self.node_by_id(node_id)
-            if node.write_through_pending_id == ack_id:
-                node.write_through_pending_id = None
+            node.write_through_pending_ids.discard(ack_id)
             self._record_store_event(node, medium=StorageMedium.CPU)
 
     def set_component_device_value(

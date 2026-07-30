@@ -107,6 +107,10 @@ class MambaComponent(TreeComponent):
             or node.component_data[ct].host_value is not None
         )
 
+    def needs_hicache_backup(self, node: UnifiedTreeNode) -> bool:
+        cd = node.component_data[self.component_type]
+        return cd.value is not None and cd.host_value is None
+
     def finalize_match_result_in_tree_core(
         self,
         result: MatchResult,
@@ -639,7 +643,7 @@ class MambaComponent(TreeComponent):
 
         if phase == CacheTransferPhase.BACKUP_HOST:
             cd = node.component_data[ct]
-            if cd.value is None:
+            if cd.value is None or cd.host_value is not None:
                 return None
             return [
                 PoolTransfer(

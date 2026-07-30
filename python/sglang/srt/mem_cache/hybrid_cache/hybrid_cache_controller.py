@@ -367,10 +367,18 @@ class HybridCacheController(BaseHiCacheController):
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        host_indices: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        host_indices = self.mem_pool_host.alloc(len(device_indices))
-        if host_indices is None:
-            return None
+        allocated_host_indices = host_indices is None
+        if allocated_host_indices:
+            host_indices = self.mem_pool_host.alloc(len(device_indices))
+            if host_indices is None:
+                return None
+        elif len(host_indices) != len(device_indices):
+            raise ValueError(
+                "Host/device index length mismatch for HiCache write: "
+                f"{len(host_indices)=}, {len(device_indices)=}"
+            )
         pool_transfers = self._resolve_pool_transfers_allocation(
             extra_pools,
             alloc_host=True,
@@ -378,7 +386,8 @@ class HybridCacheController(BaseHiCacheController):
             kv_host_indices=host_indices,
         )
         if pool_transfers is None and extra_pools:
-            self.mem_pool_host.free(host_indices)
+            if allocated_host_indices:
+                self.mem_pool_host.free(host_indices)
             return None
 
         self.write_queue.append(

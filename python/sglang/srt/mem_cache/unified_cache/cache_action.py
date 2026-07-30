@@ -30,6 +30,15 @@ class ReplaceWriteThroughOnNodeSplit(msgspec.Struct, frozen=True):
     new_child_node_id: NodeId
 
 
+class ReplaceWriteThroughBatchOnNodeSplit(msgspec.Struct, frozen=True):
+    """Replace every pending write-through publication when a node splits."""
+
+    ack_ids: tuple[int, ...]
+    old_node_id: NodeId
+    new_node_id: NodeId
+    new_child_node_id: NodeId
+
+
 class FreeDeviceKV(msgspec.Struct, frozen=True):
     """Free unreferenced device KV slots (a SWA-aware combined free)."""
 
@@ -100,4 +109,9 @@ class SWARebuild(ComponentAction, frozen=True):
 
 
 # Cache-owned actions, applied by UnifiedRadixCache itself.
-CacheAction = ReplaceWriteThroughOnNodeSplit | FreeDeviceKV | BackupKV
+CacheAction = (
+    ReplaceWriteThroughOnNodeSplit
+    | ReplaceWriteThroughBatchOnNodeSplit
+    | FreeDeviceKV
+    | BackupKV
+)

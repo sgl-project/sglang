@@ -13,7 +13,14 @@ from unittest import mock
 import torch
 from test_unified_radix_cache_unittest import CacheConfig, UnifiedRadixCacheSuite
 
-from sglang.srt.mem_cache.unified_cache.cache_action import MambaEvictExcessPathStates
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
+from sglang.srt.mem_cache.unified_cache.cache_action import (
+    MambaEvictExcessPathStates,
+    ReplaceWriteThroughBatchOnNodeSplit,
+)
 from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
     MambaComponent,
 )
@@ -21,7 +28,11 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     ComponentType,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
+from sglang.srt.mem_cache.unified_radix_cache import (
+    UnifiedLRUList,
+    UnifiedRadixCache,
+    UnifiedTreeNode,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
@@ -180,6 +191,123 @@ class TestMambaPathStateCap(unittest.TestCase):
             )
         )
 
+    def test_hicache_completeness_includes_mamba_sidecar(self):
+        component, nodes, core, _ = _build_unified_chain(cap=-1, length=1)
+        node = nodes[0]
+        core.enable_hicache = True
+        core.components = (component,)
+
+        full_data = node.component_data[ComponentType.FULL]
+        mamba_data = node.component_data[ComponentType.MAMBA]
+        full_data.host_value = torch.tensor([200])
+
+        self.assertTrue(UnifiedTreeCore._node_needs_hicache_backup(core, node))
+
+        device_value, host_value, comp_xfers = UnifiedTreeCore._build_backup_spec(
+            core, node
+        )
+        self.assertIs(device_value, full_data.value)
+        self.assertIs(host_value, full_data.host_value)
+        self.assertEqual(
+            comp_xfers[ComponentType.MAMBA][0].name,
+            PoolName.MAMBA,
+        )
+        self.assertIs(
+            comp_xfers[ComponentType.MAMBA][0].device_indices,
+            mamba_data.value,
+        )
+
+        mamba_data.host_value = torch.tensor([300])
+        self.assertFalse(UnifiedTreeCore._node_needs_hicache_backup(core, node))
+        _, _, comp_xfers = UnifiedTreeCore._build_backup_spec(core, node)
+        self.assertNotIn(ComponentType.MAMBA, comp_xfers)
+
+    def test_supplemental_backup_reuses_existing_full_host_indices(self):
+        controller = object.__new__(HybridCacheController)
+        controller.mem_pool_host = mock.Mock()
+        controller.write_queue = []
+        controller.start_writing = mock.Mock()
+        controller._resolve_pool_transfers_allocation = mock.Mock(return_value=[])
+
+        device_indices = torch.tensor([1, 2])
+        host_indices = torch.tensor([10, 11])
+        result = HybridCacheController.write(
+            controller,
+            device_indices,
+            node_id=7,
+            host_indices=host_indices,
+        )
+
+        self.assertIs(result, host_indices)
+        controller.mem_pool_host.alloc.assert_not_called()
+        self.assertEqual(len(controller.write_queue), 1)
+        self.assertIs(controller.write_queue[0].host_indices, host_indices)
+
+        controller.write_queue.clear()
+        controller._resolve_pool_transfers_allocation.return_value = None
+        result = HybridCacheController.write(
+            controller,
+            device_indices,
+            node_id=7,
+            extra_pools=[
+                PoolTransfer(name=PoolName.MAMBA, device_indices=torch.tensor([3]))
+            ],
+            host_indices=host_indices,
+        )
+
+        self.assertIsNone(result)
+        controller.mem_pool_host.free.assert_not_called()
+        self.assertEqual(controller.write_queue, [])
+
+    def test_overlapping_supplemental_backup_uses_unique_ack_id(self):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.tree_core = mock.Mock()
+        cache.ongoing_write_through = {}
+        cache._next_write_through_ack_id = -1
+
+        first_ack = cache._reserve_write_through_ack_id(7)
+        cache._track_write_through_node(7, None, first_ack)
+        second_ack = cache._reserve_write_through_ack_id(7)
+        cache._track_write_through_node(7, None, second_ack)
+
+        self.assertEqual(first_ack, 7)
+        self.assertEqual(second_ack, -1)
+        self.assertEqual(set(cache.ongoing_write_through), {7, -1})
+        self.assertEqual(
+            cache.tree_core.mark_write_through_pending.call_args_list,
+            [mock.call(7, 7), mock.call(7, -1)],
+        )
+
+    def test_storage_publish_waits_for_last_overlapping_backup(self):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.tree_core = mock.Mock()
+        cache.ongoing_write_through = {}
+        cache.enable_storage = True
+        cache.write_backup_storage = mock.Mock()
+        cache._track_write_through_node(7, None, 7)
+        cache._track_write_through_node(7, None, -1)
+
+        cache._finish_write_through_ack(7)
+        cache.write_backup_storage.assert_not_called()
+
+        cache._finish_write_through_ack(-1)
+        cache.write_backup_storage.assert_called_once_with(7)
+
+    def test_split_relocates_every_overlapping_backup_ack(self):
+        cache = mock.MagicMock()
+        action = ReplaceWriteThroughBatchOnNodeSplit(
+            ack_ids=(7, -1),
+            old_node_id=2,
+            new_node_id=3,
+            new_child_node_id=2,
+        )
+
+        UnifiedRadixCache._apply_cache_action(cache, action)
+
+        cache._replace_pending_write_through_node.assert_has_calls(
+            [mock.call(7, 2, [3, 2]), mock.call(-1, 2, [3, 2])]
+        )
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "mamba pool fixtures need CUDA")
 class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
@@ -286,9 +414,9 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
         self.assertIsNotNone(leaf.component_data[ComponentType.MAMBA].host_value)
         cache.sanity_check()
 
-    def test_walk_backup_excludes_same_insert_restamped_mamba(self):
-        """The walked target's backup executes before commit hooks, so a mamba
-        value re-stamped by the same insert stays out of the host backup."""
+    def test_walk_backup_completes_same_insert_restamped_mamba(self):
+        """A checkpoint attached after the walk backup completes the same Host
+        entry with a follow-up Mamba sidecar transfer."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         mamba_comp = cache.components[ComponentType.MAMBA]
 
@@ -302,7 +430,8 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
         self.assertIsNone(ancestor.component_data[ComponentType.MAMBA].value)
 
         # Re-inserting [1, 2] crosses the threshold and re-stamps the tombstone
-        # in the same insert; the backup must not carry the fresh mamba state.
+        # in the same insert. The post-commit policy must complete the already
+        # backed-up Full KV entry with that fresh Mamba state.
         cache.write_through_threshold = ancestor.hit_count + 1
         self._insert(cache, allocator, req_to_token_pool, [1, 2])
         cache.writing_check(write_back=True)
@@ -310,7 +439,7 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
         self.assertTrue(ancestor.backuped)
         ancestor_cd = ancestor.component_data[ComponentType.MAMBA]
         self.assertIsNotNone(ancestor_cd.value)
-        self.assertIsNone(ancestor_cd.host_value)
+        self.assertIsNotNone(ancestor_cd.host_value)
 
     def test_cap_walk_failure_still_drains_collected_frees(self):
         """A cap walk that raises mid-eviction must still free the tombstoned

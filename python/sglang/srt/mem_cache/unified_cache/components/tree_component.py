@@ -133,6 +133,14 @@ class TreeComponent(ABC):
         cd = node.component_data[self.component_type]
         return cd.value is None and cd.host_value is not None
 
+    def needs_hicache_backup(self, node: UnifiedTreeNode) -> bool:
+        """Whether this component has device data missing from the Host backup.
+
+        Components that are part of the node's reusable Host state override
+        this hook. Device-only auxiliary components keep the default ``False``.
+        """
+        return False
+
     def refresh_lru(
         self,
         phase: LRURefreshPhase,

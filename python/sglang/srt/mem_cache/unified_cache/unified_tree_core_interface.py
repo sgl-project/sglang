@@ -151,6 +151,11 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
+    def needs_hicache_backup(self, node_id: NodeId) -> bool:
+        """Whether the node is missing any policy-required Host state."""
+        ...
+
+    @abstractmethod
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
         ...
@@ -364,10 +369,12 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
-    def build_backup_spec(
-        self, node_id: NodeId
-    ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
-        """Read a node's device->host backup spec (device value + transfers) now."""
+    def build_backup_spec(self, node_id: NodeId) -> tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        dict[ComponentType, list[PoolTransfer]],
+    ]:
+        """Read current device/Host KV and component backup transfers."""
         ...
 
     @abstractmethod
@@ -440,7 +447,7 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
-    def mark_write_through_pending(self, node_id: NodeId) -> None:
+    def mark_write_through_pending(self, node_id: NodeId, ack_id: int) -> None:
         """Mark a node as having an in-flight write-through backup."""
         ...
 

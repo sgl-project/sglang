@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ComponentAction,
     FreeComponentDeviceSlot,
     FreeDeviceKV,
+    ReplaceWriteThroughBatchOnNodeSplit,
     ReplaceWriteThroughOnNodeSplit,
 )
 
@@ -280,6 +281,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
+        self._next_write_through_ack_id = -1
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -816,6 +818,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 action.old_node_id,
                 [action.new_node_id, action.new_child_node_id],
             )
+        elif isinstance(action, ReplaceWriteThroughBatchOnNodeSplit):
+            for ack_id in action.ack_ids:
+                self._replace_pending_write_through_node(
+                    ack_id,
+                    action.old_node_id,
+                    [action.new_node_id, action.new_child_node_id],
+                )
         elif isinstance(action, FreeDeviceKV):
             # tree values are page-aligned copies of a kv row: page-exact segments
             for indices in action.indices:
@@ -857,13 +866,22 @@ class UnifiedRadixCache(BasePrefixCache):
         """Run a backup action top-down, stopping at the first failed backup."""
         written = 0
         for node_id in action.node_ids:
-            # Overlapping chain actions: skip already-backed nodes.
-            if self.tree_core.is_backuped(node_id):
+            # Overlapping chain actions: skip complete Host entries. A node
+            # whose Full KV is backed up can still need a newly attached
+            # auxiliary state such as a branch-created Mamba checkpoint.
+            if not self.tree_core.needs_hicache_backup(node_id):
                 continue
-            device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
+            device_value, host_value, comp_xfers = self.tree_core.build_backup_spec(
+                node_id
+            )
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
+            ack_id = self._reserve_write_through_ack_id(node_id)
             host_indices = self._execute_kv_backup(
-                node_id, device_value, comp_xfers, sidecar_xfers
+                ack_id,
+                device_value,
+                comp_xfers,
+                sidecar_xfers,
+                host_indices=host_value,
             )
             if host_indices is None:
                 return 0
@@ -871,7 +889,7 @@ class UnifiedRadixCache(BasePrefixCache):
             lock_params = None
             if not write_back:
                 lock_params = self.inc_lock_ref(node_id).to_dec_params()
-            self._track_write_through_node(node_id, lock_params)
+            self._track_write_through_node(node_id, lock_params, ack_id)
             written = len(host_indices)
         return written
 
@@ -882,29 +900,51 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
 
-    def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
+    def _execute_kv_backup(
+        self,
+        ack_id,
+        device_value,
+        comp_xfers,
+        sidecar_xfers,
+        host_indices=None,
+    ):
         """Execute Backup action."""
-        kv_tokens = len(device_value)
-        host_avail = self.cache_controller.mem_pool_host.available_size()
-        if host_avail < kv_tokens:
-            needed = kv_tokens - host_avail
-            if self.evict_host(needed) < needed:
-                return None
+        if host_indices is None:
+            kv_tokens = len(device_value)
+            host_avail = self.cache_controller.mem_pool_host.available_size()
+            if host_avail < kv_tokens:
+                needed = kv_tokens - host_avail
+                if self.evict_host(needed) < needed:
+                    return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         return self.cache_controller.write(
-            device_value, node_id=node_id, extra_pools=aux_xfers or None
+            device_value,
+            node_id=ack_id,
+            extra_pools=aux_xfers or None,
+            host_indices=host_indices,
         )
 
     def _track_write_through_node(
         self,
         node_id: NodeId,
         lock_params: Optional[DecLockRefParams],
+        ack_id: int,
     ) -> None:
-        self.tree_core.mark_write_through_pending(node_id)
-        self.ongoing_write_through[node_id] = _OngoingWriteThrough(
+        self.tree_core.mark_write_through_pending(node_id, ack_id)
+        self.ongoing_write_through[ack_id] = _OngoingWriteThrough(
             node_id, lock_params, [node_id]
         )
+
+    def _reserve_write_through_ack_id(self, node_id: NodeId) -> int:
+        """Return an ack id that cannot overwrite another in-flight write."""
+        if node_id not in self.ongoing_write_through:
+            return node_id
+        ack_id = self._next_write_through_ack_id
+        while ack_id in self.ongoing_write_through:
+            ack_id -= 1
+        self._next_write_through_ack_id = ack_id - 1
+        return ack_id
 
     def _replace_pending_write_through_node(
         self, ack_id: int, old_node_id: NodeId, new_node_ids: list[NodeId]
@@ -941,9 +981,16 @@ class UnifiedRadixCache(BasePrefixCache):
             self.dec_lock_ref(lock_node_id, lock_params)
         if self.enable_storage:
             # Back up each fragment: after a split, lock_node only holds the
-            # suffix; the prefix fragment must be persisted as well.
+            # suffix; the prefix fragment must be persisted as well. Defer a
+            # fragment until its last overlapping Host write has completed.
+            still_pending = {
+                node_id
+                for pending in self.ongoing_write_through.values()
+                for node_id in pending.publish_node_ids
+            }
             for node_id in publish_node_ids:
-                self.write_backup_storage(node_id)
+                if node_id not in still_pending:
+                    self.write_backup_storage(node_id)
 
     def load_back(
         self,
