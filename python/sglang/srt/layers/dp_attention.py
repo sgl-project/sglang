@@ -98,6 +98,9 @@ class DpPaddingMode(IntEnum):
         ):
             return DpPaddingMode.MAX_LEN
 
+        if max(global_num_tokens) == 0:
+            return cls.SUM_LEN
+
         # we choose the mode that minimizes the communication cost
         # prefer MAX_LEN when communication cost is equal to enable symmetric memory
         max_len = max(global_num_tokens)
