@@ -460,7 +460,6 @@ template <
     bool kUsePDL,
     bool kRopeFirst,
     bool kHadamard,
-    bool kGridStride,
     uint32_t kNumWarps,
     uint32_t kMinBlocksPerSM>
 __global__ __launch_bounds__(kNumWarps* device::kWarpThreads, kMinBlocksPerSM) void fused_q_indexer_rope_hadamard_quant(
@@ -590,25 +589,16 @@ __global__ __launch_bounds__(kNumWarps* device::kWarpThreads, kMinBlocksPerSM) v
     }
   };
 
-  if constexpr (kGridStride) {
-    // Large batch: the launcher capped the grid to one wave; each warp
-    // grid-strides over the remaining rows, collapsing the partial-wave tail.
-    const uint32_t warp_stride = gridDim.x * kNumWarps;
-    uint32_t work_id = blockIdx.x * kNumWarps + warp_id;
-    if (work_id >= total_works) return;
-    PDLWaitPrimary<kUsePDL>();
-    for (; work_id < total_works; work_id += warp_stride) {
-      process_row(work_id);
-    }
-    PDLTriggerSecondary<kUsePDL>();
-    return;
-  }
-
-  // kGridStride == false: whole problem fits one wave, one row per warp.
-  const auto work_id = blockIdx.x * kNumWarps + warp_id;
+  // Persistent grid-stride: the launcher caps the grid at one wave, so each
+  // warp loops over the remaining rows. When the grid already covers all rows
+  // the loop runs exactly once, so small/medium batch pays no extra cost.
+  const uint32_t warp_stride = gridDim.x * kNumWarps;
+  uint32_t work_id = blockIdx.x * kNumWarps + warp_id;
   if (work_id >= total_works) return;
   PDLWaitPrimary<kUsePDL>();
-  process_row(work_id);
+  for (; work_id < total_works; work_id += warp_stride) {
+    process_row(work_id);
+  }
   PDLTriggerSecondary<kUsePDL>();
 }
 
@@ -630,16 +620,9 @@ struct FusedQIndexerRopeHadamardQuantKernel {
 #endif
   static constexpr uint32_t kBlockSize = kNumWarps * device::kWarpThreads;
 
-  template <typename PosT, bool kGridStride>
-  static constexpr auto kernel = fused_q_indexer_rope_hadamard_quant<
-      DType,
-      PosT,
-      kUsePDL,
-      kRopeFirst,
-      kHadamard,
-      kGridStride,
-      kNumWarps,
-      kBlocksPerSM>;
+  template <typename PosT>
+  static constexpr auto kernel =
+      fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard, kNumWarps, kBlocksPerSM>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
@@ -719,31 +702,22 @@ struct FusedQIndexerRopeHadamardQuantKernel {
         .num_heads = num_heads,
     };
     const auto total_works = batch_size * num_heads;
-    // Cap the grid at one wave; the grid-stride loop mops up the rest,
-    // collapsing the large-batch tail. Blocks/SM comes from the driver per
-    // kernel instance (cudaOccupancyMaxActiveBlocksPerMultiprocessor), not a
-    // hard-coded value; the two instances may occupy differently, so query
-    // each -- straight-line defines "one wave" for the branch, the chosen one
-    // sizes the grid.
+    // Cap the grid at one wave; the kernel's grid-stride loop mops up the rest.
+    // Blocks/SM comes from the driver (cudaOccupancyMaxActiveBlocksPerMultiprocessor),
+    // not hard-coded, so it tracks the real per-arch hardware limit. Single
+    // persistent instance, so one query suffices; when the grid already covers
+    // all rows the launch is just min(rows, wave) and the loop runs once.
     const bool is_i32 = pos_dtype.is_type<int32_t>();
+    const auto k = is_i32 ? kernel<int32_t> : kernel<int64_t>;
     int num_sm = 0;
     cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device_.unwrap().device_id);
-
-    int occ_straight = 0, occ_stride = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &occ_straight, is_i32 ? kernel<int32_t, false> : kernel<int64_t, false>, kBlockSize, 0);
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &occ_stride, is_i32 ? kernel<int32_t, true> : kernel<int64_t, true>, kBlockSize, 0);
-    if (occ_straight <= 0) occ_straight = static_cast<int>(kBlocksPerSM);  // query-failed fallback
-    if (occ_stride <= 0) occ_stride = static_cast<int>(kBlocksPerSM);
+    int blocks_per_sm = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, k, kBlockSize, 0);
+    if (blocks_per_sm <= 0) blocks_per_sm = static_cast<int>(kBlocksPerSM);  // query-failed fallback
     const uint32_t sm = static_cast<uint32_t>(num_sm > 0 ? num_sm : 1);
-
     const uint32_t rows_blocks = div_ceil(total_works, kNumWarps);
-    const uint32_t wave_blocks = sm * static_cast<uint32_t>(occ_straight);
-    const bool grid_stride = rows_blocks > wave_blocks;
-    const auto num_blocks = grid_stride ? sm * static_cast<uint32_t>(occ_stride) : rows_blocks;
-    const auto k = grid_stride ? (is_i32 ? kernel<int32_t, true> : kernel<int64_t, true>)
-                               : (is_i32 ? kernel<int32_t, false> : kernel<int64_t, false>);
+    const uint32_t wave_blocks = sm * static_cast<uint32_t>(blocks_per_sm);
+    const auto num_blocks = min(rows_blocks, wave_blocks);
     LaunchKernel(num_blocks, kBlockSize, device_.unwrap())  //
         .enable_pdl(kUsePDL)(k, params);
   }
