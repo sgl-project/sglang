@@ -339,7 +339,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self, reqs: List[Req]
     ) -> List[OutputBatch] | _SequentiallyReturnedOutputs:
         batch_size = len(reqs)
-        if self.server_args.pipeline_config.num_grouped_prefix_stages:
+        if self.server_args.pipeline_config.supports_sequential_dit_inference():
             return _SequentiallyReturnedOutputs(
                 self._iter_grouped_outputs_sequentially(reqs)
             )

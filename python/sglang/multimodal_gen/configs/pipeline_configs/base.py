@@ -7,7 +7,7 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
-from typing import Any, ClassVar
+from typing import Any
 
 import numpy as np
 import PIL
@@ -398,8 +398,9 @@ class PipelineConfig:
         """Return whether dynamic batches should run as grouped Req lists."""
         return False
 
-    # Leading stages run as a group before per-request outputs are yielded.
-    num_grouped_prefix_stages: ClassVar[int] = 0
+    def supports_sequential_dit_inference(self):
+        """Return whether batched AR is followed by per-request DiT inference."""
+        return False
 
     def estimate_request_cost(self, batch) -> float:
         """Return the relative cost used for batching admission caps.
