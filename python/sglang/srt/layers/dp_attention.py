@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import functools
 import logging
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.distributed import (
     GroupCoordinator,
@@ -136,6 +139,7 @@ class _DpGatheredBufferWrapper:
     _local_dp_buffer_len: int = 0
     _dp_max_padding: bool = False
     _global_num_tokens: Optional[List[int]] = None
+    _global_num_tokens_gpu: Optional[torch.Tensor] = None
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -153,11 +157,13 @@ class _DpGatheredBufferWrapper:
         local_dp_buffer_len: int,
         dp_max_padding: bool,
         global_num_tokens: Optional[List[int]] = None,
+        global_num_tokens_gpu: Optional[torch.Tensor] = None,
     ):
         cls._global_dp_buffer_len = global_dp_buffer_len
         cls._local_dp_buffer_len = local_dp_buffer_len
         cls._dp_max_padding = dp_max_padding
         cls._global_num_tokens = global_num_tokens
+        cls._global_num_tokens_gpu = global_num_tokens_gpu
 
     @classmethod
     def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
@@ -202,6 +208,10 @@ class _DpGatheredBufferWrapper:
         return cls._global_num_tokens
 
     @classmethod
+    def get_dp_global_num_tokens_gpu(cls) -> Optional[torch.Tensor]:
+        return cls._global_num_tokens_gpu
+
+    @classmethod
     def get_dp_hidden_size(cls) -> int:
         from sglang.srt.runtime_context import get_flags
 
@@ -229,9 +239,14 @@ def set_dp_buffer_len(
     local_dp_buffer_len: int,
     dp_max_padding: bool,
     global_num_tokens: Optional[List[int]] = None,
+    global_num_tokens_gpu: Optional[torch.Tensor] = None,
 ):
     _DpGatheredBufferWrapper.set_dp_buffer_len(
-        global_dp_buffer_len, local_dp_buffer_len, dp_max_padding, global_num_tokens
+        global_dp_buffer_len,
+        local_dp_buffer_len,
+        dp_max_padding,
+        global_num_tokens,
+        global_num_tokens_gpu,
     )
 
 
@@ -505,6 +520,142 @@ def _dp_gather_via_all_gather(
 # tp_size==dp_size (attn_tp_size==1) case is supported for now (e.g. tp8dp8).
 _USE_DP_GATHERV = get_bool_env_var("SGLANG_DP_USE_GATHERV")
 
+_DP_GATHER_FP8_GROUP = 128
+# Grow-only gathered fp8 payload / scales buffers, keyed by device.
+_dp_gather_fp8_bufs: dict = {}
+
+
+@functools.lru_cache(maxsize=1)
+def _use_dp_gather_fp8() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_ENABLE_DP_GATHER_FP8.get()
+
+
+def _get_dp_gather_fp8_bufs(rows: int, hidden: int, device: torch.device):
+    key = str(device)
+    bufs = _dp_gather_fp8_bufs.get(key)
+    if bufs is None or bufs[0].shape[0] < rows:
+        bufs = (
+            torch.empty((rows, hidden), dtype=torch.uint8, device=device),
+            torch.empty(
+                (rows, hidden // _DP_GATHER_FP8_GROUP),
+                dtype=torch.float32,
+                device=device,
+            ),
+        )
+        _dp_gather_fp8_bufs[key] = bufs
+    return bufs[0][:rows], bufs[1][:rows]
+
+
+@triton.jit
+def _dequant_per_token_group_fp8_kernel(
+    q_ptr,
+    s_ptr,
+    out_ptr,
+    HIDDEN: tl.constexpr,
+    NGROUPS: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    # HIDDEN may not be a multiple of BLOCK (e.g. DeepSeek 7168 vs BLOCK
+    # 2048): the tail iteration must be masked or it reads/writes up to
+    # BLOCK-1 elements past the row (cross-row corruption + OOB on the last
+    # row).  HIDDEN is constexpr, so the mask folds away when it divides.
+    for start in tl.static_range(0, HIDDEN, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < HIDDEN
+        qv = tl.load(q_ptr + row * HIDDEN + offs, mask=mask, other=0.0).to(tl.float32)
+        sv = tl.load(s_ptr + row * NGROUPS + offs // GROUP, mask=mask, other=0.0)
+        tl.store(out_ptr + row * HIDDEN + offs, (qv * sv).to(tl.bfloat16), mask=mask)
+
+
+@triton.jit
+def _mask_dp_pad_topk_ids_kernel(
+    topk_ids_ptr,
+    counts_ptr,
+    max_len,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    rank = row // max_len
+    pos = row % max_len
+    valid = pos < tl.load(counts_ptr + rank)
+    if valid == 0:
+        offs = tl.arange(0, BLOCK)
+        tl.store(topk_ids_ptr + row * TOPK + offs, -1, mask=offs < TOPK)
+
+
+def mask_dp_pad_moe_topk_ids(topk_ids: torch.Tensor) -> None:
+    """Set MAX_LEN pad rows' (post-translation, local) topk_ids to -1 in place.
+
+    Under dp-attention MAX_LEN padding the gathered MoE buffer is
+    [dp_size * max_len, hidden] with rank r's real rows at
+    [r*max_len, r*max_len + global_num_tokens[r]); the pad rows carry stale
+    hidden values, run the router, and get dispatched into experts whose
+    outputs are then discarded by the post-reorder scatter — pure wasted
+    compute, and a masked-grouped-GEMM workspace blow-up when they collide
+    on the same top-k.  -1 is the drop sentinel both the triton fused_moe
+    (filter_expert) and the DeepGEMM EP preprocess honor; it must be applied
+    AFTER the local_expert_mapping gather (a pre-translation -1 aliases to
+    the mapping table's last entry).  Capture-safe: per-batch state is read
+    only from the replay-updated global_num_tokens_gpu tensor.
+    """
+    counts = _DpGatheredBufferWrapper.get_dp_global_num_tokens_gpu()
+    if counts is None:
+        return
+    max_len = _DpGatheredBufferWrapper.get_local_dp_buffer_len()
+    rows, topk = topk_ids.shape
+    if max_len <= 0 or rows != counts.shape[0] * max_len:
+        # Layout mismatch (e.g. non-DP or logits-path caller): do nothing.
+        return
+    _mask_dp_pad_topk_ids_kernel[(rows,)](
+        topk_ids,
+        counts,
+        max_len,
+        TOPK=topk,
+        BLOCK=triton.next_power_of_2(topk),
+    )
+
+
+def _dp_gather_via_all_gatherv_fp8(
+    global_tokens: torch.Tensor,
+    local_real: torch.Tensor,
+    sizes: List[int],
+):
+    """fp8 wire format for the variable-length DP gather: quantize the local
+    rows per-token-group (the SAME group-128 quantization the MoE expert GEMMs
+    apply to their input downstream), gather payload (as uint8 — NCCL has no
+    fp8 dtype; the gatherv leg is broadcast-only so a byte view is safe) and
+    scales in two output-buffered gatherv calls, then dequantize into the
+    bf16 global buffer.  Zero pad rows quantize to (q=0, s=eps) and so
+    dequantize back to exact zeros — the MoE-tail invariant is preserved.
+    The combine leg (reduce_scatterv) stays bf16: NCCL SUM cannot run on fp8."""
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    rows = global_tokens.shape[0]
+    hidden = global_tokens.shape[-1]
+    q, s = sglang_per_token_group_quant_fp8(
+        local_real.contiguous(), _DP_GATHER_FP8_GROUP
+    )
+    gq, gs = _get_dp_gather_fp8_bufs(rows, hidden, global_tokens.device)
+    tp_group = get_tp_group()
+    tp_group.all_gatherv(q.view(torch.uint8), sizes=sizes, output=gq)
+    tp_group.all_gatherv(s, sizes=sizes, output=gs)
+    _dequant_per_token_group_fp8_kernel[(rows,)](
+        gq.view(torch.float8_e4m3fn),
+        gs,
+        global_tokens,
+        HIDDEN=hidden,
+        NGROUPS=hidden // _DP_GATHER_FP8_GROUP,
+        GROUP=_DP_GATHER_FP8_GROUP,
+        BLOCK=2048,
+    )
+
 
 def is_dp_gatherv_active() -> bool:
     """Variable-length DP-MoE gather/scatter (all_gatherv + reduce_scatterv) is
@@ -568,6 +719,19 @@ def _dp_gather_via_all_gatherv(
     # falls back to all_reduce). Pass global_tokens as the NCCL output buffer so
     # the gather writes directly into it -- avoids the previous extra full-buffer
     # torch.cat + copy_ (two ~sum(sizes)*hidden DtoD copies, ~700us/layer at c512).
+    # NOTE: the fp8 branch condition must be identical on EVERY DP rank (all
+    # ranks must issue the same NCCL op sequence) — env/dtype/hidden are
+    # rank-uniform; never gate on per-rank state like forward_mode (ranks can
+    # be extend/idle-mixed within one global forward).  Prefill-only is
+    # already structural: the gatherv path runs only under SUM_LEN padding,
+    # which decode-only steps and CUDA-graph capture never select.
+    if (
+        _use_dp_gather_fp8()
+        and global_tokens.dtype == torch.bfloat16
+        and global_tokens.shape[-1] % _DP_GATHER_FP8_GROUP == 0
+    ):
+        _dp_gather_via_all_gatherv_fp8(global_tokens, local_real, sizes)
+        return
     get_tp_group().all_gatherv(local_real, sizes=sizes, output=global_tokens)
 
 

@@ -15,7 +15,7 @@ traffic ratio is reported per L.
 
 Run::
 
-    python -m sglang.kernels.ops.attention.fla.bench_gdn_replayssm_decode
+    python benchmark/kernels/attention/bench_gdn_replayssm_decode.py
 
 Requires a GPU (Triton).
 """
