@@ -314,7 +314,7 @@ class TestBiasedGroupedTopK(CustomTestCase):
                         ),
                     )
 
-    def test_hash_topke(self):
+    def test_hash_topk(self):
         """Guard the XPU fused hash-topk path against math/ID drift from torch."""
         torch.manual_seed(1024)
         device = torch.device("xpu")

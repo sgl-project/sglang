@@ -181,7 +181,8 @@ class HashTopK(nn.Module):
     def _forward_xpu(
         self, router_logits: torch.Tensor, input_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Now xpu kernel of 'hash_topk' supports 'sqrtsoftplus' score func only
+        # The XPU 'hash_topk' kernel currently supports the 'sqrtsoftplus' score func only.
+        # Other score funcs fall back to the torch implementation; more will be supported in the future.
         if self.score_func == "sqrtsoftplus":
             from sgl_kernel import hash_topk
 
