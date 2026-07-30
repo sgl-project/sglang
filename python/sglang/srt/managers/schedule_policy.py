@@ -868,7 +868,9 @@ class PrefillAdder:
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
-            _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+            _rem_tokens = int(self.rem_total_tokens)
+            if self.rem_chunk_tokens is not None:
+                _rem_tokens = min(self.rem_chunk_tokens, _rem_tokens)
             if self.is_hybrid_swa:
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM
@@ -880,7 +882,11 @@ class PrefillAdder:
             if _rem_tokens <= 0:
                 if self.is_hybrid_swa:
                     return req
-                _rem_tokens = self.rem_chunk_tokens
+                _rem_tokens = (
+                    self.rem_chunk_tokens
+                    if self.rem_chunk_tokens is not None
+                    else len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+                )
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.

@@ -567,6 +567,24 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(result)
         req.set_extend_range.assert_called_once_with(29_056, 29_123)
 
+    def test_mamba_boundary_tail_runs_without_chunked_prefill_limit(self):
+        self.mock_tree_cache.supports_mamba.return_value = True
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=128,
+            rem_swa=100_000,
+            rem_chunk=None,
+            is_hybrid_swa=False,
+            full_available=100_000,
+        )
+        adder.mamba_prefill_align_size = 128
+        req.prefix_indices = list(range(29_056))
+        req.full_untruncated_fill_ids = list(range(29_123))
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIsNone(result)
+        req.set_extend_range.assert_called_once_with(29_056, 29_123)
+
     def test_mamba_prefill_creates_boundary_chunk_before_unaligned_tail(self):
         self.mock_tree_cache.supports_mamba.return_value = True
         adder, req = self._build_hybrid_swa_chunked_req(

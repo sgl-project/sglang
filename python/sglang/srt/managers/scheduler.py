@@ -3011,8 +3011,7 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
             mamba_prefill_align_size=(
                 self.server_args.mamba_cache_chunk_size
-                if self.chunked_prefill_size is not None
-                and self.server_args.uses_mamba_radix_cache
+                if self.server_args.uses_mamba_radix_cache
                 else None
             ),
         )
