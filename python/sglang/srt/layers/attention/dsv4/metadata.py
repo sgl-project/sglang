@@ -134,16 +134,9 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
-            # SM120: the JIT indexer-metadata kernel requests more dynamic
-            # shared memory than SM120 allows (cudaFuncSetAttribute ->
-            # invalid argument). Use the DeepGEMM metadata kernel, which fits.
-            use_jit_indexer = (
-                (not _IS_SM120)
-                and not self.force_deep_gemm_metadata
-                and (
-                    envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
-                    or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
-                )
+            use_jit_indexer = not self.force_deep_gemm_metadata and (
+                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+                or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
             )
             if use_jit_indexer:
                 from sglang.kernels.ops.attention.dsv4 import (
