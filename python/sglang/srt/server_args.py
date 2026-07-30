@@ -1038,14 +1038,6 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
-    dcp_size: A[
-        int,
-        Arg(
-            help="The decode context parallelism size.",
-            aliases=["--decode-context-parallel-size"],
-        ),
-        NS("parallel"),
-    ] = 1
     dwdp_size: A[
         int,
         Arg(
@@ -1064,20 +1056,24 @@ class ServerArgs:
             "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
             "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
             choices=["ag_rs", "a2a", "fi_a2a"],
+            resolvable=True,
         ),
         NS("parallel"),
     ] = "ag_rs"
     dcp_replicate_q_proj: A[
-        bool,
+        Optional[bool],
         Arg(
             help="For MLA decode context parallelism with the a2a/fi_a2a "
             "backend: replicate the Q projection so each DCP rank computes the "
             "full-head query locally (redundant projection compute), eliminating "
             "the per-layer head-dim all-gather of Q. Trades a small amount of "
-            "extra GEMM for one fewer collective per layer.",
+            "extra GEMM for one fewer collective per layer. Use "
+            "--no-dcp-replicate-q-proj to disable the model-specific default.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
         ),
         NS("parallel"),
-    ] = False
+    ] = None
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -3763,13 +3759,35 @@ class ServerArgs:
             return
         elif is_cuda():
             if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "Decode context parallel (--dcp-size / "
-                    "--decode-context-parallel-size > 1) on CUDA platform "
-                    "does not support any speculative algorithm, but got "
-                    f"dcp_size={self.dcp_size} on a CUDA platform with "
-                    "speculative decoding enabled."
+                model_arches = self.get_model_config().hf_config.architectures
+                decode_backend = self.decode_attention_backend or self.attention_backend
+                kimi_linear_dspark = (
+                    self.speculative_algorithm == "DSPARK"
+                    and "KimiLinearForCausalLM" in model_arches
+                    and self.speculative_attention_mode == "decode"
+                    and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
                 )
+                if kimi_linear_dspark:
+                    ragged_verify_mode = envs.SGLANG_RAGGED_VERIFY_MODE.get()
+                    if ragged_verify_mode != "static":
+                        raise ValueError(
+                            "Kimi Linear DCP + DSPARK currently requires "
+                            "SGLANG_RAGGED_VERIFY_MODE=static, but got "
+                            f"{ragged_verify_mode!r}."
+                        )
+                else:
+                    raise ValueError(
+                        "Decode context parallel (--dcp-size / "
+                        "--decode-context-parallel-size > 1) with speculative "
+                        "decoding on CUDA is supported only for Kimi Linear + "
+                        "DSPARK + --speculative-attention-mode decode + "
+                        "tokenspeed_mla, or experimental cutedsl_mla, but got "
+                        f"architectures={model_arches}, "
+                        f"speculative_algorithm={self.speculative_algorithm!r}, "
+                        "speculative_attention_mode="
+                        f"{self.speculative_attention_mode!r}, "
+                        f"decode_attention_backend={decode_backend!r}."
+                    )
         else:
             raise ValueError(
                 "Decode context parallel (--dcp-size / "
@@ -4729,9 +4747,9 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         return not (is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config))
 
-    def mamba_pre_capture_reserve_mb(self, gpu_mem: Optional[float]) -> float:
-        # Realistic runtime reserve for the fixed (non-resizable) mamba state cache,
-        # which post-capture can't size from measured free memory.
+    def pre_capture_activation_reserve_mb(self, gpu_mem: Optional[float]) -> float:
+        # Runtime activation working-set reserve for eager decode above the captured
+        # max_bs and transient prefill/logits; also covers fixed state caches.
         if self.disaggregation_mode == "decode":
             running_requests = (
                 self.max_running_requests or self.cuda_graph_config.decode.max_bs or 1
@@ -5377,7 +5395,7 @@ class ServerArgs:
             # _glm4_moe_overrides).
             pass
 
-        elif model_arch in ["Lfm2ForCausalLM"]:
+        elif model_arch in ["Lfm2ForCausalLM", "Lfm2MoeForCausalLM"]:
             # Attention backend selection moved to the override registry
             # (arg_groups/overrides.py: _lfm2_overrides).
             assert resolved_view(self).attention_backend != "triton", (
@@ -5547,6 +5565,10 @@ class ServerArgs:
                     or self.speculative_eagle_topk is not None
                 )
             ):
+                # trtllm_mha requires equal K/V row widths; fa4 carries
+                # v_head_dim through.
+                if model_config.has_asymmetric_kv:
+                    return "fa4"
                 return "trtllm_mha"
             elif is_hip():
                 return "aiter"

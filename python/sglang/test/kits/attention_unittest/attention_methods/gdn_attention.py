@@ -55,6 +55,7 @@ class GDNAttentionCase:
     page_size: int
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
+    linear_attn_prefill_backend: str | None = None
 
     @property
     def batch_size(self) -> int:
@@ -245,7 +246,7 @@ class MockGDNModelRunner(ModelRunner):
             enable_mis=False,
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
-            linear_attn_prefill_backend=None,
+            linear_attn_prefill_backend=case.linear_attn_prefill_backend,
             max_running_requests=None,
             revision=None,
             speculative_algorithm=None,
@@ -268,10 +269,16 @@ class MockGDNModelRunner(ModelRunner):
             state_size=head_k_dim,
             conv_kernel=2,
         )
+        temporal_state_dtype = (
+            dtype
+            if case.linear_attn_prefill_backend == "flashinfer"
+            and torch.cuda.get_device_capability()[0] >= 10
+            else torch.float32
+        )
         cache_params = Mamba2CacheParams(
             shape=cache_shape,
             layers=[0],
-            dtype=Mamba2StateDType(conv=dtype, temporal=torch.float32),
+            dtype=Mamba2StateDType(conv=dtype, temporal=temporal_state_dtype),
         )
         self.req_to_token_pool = HybridReqToTokenPool(
             size=pool_batch_size,
@@ -591,6 +598,14 @@ def build_gdn_attention_fixture(
 
     initialize_linear_attn_config(runner.server_args)
     linear_backend = GDNAttnBackend(runner)
+    if case.linear_attn_prefill_backend == "flashinfer":
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            FlashInferGDNKernel,
+        )
+
+        testcase.assertIsInstance(
+            linear_backend.kernel_dispatcher.extend_kernel, FlashInferGDNKernel
+        )
     backend = HybridLinearAttnBackend(full_backend, linear_backend, full_attn_layers=[])
     actual_module = ProjectedGDNAttention(
         num_k_heads=case.num_k_heads,
