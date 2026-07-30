@@ -341,6 +341,7 @@ DSA_CHOICES = [
     "flashmla_sparse_q8",
     "flashmla_kv",
     "flashmla_auto",
+    "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
     "aiter",
@@ -1061,6 +1062,15 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
+    dwdp_size: A[
+        int,
+        Arg(
+            help="DWDP (Distributed Weight Data Parallelism) group size. "
+            "When > 1, MoE prefill uses weight prefetch instead of token all-to-all. "
+            "Must equal tp_size. Only supported with --disaggregation-mode null or prefill.",
+        ),
+        NS("parallel"),
+    ] = 1
     dcp_comm_backend: A[
         str,
         Arg(
@@ -1088,15 +1098,6 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = None
-    dwdp_size: A[
-        int,
-        Arg(
-            help="DWDP (Distributed Weight Data Parallelism) group size. "
-            "When > 1, MoE prefill uses weight prefetch instead of token all-to-all. "
-            "Must equal tp_size. Only supported with --disaggregation-mode null or prefill.",
-        ),
-        NS("parallel"),
-    ] = 1
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",

@@ -24,7 +24,9 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
+from sglang.kernels.ops.attention.dcp_kernels import (
+    create_mla_kv_page_table_for_dcp,
+)
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
