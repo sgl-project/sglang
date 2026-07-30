@@ -1081,15 +1081,6 @@ class HiCacheController:
                     storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
-
-                logger.debug(
-                    "HiCache storage hit query for rid=%s hit_tokens=%d queried_pages=%d threshold=%d",
-                    operation.request_id,
-                    storage_hit_count,
-                    len(hash_value),
-                    self.prefetch_threshold,
-                )
-
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
