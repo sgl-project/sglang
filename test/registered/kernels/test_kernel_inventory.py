@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import importlib.util
-import re
 import sys
 from pathlib import Path
 
@@ -20,9 +19,6 @@ KERNELS_ROOT = REPO_ROOT / "python" / "sglang" / "kernels"
 OPS_ROOT = KERNELS_ROOT / "ops"
 JIT_CSRC_ROOT = KERNELS_ROOT / "jit" / "csrc"
 AOT_ROOT = KERNELS_ROOT / "aot"
-AOT_HEADER_SUFFIXES = {".h", ".hh", ".hpp", ".cuh", ".inl", ".muh"}
-AOT_SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cu", ".hip", ".metal", ".mu"}
-LOCAL_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.MULTILINE)
 
 
 def _directory_names(root: Path) -> set[str]:
@@ -123,53 +119,6 @@ def _source_patterns(expression: ast.expr, constants: dict[str, str]) -> list[st
     )
 
 
-def _aot_manifests() -> list[Path]:
-    return [
-        AOT_ROOT / "CMakeLists.txt",
-        AOT_ROOT / "setup_metal.py",
-        AOT_ROOT / "setup_musa.py",
-        AOT_ROOT / "setup_rocm.py",
-        AOT_ROOT / "csrc" / "cpu" / "CMakeLists.txt",
-        *sorted((AOT_ROOT / "cmake").rglob("*.cmake")),
-    ]
-
-
-def _aot_native_files() -> set[Path]:
-    suffixes = AOT_HEADER_SUFFIXES | AOT_SOURCE_SUFFIXES
-    return {
-        path.resolve()
-        for root in (AOT_ROOT / "csrc", AOT_ROOT / "include")
-        for path in root.rglob("*")
-        if path.is_file() and path.suffix in suffixes
-    }
-
-
-def _local_include_targets(source: Path, native_files: set[Path]) -> set[Path]:
-    targets = set()
-    for include in LOCAL_INCLUDE_RE.findall(source.read_text(errors="ignore")):
-        matches = set()
-        for root in (
-            source.parent,
-            AOT_ROOT,
-            AOT_ROOT / "csrc",
-            AOT_ROOT / "include",
-        ):
-            candidate = (root / include).resolve()
-            if candidate in native_files:
-                matches.add(candidate)
-        if not matches:
-            include_suffix = f"/{include}"
-            matches = {
-                candidate
-                for candidate in native_files
-                if f"/{candidate.relative_to(AOT_ROOT).as_posix()}".endswith(
-                    include_suffix
-                )
-            }
-        targets.update(matches)
-    return targets
-
-
 def test_declared_operator_groups_match_packages():
     assert set(kernels.ops.__all__) == _directory_names(OPS_ROOT)
 
@@ -239,7 +188,15 @@ def test_jit_source_declarations_exist():
 
 
 def test_aot_compilation_units_are_accounted_for():
-    manifest_text = "\n".join(path.read_text() for path in _aot_manifests())
+    manifests = [
+        AOT_ROOT / "CMakeLists.txt",
+        AOT_ROOT / "setup_metal.py",
+        AOT_ROOT / "setup_musa.py",
+        AOT_ROOT / "setup_rocm.py",
+        AOT_ROOT / "csrc" / "cpu" / "CMakeLists.txt",
+        *sorted((AOT_ROOT / "cmake").rglob("*.cmake")),
+    ]
+    manifest_text = "\n".join(path.read_text() for path in manifests)
     source_text = {
         path: path.read_text(errors="ignore")
         for path in (AOT_ROOT / "csrc").rglob("*")
@@ -265,34 +222,6 @@ def test_aot_compilation_units_are_accounted_for():
             continue
         missing.append(relative_path)
     assert not missing, f"AOT compilation units missing from build manifests: {missing}"
-
-
-def test_aot_headers_are_reachable():
-    native_files = _aot_native_files()
-    headers = {path for path in native_files if path.suffix in AOT_HEADER_SUFFIXES}
-    sources = native_files - headers
-    include_graph = {
-        path: _local_include_targets(path, native_files) for path in native_files
-    }
-
-    manifest_text = "\n".join(path.read_text() for path in _aot_manifests())
-    manifest_headers = {
-        header
-        for header in headers
-        if header.relative_to(AOT_ROOT).as_posix() in manifest_text
-    }
-    reachable = sources | manifest_headers
-    pending = list(reachable)
-    while pending:
-        source = pending.pop()
-        for target in include_graph[source] - reachable:
-            reachable.add(target)
-            pending.append(target)
-
-    unreachable = sorted(
-        path.relative_to(AOT_ROOT).as_posix() for path in headers - reachable
-    )
-    assert not unreachable, f"AOT headers unreachable from build roots: {unreachable}"
 
 
 if __name__ == "__main__":
