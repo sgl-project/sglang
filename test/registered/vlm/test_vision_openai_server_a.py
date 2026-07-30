@@ -53,6 +53,110 @@ class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
             super().setUpClass()
 
 
+class TestApertus1p5Server(TestOpenAIMLLMServerBase):
+    model = "swiss-ai/Apertus-v1.5-8B"
+    extra_args = ["--mem-fraction-static=0.8"]
+
+    def _chat_completion(self, content):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.chat.completions.create(
+            model="default",
+            messages=[{"role": "user", "content": content}],
+            temperature=0,
+            max_tokens=128,
+            stream=False,
+        )
+        self.assertEqual(response.choices[0].message.role, "assistant")
+        self.assertIsInstance(response.choices[0].message.content, str)
+        self.assertGreater(len(response.choices[0].message.content), 0)
+        self.assertGreater(response.usage.prompt_tokens, 0)
+        self.assertGreater(response.usage.completion_tokens, 0)
+        self.assertGreater(response.usage.total_tokens, 0)
+        return response
+
+    def _assert_taxi_image_response(self, text, require_ironing=True):
+        self.assertTrue(any(word in text for word in ("man", "person")))
+        self.assertIn("yellow", text)
+        self.assertTrue(any(word in text for word in ("taxi", "cab", "vehicle")))
+        if require_ironing:
+            self.assertTrue(
+                any(word in text for word in ("iron", "clothes", "cloth"))
+            )
+
+    def _assert_speech_transcript(self, text):
+        for phrase in ("thank you", "privilege", "forum", "leaders"):
+            self.assertIn(phrase, text)
+
+    def test_single_image_chat_completion(self):
+        response = self._chat_completion(
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                },
+                {"type": "text", "text": "Describe this image in a sentence."},
+            ]
+        )
+        text = response.choices[0].message.content.lower()
+        self._assert_taxi_image_response(text)
+
+    def test_multiple_images_chat_completion(self):
+        response = self._chat_completion(
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": IMAGE_SGL_LOGO_URL},
+                },
+                {
+                    "type": "text",
+                    "text": "Describe both images in a sentence each.",
+                },
+            ]
+        )
+        text = response.choices[0].message.content.lower()
+        self._assert_taxi_image_response(text, require_ironing=False)
+        self.assertTrue(any(word in text for word in ("sgl", "logo", "graphic")))
+
+    def test_audio_speech_completion(self):
+        audio_path = self.get_or_download_file(AUDIO_TRUMP_SPEECH_URL)
+        response = self._chat_completion(
+            [
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": audio_path},
+                },
+                {
+                    "type": "text",
+                    "text": "Transcribe this audio in English.",
+                },
+            ]
+        )
+        self._assert_speech_transcript(response.choices[0].message.content.lower())
+
+    def test_interleaved_image_audio_chat_completion(self):
+        response = self._chat_completion(
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                },
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": AUDIO_TRUMP_SPEECH_URL},
+                },
+                {
+                    "type": "text",
+                    "text": "Describe the image and transcribe the audio.",
+                },
+            ]
+        )
+        self.assertIn("thank you", response.choices[0].message.content.lower())
+
+
 class TestQwen2VLContextLengthServer(CustomTestCase):
     # --context-length 300 is calibrated to this model's mm-token expansion:
     # it must sit above the warmup image's expanded length but below the test
