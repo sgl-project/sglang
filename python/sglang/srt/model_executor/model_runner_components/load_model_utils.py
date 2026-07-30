@@ -3,7 +3,6 @@ from __future__ import annotations
 import datetime
 import logging
 import os
-import socket
 import threading
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -22,10 +21,10 @@ from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_sta
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
+    local_instance_id,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
 from sglang.srt.utils.common import is_npu
-from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -72,14 +71,13 @@ def maybe_trigger_remote_instance_nccl_send_group(
         == RemoteInstanceWeightLoaderBackend.NCCL
     ):
         if tp_rank == 0:
-            instance_ip = NetworkAddress.resolve_host(socket.gethostname())
             t = threading.Thread(
                 target=trigger_init_weights_send_group_for_remote_instance_request,
                 args=(
                     server_args.remote_instance_weight_loader_seed_instance_ip,
                     server_args.remote_instance_weight_loader_seed_instance_service_port,
                     server_args.remote_instance_weight_loader_send_weights_group_ports,
-                    instance_ip,
+                    local_instance_id(),
                 ),
             )
             t.start()
