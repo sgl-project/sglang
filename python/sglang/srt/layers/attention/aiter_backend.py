@@ -136,7 +136,9 @@ class AiterAttnBackend(AttentionBackend):
     ):
         super().__init__()
         # Lazy import to avoid the initialization of cuda context
-        from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
+        from sglang.kernels.ops.attention.extend_attention import (
+            extend_attention_fwd,
+        )
 
         self.input_dtype = model_runner.model_config.dtype
 
@@ -1122,8 +1124,8 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.max_kv_len,
                 )
         elif forward_batch.forward_mode.is_target_verify():
-            draft_num = forward_batch.input_ids.shape[0] // bs
             if self.use_mla:
+                draft_num = spec_info.draft_token_num
                 kv_lens = forward_batch.seq_lens + draft_num
                 kv_lens_sum = forward_batch.seq_lens_sum + draft_num * bs
                 device = forward_batch.seq_lens.device
@@ -1200,6 +1202,7 @@ class AiterAttnBackend(AttentionBackend):
                     run_graph=False,
                 )
             else:
+                draft_num = forward_batch.input_ids.shape[0] // bs
                 bs = len(forward_batch.req_pool_indices)
 
                 if self._use_unified_verify:
@@ -1657,16 +1660,21 @@ class AiterAttnBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
             assert verify_tokens_per_req is not None
+            # MLA uses a fixed draft length (num_draft_tokens); the non-MLA
+            # unified path derives it per batch from input_ids.
+            tokens_per_req = (
+                self.num_draft_tokens if self.use_mla else verify_tokens_per_req
+            )
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
                 0,
-                (1 + bs) * verify_tokens_per_req,
-                step=verify_tokens_per_req,
+                (1 + bs) * tokens_per_req,
+                step=tokens_per_req,
                 dtype=torch.int32,
                 device=self.device,
             )
             if self.use_mla:
-                kv_lens = seq_lens + verify_tokens_per_req
+                kv_lens = seq_lens + self.num_draft_tokens
             else:
                 kv_lens = seq_lens
             kv_indptr = self.kv_indptr[: bs + 1]
@@ -1675,7 +1683,7 @@ class AiterAttnBackend(AttentionBackend):
             # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
             if seq_lens_sum is not None:
                 kv_indices_used = seq_lens_sum + (
-                    verify_tokens_per_req * bs if self.use_mla else 0
+                    self.num_draft_tokens * bs if self.use_mla else 0
                 )
                 assert_buffer_fits(
                     kv_indices_used,
@@ -1694,9 +1702,9 @@ class AiterAttnBackend(AttentionBackend):
                 self.req_to_token.stride(0),
             )
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
-            max_q_len = verify_tokens_per_req
 
             if self.use_mla:
+                max_q_len = self.num_draft_tokens
                 if _use_mla_ps_kernel:
                     num_kv_splits = self.max_split_per_batch
 
@@ -1740,6 +1748,7 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                 )
             else:
+                max_q_len = verify_tokens_per_req
                 if self._use_unified_verify:
                     max_num_blocks_per_seq = (
                         self.max_context_len + self.page_size - 1
