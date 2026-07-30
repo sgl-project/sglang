@@ -244,13 +244,35 @@ class PrefillDelayer:
                     self.skip_first_delayer = False
                     pass
                 else:
-                    next_state = prev_state or _State()
-                    next_state = next_state.bump_delayed_count()
+                    # Bound the wait like the "mixed" branch: on a saturated
+                    # engine slot_condition may never turn false, so cap the
+                    # delay by both max_delay_passes and wall-clock time.
+                    prev_delayed_count = (
+                        prev_state.delayed_count if prev_state else 0
+                    )
+                    delayed_ms = (
+                        (time.perf_counter() - prev_state.start_time) * 1000.0
+                        if prev_state is not None
+                        else 0.0
+                    )
+                    if (
+                        prev_delayed_count < self._max_delay_passes - 1
+                        and delayed_ms < self._max_delay_ms
+                    ):
+                        next_state = prev_state or _State()
+                        next_state = next_state.bump_delayed_count()
+                        return _NegotiateOutput(
+                            next_state=next_state,
+                            output_allow=False,
+                            output_reason="delay",
+                            **debug_info,
+                        )
                     return _NegotiateOutput(
-                        next_state=next_state,
-                        output_allow=False,
-                        output_reason="delay",
+                        next_state=None,
+                        output_allow=True,
+                        output_reason="wait_timeout",
                         **debug_info,
+                        **wait_info,
                     )
             exist_previous_wait = prev_state is not None
             return _NegotiateOutput(
