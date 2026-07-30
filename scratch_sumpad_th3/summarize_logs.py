@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Optional
 
 import typer
 
@@ -23,90 +23,106 @@ def _parse_int_list(text: str) -> list[int]:
     return [int(part) for part in inner.split(",")]
 
 
+class _Bucket:
+    def __init__(self) -> None:
+        self.steps = 0
+        self.modes: Counter[str] = Counter()
+        self.real_tokens = 0
+        self.padded_tokens = 0
+        self.forced_max_steps = 0
+        self.bcg_ok_steps = 0
+
+    def waste_pct(self) -> Optional[float]:
+        if not self.real_tokens:
+            return None
+        return (self.padded_tokens - self.real_tokens) / self.real_tokens * 100
+
+    def render(self, label: str) -> str:
+        waste = self.waste_pct()
+        waste_text = "n/a" if waste is None else f"{waste:.2f}%"
+        return (
+            f"[DPPAD] {label:<12s} steps={self.steps:<5d} modes={dict(self.modes)} "
+            f"forced_max_steps={self.forced_max_steps} bcg_ok_steps={self.bcg_ok_steps} "
+            f"real={self.real_tokens} padded={self.padded_tokens} waste={waste_text}"
+        )
+
+
 @app.command()
 def main(
     log_path: Annotated[Path, typer.Argument()],
-    rank_filter: Annotated[int, typer.Option()] = -1,
 ) -> None:
-    """Summarize [DPPAD] / [PCG] / [KPROBE] lines of one server log."""
-    dppad_modes: Counter[str] = Counter()
-    extend_modes: Counter[str] = Counter()
-    real_tokens = 0
-    padded_tokens = 0
-    forced_max_steps = 0
-    bcg_ok_steps = 0
+    """Summarize [DPPAD] / [PCG] / [KPROBE] lines of one server log.
+
+    Steps are counted from rank-0 lines only; token sums cover every rank. Extend steps
+    are split by whether any DP rank was idle, because that is what decides whether
+    MAX_LEN padding fabricates work.
+    """
+    all_active = _Bucket()
+    has_idle = _Bucket()
+    decode_steps = 0
     pcg_buckets: Counter[int] = Counter()
-    pcg_raw_vs_bucket: list[tuple[int, int]] = []
     kprobe_rows: dict[tuple[int, int], Counter[int]] = defaultdict(Counter)
     capture_rows: Counter[int] = Counter()
     kprobe_real = 0
-    kprobe_graph_rows = 0
-    kprobe_graph_steps = 0
-    kprobe_eager_steps = 0
+    kprobe_rows_total = 0
+    kprobe_graph_lines = 0
+    kprobe_eager_lines = 0
 
     for raw_line in log_path.read_text(errors="replace").splitlines():
         if "[DPPAD]" in raw_line:
             fields = _parse_kv(raw_line[raw_line.index("[DPPAD]") :])
             rank = int(fields["rank"])
-            if rank_filter >= 0 and rank != rank_filter:
+            is_extend = fields["is_extend_in_batch"] == "True"
+            if not is_extend:
+                if rank == 0:
+                    decode_steps += 1
                 continue
-            dppad_modes[fields["mode"]] += 1
-            if fields["is_extend_in_batch"] == "True":
-                extend_modes[fields["mode"]] += 1
-                real_tokens += int(fields["real_local"])
-                padded_tokens += int(fields["padded_local"])
-                forced_max_steps += fields["forced_max_by_prefill_cg"] == "True"
-                bcg_ok_steps += fields["bcg_ok"] == "True"
+            raw_tokens = _parse_int_list(fields["raw"])
+            bucket = has_idle if (not raw_tokens or min(raw_tokens) == 0) else all_active
+            bucket.real_tokens += int(fields["real_local"])
+            bucket.padded_tokens += int(fields["padded_local"])
+            if rank == 0:
+                bucket.steps += 1
+                bucket.modes[fields["mode"]] += 1
+                bucket.forced_max_steps += fields["forced_max_by_prefill_cg"] == "True"
+                bucket.bcg_ok_steps += fields["bcg_ok"] == "True"
         elif "[PCG]" in raw_line:
             fields = _parse_kv(raw_line[raw_line.index("[PCG]") :])
-            bucket = int(fields["bucket"])
-            pcg_buckets[bucket] += 1
-            pcg_raw_vs_bucket.append((int(fields["raw_num_tokens"]), bucket))
+            pcg_buckets[int(fields["bucket"])] += 1
         elif "[KPROBE]" in raw_line:
             fields = _parse_kv(raw_line[raw_line.index("[KPROBE]") :])
-            rank = int(fields["rank"])
-            if rank < 0:
-                continue
-            if rank_filter >= 0 and rank != rank_filter:
+            if int(fields["rank"]) < 0:
                 continue
             mode = int(fields["dp_pad_mode"])
+            graph_rows = int(fields["graph_rows"])
             if mode == 0:
-                capture_rows[int(fields["graph_rows"])] += 1
+                capture_rows[graph_rows] += 1
                 continue
             used_graph = int(fields["used_prefill_graph"])
-            graph_rows = int(fields["graph_rows"])
             kprobe_rows[(mode, used_graph)][graph_rows] += 1
             kprobe_real += int(fields["real_local_tokens"])
-            kprobe_graph_rows += graph_rows
+            kprobe_rows_total += graph_rows
             if used_graph:
-                kprobe_graph_steps += 1
+                kprobe_graph_lines += 1
             else:
-                kprobe_eager_steps += 1
+                kprobe_eager_lines += 1
 
     print(f"log: {log_path}")
-    print(f"rank_filter: {rank_filter}")
-    print(f"[DPPAD] all-mode counts       : {dict(dppad_modes)}")
-    print(f"[DPPAD] extend-only counts    : {dict(extend_modes)}")
-    print(f"[DPPAD] extend steps forced_max_by_prefill_cg: {forced_max_steps}")
-    print(f"[DPPAD] extend steps bcg_ok   : {bcg_ok_steps}")
-    print(f"[DPPAD] real local tokens     : {real_tokens}")
-    print(f"[DPPAD] padded local tokens   : {padded_tokens}")
-    if real_tokens:
-        print(
-            f"[DPPAD] local pad waste       : "
-            f"{(padded_tokens - real_tokens) / real_tokens * 100:.2f}%"
-        )
-    print(f"[PCG] bucket histogram        : {dict(pcg_buckets)}")
-    print(f"[PCG] replays                 : {sum(pcg_buckets.values())}")
-    print(f"[KPROBE] capture launches     : {sum(capture_rows.values())} rows={dict(sorted(capture_rows.items()))}")
-    print(f"[KPROBE] graphed / eager steps: {kprobe_graph_steps} / {kprobe_eager_steps}")
-    print(f"[KPROBE] sum real local tokens: {kprobe_real}")
-    print(f"[KPROBE] sum attn rows        : {kprobe_graph_rows}")
+    print("note: steps are global (rank-0 lines); token sums cover all ranks")
+    print(all_active.render("all-active"))
+    print(has_idle.render("has-idle"))
+    print(f"[DPPAD] decode-only steps   : {decode_steps}")
+    print(f"[PCG] replay lines (rank-local): {sum(pcg_buckets.values())} {dict(sorted(pcg_buckets.items()))}")
+    print(f"[KPROBE] capture launches   : {sum(capture_rows.values())}")
+    print(f"[KPROBE] graphed / eager lines: {kprobe_graph_lines} / {kprobe_eager_lines}")
+    print(f"[KPROBE] real tokens / attn rows: {kprobe_real} / {kprobe_rows_total}")
     if kprobe_real:
         print(
-            f"[KPROBE] attn row waste       : "
-            f"{(kprobe_graph_rows - kprobe_real) / kprobe_real * 100:.2f}%"
+            f"[KPROBE] attn row waste     : "
+            f"{(kprobe_rows_total - kprobe_real) / kprobe_real * 100:.2f}%"
         )
+    print("[KPROBE] warning: mode reported here is live metadata; a replayed prefill graph")
+    print("[KPROBE]          always executes the MAX_LEN collectives it was captured with")
     for key in sorted(kprobe_rows):
         mode, used_graph = key
         print(
