@@ -5,7 +5,10 @@ metatags:
 tag: NEW
 ---
 
-import { Qwen36Deployment } from '/src/snippets/autoregressive/qwen36-deployment.jsx';
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { Playground } from "/src/snippets/_playground.jsx";
+import { config }     from "/src/snippets/configs/qwen/qwen3.6.jsx";
+import { benchmarks } from "/src/snippets/configs/qwen/qwen3.6-benchmarks.jsx";
 
 ## 1. Model Introduction
 
@@ -100,7 +103,9 @@ This section provides deployment configurations optimized for different hardware
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and capabilities.
 
 
-<Qwen36Deployment />
+<Deployment config={config} benchmarks={benchmarks} />
+
+<Playground config={config} />
 
 ### 3.2 Configuration Tips
 
