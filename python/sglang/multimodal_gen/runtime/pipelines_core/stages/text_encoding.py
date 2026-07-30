@@ -528,7 +528,10 @@ class TextEncodingStage(ConditionEncodingStage):
         policy = server_args.encoder_parallel
         if (
             policy not in ("auto", "dp")
+            # isinstance first: the loader can return a raw transformers
+            # encoder, which carries no such attribute
             or not isinstance(text_encoder, TextEncoder)
+            or not text_encoder.supports_dp_encode
             or (server_args.tp_size or 1) != 1
             or (server_args.dp_size or 1) != 1
             or encoder_config.parallel_folding_mode is not None

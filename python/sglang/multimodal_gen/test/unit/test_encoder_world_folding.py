@@ -121,10 +121,22 @@ def test_all_encoders_get_the_same_proposed_mode():
     assert img.parallel_folding_mode == "world"
 
 
-def test_dp_replicate_policy_proposes_nothing():
-    # dp/replicate never fold: adjust short-circuits so encoders stay replicated.
-    assert _proposed_mode(tp=1, sp=2, cfg=1, policy="dp") is None
+def test_replicate_policy_proposes_nothing():
     assert _proposed_mode(tp=1, sp=2, cfg=1, policy="replicate") is None
+
+
+def test_dp_only_displaces_folding_once_it_can_engage():
+    # dp needs a batched encode. At a ceiling of 1 it can never engage, so
+    # dropping the fold proposal would leave the encoder replicated for nothing
+    # (this is what serve's dp default did to qwen-image on 2 GPUs).
+    enc = T5Config()
+    enc.parallel_folding_mode = None
+    _run([enc], tp=1, sp=2, cfg=1, policy="dp", batching_max_size=1)
+    assert enc.parallel_folding_mode == "world"
+
+    enc.parallel_folding_mode = None
+    _run([enc], tp=1, sp=2, cfg=1, policy="dp", batching_max_size=2)
+    assert enc.parallel_folding_mode is None
 
 
 def test_fold_and_auto_policy_still_propose():

@@ -608,8 +608,13 @@ class ServerArgs(DisaggServerArgsMixin):
                 "--batching-max-size > 1 to use it."
             )
 
-        # 1. adjust for encoder parallel folding (dp/replicate never fold)
-        if self.encoder_parallel in ("dp", "replicate"):
+        # 1. adjust for encoder parallel folding. replicate never folds; dp only
+        # displaces folding when it can actually engage -- it needs a batched
+        # encode, so at a batching ceiling of 1 folding is the better answer and
+        # dropping it would leave the encoder replicated for nothing.
+        if self.encoder_parallel == "replicate" or (
+            self.encoder_parallel == "dp" and self.batching_max_size > 1
+        ):
             return
         fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
 
