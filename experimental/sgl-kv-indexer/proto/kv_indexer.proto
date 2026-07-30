@@ -13,6 +13,34 @@ enum TierType {
   TIER_SSD = 3;
 }
 
+// KV components are a fixed, small set with fixed match semantics -- a
+// component's rule is a property of its type, not a free choice:
+//   FULL  (bit 0, value 1) -- path component: resident on every prefix block.
+//   SWA   (bit 1, value 2) -- sliding-window: resident contiguously over at
+//                             least `swa_window_tokens` tokens ending at the
+//                             boundary (an unbroken run from the head is valid).
+//   MAMBA (bit 2, value 4) -- checkpoint: resident on the boundary block only.
+// Components are carried as a bitmask (OR of the above); FULL is always present
+// on a stored block.
+
+// A worker's versioned cache spec: which components its cache holds and the
+// static parameters the fixed rules need. Absent on a worker means legacy /
+// full-only (whole-block) behaviour.
+message WorkerCacheSpec {
+  uint32 version = 1;
+  // Bitmask of components this worker's cache holds (FULL|SWA|MAMBA); selects
+  // which fixed rules gate the prefix.
+  uint32 components = 2;
+  // Sliding-window size in tokens; used only when SWA is present.
+  uint32 swa_window_tokens = 3;
+  // Per-component servable tiers, each a bitmask of (1 << TierType). Intersected
+  // with the indexer's servable set (V1: HBM+DRAM) at query time; a component is
+  // reusable only from a tier set here.
+  uint32 full_tier_mask = 4;
+  uint32 swa_tier_mask = 5;
+  uint32 mamba_tier_mask = 6;
+}
+
 message MatchExternalKvRequest {
   // MVP semantics: these are block-level hashes to match against placement
   // metadata. The indexer returns block placement matches and does not compute
@@ -38,6 +66,15 @@ message ExternalKvAction {
   TierType tier = 2;
   // Non-empty for REPORT/REVOKE; ignored for CLEAR_ALL_AT_TIER.
   repeated string hashes = 3;
+
+  // REPORT only. Per-hash resident component bitmask at this tier, a REPLACE
+  // snapshot index-aligned with `hashes`. Empty means every hash is a legacy
+  // whole-block store (no component detail). REVOKE/CLEAR ignore it.
+  repeated uint32 component_masks = 4;
+
+  // REPORT only. Per-hash token count (block_size), index-aligned with `hashes`,
+  // used to accumulate SWA trailing windows. Empty when not supplied (legacy).
+  repeated uint32 block_sizes = 5;
 }
 
 message ApplyExternalKvBatchRequest {
@@ -54,6 +91,11 @@ message ApplyExternalKvBatchRequest {
 
   // Field 5 held the worker incarnation token used for restart fencing.
   reserved 5;
+
+  // The worker's component cache spec. Carried on every batch (like
+  // worker_address) so it self-heals across reconnects and indexer restarts.
+  // Absent means a legacy / full-only worker.
+  WorkerCacheSpec cache_spec = 6;
 }
 
 // Deliberately empty: applies are unconditional, so there is nothing to report
