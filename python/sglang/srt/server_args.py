@@ -132,30 +132,6 @@ LOAD_FORMAT_CHOICES = [
 
 # TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
 # Some of the choices here do NOT support online quantization.
-# Attention backends whose kernels read the chunked prefix-cache layout.
-# Out-of-tree platforms may extend this list (via
-# add_chunked_prefix_cache_attention_backend) before ServerArgs construction;
-# the chunked-prefix gate is evaluated during resolution.
-CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
-    "flashinfer",
-    "fa3",
-    "fa4",
-    "flashmla",
-    "cutedsl_mla",
-    "cutlass_mla",
-    "trtllm_mla",
-    "tokenspeed_mla",
-]
-
-
-def add_chunked_prefix_cache_attention_backend(backend_name):
-    if backend_name not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS:
-        CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
-        logger.info(
-            f"Added {backend_name} to CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS."
-        )
-
-
 QUANTIZATION_CHOICES = [
     "awq",
     "fp8",  # MOE + linear online quantization.
@@ -194,9 +170,6 @@ QUANTIZATION_CHOICES = [
     "humming",
 ]
 
-
-SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = QUANTIZATION_CHOICES
-
 ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
@@ -217,7 +190,7 @@ ATTENTION_BACKEND_CHOICES = [
     "tokenspeed_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
-    "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper+, requires --page-size 64
+    "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
     # AMD specific
     "aiter",
     "wave",
@@ -225,6 +198,21 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+]
+
+# Attention backends whose kernels read the chunked prefix-cache layout.
+# Out-of-tree platforms may extend this list (via
+# add_chunked_prefix_cache_attention_backend) before ServerArgs construction;
+# the chunked-prefix gate is evaluated during resolution.
+CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "flashmla",
+    "cutedsl_mla",
+    "cutlass_mla",
+    "trtllm_mla",
+    "tokenspeed_mla",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
@@ -271,7 +259,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "marlin",
     "humming",
     "experimental_sgl_marlin",
-    "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper+
+    "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -336,6 +324,7 @@ DSA_CHOICES = [
     "flashmla_sparse_q8",
     "flashmla_kv",
     "flashmla_auto",
+    "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
     "aiter",
@@ -370,6 +359,10 @@ def add_quantization_method_choices(choices):
 
 def add_attention_backend_choices(choices):
     ATTENTION_BACKEND_CHOICES.extend(choices)
+
+
+def add_chunked_prefix_cache_attention_backend(backend_name):
+    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
 
 
 def add_deterministic_attention_backend_choices(choices):
@@ -1045,14 +1038,6 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
-    dcp_size: A[
-        int,
-        Arg(
-            help="The decode context parallelism size.",
-            aliases=["--decode-context-parallel-size"],
-        ),
-        NS("parallel"),
-    ] = 1
     dwdp_size: A[
         int,
         Arg(
@@ -1071,20 +1056,24 @@ class ServerArgs:
             "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
             "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
             choices=["ag_rs", "a2a", "fi_a2a"],
+            resolvable=True,
         ),
         NS("parallel"),
     ] = "ag_rs"
     dcp_replicate_q_proj: A[
-        bool,
+        Optional[bool],
         Arg(
             help="For MLA decode context parallelism with the a2a/fi_a2a "
             "backend: replicate the Q projection so each DCP rank computes the "
             "full-head query locally (redundant projection compute), eliminating "
             "the per-layer head-dim all-gather of Q. Trades a small amount of "
-            "extra GEMM for one fewer collective per layer.",
+            "extra GEMM for one fewer collective per layer. Use "
+            "--no-dcp-replicate-q-proj to disable the model-specific default.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
         ),
         NS("parallel"),
-    ] = False
+    ] = None
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -2140,7 +2129,7 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="The quantization method for speculative model.",
-            choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
+            choices=QUANTIZATION_CHOICES,
         ),
         NS("spec"),
     ] = None
@@ -2203,6 +2192,7 @@ class ServerArgs:
         NS("spec"),
     ] = None
 
+    # -------------------------------------------------------------------------
     # Speculative decoding (ngram)
     # -------------------------------------------------------------------------
     speculative_ngram_min_bfs_breadth: A[
@@ -3336,6 +3326,9 @@ class ServerArgs:
         NS("exec.features"),
     ] = False
 
+    # -------------------------------------------------------------------------
+    # Weight cache
+    # -------------------------------------------------------------------------
     weight_cache_mode: A[
         str,
         Arg(
@@ -3412,8 +3405,6 @@ class ServerArgs:
         # direct handler invocations can rely on it even when
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
-
-        self._validate_mamba_max_states_per_path()
 
         if self.model_path.lower() in ["none", "dummy"]:
             return
@@ -3592,14 +3583,6 @@ class ServerArgs:
 
         materialize_declarations(self)
 
-    def _validate_mamba_max_states_per_path(self):
-        value = self.mamba_max_states_per_path
-        if value == 0 or value < -1:
-            raise ValueError(
-                "--mamba-max-states-per-path must be -1 (unlimited) or a positive "
-                f"integer, got {value}."
-            )
-
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
@@ -3644,23 +3627,60 @@ class ServerArgs:
         # Breakable CUDA Graph captures one complete prefill and is the graph
         # mode validated for this encoder-style attention.
         if getattr(model_config, "is_embedding_gemma", False):
+            # This is an encoder-only model even though its HF architecture is
+            # named Gemma3TextModel. Marking it as embedding mode enables the
+            # FlashAttention raw-K/V fast path, which does not write or read
+            # the paged KV cache during its single prefill forward.
+            self.is_embedding = True
             self.disable_radix_cache = True
             self.chunked_prefill_size = -1
+            # Submit a list-valued embeddings request atomically so BCG can
+            # replay its full prefill batch instead of starting item zero
+            # while the remaining texts are still being tokenized.
+            self.enable_tokenizer_batch_encode = True
+            requested_prefill_backend = (
+                self.prefill_attention_backend or self.attention_backend
+            )
+            if (
+                is_cuda()
+                and (is_sm90_supported() or is_sm100_supported())
+                and requested_prefill_backend in (None, "fa3", "fa4")
+            ):
+                # Hopper/Blackwell's default FA backend can consume raw K/V
+                # tensors for a single embedding prefill. Enable its no-KV
+                # pool path before memory-pool sizing; an explicit non-FA
+                # backend retains the existing paged-KV behavior.
+                self.prefill_only_disable_kv_cache = True
+                self._validate_prefill_only_disable_kv_cache_args()
             self.cuda_graph_config.decode.backend = Backend.DISABLED
             if is_cuda() and self.cuda_graph_config.prefill.backend != Backend.DISABLED:
                 self.cuda_graph_config.prefill.backend = Backend.BREAKABLE
-                # CUDA-graph sizing has already run by this point. With
-                # chunked prefill disabled its generic default is -1, which
-                # otherwise leaves BCG with no shapes to capture. Use the
-                # model's maximum request length as the safe default; callers
-                # can still raise it for larger aggregate prefill batches.
-                if (self.cuda_graph_config.prefill.max_bs or 0) <= 0:
-                    self.cuda_graph_config.prefill.max_bs = model_config.context_len
-                    self.cuda_graph_config.prefill.bs = (
-                        self._generate_prefill_cuda_graph_batch_sizes(
-                            model_config.context_len
-                        )
+                # CUDA-graph sizing has already run by this point and derives
+                # its generic maximum from the 8K chunked-prefill default.
+                # On the Hopper/Blackwell FA raw-K/V path, raise the unlocked
+                # default to a full eight-way 2K embedding batch; callers can
+                # still override this for larger aggregate prefills.
+                prefill_config = self.cuda_graph_config.prefill
+                # Unit-level capability tests may invoke this hook without
+                # running the full CUDA-graph configuration parser, which is
+                # where this internal lock set is normally initialized.
+                # Treat that minimal construction as having no user-locked
+                # graph settings.
+                cuda_graph_config_locked = getattr(
+                    self, "_cuda_graph_config_locked", set()
+                )
+                if (Phase.PREFILL, "max_bs") not in cuda_graph_config_locked:
+                    prefill_config.max_bs = max(
+                        prefill_config.max_bs or 0,
+                        model_config.context_len,
+                        16384,
                     )
+                    if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
+                        prefill_config.bs = (
+                            self._generate_prefill_cuda_graph_batch_sizes(
+                                prefill_config.max_bs
+                            )
+                        )
             elif not is_cuda():
                 # BCG is CUDA-only. Other graph backends do not support this
                 # encoder-style prefill, so retain the eager Triton path.
@@ -3739,13 +3759,35 @@ class ServerArgs:
             return
         elif is_cuda():
             if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "Decode context parallel (--dcp-size / "
-                    "--decode-context-parallel-size > 1) on CUDA platform "
-                    "does not support any speculative algorithm, but got "
-                    f"dcp_size={self.dcp_size} on a CUDA platform with "
-                    "speculative decoding enabled."
+                model_arches = self.get_model_config().hf_config.architectures
+                decode_backend = self.decode_attention_backend or self.attention_backend
+                kimi_linear_dspark = (
+                    self.speculative_algorithm == "DSPARK"
+                    and "KimiLinearForCausalLM" in model_arches
+                    and self.speculative_attention_mode == "decode"
+                    and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
                 )
+                if kimi_linear_dspark:
+                    ragged_verify_mode = envs.SGLANG_RAGGED_VERIFY_MODE.get()
+                    if ragged_verify_mode != "static":
+                        raise ValueError(
+                            "Kimi Linear DCP + DSPARK currently requires "
+                            "SGLANG_RAGGED_VERIFY_MODE=static, but got "
+                            f"{ragged_verify_mode!r}."
+                        )
+                else:
+                    raise ValueError(
+                        "Decode context parallel (--dcp-size / "
+                        "--decode-context-parallel-size > 1) with speculative "
+                        "decoding on CUDA is supported only for Kimi Linear + "
+                        "DSPARK + --speculative-attention-mode decode + "
+                        "tokenspeed_mla, or experimental cutedsl_mla, but got "
+                        f"architectures={model_arches}, "
+                        f"speculative_algorithm={self.speculative_algorithm!r}, "
+                        "speculative_attention_mode="
+                        f"{self.speculative_attention_mode!r}, "
+                        f"decode_attention_backend={decode_backend!r}."
+                    )
         else:
             raise ValueError(
                 "Decode context parallel (--dcp-size / "
@@ -4705,9 +4747,9 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         return not (is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config))
 
-    def mamba_pre_capture_reserve_mb(self, gpu_mem: Optional[float]) -> float:
-        # Realistic runtime reserve for the fixed (non-resizable) mamba state cache,
-        # which post-capture can't size from measured free memory.
+    def pre_capture_activation_reserve_mb(self, gpu_mem: Optional[float]) -> float:
+        # Runtime activation working-set reserve for eager decode above the captured
+        # max_bs and transient prefill/logits; also covers fixed state caches.
         if self.disaggregation_mode == "decode":
             running_requests = (
                 self.max_running_requests or self.cuda_graph_config.decode.max_bs or 1
@@ -5353,7 +5395,7 @@ class ServerArgs:
             # _glm4_moe_overrides).
             pass
 
-        elif model_arch in ["Lfm2ForCausalLM"]:
+        elif model_arch in ["Lfm2ForCausalLM", "Lfm2MoeForCausalLM"]:
             # Attention backend selection moved to the override registry
             # (arg_groups/overrides.py: _lfm2_overrides).
             assert resolved_view(self).attention_backend != "triton", (
@@ -5523,6 +5565,10 @@ class ServerArgs:
                     or self.speculative_eagle_topk is not None
                 )
             ):
+                # trtllm_mha requires equal K/V row widths; fa4 carries
+                # v_head_dim through.
+                if model_config.has_asymmetric_kv:
+                    return "fa4"
                 return "trtllm_mha"
             elif is_hip():
                 return "aiter"
@@ -5778,6 +5824,12 @@ class ServerArgs:
     def _handle_mamba_backend(self):
         if self.mamba_cache_philox_rounds < 0:
             raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
+
+        if self.mamba_max_states_per_path == 0 or self.mamba_max_states_per_path < -1:
+            raise ValueError(
+                "--mamba-max-states-per-path must be -1 (unlimited) or a positive "
+                f"integer, got {self.mamba_max_states_per_path}."
+            )
 
         if self.enable_mamba_cache_stochastic_rounding:
             if self.mamba_ssm_dtype != "float16":
