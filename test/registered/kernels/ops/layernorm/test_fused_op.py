@@ -143,11 +143,19 @@ def test_registry_register_and_get():
     assert reg.get("no.such") == []
 
 
-def test_registry_reregister_replaces():
+def test_registry_reregister_is_idempotent():
+    reg = KernelRegistry()
+    spec = _spec(target="math:sqrt")
+    reg.register(spec)
+    reg.register(spec)
+    assert reg.get("g.n") == [spec]
+
+
+def test_registry_rejects_conflicting_backend_registration():
     reg = KernelRegistry()
     reg.register(_spec(target="math:sqrt"))
-    reg.register(_spec(target="math:floor"))
-    assert [s.target for s in reg.get("g.n")] == ["math:floor"]
+    with pytest.raises(ValueError, match="Conflicting kernel registration"):
+        reg.register(_spec(target="math:floor"))
 
 
 def test_registry_get_backend_missing_raises():

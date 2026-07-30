@@ -970,6 +970,39 @@
                 "pages": [
                   "cookbook/autoregressive/intro",
                   {
+                    "group": "Kimi (Moonshot AI)",
+                    "pages": [
+                      "cookbook/autoregressive/Moonshotai/Kimi-K3",
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2.7-Code",
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2.5",
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2",
+                      "cookbook/autoregressive/Moonshotai/Kimi-Linear"
+                    ]
+                  },
+                  {
+                    "group": "Thinking Machines",
+                    "pages": [
+                      "cookbook/autoregressive/ThinkingMachines/Inkling"
+                    ]
+                  },
+                  {
+                    "group": "GLM",
+                    "pages": [
+                      "cookbook/autoregressive/GLM/GLM-5.2",
+                      "cookbook/autoregressive/GLM/GLM-5.1",
+                      "cookbook/autoregressive/GLM/GLM-5",
+                      "cookbook/autoregressive/GLM/GLM-OCR",
+                      "cookbook/autoregressive/GLM/GLM-Glyph",
+                      "cookbook/autoregressive/GLM/GLM-4.7",
+                      "cookbook/autoregressive/GLM/GLM-4.7-Flash",
+                      "cookbook/autoregressive/GLM/GLM-4.6",
+                      "cookbook/autoregressive/GLM/GLM-4.6V",
+                      "cookbook/autoregressive/GLM/GLM-4.5",
+                      "cookbook/autoregressive/GLM/GLM-4.5V"
+                    ]
+                  },
+                  {
                     "group": "Qwen",
                     "pages": [
                       "cookbook/autoregressive/Qwen/Qwen3.6",
@@ -1010,28 +1043,6 @@
                     ]
                   },
                   {
-                    "group": "GLM",
-                    "pages": [
-                      "cookbook/autoregressive/GLM/GLM-5.2",
-                      "cookbook/autoregressive/GLM/GLM-5.1",
-                      "cookbook/autoregressive/GLM/GLM-5",
-                      "cookbook/autoregressive/GLM/GLM-OCR",
-                      "cookbook/autoregressive/GLM/GLM-Glyph",
-                      "cookbook/autoregressive/GLM/GLM-4.7",
-                      "cookbook/autoregressive/GLM/GLM-4.7-Flash",
-                      "cookbook/autoregressive/GLM/GLM-4.6",
-                      "cookbook/autoregressive/GLM/GLM-4.6V",
-                      "cookbook/autoregressive/GLM/GLM-4.5",
-                      "cookbook/autoregressive/GLM/GLM-4.5V"
-                    ]
-                  },
-                  {
-                    "group": "Thinking Machines",
-                    "pages": [
-                      "cookbook/autoregressive/ThinkingMachines/Inkling"
-                    ]
-                  },
-                  {
                     "group": "Meituan",
                     "pages": [
                       "cookbook/autoregressive/Meituan/LongCat-2.0"
@@ -1055,17 +1066,6 @@
                     "group": "OpenAI",
                     "pages": [
                       "cookbook/autoregressive/OpenAI/GPT-OSS"
-                    ]
-                  },
-                  {
-                    "group": "Moonshotai",
-                    "pages": [
-                      "cookbook/autoregressive/Moonshotai/Kimi-K3",
-                      "cookbook/autoregressive/Moonshotai/Kimi-K2.7-Code",
-                      "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
-                      "cookbook/autoregressive/Moonshotai/Kimi-K2.5",
-                      "cookbook/autoregressive/Moonshotai/Kimi-K2",
-                      "cookbook/autoregressive/Moonshotai/Kimi-Linear"
                     ]
                   },
                   {
