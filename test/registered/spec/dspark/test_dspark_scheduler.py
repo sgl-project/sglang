@@ -1,6 +1,7 @@
 import functools
 import types
 import unittest
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -9,6 +10,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
+    DSparkVerifyPlanner,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
     compute_verify_token_budget,
@@ -18,7 +20,10 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    RaggedVerifyMode,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -471,6 +476,64 @@ class TestGraphTierFillBudget(CustomTestCase):
             self.assertEqual(total, min(graph_num_tokens, bs * cap))
 
 
+class TestFullWindowScheduling(CustomTestCase):
+    @staticmethod
+    def _planner(*, aligned_budget: int) -> DSparkVerifyPlanner:
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner._ragged_verify_mode = RaggedVerifyMode.COMPACT
+        planner._is_verify_all = False
+        planner._align_verify_tokens_to_graph_tier = True
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=5, min_verify_len=1)
+        planner._uniform_layout_cache = {}
+        planner.verify_num_draft_tokens = 6
+        planner.model_runner = object()
+        planner._budget_aligned_to_graph_tier = MagicMock(return_value=aligned_budget)
+        return planner
+
+    @staticmethod
+    def _schedule_kwargs() -> dict:
+        return dict(
+            req_pool_indices=torch.arange(8, dtype=torch.int32),
+            prefix_lens=torch.zeros(8, dtype=torch.int32),
+            device=torch.device("cpu"),
+            confidence=None,
+            budget=32,
+        )
+
+    def test_aligned_full_window_uses_cached_uniform_layout(self):
+        """A graph-aligned full window must bypass the per-step scheduler."""
+        planner = self._planner(aligned_budget=40)
+        planner._schedule_verify_lens = MagicMock(
+            side_effect=AssertionError("per-step scheduler should be bypassed")
+        )
+        expected_layout = object()
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_planner."
+            "uniform_ragged_layout",
+            return_value=expected_layout,
+        ) as uniform_layout:
+            first = planner.schedule_layout(**self._schedule_kwargs())
+            second = planner.schedule_layout(**self._schedule_kwargs())
+
+        self.assertIs(first, expected_layout)
+        self.assertIs(second, expected_layout)
+        planner._schedule_verify_lens.assert_not_called()
+        uniform_layout.assert_called_once()
+
+    def test_partial_window_keeps_per_step_scheduler(self):
+        """A budget one token short of the full window must still schedule."""
+        planner = self._planner(aligned_budget=39)
+        planner._schedule_verify_lens = MagicMock(
+            side_effect=RuntimeError("per-step scheduler called")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "per-step scheduler called"):
+            planner.schedule_layout(**self._schedule_kwargs())
+
+        planner._schedule_verify_lens.assert_called_once()
+
+
 class _FakeRaggedRunner(types.SimpleNamespace):
     pass
 
@@ -489,7 +552,6 @@ class TestBudgetTierSelection(CustomTestCase):
         from sglang.srt.speculative.dspark_components.dspark_planner import (
             verify_layout_graph_num_tokens_floor,
         )
-        from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
 
         model_runner = _fake_model_runner([8, 16, 1024], max_bs=128)
         floor = verify_layout_graph_num_tokens_floor(
