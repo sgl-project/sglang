@@ -149,21 +149,26 @@ def _set_kv_buffer_impl(
     device_module: Any,
     size_limit: int,
     alt_stream: Optional[torch.cuda.Stream] = None,
-    same_kv_dim: bool = True,
+    v_row_dim: Optional[int] = None,  # head_num * v_head_dim; defaults to row_dim
 ) -> None:
+    v_row_dim = row_dim if v_row_dim is None else v_row_dim
     row_bytes = row_dim * store_dtype.itemsize
-    if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):
+    v_row_bytes = v_row_dim * store_dtype.itemsize
+    if (_is_cuda or _is_hip) and can_use_store_cache(row_bytes, v_row_bytes):
         return store_cache(
             k.view(-1, row_dim),
-            v.view(-1, row_dim),
+            v.view(-1, v_row_dim),
             k_cache.view(-1, row_dim),
-            v_cache.view(-1, row_dim),
+            v_cache.view(-1, v_row_dim),
             indices,
             row_bytes=row_bytes,
+            v_row_bytes=v_row_bytes,
             size_limit=size_limit,
         )
 
-    if _is_cpu and _cpu_has_amx_support:
+    # store_cache_cpu takes a single row_dim for both K and V, so it only serves
+    # equal-width rows; asymmetric KV falls through to the naive path below.
+    if _is_cpu and _cpu_has_amx_support and v_row_dim == row_dim:
         return torch.ops.sgl_kernel.store_cache_cpu(
             k,
             v,
@@ -1819,7 +1824,7 @@ class MHATokenToKVPool(KVCache):
 
         # for store_cache JIT kernel
         self.row_dim = self.head_num * self.head_dim
-        self.same_kv_dim = self.head_dim == self.v_head_dim
+        self.v_row_dim = self.head_num * self.v_head_dim
 
     def _init_kv_copy_and_warmup(self):
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
@@ -2386,7 +2391,7 @@ class MHATokenToKVPool(KVCache):
             # dummy tokens write there); valid index range is [0, size + page_size).
             size_limit=self.size + self.page_size,
             alt_stream=self.alt_stream,
-            same_kv_dim=self.same_kv_dim,
+            v_row_dim=self.v_row_dim,
         )
 
     def _quantized_scales(self, global_layer_id: int, k_scale, v_scale):
@@ -2711,6 +2716,15 @@ class MHATokenToKVPool(KVCache):
                 layer_id_override=layer_id,
             )
             return
+
+        # The tiled kernel takes one ROW_BYTES for both tensors, so an asymmetric V
+        # row would be written at K's width and bleed into the next slot. Only this
+        # path needs the gate; the non-CUDA branch above handles both widths.
+        if self.v_row_dim != self.row_dim:
+            raise NotImplementedError(
+                "prefix-valid commit requires equal-width K/V rows, got "
+                f"head_dim={self.head_dim} v_head_dim={self.v_head_dim}."
+            )
 
         _set_kv_buffer_prefix_valid_impl(
             cache_k,

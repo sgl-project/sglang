@@ -174,6 +174,14 @@ class AttentionBackend(ABC):
         """
         return [None, None]
 
+    def target_verify_reads_custom_mask(self) -> bool:
+        """Whether target-verify attention reads spec_info.custom_mask at all.
+
+        When False, build_tree_kernel_efficient skips the full-buffer prefix
+        fill (max_num_tokens x max_context_len bool memset per verify step).
+        """
+        return True
+
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):

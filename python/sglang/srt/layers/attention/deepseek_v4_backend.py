@@ -1524,6 +1524,10 @@ class DeepseekV4AttnBackend(
     def get_verify_buffers_to_fill_after_draft(self):
         return [self.cuda_graph_custom_mask, None]
 
+    def target_verify_reads_custom_mask(self) -> bool:
+        # DSV4 verify metadata never extracts from custom_mask.
+        return False
+
     def replay_cuda_graph_metadata_from(
         self,
         bs: int,
