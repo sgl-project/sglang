@@ -1583,21 +1583,28 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _moe_runner_backend_quant_constraints(
                     _view(quantization="nvfp4_online", moe_runner_backend="triton")
                 )
+            # The rule is generic to modelopt_mixed, so existing mixed
+            # checkpoints without MXFP8 layers retain their TRT-LLM MoE default.
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
                     _view(quantization="modelopt_mixed")
                 ),
                 {"moe_runner_backend": "flashinfer_trtllm"},
             )
-            self.assertEqual(
-                _moe_runner_backend_quant_constraints(
-                    _view(
-                        quantization="modelopt_mixed",
-                        moe_runner_backend="flashinfer_cutlass",
+            for explicit_backend in (
+                "flashinfer_cutlass",
+                "flashinfer_trtllm",
+            ):
+                with self.subTest(explicit_backend=explicit_backend):
+                    self.assertEqual(
+                        _moe_runner_backend_quant_constraints(
+                            _view(
+                                quantization="modelopt_mixed",
+                                moe_runner_backend=explicit_backend,
+                            )
+                        ),
+                        {},
                     )
-                ),
-                {},
-            )
         self.assertEqual(
             _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
             {"moe_runner_backend": "flashinfer_trtllm"},

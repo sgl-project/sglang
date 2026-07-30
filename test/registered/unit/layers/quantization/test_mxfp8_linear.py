@@ -6,9 +6,11 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.moe import MoeRunnerBackend
 from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
+from sglang.srt.runtime_context import get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -16,11 +18,14 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestMxfp8LinearMethod(CustomTestCase):
-    def test_modelopt_mixed_auto_selects_cutlass(self):
+    def test_modelopt_mixed_auto_selects_cutlass_fp8_gemm_without_mutating_moe(self):
         server_args = SimpleNamespace(
             fp8_gemm_runner_backend="auto", quantization="modelopt_mixed"
         )
         with (
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM
+            ),
             patch.object(fp8_utils, "FP8_GEMM_RUNNER_BACKEND", None),
             patch.object(fp8_utils, "_is_sm100_supported", True),
             patch.object(fp8_utils, "is_flashinfer_available", return_value=True),
@@ -30,6 +35,28 @@ class TestMxfp8LinearMethod(CustomTestCase):
                 fp8_utils.get_fp8_gemm_runner_backend(),
                 Fp8GemmRunnerBackend.FLASHINFER_CUTLASS,
             )
+            self.assertEqual(
+                get_flags().moe.runner_backend,
+                MoeRunnerBackend.FLASHINFER_TRTLLM,
+            )
+
+    def test_modelopt_mixed_explicit_fp8_gemm_backend_is_preserved(self):
+        for requested in ("flashinfer_cutlass", "flashinfer_trtllm", "triton"):
+            with (
+                self.subTest(requested=requested),
+                patch.object(fp8_utils, "FP8_GEMM_RUNNER_BACKEND", None),
+                patch.object(fp8_utils, "_is_sm100_supported", True),
+                patch.object(fp8_utils, "is_flashinfer_available", return_value=True),
+            ):
+                fp8_utils.initialize_fp8_gemm_config(
+                    SimpleNamespace(
+                        fp8_gemm_runner_backend=requested,
+                        quantization="modelopt_mixed",
+                    )
+                )
+                self.assertEqual(
+                    fp8_utils.get_fp8_gemm_runner_backend().value, requested
+                )
 
     def test_cutlass_scale_swizzle_matches_reference_layout(self):
         n, k = 128, 160
