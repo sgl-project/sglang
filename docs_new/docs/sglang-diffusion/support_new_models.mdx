@@ -63,7 +63,7 @@ behavior.
 | dVLA or policy module | The checkpoint defines a new action-policy architecture | `runtime/models/{family}/modeling_*.py` or a task-specific model subfolder |
 | Shared runtime infrastructure | Cache, CUDA graph, distributed transfer, request utilities, or action-policy helpers can be reused by future models | `runtime/cache/`, `runtime/distributed/`, `runtime/utils/`, `runtime/pipelines_core/stages/` |
 | Model component config | A model component has static architecture config | `configs/models/dits/{model}.py`, `configs/models/vaes/{model}.py` |
-| Model-specific stage | Pre-processing is too custom for the standard stages | `runtime/pipelines_core/stages/model_specific_stages/{model}.py` |
+| Model-specific stage | A single stage's runtime semantics cannot be expressed by a native stage or a narrow subclass of one | `runtime/pipelines_core/stages/model_specific_stages/{model}.py` |
 | Encoder, VAE, scheduler | No existing implementation can be reused | `runtime/models/encoders/`, `runtime/models/vaes/`, `runtime/models/schedulers/` |
 
 For a new native architecture, the common minimum is:
@@ -103,16 +103,34 @@ LTX, extend that implementation before starting from an empty file.
 ## Choose a Pipeline Shape
 
 SGLang-Diffusion uses `ComposedPipelineBase` to wire stages together. Most
-native pipelines should use one of these two shapes.
+native pipelines should choose the least invasive stage shape that preserves the
+runtime semantics.
 
 | Shape | Use when | Layout |
 | --- | --- | --- |
-| Standard stages | Text/image encoding, latent prep, denoising, and decoding match existing helpers | `add_standard_t2i_stages()`, `add_standard_ti2i_stages()`, or a similar helper |
-| Model-specific pre-processing | The reference pipeline has custom captioning, image conditioning, latent packing, or timestep preparation | `{Model}BeforeDenoisingStage -> DenoisingStage -> DecodingStage` |
+| Native stages | Text/image encoding, latent prep, timestep prep, denoising, and decoding match existing helpers | `add_standard_t2i_stages()`, `add_standard_ti2i_stages()`, or a similar helper |
+| Native-stage subclass | One stage has model-specific details, but the stage boundary and batch contract still match an existing native stage | `{Model}TextEncodingStage(TextEncodingStage) -> LatentPreparationStage -> TimestepPreparationStage -> DenoisingStage -> DecodingStage` |
+| Custom single-purpose stage | One step has a different state owner or batch-field lifecycle and cannot cleanly inherit from a native stage | Native stages with one `{Model}{Purpose}Stage` inserted or substituted |
+| Aggregated custom stage | Several preparation steps are inseparable in the reference pipeline and cannot be split without fragile duplicate state | `{Model}BeforeDenoisingStage -> DenoisingStage -> DecodingStage` |
 
-Prefer standard stages when possible. Use a model-specific
-`BeforeDenoisingStage` when trying to force the model into shared stages would
-create many conditionals.
+Prefer this order:
+
+1. **Use native stages directly.** This keeps the model on shared code paths for
+   offload, component readiness, profiling, disaggregation, batching, and future
+   stage-level optimizations.
+2. **Subclass the narrowest native stage.** If only prompt processing differs,
+   inherit from `TextEncodingStage`. If only latent setup, timestep setup,
+   denoising, or decode differs, inherit from that specific native stage. Preserve
+   the existing input/output fields whenever possible.
+3. **Add a custom single-purpose stage only when no native stage contract fits.**
+   Keep the stage owner narrow: one stage should own one coherent transformation,
+   such as a custom condition assembly step or a model-specific policy/action
+   bridge.
+4. **Use an aggregated `BeforeDenoisingStage` only as a last resort.** This is the
+   least preferred shape because it hides multiple runtime responsibilities in
+   one stage, increases code size and review cost, and bypasses shared hooks for
+   offload, profiling, disaggregation, batching, and future stage-level
+   optimizations.
 
 ## Implement the Pieces
 
@@ -191,8 +209,10 @@ class MyModelPipeline(LoRAPipeline, ComposedPipelineBase):
 EntryClass = [MyModelPipeline]
 ```
 
-Use a model-specific pre-processing stage when the reference pipeline cannot be
-cleanly expressed by standard helpers.
+When a standard helper is not enough, first check whether only one native stage
+needs model-specific behavior. In that case, subclass that stage and keep the
+rest of the pipeline standard. For example, custom tokenization or prompt-window
+logic should usually inherit from `TextEncodingStage` directly.
 
 ```python
 class MyModelPipeline(LoRAPipeline, ComposedPipelineBase):
@@ -207,30 +227,103 @@ class MyModelPipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        self.add_stage(
-            MyModelBeforeDenoisingStage(
+        self.add_stage(InputValidationStage())
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            lambda: MyModelTextEncodingStage(
                 text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-                vae=self.get_module("vae"),
-            )
+            ),
+            "my_model_text_encoding_stage",
         )
-        self.add_stage(
-            DenoisingStage(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-            )
-        )
+        self.add_standard_latent_preparation_stage()
+        self.add_standard_timestep_preparation_stage()
+        self.add_standard_denoising_stage()
         self.add_standard_decoding_stage()
 
 
 EntryClass = [MyModelPipeline]
 ```
 
-### 4. Optional Before-Denoising Stage
+Use a custom single-purpose stage only when the reference pipeline has one step
+that cannot be represented cleanly by a hook or native-stage subclass. Keep the
+custom stage narrow and reuse native stages before and after it.
 
-A `BeforeDenoisingStage` should populate the batch fields consumed by
+```python
+class MyModelPipeline(LoRAPipeline, ComposedPipelineBase):
+    pipeline_name = "MyModelPipeline"
+
+    _required_config_modules = [
+        "text_encoder",
+        "tokenizer",
+        "transformer",
+        "scheduler",
+        "vae",
+    ]
+
+    def create_pipeline_stages(self, server_args: ServerArgs):
+        self.add_stage(InputValidationStage())
+        self.add_standard_text_encoding_stage()
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            lambda: MyModelConditioningStage(
+                scheduler=self.get_module("scheduler"),
+                vae=self.get_module("vae"),
+            ),
+            "my_model_conditioning_stage",
+        )
+        self.add_standard_latent_preparation_stage()
+        self.add_standard_timestep_preparation_stage()
+        self.add_standard_denoising_stage()
+        self.add_standard_decoding_stage()
+
+
+EntryClass = [MyModelPipeline]
+```
+
+Use an aggregated `BeforeDenoisingStage` only when the reference pipeline couples
+several preparation steps so tightly that splitting them would require fragile
+duplicate state or extra synchronization. Do not start with this shape.
+
+```python
+class MyModelPipeline(LoRAPipeline, ComposedPipelineBase):
+    pipeline_name = "MyModelPipeline"
+
+    _required_config_modules = [
+        "text_encoder",
+        "tokenizer",
+        "transformer",
+        "scheduler",
+        "vae",
+    ]
+
+    def create_pipeline_stages(self, server_args: ServerArgs):
+        self.add_stage(InputValidationStage())
+        self.add_stage(
+            MyModelBeforeDenoisingStage(
+                text_encoder=self.get_module("text_encoder"),
+                tokenizer=self.get_module("tokenizer"),
+                scheduler=self.get_module("scheduler"),
+                vae=self.get_module("vae"),
+            )
+        )
+        self.add_standard_denoising_stage()
+        self.add_standard_decoding_stage()
+
+
+EntryClass = [MyModelPipeline]
+```
+
+### 4. Last-Resort Before-Denoising Stage
+
+A `BeforeDenoisingStage` is not a catch-all replacement for the native stages.
+Use it when the model has custom latent packing, conditioning assembly, timestep
+preparation, or request-local state that does not fit `LatentPreparationStage` or
+`TimestepPreparationStage`, and only after checking whether the work can be a
+native-stage subclass or a custom single-purpose stage. If the difference is
+prompt handling, subclass `TextEncodingStage` instead.
+
+A proper `BeforeDenoisingStage` should populate the batch fields consumed by
 `DenoisingStage`.
 
 ```python

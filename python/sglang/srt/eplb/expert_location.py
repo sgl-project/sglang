@@ -173,7 +173,11 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def init_by_eplb(
-        server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+        logical_count: torch.Tensor,
+        *,
+        use_flat_topology: bool = False,
     ):
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
@@ -189,7 +193,7 @@ class ExpertLocationMetadata:
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_physical_experts = common["num_physical_experts"]
         num_groups = model_config_for_expert_location.num_groups
-        num_nodes = server_args.nnodes
+        num_nodes = 1 if use_flat_topology else server_args.nnodes
 
         from sglang.srt.eplb import eplb_algorithms
 
@@ -773,7 +777,7 @@ def compute_initial_expert_location_metadata(
 
     # TODO unify with the utils function
     if data.endswith(".pt"):
-        data_dict = torch.load(data, weights_only=True)
+        data_dict = torch.load(data, weights_only=True, map_location="cpu")
     elif data.endswith(".json"):
         data_dict = json.loads(Path(data).read_text())
     else:
