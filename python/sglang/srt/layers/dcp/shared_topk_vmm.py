@@ -23,13 +23,14 @@ import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
+from torch.profiler import record_function
+
 from sglang.srt.distributed.device_communicators.peer_memory import (
     RankMajorPeerBuffer,
     create_rank_major_peer_buffer,
     make_rank_major_tensor_view,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from torch.profiler import record_function
 
 logger = logging.getLogger(__name__)
 

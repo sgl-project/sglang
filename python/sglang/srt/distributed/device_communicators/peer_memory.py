@@ -31,6 +31,8 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.distributed import ProcessGroup
+
 from sglang.srt.distributed.device_communicators.vmm_utils import (
     _get_cuda_driver,
     check_drv,
@@ -38,7 +40,6 @@ from sglang.srt.distributed.device_communicators.vmm_utils import (
     import_peer_handle,
     make_rw_access_desc,
 )
-from torch.distributed import ProcessGroup
 
 
 class _DLDevice(ctypes.Structure):

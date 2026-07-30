@@ -7,9 +7,10 @@ import subprocess
 import sys
 
 import pytest
-import sglang.srt.distributed.parallel_state as ps
 import torch
 import torch.distributed as dist
+
+import sglang.srt.distributed.parallel_state as ps
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(

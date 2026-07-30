@@ -60,13 +60,13 @@ from sglang.srt.layers.attention.dsa.utils import (
     pad_dsa_cache_seqlens,
     should_use_dsa_fused_topk,
 )
-from sglang.srt.layers.dcp.layout import (
-    build_dcp_indexer_local_page_table,
-    get_dcp_lens,
-)
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
+)
+from sglang.srt.layers.dcp.layout import (
+    build_dcp_indexer_local_page_table,
+    get_dcp_lens,
 )
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
