@@ -3048,6 +3048,12 @@ class FlashAttentionBackend(AttentionBackend):
         if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
             metadata.local_attn_metadata = None
             return
+        if self.page_size > 1:
+            # make_local_attention_virtual_batches consumes a page-granularity
+            # block table, but eager metadata is still token-granular here.
+            # Passing physical token locations as FA3 page indices can address
+            # beyond the allocated KV cache and cause an IMA.
+            page_table = page_table[:, :: self.page_size] // self.page_size
 
         cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
         seq_lens_np = cache_seqlens_int32.cpu().numpy()
@@ -3446,15 +3452,11 @@ def make_local_attention_virtual_batches(
         seqlens_k_local: Key sequence lengths for local attention
         block_table_local: Block table for local attention
     """
-    # Adjust attention_chunk_size based on the actual sequence length
-    # to avoid index out of bounds errors
-    max_seq_len = seq_lens_np.max()
-    effective_chunk_size = min(attn_chunk_size, max_seq_len)
-    # Make sure effective_chunk_size is divisible by page_size
-    effective_chunk_size = (effective_chunk_size // page_size) * page_size
-    if effective_chunk_size < page_size:
-        effective_chunk_size = page_size
-    attn_chunk_size = effective_chunk_size
+    # Keep the model-defined local-attention boundary. Shortening it to the
+    # largest page-aligned value below the current sequence length changes the
+    # attention semantics and can create a spurious final virtual batch. For
+    # example, Llama 4 with a 1000-token prompt and page_size=16 would otherwise
+    # be split at token 992 instead of using its 8192-token attention chunk.
 
     q_seqlens = query_start_loc_np[1:] - query_start_loc_np[:-1]
     actual_batch_size = seq_lens_np.shape[0]
