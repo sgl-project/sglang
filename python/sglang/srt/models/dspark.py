@@ -603,4 +603,8 @@ class Qwen3DSparkModel(DSparkDraftModel):
     pass
 
 
-EntryClass = [Qwen3DSparkModel]
+class ExaoneMoeDSparkModel(DSparkDraftModel):
+    pass
+
+
+EntryClass = [Qwen3DSparkModel, ExaoneMoeDSparkModel]
