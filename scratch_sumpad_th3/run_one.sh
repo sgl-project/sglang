@@ -118,8 +118,15 @@ elif [ "$PHASE" = "evidence" ]; then
   run_bench_one_batch uniform "$UNIFORM_BS" "$ISL"
   run_bench_one_batch skew 1 "$SKEW_ISL"
 elif [ "$PHASE" = "profile" ]; then
+  # osl=1 never reaches the decode stage, so --profile-by-stage leaves the profiler
+  # armed; clear it explicitly around every profiled run.
+  curl -s -X POST "$BASE/stop_profile" > /dev/null 2>&1
   run_bench_one_batch uniform_prof "$UNIFORM_BS" "$ISL" --profile --profile-activities GPU --profile-by-stage
+  curl -s -X POST "$BASE/stop_profile" > /dev/null 2>&1
+  sleep 20
   run_bench_one_batch skew_prof 1 "$SKEW_ISL" --profile --profile-activities GPU --profile-by-stage
+  curl -s -X POST "$BASE/stop_profile" > /dev/null 2>&1
+  sleep 20
 fi
 
 curl -s "$BASE/flush_cache" > /dev/null 2>&1
