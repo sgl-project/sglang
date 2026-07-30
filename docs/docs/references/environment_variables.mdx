@@ -1884,7 +1884,10 @@ SGLang supports various environment variables that can be used to configure its 
   </tbody>
 </table>
 
-## Apple Silicon (MLX / MPS)
+## SRT Apple Silicon MLX backend
+
+These variables apply only to the SRT serving backend. Multimodal generation
+and diffusion use PyTorch MPS and do not read them.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
