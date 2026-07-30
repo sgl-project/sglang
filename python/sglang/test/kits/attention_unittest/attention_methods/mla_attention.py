@@ -200,6 +200,9 @@ class TinyMLAModelConfig:
         assert self.num_attention_heads % tp_size == 0
         return self.num_attention_heads // tp_size
 
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
     def get_num_kv_heads(self, tp_size: int) -> int:
         return 1
 
@@ -229,6 +232,7 @@ class MockMLAModelRunner(ModelRunner):
         # while the model still projects K/V in bf16; `set_mla_kv_buffer`
         # does the BF16->FP8 cast on the way in.
         self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
+        self.kv_cache_dtype_str = "fp8_e4m3" if fp8_kv_cache else "auto"
         self.gpu_id = 0
         self.canary_manager = None
         self.page_size = case.page_size

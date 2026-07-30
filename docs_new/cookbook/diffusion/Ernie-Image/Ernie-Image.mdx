@@ -4,6 +4,10 @@ metatags:
     description: "Deploy ERNIE-Image and ERNIE-Image-Turbo with SGLang Diffusion."
 ---
 
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["image", "text-to-image", "turbo"]} />
+
 ## 1. Model introduction
 
 [ERNIE-Image](https://huggingface.co/baidu/ERNIE-Image) is Baidu's text-to-image diffusion model family. SGLang Diffusion supports both the regular and Turbo checkpoints with the native `ErnieImagePipeline`.
