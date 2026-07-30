@@ -106,6 +106,12 @@ class HybridAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
 
+    def target_verify_reads_custom_mask(self) -> bool:
+        # Ask whichever child actually runs target verify.
+        return self._select_backend(
+            ForwardMode.TARGET_VERIFY
+        ).target_verify_reads_custom_mask()
+
     def forward(
         self,
         q: Optional[torch.Tensor] = None,  # For full attention

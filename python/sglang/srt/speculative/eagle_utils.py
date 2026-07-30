@@ -192,13 +192,16 @@ def build_tree_kernel_efficient(
             device=device,
         )
     elif tree_mask_mode == TreeMaskMode.FULL_MASK:
-        tree_mask = torch.full(
-            (
-                seq_lens_sum * num_verify_tokens
-                + num_verify_tokens * num_verify_tokens * bs,
-            ),
-            True,
-            device=device,
+        mask_shape = (
+            seq_lens_sum * num_verify_tokens
+            + num_verify_tokens * num_verify_tokens * bs,
+        )
+        # Same reasoning as the preallocated branch: only the [0, seq_len)
+        # prefix columns come from the fill, so drop it when nothing reads it.
+        tree_mask = (
+            torch.empty(mask_shape, dtype=torch.bool, device=device)
+            if tree_mask_unread
+            else torch.full(mask_shape, True, dtype=torch.bool, device=device)
         )
     else:
         raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
