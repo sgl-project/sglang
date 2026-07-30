@@ -675,11 +675,11 @@
     },
     {
       "source": "/docs/hardware-platforms/ascend-npus/model-tutorials",
-      "destination": "/docs/hardware-platforms/ascend-npus/model-deployment"
+      "destination": "/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_r1"
     },
     {
       "source": "/docs/hardware-platforms/ascend-npus/best_practice",
-      "destination": "/docs/hardware-platforms/ascend-npus/model-deployment"
+      "destination": "/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1"
     },
     {
       "source": "/platforms/cpu_server.html",
@@ -1094,7 +1094,6 @@
                   {
                     "group": "Model Deployment",
                     "pages": [
-                      "docs/hardware-platforms/ascend-npus/model-deployment",
                       {
                         "group": "Model Tutorials",
                         "pages": [
