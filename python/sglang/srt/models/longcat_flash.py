@@ -32,6 +32,7 @@
 
 import concurrent.futures
 import logging
+import re
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -992,6 +993,20 @@ class LongcatFlashForCausalLM(nn.Module):
                 if self.use_ngram_embedding:
                     if ".embed_tokens." in name:
                         name = "model.embed_tokens.word_embeder.weight"
+                    for src_pattern, dst_prefix in (
+                        (
+                            r"oe_embed_tokens(\d+)\.weight",
+                            "model.ngram_embeddings.embedders",
+                        ),
+                        (
+                            r"oe_embed_proj(\d+)\.weight",
+                            "model.ngram_embeddings.post_projs",
+                        ),
+                    ):
+                        match = re.search(src_pattern, name)
+                        if match:
+                            name = f"{dst_prefix}.{match.group(1)}.weight"
+                            break
                     if ".ngram_embeddings" in name:
                         self.model.embed_tokens.load_weight(None, name, loaded_weight)
                         continue
