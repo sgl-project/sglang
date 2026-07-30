@@ -15,7 +15,8 @@
 //! the engine uses unless launched with an explicit chat-template override.
 //!
 //! Tokenization does not auto-prepend special tokens (the `dynamo_tokenizers`
-//! HF wrapper hardcodes `add_special_tokens = false`; [`super::adapter::encode`]
+//! HF wrapper defaults `add_special_tokens` to false and the router never
+//! overrides it; [`super::adapter::encode`]
 //! adds none of its own), so the rendered text must already contain `bos_token`
 //! and the role markers as literal text. That matches HuggingFace
 //! `apply_chat_template(tokenize=True)` semantics, where the template — not the

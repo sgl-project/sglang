@@ -383,6 +383,19 @@ pub struct CacheAwareConfig {
     /// serves anyway with whatever it has — a cold fleet has no warm sibling to
     /// ask, so a gate without a deadline would never open.
     pub bootstrap_timeout_ms: u64,
+    /// Evict a multimodal conversation's worker pin after it has been idle
+    /// this many seconds. Bounds the pin map against unbounded image
+    /// cardinality. `0` disables multimodal affinity entirely, so image
+    /// traffic routes purely by overlap/load again.
+    ///
+    /// Default 1800 — sized for a human-paced multi-turn conversation with
+    /// images: long enough that thinking time between turns keeps the pin,
+    /// short enough that abandoned conversations do not accumulate.
+    pub mm_affinity_idle_secs: u64,
+    /// Wall-clock cadence of the pin-eviction sweep. Eviction is a memory
+    /// bound, not a correctness deadline, so this is coarser than the idle
+    /// window it enforces.
+    pub mm_affinity_eviction_interval_secs: u64,
 }
 
 impl Default for CacheAwareConfig {
@@ -392,8 +405,18 @@ impl Default for CacheAwareConfig {
             balance_abs_threshold: default_balance_abs(),
             balance_rel_threshold: default_balance_rel(),
             bootstrap_timeout_ms: default_bootstrap_timeout_ms(),
+            mm_affinity_idle_secs: default_mm_affinity_idle_secs(),
+            mm_affinity_eviction_interval_secs: default_mm_affinity_eviction_interval_secs(),
         }
     }
+}
+
+pub fn default_mm_affinity_idle_secs() -> u64 {
+    30 * 60
+}
+
+pub fn default_mm_affinity_eviction_interval_secs() -> u64 {
+    60
 }
 
 fn default_cache_threshold() -> f32 {

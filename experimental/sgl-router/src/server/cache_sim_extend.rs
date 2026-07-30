@@ -40,7 +40,7 @@ use serde_json::Value;
 use crate::discovery::ModelId;
 use crate::policies::request_tokens_for;
 use crate::server::app_context::AppContext;
-use crate::tokenizer::dsv4::RenderOpts;
+use crate::tokenizer::ChatRenderOpts;
 
 /// Cap on a captured/buffered response the extend tee will process. Bounds
 /// both the SSE capture buffer (per in-flight stream) and the non-streaming
@@ -65,7 +65,7 @@ pub(crate) enum ReplySource {
 #[derive(Clone)]
 pub(crate) struct IngressPrompt {
     pub ids: Vec<u32>,
-    pub opts: RenderOpts,
+    pub opts: ChatRenderOpts,
 }
 
 /// Whether a completed response's extension can ever be MATCHED by the next
@@ -89,10 +89,10 @@ pub(crate) struct IngressPrompt {
 /// extension that could have matched — accepted as exotic.
 ///
 /// The tools test mirrors `dsv4::render_messages` (an empty `tools` array is
-/// falsy). The thinking flag comes from [`RenderOpts`], whose resolution is
-/// DSV4-specific — for Jinja-encoder models the renderer ignores thinking
-/// mode, so keep the DSV4-named env defaults unset there or this gate skips
-/// extensions that would have been fine.
+/// falsy). The thinking flag comes from [`crate::tokenizer::dsv4::RenderOpts`],
+/// whose resolution is DSV4-specific — for Jinja-encoder models the renderer
+/// ignores thinking mode, so keep the DSV4-named env defaults unset there or
+/// this gate skips extensions that would have been fine.
 pub(crate) fn extension_can_match(request: &Value) -> bool {
     let opts = crate::tokenizer::dsv4::resolve_render_opts(request);
     if !opts.thinking {
@@ -112,7 +112,7 @@ pub(crate) fn extension_can_match(request: &Value) -> bool {
 ///
 /// `prompt` — this request's ingress chat-encoder tokenization
 /// (`RequestTokens.ids` with `engine_equivalent = true`, plus the resolved
-/// `RenderOpts`), or `None` for the raw-prompt fallback. When present, the
+/// `ChatRenderOpts`), or `None` for the raw-prompt fallback. When present, the
 /// extension is computed **incrementally**: `prompt.ids ++ encode(rendered
 /// assistant turn)` via
 /// [`crate::tokenizer::TokenizerRegistry::encode_chat_extension`] — O(generated output) instead
@@ -181,7 +181,7 @@ pub(crate) fn spawn_extend_tee(
             // prefix is guaranteed to be the prompt.
             let incremental = prompt.as_ref().and_then(|p| {
                 ctx.tokenizers
-                    .encode_chat_extension(&model, &p.ids, &reply, p.opts)
+                    .encode_chat_extension(&model, &p.ids, &reply, &p.opts)
                     .map(|ids| (ids, Some(p.ids.len())))
             });
             let produced = match incremental {
@@ -825,10 +825,10 @@ mod spawn_tests {
     #[tokio::test]
     async fn incremental_path_reports_the_ingress_prompt_length_as_the_boundary() {
         let (ctx, cap) = ctx_with("dsv4", true).await;
-        let opts = RenderOpts::chat();
+        let opts = ChatRenderOpts::chat();
         let prompt_ids = ctx
             .tokenizers
-            .encode_chat("dsv4", &messages(), None, opts)
+            .encode_chat("dsv4", &messages(), None, &opts)
             .expect("chat encode");
         let n = prompt_ids.len();
 
@@ -900,7 +900,7 @@ mod spawn_tests {
     #[tokio::test]
     async fn prompt_without_an_encoder_falls_back_and_claims_no_boundary() {
         let (ctx, cap) = ctx_with("tiny", false).await;
-        let opts = RenderOpts::chat();
+        let opts = ChatRenderOpts::chat();
         spawn_extend_tee(
             Arc::clone(&ctx),
             "tiny".into(),
@@ -923,10 +923,10 @@ mod spawn_tests {
     #[tokio::test]
     async fn fanout_yields_one_extend_per_choice_sharing_the_id() {
         let (ctx, cap) = ctx_with("dsv4", true).await;
-        let opts = RenderOpts::chat();
+        let opts = ChatRenderOpts::chat();
         let prompt_ids = ctx
             .tokenizers
-            .encode_chat("dsv4", &messages(), None, opts)
+            .encode_chat("dsv4", &messages(), None, &opts)
             .unwrap();
 
         spawn_extend_tee(
@@ -970,10 +970,10 @@ mod spawn_tests {
     #[tokio::test]
     async fn a_fanout_that_reconstructs_one_reply_is_still_tagged_as_a_fanout() {
         let (ctx, cap) = ctx_with("dsv4", true).await;
-        let opts = RenderOpts::chat();
+        let opts = ChatRenderOpts::chat();
         let prompt_ids = ctx
             .tokenizers
-            .encode_chat("dsv4", &messages(), None, opts)
+            .encode_chat("dsv4", &messages(), None, &opts)
             .unwrap();
         // The request asked for 2; only one choice carries a usable message.
         let req = Bytes::from(
@@ -1023,10 +1023,10 @@ mod spawn_tests {
     #[tokio::test]
     async fn choice_index_is_the_engines_ordinal_not_a_vector_position() {
         let (ctx, cap) = ctx_with("dsv4", true).await;
-        let opts = RenderOpts::chat();
+        let opts = ChatRenderOpts::chat();
         let prompt_ids = ctx
             .tokenizers
-            .encode_chat("dsv4", &messages(), None, opts)
+            .encode_chat("dsv4", &messages(), None, &opts)
             .unwrap();
         let req = Bytes::from(
             serde_json::to_vec(&serde_json::json!({
@@ -1074,10 +1074,10 @@ mod spawn_tests {
     #[tokio::test]
     async fn a_single_choice_is_untagged_and_keeps_its_output_tokens() {
         let (ctx, cap) = ctx_with("dsv4", true).await;
-        let opts = RenderOpts::chat();
+        let opts = ChatRenderOpts::chat();
         let prompt_ids = ctx
             .tokenizers
-            .encode_chat("dsv4", &messages(), None, opts)
+            .encode_chat("dsv4", &messages(), None, &opts)
             .unwrap();
         spawn_extend_tee(
             Arc::clone(&ctx),

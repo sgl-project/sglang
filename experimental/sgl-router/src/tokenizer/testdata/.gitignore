@@ -1,0 +1,9 @@
+# Reference-encoder sources and the real 2.8 MB `tiktoken.model`, fetched from
+# the model repo by gen_kimi_k3_cases.py. Regenerable, far too large to commit,
+# and the fixtures it produces are what actually gets reviewed.
+.kimi_k3_ref/
+
+# The `*_when_available` full-vocab parity tests read the real vocabulary from
+# SGLANG_ROUTER_K3_TEST_VOCAB_DIR, which must hold `baseten/kimi-k3-tokenizer`'s
+# tokenizer.json (~10 MB, fetched not committed). Keeping it under .kimi_k3_ref/
+# above is the convention; anywhere else works too.

@@ -58,6 +58,7 @@ use crate::policies::engine_load::EngineLoadTable;
 use crate::policies::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
 };
+use crate::policies::mm_affinity::{self, MultimodalAffinity, PinLookup};
 use crate::policies::{request_tokens_for, Policy, SelectionContext};
 use crate::server::metrics::{CacheAwareDecision, MetricsRegistry};
 use crate::tokenizer::TokenizerRegistry;
@@ -65,7 +66,7 @@ use crate::workers::Worker;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Two of the min-load fallbacks are reachable in steady state rather than
 /// being invariant violations, and `select` runs once per *evaluation* — which
@@ -118,6 +119,15 @@ pub struct CacheAwareZmqPolicy {
     /// (tests) or the `Policy::attach_metrics` hook (production, called by
     /// `PolicyRegistry::attach_metrics` after the registry is built).
     metrics: OnceLock<Arc<MetricsRegistry>>,
+    /// Worker pins for image-carrying conversations.
+    ///
+    /// Prefix matching cannot route these: the engine encodes an image as token
+    /// ids derived from a hash of its preprocessed pixels, which the router
+    /// cannot reproduce, so the router's block hashes diverge at the first image
+    /// and never recover. Without affinity, turn 2 of an image conversation
+    /// falls to min-load and lands somewhere that has to recompute the whole
+    /// prompt. See [`super::mm_affinity`].
+    mm_affinity: MultimodalAffinity,
 }
 
 impl std::fmt::Debug for CacheAwareZmqPolicy {
@@ -209,6 +219,8 @@ impl CacheAwareZmqPolicy {
         block_size_oracle: Arc<BlockSizeOracle>,
         engine_load: Arc<EngineLoadTable>,
     ) -> Self {
+        let mm_affinity_idle = Duration::from_secs(config.mm_affinity_idle_secs);
+        let mm_affinity_sweep = Duration::from_secs(config.mm_affinity_eviction_interval_secs);
         Self {
             config,
             tree,
@@ -216,6 +228,7 @@ impl CacheAwareZmqPolicy {
             block_size_oracle,
             engine_load,
             metrics: OnceLock::new(),
+            mm_affinity: MultimodalAffinity::new(mm_affinity_idle, mm_affinity_sweep),
         }
     }
 
@@ -316,6 +329,12 @@ impl Policy for CacheAwareZmqPolicy {
             engine_load_expected = self.engine_load.expected_count(),
             "cache-aware-zmq: load-balance check considered",
         );
+        // Image-carrying conversations are routed by affinity, not by prefix
+        // overlap. Resolved before the balance check so the pin can be kept
+        // current even when load overrides it — a pin that pointed at a worker
+        // we stopped using would send the NEXT turn somewhere cold.
+        let mm_key = self.mm_affinity_key(ctx);
+
         if balance.imbalanced {
             self.record_decision(model_id, CacheAwareDecision::LoadImbalance);
             let chosen = Self::pick_min_load(workers, &loads);
@@ -333,10 +352,127 @@ impl Policy for CacheAwareZmqPolicy {
                     engine_load_expected = self.engine_load.expected_count(),
                     "cache-aware-zmq: load imbalance detected — bypassing cache, routing to min-load worker",
                 );
+                // Re-pin even though load overrode affinity. The worker we are
+                // actually sending this turn to ends up with the FULLER prefix
+                // (it computes turns 1..N; the old pin holds only 1..N-1), so
+                // leaving the pin behind would send the next turn to the more
+                // stale of the two.
+                if let Some(key) = mm_key.as_deref() {
+                    self.mm_affinity.record(key, &w.url);
+                }
             }
             return chosen;
         }
 
+        // 1b. Affinity for image conversations, ahead of the overlap path
+        //     because that path cannot help them: everything after the first
+        //     image is unmatchable, and the matchable remainder (the system
+        //     prompt) is identical on every worker, so overlap ties and the
+        //     request falls to min-load — a different worker every turn.
+        //     Deliberately AFTER the imbalance check: load still outranks
+        //     affinity, exactly as it outranks cache overlap.
+        // `pin_unavailable` means a pin EXISTS but its worker was not offered
+        // (saturated, or departed). This turn routes elsewhere, but the pin is
+        // left alone so the conversation can come home rather than being
+        // permanently migrated off the worker holding its KV.
+        let mut pin_unavailable = false;
+        if let Some(key) = mm_key.as_deref() {
+            match self.mm_affinity.pinned(key, workers) {
+                PinLookup::Hit(pinned) => {
+                    tracing::debug!(
+                        model = %ctx.model(),
+                        worker = %pinned.url,
+                        "cache-aware-zmq: multimodal affinity hit; returning the conversation's worker",
+                    );
+                    return Some(pinned);
+                }
+                PinLookup::Unavailable => {
+                    pin_unavailable = true;
+                    tracing::debug!(
+                        model = %ctx.model(),
+                        "cache-aware-zmq: multimodal pin not among the offered workers \
+                         (at capacity or departed); routing elsewhere and keeping the pin",
+                    );
+                }
+                PinLookup::Miss => {}
+            }
+        }
+
+        // Every exit that is not the imbalance bypass (which re-pins above) or a
+        // pin hit (already pinned) runs through here. Recording only on the
+        // cache-overlap exit would miss the case that matters most: an image
+        // conversation's FIRST turn, whose overlap is below threshold by
+        // construction, leaving nothing for turn 2 to find.
+        //
+        // The `pin_unavailable` guard is the one exception, and it is why this
+        // does NOT leave the pin pointing at the worker actually used: when the
+        // pinned worker is merely saturated, this turn is served elsewhere and
+        // the pin must stay put so the conversation can come home. Overwriting
+        // it here would permanently migrate a busy conversation off the worker
+        // holding its KV.
+        let chosen = self.select_by_overlap(workers, ctx, &loads);
+        if !pin_unavailable {
+            if let (Some(key), Some(w)) = (mm_key.as_deref(), chosen.as_ref()) {
+                self.mm_affinity.record(key, &w.url);
+            }
+        }
+        chosen
+    }
+
+    /// Ask the ingress to pre-tokenize. Load-bearing on two axes: without it the
+    /// policy re-tokenizes inside `select()` — which runs repeatedly per request
+    /// (once per admission claim race, once per retry) — and `RequestTokens` never
+    /// reaches the forwarding decision, so `input_ids` offload silently stops.
+    fn needs_request_tokens(&self) -> bool {
+        true
+    }
+
+    fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
+        self.mm_affinity.attach_metrics(Arc::clone(&metrics));
+        self.attach_metrics_once(metrics);
+    }
+}
+
+impl CacheAwareZmqPolicy {
+    /// The affinity key for this request, or `None` when it carries no keyable
+    /// image.
+    ///
+    /// Prefers the key the ingress already computed; falls back to deriving it
+    /// from the body for callers that do not pre-compute (unit tests, and any
+    /// future non-chat entry point). The fallback re-parses the body, which is
+    /// why the ingress path exists.
+    ///
+    /// Collapses [`mm_affinity::AffinityKey`]'s two keyless states to `None`:
+    /// selection treats them identically, and only the INGRESS records the
+    /// `unkeyed` metric — recording here would over-count, since `select` runs
+    /// several times per request on the retry path.
+    fn mm_affinity_key(&self, ctx: &SelectionContext<'_>) -> Option<String> {
+        // Resolved by the ingress — including a resolved "no image", which must
+        // NOT fall through to the reparse below. Text-only traffic is the
+        // majority path and `select()` runs several times per request.
+        if let Some(resolved) = ctx.mm_affinity_key() {
+            return resolved.map(str::to_string);
+        }
+        // Nobody resolved it: unit tests, and any future entry point that
+        // builds a context by hand. Costs a body parse, which is why the
+        // ingress path exists.
+        let body = ctx.request_body()?;
+        let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+        match mm_affinity::affinity_key(&ctx.model().0, &value) {
+            mm_affinity::AffinityKey::Key(k) => Some(k),
+            mm_affinity::AffinityKey::NoMedia | mm_affinity::AffinityKey::Unkeyed => None,
+        }
+    }
+
+    /// The cache-overlap half of selection: tokens, block hashes, tree match,
+    /// with min-load as the fallback at every step that cannot proceed.
+    fn select_by_overlap(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+        loads: &WorkerLoads,
+    ) -> Option<Arc<Worker>> {
+        let model_id = ctx.model().0.as_str();
         // 2. Routing tokens. Prefer the ids computed once at ingress; fall
         //    back to tokenizing the body here so the policy stays usable for
         //    callers that don't pre-tokenize (e.g. unit tests). In production
@@ -353,7 +489,7 @@ impl Policy for CacheAwareZmqPolicy {
                             model = %ctx.model(),
                             "cache-aware-zmq: policy reached without request tokens or a request body; ingress validation invariant broken",
                         );
-                        return Self::pick_min_load(workers, &loads);
+                        return Self::pick_min_load(workers, loads);
                     }
                 };
                 let value = match serde_json::from_slice::<serde_json::Value>(body) {
@@ -365,7 +501,7 @@ impl Policy for CacheAwareZmqPolicy {
                             error = %error,
                             "cache-aware-zmq: policy received invalid JSON after ingress validation; invariant broken",
                         );
-                        return Self::pick_min_load(workers, &loads);
+                        return Self::pick_min_load(workers, loads);
                     }
                 };
                 let Some(rt) = request_tokens_for(&self.tokenizers, ctx.model(), &value) else {
@@ -376,7 +512,7 @@ impl Policy for CacheAwareZmqPolicy {
                             "cache-aware-zmq: routing tokens unavailable, routing by min-load; check tokenizer and chat encoder configuration. Also expected for requests whose messages carry no text",
                         );
                     }
-                    return Self::pick_min_load(workers, &loads);
+                    return Self::pick_min_load(workers, loads);
                 };
                 fallback_ids = rt.ids;
                 &fallback_ids
@@ -401,7 +537,7 @@ impl Policy for CacheAwareZmqPolicy {
                     "cache-aware-zmq: no worker has published a complete block-hashing config, routing by min-load. Transient while workers register; if it persists, no engine is publishing KV events",
                 );
             }
-            return Self::pick_min_load(workers, &loads);
+            return Self::pick_min_load(workers, loads);
         };
         // EAGLE-family workers hash KV blocks over token bigrams; query hashes
         // must use the same worker-reported mode or overlap always stays zero.
@@ -412,7 +548,7 @@ impl Policy for CacheAwareZmqPolicy {
         };
         if block_hashes.is_empty() {
             self.record_decision(model_id, CacheAwareDecision::NoHashBlocks);
-            return Self::pick_min_load(workers, &loads);
+            return Self::pick_min_load(workers, loads);
         }
         let matched = self.tree.match_prefix(None, &block_hashes);
         debug_assert!(matched.matched_blocks <= block_hashes.len());
@@ -447,7 +583,7 @@ impl Policy for CacheAwareZmqPolicy {
                 cache_threshold = self.config.cache_threshold,
                 "cache-aware-zmq: overlap below threshold, falling back to min-load",
             );
-            return Self::pick_min_load(workers, &loads);
+            return Self::pick_min_load(workers, loads);
         }
         if matched.workers.is_empty() {
             self.record_decision(model_id, CacheAwareDecision::MatchedNodeUnowned);
@@ -458,7 +594,7 @@ impl Policy for CacheAwareZmqPolicy {
                 match_rate,
                 "cache-aware-zmq: matched prefix has no worker owners, falling back to min-load",
             );
-            return Self::pick_min_load(workers, &loads);
+            return Self::pick_min_load(workers, loads);
         }
         // Among workers in the matched set, pick the lowest-load one.
         let matched_urls: std::collections::HashSet<&str> =
@@ -477,7 +613,7 @@ impl Policy for CacheAwareZmqPolicy {
                 matched_workers = matched.workers.len(),
                 "cache-aware-zmq: matched workers are not eligible, falling back to min-load",
             );
-            return Self::pick_min_load(workers, &loads);
+            return Self::pick_min_load(workers, loads);
         };
         self.record_decision(model_id, CacheAwareDecision::CacheHit);
         tracing::debug!(
@@ -487,14 +623,6 @@ impl Policy for CacheAwareZmqPolicy {
             "cache-aware-zmq: selected worker by cache overlap",
         );
         Some(chosen)
-    }
-
-    fn needs_request_tokens(&self) -> bool {
-        true
-    }
-
-    fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
-        self.attach_metrics_once(metrics);
     }
 }
 
@@ -1121,6 +1249,199 @@ mod tests {
         }
     }
 
+    /// THE behavior this feature exists for: an image conversation's turn 2 must
+    /// land on turn 1's worker.
+    ///
+    /// The engine caches images fine (it derives token ids from a hash of the
+    /// preprocessed pixels), but the router cannot reproduce those ids, so
+    /// prefix overlap is a tie across workers and turn 2 would otherwise go to
+    /// whichever worker is momentarily least loaded — forcing a full recompute
+    /// of a prompt the original worker still had cached.
+    #[test]
+    fn multimodal_turn_two_returns_to_turn_one_worker() {
+        let registry = tokenizer_registry_with_tiny();
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                ..Default::default()
+            },
+            Arc::new(HashTree::new()),
+            registry,
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+
+        let turn1 = serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"http://img/cat.png"}},
+            {"type":"text","text":"what is this?"}]}]});
+        let body1 = serde_json::to_vec(&turn1).unwrap();
+        let ctx1 = SelectionContext::new(&model, Some(&body1));
+        let first = policy.select(&workers, &ctx1).expect("must pick");
+
+        // Turn 2 appends to the history and carries the same image. Load the
+        // worker turn 1 chose, so a min-load fallback would pick the OTHER one
+        // — that is what distinguishes affinity from coincidence.
+        let _g1 = first.load_guard();
+        let _g2 = first.load_guard();
+
+        let turn2 = serde_json::json!({"messages":[
+            {"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"http://img/cat.png"}},
+                {"type":"text","text":"what is this?"}]},
+            {"role":"assistant","content":"a cat"},
+            {"role":"user","content":"what colour?"}]});
+        let body2 = serde_json::to_vec(&turn2).unwrap();
+        let ctx2 = SelectionContext::new(&model, Some(&body2));
+        let second = policy.select(&workers, &ctx2).expect("must pick");
+
+        assert_eq!(
+            second.url, first.url,
+            "turn 2 must return to the worker holding the image's KV, even though \
+             it is the more loaded of the two"
+        );
+    }
+
+    /// When load imbalance overrides affinity, the pin must MOVE to the worker
+    /// the turn actually went to — that worker ends up with the fuller prefix,
+    /// so leaving the pin behind would send the next turn to the staler one.
+    #[test]
+    fn imbalance_bypass_repins_to_the_worker_actually_used() {
+        let registry = tokenizer_registry_with_tiny();
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                // Trip the imbalance check on a small, easily-created spread.
+                balance_abs_threshold: 1,
+                balance_rel_threshold: 1.0,
+                ..Default::default()
+            },
+            Arc::new(HashTree::new()),
+            registry,
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"http://img/x.png"}}]}]}))
+        .unwrap();
+
+        // Turn 1, balanced: establishes a pin.
+        let first = policy
+            .select(&workers, &SelectionContext::new(&model, Some(&body)))
+            .unwrap();
+        let other = if first.url == w0.url { &w1 } else { &w0 };
+
+        // Turn 2 under imbalance: load the pinned worker so min-load bypasses
+        // affinity and routes to `other`.
+        let guards: Vec<_> = (0..4).map(|_| first.load_guard()).collect();
+        let second = policy
+            .select(&workers, &SelectionContext::new(&model, Some(&body)))
+            .unwrap();
+        assert_eq!(second.url, other.url, "imbalance must override affinity");
+        drop(guards);
+
+        // Turn 3, balanced again: the pin must now point at `other`, not the
+        // original worker.
+        let third = policy
+            .select(&workers, &SelectionContext::new(&model, Some(&body)))
+            .unwrap();
+        assert_eq!(
+            third.url, other.url,
+            "the pin must have moved to the worker the imbalanced turn used"
+        );
+    }
+
+    /// A DIFFERENT image must not inherit the pin — otherwise affinity would
+    /// funnel unrelated conversations onto one worker.
+    #[test]
+    fn multimodal_distinct_images_route_independently() {
+        let registry = tokenizer_registry_with_tiny();
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                ..Default::default()
+            },
+            Arc::new(HashTree::new()),
+            registry,
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+
+        let req = |url: &str| {
+            serde_json::to_vec(&serde_json::json!({"messages":[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":url}}]}]}))
+            .unwrap()
+        };
+        let a = req("http://img/a.png");
+        let first = policy
+            .select(&workers, &SelectionContext::new(&model, Some(&a)))
+            .unwrap();
+        // Load the first pick so min-load sends the *other* image elsewhere.
+        let _g1 = first.load_guard();
+        let _g2 = first.load_guard();
+
+        let b = req("http://img/b.png");
+        let other = policy
+            .select(&workers, &SelectionContext::new(&model, Some(&b)))
+            .unwrap();
+        assert_ne!(
+            other.url, first.url,
+            "a different image must be free to route by load, not inherit a pin"
+        );
+    }
+
+    /// Text-only traffic must be untouched — affinity must not capture requests
+    /// that prefix matching routes better.
+    #[test]
+    fn text_only_requests_are_not_pinned() {
+        let registry = tokenizer_registry_with_tiny();
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                ..Default::default()
+            },
+            Arc::new(HashTree::new()),
+            registry,
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "messages":[{"role":"user","content":"plain text"}]
+        }))
+        .unwrap();
+        let first = policy
+            .select(&workers, &SelectionContext::new(&model, Some(&body)))
+            .unwrap();
+        // With the first pick loaded, an unpinned request follows load.
+        let _g1 = first.load_guard();
+        let _g2 = first.load_guard();
+        let second = policy
+            .select(&workers, &SelectionContext::new(&model, Some(&body)))
+            .unwrap();
+        assert_ne!(
+            second.url, first.url,
+            "text-only requests must keep following load/overlap, not a pin"
+        );
+    }
+
     /// A chat-completions request on a model with a chat template must route by
     /// the **chat-templated** tokens (BOS + role markers + content) — the tokens
     /// the engine actually cached — not by the raw joined content. Worker w0
@@ -1144,7 +1465,7 @@ mod tests {
                 "tiny",
                 &messages,
                 None,
-                crate::tokenizer::dsv4::RenderOpts::chat(),
+                &crate::tokenizer::ChatRenderOpts::chat(),
             )
             .unwrap();
         let block_size = 4u32;
@@ -1209,7 +1530,7 @@ mod tests {
                 "tiny",
                 &messages,
                 None,
-                crate::tokenizer::dsv4::RenderOpts::chat(),
+                &crate::tokenizer::ChatRenderOpts::chat(),
             )
             .unwrap();
         let raw = adapter::encode(&registry.get("tiny").unwrap(), content).unwrap();
@@ -1239,7 +1560,7 @@ mod tests {
                 "tiny",
                 &messages,
                 None,
-                crate::tokenizer::dsv4::RenderOpts::chat(),
+                &crate::tokenizer::ChatRenderOpts::chat(),
             )
             .unwrap();
         let block_size = 4u32;
@@ -1941,7 +2262,7 @@ mod tests {
                 "tiny",
                 &messages,
                 None,
-                crate::tokenizer::dsv4::RenderOpts::chat(),
+                &crate::tokenizer::ChatRenderOpts::chat(),
             )
             .unwrap();
 
@@ -1997,9 +2318,12 @@ mod tests {
                 "tiny",
                 &messages,
                 None,
-                crate::tokenizer::dsv4::RenderOpts {
-                    thinking: true,
-                    reasoning_effort: crate::tokenizer::dsv4::ReasoningEffort::None,
+                &crate::tokenizer::ChatRenderOpts {
+                    dsv4: crate::tokenizer::dsv4::RenderOpts {
+                        thinking: true,
+                        reasoning_effort: crate::tokenizer::dsv4::ReasoningEffort::None,
+                    },
+                    ..crate::tokenizer::ChatRenderOpts::chat()
                 },
             )
             .unwrap();
