@@ -1160,7 +1160,6 @@
                       "docs/hardware-platforms/ascend-npus/development/operator_performance_optimizing"
                     ]
                   },
-                  "docs/hardware-platforms/ascend-npus/diffusion/disaggregation",
                   "docs/hardware-platforms/ascend-npus/mindspore_backend",
                   "docs/hardware-platforms/ascend-npus/faq"
                 ]
