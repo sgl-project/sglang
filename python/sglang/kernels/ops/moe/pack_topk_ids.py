@@ -3,6 +3,8 @@
 Migrated from ``sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe``
 (RFC #29630, Phase 2.5). Used by the FlashInfer TRT-LLM routed-MoE path, which
 consumes routing ids and bf16 weights packed as ``(id << 16) | weight_bits``.
+Routing ids may be int32 or the int64 dtype produced by ``torch.topk``; they are
+converted to int32 by the Triton kernel before packing.
 """
 
 import torch
@@ -36,9 +38,10 @@ class PackTopkIds:
         ), f"shape mismatch: {topk_ids.shape=} vs {topk_weights.shape=}"
         assert topk_ids.ndim >= 1, f"expected >=1D, got {topk_ids.shape=}"
 
-        assert (
-            topk_ids.dtype == torch.int32
-        ), f"topk_ids must be int32, got {topk_ids.dtype}"
+        assert topk_ids.dtype in (
+            torch.int32,
+            torch.int64,
+        ), f"topk_ids must be int32 or int64, got {topk_ids.dtype}"
         assert (
             topk_weights.dtype == torch.float32
         ), f"topk_weights must be float32, got {topk_weights.dtype}"
