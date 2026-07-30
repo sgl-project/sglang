@@ -1384,6 +1384,7 @@ class Engine(EngineScoreMixin, EngineBase):
         world_size: int,
         group_name: str,
         backend: str = "nccl",
+        m2n_manifest: Optional[dict] = None,
     ):
         """Initialize parameter update group."""
         obj = InitWeightsUpdateGroupReqInput(
@@ -1393,6 +1394,7 @@ class Engine(EngineScoreMixin, EngineBase):
             world_size=world_size,
             group_name=group_name,
             backend=backend,
+            m2n_manifest=m2n_manifest,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.init_weights_update_group(obj, None)

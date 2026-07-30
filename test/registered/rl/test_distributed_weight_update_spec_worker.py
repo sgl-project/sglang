@@ -10,6 +10,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
+    InitWeightsUpdateGroupReqInput,
     UpdateWeightsFromDistributedReqInput,
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
@@ -155,6 +156,138 @@ def test_end_weight_update_skips_post_load_on_both_when_weights_loaded():
 
     target_runner.end_weight_update.assert_called_once_with(run_post_load=False)
     draft_runner.end_weight_update.assert_called_once_with(run_post_load=False)
+
+
+def test_m2n_receive_forces_post_load_even_after_residual_broadcast():
+    target_runner = Mock()
+    manager = _manager(
+        tp_worker=SimpleNamespace(
+            model_runner=target_runner,
+            iter_runners=lambda: [("", target_runner)],
+        ),
+        draft_worker=None,
+    )
+    req = _distributed_req(selector="target")
+    req.load_format = "nccl_m2n"
+
+    output = manager.update_weights_from_distributed(req)
+
+    assert output.success is True
+    target_runner.receive_weights_from_m2n.assert_called_once_with("weight_update_group")
+    assert manager._weight_update_requires_post_load is True
+
+    # A later residual broadcast uses load_weights(), but must not erase the
+    # model-level post-load requirement established by the direct M2N write.
+    manager._weight_update_loaded = True
+    with patch("torch.distributed.barrier"):
+        manager.end_weight_update(EndWeightUpdateReqInput())
+    target_runner.end_weight_update.assert_called_once_with(run_post_load=True)
+
+
+def test_m2n_group_initialization_rejects_a_draft_runner():
+    tp_worker = Mock()
+    tp_worker.init_weights_update_group.return_value = (True, "Success")
+    tp_worker.destroy_weights_update_group.return_value = (True, "Success")
+    manager = _manager(
+        tp_worker=tp_worker,
+        draft_worker=SimpleNamespace(iter_runners=lambda: [("draft", Mock())]),
+    )
+    req = InitWeightsUpdateGroupReqInput(
+        master_address="127.0.0.1",
+        master_port=1234,
+        rank_offset=1,
+        world_size=2,
+        group_name="miles-m2n-test",
+        backend="nccl",
+        m2n_manifest={"schema_version": 1},
+    )
+
+    output = manager.init_weights_update_group(req)
+
+    assert output.success is False
+    tp_worker.destroy_weights_update_group.assert_called_once()
+
+
+def test_destroying_an_absent_update_group_is_idempotent():
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    runner = SimpleNamespace(
+        _model_update_group={},
+        _m2n_receivers={},
+    )
+
+    success, message = ModelRunner.destroy_weights_update_group(
+        runner, "missing-legacy-group"
+    )
+
+    assert success is True
+    assert "already absent" in message
+
+
+def test_failed_update_group_destroy_remains_retryable():
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    receiver = Mock()
+    receiver.destroy.side_effect = [RuntimeError("injected destroy failure"), None]
+    process_group = object()
+    runner = SimpleNamespace(
+        _model_update_group={"miles-m2n-old": process_group},
+        _m2n_receivers={"miles-m2n-old": receiver},
+    )
+
+    with patch("torch.distributed.destroy_process_group") as destroy_group:
+        success, message = ModelRunner.destroy_weights_update_group(
+            runner, "miles-m2n-old"
+        )
+
+        assert success is False
+        assert "injected destroy failure" in message
+        assert runner._m2n_receivers["miles-m2n-old"] is receiver
+        assert runner._model_update_group["miles-m2n-old"] is process_group
+
+        success, _ = ModelRunner.destroy_weights_update_group(
+            runner, "miles-m2n-old"
+        )
+
+    assert success is True
+    assert receiver.destroy.call_count == 2
+    destroy_group.assert_called_once_with(process_group)
+    assert runner._m2n_receivers == {}
+    assert runner._model_update_group == {}
+
+
+def test_failed_process_group_destroy_remains_retryable():
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    receiver = Mock()
+    process_group = object()
+    runner = SimpleNamespace(
+        _model_update_group={"miles-m2n-old": process_group},
+        _m2n_receivers={"miles-m2n-old": receiver},
+    )
+
+    with patch(
+        "torch.distributed.destroy_process_group",
+        side_effect=[RuntimeError("injected process-group failure"), None],
+    ) as destroy_group:
+        success, message = ModelRunner.destroy_weights_update_group(
+            runner, "miles-m2n-old"
+        )
+
+        assert success is False
+        assert "injected process-group failure" in message
+        assert runner._model_update_group["miles-m2n-old"] is process_group
+        assert runner._m2n_receivers["miles-m2n-old"] is receiver
+
+        success, _ = ModelRunner.destroy_weights_update_group(
+            runner, "miles-m2n-old"
+        )
+
+    assert success is True
+    assert receiver.destroy.call_count == 2
+    assert destroy_group.call_count == 2
+    assert runner._model_update_group == {}
+    assert runner._m2n_receivers == {}
 
 
 def test_model_runner_begin_end_wire_to_loader_hooks():

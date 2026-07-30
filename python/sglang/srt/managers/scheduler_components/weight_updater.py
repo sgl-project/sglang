@@ -125,6 +125,7 @@ class SchedulerWeightUpdaterManager:
     stashed_model_static_state: Any = None
     _weight_update_in_progress: bool = False
     _weight_update_loaded: bool = False
+    _weight_update_requires_post_load: bool = False
     # Runner selector for the open session, recorded at begin_weight_update and
     # reused by end_weight_update so the same set is restored and finalized.
     _weight_update_selector: str = "all"
@@ -229,6 +230,25 @@ class SchedulerWeightUpdaterManager:
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
+        if (
+            success
+            and recv_req.m2n_manifest is not None
+            and self.draft_worker is not None
+        ):
+            cleanup_success, cleanup_message = (
+                self.tp_worker.destroy_weights_update_group(
+                    DestroyWeightsUpdateGroupReqInput(
+                        group_name=recv_req.group_name
+                    )
+                )
+            )
+            success = False
+            message = (
+                "NCCL M2N Phase 2 does not support a draft/speculative model "
+                "runner."
+            )
+            if not cleanup_success:
+                message += f" Cleanup also failed: {cleanup_message}"
         return InitWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def destroy_weights_update_group(
@@ -271,9 +291,41 @@ class SchedulerWeightUpdaterManager:
             self._weight_update_in_progress
         ), "update_weights_from_distributed requires an open begin_weight_update session"
         with self._observe_weight_load("distributed"):
-            # Only the target (main) model joined this process's update group, so it
-            # receives the broadcast once; the received weights are then loaded into
-            # each selected runner locally. Draft runners never join the group.
+            if recv_req.load_format == "nccl_m2n":
+                try:
+                    if recv_req.selector not in ("target", "all"):
+                        raise ValueError(
+                            "NCCL M2N Phase 2 can update only the target model runner"
+                        )
+                    self.tp_worker.model_runner.receive_weights_from_m2n(
+                        recv_req.group_name
+                    )
+                    success, message = (
+                        True,
+                        "Succeeded to update parameter online through NCCL M2N.",
+                    )
+                except Exception as e:
+                    success = False
+                    message = (
+                        f"Failed to update parameter online through NCCL M2N: {e}. "
+                        "The ModelRunner weights may be partially updated; discard "
+                        "the connection and reconnect before retrying."
+                    )
+                    logger.error(message)
+                if success:
+                    # M2N writes model storage directly, bypassing load_weights().
+                    # Residual broadcast updates may subsequently set
+                    # _weight_update_loaded, so remember independently that the
+                    # session still needs model-level post-load processing.
+                    self._weight_update_requires_post_load = True
+                    self.flush_cache_after_weight_update(recv_req)
+                return UpdateWeightsFromDistributedReqOutput(
+                    success=success, message=message
+                )
+
+            # The target (main) model owns this process's connection to the training
+            # engine, so it receives the broadcast once; the received weights are then
+            # loaded into each selected runner locally.
             try:
                 weights = self.tp_worker.model_runner.weight_updater.receive_weights_from_distributed(
                     recv_req.names,
@@ -395,11 +447,22 @@ class SchedulerWeightUpdaterManager:
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
         """Begin a weight-update session: restore in-place-packed weights to a
         loadable state on the selected runners (target and/or draft), so the draft
-        model is prepared identically to the target. The selector is recorded and
-        reused by end_weight_update so the same set is finalized."""
-        assert (
-            not self._weight_update_in_progress
-        ), "begin_weight_update called while a weight-update session is already open"
+        model is prepared identically to the target. Re-entering after a failed
+        transfer resets the open transaction so a reconnected sender can replay
+        the complete update without exposing the partial weights."""
+        if self._weight_update_in_progress:
+            logger.warning(
+                "Restarting an incomplete weight-update session; the sender must "
+                "replay the complete update before generation resumes."
+            )
+            self._weight_update_selector = recv_req.selector
+            self._weight_update_loaded = False
+            self._weight_update_requires_post_load = False
+            torch.distributed.barrier(group=self.tp_cpu_group)
+            return BeginWeightUpdateReqOutput(
+                success=True, message="Restarted incomplete weight update"
+            )
+
         self._weight_update_selector = recv_req.selector
         self._weight_update_sync_base = recv_req.sync_base
         self._lora_stash = {}
@@ -409,6 +472,7 @@ class SchedulerWeightUpdaterManager:
                 runner.begin_weight_update()
         self._weight_update_in_progress = True
         self._weight_update_loaded = False
+        self._weight_update_requires_post_load = False
         torch.distributed.barrier(group=self.tp_cpu_group)
         return BeginWeightUpdateReqOutput(success=True, message="Success")
 
@@ -420,7 +484,7 @@ class SchedulerWeightUpdaterManager:
             self._weight_update_in_progress
         ), "end_weight_update called without begin_weight_update"
         if self._weight_update_sync_base:
-            run_post_load = not self._weight_update_loaded
+            run_post_load = self._weight_update_requires_post_load or not self._weight_update_loaded
             for _, runner in self.get_model_runners(self._weight_update_selector):
                 runner.end_weight_update(run_post_load=run_post_load)
         if recv_req.abort:

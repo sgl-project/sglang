@@ -1971,6 +1971,8 @@ class InitWeightsUpdateGroupReqInput(BaseReq, kw_only=True):
     group_name: str = "weight_update_group"
     # The backend
     backend: str = "nccl"
+    # Optional Miles NCCL M2N manifest. Ordinary broadcast groups omit it.
+    m2n_manifest: Optional[Dict[str, Any]] = None
 
 
 class InitWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
