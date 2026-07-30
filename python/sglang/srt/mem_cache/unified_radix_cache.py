@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, Sequence, TypeVar
+from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
 import torch
 
@@ -536,28 +536,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.tree_core.evict_device_end(ct)
 
     def inc_lock_ref(
-        self, node: Any, skip_lock_components: Sequence[ComponentType] = ()
+        self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
     ) -> IncLockRefResult:
-        result = self.session.try_inc_lock_ref(node)
+        result = self.session.try_inc_lock_ref(node_id)
         if result is not None:
             return result
         if self.disable:
             return IncLockRefResult()
-        result = IncLockRefResult()
-        for component in self._components_tuple:
-            if component.component_type in skip_lock_components:
-                # Leave this component's value evictable and record every
-                # non-root node (incl tombstones) so the matching dec skips a
-                # lock we never took, which may be another req's on a shared node.
-                if node is not self.root_node:
-                    result.skip_lock_node_ids.setdefault(
-                        component.component_type, set()
-                    ).add(node.id)
-                continue
-            result = component.acquire_component_lock(node=node, result=result)
-
-        self._update_evictable_leaf_sets(node)
-        return result
+        return self.tree_core.inc_lock_ref(node_id, skip_lock_components)
 
     def dec_lock_ref(
         self,

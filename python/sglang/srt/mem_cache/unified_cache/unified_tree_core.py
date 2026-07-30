@@ -442,10 +442,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Drop a tree node from the arena."""
         self._node_arena.pop(node.id, None)
 
-    def inc_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
+    def inc_lock_ref(
+        self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
+    ) -> IncLockRefResult:
         node = self.node_by_id(node_id)
         result = IncLockRefResult()
         for component in self.components:
+            if component.component_type in skip_lock_components:
+                # Leave this component's value evictable and record every
+                # non-root node (incl tombstones) so the matching dec skips a
+                # lock we never took, which may be another req's on a shared node.
+                if node is not self.root_node:
+                    result.skip_lock_node_ids.setdefault(
+                        component.component_type, set()
+                    ).add(node.id)
+                continue
             result = component.acquire_component_lock(node=node, result=result)
         self._update_evictable_leaf_sets(node)
         return result
@@ -482,7 +493,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node, swa_uuid_for_lock, result.device_frees, result.host_frees
         )
 
-        # Drop strictly-lower-priority locks (e.g. Mamba) co-located on `node`,
+        # Drop strictly-lower-priority locks (e.g. Mamba) co-located on the node,
         # honoring skip ids so we don't drop a lock a partial inc never took
         # (matters for FULL+SWA+MAMBA models, e.g. Inkling).
         swa_priority = swa_component.eviction_priority(is_leaf=False)
