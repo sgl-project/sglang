@@ -11,7 +11,7 @@ import unittest
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 from PIL import Image
@@ -42,6 +42,13 @@ from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.datasets.openai_dataset import sample_openai_requests
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
+from sglang.benchmark.serving import (
+    _BACKEND_API_PATHS,
+    _EMBEDDING_BACKENDS,
+    ASYNC_REQUEST_FUNCS,
+    async_request_openai_embeddings,
+    flush_server_cache,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
@@ -85,6 +92,33 @@ def create_lightweight_tokenizer() -> PreTrainedTokenizerFast:
         "{% if add_generation_prompt %}assistant:{% endif %}"
     )
     return hf_tokenizer
+
+
+class TestEmbeddingBenchmarkBackends(unittest.TestCase):
+    def test_vllm_embedding_reuses_the_openai_embedding_request_path(self):
+        self.assertIn("vllm-embedding", _EMBEDDING_BACKENDS)
+        self.assertIs(
+            ASYNC_REQUEST_FUNCS["vllm-embedding"], async_request_openai_embeddings
+        )
+        self.assertEqual(_BACKEND_API_PATHS["vllm-embedding"], "/v1/embeddings")
+
+    def test_embedding_cache_flush_uses_the_engine_specific_endpoint(self):
+        with (
+            patch("sglang.benchmark.serving.get_auth_headers", return_value={}),
+            patch("sglang.benchmark.serving.requests.post") as post,
+        ):
+            post.return_value = MagicMock()
+
+            flush_server_cache("http://127.0.0.1:8000", "vllm-embedding")
+            post.assert_called_once_with(
+                "http://127.0.0.1:8000/reset_prefix_cache", headers={}
+            )
+            post.reset_mock()
+
+            flush_server_cache("http://127.0.0.1:30000", "sglang-embedding")
+            post.assert_called_once_with(
+                "http://127.0.0.1:30000/flush_cache", headers={}
+            )
 
 
 class DummyProcessor:
@@ -426,24 +460,26 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
         self.assertTrue(all(row.image_data for row in rows))
 
-    def test_image_sampler_vllm_chat(self):
-        rows = sample_image_requests(
-            num_requests=2,
-            image_count=1,
-            input_len=8,
-            output_len=4,
-            range_ratio=0.0,
-            processor=self.processor,
-            image_content="blank",
-            image_format="png",
-            image_resolution="8x8",
-            backend="vllm-chat",
-            random_image_count=False,
-        )
-        self.assertEqual(len(rows), 2)
-        self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
-        self.assertTrue(all(row.image_data for row in rows))
-        self.assertTrue(all("[IMAGE]" not in row.prompt for row in rows))
+    def test_image_sampler_chat_backends_use_raw_prompt(self):
+        for backend in ("sglang-oai-chat", "vllm-chat", "lmdeploy-chat"):
+            with self.subTest(backend=backend):
+                rows = sample_image_requests(
+                    num_requests=1,
+                    image_count=1,
+                    input_len=8,
+                    output_len=4,
+                    range_ratio=0.0,
+                    processor=self.processor,
+                    image_content="blank",
+                    image_format="png",
+                    image_resolution="8x8",
+                    backend=backend,
+                    random_image_count=False,
+                )
+                self.assertEqual(len(rows), 1)
+                self.assertTrue(rows[0].image_data)
+                for marker in ("user:", "assistant:", "[IMAGE]"):
+                    self.assertNotIn(marker, rows[0].prompt)
 
     def test_image_sampler_random_resolution(self):
         state = np.random.get_state()

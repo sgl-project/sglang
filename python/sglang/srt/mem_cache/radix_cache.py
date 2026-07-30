@@ -434,21 +434,25 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         )
         return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ):
         """Cache request when it finishes."""
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert:
             is_insert = False
 
-        kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
+            # The protected prefix is not this req's to free.
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
+                req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free_segment(
+                kv_indices, start_pos=req.cache_protected_len
+            )
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -466,18 +470,21 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
             session_leaf = result.last_device_node
-            # Free the duplicates that were already in the tree
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : result.prefix_len]
-            )
+            freed_end = result.prefix_len
         else:
             session_leaf = None
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : key_len]
-            )
+            freed_end = key_len
 
-        # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
+        # duplicates / uninserted range, then the unaligned tail
+        self.token_to_kv_pool_allocator.free_segments(
+            [
+                (
+                    kv_indices[req.cache_protected_len : freed_end],
+                    req.cache_protected_len,
+                ),
+                (kv_indices[key_len:], key_len),
+            ]
+        )
 
         self._tag_session_leaf(req, radix_key, node=session_leaf)
 
@@ -511,8 +518,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         )
         new_prefix_len = result.prefix_len
 
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[req.cache_protected_len : new_prefix_len]
+        self.token_to_kv_pool_allocator.free_segment(
+            kv_indices[req.cache_protected_len : new_prefix_len],
+            start_pos=req.cache_protected_len,
         )
 
         # The prefix indices could be updated, reuse it
@@ -576,7 +584,8 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
-            self.token_to_kv_pool_allocator.free(x.value)
+            # Tree values are page-aligned copies of a kv row: page-exact segment.
+            self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
             num_evicted += len(x.value)
             self._delete_leaf(x)
 

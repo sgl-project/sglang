@@ -117,7 +117,6 @@ export const GLM47FlashDeployment = () => {
       cmd += ` \\\n   --dp 1 \\\n   --enable-dp-attention`;
     }
     if (strategyArray.includes('mtp')) {
-      cmd = 'SGLANG_ENABLE_SPEC_V2=1 ' + cmd;
 
       if (hardware === 'b200') {
         cmd += ` \\\n   --speculative-draft-attention-backend triton`;
