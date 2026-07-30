@@ -684,7 +684,6 @@ class KVCacheConfigurator:
                 self.server_args.enable_gdn_replayssm_spec
                 and self.hybrid_gdn_config is not None
             ),
-            gdn_replayssm_spec_fold=self.server_args.enable_mamba_extra_buffer(),
         )
         return req_to_token_pool
 
@@ -745,7 +744,6 @@ class KVCacheConfigurator:
                 self.server_args.enable_gdn_replayssm_spec
                 and self.hybrid_gdn_config is not None
             ),
-            gdn_replayssm_spec_fold=self.server_args.enable_mamba_extra_buffer(),
         )
         return req_to_token_pool
 
@@ -1737,16 +1735,14 @@ class KVCacheConfigurator:
             server_args.enable_gdn_replayssm_spec and self.hybrid_gdn_config is not None
         )
         if replayssm_active:
-            spec_fold = server_args.enable_mamba_extra_buffer()
             record_len = (
                 server_args.max_speculative_num_draft_tokens
-                if spec_fold
-                and server_args.max_speculative_num_draft_tokens is not None
+                if server_args.max_speculative_num_draft_tokens is not None
                 else server_args.linear_replayssm_cache_len
             )
             replayssm_ring_per_req = (
                 config.mamba2_cache_params.replayssm_ring_bytes_per_req(
-                    record_len=record_len, spec_fold=spec_fold
+                    record_len=record_len
                 )
             )
         else:

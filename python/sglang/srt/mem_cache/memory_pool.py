@@ -464,7 +464,6 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_gdn_replayssm_spec: bool = False,
-        gdn_replayssm_spec_fold: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -481,17 +480,13 @@ class MambaPool:
         self.debug_memory_pool = envs.SGLANG_DEBUG_MEMORY_POOL.get()
         self.enable_linear_replayssm = enable_linear_replayssm
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
-        # ReplaySSM spec-verify (Part B of #28511) REUSES the linear_replayssm ring
-        # (replayssm_d/k/g + write_pos) and ADDS two per-slot cursors
-        # (replayssm_cache_base + replayssm_is_flush). Enabling the spec-verify path
-        # therefore implies the ring, so the d/k/g + write_pos allocation gates on
-        # `_replayssm_on` (either flag). GDN-only is enforced upstream + below.
-        # Fold-every-commit allocates only the raw (v, k, g, beta) rings: the
-        # chunked (d, k) records and all three cursors are unused.
+        # ReplaySSM: the decode ring (--enable-linear-replayssm) allocates the
+        # chunked (d, k) records + write_pos; the spec-verify flag
+        # (--enable-gdn-replayssm-spec) always uses fold-every-commit and
+        # allocates only the raw (v, k, g, beta) window -- no chunked records,
+        # no cursors. The shared g allocation gates on `_replayssm_on`.
         self.enable_gdn_replayssm_spec = enable_gdn_replayssm_spec
-        self.replayssm_spec_fold = bool(
-            enable_gdn_replayssm_spec and gdn_replayssm_spec_fold
-        )
+        self.replayssm_spec_fold = bool(enable_gdn_replayssm_spec)
         _replayssm_on = enable_linear_replayssm or enable_gdn_replayssm_spec
 
         # for disagg with nvlink
@@ -627,19 +622,6 @@ class MambaPool:
                 # (bit-identical to the recurrent baseline) instead of folding
                 # the chunked `d` records open-loop.
                 if enable_gdn_replayssm_spec:
-                    if not self.replayssm_spec_fold:
-                        if L & (L - 1) != 0:
-                            raise ValueError(
-                                f"spec-verify ring length must be a power of two, got {L}"
-                            )
-                        if (
-                            speculative_num_draft_tokens is not None
-                            and L < 2 * speculative_num_draft_tokens
-                        ):
-                            raise ValueError(
-                                f"spec-verify ring too small: {L} < "
-                                f"2 * {speculative_num_draft_tokens} (early-flush margin)"
-                            )
                     replayssm_rawv = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
                         dtype=conv_dtype,
@@ -1151,7 +1133,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_gdn_replayssm_spec: bool = False,
-        gdn_replayssm_spec_fold: bool = False,
     ):
         super().__init__(
             size=size,
@@ -1179,7 +1160,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
-            gdn_replayssm_spec_fold=gdn_replayssm_spec_fold,
         )
 
     def _init_mamba_pool(
@@ -1196,7 +1176,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_gdn_replayssm_spec: bool = False,
-        gdn_replayssm_spec_fold: bool = False,
     ):
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
@@ -1211,7 +1190,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
-            gdn_replayssm_spec_fold=gdn_replayssm_spec_fold,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

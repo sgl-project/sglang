@@ -2,10 +2,9 @@
 
 The memory solver charges this on top of mamba_cache_per_req so num_slots is not
 over-provisioned (the ring is allocated per slot but is NOT part of the state
-cache cost). Pins the arithmetic against hand-computed byte counts for both
-protocols (fold-every-commit stores only the raw v / pre-norm k / g / beta
-window; the circular spec ring adds the (d, k) reconstruction records). If the
-MambaPool allocation changes shape, update both together.
+cache cost). Pins the arithmetic against hand-computed byte counts for the
+fold window (raw v / pre-norm k / g / beta). If the MambaPool allocation
+changes shape, update both together.
 """
 
 import pytest
@@ -27,7 +26,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 #   rawv hv*RL*v_dim, rawk h_k*RL*k_dim -> conv dtype
 #   g    hv*RL                          -> fp32
 #   beta hv*RL                          -> fp32
-#   d    hv*RL*v_dim, k    h_k*RL*k_dim -> conv dtype (circular ring only)
 DTYPE = Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32)
 RL = 8
 LAYERS = [0, 1]
@@ -55,21 +53,12 @@ class TestReplaySSMRingAccounting(CustomTestCase):
     def test_gdn_fold(self):
         # fold window: rawv 512 + rawk 512 + g(scalar, 4*8*4) 128 + beta 128 = 1280
         self.assertEqual(
-            _gdn_params().replayssm_ring_bytes_per_req(record_len=RL, spec_fold=True),
+            _gdn_params().replayssm_ring_bytes_per_req(record_len=RL),
             1280 * len(LAYERS),
         )
 
-    def test_gdn_circular_ring(self):
-        # circular ring adds the (d, k) records: 1280 + d 512 + k 512 = 2304
-        self.assertEqual(
-            _gdn_params().replayssm_ring_bytes_per_req(record_len=RL, spec_fold=False),
-            2304 * len(LAYERS),
-        )
-
     def test_zero_len_ring(self):
-        self.assertEqual(
-            _gdn_params().replayssm_ring_bytes_per_req(record_len=0, spec_fold=True), 0
-        )
+        self.assertEqual(_gdn_params().replayssm_ring_bytes_per_req(record_len=0), 0)
 
 
 if __name__ == "__main__":
