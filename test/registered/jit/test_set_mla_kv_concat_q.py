@@ -19,9 +19,12 @@ import torch
 from sglang.kernels.ops.attention.concat_mla import concat_mla_absorb_q
 from sglang.kernels.ops.attention.set_mla_kv_concat_q import (
     can_use_set_mla_kv_concat_q,
+    can_use_set_mla_kv_concat_q_fp8,
     covered,
     set_mla_kv_concat_q,
+    set_mla_kv_concat_q_fp8,
 )
+from sglang.kernels.ops.attention.utils import concat_mla_absorb_q_general
 from sglang.kernels.ops.kvcache.set_mla_kv_buffer import set_mla_kv_buffer
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -188,6 +191,42 @@ def test_covered_rejects_unsupported_layouts():
 
     # Unsupported loc dtype.
     assert not covered(pool, loc.to(torch.int16), k_nope, k_rope, q_nope, q_rope)
+
+
+def test_fp8_scatter_concat_and_dcp():
+    if not can_use_set_mla_kv_concat_q_fp8():
+        pytest.skip("fused fp8 set_mla_kv_concat_q requires SM90+")
+
+    bs, heads = 64, 8
+    _, loc, k_nope, k_rope, q_nope, q_rope = _make_inputs(bs, heads, torch.int64, 17)
+    pool = torch.zeros(PAGES, TOTAL_DIM, device="cuda", dtype=torch.float8_e4m3fn)
+    pool_ref = pool.clone()
+    query = set_mla_kv_concat_q_fp8(pool, loc, k_nope, k_rope, q_nope, q_rope)
+    row = torch.cat([k_nope, k_rope], dim=-1).to(torch.float8_e4m3fn)
+    pool_ref[loc.long()] = row
+    query_ref = concat_mla_absorb_q_general(q_nope, q_rope).to(torch.float8_e4m3fn)
+    assert torch.equal(pool.view(torch.uint8), pool_ref.view(torch.uint8))
+    assert torch.equal(query.view(torch.uint8), query_ref.view(torch.uint8))
+
+    world, rank = 8, 7
+    physical = torch.arange(bs, device="cuda")
+    owner = physical % world
+    virtual_loc = physical * world + owner
+    pool.zero_()
+    pool_ref.zero_()
+    set_mla_kv_concat_q_fp8(
+        pool,
+        virtual_loc,
+        k_nope,
+        k_rope,
+        q_nope,
+        q_rope,
+        dcp_world_size=world,
+        dcp_rank=rank,
+    )
+    owned = owner == rank
+    pool_ref[physical[owned]] = row[owned]
+    assert torch.equal(pool.view(torch.uint8), pool_ref.view(torch.uint8))
 
 
 if __name__ == "__main__":
