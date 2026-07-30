@@ -661,9 +661,12 @@ class DPDispatcher:
                 continue
             future = self.pending_futures[rank].pop(key)
             self._update_pending_gauge()
-            # Only mooncake encode (content=request dict) needs the mapping
-            # kept for the follow-up /send.
-            keep_mapping = dp_type == "encode" and msg.get("content") is not None
+            # Each decoder TP rank sends against the same req_id, so dropping the
+            # mapping on the first /send leaves the siblings unroutable. Refresh
+            # the timestamp instead and let the stale-mapping sweep evict it.
+            keep_mapping = dp_type == "send" or (
+                dp_type == "encode" and msg.get("content") is not None
+            )
             if keep_mapping:
                 self._pending_send_at[req_id] = time.monotonic()
             else:
@@ -778,16 +781,10 @@ async def _dp_worker_encode_and_send(
             logger.error(
                 f"DP error-send failed for req_id={req_id}: {e}", exc_info=True
             )
-        # Free the error EmbeddingData stored during encode, or it leaks in
-        # pending embedding state and pins /health into "busy". Neither path
-        # guarantees cleanup on its own: mooncake's _push_embedding_to_prefill
-        # is a no-op, and a swallowed zmq send failure above skips its own pop.
-        # zmq lacks the Mooncake inflight state, so discard its embedding
-        # directly. Mirrors the non-DP error path.
-        if backend == "mooncake":
-            await enc.complete_inflight_encode(req_id, None)
-        else:
-            enc.discard_embedding(req_id)
+        # Free the error EmbeddingData or it pins /health into "busy": mooncake's
+        # _push_embedding_to_prefill is a no-op and a swallowed zmq send failure
+        # above skips its own pop. The main process publishes the error.
+        enc.discard_embedding(req_id)
         raise MMError(error_msg, code=error_code or HTTPStatus.INTERNAL_SERVER_ERROR)
 
     time_stats.set_mm_encode_end_time()
@@ -799,10 +796,10 @@ async def _dp_worker_encode_and_send(
             embedding_len=embedding_len,
             embedding_dim=embedding_dim,
         )
-        # Free the held embedding if the follow-up /send never arrives (same
-        # send_timeout cleanup the non-DP path uses).
-        await enc.complete_inflight_encode(
-            req_id, (nbytes, embedding_len, embedding_dim)
+        # Arm this worker's own sweep in case the follow-up /send never arrives;
+        # the main process publishes separately to serve the decoder's pull.
+        await encode_server_module.meta_registry.publish(
+            req_id, nbytes, embedding_len, embedding_dim
         )
         return request
 
@@ -911,7 +908,15 @@ async def _dp_worker_handle_request(
                 session_id=request["session_id"],
                 buffer_address=request["buffer_address"],
             )
-            await enc.release_inflight_encode(req_id)
+            # Releasing on the first /send breaks decoder TP > 1. No count means
+            # a pre-refcount decoder: stay eager rather than pin until the sweep.
+            receive_count = request.get("receive_count")
+            if receive_count:
+                await encode_server_module.meta_registry.note_send_done(
+                    req_id, receive_count
+                )
+            else:
+                enc.discard_embedding(req_id)
             content = None
         else:
             content = await _dp_worker_encode_and_send(enc, sched, request)

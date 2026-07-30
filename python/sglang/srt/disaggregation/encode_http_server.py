@@ -72,6 +72,9 @@ local_runtime: Optional[EncoderRuntime] = None
 # and ZMQ; HTTP only keeps the dispatcher handle used by route handlers.
 dp_dispatcher: Optional["DPDispatcher"] = None
 
+# Route handlers need the backend in DP mode too, where `encoder` is None.
+encoder_transfer_backend: Optional[str] = None
+
 
 def is_health_check_request(rid: Optional[str]) -> bool:
     return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
@@ -198,8 +201,10 @@ def _unregister_encoder_url_from_bootstrap(server_args: ServerArgs):
 
 def launch_server(server_args: ServerArgs):
     global dp_dispatcher, encoder, encoder_scheduler, local_runtime, send_sockets
+    global encoder_transfer_backend
 
     configure_logger(server_args, prefix=" encode_server")
+    encoder_transfer_backend = server_args.encoder_transfer_backend
     if server_args.dp_size > 1:
         dp_dispatcher = launch_dp_runtime(server_args)
         # encoder_runtime initializes multiprocess metrics before spawning;
@@ -282,6 +287,11 @@ async def handle_encode_request(request: dict):
                 else HTTPStatus.INTERNAL_SERVER_ERROR
             )
             logger.error(f"DP worker error for req_id={req_id}: {result['_error']}")
+            # Fail a blocked metadata puller now instead of at its timeout.
+            if encoder_transfer_backend == "mooncake":
+                await encode_server_module.meta_registry.publish(
+                    req_id, 0, 0, 0, error=result["_error"]
+                )
             return ORJSONResponse(
                 status_code=status_code,
                 content={
@@ -295,37 +305,53 @@ async def handle_encode_request(request: dict):
             f"[{req_id}] /encode completed in {elapsed:.3f}s, "
             f"modality={request.get('modality', 'image')}"
         )
-        return ORJSONResponse(content=result.get("content"))
+        content = result.get("content")
+        # Republish here: this main process is what serves the receiver's pull.
+        if isinstance(content, dict) and "embedding_size" in content:
+            await encode_server_module.meta_registry.publish(
+                req_id,
+                content["embedding_size"],
+                content["embedding_len"],
+                content["embedding_dim"],
+            )
+        return ORJSONResponse(content=content)
 
     modality_str = str(request.get("modality", "image")).lower()
     try:
-        # when multiple decoder TP ranks POST /encode
-        # with the same req_id, only the first triggers the VIT forward;
-        # subsequent callers wait and return the same metadata.
-        if encoder.server_args.encoder_transfer_backend == "mooncake":
-            is_owner, meta = await encoder.begin_or_wait_inflight_encode(req_id)
-            if not is_owner:
-                if meta is None:
-                    return ORJSONResponse(
-                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                        content={
-                            "status": "error",
-                            "message": "Encode failed on the first request",
-                            "req_id": req_id,
-                        },
-                    )
-                nbytes, embedding_len, embedding_dim = meta
-                # Build the same metadata response as the first request
-                resp = dict(request)
-                del resp["mm_items"]
-                resp.update(
-                    {
-                        "embedding_size": nbytes,
-                        "embedding_len": embedding_len,
-                        "embedding_dim": embedding_dim,
-                    }
+        # A pre-pull receiver sends the same req_id once per TP rank; only the
+        # claimer runs the forward and the rest echo its metadata.
+        if (
+            encoder_transfer_backend == "mooncake"
+            and not await encode_server_module.meta_registry.claim(req_id)
+        ):
+            try:
+                meta = await encode_server_module.meta_registry.wait(req_id)
+            except asyncio.TimeoutError:
+                meta = None
+            if meta is None or meta.get("error") is not None:
+                return ORJSONResponse(
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    content={
+                        "status": "error",
+                        "message": (
+                            meta["error"]
+                            if meta
+                            else "Encode failed on the first request"
+                        ),
+                        "req_id": req_id,
+                    },
                 )
-                return ORJSONResponse(content=resp)
+            # Build the same metadata response as the first request
+            resp = dict(request)
+            del resp["mm_items"]
+            resp.update(
+                {
+                    "embedding_size": meta["embedding_size"],
+                    "embedding_len": meta["embedding_len"],
+                    "embedding_dim": meta["embedding_dim"],
+                }
+            )
+            return ORJSONResponse(content=resp)
 
         def start_background_send(req_id):
             task = asyncio.create_task(encoder.send_with_url(req_id=req_id))
@@ -352,7 +378,10 @@ async def handle_encode_request(request: dict):
                 )
             except asyncio.TimeoutError:
                 if encoder.server_args.encoder_transfer_backend == "mooncake":
-                    await encoder.complete_inflight_encode(req_id, None)
+                    await encode_server_module.meta_registry.publish(
+                        req_id, 0, 0, 0, error="encoder batch timed out"
+                    )
+                    encoder.discard_embedding(req_id)
                 time_stats.trace_ctx.abort(
                     abort_info={"reason": "encoder batch timed out"}
                 )
@@ -390,9 +419,13 @@ async def handle_encode_request(request: dict):
                             prefill_host=request["prefill_host"],
                             embedding_port=port,
                         )
-            # Signal waiters on failure for mooncake
+            # Drop only the embedding: discarding the metadata here would
+            # strand a waiter that has been notified but not yet resumed.
             if encoder.server_args.encoder_transfer_backend == "mooncake":
-                await encoder.complete_inflight_encode(req_id, None)
+                await encode_server_module.meta_registry.publish(
+                    req_id, 0, 0, 0, error=error_msg
+                )
+                encoder.discard_embedding(req_id)
             if encode_server_module.encoder_metrics_collector is not None:
                 encode_server_module.encoder_metrics_collector.inc_requests_total(
                     modality=modality_str, status="error"
@@ -402,9 +435,10 @@ async def handle_encode_request(request: dict):
                 content={"status": "error", "message": error_msg, "req_id": req_id},
             )
         if encoder.server_args.encoder_transfer_backend == "mooncake":
-            # Store metadata for duplicate callers and signal them
-            await encoder.complete_inflight_encode(
-                req_id, (nbytes, embedding_len, embedding_dim)
+            # Dual-write: pulling decoders read the registry, pre-pull ones read
+            # this response. Same values, so either generation of prefill works.
+            await encode_server_module.meta_registry.publish(
+                req_id, nbytes, embedding_len, embedding_dim
             )
             del request["mm_items"]
             request.update(
@@ -464,9 +498,12 @@ async def handle_encode_request(request: dict):
         error_msg = str(e)
         logger.error(f"Unexpected error in encoder logic for {req_id}: {error_msg}")
         encode_server_module.rid_to_err_msg[req_id] = error_msg
-        # Ensure inflight waiters are unblocked on unexpected errors
+        # Ensure metadata waiters are unblocked on unexpected errors
         if encoder.server_args.encoder_transfer_backend == "mooncake":
-            await encoder.complete_inflight_encode(req_id, None)
+            await encode_server_module.meta_registry.publish(
+                req_id, 0, 0, 0, error=error_msg
+            )
+            encoder.discard_embedding(req_id)
         if encode_server_module.encoder_metrics_collector is not None:
             encode_server_module.encoder_metrics_collector.inc_requests_total(
                 modality=modality_str, status="error"
@@ -484,18 +521,18 @@ async def handle_encode_request(request: dict):
 @app.post("/send")
 async def handle_send_request(request: dict):
     # mooncake backend
+    req_id = request["req_id"]
+    receive_count = request.get("receive_count")
     if dp_dispatcher is not None:
         try:
             result = await dp_dispatcher.dispatch_send(request)
         except MMError as e:
-            req_id = request.get("req_id", "?")
             logger.error(f"DP dispatch_send refused req_id={req_id}: {e}")
             return Response(
                 content=f"Encoder DP worker send error: {e}",
                 status_code=int(e.code),
             )
         if result.get("_error"):
-            req_id = request.get("req_id", "?")
             status_code = result.get("_error_code") or int(
                 HTTPStatus.INTERNAL_SERVER_ERROR
             )
@@ -506,19 +543,59 @@ async def handle_send_request(request: dict):
                 content=f"Encoder DP worker send error: {result['_error']}",
                 status_code=status_code,
             )
+        # The worker frees the embedding on its own count; we hold only metadata.
+        if receive_count:
+            await encode_server_module.meta_registry.note_send_done(
+                req_id, receive_count
+            )
         return ORJSONResponse(content=result.get("content"))
     await encoder.send(
-        req_id=request["req_id"],
+        req_id=req_id,
         prefill_host=request["prefill_host"],
         embedding_port=request["embedding_port"],
         session_id=request["session_id"],
         buffer_address=request["buffer_address"],
     )
-    req_id = request["req_id"]
-    # Keep the pending embedding here because other decoder TP ranks may still
-    # need it for their /send calls. Cleanup is handled by the scheduled
-    # timeout task or release_inflight_encode.
+    # Sibling ranks share this embedding, so free it only once all have sent.
+    # No count means a pre-refcount decoder: leave it to the sweep, as when
+    # some rank never sends at all.
+    if receive_count:
+        await encode_server_module.meta_registry.note_send_done(req_id, receive_count)
     return ORJSONResponse(content=None)
+
+
+@app.post("/scheduler_receive_meta_data")
+async def handle_scheduler_receive_meta_data(request: dict):
+    """Decoder pull endpoint for the per-part encode metadata. Blocks until the
+    encode publishes its sizes, so a pull that beats the encode simply waits."""
+    req_id = request["req_id"]
+    try:
+        meta = await encode_server_module.meta_registry.wait(req_id)
+    except asyncio.TimeoutError:
+        logger.error(f"[{req_id}] /scheduler_receive_meta_data timed out")
+        return ORJSONResponse(
+            status_code=HTTPStatus.GATEWAY_TIMEOUT,
+            content={
+                "status": "error",
+                "message": "encode metadata not ready",
+                "req_id": req_id,
+            },
+        )
+    if meta is None or meta.get("error") is not None:
+        message = meta["error"] if meta else "encode metadata missing"
+        return ORJSONResponse(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": message, "req_id": req_id},
+        )
+    return ORJSONResponse(
+        content={
+            "req_id": req_id,
+            "part_idx": request["part_idx"],
+            "embedding_size": meta["embedding_size"],
+            "embedding_len": meta["embedding_len"],
+            "embedding_dim": meta["embedding_dim"],
+        }
+    )
 
 
 @app.post("/scheduler_receive_url")
