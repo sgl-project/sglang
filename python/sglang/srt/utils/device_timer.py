@@ -9,9 +9,8 @@ import torch
 def device_timer_ctx(timer: Optional["DeviceTimer"], category: str):
     """Timing context for one forward segment; no-op when the timer is absent.
 
-    Every runner wraps its graph replay / forward execution with this so the
-    segment's device time enters fwd_occupancy (and the metrics riding the
-    same timer).
+    A segment that skips this stays out of the fwd_occupancy numerator while
+    still counting in its wall-clock denominator, i.e. reads as GPU idle.
     """
     if timer is None:
         return nullcontext()

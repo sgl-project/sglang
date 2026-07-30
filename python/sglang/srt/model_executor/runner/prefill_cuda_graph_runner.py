@@ -1609,8 +1609,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if shape_key.variant_label is not None:
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
 
-            # Timed here (not in ModelRunner.forward) so load_batch stays out
-            # of the fwd-occupancy numerator.
+            # Timed around the forward only: load_batch and the chunked-prefix
+            # refresh above stay out of the fwd-occupancy numerator.
             timer_ctx = device_timer_ctx(
                 self.model_runner.device_timer,
                 (

@@ -499,7 +499,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         self.bs = bs
         shape_key = self._make_graph_key(bs)
-        # Same fwd-occupancy accounting as the single-layer draft runners.
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             return self._replay_graph(shape_key, fb_view)
 

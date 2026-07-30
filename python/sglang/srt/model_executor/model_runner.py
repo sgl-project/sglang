@@ -1543,8 +1543,7 @@ class ModelRunner:
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
                 and get_cp_strategy() is None
             ):
-                # Prefill cuda graph (piecewise). Timing lives inside the
-                # runner's execute, wrapped around the model forward only.
+                # Prefill cuda graph (piecewise). Timed inside the runner's execute.
                 kwargs = self._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
                 ret = self.prefill_cuda_graph_runner.execute(forward_batch, **kwargs)
                 can_run_graph = True
