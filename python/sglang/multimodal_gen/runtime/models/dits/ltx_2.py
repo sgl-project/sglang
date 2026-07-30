@@ -31,7 +31,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNormNoWeight
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNormNoWeight, RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
 
 _is_npu = current_platform.is_npu()
 
@@ -164,12 +165,12 @@ def _ltx2_try_fused_ada_values9(
     if (
         _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED
         or get_tp_world_size() != 1
-        or not timestep.is_cuda
+        or not (timestep.is_cuda or timestep.is_npu)
         or timestep.dtype != torch.bfloat16
         or timestep.ndim != 3
         or int(timestep.shape[0]) != int(batch_size)
         or not timestep.is_contiguous()
-        or not scale_shift_table.is_cuda
+        or not (scale_shift_table.is_cuda or scale_shift_table.is_npu)
         or scale_shift_table.dtype not in (torch.bfloat16, torch.float32)
         or scale_shift_table.ndim != 2
         or int(scale_shift_table.shape[0]) != 9
@@ -259,10 +260,10 @@ def apply_split_rotary_emb(
         and x.dtype == torch.bfloat16
         and cos.dtype == torch.bfloat16
         and sin.dtype == torch.bfloat16
-        and x.is_cuda
+        and (x.is_cuda or x.is_npu)
         and x.is_contiguous()
-        and cos.is_cuda
-        and sin.is_cuda
+        and (cos.is_cuda or cos.is_npu)
+        and (sin.is_cuda or sin.is_npu)
     ):
         from sglang.kernels.ops.diffusion.triton.ltx2_rotary import (
             apply_ltx2_split_rotary_emb,
@@ -739,8 +740,8 @@ class LTX2Attention(nn.Module):
         self.k_norm: nn.Module | None = None
         if self.qk_norm:
             if tp_size == 1:
-                self.q_norm = torch.nn.RMSNorm(self.inner_dim, eps=self.norm_eps)
-                self.k_norm = torch.nn.RMSNorm(self.inner_dim, eps=self.norm_eps)
+                self.q_norm = RMSNorm(self.inner_dim, eps=self.norm_eps)
+                self.k_norm = RMSNorm(self.inner_dim, eps=self.norm_eps)
             else:
                 self.q_norm = LTX2TPRMSNormAcrossHeads(
                     full_hidden_size=self.inner_dim,
