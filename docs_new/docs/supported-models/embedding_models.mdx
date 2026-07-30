@@ -5,7 +5,7 @@ description: Dense and sparse embedding models with FlashInfer acceleration and 
 SGLang provides robust support for embedding models by integrating efficient serving mechanisms with its flexible programming interface. This integration allows for streamlined handling of embedding tasks, facilitating faster and more accurate retrieval and semantic search operations. SGLang's architecture enables better resource utilization and reduced latency in embedding model deployment.
 
 <Warning>
-Embedding models are executed with `--is-embedding` flag and some may require `--trust-remote-code`
+Native encoder embedding architectures and `google/embeddinggemma-300m` are detected automatically. Decoder-style embedding models require `--is-embedding`; add `--trust-remote-code` when the model requires it.
 </Warning>
 
 ## Quick Start
@@ -13,12 +13,20 @@ Embedding models are executed with `--is-embedding` flag and some may require `-
 ### Launch Server
 
 ```bash
-python3 -m sglang.launch_server \
+sglang serve \
   --model-path Qwen/Qwen3-Embedding-4B \
-  --is-embedding \
-  --host 0.0.0.0 \
-  --port 30000
+  --is-embedding
 ```
+
+### EmbeddingGemma
+
+EmbeddingGemma uses bidirectional attention and is auto-detected, so its best default command is simply:
+
+```bash
+sglang serve --model-path google/embeddinggemma-300m
+```
+
+On CUDA, SGLang automatically uses breakable CUDA graph (BCG) for its full encoder prefill and disables incompatible radix-cache and chunked-prefill behavior. Do not add the deprecated piecewise CUDA graph knobs.
 
 ### Client Request
 
@@ -30,7 +38,7 @@ url = "http://127.0.0.1:30000"
 payload = {
     "model": "Qwen/Qwen3-Embedding-4B",
     "input": "What is the capital of France?",
-    "encoding_format": "float"
+    "encoding_format": "float"  # or "base64" for compact FP32 responses
 }
 
 response = requests.post(url + "/v1/embeddings", json=payload).json()
@@ -43,12 +51,10 @@ print("Embedding:", response["data"][0]["embedding"])
 For multimodal models like GME that support both text and images:
 
 ```bash
-python3 -m sglang.launch_server \
+sglang serve \
   --model-path Alibaba-NLP/gme-Qwen2-VL-2B-Instruct \
   --is-embedding \
-  --chat-template gme-qwen2-vl \
-  --host 0.0.0.0 \
-  --port 30000
+  --chat-template gme-qwen2-vl
 ```
 
 ```python Example
@@ -85,11 +91,9 @@ print("Embeddings:", [x.get("embedding") for x in response.get("data", [])])
 If the model config already includes `matryoshka_dimensions` or `is_matryoshka` then no override is needed. Otherwise, you can use `--json-model-override-args` as below:
 
 ```bash Command
-python3 -m sglang.launch_server \
+sglang serve \
     --model-path Qwen/Qwen3-Embedding-0.6B \
     --is-embedding \
-    --host 0.0.0.0 \
-    --port 30000 \
     --json-model-override-args '{"matryoshka_dimensions": [128, 256, 512, 1024, 1536]}'
 ```
 
@@ -133,6 +137,12 @@ print("Embedding:", response["data"][0]["embedding"])
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>EmbeddingGemma</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`google/embeddinggemma-300m`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bidirectional Gemma3 text encoder; auto-detected and served with BCG by default</td>
+    </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>E5 (Llama/Mistral based)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`intfloat/e5-mistral-7b-instruct`</td>

@@ -227,7 +227,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             patch.dict(
                 "sys.modules",
                 {
-                    "sglang.srt.mem_cache.unified_cache_components": fake_components,
+                    "sglang.srt.mem_cache.unified_cache.components": fake_components,
                     "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
                 },
             ),
@@ -261,7 +261,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         with patch.dict(
             "sys.modules",
             {
-                "sglang.srt.mem_cache.unified_cache_components": fake_components,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
                 "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
             },
         ):
@@ -281,7 +281,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         with patch.dict(
             "sys.modules",
             {
-                "sglang.srt.mem_cache.unified_cache_components": fake_components,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
                 "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
             },
         ):
@@ -302,7 +302,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         with patch.dict(
             "sys.modules",
             {
-                "sglang.srt.mem_cache.unified_cache_components": fake_components,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
                 "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
             },
         ):
@@ -322,7 +322,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         with patch.dict(
             "sys.modules",
             {
-                "sglang.srt.mem_cache.unified_cache_components": fake_components,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
                 "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
             },
         ):
@@ -348,7 +348,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         with patch.dict(
             "sys.modules",
             {
-                "sglang.srt.mem_cache.unified_cache_components": fake_components,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
                 "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
             },
         ):

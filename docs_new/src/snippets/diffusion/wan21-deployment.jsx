@@ -47,6 +47,8 @@ export const Wan21Deployment = () => {
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'a2', label: 'A2', default: false },
+        { id: 'a3', label: 'A3', default: false }
       ],
     },
     task: {
@@ -64,10 +66,10 @@ export const Wan21Deployment = () => {
     },
     bestPractice: {
       name: 'bestPractice',
-      title: 'Sequence Parallelism',
+      title: 'Optimization',
       items: [
         { id: 'off', label: 'Standard', default: true },
-        { id: 'on', label: 'Best Practice (4 GPUs)', default: false },
+        { id: 'on', label: 'Best Practice', default: false },
       ],
     },
   };
@@ -114,6 +116,22 @@ export const Wan21Deployment = () => {
     return () => observer.disconnect();
   }, []);
 
+  useEffect(() => {
+    const isAscend = values.hardware === 'a2' || values.hardware === 'a3';
+
+    const targetTabName = isAscend ? 'Ascend A3' : 'NVIDIA B200';
+
+    const allTabs = document.querySelectorAll('button, [role="tab"]');
+
+    allTabs.forEach((tab) => {
+      const text = tab.textContent.trim();
+
+      if (text === targetTabName && tab.getAttribute('aria-selected') !== 'true') {
+        tab.click();
+      }
+    });
+  }, [values.hardware]);
+
   const handleRadioChange = (optionName, itemId) => {
     setValues((prev) => {
       let next = { ...prev, [optionName]: itemId };
@@ -154,12 +172,49 @@ export const Wan21Deployment = () => {
   };
 
   const generateCommand = () => {
-    const { task, modelsize, selectedLoraPath, bestPractice } = values;
+    const { hardware, task, modelsize, selectedLoraPath, bestPractice } = values;
     const configKey = `${task}-${modelsize}`;
     const config = modelConfigs[configKey];
 
     if (!config) {
       return '# Error: Invalid configuration';
+    }
+
+    if (hardware === 'a2' || hardware === 'a3') {
+      const comment = hardware === 'a3'
+        ? '#One A3 card has 2 npu chips\n'
+        : '';
+      const isBestPractice = bestPractice === 'on';
+      let command;
+
+      if (task === 't2v' && modelsize === '1_3b' && hardware === 'a2' && !isBestPractice) {
+        command = `${comment}sglang serve \\
+  --model-path ${config.repoId} \\
+  --num-gpus 1`;
+      } else {
+        const tpSize = modelsize === '1_3b' ? (isBestPractice ? 4 : 1) : 2;
+        const spDegree = modelsize === '14b' && isBestPractice ? 4 : 1;
+        const numGpus = isBestPractice ? 8 : (hardware === 'a3' ? 2 : 4);
+
+        command = `${comment}sglang serve \\
+  --model-path ${config.repoId} \\
+  --tp-size ${tpSize} \\
+  --sp-degree ${spDegree} \\
+  --num-gpus ${numGpus}`;
+      }
+
+      if (isBestPractice) {
+        command += ` \\\n  --attention-backend laser_attn`;
+      }
+
+      if (
+        selectedLoraPath === 'NIVEDAN/wan2.1-lora' ||
+        selectedLoraPath === 'valiantcat/Wan2.1-Fight-LoRA'
+      ) {
+        command += ` \\\n  --lora-path ${selectedLoraPath}`;
+      }
+
+      return command;
     }
 
     let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;
