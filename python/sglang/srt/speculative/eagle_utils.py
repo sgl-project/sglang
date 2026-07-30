@@ -103,7 +103,9 @@ def organize_draft_results(
     parents_list: List[torch.Tensor],
     num_draft_token: int,
 ):
+    # b, n, topk; n = 1 + (num_steps-1) * topk
     score_list = torch.cat(score_list, dim=1).flatten(1)
+    # b, (topk + (num_steps-1) * topk)
     ss_token_list = torch.cat(token_list, dim=1)
     top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
     top_scores_index = top_scores.indices
@@ -152,6 +154,7 @@ def build_tree_kernel_efficient(
     tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
     tree_mask_buf: Optional[torch.Tensor] = None,
     position_buf: Optional[torch.Tensor] = None,
+    fill_prefix_mask: bool = True,
 ):
     draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
 
@@ -168,7 +171,11 @@ def build_tree_kernel_efficient(
         elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
             tree_mask.fill_(0)
         elif tree_mask_mode == TreeMaskMode.FULL_MASK:
-            tree_mask.fill_(True)
+            # Only the [0, seq_len) prefix columns depend on this fill; the
+            # kernel below writes every tree cell itself. Skip the (up to
+            # 100s of MB) per-step memset when nothing reads the mask.
+            if fill_prefix_mask:
+                tree_mask.fill_(True)
         else:
             raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
     elif tree_mask_mode == TreeMaskMode.QLEN_ONLY:
@@ -187,13 +194,15 @@ def build_tree_kernel_efficient(
             device=device,
         )
     elif tree_mask_mode == TreeMaskMode.FULL_MASK:
-        tree_mask = torch.full(
-            (
-                seq_lens_sum * num_verify_tokens
-                + num_verify_tokens * num_verify_tokens * bs,
-            ),
-            True,
-            device=device,
+        mask_shape = (
+            seq_lens_sum * num_verify_tokens
+            + num_verify_tokens * num_verify_tokens * bs,
+        )
+        # Same reasoning as the preallocated branch above.
+        tree_mask = (
+            torch.full(mask_shape, True, dtype=torch.bool, device=device)
+            if fill_prefix_mask
+            else torch.empty(mask_shape, dtype=torch.bool, device=device)
         )
     else:
         raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")

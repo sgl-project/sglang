@@ -34,15 +34,15 @@ If you do not want to use a Docker image, reproduce the dependency installation 
 
 </Accordion>
 
-Pick your hardware, then the deployment shape and operating point. Node count follows the hardware recipe (B200 2×8, GB200 4×4, H100 4×8, B300 1×8, H200 2×8, GB300 2×4, MI350X/MI355X 1×8), so it is not a separate choice.
+Pick your hardware, then the deployment shape and operating point. Node count follows the hardware recipe (B200 2×8, GB200 4×4, H100 4×8, B300 1×8, H200 2×8 — 4×8 on Unified High-Throughput, GB300 2×4, MI350X/MI355X 1×8), so it is not a separate choice.
 
-**PD Mode** — `Unified` serves prefill and decode together. `Prefill` / `Decode` split them into dedicated pools (see [PD disaggregation](#pd-disaggregation)); `Prefill` ships two strategies on the TP8 platforms, both chunked at 16k: `Default` (TP8) and `Long-Context` (`--pp-size 8 --tp-size 1`, see [Deep PP](#deep-pp-for-long-context-prefill)).
+**PD Mode** — `Unified` serves prefill and decode together. `Prefill` / `Decode` split them into dedicated pools (see [PD disaggregation](#3-4-pd-disaggregation)); `Prefill` ships two strategies on the TP8 platforms, both chunked at 16k: `Default` (TP8) and `Long-Context` (`--pp-size 8 --tp-size 1`, see [Deep PP](#deep-pp-for-long-context-prefill)).
 
 **Strategy** — the operating point within that shape:
 
 - **Low-Latency** — plain TP, no DCP. For chat.
 - **Balanced** — the accuracy-preserving default: TP16/DCP16 on B200/GB200, TP8/DCP8 on B300/GB300, TP8 ROCm/AITER on MI35x.
-- **High-Throughput** — the large-scale lane: pick a **Cluster Size** and **Large-Scale Preset** in the Playground ([details](#large-scale-presets)). On H100/H200: Balanced plus `extra_buffer_lazy`.
+- **High-Throughput** — the large-scale lane: pick a **Cluster Size** and **Large-Scale Preset** in the Playground ([details](#large-scale-presets)). On H100: Balanced plus `extra_buffer_lazy`; on H200 the cell itself widens to 4×8 TP32/EP32 at `--mem-fraction-static 0.90`.
 - **Long-Context** — B200 only: TP8/PP2 splits KV and KDA state across two pipeline stages.
 
 **Spec Decode** — independent of the strategy: DSPARK layers onto any `pp_size == 1` recipe, proposing 7 draft tokens per step (tune in the Playground); DFLASH has no published draft checkpoint. Its win is largest on short interactive traffic and fades as the prompt grows.
@@ -151,7 +151,7 @@ Remaining kernel sources JIT once from the public `flashinfer` wheel (a few minu
 | GB300 2×4 | TP8/DCP8 | MNNVL transport and cuMem auto-detected |
 | B200 2×8 | TP16 (+DCP16); Long-Context TP8/PP2, 128K ctx, 8192 chunked prefill | DSPARK off on Long-Context (`pp_size == 1` required) |
 | GB200 4×4 | TP16/DCP16 | MNNVL auto-detected |
-| H200 2×8 | TP16/EP16 + symm-mem | same block on both ranks; export the cross-node NIC (`GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME`, `SGLANG_HOST_IP`); keep `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1` |
+| H200 2×8 (4×8 on Unified High-Throughput) | TP16/EP16 + symm-mem, Marlin + FlashMLA; High-Throughput widens to TP32/EP32 over 4 nodes at mem-frac 0.90 with `extra_buffer_lazy` | same block on every node; export the cross-node NIC (`GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME`, `SGLANG_HOST_IP`); keep `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1` |
 | H100 4×8 | TP32/EP32, Marlin + FlashMLA | SM90a build of the K3 image; pin NCCL/Gloo to the same NIC on all nodes; least post-weight headroom (80 GB) |
 | MI350X/MI355X 1×8 | TP8 ROCm/AITER | AITER A8W4 FlyDSL MoE, Triton attention, graph bs up to 256; DSPARK supported |
 
@@ -312,6 +312,16 @@ sglang serve \
 - 2 processor / 16 I/O workers are the measured defaults; more adds contention.
 - Leave `--mm-attention-backend` unset — auto-selected, with a correctness fallback.
 - Don't add `--mm-enable-dp-encoder`; K3 already shards images across TP ranks.
+
+#### VLM compatibility
+
+| Feature | K3 behavior |
+|---|---|
+| PD | Supported. Image processing and ViT run on prefill; the PD transfer then moves both paged MLA KV and KDA recurrent state as described in [PD disaggregation](#pd-disaggregation). |
+| EPD | Supported on the public `kimi-k3` branch. Use an `--encoder-only` vision role and a `--language-only` prefill role; add the normal decode role for full EPD. See the [EPD guide](../../../docs/advanced_features/epd_disaggregation). |
+| MM encoder DP | Built in. K3 shards complete images across TP ranks, so leave `--mm-enable-dp-encoder` unset in unified, PD-prefill, and encoder-only roles. |
+| CUDA IPC | Compatible with the local processor-to-scheduler path on a single-node unified or PD-prefill role. It does not replace `--encoder-transfer-backend` for EPD or the PD KV/KDA transfer, and its bounded pool consumes HBM. |
+| ViT BCG | Compatible with unified and encoder-only roles, but recommended only for repeated encoder shapes after measuring the HBM trade-off below. |
 
 #### Should ViT BCG be enabled?
 
