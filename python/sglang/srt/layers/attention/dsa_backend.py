@@ -416,6 +416,16 @@ class DeepseekSparseAttnBackend(
                     kv_dtype=fp8_dtype,
                     device=self.device,
                 )
+                # asm_mla.cu rejects fp8 Q unless BOTH scales are given, and the
+                # fused rope/cache path quantizes Q and KV against a unit scale,
+                # so the value is a constant 1.0. Allocating it per layer costs
+                # 2 fill launches x every layer x every forward, which measured
+                # +0.62 ms per decode iteration -- more than the aiter kernel
+                # itself saves. One tensor, allocated once, is shared by all
+                # layers; nothing ever writes to it.
+                self.aiter_sparse_mla_identity_scale = torch.ones(
+                    (), dtype=torch.float32, device=self.device
+                )
 
         # Speculative decoding
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
@@ -3055,15 +3065,12 @@ class DeepseekSparseAttnBackend(
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        # asm_mla.cu rejects fp8 Q unless BOTH scales are given. The values are 1
-        # because the fused rope/cache path quantizes Q and KV against the same
-        # unit scale rather than a per-tensor one.
-        q_scale = None
-        kv_scale = None
-        if q_kernel.dtype.itemsize == 1:
-            q_scale = torch.ones((), dtype=torch.float32, device=q.device)
-        if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q.device)
+        # asm_mla.cu rejects fp8 Q unless BOTH scales are given. Both point at the
+        # same preallocated unit scalar -- see __init__ for why it is not built
+        # here.
+        identity_scale = self.aiter_sparse_mla_identity_scale
+        q_scale = identity_scale if q_kernel.dtype.itemsize == 1 else None
+        kv_scale = identity_scale if kv_cache.dtype == fp8_dtype else None
 
         # dsa_cu_seqlens_k is seq_lens clamped to index_topk, cumulatively summed
         # -- exactly the sparse indptr, and already up to date for this batch.
