@@ -125,30 +125,23 @@ class BaseLinearStateParams(ABC):
         ) * len(self.layers)
 
     def replayssm_ring_bytes_per_req(self, record_len: int, spec_fold: bool) -> int:
-        """Per-slot bytes of the ReplaySSM spec-verify ring (all layers), which
-        are NOT part of ``mamba_cache_per_req`` -- the memory solver must add
-        these or num_slots is over-provisioned (the ring silently eats into the
-        KV budget). MUST mirror the allocation in ``MambaPool`` (memory_pool):
-        fold-every-commit allocates only the raw (v, pre-norm k, g, beta) window
-        of ``record_len`` = the draft maximum; the circular ring additionally
-        allocates the (d, k) reconstruction records at ``record_len`` = L. Raw
-        records use the conv dtype; g and beta are fp32. GDN only: the scalar-g
-        layout below does not cover the KDA per-K gate ring."""
+        """Per-slot bytes of the ReplaySSM spec-verify ring (all layers). Not
+        part of ``mamba_cache_per_req``, so the memory solver must charge it
+        separately. MUST mirror the ``MambaPool`` allocation: raw v/k in the
+        conv dtype + fp32 g and beta; the circular ring (not spec_fold) adds
+        the (d, k) reconstruction records. GDN scalar-g layout only."""
         assert not self.is_kda, "replayssm ring accounting supports GDN only"
         hv, v_dim, k_dim = self.shape.temporal
         h_k = self.shape.num_k_heads_per_tp
         conv_b = self.dtype.conv.itemsize
         fp32_b = 4
-        per_layer = (
-            hv * record_len * v_dim * conv_b
-            + h_k * record_len * k_dim * conv_b
-            + hv * record_len * fp32_b
-            + hv * record_len * fp32_b
+        rawv_k_bytes = (
+            hv * record_len * v_dim * conv_b + h_k * record_len * k_dim * conv_b
         )
+        g_beta_bytes = 2 * hv * record_len * fp32_b
+        per_layer = rawv_k_bytes + g_beta_bytes
         if not spec_fold:
-            per_layer += (
-                hv * record_len * v_dim * conv_b + h_k * record_len * k_dim * conv_b
-            )
+            per_layer += rawv_k_bytes
         return per_layer * len(self.layers)
 
     @property

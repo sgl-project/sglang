@@ -2539,9 +2539,17 @@ class ServerArgs:
         "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
         NS("exec.mamba"),
     ] = 16
+    # ReplaySSM spec-verify (Part B of RFC #28511): GDN linear-chain target-verify
+    # via a per-slot circular (d, k, g) ring + periodic flush instead of per-draft
+    # full-state snapshots. GDN only; linear-chain (topk <= 1) only. Reuses the
+    # `linear_replayssm` ring (replayssm_d/k/g + write_pos) and adds two per-slot
+    # cursors (cache_base, is_flush); the ring length reuses
+    # `linear_replayssm_cache_len`. Under mamba extra_buffer the fold-every-commit
+    # protocol is used instead: a raw-input window sized to the draft maximum,
+    # no cursors.
     enable_gdn_replayssm_spec: A[
         bool,
-        "Enable the ReplaySSM linear-attn spec-verify kernel (Part B of RFC #28511): a per-slot ring replacing the recurrent verify's per-draft full-state snapshots (fold-every-commit under mamba extra_buffer, circular ring + periodic flush otherwise). GDN only, linear-chain (--speculative-eagle-topk in {None, 1}) only. Reuses --linear-replayssm-cache-len for the ring length.",
+        "Enable the ReplaySSM GDN spec-verify kernel (Part B of RFC #28511): a per-slot circular (d, k, g) ring + periodic flush replacing the recurrent verify's per-draft full-state snapshots (under mamba extra_buffer: a fold-every-commit raw-input window instead). GDN only, linear-chain (--speculative-eagle-topk in {None, 1}) only. Reuses --linear-replayssm-cache-len for the circular ring length.",
         NS("exec.mamba"),
     ] = False
 
@@ -6023,37 +6031,21 @@ class ServerArgs:
                     "EAGLE tree verify. Got "
                     f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
                 )
-            # Read through the resolved view: the auto->extra_buffer strategy
-            # resolution is still a declaration here (the raw field would
-            # silently read "auto").
-            from sglang.srt.arg_groups.overrides import (
-                mamba_extra_buffer_of,
-                resolved_view,
-            )
+            from sglang.srt.arg_groups.overrides import mamba_extra_buffer_of
 
-            _mamba_view = resolved_view(self)
-            _spec_fold = mamba_extra_buffer_of(_mamba_view)
-            if _spec_fold:
-                # The fold verify/commit never route through the decode kernel,
-                # so the decode backend only serves non-spec forwards.
-                if decode not in ("triton", "flashinfer"):
-                    raise ValueError(
-                        "--enable-gdn-replayssm-spec (fold-every-commit) "
-                        "supports the 'triton' or 'flashinfer' linear-attn "
-                        "decode backend, got "
-                        f"--linear-attn-decode-backend={decode!r}."
-                    )
-            elif decode != "triton":
+            # The auto->extra_buffer strategy resolution is still a declaration
+            # here, so read it through the resolved view.
+            view = self._resolved()
+            spec_fold = mamba_extra_buffer_of(view)
+            allowed_decode = ("triton", "flashinfer") if spec_fold else ("triton",)
+            if decode not in allowed_decode:
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec with the circular spec ring "
-                    "(no mamba extra_buffer) requires the Triton linear-attn "
-                    "decode backend, got "
+                    "--enable-gdn-replayssm-spec requires a linear-attn decode "
+                    f"backend in {allowed_decode} (flashinfer needs the "
+                    "fold-every-commit protocol, i.e. mamba extra_buffer), got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
-            if (
-                _spec_fold
-                and _mamba_view.mamba_radix_cache_strategy == "extra_buffer_lazy"
-            ):
+            if spec_fold and view.mamba_radix_cache_strategy == "extra_buffer_lazy":
                 raise ValueError(
                     "--enable-gdn-replayssm-spec fold-every-commit is not "
                     "validated with --mamba-radix-cache-strategy extra_buffer_lazy "
@@ -6077,10 +6069,10 @@ class ServerArgs:
                     "with incompatible cursor protocols (per-decode-forward vs "
                     "per-verify-commit advance)."
                 )
-            # Circular-ring invariants only; fold-every-commit sizes its window
-            # to the draft maximum and never reads --linear-replayssm-cache-len.
+            # Circular-ring-only invariant; the fold window is sized to the
+            # draft maximum and never reads --linear-replayssm-cache-len.
             ring_len = self.linear_replayssm_cache_len
-            if not _spec_fold and ring_len & (ring_len - 1) != 0:
+            if not spec_fold and ring_len & (ring_len - 1) != 0:
                 raise ValueError(
                     "--linear-replayssm-cache-len must be a power of two for the "
                     f"circular spec-verify ring, got {ring_len}."
@@ -6114,12 +6106,9 @@ class ServerArgs:
         """
         if not self.enable_gdn_replayssm_spec:
             return
-        from sglang.srt.arg_groups.overrides import (
-            mamba_extra_buffer_of,
-            resolved_view,
-        )
+        from sglang.srt.arg_groups.overrides import mamba_extra_buffer_of
 
-        if mamba_extra_buffer_of(resolved_view(self)):
+        if mamba_extra_buffer_of(self._resolved()):
             return
         max_drafts = self.max_speculative_num_draft_tokens
         if max_drafts is None:

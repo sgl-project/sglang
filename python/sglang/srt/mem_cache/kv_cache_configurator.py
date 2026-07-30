@@ -1852,7 +1852,7 @@ class KVCacheConfigurator:
                 f"(4) use GPUs with more memory."
             )
 
-        # +1: the pool's padding slot is allocated alongside the request slots.
+        # +1: the pool's padding slot
         mamba_state_memory = (
             (server_args.max_mamba_cache_size + 1)
             * (config.mamba2_cache_params.mamba_cache_per_req + replayssm_ring_per_req)

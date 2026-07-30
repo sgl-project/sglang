@@ -1,26 +1,9 @@
-"""Microbenchmark: GDN ReplaySSM fold-every-commit state commit.
+"""Microbenchmark for ``commit_gdn_replayssm_fold_all_layers`` (defaults match
+Qwen3.5-397B at TP4). The kernel is bound by the mandatory checkpoint
+read+write (``bs * layers * HV * K * V * 4 B * 2``), so the reported GB/s
+approximates achieved HBM bandwidth.
 
-Times ``commit_gdn_replayssm_fold_all_layers`` (one launch folding every
-layer's accepted window into the fp32 checkpoint) across batch sizes for a
-realistic hybrid-GDN serving config (Qwen3.5-397B at TP4: 45 GDN layers,
-HV=16, H=4, K=V=128, draft window 4), and reports achieved HBM bandwidth
-against the kernel's traffic floor.
-
-The kernel is checkpoint-bandwidth-bound: per launch it reads and writes the
-full fp32 state of every folded request across all layers
-(``bs * layers * HV * K * V * 4 bytes * 2``, ~94 MB per request at this
-config); the ring reads (raw v / pre-norm k / g / beta for <= spec_len steps)
-are noise next to that. The reported GB/s therefore approximates the achieved
-HBM bandwidth. As a reference the same commit's cost in the snapshotting
-recurrent baseline is a state *scatter* (read snapshot + write checkpoint),
-i.e. the same order of traffic -- the fold's win lives in the verify kernel
-(no per-draft snapshot writes), not here.
-
-Run::
-
-    python -m sglang.kernels.ops.attention.fla.bench_gdn_replayssm_fold
-
-Requires a GPU (Triton).
+Run: ``python -m sglang.kernels.ops.attention.fla.bench_gdn_replayssm_fold``
 """
 
 from __future__ import annotations
