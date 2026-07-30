@@ -204,6 +204,14 @@ def test_dims_divide():
     assert _encoder_dims_divide(_enc(4096, 64, 10240), 1) is False  # group of 1
 
 
+def test_dp_unmeasured_topology_stays_replicated():
+    # the width thresholds were measured on NVLink H100s; without peer-to-peer
+    # between ranks the collective costs several times more, so auto declines.
+    wide = _enc(4096, 64, 10240)
+    assert encoder_dp_worthwhile(wide, 4, measured_topology=False) is False
+    assert encoder_dp_worthwhile(wide, 4, measured_topology=True) is True
+
+
 def test_dp_worthwhile():
     # batch data-parallel pays only above the latency-bound width and batch>1.
     assert encoder_dp_worthwhile(_enc(4096, 64, 10240), batch_size=2) is True

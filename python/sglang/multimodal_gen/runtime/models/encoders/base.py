@@ -91,9 +91,35 @@ def encoder_folding_worthwhile(config: EncoderConfig, group_size: int) -> bool:
     )
 
 
-def encoder_dp_worthwhile(config: EncoderConfig, batch_size: int) -> bool:
+def group_has_measured_topology(group) -> bool:
+    """Whether the measured fold/dp verdicts transfer to this group's topology.
+
+    Both thresholds above were measured on single-node H100s over NVLink. Their
+    costs are pure interconnect: folding adds an all_reduce per layer, dp one
+    all_gather per encode. Without peer-to-peer between the ranks (multi-node, or
+    a host-routed topology) the traffic costs several times more and a rule that
+    barely paid on NVLink can invert, so `auto` treats those topologies as
+    unmeasured and stays replicated. An explicit --encoder-parallel still wins.
+    """
+    local_devices = torch.cuda.device_count()
+    if group.world_size <= 1 or group.world_size > local_devices:
+        return False
+    return all(
+        torch.cuda.can_device_access_peer(0, peer)
+        for peer in range(1, group.world_size)
+    )
+
+
+def encoder_dp_worthwhile(
+    config: EncoderConfig, batch_size: int, measured_topology: bool = True
+) -> bool:
     hidden, _, _ = _encoder_dims(config)
-    return batch_size > 1 and hidden is not None and hidden >= DP_MIN_HIDDEN_SIZE
+    return (
+        measured_topology
+        and batch_size > 1
+        and hidden is not None
+        and hidden >= DP_MIN_HIDDEN_SIZE
+    )
 
 
 def finalize_encoder_folding(config: EncoderConfig, policy: str = "auto") -> None:
@@ -105,12 +131,15 @@ def finalize_encoder_folding(config: EncoderConfig, policy: str = "auto") -> Non
     if policy in ("dp", "replicate"):
         config.parallel_folding_mode = None
         return
-    group_size = get_folding_tp_group(config).world_size
-    keep = (
-        _encoder_dims_divide(config, group_size)
-        if policy == "fold"
-        else encoder_folding_worthwhile(config, group_size)
-    )
+    group = get_folding_tp_group(config)
+    group_size = group.world_size
+    if policy == "fold":
+        # explicit: shard whenever the dims allow it, topology is the caller's call
+        keep = _encoder_dims_divide(config, group_size)
+    else:
+        keep = encoder_folding_worthwhile(
+            config, group_size
+        ) and group_has_measured_topology(group)
     if not keep:
         config.parallel_folding_mode = None
 
