@@ -576,3 +576,18 @@ def resolve_host_port(base_url: str, host: str, port: int) -> str:
     if base_url:
         return base_url
     return NetworkAddress(host, port).to_host_port_str()
+
+
+def local_ephemeral_port_range() -> Optional[Tuple[int, int]]:
+    """The kernel's outbound (ephemeral) port range, or None if unknown.
+
+    Ports inside this range can be grabbed at any moment by an unrelated
+    outbound connection, so anything that needs to *listen* on a fixed,
+    operator-chosen port has to stay out of it.
+    """
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            low, high = (int(x) for x in f.read().split())
+    except (OSError, ValueError):
+        return None
+    return low, high

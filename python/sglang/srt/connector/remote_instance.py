@@ -9,6 +9,7 @@ import torch.distributed as dist
 
 from sglang.srt.connector import BaseConnector
 from sglang.srt.utils import init_custom_process_group
+from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +42,11 @@ class RemoteInstanceConnector(BaseConnector):
         self.device_id = torch.device(self.device.type, gpu_id)
 
         parsed_url = urlparse(self.url)
-        master_address = parsed_url.hostname
-        master_port = parsed_url.port
+        # hostname strips the brackets off an IPv6 literal, so rebuild the
+        # rendezvous endpoint through NetworkAddress rather than re-interpolating.
+        master = NetworkAddress(parsed_url.hostname, parsed_url.port)
+        master_address = master.host
+        master_port = master.port
         group_name = f"send_weights_{instance_ip}_{master_port}_{tp_rank}"
         backend = "nccl"
 
@@ -54,7 +58,7 @@ class RemoteInstanceConnector(BaseConnector):
         try:
             self._model_update_group = init_custom_process_group(
                 backend=backend,
-                init_method=f"tcp://{master_address}:{master_port}",
+                init_method=master.to_tcp(),
                 world_size=world_size,
                 rank=group_rank,
                 group_name=group_name,
