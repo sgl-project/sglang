@@ -463,7 +463,7 @@ async def handle_encode_request(request: dict):
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Unexpected error in encoder logic for {req_id}: {error_msg}")
-        encode_server_module.rid_to_err_msg[req_id] = error_msg
+        encoder.discard_embedding(req_id)
         # Ensure inflight waiters are unblocked on unexpected errors
         if encoder.server_args.encoder_transfer_backend == "mooncake":
             await encoder.complete_inflight_encode(req_id, None)
@@ -562,7 +562,7 @@ async def health_generate():
     # Skip the dummy encode when real requests are already in flight — the
     # ongoing traffic already proves liveness, matching the scheduler's
     # `is_fully_idle`-based health-check skip pattern.
-    if encoder.has_pending_embeddings():
+    if encoder.has_active_requests():
         return Response(status_code=200)
 
     # Pick the first available modality for the dummy encode

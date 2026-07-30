@@ -31,6 +31,7 @@ from sglang.srt.disaggregation.encode_server import (
     EncoderProfiler,
     MMEncoder,
     MMError,
+    ReqState,
     launch_encoder,
 )
 from sglang.srt.environ import envs
@@ -58,9 +59,10 @@ logger = logging.getLogger(__name__)
 
 
 class PendingRequest:
-    __slots__ = ("request", "future", "submit_time")
+    __slots__ = ("state", "request", "future", "submit_time")
 
-    def __init__(self, request: dict, loop: asyncio.AbstractEventLoop):
+    def __init__(self, state: ReqState, request: dict, loop: asyncio.AbstractEventLoop):
+        self.state = state
         self.request = request
         self.future: asyncio.Future = loop.create_future()
         self.submit_time = time.time()
@@ -117,14 +119,21 @@ class EncoderScheduler:
                 pending.future.set_exception(RuntimeError("EncoderScheduler stopped"))
 
     async def submit(self, request: dict) -> Tuple:
-        pending = PendingRequest(request, asyncio.get_running_loop())
+        req_id = request["req_id"]
+        async with self.encoder.req_states_lock:
+            state = self.encoder.get_request_state(req_id)
+            if state is None:
+                # Scheduler submission is a valid initial request event.
+                state = ReqState(req_id=req_id)
+                self.encoder.req_states[req_id] = state
+        pending = PendingRequest(state, request, asyncio.get_running_loop())
         await self.pending_queue.put(pending)
         try:
             return await asyncio.wait_for(pending.future, timeout=self.request_timeout)
         except asyncio.TimeoutError:
             if not pending.future.done():
                 pending.future.cancel()
-            req_id = request.get("req_id")
+            self.encoder.discard_embedding(req_id)
             logger.error(
                 f"EncoderScheduler.submit timed out after {self.request_timeout}s "
                 f"for req_id={req_id}"
@@ -232,7 +241,9 @@ class EncoderScheduler:
         logger.info(f"Dispatching batch of {len(group)} {modality.name} requests")
 
         try:
-            results = await self.encoder.batch_encode(requests, modality)
+            results = await self.encoder.batch_encode(
+                requests, modality, states=[p.state for p in group]
+            )
             if len(group) > 1:
                 logger.info(
                     f"Batch of {len(group)} {modality.name} requests completed in "
@@ -279,7 +290,7 @@ class EncoderScheduler:
                     )
                 for sock in self.send_sockets:
                     sock_send(sock, wrap_as_pickle(req))
-                result = await self.encoder.encode_request(req, modality)
+                result = await self.encoder.encode_request(req, modality, state=p.state)
                 if not p.future.done():
                     p.future.set_result(result)
             except Exception as e:
@@ -824,7 +835,7 @@ async def _dp_worker_health_encode(enc: MMEncoder) -> None:
     # and report healthy — the same pending-embedding signal the non-DP
     # /health path uses. A wedged-but-busy worker never reaches here because
     # it can't service the recv, so the dispatcher's broadcast still times out → 503.
-    if enc.has_pending_embeddings():
+    if enc.has_active_requests():
         return None
 
     if enc.supports_modality(Modality.IMAGE):
