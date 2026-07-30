@@ -2028,7 +2028,19 @@ class AiterAttnBackend(AttentionBackend):
                         K_Buffer, [kv_lora_rank, qk_rope_head_dim], dim=-1
                     )
 
-                    if self.kv_cache_dtype == fp8_dtype:
+                    use_fused_a16w16 = (
+                        _use_fp8_prefill_attn
+                        and _use_fused_kvb_split_cat
+                        and layer.kv_b_proj.weight.dtype
+                        in (torch.bfloat16, torch.float16)
+                    )
+
+                    if self.kv_cache_dtype == fp8_dtype and not use_fused_a16w16:
+                        # The fused a16w16 split-cat GEMM consumes the fp8 latent
+                        # directly (fp8 A upconverted on load, fp8 k_pe stored
+                        # straight to the fp8 output), so skip this dequant for
+                        # that path -- it is the per-layer fp8->bf16 cast of the
+                        # kvc[N,512] + k_pe[N,64] KV latent.
                         dtype = q.dtype
 
                         kvc = kvc.to(dtype)
@@ -2050,19 +2062,22 @@ class AiterAttnBackend(AttentionBackend):
                                 fp8_dtype,
                             )
                         )[0]
-                    elif (
-                        _use_fp8_prefill_attn
-                        and _use_fused_kvb_split_cat
-                        and layer.kv_b_proj.weight.dtype
-                        in (torch.bfloat16, torch.float16)
-                    ):
+                    elif use_fused_a16w16:
                         # BF16 weights + FP8 prefill: fuse the kv_b_proj GEMM,
                         # nope/v split, and k_pe cat into a single kernel
                         # (fused_gemm_a16w16_split_cat) that writes k and v
                         # directly in FP8, avoiding separate split / cat /
                         # float8_copy passes.
+                        #
+                        # When the KV cache is fp8, kvc/k_pe are still fp8 here
+                        # (dequant skipped above): the kernel upconverts the fp8
+                        # A tile to the weight dtype before the dot and stores
+                        # the fp8 k_pe straight into the fp8 output, eliminating
+                        # the fp8->bf16 dequant. It also builds A block pointers
+                        # from x.stride(0/1), so the row-strided index_select +
+                        # split view feeds in without a .contiguous() copy.
                         k, v = fused_gemm_a16w16_split_cat(
-                            x=kvc.squeeze(1).contiguous(),
+                            x=kvc.squeeze(1),
                             w=layer.kv_b_proj.weight,
                             y=k_pe.expand(-1, layer.tp_k_head_num, -1),
                             S1=qk_nope_head_dim,
