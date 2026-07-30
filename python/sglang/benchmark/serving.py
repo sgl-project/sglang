@@ -937,6 +937,7 @@ ASYNC_REQUEST_FUNCS = {
     "sglang-embedding": async_request_openai_embeddings,
     "vllm": async_request_openai_completions,
     "vllm-chat": async_request_openai_chat_completions,
+    "vllm-embedding": async_request_openai_embeddings,
     "lmdeploy": async_request_openai_completions,
     "lmdeploy-chat": async_request_openai_chat_completions,
     "trt": async_request_trt_llm,
@@ -954,11 +955,23 @@ _BACKEND_API_PATHS = {
     "sglang-embedding": "/v1/embeddings",
     "vllm": "/v1/completions",
     "vllm-chat": "/v1/chat/completions",
+    "vllm-embedding": "/v1/embeddings",
     "lmdeploy": "/v1/completions",
     "lmdeploy-chat": "/v1/chat/completions",
     "trt": "/v2/models/ensemble/generate_stream",
     "truss": "/v1/models/model:predict",
 }
+
+_EMBEDDING_BACKENDS = frozenset(("sglang-embedding", "vllm-embedding"))
+
+
+def flush_server_cache(base_url: str, backend: str) -> None:
+    """Flush an engine's prefix cache after benchmark warmup."""
+    cache_endpoint = (
+        "/reset_prefix_cache" if backend.startswith("vllm") else "/flush_cache"
+    )
+    response = requests.post(base_url + cache_endpoint, headers=get_auth_headers())
+    response.raise_for_status()
 
 
 @dataclass
@@ -1419,9 +1432,14 @@ async def benchmark(
             f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run..."
         )
 
-    # Flush cache
-    if ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
-        requests.post(base_url + "/flush_cache", headers=get_auth_headers())
+    # Flush cache after warmup so the measured run does not benefit from
+    # request-local prefix reuse. vLLM exposes a different, development-mode
+    # endpoint for the same purpose.
+    should_flush_cache = (
+        "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
+    ) or flush_cache
+    if should_flush_cache:
+        flush_server_cache(base_url, backend)
 
     time.sleep(1.0)
 
@@ -1595,7 +1613,7 @@ async def benchmark(
                 "Total input vision tokens:", metrics.total_input_vision
             )
         )
-    is_embedding = backend == "sglang-embedding"
+    is_embedding = backend in _EMBEDDING_BACKENDS
     if not is_embedding:
         print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
         print(
@@ -1963,6 +1981,7 @@ def run_benchmark(args_: argparse.Namespace):
             "sglang-oai": 30000,
             "lmdeploy": 23333,
             "vllm": 8000,
+            "vllm-embedding": 8000,
             "trt": 8000,
             "gserver": 9988,
             "truss": 8080,
@@ -2014,14 +2033,14 @@ def run_benchmark(args_: argparse.Namespace):
         print("No model specified or found. Please provide a model using `--model`.")
         sys.exit(1)
 
-    if args.backend != "sglang-embedding" and not check_chat_template(args.model):
+    if args.backend not in _EMBEDDING_BACKENDS and not check_chat_template(args.model):
         print(
             "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
             "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
         )
 
     if (
-        args.backend == "sglang-embedding"
+        args.backend in _EMBEDDING_BACKENDS
         and args.dataset_name in _EMBEDDING_UNSUPPORTED_DATASETS
     ):
         print(f"{args.dataset_name} dataset is unsupported for embeddings benchmark")

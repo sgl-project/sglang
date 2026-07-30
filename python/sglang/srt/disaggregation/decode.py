@@ -898,7 +898,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
         if is_pp_mode:
-            rids_to_check = pp_good_rids + pp_bad_rids
+            rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
 
         failed_reqs = []
         preallocated_reqs = []

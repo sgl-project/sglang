@@ -4,9 +4,11 @@ Enumerates tile sizes, swap modes, atom layouts, and staging options.
 Checks GMMA divisibility, register budget, and shared memory budget.
 
 Usage:
-    python flash_attn/cute/sm90_config_search.py --headdim 128
-    python flash_attn/cute/sm90_config_search.py --mode fwd --headdim 192-128
-    python flash_attn/cute/sm90_config_search.py --mode bwd --headdim 192 --tile-n 64,96
+    python benchmark/kernels/attention/sm90_config_search.py --headdim 128
+    python benchmark/kernels/attention/sm90_config_search.py \
+        --mode fwd --headdim 192-128
+    python benchmark/kernels/attention/sm90_config_search.py \
+        --mode bwd --headdim 192 --tile-n 64,96
 """
 
 import math
@@ -15,6 +17,10 @@ import math
 SMEM_LIMIT = 224 * 1024  # 228 KB minus ~3 KB for LSE, dPsum, mbarriers
 REG_LIMITS = {2: 216, 3: 128}  # per-WG budget: 2WG=240-24, 3WG=160-32
 THREADS_PER_WG = 128
+
+
+def _bool_flag(value):
+    return "T" if value else "F"
 
 
 def _divisors(n):
@@ -242,11 +248,12 @@ def print_bwd_configs(configs, max_results=20):
     )
     print(hdr)
     print("-" * len(hdr))
-    B = lambda b: "T" if b else "F"
     for c in configs[:max_results]:
         print(
             f"{c['num_wg']:>2} {c['tile_m']:>3} {c['tile_n']:>3}  "
-            f"{B(c['SdP_swapAB']):>3} {B(c['dKV_swapAB']):>3} {B(c['dQ_swapAB']):>3}  "
+            f"{_bool_flag(c['SdP_swapAB']):>3} "
+            f"{_bool_flag(c['dKV_swapAB']):>3} "
+            f"{_bool_flag(c['dQ_swapAB']):>3}  "
             f"{c['AtomLayoutMSdP']:>4} {c['AtomLayoutNdKV']:>4} {c['AtomLayoutMdQ']:>4}  "
             f"{c['Q_stage']:>2} {c['dO_stage']:>3}  "
             f"{c['regs_SdP']:>3} {c['regs_dK']:>3} {c['regs_dV']:>3} {c['regs_dQ']:>3} "
@@ -354,11 +361,11 @@ def print_fwd_configs(configs, max_results=20):
     )
     print(hdr)
     print("-" * len(hdr))
-    B = lambda b: "T" if b else "F"
     for c in configs[:max_results]:
         print(
             f"{c['num_wg']:>2} {c['tile_m']:>3} {c['tile_n']:>3}  "
-            f"{B(c['pv_is_rs']):>2} {B(c['overlap_wg']):>4}  "
+            f"{_bool_flag(c['pv_is_rs']):>2} "
+            f"{_bool_flag(c['overlap_wg']):>4}  "
             f"{c['regs_S']:>3} {c['regs_P']:>3} {c['regs_O']:>3} "
             f"{c['total_regs']:>4}/{c['reg_limit']:<3}  "
             f"{c['smem_kb']:>4.0f}K  "

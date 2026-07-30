@@ -2563,6 +2563,11 @@ class FlashAttentionBackend(AttentionBackend):
         # needs seq_lens_sum to size a dynamic allocation (no D2H sync).
         return [self.cuda_graph_custom_mask, None]
 
+    def target_verify_reads_custom_mask(self) -> bool:
+        # topk<=1 verify never extracts from custom_mask (both the eager and
+        # cuda-graph metadata paths gate the extraction on topk > 1).
+        return self.topk > 1
+
     @staticmethod
     def _host_max_seq_len(
         seq_lens_cpu: Optional[torch.Tensor], seq_lens: torch.Tensor
