@@ -478,11 +478,16 @@ class TestGraphTierFillBudget(CustomTestCase):
 
 class TestFullWindowScheduling(CustomTestCase):
     @staticmethod
-    def _planner(*, aligned_budget: int) -> DSparkVerifyPlanner:
+    def _planner(
+        *,
+        aligned_budget: int,
+        is_verify_all: bool = False,
+        align_to_graph_tier: bool = True,
+    ) -> DSparkVerifyPlanner:
         planner = object.__new__(DSparkVerifyPlanner)
         planner._ragged_verify_mode = RaggedVerifyMode.COMPACT
-        planner._is_verify_all = False
-        planner._align_verify_tokens_to_graph_tier = True
+        planner._is_verify_all = is_verify_all
+        planner._align_verify_tokens_to_graph_tier = align_to_graph_tier
         planner._schedule_cfg = DSparkScheduleConfig(gamma=5, min_verify_len=1)
         planner._uniform_layout_cache = {}
         planner.verify_num_draft_tokens = 6
@@ -491,13 +496,13 @@ class TestFullWindowScheduling(CustomTestCase):
         return planner
 
     @staticmethod
-    def _schedule_kwargs() -> dict:
+    def _schedule_kwargs(*, bs: int = 8, budget: int = 32) -> dict:
         return dict(
-            req_pool_indices=torch.arange(8, dtype=torch.int32),
-            prefix_lens=torch.zeros(8, dtype=torch.int32),
+            req_pool_indices=torch.arange(bs, dtype=torch.int32),
+            prefix_lens=torch.zeros(bs, dtype=torch.int32),
             device=torch.device("cpu"),
             confidence=None,
-            budget=32,
+            budget=budget,
         )
 
     def test_aligned_full_window_uses_cached_uniform_layout(self):
@@ -521,17 +526,27 @@ class TestFullWindowScheduling(CustomTestCase):
         planner._schedule_verify_lens.assert_not_called()
         uniform_layout.assert_called_once()
 
-    def test_partial_window_keeps_per_step_scheduler(self):
-        """A budget one token short of the full window must still schedule."""
-        planner = self._planner(aligned_budget=39)
+    def test_sps_profiler_partial_budget_keeps_per_step_scheduler(self):
+        """A profiler budget must override verify-all and schedule its sample."""
+        planner = self._planner(
+            aligned_budget=168,
+            is_verify_all=True,
+            align_to_graph_tier=False,
+        )
         planner._schedule_verify_lens = MagicMock(
             side_effect=RuntimeError("per-step scheduler called")
         )
 
-        with self.assertRaisesRegex(RuntimeError, "per-step scheduler called"):
-            planner.schedule_layout(**self._schedule_kwargs())
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_planner."
+            "uniform_ragged_layout",
+            return_value=object(),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "per-step scheduler called"):
+                planner.schedule_layout(**self._schedule_kwargs(bs=168, budget=168))
 
         planner._schedule_verify_lens.assert_called_once()
+        self.assertEqual(planner._schedule_verify_lens.call_args.kwargs["budget"], 168)
 
 
 class _FakeRaggedRunner(types.SimpleNamespace):
