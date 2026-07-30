@@ -1095,6 +1095,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
                     forward_batch.input_embeds
                 )
+            # Under speculative decoding + PP, pp_proxy_tensors also
+            # need to be copied here
+            if pp_proxy_tensors is not None and hasattr(
+                self.buffers, "pp_proxy_tensors"
+            ):
+                for key, dst in self.buffers.pp_proxy_tensors.items():
+                    src = pp_proxy_tensors.tensors.get(key)
+                    if src is not None:
+                        dst[: src.shape[0]].copy_(src)
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
@@ -1288,7 +1297,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            return PPProxyTensors(
+                {k: v[: self.raw_num_token] for k, v in output.tensors.items()}
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
