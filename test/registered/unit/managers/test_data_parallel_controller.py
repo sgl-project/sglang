@@ -446,6 +446,25 @@ class TestPrefixAffinityFallback(CustomTestCase):
             ranks.add(_dispatched_rank(c))
         self.assertEqual(len(ranks), 1)
 
+    def test_req_without_routing_key_attribute_does_not_raise(self):
+        """Regression: TokenizedEmbeddingReqInput does not declare routing_key
+        (unlike TokenizedGenerateReqInput) yet it reaches this scheduler via
+        dispatching_with_trace. A bare req.routing_key would raise
+        AttributeError in the dispatcher; the getattr guard must route it
+        through the token/load fallback instead. Mirrors the embedding path."""
+        ctl = _make_affinity_controller(dp_size=8)
+        # Deliberately omit routing_key, like TokenizedEmbeddingReqInput.
+        req = SimpleNamespace(
+            routed_dp_rank=None,
+            bootstrap_room=None,
+            input_ids=list(range(4096)),
+        )
+        ctl.prefix_affinity_scheduler(req)  # must not raise
+        self.assertEqual(
+            sum(w.send_pyobj.call_count for w in ctl.workers), 1,
+            "keyless req without a routing_key attribute must dispatch exactly once",
+        )
+
     def test_keyless_with_token_fallback_disabled_uses_load_balancer(self):
         """No key + token fallback disabled -> defer to the load-aware fallback
         (total_tokens picks the least-loaded rank) rather than pinning."""

@@ -832,7 +832,12 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        route_key = req.routing_key
+        # ``routing_key`` is declared on TokenizedGenerateReqInput but not on
+        # TokenizedEmbeddingReqInput, which also reaches this scheduler via
+        # dispatching_with_trace. Use getattr so a request that doesn't carry
+        # the attribute falls through to the token/load fallback instead of
+        # raising AttributeError in the dispatcher.
+        route_key = getattr(req, "routing_key", None)
         if not route_key and not self._affinity_disable_token_fallback:
             route_key = self._token_prefix_key(req, self._affinity_hash_tokens)
 
