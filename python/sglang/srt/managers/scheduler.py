@@ -4165,7 +4165,9 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(rid=req.rid, finished_reason=recv_req.finished_reason), req
+            )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
@@ -4198,7 +4200,8 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     self.tree_cache.release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(rid=req.rid), req
+                    AbortReq(rid=req.rid, finished_reason=recv_req.finished_reason),
+                    req,
                 )
                 if (
                     req.req_pool_idx is not None
@@ -4253,7 +4256,11 @@ class Scheduler(
                         assert hasattr(decode_req, "kv_cache_cpu")
                         del decode_req.kv_cache_cpu
                         self.ipc_channels.send_to_tokenizer.send_output(
-                            AbortReq(rid=decode_req.rid), decode_req
+                            AbortReq(
+                                rid=decode_req.rid,
+                                finished_reason=recv_req.finished_reason,
+                            ),
+                            decode_req,
                         )
                     else:
                         remaining_retracted.append(decode_req)
@@ -4274,7 +4281,14 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                req.to_finish = FINISH_ABORT()
+                # Honor a reason the tokenizer attached to the abort (e.g. a
+                # client cancel/disconnect) so the finish carries the correct
+                # status at the source instead of a bare, status-less abort.
+                req.to_finish = (
+                    FINISH_ABORT.from_json(recv_req.finished_reason)
+                    if recv_req.finished_reason
+                    else FINISH_ABORT()
+                )
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

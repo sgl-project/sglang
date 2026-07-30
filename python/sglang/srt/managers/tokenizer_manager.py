@@ -90,7 +90,11 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    CLIENT_CLOSED_REQUEST,
+    MultimodalDataItem,
+    client_cancel_finish_reason,
+)
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
@@ -1542,6 +1546,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ) in (
             HTTPStatus.SERVICE_UNAVAILABLE,
             HTTPStatus.INTERNAL_SERVER_ERROR,
+            CLIENT_CLOSED_REQUEST,
         ):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.
@@ -1581,7 +1586,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
-                    self.abort_request(obj.rid)
+                    self.abort_request(
+                        obj.rid, finished_reason=client_cancel_finish_reason()
+                    )
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
@@ -1662,7 +1669,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, running)
-                    self.abort_request(obj.rid)
+                    self.abort_request(
+                        obj.rid, finished_reason=client_cancel_finish_reason()
+                    )
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
@@ -1789,7 +1798,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     except StopAsyncIteration:
                         pass
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self, rid: str = "", abort_all: bool = False, finished_reason=None
+    ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
@@ -1800,7 +1811,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and rid not in self.rid_to_state
         ):
             return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        # `finished_reason` (a FINISH_ABORT.to_json() dict) lets the caller record
+        # WHY the request is aborted (e.g. a client cancel/disconnect, via
+        # `client_cancel_finish_reason`). The scheduler uses it to set the correct
+        # status on the resulting FINISH_ABORT instead of a bare, status-less abort.
+        req = AbortReq(rid=rid, abort_all=abort_all, finished_reason=finished_reason)
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
@@ -1927,11 +1942,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
+            # Fires when the client connection has closed -> a client cancel.
+            reason = client_cancel_finish_reason()
             if obj.is_single:
-                self.abort_request(obj.rid)
+                self.abort_request(obj.rid, finished_reason=reason)
             else:
                 for rid in obj.rid:
-                    self.abort_request(rid)
+                    self.abort_request(rid, finished_reason=reason)
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
@@ -2630,6 +2647,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
+            # A client cancel/disconnect is not a completed request. It is already
+            # counted via observe_one_aborted_request in abort_request(), so exclude
+            # it from the finished (success) request metric rather than counting it
+            # as a normal finish.
+            finish_reason_i = (
+                recv_obj.finished_reasons[i]
+                if getattr(recv_obj, "finished_reasons", None)
+                else None
+            )
+            is_client_cancel = (
+                isinstance(finish_reason_i, dict)
+                and finish_reason_i.get("type") == "abort"
+                and finish_reason_i.get("status_code") == CLIENT_CLOSED_REQUEST
+            )
+
             # Get detailed cache breakdown if available
             cached_tokens_details = None
             if (
@@ -2646,16 +2678,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else 0
             )
 
-            self.metrics_collector.observe_one_finished_request(
-                labels,
-                recv_obj.prompt_tokens[i],
-                completion_tokens,
-                recv_obj.cached_tokens[i],
-                state.time_stats.get_e2e_latency(),
-                self._request_has_grammar(state.obj),
-                cached_tokens_details,
-                spec_verify_ct=spec_verify_ct,
-            )
+            if not is_client_cancel:
+                self.metrics_collector.observe_one_finished_request(
+                    labels,
+                    recv_obj.prompt_tokens[i],
+                    completion_tokens,
+                    recv_obj.cached_tokens[i],
+                    state.time_stats.get_e2e_latency(),
+                    self._request_has_grammar(state.obj),
+                    cached_tokens_details,
+                    spec_verify_ct=spec_verify_ct,
+                )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
         if self.dump_requests_exclude_meta_keys and isinstance(
