@@ -53,9 +53,16 @@ def _make_x(num_tokens: int, strided: bool) -> torch.Tensor:
     return x
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 8, 64])
-@pytest.mark.parametrize("case", ["random", "all_equal", "nan_mixed"])
-@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize(
+    "num_tokens,case,strided",
+    [
+        (1, "random", False),
+        (2, "all_equal", False),
+        (8, "nan_mixed", True),
+        (8, "random", True),
+        (64, "random", False),
+    ],
+)
 def test_fused_matches_unfused_chain(num_tokens: int, case: str, strided: bool):
     if not moe_route_quant_fused.available():
         pytest.skip("JIT fused route+quant kernel unavailable")

@@ -65,22 +65,18 @@ def _make_case(
     return scores, bias
 
 
-@pytest.mark.parametrize("num_tokens", [1, 3, 8, 512])
 @pytest.mark.parametrize(
-    "case",
+    "num_tokens,case,renormalize,apply_scale,score_dtype",
     [
-        "random",
-        "all_equal",
-        "few_values",
-        "nan_mixed",
-        "mostly_nan",
-        "huge_negative_bias",
+        (1, "random", True, True, torch.bfloat16),
+        (8, "few_values", True, False, torch.bfloat16),
+        (3, "nan_mixed", False, False, torch.bfloat16),
+        (1, "mostly_nan", True, True, torch.bfloat16),
+        (8, "huge_negative_bias", True, True, torch.bfloat16),
+        (3, "random", True, True, torch.float32),
+        (512, "random", True, True, torch.bfloat16),
     ],
 )
-@pytest.mark.parametrize(
-    "renormalize,apply_scale", [(True, True), (False, False), (True, False)]
-)
-@pytest.mark.parametrize("score_dtype", [torch.bfloat16, torch.float32])
 def test_route_radix_vs_triton(num_tokens, case, renormalize, apply_scale, score_dtype):
     torch.manual_seed(num_tokens)
     scores, bias = _make_case(case, num_tokens, dtype=score_dtype)

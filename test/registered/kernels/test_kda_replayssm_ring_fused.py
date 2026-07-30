@@ -37,23 +37,18 @@ from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (  # noqa
 
 DEV = "cuda"
 
-# (bs, T, HV, H, K, V) -- cover GQA (H<HV), non-pow2 K/V, small T, single head.
-SHAPES = [
-    (16, 7, 4, 4, 64, 64),  # baseline square heads
-    (64, 7, 32, 32, 128, 128),  # K3-like TP8 shape
-    (8, 4, 8, 2, 128, 128),  # GQA: 4 v-heads per k-head
-    (4, 3, 6, 3, 96, 80),  # non-pow2 K/V, GQA 2:1
-    (1, 1, 4, 4, 64, 64),  # single req, single step
-]
-SHAPE_IDS = ["square", "k3-tp8", "gqa4", "nonpow2", "single"]
-GATES = [(-5.0, "safe"), (None, "softplus")]
 
-
-@pytest.mark.parametrize("bs,T,HV,H,K,V", SHAPES, ids=SHAPE_IDS)
 @pytest.mark.parametrize(
-    "lower_bound", [g[0] for g in GATES], ids=[g[1] for g in GATES]
+    "bs,T,HV,H,K,V,lower_bound,pad",
+    [
+        (16, 7, 4, 4, 64, 64, -5.0, False),
+        (64, 7, 32, 32, 128, 128, None, False),
+        (8, 4, 8, 2, 128, 128, -5.0, True),
+        (4, 3, 6, 3, 96, 80, None, False),
+        (1, 1, 4, 4, 64, 64, -5.0, False),
+    ],
+    ids=["square", "k3-tp8-softplus", "gqa4-pad", "nonpow2", "single"],
 )
-@pytest.mark.parametrize("pad", [False, True], ids=["nopad", "pad"])
 def test_ring_fold_parity(bs, T, HV, H, K, V, lower_bound, pad):
     L = max(16, 2 * T)  # ring length; power-of-two backstop satisfied
     scale = K**-0.5

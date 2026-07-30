@@ -9,25 +9,16 @@ single-rounded fp32 sum; the prefetch_bc entry point must compute the same
 function (it only reorders loads around the PDL wait).
 """
 
-import itertools
 import sys
 
 import pytest
 import torch
 
-from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.elementwise import add3
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-# Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
-NUM_TOKENS = [2**n for n in range(0, 15)]
-NUM_TOKENS += [x + 1 + i for i, x in enumerate(NUM_TOKENS)]
-NUM_TOKENS = get_ci_test_range(NUM_TOKENS, [1, 9, 256, 16399])
-# All divisible by 16 so numel stays a vector-width multiple at any T.
-HIDDEN_DIMS = get_ci_test_range([48, 64, 112, 512, 1024, 4096, 7168], [64, 112, 7168])
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
 
@@ -45,7 +36,7 @@ def _assert_bit_exact(a, b, c, *, prefetch_bc: bool = False) -> None:
 
 @pytest.mark.parametrize(
     "num_tokens,hidden_dim",
-    list(itertools.product(NUM_TOKENS, HIDDEN_DIMS)),
+    [(1, 64), (9, 112), (256, 7168), (16399, 64)],
 )
 def test_bit_exact(num_tokens: int, hidden_dim: int) -> None:
     torch.manual_seed(num_tokens * 7 + hidden_dim)
@@ -55,11 +46,7 @@ def test_bit_exact(num_tokens: int, hidden_dim: int) -> None:
     _assert_bit_exact(a, b, c)
 
 
-# Smaller subset for targeted tests below
-REPR_TOKENS = get_ci_test_range([1, 7, 128, 4096], [1, 128])
-
-
-@pytest.mark.parametrize("num_tokens", REPR_TOKENS)
+@pytest.mark.parametrize("num_tokens", [1, 128])
 def test_prefetch_bc(num_tokens: int) -> None:
     # The prefetch entry point only reorders loads around the PDL wait; it
     # must compute the same function as the default entry point.

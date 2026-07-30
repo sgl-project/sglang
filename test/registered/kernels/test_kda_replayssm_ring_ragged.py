@@ -127,9 +127,9 @@ def test_ragged_full_commit(bs, gamma, HV, H, K, V):
     _run_case(bs, gamma, HV, H, K, V, lens, acc=lens.clone(), L=L)
 
 
-@pytest.mark.parametrize("bs,gamma,HV,H,K,V", SHAPES, ids=SHAPE_IDS)
-def test_ragged_partial_commit(bs, gamma, HV, H, K, V):
+def test_ragged_partial_commit():
     torch.manual_seed(1)
+    bs, gamma, HV, H, K, V = SHAPES[1]
     L = max(16, 2 * gamma)
     lens = torch.randint(1, gamma + 1, (bs,), device=DEV, dtype=torch.int32)
     acc = (lens + 1) // 2

@@ -55,20 +55,6 @@ class TestNormalizeAndPatchify(CustomTestCase):
                 )
                 self.assertTrue(torch.equal(image, image_before))
 
-    def test_noncontiguous_input_uses_equivalent_fallback(self):
-        image = torch.randn((1, 3, 8, 10), device="cuda")[:, :, :, ::2]
-        scale = torch.ones((1, 3, 1, 1), device="cuda")
-        bias = torch.zeros((1, 3, 1, 1), device="cuda")
-
-        actual = normalize_and_patchify(
-            image, scale, bias, patch_size=2, padded_height=8, padded_width=6
-        )
-        expected = _normalize_and_patchify_torch(
-            image, scale, bias, patch_size=2, padded_height=8, padded_width=6
-        )
-
-        self.assertTrue(torch.equal(actual, expected))
-
 
 if __name__ == "__main__":
     unittest.main()

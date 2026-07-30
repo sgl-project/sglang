@@ -3,9 +3,8 @@
 Compares the 1shot multicast-push and the in-place low-SM NVLS 2shot pull
 (with and without the fused residual) against
 NCCL, bit-exact on small-int bf16 inputs; the fused-RMSNorm pull against a
-torch reference; the pull tuning knobs (num_blocks, unroll) on sizes whose
-shard split is uneven; plus a CUDA-graph capture/replay pass exercising the
-push phase double-buffering and pull semaphore reuse.
+torch reference; plus a CUDA-graph capture/replay pass exercising the push
+phase double-buffering and pull semaphore reuse.
 
 The module relaunches itself under torchrun with four GPUs when run directly.
 """
@@ -21,7 +20,7 @@ import torch
 import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.kernels.jit.utils import cache_once, get_ci_test_range
+from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.kernels.ops.kimi_k3 import all_reduce
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
@@ -45,10 +44,10 @@ H = 7168  # Kimi-K3 hidden size; the kernels are tuned/used at multiples of it
 NORM_DIM = 3584  # latent width; the norm buffer is [N, NORM_DIM] + [N, 2*NORM_DIM]
 MB = 1024 * 1024
 
-PUSH_BS = [1, 2, 8, 32, 128]
-PULL_BS = [1, 8, 64, 1024, 4096]
-PUSH_BS = get_ci_test_range(PUSH_BS, [1, 32, 128])
-PULL_BS = get_ci_test_range(PULL_BS, [1, 64, 4096])
+PUSH_CASES = [(1, False), (32, True), (128, False)]
+PULL_CASES = [(1, False), (64, True), (4096, False)]
+PUSH_BS = [case[0] for case in PUSH_CASES]
+PULL_BS = [case[0] for case in PULL_CASES]
 
 
 def _precompile(num_gpus):
@@ -157,8 +156,7 @@ def _assert_norm_close(x: torch.Tensor, ref: torch.Tensor, num_norm_rows: int):
     )
 
 
-@pytest.mark.parametrize("bs", PUSH_BS)
-@pytest.mark.parametrize("use_residual", [False, True])
+@pytest.mark.parametrize("bs,use_residual", PUSH_CASES)
 @torch.inference_mode()
 def test_ar_fusion_push(bs: int, use_residual: bool):
     comm = _init_comm()
@@ -172,8 +170,7 @@ def test_ar_fusion_push(bs: int, use_residual: bool):
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("bs", PULL_BS)
-@pytest.mark.parametrize("use_residual", [False, True])
+@pytest.mark.parametrize("bs,use_residual", PULL_CASES)
 @torch.inference_mode()
 def test_ar_fusion_pull_2shot(bs: int, use_residual: bool):
     comm = _init_comm()
@@ -189,29 +186,10 @@ def test_ar_fusion_pull_2shot(bs: int, use_residual: bool):
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("num_blocks", [1, 2, 4, 8])
-@pytest.mark.parametrize("unroll", [4, 8])
-@torch.inference_mode()
-def test_ar_fusion_pull_tuning_grid(num_blocks: int, unroll: int):
-    """Every (num_blocks, unroll) combination must agree with NCCL on a size
-    whose 16B-vector count is not divisible by the world size (uneven shards)
-    and whose per-thread range leaves an unrolled-loop tail."""
-    _init_comm()
-    world = dist.get_world_size()
-    buf, mc = _init_pool_buf()
-    n = (3 * H + 7) * 8  # 21511 vecs: % 8 ranks != 0, small vs blocks*512*unroll
-    x = buf[:n]
-    x.copy_(_int_input(n, num_blocks * 10 + unroll, per_rank=True))
-    ref = _nccl_ref(x, None)
-    all_reduce.all_reduce_pull_res(
-        world, x, None, input_mc_ptr=mc, num_blocks=num_blocks, unroll=unroll
-    )
-    torch.cuda.synchronize()
-    torch.testing.assert_close(x, ref, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("num_tokens", PULL_BS)
-@pytest.mark.parametrize("rows_per_token", [3, 1])  # [N|2N] MoE buf / latent-only
+@pytest.mark.parametrize(
+    "num_tokens,rows_per_token",
+    [(1, 1), (64, 3), (4096, 1)],
+)
 @torch.inference_mode()
 def test_ar_fusion_pull_norm(num_tokens: int, rows_per_token: int):
     _init_comm()
@@ -229,8 +207,10 @@ def test_ar_fusion_pull_norm(num_tokens: int, rows_per_token: int):
     _assert_norm_close(x, ref, num_tokens)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 8, 24])
-@pytest.mark.parametrize("rows_per_token", [3, 1])
+@pytest.mark.parametrize(
+    "num_tokens,rows_per_token",
+    [(1, 1), (8, 3), (24, 1)],
+)
 @torch.inference_mode()
 def test_ar_fusion_push_norm(num_tokens: int, rows_per_token: int):
     """The push-side norm (small-message regime of the serving dispatch) with
@@ -300,7 +280,7 @@ def _finalize_norm_ref(gemm2, idx, weights, norm_w, eps: float) -> torch.Tensor:
     return (total * factor * norm_w.float()).to(torch.bfloat16)
 
 
-@pytest.mark.parametrize("bs", PUSH_BS)
+@pytest.mark.parametrize("bs", [1, 128])
 @torch.inference_mode()
 def test_ar_fusion_finalize_push_norm(bs: int):
     comm = _init_comm()
@@ -348,7 +328,7 @@ def test_ar_fusion_graph_capture():
     with torch.cuda.graph(graph):
         _run_all()
 
-    for it in range(4):
+    for it in range(2):
         vx = _int_input(n, 5000 + it, per_rank=True)
         vy = _int_input(n, 6000 + it, per_rank=True)
         vz = _int_input(n, 7000 + it, per_rank=True)

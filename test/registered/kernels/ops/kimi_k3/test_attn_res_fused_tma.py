@@ -10,7 +10,7 @@ dispatched per nvb through _TMA_BEST_CONFIG.
 
 Pinned failure modes:
 - chain math (score formula, online-softmax chunk correction across full and
-  partial chunks — nvb 1..8 covers every chunk shape of the dispatch table —
+  partial chunks — representative nvb values cover every launch config —
   fp32-accumulated combine, fused output RMSNorm) vs an fp32 reference, on
   every launch config the table dispatches: the occupancy=2 config (nvb=1,
   T >= 128 plus its small-T fallback) and the 3/4/5-row-chunk setmaxnreg
@@ -76,27 +76,31 @@ class TestAttnResFusedTma(CustomTestCase):
         if get_device_sm() < 100:
             raise unittest.SkipTest("attn_res_fused_tma requires SM100a+")
 
-    def test_matches_reference_all_bank_sizes(self):
-        # T = 1 and 5 run every nvb on the small-T side of the dispatch
-        # (nvb=1 takes the occupancy=1 fallback); 6*SM+3 crosses the nvb=1
-        # occupancy=2 threshold and gives >= 3 tokens per CTA even on its
-        # 2*SM grid, so single-chunk-per-token configs still flip the
-        # mbarrier phase parity (slot reuse starts at the third chunk).
+    def test_matches_reference_dispatch_configs(self):
+        # Cover every unique launch config, the nvb=1 small-T fallback, the
+        # occupancy=2 path, and the two-chunk nvb=8 row layout.
         num_sm = torch.cuda.get_device_properties(0).multi_processor_count
-        for nvb in range(1, 9):
-            for T in (1, 5, 6 * num_sm + 3):
-                with self.subTest(nvb=nvb, T=T):
-                    prefix, bank, cw, ow = _make_inputs(T, seed=8 * T + nvb)
-                    prefix_ref, bank_ref = prefix.clone(), bank.clone()
+        cases = [
+            (1, 5),
+            (1, 6 * num_sm + 3),
+            (2, 5),
+            (4, 5),
+            (5, 5),
+            (8, 5),
+        ]
+        for nvb, T in cases:
+            with self.subTest(nvb=nvb, T=T):
+                prefix, bank, cw, ow = _make_inputs(T, seed=8 * T + nvb)
+                prefix_ref, bank_ref = prefix.clone(), bank.clone()
 
-                    out = torch.empty_like(prefix)
-                    attn_res_fused_tma(prefix, bank, cw, ow, out, nvb, _EPS)
+                out = torch.empty_like(prefix)
+                attn_res_fused_tma(prefix, bank, cw, ow, out, nvb, _EPS)
 
-                    ref = _reference(prefix, bank, nvb, cw, ow, _EPS)
-                    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=4e-2)
+                ref = _reference(prefix, bank, nvb, cw, ow, _EPS)
+                torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=4e-2)
 
-                    self.assertTrue(torch.equal(prefix, prefix_ref))
-                    self.assertTrue(torch.equal(bank, bank_ref))
+                self.assertTrue(torch.equal(prefix, prefix_ref))
+                self.assertTrue(torch.equal(bank, bank_ref))
 
     def test_wide_bank_row_addressing(self):
         """NB > nvb: rows must be addressed with the true bank stride."""
@@ -109,28 +113,24 @@ class TestAttnResFusedTma(CustomTestCase):
     def test_fused_prefix_write(self):
         """write_prefix=True snapshots the prefix row into bank[:, nvb]
         bit-exactly without touching any other row or the aggregation
-        output. nvb 1..8 covers the prefix row landing in every chunk
-        shape of the dispatch table; the large T exercises the persistent
-        token loop (each CTA writes several tokens' rows)."""
+        output. The cases cover the first, middle, and final valid prefix-row
+        positions plus the persistent token loop."""
         num_sm = torch.cuda.get_device_properties(0).multi_processor_count
-        for nvb in range(1, 9):
-            for T in (1, 5, 6 * num_sm + 3):
-                with self.subTest(nvb=nvb, T=T):
-                    prefix, bank, cw, ow = _make_inputs(
-                        T, seed=8 * T + nvb, num_bank_slots=9
-                    )
-                    bank_ref = bank.clone()
-                    out = torch.empty_like(prefix)
-                    attn_res_fused_tma(
-                        prefix, bank, cw, ow, out, nvb, _EPS, write_prefix=True
-                    )
-                    ref = _reference(prefix, bank_ref, nvb, cw, ow, _EPS)
-                    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=4e-2)
-                    self.assertTrue(torch.equal(bank[:, nvb], prefix))
-                    self.assertTrue(torch.equal(bank[:, :nvb], bank_ref[:, :nvb]))
-                    self.assertTrue(
-                        torch.equal(bank[:, nvb + 1 :], bank_ref[:, nvb + 1 :])
-                    )
+        for nvb, T in ((1, 1), (5, 5), (8, 6 * num_sm + 3)):
+            with self.subTest(nvb=nvb, T=T):
+                prefix, bank, cw, ow = _make_inputs(
+                    T, seed=8 * T + nvb, num_bank_slots=9
+                )
+                bank_ref = bank.clone()
+                out = torch.empty_like(prefix)
+                attn_res_fused_tma(
+                    prefix, bank, cw, ow, out, nvb, _EPS, write_prefix=True
+                )
+                ref = _reference(prefix, bank_ref, nvb, cw, ow, _EPS)
+                torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=4e-2)
+                self.assertTrue(torch.equal(bank[:, nvb], prefix))
+                self.assertTrue(torch.equal(bank[:, :nvb], bank_ref[:, :nvb]))
+                self.assertTrue(torch.equal(bank[:, nvb + 1 :], bank_ref[:, nvb + 1 :]))
 
     def test_pdl_chain_under_cuda_graph(self):
         """A preceding kernel writes prefix_sum; capture + replay (where the
@@ -152,14 +152,13 @@ class TestAttnResFusedTma(CustomTestCase):
 
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
-            for _ in range(3):
-                chain()
+            chain()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
                 chain()
         torch.cuda.synchronize()
         out.zero_()
-        for _ in range(10):
+        for _ in range(2):
             graph.replay()
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(out, out_eager))

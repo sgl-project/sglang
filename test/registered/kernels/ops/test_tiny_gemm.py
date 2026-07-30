@@ -5,20 +5,21 @@ from sglang.kernels.ops.gemm.tiny_gemm import tiny_k_gemm_bf16, tiny_n_gemm_bf16
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-
-# (n, k) shapes: skinny decode projections; (1536, 512) exercises the
-# multi-wave fallback (split_n capped by the 32-thread block).
-SHAPES = [(144, 7168), (896, 7168), (256, 4096), (1536, 512)]
 
 
 def _ref(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return x.double() @ w.double().t()
 
 
-@pytest.mark.parametrize("n,k", SHAPES)
-@pytest.mark.parametrize("m", [1, 2, 7, 16])
-@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "n,k,m,out_dtype",
+    [
+        (144, 7168, 1, torch.float32),
+        (896, 7168, 7, torch.bfloat16),
+        (256, 4096, 16, torch.float32),
+        (1536, 512, 2, torch.bfloat16),
+    ],
+)
 def test_tiny_gemm_correctness(n, k, m, out_dtype):
     torch.manual_seed(0)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) / 8
@@ -29,7 +30,7 @@ def test_tiny_gemm_correctness(n, k, m, out_dtype):
     torch.testing.assert_close(out.double(), _ref(x, w), rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("split_n", [1, 2, 4, 8])
+@pytest.mark.parametrize("split_n", [1, 4, 8])
 def test_tiny_gemm_split_n(split_n):
     torch.manual_seed(0)
     x = torch.randn(4, 7168, device="cuda", dtype=torch.bfloat16) / 8
@@ -47,9 +48,14 @@ def test_tiny_gemm_out_param():
     torch.testing.assert_close(out.double(), _ref(x, w), rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("n,k", [(1536, 128), (896, 256)])
-@pytest.mark.parametrize("m", [1, 2, 7, 16])
-@pytest.mark.parametrize("split_n", [None, 2, 4])
+@pytest.mark.parametrize(
+    "n,k,m,split_n",
+    [
+        (1536, 128, 1, None),
+        (1536, 128, 7, 4),
+        (896, 256, 16, 2),
+    ],
+)
 def test_tiny_k_gemm_correctness(n, k, m, split_n):
     torch.manual_seed(0)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) / 4

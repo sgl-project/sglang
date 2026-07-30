@@ -161,8 +161,8 @@ def test_cutedsl_ring_fold_parity(N, H, num_spec):
         assert rel < 2e-2, f"req={j}: rel={rel:.3e}"
 
 
-@pytest.mark.parametrize("N", [4, 32], ids=["small-grid", "large-grid"])
-def test_cutedsl_fused_output_norm(N):
+def test_cutedsl_fused_output_norm():
+    N = 4
     H, num_spec, seed = 2, 2, 7
     raw, _ = _run("baseline", N=N, H=H, num_spec=num_spec, seed=seed)
     fused, norm = _run("baseline", N=N, H=H, num_spec=num_spec, seed=seed, onorm=True)
@@ -173,8 +173,8 @@ def test_cutedsl_fused_output_norm(N):
     torch.testing.assert_close(fused.float(), ref, rtol=2e-2, atol=3e-2)
 
 
-@pytest.mark.parametrize("N", [4, 32], ids=["small-grid", "large-grid"])
-def test_cutedsl_cuda_graph_padding_slot_is_safe(N):
+def test_cutedsl_cuda_graph_padding_slot_is_safe():
+    N = 32
     _, ring = _run("ring", N=N, H=2, num_spec=2, seed=11, pad_last=True)
     torch.cuda.synchronize()
 

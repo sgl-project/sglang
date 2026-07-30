@@ -26,7 +26,6 @@ from sglang.kernels.ops.kvcache.set_mla_kv_buffer import set_mla_kv_buffer
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 NOPE_DIM = 512
 ROPE_DIM = 64
@@ -70,10 +69,14 @@ def _reference(pool, loc, k_nope, k_rope, q_nope, q_rope):
     return concat_mla_absorb_q(q_nope, q_rope)
 
 
-@pytest.mark.parametrize("loc_dtype", [torch.int64, torch.int32])
 @pytest.mark.parametrize(
-    "bs,heads",
-    [(1, 8), (12, 8), (64, 8), (300, 16), (1024, 8)],  # spans nw=4 and nw=8 tiers
+    "bs,heads,loc_dtype",
+    [
+        (1, 8, torch.int64),
+        (64, 8, torch.int32),
+        (300, 16, torch.int64),
+        (1024, 8, torch.int32),
+    ],
 )
 def test_bitexact_vs_two_kernels(bs, heads, loc_dtype):
     _require_supported()

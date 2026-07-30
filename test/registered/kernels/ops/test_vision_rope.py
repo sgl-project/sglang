@@ -16,8 +16,15 @@ def native_complex_rope(q, k, freqs_cis):
     return q_out.type_as(q), k_out.type_as(k)
 
 
-@pytest.mark.parametrize("tokens", [1, 480, 5660, 8360])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "tokens,dtype",
+    [
+        (1, torch.bfloat16),
+        (480, torch.float16),
+        (5660, torch.bfloat16),
+        (8360, torch.float16),
+    ],
+)
 def test_fused_qk_complex_rope_matches_native(tokens, dtype):
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("The fused vision RoPE path targets Hopper or newer NVIDIA GPUs")

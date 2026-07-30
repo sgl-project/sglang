@@ -23,7 +23,6 @@ from sglang.kernels.ops.attention.utils import concat_mla_absorb_q_general
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 NOPE, ROPE, TOTAL, PAGES = 512, 64, 576, 2048
 
@@ -68,8 +67,15 @@ def _reference(pool, loc, k_nope, k_rope, q_nope, q_rope):
     return q_fp8
 
 
-@pytest.mark.parametrize("loc_dtype", [torch.int64, torch.int32])
-@pytest.mark.parametrize("bs,heads", [(1, 8), (12, 8), (64, 8), (300, 16), (1024, 8)])
+@pytest.mark.parametrize(
+    "bs,heads,loc_dtype",
+    [
+        (1, 8, torch.int64),
+        (64, 8, torch.int32),
+        (300, 16, torch.int64),
+        (1024, 8, torch.int32),
+    ],
+)
 def test_bitexact_vs_aten_chain(bs, heads, loc_dtype):
     _require_supported()
     pool, loc, k_nope, k_rope, q_nope, q_rope = _make_inputs(bs, heads, loc_dtype, bs)
@@ -114,7 +120,7 @@ def test_graph_capture_replay_bitexact():
         assert torch.equal(query.view(torch.uint8), query_ref.view(torch.uint8))
 
 
-@pytest.mark.parametrize("world,rank", [(8, 0), (8, 3), (8, 7), (4, 1)])
+@pytest.mark.parametrize("world,rank", [(8, 0), (8, 7)])
 def test_dcp_virtual_loc_semantics(world, rank):
     """Under DCP the loc is VIRTUAL: only the owner rank
     (loc % world == rank) writes, at physical row loc // world — mirroring

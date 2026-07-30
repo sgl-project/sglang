@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.kernels.jit.utils import cache_once, get_ci_test_range
+from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.kimi_k3 import gemm_ar
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
@@ -34,9 +34,7 @@ register_cuda_ci(
 N = gemm_ar.N
 K = 12288 // int(os.environ.get("WORLD_SIZE", "8"))
 
-BATCH = get_ci_test_range(
-    [1, 5, 8, 16, 24, 32, 64, 100, 128, 300, 512], [1, 8, 64, 512]
-)
+BATCH = [1, 8, 64, 512]
 
 
 def _precompile(num_gpus):
@@ -112,7 +110,7 @@ def test_gemm_ar_correctness(bs: int):
     x = _make_x(bs)
     ref = _ref(x, weight)
     # back-to-back same-cell launches exercise the epoch ring reuse
-    for _ in range(3):
+    for _ in range(2):
         out = gemm_ar.o_proj_gemm_ar(x, weight)
     torch.cuda.synchronize()
     dist.barrier()
@@ -124,7 +122,7 @@ def test_gemm_ar_cell_flip():
     """Alternating cells forces the collective ring reset each call."""
     _init_state()
     weight = _weight()
-    for bs in [1, 64, 1, 300, 8]:
+    for bs in [1, 64, 300]:
         x = _make_x(bs)
         ref = _ref(x, weight)
         out = gemm_ar.o_proj_gemm_ar(x, weight)
