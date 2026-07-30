@@ -239,9 +239,7 @@ class _ControlFrameProxy:
         deadline = time.monotonic() + (5 if wait else 0.2)
         while not self._stop.is_set() and time.monotonic() < deadline:
             try:
-                return socket.create_connection(
-                    ("127.0.0.1", self.upstream_port), timeout=0.2
-                )
+                return socket.create_connection(("127.0.0.1", self.upstream_port), timeout=0.2)
             except OSError:
                 time.sleep(0.02)
         return None
@@ -280,23 +278,13 @@ class _ControlFrameProxy:
                 if header is None:
                     return
                 payload_length = int.from_bytes(header[12:16], "big")
-                body = self._receive_exact(
-                    source, payload_length + self._TAG_BYTES, closed
-                )
+                body = self._receive_exact(source, payload_length + self._TAG_BYTES, closed)
                 if body is None:
                     return
                 kind = int.from_bytes(header[8:10], "big")
-                if (
-                    pause_enabled
-                    and self.pause_kind == kind
-                    and not self.reached.is_set()
-                ):
+                if pause_enabled and self.pause_kind == kind and not self.reached.is_set():
                     self.reached.set()
-                    while (
-                        not self.release.wait(0.05)
-                        and not self._stop.is_set()
-                        and not closed.is_set()
-                    ):
+                    while not self.release.wait(0.05) and not self._stop.is_set() and not closed.is_set():
                         pass
                 if self._stop.is_set() or closed.is_set():
                     return
@@ -321,10 +309,32 @@ class _ControlFrameProxy:
 
 
 class RustPdTransportSourceTreeTest(unittest.TestCase):
+    def test_idle_pair_survives_three_heartbeat_intervals(self):
+        module = importlib.import_module(os.environ.get("SGLANG_PD_CORE_MODULE", "_core"))
+        with tempfile.TemporaryDirectory() as directory:
+            psk_file = Path(directory) / "control.psk"
+            psk_file.write_bytes(bytes(range(32)))
+            psk_file.chmod(0o400)
+            control_port = _free_control_port()
+            prefill = module.PdTransport(_config("prefill", control_port, psk_file))
+            decode = module.PdTransport(_config("decode", control_port, psk_file))
+            try:
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    prefill_start = executor.submit(prefill.start)
+                    decode_start = executor.submit(decode.start)
+                    decode_start.result(timeout=10)
+                    prefill_start.result(timeout=10)
+
+                time.sleep(16)
+
+                self.assertEqual(prefill.readiness().snapshot().lifecycle, "PairReady")
+                self.assertEqual(decode.readiness().snapshot().lifecycle, "PairReady")
+            finally:
+                prefill.shutdown()
+                decode.shutdown()
+
     def test_plain_server_starts_without_transport_or_psk(self):
-        module = importlib.import_module(
-            os.environ.get("SGLANG_PD_CORE_MODULE", "_core")
-        )
+        module = importlib.import_module(os.environ.get("SGLANG_PD_CORE_MODULE", "_core"))
         http_port = _free_control_port()
         model_path = "/mnt/models/Qwen/Qwen3-0.6B"
         server = module.Server(
@@ -354,9 +364,7 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
             server.shutdown()
 
     def test_symmetric_abort_ack_is_terminal_once_and_clears_handles(self):
-        module = importlib.import_module(
-            os.environ.get("SGLANG_PD_CORE_MODULE", "_core")
-        )
+        module = importlib.import_module(os.environ.get("SGLANG_PD_CORE_MODULE", "_core"))
         with tempfile.TemporaryDirectory() as directory:
             psk_file = Path(directory) / "control.psk"
             psk_file.write_bytes(bytes(range(32)))
@@ -372,21 +380,15 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
 
                 attempt = "77777777-7777-4777-8777-777777777777"
                 digest = "77" * 32
-                decode_handle = decode.receiver_create_many([0], [attempt], [digest])[
-                    0
-                ].handle
+                decode_handle = decode.receiver_create_many([0], [attempt], [digest])[0].handle
                 prefill_handle = prefill.sender_create_many(
                     ["22222222-2222-4222-8222-222222222222"],
                     [0],
                     [attempt],
                     [digest],
                 )[0].handle
-                prefill_abort = executor.submit(
-                    prefill.abort_many, [prefill_handle], "PD_ABORTED"
-                )
-                decode_abort = executor.submit(
-                    decode.abort_many, [decode_handle], "PD_ABORTED"
-                )
+                prefill_abort = executor.submit(prefill.abort_many, [prefill_handle], "PD_ABORTED")
+                decode_abort = executor.submit(decode.abort_many, [decode_handle], "PD_ABORTED")
                 self.assertTrue(prefill_abort.result(timeout=10)[0].ok)
                 self.assertTrue(decode_abort.result(timeout=10)[0].ok)
 
@@ -402,9 +404,7 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
                 transport.shutdown()
 
     def test_authenticated_batch_transfers_completion_and_first_token_once(self):
-        module = importlib.import_module(
-            os.environ.get("SGLANG_PD_CORE_MODULE", "_core")
-        )
+        module = importlib.import_module(os.environ.get("SGLANG_PD_CORE_MODULE", "_core"))
         with tempfile.TemporaryDirectory() as directory:
             psk_file = Path(directory) / "control.psk"
             psk_file.write_bytes(bytes(range(32)))
@@ -475,14 +475,10 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
             second = decode.poll_many(decode_handles)
             self.assertEqual([item.first_token_id for item in second], [None, None])
             self.assertTrue(second[0].first_token_consumed)
-            self.assertTrue(
-                all(item.status == 4 for item in prefill.poll_many(prefill_handles))
-            )
+            self.assertTrue(all(item.status == 4 for item in prefill.poll_many(prefill_handles)))
 
             self.assertTrue(all(item.ok for item in decode.clear_many(decode_handles)))
-            self.assertTrue(
-                all(item.ok for item in prefill.clear_many(prefill_handles))
-            )
+            self.assertTrue(all(item.ok for item in prefill.clear_many(prefill_handles)))
             self.assertEqual(decode.readiness().snapshot().active_handles, 0)
             self.assertEqual(prefill.readiness().snapshot().active_handles, 0)
             resource_fields = (
@@ -607,9 +603,7 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
             self.assertEqual(decode.exitcode, 0)
 
     def test_surviving_prefill_rejects_old_epoch_and_recovers_with_new_decode(self):
-        module = importlib.import_module(
-            os.environ.get("SGLANG_PD_CORE_MODULE", "_core")
-        )
+        module = importlib.import_module(os.environ.get("SGLANG_PD_CORE_MODULE", "_core"))
         with tempfile.TemporaryDirectory() as directory:
             psk_file = Path(directory) / "control.psk"
             psk_file.write_bytes(bytes(range(32)))
@@ -627,10 +621,7 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
 
             first_decode.shutdown()
             deadline = time.monotonic() + 10
-            while (
-                prefill.readiness().snapshot().lifecycle != "LocalReady"
-                and time.monotonic() < deadline
-            ):
+            while prefill.readiness().snapshot().lifecycle != "LocalReady" and time.monotonic() < deadline:
                 time.sleep(0.05)
             disconnected = prefill.readiness().snapshot()
             self.assertFalse(disconnected.pair_ready)
@@ -646,10 +637,7 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
             # before the surviving endpoint rejects ownership. It must still
             # converge no later than the frozen two-miss heartbeat boundary.
             deadline = time.monotonic() + 12
-            while (
-                duplicate.readiness().snapshot().pair_ready
-                and time.monotonic() < deadline
-            ):
+            while duplicate.readiness().snapshot().pair_ready and time.monotonic() < deadline:
                 time.sleep(0.05)
             self.assertFalse(duplicate.readiness().snapshot().pair_ready)
             duplicate.shutdown()
@@ -667,10 +655,7 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
             )
             second_decode.start()
             deadline = time.monotonic() + 10
-            while (
-                not prefill.readiness().snapshot().pair_ready
-                and time.monotonic() < deadline
-            ):
+            while not prefill.readiness().snapshot().pair_ready and time.monotonic() < deadline:
                 time.sleep(0.05)
             recovered = prefill.readiness().snapshot()
             self.assertTrue(recovered.pair_ready)
@@ -681,12 +666,8 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
 
             attempt = "99999999-9999-4999-8999-999999999999"
             digest = "99" * 32
-            decode_handle = second_decode.receiver_create_many(
-                [1], [attempt], [digest]
-            )[0].handle
-            prefill_handle = prefill.sender_create_many(
-                [second_epoch], [1], [attempt], [digest]
-            )[0].handle
+            decode_handle = second_decode.receiver_create_many([1], [attempt], [digest])[0].handle
+            prefill_handle = prefill.sender_create_many([second_epoch], [1], [attempt], [digest])[0].handle
             with ThreadPoolExecutor(max_workers=4) as executor:
                 prepare = executor.submit(
                     second_decode.receiver_prepare_many,
@@ -725,9 +706,7 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
             [attempt],
             digest,
         )
-        decode_handle = _receive(queues["decode"][1], "receiver_create_many")[0][
-            "handle"
-        ]
+        decode_handle = _receive(queues["decode"][1], "receiver_create_many")[0]["handle"]
         _send(
             queues["prefill"][0],
             "sender_create_many",
@@ -736,9 +715,7 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
             [attempt],
             digest,
         )
-        prefill_handle = _receive(queues["prefill"][1], "sender_create_many")[0][
-            "handle"
-        ]
+        prefill_handle = _receive(queues["prefill"][1], "sender_create_many")[0]["handle"]
         return {"prefill": prefill_handle, "decode": decode_handle}
 
     def _prepare_process_room(self, queues, handles):
@@ -827,10 +804,7 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
             }.get(stage)
             proxy = _ControlFrameProxy(proxy_port, upstream_port, pause_kind)
             proxy.start()
-            queues = {
-                role: (context.Queue(), context.Queue())
-                for role in ("prefill", "decode")
-            }
+            queues = {role: (context.Queue(), context.Queue()) for role in ("prefill", "decode")}
             control_ports = {"prefill": upstream_port, "decode": proxy_port}
             processes = {
                 role: context.Process(
@@ -945,9 +919,7 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
                         "clear_many",
                         [handles[survivor_role]],
                     )
-                    self.assertTrue(
-                        _receive(queues[survivor_role][1], "clear_many")[0]["ok"]
-                    )
+                    self.assertTrue(_receive(queues[survivor_role][1], "clear_many")[0]["ok"])
                     self._assert_process_resources_clean(queues, roles=(survivor_role,))
 
                 replacement_epoch = {
@@ -985,11 +957,7 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
 
                 active_queues = dict(queues)
                 active_queues[killed_role] = replacement_queues
-                decode_epoch = (
-                    replacement_epoch
-                    if killed_role == "decode"
-                    else "22222222-2222-4222-8222-222222222222"
-                )
+                decode_epoch = replacement_epoch if killed_role == "decode" else "22222222-2222-4222-8222-222222222222"
                 recovered_handles = self._create_process_room(
                     active_queues,
                     decode_epoch,
@@ -1002,9 +970,7 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
                 for role in ("prefill", "decode"):
                     _send(active_queues[role][0], "shutdown")
                 for role in ("prefill", "decode"):
-                    self.assertEqual(
-                        _receive(active_queues[role][1], "shutdown"), "SafeTerminal"
-                    )
+                    self.assertEqual(_receive(active_queues[role][1], "shutdown"), "SafeTerminal")
                 clean_shutdown = True
             finally:
                 for process in (*processes.values(), replacement):
@@ -1035,9 +1001,7 @@ class RustPdTransportSourceTreeTest(unittest.TestCase):
                         killed_role=killed_role,
                         stage=stage,
                     ):
-                        self._assert_stage_signal_recovery(
-                            killed_role, process_signal, stage
-                        )
+                        self._assert_stage_signal_recovery(killed_role, process_signal, stage)
 
 
 if __name__ == "__main__":

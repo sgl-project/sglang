@@ -12,6 +12,15 @@ use crate::mooncake::{
 
 const MAX_INFLIGHT_BATCHES: usize = 4;
 
+fn normalize_exact_progress(expected: u64, mut progress: OperationProgress) -> OperationProgress {
+    if progress.state == crate::mooncake::OperationState::Completed
+        && progress.transferred_bytes != expected
+    {
+        progress.state = crate::mooncake::OperationState::Pending;
+    }
+    progress
+}
+
 struct RegionState {
     descriptor: RegionDescriptor,
     release_requested: bool,
@@ -411,27 +420,13 @@ impl Worker {
             match self.engine.poll(id, operation_index) {
                 Ok(progress) => {
                     let expected = self.batches[&id].operations[operation_index].length();
+                    let progress = normalize_exact_progress(expected, progress);
                     let batch = self
                         .batches
                         .get_mut(&id)
                         .expect("batch exists while polling");
-                    if progress.state == crate::mooncake::OperationState::Completed
-                        && progress.transferred_bytes != expected
-                    {
-                        batch.last_error = Some(EngineError::InvalidDescriptor {
-                            field: "transferred_bytes",
-                            detail: format!(
-                                "batch {} operation {} expected {}, got {}",
-                                id.get(),
-                                operation_index,
-                                expected,
-                                progress.transferred_bytes
-                            ),
-                        });
-                    } else {
-                        batch.progress[operation_index] = progress;
-                        batch.last_error = None;
-                    }
+                    batch.progress[operation_index] = progress;
+                    batch.last_error = None;
                 }
                 Err(error) => {
                     if let Some(batch) = self.batches.get_mut(&id) {
@@ -604,5 +599,56 @@ impl Worker {
             *outcome = Some(ShutdownOutcome::SafeTerminal);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mooncake::{OperationProgress, OperationState};
+
+    #[test]
+    fn completed_progress_stays_nonterminal_until_transferred_bytes_are_exact() {
+        for actual in [65_536, 196_608] {
+            assert_eq!(
+                normalize_exact_progress(
+                    131_072,
+                    OperationProgress {
+                        state: OperationState::Completed,
+                        transferred_bytes: actual,
+                    },
+                ),
+                OperationProgress {
+                    state: OperationState::Pending,
+                    transferred_bytes: actual,
+                }
+            );
+        }
+        assert_eq!(
+            normalize_exact_progress(
+                131_072,
+                OperationProgress {
+                    state: OperationState::Completed,
+                    transferred_bytes: 131_072,
+                },
+            ),
+            OperationProgress {
+                state: OperationState::Completed,
+                transferred_bytes: 131_072,
+            }
+        );
+        assert_eq!(
+            normalize_exact_progress(
+                131_072,
+                OperationProgress {
+                    state: OperationState::Failed,
+                    transferred_bytes: 0,
+                },
+            ),
+            OperationProgress {
+                state: OperationState::Failed,
+                transferred_bytes: 0,
+            }
+        );
     }
 }

@@ -595,7 +595,8 @@ mod upstream_cancel_tests {
 
         let payload = json!({
             "text": "PD streaming test",
-            "stream": true
+            "stream": true,
+            "sampling_params": {"temperature": 0}
         });
         let req = Request::builder()
             .method("POST")
@@ -1674,7 +1675,8 @@ mod upstream_cancel_tests {
 
         let payload = json!({
             "text": "PD streaming breaker test",
-            "stream": true
+            "stream": true,
+            "sampling_params": {"temperature": 0}
         });
         let req = Request::builder()
             .method("POST")
@@ -2091,7 +2093,11 @@ mod upstream_cancel_tests {
         let (s_pre, f_pre) = breaker_counts(&decode);
         let (_s_pre_prefill, f_pre_prefill) = breaker_counts(&prefill);
 
-        let payload = json!({ "text": "x", "stream": true });
+        let payload = json!({
+            "text": "x",
+            "stream": true,
+            "sampling_params": {"temperature": 0}
+        });
         let req = Request::builder()
             .method("POST")
             .uri("/generate")
@@ -2183,7 +2189,10 @@ mod upstream_cancel_tests {
         let (_s_pre_prefill, f_pre_prefill) = breaker_counts(&prefill);
 
         // Non-streaming /generate request.
-        let payload = json!({ "text": "x" });
+        let payload = json!({
+            "text": "x",
+            "sampling_params": {"temperature": 0}
+        });
         let req = Request::builder()
             .method("POST")
             .uri("/generate")
@@ -2399,7 +2408,11 @@ mod upstream_cancel_tests {
         let (s_pre_decode, f_pre_decode) = breaker_counts(&decode);
         let (s_pre_prefill, f_pre_prefill) = breaker_counts(&prefill);
 
-        let payload = json!({ "text": "x", "stream": true });
+        let payload = json!({
+            "text": "x",
+            "stream": true,
+            "sampling_params": {"temperature": 0}
+        });
         let req = Request::builder()
             .method("POST")
             .uri("/generate")
@@ -2484,7 +2497,11 @@ mod upstream_cancel_tests {
         let (s_pre_p, f_pre_p) = breaker_counts(&prefill);
         let (s_pre_d, f_pre_d) = breaker_counts(&decode);
 
-        let payload = json!({ "text": "x", "stream": true });
+        let payload = json!({
+            "text": "x",
+            "stream": true,
+            "sampling_params": {"temperature": 0}
+        });
         let req = Request::builder()
             .method("POST")
             .uri("/generate")
@@ -2661,7 +2678,11 @@ mod upstream_cancel_tests {
         // "decode_result is Err" arm in `execute_dual_dispatch_internal`.
         ctx.workers[1].stop().await;
 
-        let payload = json!({ "text": "x", "stream": true });
+        let payload = json!({
+            "text": "x",
+            "stream": true,
+            "sampling_params": {"temperature": 0}
+        });
         let req = Request::builder()
             .method("POST")
             .uri("/generate")

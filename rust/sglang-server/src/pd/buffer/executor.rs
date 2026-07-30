@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use crate::mooncake::BatchSnapshot;
+use crate::mooncake::{BatchSnapshot, OperationState};
 use crate::pd::buffer::{
     AUX_BYTES, BufferError, CapacityLedger, CompletionRecordInput, CompletionWrites,
     DestinationVisibilityFence, GpuDirectFlushPort, LeaseHandle, NativeBatchToken, NativeSafety,
@@ -118,6 +118,44 @@ pub trait NativeStagePort: Send {
     fn poll(&mut self, batch: NativeBatchToken) -> Result<BatchSnapshot, BufferError>;
 
     fn free_safe(&mut self, batch: NativeBatchToken) -> Result<(), BufferError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeBatchProgress {
+    operation_count: usize,
+    completed: usize,
+    failed: usize,
+    pending: usize,
+    transferred_bytes: u64,
+    expected_bytes: u64,
+}
+
+fn native_batch_progress(
+    snapshot: &BatchSnapshot,
+    expected_lengths: &[u64],
+) -> NativeBatchProgress {
+    let mut progress = NativeBatchProgress {
+        operation_count: snapshot.operations.len(),
+        completed: 0,
+        failed: 0,
+        pending: 0,
+        transferred_bytes: 0,
+        expected_bytes: expected_lengths
+            .iter()
+            .copied()
+            .fold(0_u64, u64::saturating_add),
+    };
+    for operation in &snapshot.operations {
+        progress.transferred_bytes = progress
+            .transferred_bytes
+            .saturating_add(operation.transferred_bytes);
+        match operation.state {
+            OperationState::Completed => progress.completed += 1,
+            state if state.is_terminal() => progress.failed += 1,
+            _ => progress.pending += 1,
+        }
+    }
+    progress
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,7 +394,19 @@ impl SourceExecutor {
         loop {
             let snapshot = match port.poll(batch) {
                 Ok(snapshot) => snapshot,
-                Err(_) => return Ok(BatchOutcome::Quarantined(batch)),
+                Err(_) => {
+                    tracing::warn!(
+                        phase = ?command.phase(),
+                        operation_count = command.expected_lengths().len(),
+                        expected_bytes = command
+                            .expected_lengths()
+                            .iter()
+                            .copied()
+                            .fold(0_u64, u64::saturating_add),
+                        "Rust PD native batch status failed closed"
+                    );
+                    return Ok(BatchOutcome::Quarantined(batch));
+                }
             };
             match evaluate_native_fence(&snapshot, command.expected_lengths()) {
                 NativeSafety::SafeSuccess => {
@@ -371,6 +421,17 @@ impl SourceExecutor {
                 }
                 NativeSafety::Pending => {
                     if self.clock.now_monotonic_ms() >= deadline_monotonic_ms {
+                        let progress = native_batch_progress(&snapshot, command.expected_lengths());
+                        tracing::warn!(
+                            phase = ?command.phase(),
+                            operation_count = progress.operation_count,
+                            completed = progress.completed,
+                            failed = progress.failed,
+                            pending = progress.pending,
+                            transferred_bytes = progress.transferred_bytes,
+                            expected_bytes = progress.expected_bytes,
+                            "Rust PD native batch exceeded frozen deadline"
+                        );
                         return Ok(BatchOutcome::Quarantined(batch));
                     }
                 }
@@ -556,5 +617,45 @@ impl DestinationExecutor {
             records.clear_final_kv_page_tail(region_id, final_page, plan.valid_token_count())?;
         }
         Ok(validated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mooncake::{OperationProgress, OperationState};
+
+    #[test]
+    fn native_batch_progress_reports_only_bounded_counts_and_bytes() {
+        let snapshot = BatchSnapshot {
+            operations: vec![
+                OperationProgress {
+                    state: OperationState::Completed,
+                    transferred_bytes: 128,
+                },
+                OperationProgress {
+                    state: OperationState::Pending,
+                    transferred_bytes: 32,
+                },
+                OperationProgress {
+                    state: OperationState::Failed,
+                    transferred_bytes: 0,
+                },
+            ],
+            logical_aborted: false,
+            safe_terminal: false,
+        };
+
+        assert_eq!(
+            native_batch_progress(&snapshot, &[128, 64, 32]),
+            NativeBatchProgress {
+                operation_count: 3,
+                completed: 1,
+                failed: 1,
+                pending: 1,
+                transferred_bytes: 160,
+                expected_bytes: 224,
+            }
+        );
     }
 }

@@ -2714,6 +2714,10 @@ def launch_server(
     )
 
     if envs.SGLANG_RUST_SERVER.get():
+        from sglang.srt.managers.rust_server import (
+            install_parent_shutdown_handlers,
+        )
+
         # The Rust server serves api-server, tokenizer, and detokenizer, so the
         # main process has no Python HTTP server / tokenizer manager to run.
         # Run a warmup /generate before advertising readiness: the Rust /health
@@ -2725,6 +2729,9 @@ def launch_server(
         logger.info("The server is fired up and ready to roll!")
         if launch_callback is not None:
             launch_callback()
+        install_parent_shutdown_handlers(
+            scheduler_init_result.all_child_pids, subprocess_watchdog
+        )
         scheduler_init_result.block_until_scheduler_exits()
     else:
         _setup_and_run_http_server(

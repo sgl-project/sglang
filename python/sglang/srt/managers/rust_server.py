@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 from array import array
 from itertools import chain
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
@@ -36,6 +37,34 @@ if TYPE_CHECKING:
     from sglang.srt.server._core import Server
 
 logger = logging.getLogger(__name__)
+
+
+def install_parent_shutdown_handlers(
+    child_pids: List[int], subprocess_watchdog: Any
+) -> None:
+    """Forward container shutdown signals to embedded Rust scheduler children."""
+
+    def request_shutdown(_signum=None, _frame=None):
+        if subprocess_watchdog is not None:
+            subprocess_watchdog.stop()
+        for pid in dict.fromkeys(child_pids):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, request_shutdown)
+
+
+def install_scheduler_shutdown_handlers(scheduler: Scheduler) -> None:
+    """Turn a forwarded shutdown signal into the scheduler's graceful exit."""
+
+    def request_shutdown(_signum=None, _frame=None):
+        scheduler.gracefully_exit = True
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, request_shutdown)
 
 
 class RustServer:

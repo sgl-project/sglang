@@ -40,7 +40,7 @@ use crate::utils::regex::RegexPattern;
 /// `_SAMPLING_EPS` — temperatures in `[0, eps)` mean greedy decoding.
 const SAMPLING_EPS: f64 = 1e-6;
 /// `TOP_K_ALL = 1 << 30` — `top_k` sentinel for "consider the whole vocabulary".
-const TOP_K_ALL: i64 = 1 << 30;
+pub(super) const TOP_K_ALL: i64 = 1 << 30;
 /// Most stop STRINGS accepted per request. The scheduler scans the decoded text
 /// once per stop per decode step, so this is a per-step multiplier: 50k stops
 /// measured 20.4 ms/step from a 586 KB body.

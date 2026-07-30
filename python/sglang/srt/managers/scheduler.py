@@ -72,7 +72,11 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.distributed.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    get_tp_group,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
@@ -1185,6 +1189,7 @@ class Scheduler(
         self.disagg_prefill_inflight_queue = None
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
+        self.enable_staging = False
 
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
@@ -1557,6 +1562,8 @@ class Scheduler(
             ):
                 raise RustPdFatalError(f"PD_LOCAL_FATAL shutdown={outcome}")
         self.release_host_resources()
+        destroy_model_parallel()
+        destroy_distributed_environment()
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
@@ -1980,6 +1987,7 @@ class Scheduler(
             get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
+            get_rust_pd_adapter=lambda: self.rust_pd_adapter,
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
             get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
@@ -2292,9 +2300,10 @@ class Scheduler(
                         f"bootstrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
-                    recv_req.time_stats.trace_ctx.abort(
-                        abort_info={"reason": error_msg}
-                    )
+                    if recv_req.time_stats is not None:
+                        recv_req.time_stats.trace_ctx.abort(
+                            abort_info={"reason": error_msg}
+                        )
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.output_streamer.stream_output([req], req.return_logprob)
                     return
@@ -3898,11 +3907,17 @@ class Scheduler(
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self.rust_pd_adapter is not None:
+                idle &= (
+                    self.rust_pd_adapter.active_count == 0
+                    and self.rust_pd_adapter.pending_count == 0
+                    and self.rust_pd_adapter.inflight_count == 0
+                )
+            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
 
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
+            elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
@@ -4851,6 +4866,12 @@ def run_scheduler_process(
             moe_dp_rank,
             dp_rank,
         )
+        if envs.SGLANG_RUST_SERVER.get():
+            from sglang.srt.managers.rust_server import (
+                install_scheduler_shutdown_handlers,
+            )
+
+            install_scheduler_shutdown_handlers(scheduler)
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())

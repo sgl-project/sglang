@@ -111,7 +111,7 @@ impl ManualPolicy {
     }
 
     pub fn with_config(config: ManualConfig) -> Self {
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         let routing_map = Arc::new(DashMap::<RoutingId, Node>::new());
 
@@ -762,7 +762,10 @@ mod tests {
 
         assert_eq!(policy.routing_map.len(), 1);
 
-        std::thread::sleep(Duration::from_secs(4));
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while !policy.routing_map.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
 
         assert_eq!(policy.routing_map.len(), 0);
     }

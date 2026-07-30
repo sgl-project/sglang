@@ -348,15 +348,16 @@ impl NativeReceiver {
         ] {
             self.ledger
                 .begin_stage(lease, stage)
-                .map_err(buffer_error)?;
+                .map_err(|error| destination_validation_error("lease_begin", error))?;
             self.ledger
                 .finish_stage(lease, stage)
-                .map_err(buffer_error)?;
+                .map_err(|error| destination_validation_error("lease_finish", error))?;
         }
         let identity = DataPlaneIdentity::from_plan(plan);
-        let flush = CudaHostFlushPort::production().map_err(buffer_error)?;
-        let mut visibility =
-            DestinationVisibilityFence::new(self.device, flush).map_err(buffer_error)?;
+        let flush = CudaHostFlushPort::production()
+            .map_err(|error| destination_validation_error("visibility_port", error))?;
+        let mut visibility = DestinationVisibilityFence::new(self.device, flush)
+            .map_err(|error| destination_validation_error("visibility_fence", error))?;
         let mut records = ExternalRecords {
             buffers: self.buffers.clone(),
         };
@@ -370,7 +371,7 @@ impl NativeReceiver {
                 &mut records,
                 expected,
             )
-            .map_err(buffer_error)?
+            .map_err(|error| destination_validation_error("record_validation", error))?
         {
             DataPlaneEffect::TransferComplete { .. } => Ok(()),
             _ => Err(TransportError::InvalidTransition),
@@ -561,6 +562,15 @@ fn reservation(plan: &TransferPlan, deadline_monotonic_ms: u64) -> ReservationRe
         kv_bytes: plan.expected_kv_bytes(),
         deadline_monotonic_ms,
     }
+}
+
+fn destination_validation_error(stage: &'static str, error: BufferError) -> TransportError {
+    tracing::warn!(
+        stage,
+        error = %error,
+        "Rust PD destination validation failed closed"
+    );
+    buffer_error(error)
 }
 
 fn buffer_error(error: BufferError) -> TransportError {
@@ -935,6 +945,21 @@ mod tests {
         assert_eq!(
             buffer_error(BufferError::InvalidTransition),
             TransportError::LocalFatal(PdReason::LocalFatal)
+        );
+    }
+
+    #[test]
+    fn destination_validation_errors_keep_a_safe_internal_check_and_stable_public_reason() {
+        let error = BufferError::DataRecord {
+            check: "completion_crc",
+        };
+        assert_eq!(
+            error.to_string(),
+            "PD data record failed the frozen completion_crc check"
+        );
+        assert_eq!(
+            destination_validation_error("completion", error),
+            TransportError::Room(PdReason::TransferFailed)
         );
     }
 }

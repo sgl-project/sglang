@@ -196,7 +196,7 @@ impl PdTransportCore {
             return Err(TransportError::StaleHandle);
         }
         let generation = self.next_room_generation;
-        self.next_room_generation = self
+        let next_generation = self
             .next_room_generation
             .checked_add(1)
             .ok_or(TransportError::LocalFatal(PdReason::LocalFatal))?;
@@ -210,7 +210,9 @@ impl PdTransportCore {
             generation,
         )
         .map_err(|_| TransportError::InvalidBatch)?;
-        self.create_handle(TransportHandleRole::Sender, room, input.request_digest)
+        let handle = self.create_handle(TransportHandleRole::Sender, room, input.request_digest)?;
+        self.next_room_generation = next_generation;
+        Ok(handle)
     }
 
     pub fn sender_create_many(
@@ -237,7 +239,7 @@ impl PdTransportCore {
         let mut output = Vec::with_capacity(inputs.len());
         for input in inputs {
             let generation = self.next_room_generation;
-            self.next_room_generation = self
+            let next_generation = self
                 .next_room_generation
                 .checked_add(1)
                 .ok_or(TransportError::LocalFatal(PdReason::LocalFatal))?;
@@ -254,11 +256,12 @@ impl PdTransportCore {
                     continue;
                 }
             };
-            output.push(self.create_handle(
-                TransportHandleRole::Receiver,
-                room,
-                input.request_digest,
-            ));
+            let result =
+                self.create_handle(TransportHandleRole::Receiver, room, input.request_digest);
+            if result.is_ok() {
+                self.next_room_generation = next_generation;
+            }
+            output.push(result);
         }
         Ok(output)
     }

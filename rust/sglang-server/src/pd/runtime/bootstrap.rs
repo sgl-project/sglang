@@ -160,6 +160,8 @@ pub struct PairConnection {
     goaway_ack_generation: Option<u64>,
 }
 
+const LIFECYCLE_READINESS_POLL: Duration = Duration::from_millis(1);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionLifecycle {
     Idle,
@@ -227,6 +229,10 @@ impl PairConnection {
     }
 
     pub async fn lifecycle_tick(&mut self) -> Result<ConnectionLifecycle, RuntimeError> {
+        match timeout(LIFECYCLE_READINESS_POLL, self.stream.readable()).await {
+            Ok(Ok(())) | Err(_) => {}
+            Ok(Err(_)) => return Err(RuntimeError::Session(SessionError::Read)),
+        }
         self.read_available()?;
         let mut observed = ConnectionLifecycle::Idle;
         while let Some(decoded) = self.decode_buffered_frame()? {
@@ -647,11 +653,20 @@ async fn client_handshake(
     let ControlPayload::ServerHello(server_hello) = decoded.payload else {
         return Err(RuntimeError::UnexpectedMessage);
     };
+    let compatibility_mismatch = server_compatibility_mismatch(identity, psk, &server_hello);
     if !server_hello.accepted
         || !server_hello.reason.is_empty()
         || server_hello.client_hello_hash != FixedBytes::new(frame_hash(&client_frame))
-        || !compatible_server(identity, psk, &server_hello)
+        || compatibility_mismatch.is_some()
     {
+        if let Some(field) = compatibility_mismatch {
+            tracing::warn!(
+                role = "decode",
+                mismatch_field = field,
+                "PD peer compatibility check failed"
+            );
+            eprintln!("PD peer compatibility check failed role=decode mismatch_field={field}");
+        }
         return Err(RuntimeError::Compatibility);
     }
     let transcript = FixedBytes::new(transcript_hash(&client_frame, &server_frame));
@@ -710,7 +725,16 @@ async fn server_handshake(
     let ControlPayload::ClientHello(client_hello) = decoded.payload else {
         return Err(RuntimeError::UnexpectedMessage);
     };
-    let accepted = compatible_client(identity, psk, &client_hello);
+    let compatibility_mismatch = client_compatibility_mismatch(identity, psk, &client_hello);
+    let accepted = compatibility_mismatch.is_none();
+    if let Some(field) = compatibility_mismatch {
+        tracing::warn!(
+            role = "prefill",
+            mismatch_field = field,
+            "PD peer compatibility check failed"
+        );
+        eprintln!("PD peer compatibility check failed role=prefill mismatch_field={field}");
+    }
     let prefill_nonce = random_nonce()?;
     let server_payload = ControlPayload::ServerHello(ServerHello {
         role: Role::Prefill,
@@ -791,24 +815,70 @@ async fn server_handshake(
     Ok((stream, session, client_hello.process_epoch))
 }
 
-fn compatible_client(identity: &RuntimeIdentity, psk: &Psk, hello: &ClientHello) -> bool {
-    hello.role == Role::Decode
-        && hello.profile_digest == identity.profile_digest
-        && hello.model_manifest_digest == identity.model_manifest_digest
-        && hello.tokenizer_manifest_digest == identity.tokenizer_manifest_digest
-        && hello.layout_fingerprint == identity.layout_fingerprint
-        && hello.native_abi_digest == identity.native_abi_digest
-        && hello.psk_id == FixedBytes::new(psk.id())
+fn client_compatibility_mismatch(
+    identity: &RuntimeIdentity,
+    psk: &Psk,
+    hello: &ClientHello,
+) -> Option<&'static str> {
+    [
+        (hello.role != Role::Decode, "role"),
+        (
+            hello.profile_digest != identity.profile_digest,
+            "profile_digest",
+        ),
+        (
+            hello.model_manifest_digest != identity.model_manifest_digest,
+            "model_manifest_digest",
+        ),
+        (
+            hello.tokenizer_manifest_digest != identity.tokenizer_manifest_digest,
+            "tokenizer_manifest_digest",
+        ),
+        (
+            hello.layout_fingerprint != identity.layout_fingerprint,
+            "layout_fingerprint",
+        ),
+        (
+            hello.native_abi_digest != identity.native_abi_digest,
+            "native_abi_digest",
+        ),
+        (hello.psk_id != FixedBytes::new(psk.id()), "psk_identity"),
+    ]
+    .into_iter()
+    .find_map(|(mismatch, field)| mismatch.then_some(field))
 }
 
-fn compatible_server(identity: &RuntimeIdentity, psk: &Psk, hello: &ServerHello) -> bool {
-    hello.role == Role::Prefill
-        && hello.profile_digest == identity.profile_digest
-        && hello.model_manifest_digest == identity.model_manifest_digest
-        && hello.tokenizer_manifest_digest == identity.tokenizer_manifest_digest
-        && hello.layout_fingerprint == identity.layout_fingerprint
-        && hello.native_abi_digest == identity.native_abi_digest
-        && hello.psk_id == FixedBytes::new(psk.id())
+fn server_compatibility_mismatch(
+    identity: &RuntimeIdentity,
+    psk: &Psk,
+    hello: &ServerHello,
+) -> Option<&'static str> {
+    [
+        (hello.role != Role::Prefill, "role"),
+        (
+            hello.profile_digest != identity.profile_digest,
+            "profile_digest",
+        ),
+        (
+            hello.model_manifest_digest != identity.model_manifest_digest,
+            "model_manifest_digest",
+        ),
+        (
+            hello.tokenizer_manifest_digest != identity.tokenizer_manifest_digest,
+            "tokenizer_manifest_digest",
+        ),
+        (
+            hello.layout_fingerprint != identity.layout_fingerprint,
+            "layout_fingerprint",
+        ),
+        (
+            hello.native_abi_digest != identity.native_abi_digest,
+            "native_abi_digest",
+        ),
+        (hello.psk_id != FixedBytes::new(psk.id()), "psk_identity"),
+    ]
+    .into_iter()
+    .find_map(|(mismatch, field)| mismatch.then_some(field))
 }
 
 async fn timed_read(

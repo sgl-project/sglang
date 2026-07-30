@@ -240,11 +240,15 @@ def normal_batch(
         prepare_request(request)
         adapter.enqueue(request)
 
-    ready = adapter.flush_pending()
-    if role == "prefill":
-        if ready != requests:
-            raise AssertionError("prefill batch did not become compute-ready")
-        for request in requests:
+    all_completed = []
+    all_failures = []
+    for request in requests:
+        ready = adapter.flush_pending()
+        if role == "prefill":
+            if ready != [request]:
+                raise AssertionError(
+                    "prefill rendezvous quantum did not become compute-ready"
+                )
             sentinel = request.origin_input_ids[0]
             first_token = (
                 None
@@ -253,27 +257,30 @@ def normal_batch(
             )
             if first_token is not None:
                 request.output_ids.append(first_token)
-        transfer_bytes = [
-            len(request.origin_input_ids) * 56 * 2_048 for request in requests
-        ]
-        adapter.sender_send_chunks(requests, transfer_bytes)
-        adapter.add_prefill_inflight(requests)
-        completed, failures = adapter.poll_inflight()
-    else:
-        if ready:
+            transfer_bytes = len(request.origin_input_ids) * 56 * 2_048
+            adapter.sender_send_chunks([request], [transfer_bytes])
+            adapter.add_prefill_inflight([request])
+        elif ready:
             raise AssertionError("decode must wait for destination visibility")
+
         completed, failures = adapter.poll_inflight()
-        for request in completed:
+        if role == "decode":
             terminal_on_first = request.origin_input_ids[0] in (9010, 9011)
             if (
                 not terminal_on_first
                 and len(request.output_ids) < request.sampling_params.max_new_tokens
             ):
                 request.output_ids.append(43)
+        if failures or completed != [request]:
+            raise AssertionError(
+                f"{role} terminal mismatch: completed={len(completed)} failures={failures}"
+            )
+        all_completed.extend(completed)
+        all_failures.extend(failures)
 
-    if failures or completed != requests:
+    if all_failures or all_completed != requests:
         raise AssertionError(
-            f"{role} terminal mismatch: completed={len(completed)} failures={failures}"
+            f"{role} batch terminal mismatch: completed={len(all_completed)} failures={all_failures}"
         )
     finish_reasons = []
     for request in requests:
@@ -282,10 +289,11 @@ def normal_batch(
             finish_reasons.append({"type": "stop", "matched": request.output_ids[-1]})
         else:
             finish_reasons.append({"type": "length", "length": len(request.output_ids)})
+    rooms = [int(request.pd_sidecar.bootstrap_room) for request in requests]
     if publish:
-        rust_server.push_generation(output_payload(requests, finish_reasons))
         adapter.clear_terminal(requests)
-    return [int(request.pd_sidecar.bootstrap_room) for request in requests]
+        rust_server.push_generation(output_payload(requests, finish_reasons))
+    return rooms
 
 
 def resource_counts(adapter: RustPdSchedulerAdapter, transport: Any) -> tuple[int, ...]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import http.client
 import importlib
 import json
@@ -220,9 +221,7 @@ class _EventInbox:
         raise AssertionError(f"timed out waiting for {(role, name)}: {self.pending}")
 
 
-def _http_request(
-    port: int, body: dict[str, Any], token: str | None = API_KEY
-) -> tuple[int, dict[str, str], bytes]:
+def _http_request(port: int, body: dict[str, Any], token: str | None = API_KEY) -> tuple[int, dict[str, str], bytes]:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
     headers = {"content-type": "application/json"}
     if token is not None:
@@ -260,9 +259,7 @@ def _wait_readiness_status(port: int, expected: int, timeout: float = 30) -> Non
         except OSError:
             last_status = "connection-error"
         time.sleep(0.5)
-    raise AssertionError(
-        f"readiness never became {expected}; last status={last_status}"
-    )
+    raise AssertionError(f"readiness never became {expected}; last status={last_status}")
 
 
 def _get(port: int, path: str) -> tuple[int, bytes]:
@@ -280,11 +277,7 @@ class RustPdHttpE2ETest(unittest.TestCase):
         gateway = Path(
             os.environ.get(
                 "SGLANG_PD_GATEWAY_BIN",
-                Path(__file__).parents[3]
-                / "sgl-model-gateway"
-                / "target"
-                / "debug"
-                / "smg",
+                Path(__file__).parents[3] / "sgl-model-gateway" / "target" / "debug" / "smg",
             )
         )
         self.assertTrue(gateway.is_file(), f"build Gateway first: {gateway}")
@@ -379,14 +372,10 @@ class RustPdHttpE2ETest(unittest.TestCase):
                 except AssertionError as error:
                     gateway_log.flush()
                     gateway_log.seek(0)
-                    diagnostics = [
-                        line
-                        for line in gateway_log.read().splitlines()
-                        if "uri=/readiness" not in line
-                    ][-200:]
-                    raise AssertionError(
-                        f"{error}; Gateway exit={router.poll()}\n{'\n'.join(diagnostics)}"
-                    ) from error
+                    diagnostics = [line for line in gateway_log.read().splitlines() if "uri=/readiness" not in line][
+                        -200:
+                    ]
+                    raise AssertionError(f"{error}; Gateway exit={router.poll()}\n{'\n'.join(diagnostics)}") from error
 
                 request = {
                     "input_ids": [1, 2],
@@ -412,7 +401,8 @@ class RustPdHttpE2ETest(unittest.TestCase):
                     event = inbox.take(role, "complete")
                     self.assertEqual(event[3], CLEAN_RESOURCES)
                     observed_rooms.append(event[4])
-                self.assertEqual(observed_rooms, [[0], [0]])
+                self.assertEqual(observed_rooms[0], observed_rooms[1])
+                self.assertNotEqual(observed_rooms[0], [request["bootstrap_room"]])
 
                 text_request = {
                     "text": "hello",
@@ -448,6 +438,82 @@ class RustPdHttpE2ETest(unittest.TestCase):
                 for role in ("prefill", "decode"):
                     self.assertEqual(inbox.take(role, "complete")[3], CLEAN_RESOURCES)
 
+                for wave in range(4):
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                        futures = [
+                            executor.submit(
+                                _http_request,
+                                gateway_port,
+                                {
+                                    **request,
+                                    "input_ids": [100 + wave * 8 + index],
+                                },
+                            )
+                            for index in range(8)
+                        ]
+                        responses = [future.result() for future in futures]
+                    for status, _, body in responses:
+                        self.assertEqual(status, 200)
+                        self.assertEqual(json.loads(body)["output_ids"], [42, 43])
+                    for role in ("prefill", "decode"):
+                        completed = 0
+                        while completed < 8:
+                            event = inbox.take(role, "complete")
+                            completed += event[2]
+                            self.assertEqual(event[3], CLEAN_RESOURCES)
+                        self.assertEqual(completed, 8)
+
+                concurrent_requests = []
+                for repetition in range(2):
+                    base = 200 + repetition * 20
+                    concurrent_requests.extend(
+                        [
+                            {**request, "input_ids": [base]},
+                            {**request, "input_ids": [base + 1], "stream": True},
+                            {
+                                **request,
+                                "input_ids": [[base + 2], [base + 3]],
+                            },
+                            {
+                                **request,
+                                "input_ids": [[base + 4 + index] for index in range(8)],
+                                "stream": True,
+                            },
+                        ]
+                    )
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                    responses = list(
+                        executor.map(
+                            lambda body: _http_request(gateway_port, body),
+                            concurrent_requests,
+                        )
+                    )
+                for request_body, (status, headers, body) in zip(
+                    concurrent_requests,
+                    responses,
+                    strict=True,
+                ):
+                    self.assertEqual(status, 200)
+                    if request_body.get("stream", False):
+                        self.assertTrue(headers["content-type"].startswith("text/event-stream"))
+                        self.assertEqual(body.count(b"data: [DONE]"), 1)
+                    else:
+                        output = json.loads(body)
+                        expected_items = (
+                            len(request_body["input_ids"]) if isinstance(request_body["input_ids"][0], list) else 1
+                        )
+                        self.assertEqual(
+                            len(output) if isinstance(output, list) else 1,
+                            expected_items,
+                        )
+                for role in ("prefill", "decode"):
+                    completed = 0
+                    while completed < 24:
+                        event = inbox.take(role, "complete")
+                        completed += event[2]
+                        self.assertEqual(event[3], CLEAN_RESOURCES)
+                    self.assertEqual(completed, 24)
+
                 edge_cases = [
                     (0, [9012], [], "length", None),
                     (1, [9013], [42], "length", None),
@@ -476,9 +542,7 @@ class RustPdHttpE2ETest(unittest.TestCase):
                     if matched is not None:
                         self.assertEqual(finish["matched"], matched)
                     for role in ("prefill", "decode"):
-                        self.assertEqual(
-                            inbox.take(role, "complete")[3], CLEAN_RESOURCES
-                        )
+                        self.assertEqual(inbox.take(role, "complete")[3], CLEAN_RESOURCES)
 
                 unsupported = {
                     **request,
@@ -490,9 +554,7 @@ class RustPdHttpE2ETest(unittest.TestCase):
                 status, headers, body = _http_request(gateway_port, unsupported)
                 self.assertEqual(status, 422)
                 self.assertEqual(headers["x-sglang-pd-reason"], "PD_UNSUPPORTED")
-                self.assertEqual(
-                    json.loads(body)["error"]["pd_reason"], "PD_UNSUPPORTED"
-                )
+                self.assertEqual(json.loads(body)["error"]["pd_reason"], "PD_UNSUPPORTED")
                 for role in ("prefill", "decode"):
                     commands[role].put("snapshot")
                     self.assertEqual(inbox.take(role, "snapshot")[2], CLEAN_RESOURCES)

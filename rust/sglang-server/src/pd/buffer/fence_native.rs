@@ -15,7 +15,9 @@ const CUDA_EVENT_DISABLE_TIMING: c_uint = 2;
 const CUDA_DEVICE_ATTRIBUTE_FLUSH_WRITES_OPTIONS: c_int = 117;
 const CUDA_DEVICE_ATTRIBUTE_WRITES_ORDERING: c_int = 118;
 const CUDA_FLUSH_OPTION_HOST: c_int = 1;
+const CUDA_WRITES_ORDERING_NONE: c_int = 0;
 const CUDA_WRITES_ORDERING_OWNER: c_int = 100;
+const CUDA_WRITES_ORDERING_ALL_DEVICES: c_int = 200;
 const CUDA_FLUSH_TARGET_CURRENT_DEVICE: c_int = 0;
 const CUDA_FLUSH_SCOPE_TO_OWNER: c_int = 100;
 
@@ -73,10 +75,8 @@ impl GpuDirectFlushPort for CudaHostFlushPort {
             return false;
         }
         self.attribute(device, CUDA_DEVICE_ATTRIBUTE_FLUSH_WRITES_OPTIONS)
-            .is_some_and(|options| options & CUDA_FLUSH_OPTION_HOST != 0)
-            && self
-                .attribute(device, CUDA_DEVICE_ATTRIBUTE_WRITES_ORDERING)
-                .is_some_and(|ordering| ordering >= CUDA_WRITES_ORDERING_OWNER)
+            .zip(self.attribute(device, CUDA_DEVICE_ATTRIBUTE_WRITES_ORDERING))
+            .is_some_and(|(options, ordering)| supports_owner_visibility(options, ordering))
     }
 
     fn flush_to_owner(&mut self, device: u32) -> Result<(), BufferError> {
@@ -95,6 +95,16 @@ impl GpuDirectFlushPort for CudaHostFlushPort {
         }
         Ok(())
     }
+}
+
+fn supports_owner_visibility(flush_options: c_int, native_ordering: c_int) -> bool {
+    flush_options & CUDA_FLUSH_OPTION_HOST != 0
+        && matches!(
+            native_ordering,
+            CUDA_WRITES_ORDERING_NONE
+                | CUDA_WRITES_ORDERING_OWNER
+                | CUDA_WRITES_ORDERING_ALL_DEVICES
+        )
 }
 
 /// Production dynamic CUDA Runtime adapter for the source-compute event.
@@ -192,4 +202,15 @@ where
     unsafe { library.get::<T>(symbol) }
         .map(|loaded| *loaded)
         .map_err(|_| BufferError::SourceFence)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_ordering_none_is_supported_when_explicit_host_flush_is_available() {
+        assert!(supports_owner_visibility(CUDA_FLUSH_OPTION_HOST, 0,));
+        assert!(!supports_owner_visibility(0, 0));
+    }
 }

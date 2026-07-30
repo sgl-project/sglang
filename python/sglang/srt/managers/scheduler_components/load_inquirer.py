@@ -48,11 +48,32 @@ class SchedulerLoadInquirer:
     get_disagg_prefill_inflight_queue: Callable
     get_disagg_decode_prealloc_queue: Callable
     get_disagg_decode_transfer_queue: Callable
+    get_rust_pd_adapter: Callable
     get_spec_total_num_accept_tokens: Callable
     get_spec_total_num_forward_ct: Callable
     get_total_prefill_uncached_tokens: Callable
     get_total_prefill_busy_us: Callable
     get_decode_moment_totals: Callable
+
+    def _get_disaggregation_queues(self) -> tuple[tuple, tuple, tuple]:
+        """Return pending, in-flight, and retracted request snapshots."""
+        adapter = self.get_rust_pd_adapter()
+        if adapter is not None:
+            return adapter.pending_requests, adapter.inflight_requests, ()
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            return (
+                tuple(self.get_disagg_prefill_bootstrap_queue().queue),
+                tuple(self.get_disagg_prefill_inflight_queue()),
+                (),
+            )
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            prealloc = self.get_disagg_decode_prealloc_queue()
+            return (
+                tuple(prealloc.queue),
+                tuple(self.get_disagg_decode_transfer_queue().queue),
+                tuple(prealloc.retracted_queue),
+            )
+        return (), (), ()
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -95,27 +116,24 @@ class SchedulerLoadInquirer:
         waiting_queues = [self.get_waiting_queue()]
         pending_token_queues = [self.get_waiting_queue()]
         awaiting_kv_tokens = 0
+        pd_pending_queue, pd_inflight_queue, pd_retracted_queue = (
+            self._get_disaggregation_queues()
+        )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            prefill_bootstrap_queue = self.get_disagg_prefill_bootstrap_queue().queue
-            waiting_queues.append(prefill_bootstrap_queue)
-            pending_token_queues.append(prefill_bootstrap_queue)
+            waiting_queues.append(pd_pending_queue)
+            pending_token_queues.append(pd_pending_queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            decode_prealloc_queue = self.get_disagg_decode_prealloc_queue().queue
-            decode_transfer_queue = self.get_disagg_decode_transfer_queue().queue
-            decode_retracted_queue = (
-                self.get_disagg_decode_prealloc_queue().retracted_queue
-            )
-            waiting_queues.append(decode_prealloc_queue)
-            waiting_queues.append(decode_transfer_queue)
-            waiting_queues.append(decode_retracted_queue)
+            waiting_queues.append(pd_pending_queue)
+            waiting_queues.append(pd_inflight_queue)
+            waiting_queues.append(pd_retracted_queue)
             # In disaggregated decode, transfer-queue requests and transferred
             # waiting-queue requests have already pre-allocated decode-side KV
             # slots, so they are already included in num_used_tokens.
-            pending_token_queues = [decode_prealloc_queue, decode_retracted_queue]
+            pending_token_queues = [pd_pending_queue, pd_retracted_queue]
             # KV not yet arrived from the prefill side.
             awaiting_kv_tokens = sum(
                 req.seqlen
-                for queue in (decode_prealloc_queue, decode_transfer_queue)
+                for queue in (pd_pending_queue, pd_inflight_queue)
                 for req in queue
             )
 
@@ -167,15 +185,13 @@ class SchedulerLoadInquirer:
         decode_prealloc = decode_transfer = decode_retracted = 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             mode_str = "prefill"
-            prefill_bootstrap = len(self.get_disagg_prefill_bootstrap_queue().queue)
-            prefill_inflight = len(self.get_disagg_prefill_inflight_queue())
+            prefill_bootstrap = len(pd_pending_queue)
+            prefill_inflight = len(pd_inflight_queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             mode_str = "decode"
-            decode_prealloc = len(self.get_disagg_decode_prealloc_queue().queue)
-            decode_transfer = len(self.get_disagg_decode_transfer_queue().queue)
-            decode_retracted = len(
-                self.get_disagg_decode_prealloc_queue().retracted_queue
-            )
+            decode_prealloc = len(pd_pending_queue)
+            decode_transfer = len(pd_inflight_queue)
+            decode_retracted = len(pd_retracted_queue)
         disaggregation = DisaggregationMetrics(
             mode=mode_str,
             prefill_bootstrap_queue_reqs=prefill_bootstrap,

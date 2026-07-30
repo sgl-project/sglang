@@ -23,6 +23,9 @@ from sglang.srt.disaggregation.rust_pd_buffers import (
 from sglang.srt.disaggregation.rust_pd_contract import contract_digests
 
 PD_BATCH_MAX = 8
+PD_RENDEZVOUS_QUANTUM = 1
+MOONCAKE_RPC_PORT_MIN = 15000
+MOONCAKE_RPC_PORT_MAX = 17000
 
 
 class RustPdFatalError(RuntimeError):
@@ -175,6 +178,16 @@ class RustPdSchedulerAdapter:
         return len(self._inflight)
 
     @property
+    def pending_requests(self) -> tuple[Any, ...]:
+        """Stable read-only snapshot for Scheduler observability."""
+        return tuple(self._pending)
+
+    @property
+    def inflight_requests(self) -> tuple[Any, ...]:
+        """Stable read-only snapshot for Scheduler observability."""
+        return tuple(self._inflight)
+
+    @property
     def safe_to_release_pools(self) -> bool:
         return self._shutdown_outcome == "SafeTerminal"
 
@@ -186,19 +199,14 @@ class RustPdSchedulerAdapter:
         lifecycle = getattr(snapshot, "lifecycle", None)
         if fatal_generation is not None or lifecycle == "Fatal":
             source = getattr(snapshot, "fatal_source", None) or "Unknown"
-            raise RustPdFatalError(
-                f"PD_LOCAL_FATAL source={source} generation={fatal_generation}"
-            )
+            raise RustPdFatalError(f"PD_LOCAL_FATAL source={source} generation={fatal_generation}")
         return snapshot
 
     def enqueue(self, request: Any, *, is_retracted: bool = False) -> None:
         snapshot = self.lifecycle_tick()
         if self._draining or (
             snapshot is not None
-            and (
-                not getattr(snapshot, "pair_ready", False)
-                or not getattr(snapshot, "accepting_rooms", False)
-            )
+            and (not getattr(snapshot, "pair_ready", False) or not getattr(snapshot, "accepting_rooms", False))
         ):
             raise RuntimeError("PD_PEER_UNAVAILABLE")
         if is_retracted:
@@ -213,34 +221,38 @@ class RustPdSchedulerAdapter:
         self._pending.append(request)
 
     def flush_pending(self) -> list[Any]:
-        """Create queued Rooms in Scheduler-sized batches.
+        """Advance one queued Room through the cross-peer rendezvous.
 
         Prefill requests become compute-ready after sender initialization.
         Decode requests stay in the adapter until destination transfer reaches
         a validated terminal result.
         """
+        if not self._pending:
+            return []
         compute_ready: list[Any] = []
-        while self._pending:
-            requests = self._pending[:PD_BATCH_MAX]
+        requests = self._pending[:PD_RENDEZVOUS_QUANTUM]
+        try:
             self.create_many(requests)
+        except RuntimeError as error:
+            if str(error) == "PD_CAPACITY_EXHAUSTED":
+                return []
+            raise
+        try:
+            if self.role == "prefill":
+                self.sender_init_many(requests)
+                compute_ready.extend(requests)
+            else:
+                self._prepare_decode_batch(requests)
+                self.receiver_prepare_many(requests)
+                self._inflight.extend(requests)
+        except Exception as error:
             try:
-                if self.role == "prefill":
-                    self.sender_init_many(requests)
-                    compute_ready.extend(requests)
-                else:
-                    self._prepare_decode_batch(requests)
-                    self.receiver_prepare_many(requests)
-                    self._inflight.extend(requests)
-            except Exception as error:
-                try:
-                    self.abort_many(requests)
-                except Exception:
-                    error.add_note(
-                        "Rust PD best-effort abort failed after the primary transport error"
-                    )
-                raise
-            finally:
-                del self._pending[: len(requests)]
+                self.abort_many(requests)
+            except Exception:
+                error.add_note("Rust PD best-effort abort failed after the primary transport error")
+            raise
+        finally:
+            del self._pending[: len(requests)]
         return compute_ready
 
     def add_prefill_inflight(self, requests: Sequence[Any]) -> None:
@@ -274,9 +286,7 @@ class RustPdSchedulerAdapter:
         if requests:
             self.clear_many(requests)
 
-    def abort_matching(
-        self, rid: str, *, abort_all: bool = False
-    ) -> tuple[list[Any], list[Any]]:
+    def abort_matching(self, rid: str, *, abort_all: bool = False) -> tuple[list[Any], list[Any]]:
         """Abort queued and Rust-owned requests without touching legacy owners."""
 
         def matches(request: Any) -> bool:
@@ -286,9 +296,7 @@ class RustPdSchedulerAdapter:
         self._pending = [request for request in self._pending if not matches(request)]
 
         active_by_rid = {
-            binding.request.rid: binding.request
-            for binding in self._bindings.values()
-            if matches(binding.request)
+            binding.request.rid: binding.request for binding in self._bindings.values() if matches(binding.request)
         }
         active = list(active_by_rid.values())
         for offset in range(0, len(active), PD_BATCH_MAX):
@@ -332,13 +340,9 @@ class RustPdSchedulerAdapter:
                 )
                 if kv_loc is None:
                     raise RuntimeError("PD_CAPACITY_EXHAUSTED")
-                scheduler.req_to_token_pool.write(
-                    (request.req_pool_idx, slice(0, len(kv_loc))), kv_loc
-                )
+                scheduler.req_to_token_pool.write((request.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
                 request.kv_committed_len = fill_len
-                request.full_untruncated_fill_ids = (
-                    request.origin_input_ids + request.output_ids
-                )
+                request.full_untruncated_fill_ids = request.origin_input_ids + request.output_ids
                 request.prefix_indices = torch.empty((0,), dtype=torch.int64)
                 request.set_extend_range(0, fill_len)
                 page_ids = (
@@ -364,10 +368,7 @@ class RustPdSchedulerAdapter:
         snapshot = self.lifecycle_tick()
         if self._draining or (
             snapshot is not None
-            and (
-                not getattr(snapshot, "pair_ready", False)
-                or not getattr(snapshot, "accepting_rooms", False)
-            )
+            and (not getattr(snapshot, "pair_ready", False) or not getattr(snapshot, "accepting_rooms", False))
         ):
             raise RuntimeError("PD_PEER_UNAVAILABLE")
         self._validate_requests(requests, allow_existing=False)
@@ -414,19 +415,13 @@ class RustPdSchedulerAdapter:
         valid_token_counts = [len(request.origin_input_ids) for request in requests]
         cuda_stream = 0
         if self.scheduler is not None:
-            stream_hook = getattr(
-                self.scheduler, "_rust_pd_compute_stream_handle", None
-            )
+            stream_hook = getattr(self.scheduler, "_rust_pd_compute_stream_handle", None)
             if stream_hook is not None:
                 cuda_stream = int(stream_hook())
             else:
                 import torch
 
-                cuda_stream = int(
-                    torch.cuda.current_stream(
-                        device=f"cuda:{self.scheduler.ps.gpu_id}"
-                    ).cuda_stream
-                )
+                cuda_stream = int(torch.cuda.current_stream(device=f"cuda:{self.scheduler.ps.gpu_id}").cuda_stream)
         results = self.transport.sender_send_chunks(
             [binding.handle for binding in bindings],
             list(transfer_bytes),
@@ -467,13 +462,9 @@ class RustPdSchedulerAdapter:
                 binding.first_token_committed = True
         return list(results)
 
-    def abort_many(
-        self, requests: Sequence[Any], reason: str = "PD_ABORTED"
-    ) -> list[Any]:
+    def abort_many(self, requests: Sequence[Any], reason: str = "PD_ABORTED") -> list[Any]:
         bindings = self._bindings_for(requests)
-        results = self.transport.abort_many(
-            [binding.handle for binding in bindings], reason
-        )
+        results = self.transport.abort_many([binding.handle for binding in bindings], reason)
         self._require_success(results, [binding.handle for binding in bindings])
         return list(results)
 
@@ -489,12 +480,7 @@ class RustPdSchedulerAdapter:
             return
         self._draining = True
         self._pending.clear()
-        active = list(
-            {
-                binding.request.rid: binding.request
-                for binding in self._bindings.values()
-            }.values()
-        )
+        active = list({binding.request.rid: binding.request for binding in self._bindings.values()}.values())
         for offset in range(0, len(active), PD_BATCH_MAX):
             requests = active[offset : offset + PD_BATCH_MAX]
             try:
@@ -508,9 +494,7 @@ class RustPdSchedulerAdapter:
     def shutdown(self) -> str:
         if self._shutdown_outcome is not None:
             if self._shutdown_outcome != "SafeTerminal":
-                raise RustPdFatalError(
-                    f"PD_LOCAL_FATAL shutdown={self._shutdown_outcome}"
-                )
+                raise RustPdFatalError(f"PD_LOCAL_FATAL shutdown={self._shutdown_outcome}")
             return self._shutdown_outcome
         try:
             self.begin_drain()
@@ -520,9 +504,7 @@ class RustPdSchedulerAdapter:
         except Exception as error:
             raise RustPdFatalError("PD_LOCAL_FATAL shutdown=TransportError") from error
         if outcome not in ("SafeTerminal", "FatalUnsafe"):
-            raise RustPdFatalError(
-                f"PD_LOCAL_FATAL shutdown=InvalidOutcome:{outcome!r}"
-            )
+            raise RustPdFatalError(f"PD_LOCAL_FATAL shutdown=InvalidOutcome:{outcome!r}")
         self._shutdown_outcome = outcome
         if outcome != "SafeTerminal":
             raise RustPdFatalError(f"PD_LOCAL_FATAL shutdown={outcome}")
@@ -564,9 +546,7 @@ class RustPdSchedulerAdapter:
         except KeyError as error:
             raise RuntimeError("PD_STALE_EPOCH") from error
 
-    def _validate_requests(
-        self, requests: Sequence[Any], *, allow_existing: bool
-    ) -> None:
+    def _validate_requests(self, requests: Sequence[Any], *, allow_existing: bool) -> None:
         self.region_table.verify(self.pool)
         if not 1 <= len(requests) <= PD_BATCH_MAX:
             raise ValueError("PD_REQUEST_INVALID")
@@ -609,15 +589,9 @@ class RustPdSchedulerAdapter:
                 raise RuntimeError("PD_PROTOCOL_MISMATCH")
             return [int(page) for page in pages]
         page_size = self.scheduler.token_to_kv_pool_allocator.page_size
-        locations = self.scheduler.req_to_token_pool.req_to_token[
-            request.req_pool_idx, : len(request.origin_input_ids)
-        ]
+        locations = self.scheduler.req_to_token_pool.req_to_token[request.req_pool_idx, : len(request.origin_input_ids)]
         return [
-            int(page)
-            for page in locations[::page_size]
-            .to(device="cpu")
-            .div(page_size, rounding_mode="floor")
-            .tolist()
+            int(page) for page in locations[::page_size].to(device="cpu").div(page_size, rounding_mode="floor").tolist()
         ]
 
 
@@ -687,6 +661,10 @@ def _transport_config(
         str(args.model_path),
         str(args.tokenizer_path or args.model_path),
     )
+    if mock_data_plane:
+        mooncake_ports = [19000]
+    else:
+        mooncake_ports = list(range(MOONCAKE_RPC_PORT_MIN, MOONCAKE_RPC_PORT_MAX + 1))
     return {
         "role": role,
         "model_manifest_digest": model_digest,
@@ -694,7 +672,7 @@ def _transport_config(
         "layout_fingerprint": layout_digest,
         "native_abi_digest": native_digest,
         "mooncake_host": "127.0.0.1" if mock_data_plane else str(args.host),
-        "mooncake_ports": [19000 if mock_data_plane or role == "prefill" else 19001],
+        "mooncake_ports": mooncake_ports,
         "control_host": str(args.host),
         "control_port": int(args.disaggregation_bootstrap_port),
         "pd_control_psk_file": str(args.pd_control_psk_file),

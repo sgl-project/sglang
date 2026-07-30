@@ -301,15 +301,16 @@ class SchedulerMetricsReporter:
 
         prefill_q = WelfordAccumulator()
         decode_q = WelfordAccumulator()
+        pd_pending_queue, pd_inflight_queue, _ = self._get_disaggregation_queues()
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-            for req in self.scheduler.disagg_prefill_bootstrap_queue.queue:
+            for req in pd_pending_queue:
                 prefill_q.add(len(req.origin_input_ids))
             for req in self.scheduler.waiting_queue:
                 prefill_q.add(len(req.origin_input_ids))
         elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-            for req in self.scheduler.disagg_decode_prealloc_queue.queue:
+            for req in pd_pending_queue:
                 decode_q.add(req.seqlen)
-            for req in self.scheduler.disagg_decode_transfer_queue.queue:
+            for req in pd_inflight_queue:
                 decode_q.add(req.seqlen)
         else:
             for req in self.scheduler.waiting_queue:
@@ -326,6 +327,26 @@ class SchedulerMetricsReporter:
             sum_decode_kv_tokens=decode_q.total,
             var_decode_kv_tokens=decode_q.variance(),
         )
+
+    def _get_disaggregation_queues(self) -> tuple[tuple, tuple, tuple]:
+        """Return observer-only snapshots without constructing a Python PD owner."""
+        adapter = self.scheduler.rust_pd_adapter
+        if adapter is not None:
+            return adapter.pending_requests, adapter.inflight_requests, ()
+        if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+            return (
+                tuple(self.scheduler.disagg_prefill_bootstrap_queue.queue),
+                tuple(self.scheduler.disagg_prefill_inflight_queue),
+                (),
+            )
+        if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+            prealloc = self.scheduler.disagg_decode_prealloc_queue
+            return (
+                tuple(prealloc.queue),
+                tuple(self.scheduler.disagg_decode_transfer_queue.queue),
+                tuple(prealloc.retracted_queue),
+            )
+        return (), (), ()
 
     def _active_spec_config_snapshot(self) -> dict[str, int]:
         """Read the currently active speculative decoding configuration."""
@@ -537,6 +558,7 @@ class SchedulerMetricsReporter:
             and not self.current_scheduler_metrics_enabled
         ):
             return
+        pd_pending_queue, pd_inflight_queue, _ = self._get_disaggregation_queues()
 
         now = time.perf_counter()
         gap_latency = now - self.last_prefill_stats_tic
@@ -568,10 +590,8 @@ class SchedulerMetricsReporter:
         )
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-            msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
-            msg += (
-                f"#inflight-req: {len(self.scheduler.disagg_prefill_inflight_queue)}, "
-            )
+            msg += f"#bootstrap-req: {len(pd_pending_queue)}, "
+            msg += f"#inflight-req: {len(pd_inflight_queue)}, "
             num_optimistic = sum(1 for r in batch.reqs if r.pending_bootstrap)
             msg += f"#optimistic-req: {num_optimistic}, "
 
@@ -665,20 +685,20 @@ class SchedulerMetricsReporter:
             # PD disaggregation
             if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_bootstrap_queue.queue,
+                    pd_pending_queue,
                     priority_enabled,
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_inflight_queue, priority_enabled
+                    pd_inflight_queue, priority_enabled
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
             elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
+                    pd_pending_queue, priority_enabled
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
+                    pd_inflight_queue, priority_enabled
                 )
 
             # Utilization / LoRA / HiCache
@@ -697,6 +717,9 @@ class SchedulerMetricsReporter:
         num_correct_drafts: int = 0,
     ):
         batch = running_batch or self.scheduler.running_batch
+        pd_pending_queue, pd_inflight_queue, pd_retracted_queue = (
+            self._get_disaggregation_queues()
+        )
 
         # Every-iteration work: realtime token counting + status logger
         if self.current_scheduler_metrics_enabled:
@@ -815,10 +838,16 @@ class SchedulerMetricsReporter:
         cache_hit_rate = 0.0
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-            msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
-            msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
-            msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
-            msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
+            if self.scheduler.rust_pd_adapter is not None:
+                num_tokens_pre_allocated = sum(req.seqlen for req in pd_inflight_queue)
+            else:
+                num_tokens_pre_allocated = (
+                    self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated
+                )
+            msg += f"pre-allocated usage: {num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
+            msg += f"#prealloc-req: {len(pd_pending_queue)}, "
+            msg += f"#transfer-req: {len(pd_inflight_queue)}, "
+            msg += f"#retracted-req: {len(pd_retracted_queue)}, "
 
         if (
             self.scheduler.server_args.language_only
@@ -894,18 +923,18 @@ class SchedulerMetricsReporter:
             # PD disaggregation
             if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_bootstrap_queue.queue,
+                    pd_pending_queue,
                     priority_enabled,
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_inflight_queue, priority_enabled
+                    pd_inflight_queue, priority_enabled
                 )
             elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
+                    pd_pending_queue, priority_enabled
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
+                    pd_inflight_queue, priority_enabled
                 )
 
             # Streaming session metrics
@@ -1104,6 +1133,7 @@ class SchedulerMetricsReporter:
         """Collect and log metrics every 30 seconds during idle."""
         if not self.current_scheduler_metrics_enabled:
             return
+        pd_pending_queue, pd_inflight_queue, _ = self._get_disaggregation_queues()
         # The running-reqs gauge holds the last batch report until the next
         # one (on PD prefill that is the last forward-batch snapshot, which
         # no later report zeroes). If it disagrees with running_batch -- the
@@ -1138,16 +1168,16 @@ class SchedulerMetricsReporter:
         self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_prefill_bootstrap_queue.queue, priority_enabled
+                pd_pending_queue, priority_enabled
             )
             self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_prefill_inflight_queue, priority_enabled
+                pd_inflight_queue, priority_enabled
             )
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
+                pd_pending_queue, priority_enabled
             )
             self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
+                pd_inflight_queue, priority_enabled
             )
         self.metrics_collector.log_stats(self.stats)

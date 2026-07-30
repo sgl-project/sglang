@@ -66,7 +66,8 @@ mod pd_routing_tests {
         for i in 0..10 {
             let payload = json!({
                 "text": format!("PD mode request {}", i),
-                "stream": false
+                "stream": false,
+                "sampling_params": {"temperature": 0}
             });
 
             let req = Request::builder()
@@ -125,7 +126,8 @@ mod pd_routing_tests {
         for i in 0..20 {
             let payload = json!({
                 "text": format!("PD round robin {}", i),
-                "stream": false
+                "stream": false,
+                "sampling_params": {"temperature": 0}
             });
 
             let req = Request::builder()
@@ -200,7 +202,8 @@ mod pd_routing_tests {
         // Request should succeed via retry to healthy decode worker
         let payload = json!({
             "text": "Test with failing decode worker",
-            "stream": false
+            "stream": false,
+            "sampling_params": {"temperature": 0}
         });
 
         let req = Request::builder()

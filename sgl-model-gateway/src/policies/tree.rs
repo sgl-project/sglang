@@ -602,8 +602,9 @@ impl Tree {
         // LRU eviction doesn't need perfect accuracy - approximate timestamps suffice.
         let epoch = get_epoch();
         if epoch & 0x7 == 0 {
-            curr.tenant_last_access_time
-                .insert(Arc::clone(&tenant), epoch);
+            if let Some(mut timestamp) = curr.tenant_last_access_time.get_mut(tenant.as_ref()) {
+                *timestamp = epoch;
+            }
         }
 
         // Compute input char count directly from input text.
@@ -1094,6 +1095,19 @@ mod tests {
 
         assert_eq!(matched_text, "");
         assert_eq!(tenant, "empty");
+    }
+
+    #[test]
+    fn cold_start_matches_do_not_register_the_empty_sentinel_as_a_tenant() {
+        let tree = Tree::new();
+
+        for _ in 0..8 {
+            let (matched_text, tenant) = tree.prefix_match("hello");
+            assert_eq!(matched_text, "");
+            assert_eq!(tenant, "empty");
+        }
+
+        assert!(tree.get_used_size_per_tenant().is_empty());
     }
 
     #[test]

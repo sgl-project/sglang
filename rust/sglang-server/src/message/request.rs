@@ -11,6 +11,7 @@ use itertools::izip;
 use serde::Deserialize;
 
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
+use super::sampling::TOP_K_ALL;
 use super::{OneOrMany, OneOrManyItem, SamplingParams, SamplingParamsInput, TokenIds};
 use crate::environ::env_u64;
 use crate::error::Error;
@@ -476,7 +477,10 @@ fn validate_pd_sampling_params(params: &SamplingParams) -> Result<(), crate::pd:
     if params.temperature != 0.0 {
         return Err(PdReason::Unsupported);
     }
-    if params.top_p != 1.0 || params.min_p != 0.0 {
+    // Before normalization, an omitted `top_k` uses SamplingParams' whole-vocab
+    // sentinel; greedy post-init rewrites it to 1. Accept both representations,
+    // but fail closed on an explicitly non-greedy value such as 2.
+    if !matches!(params.top_k, 1 | TOP_K_ALL) || params.top_p != 1.0 || params.min_p != 0.0 {
         return Err(PdReason::Unsupported);
     }
     let max_new_tokens = params.max_new_tokens.unwrap_or(128);
@@ -752,7 +756,11 @@ impl GenerateRequest {
     }
 
     pub fn encode_header(&self) -> Result<Bytes, Error> {
-        TokenizedGenerateReqInput::from(self).encode()
+        let header = TokenizedGenerateReqInput::from(self);
+        match self.pd_bootstrap.as_ref() {
+            Some(bootstrap) => header.encode_with_pd_bootstrap(bootstrap),
+            None => header.encode(),
+        }
     }
 
     /// `input_ids` widened to raw little-endian int64 bytes (the scheduler's
@@ -1138,6 +1146,15 @@ mod tests {
                 .unwrap();
         assert_eq!(
             random.validate_pd_support(),
+            Err(crate::pd::room::PdReason::Unsupported)
+        );
+
+        let non_greedy_top_k: GenerateBody = serde_json::from_str(
+            r#"{"input_ids":[1],"sampling_params":{"temperature":0,"top_k":2}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            non_greedy_top_k.validate_pd_support(),
             Err(crate::pd::room::PdReason::Unsupported)
         );
 

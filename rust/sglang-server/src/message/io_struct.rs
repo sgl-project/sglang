@@ -6,6 +6,7 @@
 use bytes::Bytes;
 use serde::Serialize;
 
+use super::request::PdBootstrap;
 use super::types::{Tagged, control_messages, wire_struct};
 use super::{GenerateRequest, SamplingParams, TokenIds};
 use crate::error::Error;
@@ -33,6 +34,63 @@ wire_struct! {
         /// Versioned Rust-PD identity/digest map. Appended at the Python-owned
         /// extension slot so upstream positional fields retain their indices.
         pd_sidecar: Option<&'a rmpv::Value>,
+    }
+}
+
+/// PD requests must also populate Python's legacy bootstrap identity at indices
+/// 25..27. Keep the ordinary header at its upstream length (17 elements) and
+/// append the intervening Python defaults only when a bootstrap is present.
+struct TokenizedGenerateReqInputWithPdBootstrap<'header, 'request> {
+    header: &'header TokenizedGenerateReqInput<'request>,
+    bootstrap: &'header PdBootstrap,
+}
+
+impl Serialize for TokenizedGenerateReqInputWithPdBootstrap<'_, '_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct; // codespell:ignore ser
+
+        let header = self.header;
+        let mut st = serializer.serialize_struct("TokenizedGenerateReqInput", 28)?;
+        st.serialize_field("tag", <TokenizedGenerateReqInput<'_> as Tagged>::TAG)?;
+        st.serialize_field("rid", &header.rid)?;
+        st.serialize_field("http_worker_ipc", &())?;
+        st.serialize_field("input_text", &header.input_text)?;
+        st.serialize_field("input_ids", &header.input_ids)?;
+        st.serialize_field("input_embeds", &header.input_embeds)?;
+        st.serialize_field("mm_inputs", &header.mm_inputs)?;
+        st.serialize_field("token_type_ids", &header.token_type_ids)?;
+        st.serialize_field("sampling_params", &header.sampling_params)?;
+        st.serialize_field("return_logprob", &header.return_logprob)?;
+        st.serialize_field("logprob_start_len", &header.logprob_start_len)?;
+        st.serialize_field("top_logprobs_num", &header.top_logprobs_num)?;
+        st.serialize_field("token_ids_logprob", &header.token_ids_logprob)?;
+        st.serialize_field("stream", &header.stream)?;
+        st.serialize_field("return_sampling_mask", &header.return_sampling_mask)?;
+        st.serialize_field("return_hidden_states", &header.return_hidden_states)?;
+        st.serialize_field("pd_sidecar", &header.pd_sidecar)?;
+        st.serialize_field("return_routed_experts", &false)?;
+        st.serialize_field("routed_experts_start_len", &0_i64)?;
+        st.serialize_field("return_indexer_topk", &false)?;
+        st.serialize_field("session_id", &())?;
+        st.serialize_field("session_params", &())?;
+        st.serialize_field("lora_id", &())?;
+        st.serialize_field("custom_logit_processor", &())?;
+        st.serialize_field("positional_embed_overrides", &())?;
+        st.serialize_field("bootstrap_host", &self.bootstrap.host)?;
+        st.serialize_field("bootstrap_port", &self.bootstrap.port)?;
+        st.serialize_field("bootstrap_room", &self.bootstrap.room)?;
+        st.end()
+    }
+}
+
+impl TokenizedGenerateReqInput<'_> {
+    pub(super) fn encode_with_pd_bootstrap(&self, bootstrap: &PdBootstrap) -> Result<Bytes, Error> {
+        rmp_serde::to_vec(&TokenizedGenerateReqInputWithPdBootstrap {
+            header: self,
+            bootstrap,
+        })
+        .map(Bytes::from)
+        .map_err(|e| Error::Codec(e.to_string()))
     }
 }
 
@@ -149,12 +207,8 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 16.
-        assert!(
-            arr.len() >= 14,
-            "header must have >=14 elements, got {}",
-            arr.len()
-        );
+        // No bootstrap means the upstream header remains exactly 17 elements.
+        assert_eq!(arr.len(), 17);
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
@@ -178,5 +232,36 @@ mod tests {
             "return_hidden_states at idx 15"
         );
         assert!(arr[16].is_map(), "pd_sidecar must land at idx 16");
+    }
+
+    #[test]
+    fn pd_header_reaches_legacy_bootstrap_slots() {
+        let req = GenerateRequest {
+            rid: "r1".into(),
+            sampling_params: SamplingParams::default(),
+            pd_bootstrap: Some(PdBootstrap {
+                host: "prefill.internal".into(),
+                port: 8998,
+                room: 42,
+                attempt_id: "44444444-4444-4444-8444-444444444444".into(),
+                batch_index: 0,
+            }),
+            ..Default::default()
+        };
+
+        let bytes = req.encode_header().unwrap();
+        let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert_eq!(arr.len(), 28);
+        assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
+        assert_eq!(arr[1].as_str(), Some("r1"));
+        assert!(arr[8].is_array(), "sampling_params must land at idx 8");
+        assert_eq!(
+            arr[25].as_str(),
+            Some("prefill.internal"),
+            "bootstrap_host at idx 25"
+        );
+        assert_eq!(arr[26].as_u64(), Some(8998), "bootstrap_port at idx 26");
+        assert_eq!(arr[27].as_u64(), Some(42), "bootstrap_room at idx 27");
     }
 }

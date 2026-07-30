@@ -104,6 +104,8 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            rendezvous_gate: Arc::new(Mutex::new(())),
+            active_item_permits: Arc::new(tokio::sync::Semaphore::new(PD_ACTIVE_ITEM_CAPACITY)),
         })
     }
 

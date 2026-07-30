@@ -15,6 +15,7 @@ use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
@@ -27,7 +28,7 @@ use super::pd_types::api_path;
 use crate::{
     config::types::RetryConfig,
     core::{
-        HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
+        AttachedBody, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
         UNKNOWN_MODEL_ID,
     },
     observability::{
@@ -54,6 +55,8 @@ use crate::{
     },
 };
 
+const PD_ACTIVE_ITEM_CAPACITY: usize = 32;
+
 #[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
@@ -62,6 +65,8 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    rendezvous_gate: Arc<Mutex<()>>,
+    active_item_permits: Arc<tokio::sync::Semaphore>,
 }
 
 struct PreparedWorkerRequest<'a> {
@@ -233,9 +238,12 @@ impl RouterTrait for PDRouter {
         body: &Value,
         model_id: Option<&str>,
     ) -> Response {
+        if let Err(error) = raw_generate::validate_pd_support(body) {
+            return raw_generate::pd_error_response(error);
+        }
         let (batch_size, is_stream, return_logprob) = match raw_generate::generate_shape(body) {
             Ok(shape) => shape,
-            Err(message) => return error::bad_request("invalid_generate_request", message),
+            Err(_) => return raw_generate::request_invalid_response(),
         };
         let request_text = self
             .policies_need_request_text()
@@ -379,6 +387,12 @@ impl RouterTrait for PDRouter {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        convert::Infallible,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
     use super::*;
     use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
 
@@ -394,6 +408,8 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            rendezvous_gate: Arc::new(Mutex::new(())),
+            active_item_permits: Arc::new(tokio::sync::Semaphore::new(PD_ACTIVE_ITEM_CAPACITY)),
         }
     }
 
@@ -403,6 +419,148 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[tokio::test]
+    async fn pd_item_admission_is_weighted_and_exactly_32() {
+        let router = create_test_pd_router();
+        let all_items = Arc::clone(&router.active_item_permits)
+            .acquire_many_owned(32)
+            .await
+            .unwrap();
+        assert_eq!(router.active_item_permits.available_permits(), 0);
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            Arc::clone(&router.active_item_permits).acquire_owned(),
+        )
+        .await
+        .is_err());
+
+        drop(all_items);
+        let one_item = Arc::clone(&router.active_item_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+        assert_eq!(router.active_item_permits.available_permits(), 31);
+        drop(one_item);
+        assert_eq!(router.active_item_permits.available_permits(), 32);
+    }
+
+    #[tokio::test]
+    async fn pd_item_permit_is_held_until_response_body_drop() {
+        let router = create_test_pd_router();
+        let permit = Arc::clone(&router.active_item_permits)
+            .acquire_many_owned(8)
+            .await
+            .unwrap();
+        let response = AttachedBody::wrap_response(Response::new(Body::empty()), permit);
+        assert_eq!(router.active_item_permits.available_permits(), 24);
+
+        drop(response);
+        assert_eq!(router.active_item_permits.available_permits(), 32);
+    }
+
+    #[tokio::test]
+    async fn pd_rendezvous_gate_is_held_until_prefill_body_is_consumed() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let prefill_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prefill_address = prefill_listener.local_addr().unwrap();
+        let prefill_app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post({
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                move || {
+                    let active = Arc::clone(&active);
+                    let maximum = Arc::clone(&maximum);
+                    async move {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(current, Ordering::SeqCst);
+                        let body = futures_util::stream::once(async move {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            Ok::<_, Infallible>(bytes::Bytes::from_static(b"{}"))
+                        });
+                        Response::new(Body::from_stream(body))
+                    }
+                }
+            }),
+        );
+        let prefill_server =
+            tokio::spawn(async move { axum::serve(prefill_listener, prefill_app).await });
+
+        let decode_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decode_address = decode_listener.local_addr().unwrap();
+        let decode_app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(|| async { (StatusCode::OK, "{}") }),
+        );
+        let decode_server =
+            tokio::spawn(async move { axum::serve(decode_listener, decode_app).await });
+
+        let router = create_test_pd_router();
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("http://{prefill_address}"))
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                })
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("http://{decode_address}"))
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        let request = raw_generate::inject_bootstrap(
+            json!({
+                "text": "rendezvous ordering",
+                "stream": false,
+                "sampling_params": {"temperature": 0}
+            }),
+            prefill.as_ref(),
+            None,
+            true,
+        )
+        .unwrap();
+        let context = || PDRequestContext {
+            route: "/generate",
+            batch_size: None,
+            is_stream: false,
+            return_logprob: false,
+            request_text: None,
+            model_id: None,
+            headers: None,
+        };
+
+        let first = router.execute_dual_dispatch_internal(
+            None,
+            request.clone(),
+            context(),
+            Arc::clone(&prefill),
+            Arc::clone(&decode),
+            Instant::now(),
+        );
+        let second = router.execute_dual_dispatch_internal(
+            None,
+            request,
+            context(),
+            prefill,
+            decode,
+            Instant::now(),
+        );
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            maximum.load(Ordering::SeqCst),
+            1,
+            "a second Prefill request entered before the first response body reached terminal"
+        );
+
+        prefill_server.abort();
+        decode_server.abort();
     }
 
     #[test]

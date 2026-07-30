@@ -1265,7 +1265,7 @@ class ServerArgs:
     ssl_ca_certs: A[Optional[str], "The CA certificates file.", NS("serving")] = None
     ssl_keyfile_password: A[
         Optional[str], "The password to decrypt the SSL keyfile.", NS("serving")
-    ] = None
+    ] = dataclasses.field(default=None, repr=False)
     enable_ssl_refresh: A[
         bool,
         "Enable automatic SSL certificate hot-reloading when cert/key files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
@@ -1279,12 +1279,12 @@ class ServerArgs:
         Optional[str],
         "Set API key of the server. It is also used in the OpenAI API compatible server.",
         NS("serving"),
-    ] = None
+    ] = dataclasses.field(default=None, repr=False)
     admin_api_key: A[
         Optional[str],
         "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key.",
         NS("serving"),
-    ] = None
+    ] = dataclasses.field(default=None, repr=False)
     served_model_name: A[
         Optional[str],
         "Override the model name returned by the v1/models endpoint in OpenAI API server.",
@@ -2959,7 +2959,7 @@ class ServerArgs:
         Optional[str],
         "Path to the 32-byte mode-0400 PSK used only by the Rust PD control plane.",
         NS("disagg"),
-    ] = None
+    ] = dataclasses.field(default=None, repr=False)
     disaggregation_ib_device: A[
         Optional[str],
         'The InfiniBand devices for disaggregation transfer. Supports a single device (e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping (e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), or a path to a JSON file containing that mapping. Default is None, which triggers automatic device detection when mooncake backend is enabled.',

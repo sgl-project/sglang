@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import sglang.srt.disaggregation.rust_pd as rust_pd
 from sglang.srt.disaggregation.rust_pd import (
     PdRequestSidecar,
     RustPdFatalError,
@@ -23,9 +24,7 @@ class FakeTensor:
         self._address = address
         self.shape = shape
         self._stride = stride
-        self.device = SimpleNamespace(
-            type=device.split(":")[0], index=int(device.split(":")[1])
-        )
+        self.device = SimpleNamespace(type=device.split(":")[0], index=int(device.split(":")[1]))
         self.dtype = dtype
         self._pinned = pinned
 
@@ -56,12 +55,8 @@ class FakePool:
 
     def __init__(self, device="cuda:5"):
         self.pd_generation = 3
-        self.k_buffer = [
-            FakeTensor(0x100000 + index * 0x10000, device=device) for index in range(28)
-        ]
-        self.v_buffer = [
-            FakeTensor(0x300000 + index * 0x10000, device=device) for index in range(28)
-        ]
+        self.k_buffer = [FakeTensor(0x100000 + index * 0x10000, device=device) for index in range(28)]
+        self.v_buffer = [FakeTensor(0x300000 + index * 0x10000, device=device) for index in range(28)]
 
     def _pd_registerable_tensors(self):
         return self.k_buffer + self.v_buffer
@@ -130,9 +125,7 @@ class FakeTransport:
         valid_token_counts,
         cuda_stream,
     ):
-        self.calls.append(
-            ("sender_send_chunks", list(handles), list(transfer_bytes), cuda_stream)
-        )
+        self.calls.append(("sender_send_chunks", list(handles), list(transfer_bytes), cuda_stream))
         return [Item(handle) for handle in handles]
 
     def receiver_create_many(self, rooms, attempts, digests):
@@ -146,10 +139,7 @@ class FakeTransport:
     def poll_many(self, handles):
         self.calls.append(("poll_many", list(handles)))
         self.poll_count += 1
-        return [
-            Poll(handle, 42 if self.poll_count == 1 else None, self.poll_count != 1)
-            for handle in handles
-        ]
+        return [Poll(handle, 42 if self.poll_count == 1 else None, self.poll_count != 1) for handle in handles]
 
     def abort_many(self, handles, reason):
         self.calls.append(("abort_many", list(handles), reason))
@@ -219,6 +209,30 @@ def test_region_table_is_exact_and_detects_pool_address_or_generation_change():
     pool.k_buffer[0]._address += 64
     with pytest.raises(RuntimeError, match="PD_STALE_EPOCH"):
         table.verify(pool)
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_transport_config_allows_the_frozen_mooncake_rpc_range(monkeypatch, role):
+    monkeypatch.setattr(
+        rust_pd,
+        "contract_digests",
+        lambda _model, _tokenizer: ("11" * 32, "22" * 32, "33" * 32, "44" * 32),
+    )
+    scheduler = SimpleNamespace(
+        server_args=SimpleNamespace(
+            disaggregation_mode=role,
+            model_path="/model",
+            tokenizer_path=None,
+            host="10.246.52.6",
+            disaggregation_bootstrap_port=8998,
+            pd_control_psk_file="/run/secrets/pd-control-psk",
+        )
+    )
+    regions = SimpleNamespace(transport_values=lambda: [])
+
+    config = rust_pd._transport_config(scheduler, regions)
+
+    assert config["mooncake_ports"] == list(range(15000, 17001))
 
     pool, table = region_table()
     pool.pd_generation += 1
@@ -308,10 +322,76 @@ def test_flush_pending_preserves_primary_error_when_cleanup_also_fails():
     with pytest.raises(RuntimeError, match="PD_PROTOCOL_MISMATCH") as raised:
         adapter.flush_pending()
 
-    assert raised.value.__notes__ == [
-        "Rust PD best-effort abort failed after the primary transport error"
-    ]
+    assert raised.value.__notes__ == ["Rust PD best-effort abort failed after the primary transport error"]
     assert adapter.pending_count == 0
+
+
+def test_flush_pending_advances_one_rendezvous_quantum_per_scheduler_tick():
+    pool, table = region_table("cuda:4")
+    transport = FakeTransport()
+    adapter = RustPdSchedulerAdapter(transport, "prefill", table, pool)
+    requests = [request(index, index) for index in range(8)]
+    for item in requests:
+        adapter.enqueue(item)
+    transport.calls.clear()
+
+    first = adapter.flush_pending()
+
+    assert first == requests[:1]
+    assert adapter.pending_count == 7
+    assert transport.calls == [
+        ("sender_create_many", [0]),
+        ("sender_init_many", [100]),
+    ]
+
+    second = adapter.flush_pending()
+
+    assert second == requests[1:2]
+    assert adapter.pending_count == 6
+    assert transport.calls[-2:] == [
+        ("sender_create_many", [1]),
+        ("sender_init_many", [100]),
+    ]
+
+
+def test_flush_pending_retries_transient_room_capacity_on_the_next_tick():
+    pool, table = region_table("cuda:4")
+    transport = FakeTransport()
+    adapter = RustPdSchedulerAdapter(transport, "prefill", table, pool)
+    pending = request(0, 0)
+    adapter.enqueue(pending)
+    attempts = 0
+
+    def capacity_then_create(epochs, rooms, attempts_ids, digests):
+        nonlocal attempts
+        attempts += 1
+        transport.calls.append(("sender_create_many", list(rooms)))
+        if attempts == 1:
+            return [
+                Item(
+                    0,
+                    ok=False,
+                    pd_reason="PD_CAPACITY_EXHAUSTED",
+                    retryable=True,
+                )
+            ]
+        return [Item(100)]
+
+    transport.sender_create_many = capacity_then_create
+    transport.calls.clear()
+
+    assert adapter.flush_pending() == []
+    assert adapter.pending_requests == (pending,)
+    assert adapter.active_count == 0
+    assert transport.calls == [("sender_create_many", [0])]
+
+    assert adapter.flush_pending() == [pending]
+    assert adapter.pending_count == 0
+    assert adapter.active_count == 1
+    assert transport.calls[-2:] == [
+        ("sender_create_many", [0]),
+        ("sender_init_many", [100]),
+    ]
 
 
 def test_shutdown_aborts_and_clears_before_transport_allows_pool_release():

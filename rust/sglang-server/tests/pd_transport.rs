@@ -166,6 +166,105 @@ fn generation_role_and_epoch_bound_handles_fail_closed_after_reuse() {
 }
 
 #[test]
+fn rejected_sender_creation_does_not_advance_cross_peer_room_generation() {
+    let decode = identity(Role::Decode, 0x20);
+    let prefill = identity(Role::Prefill, 0x30);
+    let (mut sender, _) = started(prefill.clone(), &decode);
+    let (mut receiver, _) = started(decode.clone(), &prefill);
+    assert_eq!(
+        sender.sender_create(SenderCreateInput {
+            decode_process_epoch: decode.process_epoch,
+            bootstrap_room: 1,
+            attempt_id: AttemptId::random(),
+            request_digest: FixedBytes::new([0; 32]),
+        }),
+        Err(TransportError::InvalidBatch)
+    );
+
+    let attempt_id = AttemptId::random();
+    let request_digest = FixedBytes::new([0xa5; 32]);
+    let sender_handle = sender
+        .sender_create(SenderCreateInput {
+            decode_process_epoch: decode.process_epoch,
+            bootstrap_room: 2,
+            attempt_id,
+            request_digest,
+        })
+        .expect("sender handle");
+    let receiver_handle = receiver
+        .receiver_create_many(&[ReceiverCreateInput {
+            bootstrap_room: 2,
+            attempt_id,
+            request_digest,
+        }])
+        .expect("receiver batch")[0]
+        .as_ref()
+        .copied()
+        .expect("receiver handle");
+    let sender_generation = sender
+        .room_context(sender_handle)
+        .expect("sender room context")
+        .room
+        .generation;
+    let receiver_generation = receiver
+        .room_context(receiver_handle)
+        .expect("receiver room context")
+        .room
+        .generation;
+    assert_eq!(sender_generation, 1);
+    assert_eq!(sender_generation, receiver_generation);
+}
+
+#[test]
+fn rejected_receiver_creation_does_not_advance_cross_peer_room_generation() {
+    let decode = identity(Role::Decode, 0x20);
+    let prefill = identity(Role::Prefill, 0x30);
+    let (mut sender, _) = started(prefill.clone(), &decode);
+    let (mut receiver, _) = started(decode.clone(), &prefill);
+    assert_eq!(
+        receiver.receiver_create_many(&[ReceiverCreateInput {
+            bootstrap_room: 1,
+            attempt_id: AttemptId::random(),
+            request_digest: FixedBytes::new([0; 32]),
+        }]),
+        Ok(vec![Err(TransportError::InvalidBatch)])
+    );
+
+    let attempt_id = AttemptId::random();
+    let request_digest = FixedBytes::new([0xa5; 32]);
+    let sender_handle = sender
+        .sender_create(SenderCreateInput {
+            decode_process_epoch: decode.process_epoch,
+            bootstrap_room: 2,
+            attempt_id,
+            request_digest,
+        })
+        .expect("sender handle");
+    let receiver_handle = receiver
+        .receiver_create_many(&[ReceiverCreateInput {
+            bootstrap_room: 2,
+            attempt_id,
+            request_digest,
+        }])
+        .expect("receiver batch")[0]
+        .as_ref()
+        .copied()
+        .expect("receiver handle");
+    let sender_generation = sender
+        .room_context(sender_handle)
+        .expect("sender room context")
+        .room
+        .generation;
+    let receiver_generation = receiver
+        .room_context(receiver_handle)
+        .expect("receiver room context")
+        .room
+        .generation;
+    assert_eq!(receiver_generation, 1);
+    assert_eq!(sender_generation, receiver_generation);
+}
+
+#[test]
 fn room_generation_restarts_with_each_authenticated_peer_session() {
     let first_decode = identity(Role::Decode, 0x20);
     let restarted_decode = identity(Role::Decode, 0x40);

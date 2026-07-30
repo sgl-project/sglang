@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::mooncake::{
-    Batch, EngineOwner, MemoryBuffer, MemoryLocation, Peer, Region as MooncakeRegion,
-    RemoteRegionDescriptor, TransferOperation,
+    Batch, EngineError, EngineOwner, MemoryBuffer, MemoryLocation, NativeCode, NativeOperation,
+    Peer, Region as MooncakeRegion, RemoteRegionDescriptor, TransferOperation,
 };
 use crate::pd::buffer::descriptor::{
     AUX_SLOT_BYTES, COMPLETION_SLOT_BYTES, KV_PAGE_BYTES, KV_REGION_COUNT, RegisteredRegionTable,
@@ -55,6 +55,101 @@ pub struct MooncakeNativeStagePort {
     destination_regions: Vec<RemoteRegionDescriptor>,
     batches: HashMap<NativeBatchToken, Batch>,
     next_batch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EngineErrorDiagnostic {
+    class: &'static str,
+    operation: Option<&'static str>,
+    code: Option<&'static str>,
+}
+
+fn engine_error_diagnostic(error: &EngineError) -> EngineErrorDiagnostic {
+    let class = match error {
+        EngineError::UnsupportedGpu { .. } => "unsupported_gpu",
+        EngineError::InvalidDescriptor { .. } => "invalid_descriptor",
+        EngineError::RangeOverflow { .. } => "range_overflow",
+        EngineError::RangeOutOfBounds { .. } => "range_out_of_bounds",
+        EngineError::QueueFull => "queue_full",
+        EngineError::WorkerClosed => "worker_closed",
+        EngineError::ResponseTimeout { .. } => "response_timeout",
+        EngineError::InFlightLimit { .. } => "in_flight_limit",
+        EngineError::ResourceClosed { .. } => "resource_closed",
+        EngineError::BatchNotTerminal { .. } => "batch_not_terminal",
+        EngineError::Native { .. } => "native",
+        EngineError::NativeHandle { .. } => "native_handle",
+        EngineError::LibraryMissing { .. } => "library_missing",
+        EngineError::ManifestMissing { .. } => "manifest_missing",
+        EngineError::ArtifactMismatch { .. } => "artifact_mismatch",
+        EngineError::AbiMismatch { .. } => "abi_mismatch",
+        EngineError::SymbolMissing { .. } => "symbol_missing",
+        EngineError::LoaderFailure { .. } => "loader_failure",
+        EngineError::ForkDetected { .. } => "fork_detected",
+        EngineError::WorkerStart { .. } => "worker_start",
+        EngineError::Rollback { .. } => "rollback",
+        EngineError::LockPoisoned => "lock_poisoned",
+    };
+    let operation = match error {
+        EngineError::Native { operation, .. } | EngineError::NativeHandle { operation } => {
+            Some(native_operation_name(*operation))
+        }
+        _ => None,
+    };
+    let code = match error {
+        EngineError::Native { code, .. } => Some(native_code_name(*code)),
+        _ => None,
+    };
+    EngineErrorDiagnostic {
+        class,
+        operation,
+        code,
+    }
+}
+
+const fn native_operation_name(operation: NativeOperation) -> &'static str {
+    match operation {
+        NativeOperation::SetCudaDevice => "set_cuda_device",
+        NativeOperation::AllocatePinnedMemory => "allocate_pinned_memory",
+        NativeOperation::AllocateCudaMemory => "allocate_cuda_memory",
+        NativeOperation::CopyMemory => "copy_memory",
+        NativeOperation::CreateEngine => "create_engine",
+        NativeOperation::GetLocalEndpoint => "get_local_endpoint",
+        NativeOperation::InstallTransport => "install_transport",
+        NativeOperation::RegisterRegion => "register_region",
+        NativeOperation::UnregisterRegion => "unregister_region",
+        NativeOperation::OpenPeer => "open_peer",
+        NativeOperation::ClosePeer => "close_peer",
+        NativeOperation::AllocateBatch => "allocate_batch",
+        NativeOperation::SubmitBatch => "submit_batch",
+        NativeOperation::Poll => "poll",
+        NativeOperation::FreeBatch => "free_batch",
+        NativeOperation::UninstallTransport => "uninstall_transport",
+        NativeOperation::DestroyEngine => "destroy_engine",
+    }
+}
+
+const fn native_code_name(code: NativeCode) -> &'static str {
+    match code {
+        NativeCode::InvalidArgument => "invalid_argument",
+        NativeCode::TooManyRequests => "too_many_requests",
+        NativeCode::AddressNotRegistered => "address_not_registered",
+        NativeCode::BatchBusy => "batch_busy",
+        NativeCode::DeviceNotFound => "device_not_found",
+        NativeCode::AddressOverlapped => "address_overlapped",
+        NativeCode::NotSupportedTransport => "not_supported_transport",
+        NativeCode::Dns => "dns",
+        NativeCode::Socket => "socket",
+        NativeCode::MalformedJson => "malformed_json",
+        NativeCode::RejectHandshake => "reject_handshake",
+        NativeCode::Metadata => "metadata",
+        NativeCode::Endpoint => "endpoint",
+        NativeCode::Context => "context",
+        NativeCode::Numa => "numa",
+        NativeCode::Clock => "clock",
+        NativeCode::Memory => "memory",
+        NativeCode::NotImplemented => "not_implemented",
+        NativeCode::Unknown(_) => "unknown",
+    }
 }
 
 impl MooncakeNativeStagePort {
@@ -239,11 +334,24 @@ impl NativeStagePort for MooncakeNativeStagePort {
         &mut self,
         batch: NativeBatchToken,
     ) -> Result<crate::mooncake::BatchSnapshot, BufferError> {
-        self.batches
+        let result = self
+            .batches
             .get(&batch)
             .ok_or(BufferError::StaleHandle)?
-            .status()
-            .map_err(|_| BufferError::NativeTransfer)
+            .status();
+        match result {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                let diagnostic = engine_error_diagnostic(&error);
+                tracing::warn!(
+                    error_class = diagnostic.class,
+                    native_operation = diagnostic.operation.unwrap_or("none"),
+                    native_code = diagnostic.code.unwrap_or("none"),
+                    "Rust PD Mooncake batch status failed closed"
+                );
+                Err(BufferError::NativeTransfer)
+            }
+        }
     }
 
     fn free_safe(&mut self, batch: NativeBatchToken) -> Result<(), BufferError> {
@@ -357,7 +465,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::mooncake::{
-        HostMemory, MockEngineFactory, MockEvent, MockPlan, OwnerConfig, PeerDescriptor,
+        EngineError, HostMemory, MockEngineFactory, MockEvent, MockPlan, NativeCode,
+        NativeOperation, OwnerConfig, PeerDescriptor,
     };
     use crate::pd::buffer::descriptor::{
         BufferDType, BufferRegionSpec, BufferTable, RegionKind, RegionLayout, RegionLocation,
@@ -411,6 +520,84 @@ mod tests {
     impl SourceComputeFence for Ready {
         fn wait_ready(&mut self, _deadline_monotonic_ms: u64) -> Result<(), BufferError> {
             Ok(())
+        }
+    }
+
+    #[test]
+    fn engine_error_diagnostic_omits_ids_paths_and_raw_codes() {
+        assert_eq!(
+            engine_error_diagnostic(&EngineError::Native {
+                operation: NativeOperation::Poll,
+                code: NativeCode::TooManyRequests,
+                raw_code: -2,
+            }),
+            EngineErrorDiagnostic {
+                class: "native",
+                operation: Some("poll"),
+                code: Some("too_many_requests"),
+            }
+        );
+        assert_eq!(
+            engine_error_diagnostic(&EngineError::ResourceClosed {
+                kind: "batch",
+                id: 0xdead_beef,
+            }),
+            EngineErrorDiagnostic {
+                class: "resource_closed",
+                operation: None,
+                code: None,
+            }
+        );
+
+        let operations = [
+            (NativeOperation::SetCudaDevice, "set_cuda_device"),
+            (
+                NativeOperation::AllocatePinnedMemory,
+                "allocate_pinned_memory",
+            ),
+            (NativeOperation::AllocateCudaMemory, "allocate_cuda_memory"),
+            (NativeOperation::CopyMemory, "copy_memory"),
+            (NativeOperation::CreateEngine, "create_engine"),
+            (NativeOperation::GetLocalEndpoint, "get_local_endpoint"),
+            (NativeOperation::InstallTransport, "install_transport"),
+            (NativeOperation::RegisterRegion, "register_region"),
+            (NativeOperation::UnregisterRegion, "unregister_region"),
+            (NativeOperation::OpenPeer, "open_peer"),
+            (NativeOperation::ClosePeer, "close_peer"),
+            (NativeOperation::AllocateBatch, "allocate_batch"),
+            (NativeOperation::SubmitBatch, "submit_batch"),
+            (NativeOperation::Poll, "poll"),
+            (NativeOperation::FreeBatch, "free_batch"),
+            (NativeOperation::UninstallTransport, "uninstall_transport"),
+            (NativeOperation::DestroyEngine, "destroy_engine"),
+        ];
+        for (operation, expected) in operations {
+            assert_eq!(native_operation_name(operation), expected);
+        }
+
+        let codes = [
+            (NativeCode::InvalidArgument, "invalid_argument"),
+            (NativeCode::TooManyRequests, "too_many_requests"),
+            (NativeCode::AddressNotRegistered, "address_not_registered"),
+            (NativeCode::BatchBusy, "batch_busy"),
+            (NativeCode::DeviceNotFound, "device_not_found"),
+            (NativeCode::AddressOverlapped, "address_overlapped"),
+            (NativeCode::NotSupportedTransport, "not_supported_transport"),
+            (NativeCode::Dns, "dns"),
+            (NativeCode::Socket, "socket"),
+            (NativeCode::MalformedJson, "malformed_json"),
+            (NativeCode::RejectHandshake, "reject_handshake"),
+            (NativeCode::Metadata, "metadata"),
+            (NativeCode::Endpoint, "endpoint"),
+            (NativeCode::Context, "context"),
+            (NativeCode::Numa, "numa"),
+            (NativeCode::Clock, "clock"),
+            (NativeCode::Memory, "memory"),
+            (NativeCode::NotImplemented, "not_implemented"),
+            (NativeCode::Unknown(-1), "unknown"),
+        ];
+        for (code, expected) in codes {
+            assert_eq!(native_code_name(code), expected);
         }
     }
 

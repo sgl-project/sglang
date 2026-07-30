@@ -70,6 +70,17 @@ impl PDRouter {
                             Err(e) => return Self::handle_serialization_error(e),
                         };
 
+                        let item_count = context.batch_size.unwrap_or(1);
+                        if item_count > PD_ACTIVE_ITEM_CAPACITY {
+                            return raw_generate::pd_error_response(
+                                raw_generate::PdRawError::RequestInvalid,
+                            );
+                        }
+                        let item_permits = Arc::clone(&self.active_item_permits)
+                            .acquire_many_owned(item_count as u32)
+                            .await
+                            .expect("PD item admission semaphore is never closed");
+
                         let ctx_is_stream = context.is_stream;
                         let response = self
                             .execute_dual_dispatch_internal(
@@ -81,6 +92,7 @@ impl PDRouter {
                                 start_time,
                             )
                             .await;
+                        let response = AttachedBody::wrap_response(response, item_permits);
 
                         let status = response.status();
                         let outcomes_already_recorded = response
@@ -325,6 +337,14 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
+        // The frozen PD control protocol performs one synchronous Room
+        // rendezvous at a time on a shared peer session. Independent HTTP
+        // connections can otherwise deliver concurrent requests to P and D in
+        // different orders. Hold this gate only until Prefill confirms that
+        // the paired rendezvous and transfer completed; Decode generation and
+        // streaming continue concurrently after that point.
+        let rendezvous_guard = self.rendezvous_gate.lock().await;
+
         // For non-streaming: use guard for automatic load management
         // For streaming: load will be managed in create_streaming_response
         let _prefill_guard =
@@ -491,6 +511,21 @@ impl PDRouter {
             return response;
         }
 
+        // A successful `reqwest::send` only proves that Prefill returned HTTP
+        // headers. The Scheduler clears its Rust handle immediately before it
+        // publishes the response body, so drain that body while still holding
+        // the rendezvous gate. Releasing on headers allows Decode to finish and
+        // the outer item permit to recycle before the Prefill slot is clear,
+        // creating a transient 33rd handle at the frozen capacity of 32.
+        let prefill_body = match self
+            .process_prefill_response(prefill_result, prefill.url(), context.return_logprob)
+            .await
+        {
+            Ok((_, body)) => body,
+            Err(error_response) => return error_response,
+        };
+        drop(rendezvous_guard);
+
         // Prefill ok: take decode's result, awaiting it if still pending.
         let decode_result = match decode_early {
             Some(dr) => dr,
@@ -528,14 +563,7 @@ impl PDRouter {
                     // decode on drop, so skip to avoid double-counting.
                     // Mark the response so the outer dispatcher skips its
                     // status-derived `record_outcome`.
-                    let prefill_ok = match &prefill_result {
-                        Ok(r) => {
-                            let s = r.status();
-                            s.is_success() || s.is_client_error()
-                        }
-                        Err(_) => false,
-                    };
-                    prefill.record_outcome(prefill_ok);
+                    prefill.record_outcome(true);
                     if !context.is_stream {
                         let decode_ok = status.is_success() || status.is_client_error();
                         decode.record_outcome(decode_ok);
@@ -547,30 +575,6 @@ impl PDRouter {
                     response.extensions_mut().insert(BreakerOutcomesRecorded);
                     return response;
                 }
-
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                };
 
                 if context.is_stream {
                     // Streaming response
@@ -647,14 +651,7 @@ impl PDRouter {
                 // dispatcher skips its status-derived `record_outcome`
                 // and we don't double-count.
                 decode.record_outcome(false);
-                let prefill_ok = match &prefill_result {
-                    Ok(res) => {
-                        let s = res.status();
-                        s.is_success() || s.is_client_error()
-                    }
-                    Err(_) => false,
-                };
-                prefill.record_outcome(prefill_ok);
+                prefill.record_outcome(true);
 
                 let mut response = error::bad_gateway(
                     "decode_server_error",

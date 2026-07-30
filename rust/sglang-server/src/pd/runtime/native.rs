@@ -40,7 +40,6 @@ pub struct NativeRegionDescriptor {
 
 pub struct NativeBootstrapPort {
     role: Role,
-    endpoint: SocketAddr,
     owner: Arc<EngineOwner>,
     table: Mutex<Option<Arc<RegisteredRegionTable<MooncakeRegion>>>>,
     buffers: BTreeMap<u16, MemoryBuffer>,
@@ -75,7 +74,6 @@ impl NativeBootstrapPort {
         );
         Ok(Self {
             role,
-            endpoint,
             owner,
             table: Mutex::new(Some(table)),
             buffers,
@@ -88,7 +86,7 @@ impl NativeBootstrapPort {
     #[cfg(test)]
     pub(crate) fn new_mock(
         role: Role,
-        endpoint: SocketAddr,
+        _endpoint: SocketAddr,
         layout_fingerprint: FixedBytes<32>,
         descriptors: Vec<NativeRegionDescriptor>,
     ) -> Result<Self, PdReason> {
@@ -110,7 +108,6 @@ impl NativeBootstrapPort {
         );
         Ok(Self {
             role,
-            endpoint,
             owner,
             table: Mutex::new(Some(table)),
             buffers,
@@ -214,10 +211,15 @@ impl BootstrapPort for NativeBootstrapPort {
             return Err(PdReason::ProtocolMismatch);
         }
         let table = self.table()?;
+        let endpoint = self
+            .owner
+            .local_peer_descriptor()
+            .map_err(|_| PdReason::LocalFatal)?
+            .endpoint();
         BootstrapRegistration::from_registered_table(
             &table,
-            self.endpoint.ip().to_string(),
-            self.endpoint.port(),
+            endpoint.ip().to_string(),
+            endpoint.port(),
         )
     }
 
@@ -586,6 +588,10 @@ mod tests {
         );
 
         let registration = decode.registration().expect("decode registration");
+        assert_eq!(
+            registration.mooncake_port, 19000,
+            "registration must publish the engine-reported endpoint, not its requested port"
+        );
         let payload = RegisterRegions {
             registration_epoch: registration.registration_epoch,
             layout_fingerprint: registration.layout_fingerprint,

@@ -1,5 +1,9 @@
-use axum::{http::HeaderMap, response::Response};
-use serde_json::Value;
+use axum::{
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
+use serde_json::{json, Value};
 
 use crate::core::{is_retryable_status, Worker};
 
@@ -7,6 +11,135 @@ const BOOTSTRAP_HOST_KEY: &str = "bootstrap_host";
 const BOOTSTRAP_PORT_KEY: &str = "bootstrap_port";
 const BOOTSTRAP_ROOM_KEY: &str = "bootstrap_room";
 const BOOTSTRAP_ATTEMPT_ID_KEY: &str = "bootstrap_attempt_id";
+
+#[derive(Clone, Copy)]
+pub(super) enum PdRawError {
+    RequestInvalid,
+    Unsupported,
+}
+
+fn optional_pd_bool(body: &Value, field: &str) -> Result<Option<bool>, PdRawError> {
+    match body.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(PdRawError::RequestInvalid),
+    }
+}
+
+fn pd_i64(value: Option<&Value>, default: i64) -> Result<i64, PdRawError> {
+    match value {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+            .ok_or(PdRawError::RequestInvalid),
+    }
+}
+
+fn pd_f64(value: Option<&Value>, default: f64) -> Result<f64, PdRawError> {
+    match value {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or(PdRawError::RequestInvalid),
+    }
+}
+
+fn validate_pd_sampling_map(map: &serde_json::Map<String, Value>) -> Result<(), PdRawError> {
+    for forbidden in [
+        "regex",
+        "json_schema",
+        "ebnf",
+        "grammar",
+        "structural_tag",
+        "custom_logit_processor",
+    ] {
+        if map.get(forbidden).is_some_and(|value| !value.is_null()) {
+            return Err(PdRawError::Unsupported);
+        }
+    }
+    if pd_f64(map.get("temperature"), 1.0)? != 0.0
+        || pd_i64(map.get("top_k"), 1)? != 1
+        || pd_f64(map.get("top_p"), 1.0)? != 1.0
+        || pd_f64(map.get("min_p"), 0.0)? != 0.0
+    {
+        return Err(PdRawError::Unsupported);
+    }
+    if !(0..=256).contains(&pd_i64(map.get("max_new_tokens"), 128)?) {
+        return Err(PdRawError::RequestInvalid);
+    }
+    Ok(())
+}
+
+pub(super) fn validate_pd_support(body: &Value) -> Result<(), PdRawError> {
+    let object = body.as_object().ok_or(PdRawError::RequestInvalid)?;
+    const ALLOWED_FIELDS: &[&str] = &[
+        "rid",
+        "text",
+        "input_ids",
+        "stream",
+        "sampling_params",
+        "return_logprob",
+        "logprob_start_len",
+        "top_logprobs_num",
+        "token_ids_logprob",
+        "return_hidden_states",
+        "return_sampling_mask",
+        "return_text_in_logprobs",
+        "n",
+        "lora_path",
+        "return_routed_experts",
+        "image_data",
+        "bootstrap_host",
+        "bootstrap_port",
+        "bootstrap_room",
+        "bootstrap_attempt_id",
+    ];
+    if object
+        .keys()
+        .any(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(PdRawError::RequestInvalid);
+    }
+
+    for field in [
+        "return_logprob",
+        "return_hidden_states",
+        "return_sampling_mask",
+        "return_routed_experts",
+    ] {
+        if optional_pd_bool(body, field)?.unwrap_or(false) {
+            return Err(PdRawError::Unsupported);
+        }
+    }
+    if pd_i64(object.get("top_logprobs_num"), 0)? != 0
+        || pd_i64(object.get("n"), 1)? != 1
+        || object
+            .get("token_ids_logprob")
+            .is_some_and(|value| !value.is_null())
+        || object
+            .get("lora_path")
+            .is_some_and(|value| !value.is_null())
+        || object
+            .get("image_data")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Err(PdRawError::Unsupported);
+    }
+
+    match object.get("sampling_params") {
+        Some(Value::Object(map)) => validate_pd_sampling_map(map)?,
+        Some(Value::Array(items)) => {
+            for item in items {
+                validate_pd_sampling_map(item.as_object().ok_or(PdRawError::RequestInvalid)?)?;
+            }
+        }
+        Some(_) => return Err(PdRawError::RequestInvalid),
+        None => return Err(PdRawError::Unsupported),
+    }
+    Ok(())
+}
 
 fn valid_token_id(value: &Value) -> bool {
     value.as_u64().is_some_and(|token| token <= u32::MAX as u64)
@@ -47,12 +180,13 @@ pub(super) fn generate_shape(body: &Value) -> Result<(Option<usize>, bool, bool)
         if items.is_empty() {
             return Err("input_ids must not be empty".to_string());
         }
-        if items.iter().all(valid_token_id) {
+        if items.len() <= 4096 && items.iter().all(valid_token_id) {
             None
         } else if (1..=8).contains(&items.len())
             && items.iter().all(|item| {
-                item.as_array()
-                    .is_some_and(|tokens| !tokens.is_empty() && tokens.iter().all(valid_token_id))
+                item.as_array().is_some_and(|tokens| {
+                    (1..=4096).contains(&tokens.len()) && tokens.iter().all(valid_token_id)
+                })
             })
         {
             Some(items.len())
@@ -110,6 +244,45 @@ pub(super) fn response_retryable(response: &Response) -> bool {
 
 pub(super) fn has_typed_error(headers: &HeaderMap) -> bool {
     headers.contains_key("x-sglang-pd-reason") && headers.contains_key("x-sglang-retryable")
+}
+
+pub(super) fn request_invalid_response() -> Response {
+    pd_error_response(PdRawError::RequestInvalid)
+}
+
+pub(super) fn pd_error_response(error: PdRawError) -> Response {
+    let (status, message, reason) = match error {
+        PdRawError::RequestInvalid => (
+            StatusCode::BAD_REQUEST,
+            "PD request is invalid",
+            "PD_REQUEST_INVALID",
+        ),
+        PdRawError::Unsupported => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "PD request uses an unsupported capability",
+            "PD_UNSUPPORTED",
+        ),
+    };
+    let mut response = (
+        status,
+        Json(json!({
+            "error": {
+                "code": status.as_u16(),
+                "message": message,
+                "pd_reason": reason,
+                "retryable": false,
+                "type": "pd_error"
+            }
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert("x-sglang-pd-reason", HeaderValue::from_static(reason));
+    response
+        .headers_mut()
+        .insert("x-sglang-retryable", HeaderValue::from_static("false"));
+    response
 }
 
 pub(super) fn inject_bootstrap(
@@ -226,6 +399,10 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("client-secret".to_string()),
             enable_igw: false,
+            rendezvous_gate: Arc::new(tokio::sync::Mutex::new(())),
+            active_item_permits: Arc::new(tokio::sync::Semaphore::new(
+                super::super::PD_ACTIVE_ITEM_CAPACITY,
+            )),
         }
     }
 
@@ -315,7 +492,15 @@ mod tests {
 
         let response = tokio::time::timeout(
             Duration::from_secs(2),
-            router.route_generate_raw(None, &json!({"text": "hello", "stream": stream}), None),
+            router.route_generate_raw(
+                None,
+                &json!({
+                    "text": "hello",
+                    "stream": stream,
+                    "sampling_params": {"temperature": 0}
+                }),
+                None,
+            ),
         )
         .await
         .expect("decode failure must not wait for pending prefill");
@@ -378,7 +563,15 @@ mod tests {
 
         let response = tokio::time::timeout(
             Duration::from_secs(2),
-            router.route_generate_raw(None, &json!({"text": "hello", "stream": stream}), None),
+            router.route_generate_raw(
+                None,
+                &json!({
+                    "text": "hello",
+                    "stream": stream,
+                    "sampling_params": {"temperature": 0}
+                }),
+                None,
+            ),
         )
         .await
         .expect("prefill failure must not wait for pending decode");
@@ -582,6 +775,106 @@ mod tests {
             .headers_mut()
             .insert("x-sglang-retryable", HeaderValue::from_static("true"));
         assert!(!response_retryable(&unknown));
+    }
+
+    #[tokio::test]
+    async fn invalid_raw_generate_shape_returns_frozen_typed_pd_error() {
+        let response = router()
+            .route_generate_raw(
+                None,
+                &json!({"sampling_params": {"temperature": 0, "max_new_tokens": 1}}),
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get("x-sglang-pd-reason").unwrap(),
+            "PD_REQUEST_INVALID"
+        );
+        assert_eq!(
+            response.headers().get("x-sglang-retryable").unwrap(),
+            "false"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({
+                "error": {
+                    "message": "PD request is invalid",
+                    "type": "pd_error",
+                    "code": 400,
+                    "pd_reason": "PD_REQUEST_INVALID",
+                    "retryable": false
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn prevalidation_errors_match_native_api_wire_bytes() {
+        let cases = [
+            (
+                PdRawError::RequestInvalid,
+                concat!(
+                    "{\"error\":{\"code\":400,\"message\":\"PD request is invalid\",",
+                    "\"pd_reason\":\"PD_REQUEST_INVALID\",\"retryable\":false,",
+                    "\"type\":\"pd_error\"}}"
+                ),
+            ),
+            (
+                PdRawError::Unsupported,
+                concat!(
+                    "{\"error\":{\"code\":422,",
+                    "\"message\":\"PD request uses an unsupported capability\",",
+                    "\"pd_reason\":\"PD_UNSUPPORTED\",\"retryable\":false,",
+                    "\"type\":\"pd_error\"}}"
+                ),
+            ),
+        ];
+        for (error, expected) in cases {
+            let response = pd_error_response(error);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), expected.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_pd_support_and_range_errors_are_typed_before_worker_selection() {
+        let unsupported = [
+            json!({"input_ids": [1], "sampling_params": {"temperature": 0.5, "max_new_tokens": 1}}),
+            json!({"input_ids": [1], "sampling_params": {"temperature": 0, "max_new_tokens": 1, "json_schema": {"type": "object"}}}),
+            json!({"input_ids": [1], "sampling_params": {"temperature": 0, "top_k": 2, "max_new_tokens": 1}}),
+            json!({"input_ids": [1], "sampling_params": {"temperature": 0, "max_new_tokens": 1}, "return_logprob": true}),
+            json!({"input_ids": [1], "sampling_params": {"temperature": 0, "max_new_tokens": 1}, "n": 2}),
+            json!({"input_ids": [1], "sampling_params": {"temperature": 0, "max_new_tokens": 1}, "image_data": "image"}),
+        ];
+        for payload in unsupported {
+            let response = router().route_generate_raw(None, &payload, None).await;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                response.headers().get("x-sglang-pd-reason").unwrap(),
+                "PD_UNSUPPORTED"
+            );
+        }
+
+        let invalid = [
+            json!({"input_ids": vec![1; 4097], "sampling_params": {"temperature": 0, "max_new_tokens": 1}}),
+            json!({"input_ids": [1], "sampling_params": {"temperature": 0, "max_new_tokens": -1}}),
+            json!({"input_ids": [1], "sampling_params": {"temperature": 0, "max_new_tokens": 257}}),
+            json!({"input_ids": [1], "sampling_params": {"temperature": 0, "max_new_tokens": 1}, "pd07_unknown": true}),
+        ];
+        for payload in invalid {
+            let response = router().route_generate_raw(None, &payload, None).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.headers().get("x-sglang-pd-reason").unwrap(),
+                "PD_REQUEST_INVALID"
+            );
+        }
     }
 
     #[test]
