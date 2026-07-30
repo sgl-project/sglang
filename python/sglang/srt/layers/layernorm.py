@@ -26,6 +26,10 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.device_capabilities import (
+    NPUFeature,
+    supports_npu_feature,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -1000,9 +1004,12 @@ class GemmaRMSNorm(MultiPlatformOp):
             )
             return norm_out, residual
 
-        # Gemma RMSNorm == normalize(x) * (1 + weight). Use the equivalent
-        # npu_rms_norm path across NPU generations because npu_gemma_rms_norm
-        # has no kernel registered on Ascend A5.
+        if supports_npu_feature(NPUFeature.NATIVE_GEMMA_RMS_NORM):
+            x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
+            return x
+
+        # Gemma RMSNorm == normalize(x) * (1 + weight). Ascend A5 does not
+        # provide the fused Gemma kernel, so use the equivalent RMSNorm path.
         x, _ = torch_npu.npu_rms_norm(x, 1.0 + self.weight, self.variance_epsilon)
         return x
 
