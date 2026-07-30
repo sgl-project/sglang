@@ -206,7 +206,11 @@ class DeepseekV2WeightLoaderMixin:
             weight_names = []
 
             for name, loaded_weight in weights:
-                use_async_loading = should_async_load(loaded_weight)
+                use_async_loading = should_async_load(
+                    loaded_weight
+                ) and not getattr(
+                    loaded_weight, RUNAI_STREAMER_TENSOR_ATTR, False
+                )
                 layer_id = get_layer_id(name)
                 if (
                     layer_id is not None
