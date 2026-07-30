@@ -15,7 +15,7 @@ from contextlib import nullcontext
 
 import pytest
 import torch
-from flashinfer import mxfp8_quantize, trtllm_fp4_block_scale_moe
+from flashinfer import trtllm_fp4_block_scale_moe
 
 from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -164,7 +164,9 @@ def _quant_input(x, precision, hidden_size):
                 x_quant, (0, hidden_size - origin), mode="constant", value=0.0
             )
     elif precision == "default":
-        x_quant, x_scale = mxfp8_quantize(x, False, alignment=hidden_size)
+        from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
+
+        x_quant, x_scale = flashinfer_mxfp8_quantize(x, False, alignment=hidden_size)
         x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
     else:
         raise AssertionError(precision)
