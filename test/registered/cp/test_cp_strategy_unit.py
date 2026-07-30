@@ -1,15 +1,10 @@
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.attention.dsa.utils import (
-    can_dsa_cp_split,
-    can_dsa_prefill_cp_round_robin_split,
-    is_dsa_enable_prefill_cp,
-)
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     get_cp_strategy,
@@ -105,87 +100,6 @@ class TestCPStrategyUnit(CustomTestCase):
             "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
         ):
             self.assertIsNotNone(get_cp_strategy())
-
-    def test_dsa_cp_v2_materializes_mla_kv_through_strategy(self):
-        from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
-
-        forward_batch = SimpleNamespace()
-        layer = object()
-        attn_mla = SimpleNamespace(attn_mqa=layer)
-        latent_cache = torch.empty(2, 5)
-        k_nope = torch.empty(2, 1, 3)
-        k_rope = torch.empty(2, 1, 2)
-        full_k_nope = torch.empty(4, 1, 3)
-        full_k_rope = torch.empty(4, 1, 2)
-        strategy = MagicMock()
-        strategy.materialize_full_mla_kv.return_value = (full_k_nope, full_k_rope)
-
-        with (
-            patch(
-                "sglang.srt.layers.attention.dsa_backend.is_cp_v2_active",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.attention.dsa_backend.get_cp_strategy",
-                return_value=strategy,
-            ),
-        ):
-            actual = materialize_full_kv_cp(
-                attn_mla,
-                forward_batch,
-                latent_cache,
-                k_nope,
-                k_rope,
-            )
-
-        self.assertIs(actual[0], full_k_nope)
-        self.assertIs(actual[1], full_k_rope)
-        strategy.materialize_full_mla_kv.assert_called_once_with(
-            forward_batch,
-            layer,
-            k_nope,
-            k_rope,
-        )
-        strategy.materialize_full_kv.assert_not_called()
-
-    def test_dsa_cp_v1_rebuilds_mla_kv_without_strategy(self):
-        from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
-
-        forward_batch = SimpleNamespace()
-        latent_cache = torch.empty(2, 5)
-        k_nope = torch.empty(2, 1, 3)
-        k_rope = torch.empty(2, 1, 2)
-        full_k_nope = torch.empty(4, 1, 3)
-        full_k_rope = torch.empty(4, 1, 2)
-        rebuild_cp_kv_cache = MagicMock(return_value=(full_k_nope, full_k_rope))
-        attn_mla = SimpleNamespace(rebuild_cp_kv_cache=rebuild_cp_kv_cache)
-
-        with (
-            patch(
-                "sglang.srt.layers.attention.dsa_backend.is_cp_v2_active",
-                return_value=False,
-            ),
-            patch(
-                "sglang.srt.layers.attention.dsa_backend.get_cp_strategy"
-            ) as get_strategy,
-        ):
-            actual = materialize_full_kv_cp(
-                attn_mla,
-                forward_batch,
-                latent_cache,
-                k_nope,
-                k_rope,
-            )
-
-        self.assertIs(actual[0], full_k_nope)
-        self.assertIs(actual[1], full_k_rope)
-        rebuild_cp_kv_cache.assert_called_once_with(
-            latent_cache,
-            forward_batch,
-            k_nope,
-            k_rope,
-        )
-        get_strategy.assert_not_called()
 
 
 class TestCPZigzagStrategy(CustomTestCase):
@@ -724,16 +638,6 @@ class TestCPInterleaveStrategy(CustomTestCase):
         ):
             yield
 
-    def test_interleave_metadata_matches_legacy_round_robin_placeholder(self):
-        metadata = InterleaveCPStrategy(cp_size=4).build_metadata(
-            num_tokens=8,
-            seqs_len=[5, 6],
-            extend_seqs_len=[3, 4],
-        )
-
-        self.assertEqual(metadata.bs, 2)
-        self.assertEqual(metadata.total_seq_lens, 8)
-
     def test_interleave_metadata_supports_shared_padding(self):
         metadata = InterleaveCPStrategy(cp_size=4).build_metadata(
             num_tokens=10,
@@ -785,127 +689,6 @@ class TestCPInterleaveStrategy(CustomTestCase):
             [4, 4, 4, 4],
         )
         set_buffer_len.assert_called_once_with(16)
-
-    def test_interleave_can_apply_uses_legacy_round_robin_predicate(self):
-        active_batch = SimpleNamespace(
-            input_ids=torch.arange(8),
-            forward_mode=_ExtendMode(),
-            extend_seq_lens_cpu=[8],
-        )
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
-            return_value=True,
-        ):
-            self.assertTrue(is_cp_v2_active(active_batch))
-
-        small_batch = SimpleNamespace(
-            input_ids=torch.arange(2),
-            forward_mode=_ExtendMode(),
-            extend_seq_lens_cpu=[2],
-        )
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
-            return_value=True,
-        ):
-            self.assertFalse(is_cp_v2_active(small_batch))
-
-    def test_dsa_round_robin_split_applies_to_cp_extend(self):
-        active_batch = SimpleNamespace(
-            input_ids=torch.arange(8),
-            forward_mode=_ExtendMode(),
-            extend_seq_lens_cpu=[8],
-        )
-
-        with (
-            get_parallel().override(attn_cp_size=4),
-            patch(
-                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
-            ) as enable_cp_v2,
-            patch(
-                "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_round_robin_split",
-                return_value=True,
-            ),
-        ):
-            self.assertTrue(can_dsa_prefill_cp_round_robin_split(active_batch))
-            enable_cp_v2.assert_not_called()
-
-    def test_dsa_cp_v1_enablement_uses_legacy_config(self):
-        for enabled in (False, True):
-            with (
-                self.subTest(enabled=enabled),
-                patch(
-                    "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
-                    return_value=False,
-                ),
-                patch(
-                    "sglang.srt.layers.attention.dsa.utils.get_parallel",
-                    return_value=SimpleNamespace(
-                        attn_cp_size=4,
-                        enable_dsa_prefill_context_parallel=enabled,
-                    ),
-                ),
-                patch(
-                    "sglang.srt.configs.model_config.is_deepseek_dsa"
-                ) as is_deepseek_dsa,
-            ):
-                self.assertEqual(is_dsa_enable_prefill_cp(), enabled)
-                is_deepseek_dsa.assert_not_called()
-
-    def test_dsa_cp_v2_enablement_uses_model_and_topology(self):
-        hf_config = object()
-        server_args = SimpleNamespace(
-            get_model_config=MagicMock(
-                return_value=SimpleNamespace(hf_config=hf_config)
-            )
-        )
-        with (
-            patch(
-                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.attention.dsa.utils.get_parallel",
-                return_value=SimpleNamespace(
-                    attn_cp_size=4,
-                    enable_dsa_prefill_context_parallel=False,
-                ),
-            ),
-            patch(
-                "sglang.srt.layers.attention.dsa.utils.get_server_args",
-                return_value=server_args,
-            ),
-            patch(
-                "sglang.srt.configs.model_config.is_deepseek_dsa",
-                return_value=True,
-            ) as is_deepseek_dsa,
-        ):
-            self.assertTrue(is_dsa_enable_prefill_cp())
-            is_deepseek_dsa.assert_called_once_with(hf_config)
-
-    def test_legacy_dsa_split_skips_short_cp_v2_fallback_batch(self):
-        short_batch = SimpleNamespace(
-            forward_mode=_ExtendMode(),
-            extend_seq_lens_cpu=[6],
-        )
-
-        with (
-            patch(
-                "sglang.srt.layers.attention.dsa.utils.is_dsa_enable_prefill_cp",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_round_robin_split",
-                return_value=True,
-            ),
-        ):
-            self.assertFalse(
-                can_dsa_cp_split(
-                    seq_len=6,
-                    cp_size=8,
-                    use_dsa=True,
-                    forward_batch=short_batch,
-                )
-            )
 
     def test_interleave_shards_hidden_states_and_position_ids(self):
         cp_size = 4

@@ -14,14 +14,14 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=320, stage="extra-b", runner_config="deepep-8-gpu-h200")
-DEEPSEEK_V32_MODEL_PATH = "zai-org/GLM-5.2-FP8"
+GLM52_MODEL_PATH = "zai-org/GLM-5.2-FP8"
 SERVER_LAUNCH_TIMEOUT = max(DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, 1800)
 
 
-class TestDeepseekV32CPV2Interleave(CustomTestCase):
+class TestDSACPV2Interleave(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEEPSEEK_V32_MODEL_PATH
+        cls.model = GLM52_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
@@ -79,7 +79,7 @@ class TestDeepseekV32CPV2Interleave(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_a_gsm8k (deepseek-v32-cp-v2-interleave)\n"
+                f"### test_a_gsm8k (dsa-cp-v2-interleave)\n"
                 f'{metrics["score"]=:.3f}\n'
             )
             self.assertGreater(metrics["score"], 0.935)
