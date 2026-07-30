@@ -169,8 +169,7 @@ class AttentionBackend(ABC):
 
     @property
     def verify_tree_mask(self) -> Optional[VerifyTreeMask]:
-        """The tree-mask scratch the draft stage fills in place, if this
-        backend runs target verify with a preallocated one."""
+        """The scratch the draft stage fills in place, if this backend has one."""
         return None
 
     def update_verify_buffers_to_fill_after_draft(

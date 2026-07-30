@@ -1,7 +1,3 @@
-"""Unit tests for the VerifyTreeMask scratch: worst-case sizing, the
-allocate-only-for-a-verifying-target gate, and HybridAttnBackend handing out
-the scratch of whichever child actually runs target verify."""
-
 import unittest
 from types import SimpleNamespace
 
@@ -34,8 +30,7 @@ def _create(**overrides):
 
 class TestVerifyTreeMaskSizing(CustomTestCase):
     def test_covers_what_the_tree_kernel_writes(self):
-        """Must hold num_draft_tokens * (seq_len + num_draft_tokens) cells per
-        request at max context -- the bound the tree kernel writes up to."""
+        """Must cover the tree kernel's write bound at max context."""
         max_bs, num_draft_tokens, max_context_len = 4, 3, 128
 
         mask = _create(
@@ -95,9 +90,7 @@ def _make_hybrid_backend(speculative_attention_mode, prefill_mask, decode_mask):
 
 
 class TestHybridAttnBackendHandsOutSelectedChildScratch(CustomTestCase):
-    """The child that runs target verify is the one whose scratch is used --
-    a wrapper that forwarded only part of this would silently fall back to
-    allocating a fresh mask every verify step."""
+    """Forwarding the wrong child silently falls back to a fresh mask per step."""
 
     def test_decode_mode_uses_decode_child(self):
         prefill_mask = VerifyTreeMask(buffer=torch.zeros(4, dtype=torch.bool))

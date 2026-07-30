@@ -575,7 +575,6 @@ class DeepseekV4AttnBackend(
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
-        # Allocated in init_cuda_graph_state; see VerifyTreeMask.
         self._verify_tree_mask = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
@@ -1514,9 +1513,8 @@ class DeepseekV4AttnBackend(
         self.draft_extend_num_tokens_per_req = (
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
-        # DSV4's verify metadata never extracts from the mask, but the tree
-        # kernel still writes it, so the scratch is allocated with is_read=False.
-        # DSV4 has no skip_prefill notion: every instance that verifies needs it.
+        # Verify metadata never extracts the mask, but the tree kernel still
+        # writes it. No skip_prefill notion here.
         self._verify_tree_mask = maybe_create_verify_tree_mask(
             is_draft_runner=self.is_draft_runner,
             skip_prefill=False,

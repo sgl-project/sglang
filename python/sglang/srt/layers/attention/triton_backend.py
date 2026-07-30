@@ -297,8 +297,6 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         self.forward_metadata: ForwardMetadata = None
-
-        # Allocated in init_cuda_graph_state; see VerifyTreeMask.
         self._verify_tree_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
@@ -997,9 +995,8 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
-        # Triton's mask layout is num_draft_tokens * (seq_len + num_draft_tokens)
-        # per request (see the seq_mask_len cumsum below), i.e. the same bound
-        # the shared FULL_MASK sizing covers. It reads the mask via uint8.
+        # Layout is draft * (seq_len + draft) per request (seq_mask_len cumsum
+        # below) -- the same bound the shared sizing covers. Read as uint8.
         self._verify_tree_mask = maybe_create_verify_tree_mask(
             is_draft_runner=self.is_draft_runner,
             skip_prefill=self.skip_prefill,

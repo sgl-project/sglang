@@ -189,7 +189,6 @@ class FlashAttentionBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.ps.attn_cp_size
-        # Allocated in init_cuda_graph_state; see VerifyTreeMask.
         self._verify_tree_mask = None
         # The worker fetches the tree-mask scratch from the target backend
         # only; draft-side instances must not allocate it.
@@ -2202,8 +2201,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             }
 
-            # topk<=1 verify never extracts from the mask (both the eager and
-            # cuda-graph metadata paths gate the extraction on topk > 1).
+            # topk<=1 never extracts the mask; both metadata paths gate on topk > 1.
             self._verify_tree_mask = maybe_create_verify_tree_mask(
                 is_draft_runner=self.is_draft_runner,
                 skip_prefill=self.skip_prefill,

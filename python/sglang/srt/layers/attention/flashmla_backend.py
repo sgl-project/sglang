@@ -106,7 +106,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_num_splits_view = None
         # Static K-lens buffer bound by the draft-extend graph kernel.
         self.cuda_graph_draft_extend_seq_lens_k = None
-        # Allocated in init_cuda_graph_state; see VerifyTreeMask.
         self._verify_tree_mask = None
         self._eager_kv_indices_buf = None
         # The worker fetches the tree-mask scratch from the target backend

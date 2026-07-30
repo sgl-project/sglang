@@ -923,9 +923,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     @property
     def verify_tree_mask(self) -> Optional[VerifyTreeMask]:
-        # The scratch lives on the full-attn child; the linear side consumes no
-        # mask. Handing it out lets the draft stage write straight into the
-        # captured buffer instead of allocating a fresh mask every step.
+        # The scratch lives on the full-attn child; the linear side reads no mask.
         return self.full_attn_backend.verify_tree_mask
 
     def update_verify_buffers_to_fill_after_draft(
