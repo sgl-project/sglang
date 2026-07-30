@@ -61,6 +61,7 @@ class ChebyshevForecaster(nn.Module):
         self._write_idx = 0
         self._count = 0
         self._shape: Optional[torch.Size] = feature_shape
+        self._feature_dtype: Optional[torch.dtype] = None
         self._coef: Optional[torch.Tensor] = None
         self.device_ref = device
         self._tau_scale = 2.0 / float(self.num_steps) if self.num_steps != 0 else 0.0
@@ -92,6 +93,8 @@ class ChebyshevForecaster(nn.Module):
         device = self.device_ref or h.device
         t_tensor = torch.as_tensor(t, dtype=torch.float32, device=device)
         h_flat, shape = _flatten(h)
+        if self._feature_dtype is None:
+            self._feature_dtype = h_flat.dtype
         h_flat = h_flat.to(device).to(torch.float32)
         if self._shape is None:
             self._shape = shape
@@ -142,7 +145,8 @@ class ChebyshevForecaster(nn.Module):
             return
         assert self.ready()
         assert self._H_buf is not None
-        feature_dtype = self._H_buf.dtype
+        assert self._feature_dtype is not None
+        feature_dtype = self._feature_dtype
         t, h = self.t_buf[: self._count], self._H_buf[: self._count]
         taus = self._taus(t)
         # Ridge solve in fp32; autocast would keep matmuls in bf16 and break
@@ -200,10 +204,12 @@ class SpectrumForecaster(nn.Module):
         """Predict hidden state at t_star using discrete Taylor expansion from recent real steps."""
         assert self.cheb._H_buf is not None
         assert self.cheb._shape is not None
+        assert self.cheb._feature_dtype is not None
+        feature_dtype = self.cheb._feature_dtype
         t, h = self.cheb._recent(self.taylor_order + 1)
         h_i = h[-1]
         if t.numel() < 2:
-            return _unflatten(h_i.reshape(1, -1), self.cheb._shape)
+            return _unflatten(h_i.reshape(1, -1), self.cheb._shape).to(feature_dtype)
         h_im1 = h[-2]
         t_i = t[-1]
         t_im1 = t[-2]
@@ -219,7 +225,7 @@ class SpectrumForecaster(nn.Module):
             h_im3 = h[-4]
             d3 = h_i - 3 * h_im1 + 3 * h_im2 - h_im3
             out = out + (k * (k - 1.0) * (k - 2.0) / 6.0) * d3
-        return _unflatten(out.reshape(1, -1), self.cheb._shape)
+        return _unflatten(out.reshape(1, -1), self.cheb._shape).to(feature_dtype)
 
     @torch.no_grad()
     def predict(self, t_star: float | torch.Tensor) -> torch.Tensor:
