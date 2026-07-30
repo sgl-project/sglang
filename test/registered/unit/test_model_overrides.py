@@ -1587,7 +1587,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _moe_runner_backend_quant_constraints(
                     _view(quantization="modelopt_mixed")
                 ),
-                {"moe_runner_backend": "flashinfer_cutlass"},
+                {"moe_runner_backend": "flashinfer_trtllm"},
+            )
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(
+                    _view(
+                        quantization="modelopt_mixed",
+                        moe_runner_backend="flashinfer_cutlass",
+                    )
+                ),
+                {},
             )
         self.assertEqual(
             _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),

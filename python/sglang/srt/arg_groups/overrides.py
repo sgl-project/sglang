@@ -2128,7 +2128,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         and view.quantization == "modelopt_mixed"
         and is_sm100_supported()
     ):
-        moe_runner_backend = "flashinfer_cutlass"
+        moe_runner_backend = "flashinfer_trtllm"
     if (
         moe_runner_backend == "auto"
         and view.quantization == "modelopt_fp4"

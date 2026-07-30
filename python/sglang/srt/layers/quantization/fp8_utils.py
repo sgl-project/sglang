@@ -638,6 +638,8 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
         and _is_sm100_supported
         and is_flashinfer_available()
     ):
+        # CUTLASS supports the full MXFP8 linear shape set without TRT-LLM's
+        # K % 256 requirement; narrow output shards are padded by Fp8LinearMethod.
         backend = Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
 
     FP8_GEMM_RUNNER_BACKEND = backend
