@@ -15,8 +15,7 @@ if TYPE_CHECKING:
 
 
 class EagleDraftWorkerBase(ABC):
-    # Chain (topk=1) constants shared by every draft worker's draft_forward
-    # fast path; stay None when topk > 1. See _rebuild_topk1_chain_buffers.
+    # topk=1 chain constants for draft_forward's fast path; None when topk > 1.
     _topk1_parents_prealloc: Optional[torch.Tensor] = None
     _topk1_score_indices_prealloc: Optional[torch.Tensor] = None
 

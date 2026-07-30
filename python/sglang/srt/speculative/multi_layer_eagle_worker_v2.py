@@ -134,7 +134,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             server_args.speculative_algorithm
         )
 
-        # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
         self._rebuild_topk1_chain_buffers()
 
         # Set constant
@@ -447,9 +446,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
 
         # Chain-style (topk=1, one token per draft step, all of them selected):
-        # the slice/cat organization in _draft_forward_organize is the identity
-        # on topk_index, and parent_list is the constant [-1, 0, .., S-2] per
-        # row. Return the prealloc'd constants and skip every kernel launch here.
+        # _draft_forward_organize's slice/cat/topk/sort/gather is the identity on
+        # topk_index, and parent_list is the constant [-1, 0, .., S-2] per row.
         parents_prealloc = self._topk1_parents_prealloc
         if (
             parents_prealloc is not None
@@ -502,7 +500,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                         )
                     )
 
-        # Organize the results
         return organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )

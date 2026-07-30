@@ -144,7 +144,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             server_args.speculative_algorithm
         )
 
-        # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
         self._rebuild_topk1_chain_buffers()
 
         # Load draft model weights only.
