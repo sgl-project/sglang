@@ -1198,7 +1198,7 @@ class EmbeddingRequest(BaseModel):
 
 
 class EmbeddingObject(BaseModel):
-    embedding: List[float]
+    embedding: Union[List[float], str]
     index: int
     object: str = "embedding"
 

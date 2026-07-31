@@ -5,7 +5,16 @@ import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, overload
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    overload,
+)
 
 import numpy as np
 import torch
@@ -27,11 +36,34 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.server_args import ServerArgs
 
+if is_npu():
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+        DSV4NPUTokenToKVPool,
+    )
+
 #########################
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+
+
+def poll_and_all_reduce_pp(
+    rids: Iterable[str],
+    ready_poll: int,
+    pp_good_rids: Optional[List[str]] = None,
+    pp_bad_rids: Optional[List[str]] = None,
+) -> List[Optional[int]]:
+    """Map authoritative PP consensus to poll states without polling again."""
+    if pp_good_rids is None or pp_bad_rids is None:
+        raise ValueError("PP consensus is required")
+
+    good_rids = set(pp_good_rids)
+    bad_rids = set(pp_bad_rids)
+    return [
+        KVPoll.Failed if rid in bad_rids else ready_poll if rid in good_rids else None
+        for rid in rids
+    ]
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
@@ -981,7 +1013,17 @@ def setup_state_kv_args(
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
 
-    if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
+    if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
+        # Pool ships each sub-pool as its own page-indexed component (fixed order
+        # so prefill and decode register identically); skips get_state_buf_infos.
+        for (
+            st,
+            comp_ptrs,
+            comp_lens,
+            comp_item_lens,
+        ) in token_to_kv_pool.get_pd_state_components():
+            append_state_component(kv_args, st, comp_ptrs, comp_lens, comp_item_lens)
+    elif isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
             raise NotImplementedError(
                 "PD disaggregation for MiniMax sparse layers with index value "

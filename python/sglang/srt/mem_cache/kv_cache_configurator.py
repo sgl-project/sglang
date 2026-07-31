@@ -716,7 +716,12 @@ class KVCacheConfigurator:
         extra_max_context_len: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
-        from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+        if _is_npu and is_deepseek_v4(self.model_config.hf_config):
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
+                DSV4NPUDecodeReqToTokenPool as DecodeReqToTokenPool,
+            )
+        else:
+            from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 
         req_to_token_pool = DecodeReqToTokenPool(
             size=max_num_reqs,
@@ -1589,7 +1594,7 @@ class KVCacheConfigurator:
             # Mamba state is a fixed pre-capture allocation, so it can't ride the ~0 post-capture slack.
             slack_gb = max(
                 slack_gb,
-                self.server_args.mamba_pre_capture_reserve_mb(
+                self.server_args.pre_capture_activation_reserve_mb(
                     get_device_memory_capacity(self.device)
                 )
                 / 1024,

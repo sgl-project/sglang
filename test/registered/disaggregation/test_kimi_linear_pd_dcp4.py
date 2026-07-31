@@ -62,19 +62,16 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
         cls.launch_all()
 
     @classmethod
-    def _common_dcp_args(cls):
+    def _monolithic_reference_args(cls):
         return [
             "--tp-size",
             "4",
-            "--dcp-size",
+            "--ep-size",
             "4",
             "--attention-backend",
             "tokenspeed_mla",
             "--kv-cache-dtype",
             "fp8_e4m3",
-            "--dcp-comm-backend",
-            "a2a",
-            "--dcp-replicate-q-proj",
             "--trust-remote-code",
             "--random-seed",
             "0",
@@ -84,7 +81,6 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
             str(PHYSICAL_PAGE_SIZE),
             "--chunked-prefill-size",
             str(CHUNKED_PREFILL_SIZE),
-            "--disable-radix-cache",
             "--cuda-graph-max-bs-decode",
             "64",
             "--cuda-graph-backend-prefill",
@@ -228,13 +224,27 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
         response.raise_for_status()
         return response.json()
 
+    @staticmethod
+    def _flush_cache(base_url: str):
+        response = requests.post(
+            base_url + "/flush_cache",
+            params={"timeout": 30},
+            timeout=120,
+        )
+        response.raise_for_status()
+
+    @classmethod
+    def _flush_pd_caches(cls):
+        cls._flush_cache(cls.prefill_url)
+        cls._flush_cache(cls.decode_url)
+
     @classmethod
     def _collect_monolithic_references(cls):
         reference_process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
-            other_args=cls._common_dcp_args(),
+            other_args=cls._monolithic_reference_args(),
         )
         try:
             cls.tokenizer = AutoTokenizer.from_pretrained(
@@ -244,10 +254,12 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
                 cls._build_boundary_prompt(target_length)
                 for target_length in PARITY_PROMPT_LENGTHS
             ]
+            cls._flush_cache(cls.base_url)
             cls.parity_references = [
                 cls._generate(cls.base_url, prompt, max_new_tokens=1)
                 for prompt in cls.parity_prompts
             ]
+            cls._flush_cache(cls.base_url)
             cls.parity_batch_references = cls._generate(
                 cls.base_url, cls.parity_prompts, max_new_tokens=1
             )
@@ -256,6 +268,7 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
                 cls._build_niah_prompt(LONG_CONTEXT_TOKENS, needle_depth)
                 for needle_depth in LONG_CONTEXT_DEPTHS
             ]
+            cls._flush_cache(cls.base_url)
             cls.niah_references = [
                 cls._generate(
                     cls.base_url,
@@ -382,6 +395,7 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
         )
 
     def test_monolithic_pd_token_and_logprob_parity(self):
+        self._flush_pd_caches()
         for target_length, prompt, reference in zip(
             PARITY_PROMPT_LENGTHS, self.parity_prompts, self.parity_references
         ):
@@ -395,6 +409,7 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
                 )
 
     def test_chunk_and_virtual_page_boundary_batch_parity(self):
+        self._flush_pd_caches()
         actual_outputs = self._generate(
             self.base_url, self.parity_prompts, max_new_tokens=1
         )
@@ -412,6 +427,7 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
                 )
 
     def test_long_context_needle_parity(self):
+        self._flush_pd_caches()
         for needle_depth, prompt, reference in zip(
             LONG_CONTEXT_DEPTHS, self.niah_prompts, self.niah_references
         ):
