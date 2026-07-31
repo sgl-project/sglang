@@ -78,6 +78,9 @@ _MINWM_PACKED_ATTENTION_DETERMINISTIC = _env_flag(
     "MINWM_PACKED_ATTENTION_DETERMINISTIC", True
 )
 _MINWM_SEGMENT_COMPILE = _env_flag("MINWM_SEGMENT_COMPILE", True)
+_MINWM_CACHE_ROTATED_K = _env_flag("MINWM_CACHE_ROTATED_K", True)
+_MINWM_PRECOMPUTE_CACHE_ROPE = _env_flag("MINWM_PRECOMPUTE_CACHE_ROPE", True)
+_MINWM_CACHE_PACKED_METADATA = _env_flag("MINWM_CACHE_PACKED_METADATA", True)
 _MINWM_ANNOUNCED_ATTENTION_BACKENDS: set[tuple[str, str]] = set()
 
 
@@ -310,10 +313,19 @@ def _minwm_frame_indices(hidden_states: torch.Tensor, num_frames: int) -> torch.
             f"MinWM sequence length {hidden_states.shape[1]} must be divisible "
             f"by num_frames {num_frames} when sequence sharding is disabled."
         )
-    tokens_per_frame = hidden_states.shape[1] // num_frames
-    return torch.arange(num_frames, device=hidden_states.device).repeat_interleave(
-        tokens_per_frame
+    return _minwm_uniform_frame_indices(
+        hidden_states.shape[1], num_frames, hidden_states.device
     )
+
+
+@lru_cache(maxsize=32)
+def _minwm_uniform_frame_indices(
+    sequence_length: int,
+    num_frames: int,
+    device: torch.device,
+) -> torch.Tensor:
+    tokens_per_frame = sequence_length // num_frames
+    return torch.arange(num_frames, device=device).repeat_interleave(tokens_per_frame)
 
 
 def _minwm_qk_norm_rope_op(
@@ -381,9 +393,8 @@ def _minwm_packed_varlen_attention(
     """Call the same device-selected packed-varlen backend as minWM main.
 
     Keep the packed FlashAttention boundary eager when the enclosing DiT is
-    compiled.  Inductor cannot lower the symbolic ``cumsum``-built varlen
-    metadata on current PyTorch/FA4 (``FakeTensor * Node``), while FA4 already
-    supplies the fused kernel we want here.
+    compiled. FA4 already supplies the fused kernel; fixed-shape cu-seqlens are
+    cached separately so this boundary performs no metadata kernels.
     """
     if query.device.type != "cuda":
         raise RuntimeError("MinWM packed-varlen attention requires CUDA")
@@ -394,14 +405,18 @@ def _minwm_packed_varlen_attention(
     if key.shape[2:] != (num_heads, head_dim):
         raise ValueError("MinWM attention Q/K/V head geometry must match")
 
-    query_lengths = torch.full(
-        (batch_size,), query_length, dtype=torch.int32, device=query.device
-    )
-    key_lengths = torch.full(
-        (batch_size,), key_length, dtype=torch.int32, device=key.device
-    )
-    cu_query = F.pad(query_lengths.cumsum(0), (1, 0)).to(torch.int32)
-    cu_key = F.pad(key_lengths.cumsum(0), (1, 0)).to(torch.int32)
+    if _MINWM_CACHE_PACKED_METADATA:
+        cu_query = _minwm_uniform_cu_seqlens(batch_size, query_length, query.device)
+        cu_key = _minwm_uniform_cu_seqlens(batch_size, key_length, key.device)
+    else:
+        query_lengths = torch.full(
+            (batch_size,), query_length, dtype=torch.int32, device=query.device
+        )
+        key_lengths = torch.full(
+            (batch_size,), key_length, dtype=torch.int32, device=key.device
+        )
+        cu_query = F.pad(query_lengths.cumsum(0), (1, 0)).to(torch.int32)
+        cu_key = F.pad(key_lengths.cumsum(0), (1, 0)).to(torch.int32)
     backend = _minwm_packed_attention_backend(query.device)
     announce_key = (backend, str(query.device))
     if announce_key not in _MINWM_ANNOUNCED_ATTENTION_BACKENDS:
@@ -445,6 +460,18 @@ def _minwm_packed_varlen_attention(
     if isinstance(output, tuple):
         output = output[0]
     return output.reshape(batch_size, query_length, num_heads, head_dim)
+
+
+@lru_cache(maxsize=128)
+def _minwm_uniform_cu_seqlens(
+    batch_size: int,
+    sequence_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Cache fixed-shape packed-attention metadata outside the hot path."""
+    return (
+        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * sequence_length
+    )
 
 
 def _minwm_packed_attention_backend(device: torch.device) -> str:
@@ -562,18 +589,40 @@ class MinWMCausalSelfAttention(CausalWanSelfAttention):
             current_chunk_start=current_start,
             cache_head_start=0 if sequence_shard_enabled else self.head_start,
         )
-        query_cos, query_sin = self._minwm_rotary_emb.forward_uncached(
-            cache_view.query_position_ids
-        )
-        key_cos, key_sin = self._minwm_rotary_emb.forward_uncached(
-            cache_view.key_position_ids
-        )
+        if cache_view.query_cos is None or cache_view.query_sin is None:
+            query_cos, query_sin = self._minwm_rotary_emb.forward_uncached(
+                cache_view.query_position_ids
+            )
+        else:
+            query_cos, query_sin = cache_view.query_cos, cache_view.query_sin
         roped_query = apply_minwm_rotary_embedding(query, query_cos, query_sin).type_as(
             value
         )
-        attention_key = apply_minwm_rotary_embedding(
-            cache_view.k, key_cos, key_sin
-        ).type_as(value)
+        if (
+            _MINWM_CACHE_ROTATED_K
+            and cache_view.rotated_k_is_valid
+            and cache_view.is_recompute
+        ):
+            rotated_current_key = apply_minwm_rotary_embedding(
+                key, query_cos, query_sin
+            ).type_as(value)
+            cache_view.rotated_k[
+                :, cache_view.current_local_start : cache_view.current_local_end
+            ].copy_(rotated_current_key)
+            attention_key = cache_view.rotated_k
+        else:
+            if cache_view.key_cos is None or cache_view.key_sin is None:
+                key_cos, key_sin = self._minwm_rotary_emb.forward_uncached(
+                    cache_view.key_position_ids
+                )
+            else:
+                key_cos, key_sin = cache_view.key_cos, cache_view.key_sin
+            attention_key = apply_minwm_rotary_embedding(
+                cache_view.k, key_cos, key_sin
+            ).type_as(value)
+            if _MINWM_CACHE_ROTATED_K:
+                cache_view.rotated_k.copy_(attention_key)
+                kv_cache.rotated_k_is_valid = True
         attention_value = cache_view.v
         parity_dump_dir = getattr(self, "_minwm_parity_dump_dir", None)
         parity_index = getattr(self, "_minwm_parity_forward_index", 0)
@@ -857,10 +906,14 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
             )
         logger.info(
             "MinWM execution profile: attention_impl=%s "
-            "packed_deterministic=%s segment_compile=%s",
+            "packed_deterministic=%s segment_compile=%s cache_rotated_k=%s "
+            "precompute_cache_rope=%s cache_packed_metadata=%s",
             _MINWM_ATTENTION_IMPL,
             _MINWM_PACKED_ATTENTION_DETERMINISTIC,
             _MINWM_SEGMENT_COMPILE,
+            _MINWM_CACHE_ROTATED_K,
+            _MINWM_PRECOMPUTE_CACHE_ROPE,
+            _MINWM_CACHE_PACKED_METADATA,
         )
         deterministic = os.environ.get("MINWM_PARITY_DETERMINISTIC", "0")
         if deterministic.strip().lower() not in {"", "0", "false", "no", "off"}:
@@ -934,6 +987,32 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
         positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
         return self._sequence_shard_rotary_emb.forward_uncached(positions)
 
+    @lru_cache(maxsize=64)
+    def _compute_cache_position_ids(
+        self,
+        num_frames: int,
+        grid_height: int,
+        grid_width: int,
+        start_frame: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        temporal = (
+            torch.arange(
+                num_frames,
+                device=device,
+                dtype=torch.long,
+            )
+            + start_frame
+        )
+        temporal = temporal[:, None, None].expand(num_frames, grid_height, grid_width)
+        height_ids = torch.arange(grid_height, device=device, dtype=torch.long)[
+            None, :, None
+        ].expand(num_frames, grid_height, grid_width)
+        width_ids = torch.arange(grid_width, device=device, dtype=torch.long)[
+            None, None, :
+        ].expand(num_frames, grid_height, grid_width)
+        return torch.stack([temporal, height_ids, width_ids], dim=-1).reshape(-1, 3)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -952,29 +1031,41 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
             _, patch_height, patch_width = self.patch_size
             grid_height = latent_height // patch_height
             grid_width = latent_width // patch_width
-            temporal = torch.arange(
+            position_ids = self._compute_cache_position_ids(
                 num_frames,
-                device=hidden_states.device,
-                dtype=torch.long,
-            ) + int(start_frame)
-            temporal = temporal[:, None, None].expand(
-                num_frames, grid_height, grid_width
+                grid_height,
+                grid_width,
+                int(start_frame),
+                hidden_states.device,
             )
-            height_ids = torch.arange(
-                grid_height, device=hidden_states.device, dtype=torch.long
-            )[None, :, None].expand(num_frames, grid_height, grid_width)
-            width_ids = torch.arange(
-                grid_width, device=hidden_states.device, dtype=torch.long
-            )[None, None, :].expand(num_frames, grid_height, grid_width)
-            position_ids = torch.stack(
-                [temporal, height_ids, width_ids], dim=-1
-            ).reshape(-1, 3)
+            metadata_cache = kv_cache[0]
+            if not isinstance(metadata_cache, MinWMCausalSelfAttentionKVCache):
+                raise TypeError(
+                    "MinWM transformer requires position-aware raw-K caches"
+                )
+            attention_plan = metadata_cache.prepare_attention_plan(
+                current_chunk_start=current_start,
+                position_ids=position_ids,
+            )
+            if _MINWM_PRECOMPUTE_CACHE_ROPE and attention_plan.query_cos is None:
+                (
+                    attention_plan.query_cos,
+                    attention_plan.query_sin,
+                ) = self._sequence_shard_rotary_emb.forward_uncached(
+                    attention_plan.query_position_ids
+                )
+                (
+                    attention_plan.key_cos,
+                    attention_plan.key_sin,
+                ) = self._sequence_shard_rotary_emb.forward_uncached(
+                    attention_plan.key_position_ids
+                )
             for cache_block in kv_cache:
                 if not isinstance(cache_block, MinWMCausalSelfAttentionKVCache):
                     raise TypeError(
                         "MinWM transformer requires position-aware raw-K caches"
                     )
-                cache_block.set_current_position_ids(position_ids)
+                cache_block.set_prepared_attention_plan(attention_plan)
 
         forward_batch = get_forward_context().forward_batch
         sequence_shard_enabled = (

@@ -611,6 +611,71 @@ benchmark/minwm_realtime_parity/results/
     sglang-performance.mp4
 ```
 
+### 8.3 正确语义路径的 hot-path 优化（2026-07-31）
+
+本轮没有回退到旧 absolute-RoPE cache，也没有改变 checkpoint 的 window 32、
+sink 8、gap 12 或 prompt pin 合同。优化只消除当前正确语义路径中的重复工作：
+
+1. 每次 transformer forward 只由第 0 层构造一次 sink/pin/tail 选择和
+   block-relative position metadata，30 层共享同一个不可变 plan；同一 chunk 的
+   4 次 DMD recompute 也复用选区结果。
+2. 单卡路径用 host integer cursor 作为权威位置，去掉逐层 `.item()` 带来的
+   device-to-host 同步；position IDs 和 uniform frame indices 按固定 shape 缓存。
+3. query/key RoPE 表每个 forward 只生成一次；完成第一次可见窗口 RoPE 后，
+   recompute 只旋转并覆盖当前 chunk 的 K，历史 rotated K 直接复用。
+4. packed FA4 的固定 batch/sequence `cu_seqlens` 按 shape 缓存，不再在每个
+   self/cross attention 边界运行 `full + cumsum + pad`。
+5. append 时直接分别 gather 旧 cache 与新 K/V，再拼成可见窗口，避免先构造完整
+   history K/V 后再做第二次 gather。
+
+三个容易单独消融的开关默认打开：
+
+```text
+MINWM_CACHE_ROTATED_K=true
+MINWM_PRECOMPUTE_CACHE_ROPE=true
+MINWM_CACHE_PACKED_METADATA=true
+```
+
+whole-DiT `torch.compile` 仍保持关闭。这里与最初预期不同：它不是“打开即可加速”的
+开关。当前 PyTorch 2.11 + FA4 对有状态、变长 raw-K cache 的整图会产生 graph break，
+实测仍远慢于 eager/segment compile；本轮收益来自缩小 eager hot path，而不是强行
+扩大编译图。
+
+同一台 B200、同一 checkpoint、832×480、4 steps、window 32、sink 8 的结果：
+
+| 执行路径 | 稳态 scheduler FPS | 相对原正确语义路径 |
+| --- | ---: | ---: |
+| 优化前 parity-capable runtime | 11.301 | 1.00× |
+| 共享 plan/host cursor，但关闭上述三个复用开关 | 14.935 | 1.32× |
+| 完整性能优化，10 warmup + 20 measured chunks | 30.289 | 2.68× |
+| 完整性能优化，公网 Nginx 5 秒 case | 30.227 | 2.67× |
+
+公网 5 秒 case 共返回 65 帧，后三个完整 16-frame chunk 的
+`scheduler_forward_ms` 为 528/531/529 ms，已经低于 24 FPS 所需的
+666.7 ms/chunk。服务冷启动后的首次请求 TTFF 约 19.89 秒，主要包含首次
+kernel/segment compile；预热后的下一次 5 秒请求 TTFF 为 0.87 秒。TTFF 不应与
+稳态生成 FPS 混为一个指标。
+
+性能档不承诺 bitwise。相对优化前、可重复 bitwise 的 SGLang 参考，固定 prompt、
+seed、首帧和 action 的 raw uint8 RGB 比较为：首帧 exact，`exact_frames=1/65`、
+`mean_abs=1.477/255`、`max_abs=190`、`changed_fraction=0.483`。同一稳定服务进程
+连续重跑则是 65/65 帧 bitwise exact；相对参考的 raw RGB PSNR 为 34.736 dB。
+跨执行档误差仍比“值完全一致”
+宽松得多，因此上线口径必须写成性能优先数值回归，不能写成 parity 档。重大决策是
+保留优化前提交作为严格 parity 回滚点；三个开关只用于局部消融，关闭它们仍会经过
+共享 cache plan，因此不能冒充 bitwise 档。后续若要恢复严格 parity，需要按
+latent 与逐 block dump 定位 split gather/缓存复用改变 FA4 数值路径的首个差异，
+而不是只比较最终 MP4。
+
+部署前执行了 140 个 realtime 单测，另有 Ruff、format、`py_compile` 和
+`git diff --check`。公网入口经 Nginx WebSocket 重新跑过完整 5 秒 case，而不是只
+检查 `/health`。
+
+当前公网 `http://18.221.245.74/` 由 systemd 的
+`minwm-tianpeng-perf.service` 管理，物理 GPU 4、API 30120、WebUI 18070，再由
+Nginx 统一暴露 80 端口。切换并复核后，旧 GPU 1/2/3 候选与服务均已停止，当前只
+占用一张 B200。
+
 ## 9. 交给克君部署前的检查
 
 - 必须使用本次提交后的 SGLang commit，而不是复制工作区文件；

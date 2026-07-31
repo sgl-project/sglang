@@ -36,6 +36,8 @@ from sglang.multimodal_gen.runtime.models.dits.minwm import (
     _minwm_packed_attention_backend,
     _minwm_qk_norm_op,
     _minwm_qk_norm_rope_op,
+    _minwm_uniform_cu_seqlens,
+    _minwm_uniform_frame_indices,
     apply_minwm_rotary_embedding,
 )
 from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
@@ -281,6 +283,60 @@ def test_minwm_raw_k_cache_overwrites_active_chunk_without_appending():
     assert cache.token_ids.tolist() == [0, 1]
     torch.testing.assert_close(cache.k[:, :2], replacement, rtol=0, atol=0)
     assert first.key_position_ids[:, 0].tolist() == [0, 1]
+
+
+def test_minwm_cache_plan_is_shared_across_layers_and_reused_for_recompute():
+    first_cache = _make_minwm_test_cache(cache_size=6, sink_tokens=1)
+    second_cache = _make_minwm_test_cache(cache_size=6, sink_tokens=1)
+    position_ids = torch.tensor([[0, 0, 0], [1, 0, 0]])
+    plan = first_cache.prepare_attention_plan(
+        current_chunk_start=0,
+        position_ids=position_ids,
+    )
+    first_cache.set_prepared_attention_plan(plan)
+    second_cache.set_prepared_attention_plan(plan)
+    first_values = torch.ones(1, 2, 1, 2)
+    second_values = torch.full((1, 2, 1, 2), 2.0)
+    first_cache.update_and_get_attention_kv(
+        key=first_values,
+        value=-first_values,
+        current_chunk_start=0,
+    )
+    second_cache.update_and_get_attention_kv(
+        key=second_values,
+        value=-second_values,
+        current_chunk_start=0,
+    )
+
+    assert first_cache.position_ids is second_cache.position_ids
+    assert first_cache.token_ids is second_cache.token_ids
+    torch.testing.assert_close(first_cache.k[:, :2], first_values)
+    torch.testing.assert_close(second_cache.k[:, :2], second_values)
+
+    recompute = first_cache.prepare_attention_plan(
+        current_chunk_start=0,
+        position_ids=position_ids,
+    )
+    assert recompute.is_recompute
+    assert (
+        first_cache.prepare_attention_plan(
+            current_chunk_start=0,
+            position_ids=position_ids,
+        )
+        is recompute
+    )
+
+
+def test_minwm_fixed_shape_metadata_is_cached():
+    _minwm_uniform_cu_seqlens.cache_clear()
+    cu_seqlens = _minwm_uniform_cu_seqlens(2, 7, torch.device("cpu"))
+    assert cu_seqlens.tolist() == [0, 7, 14]
+    assert _minwm_uniform_cu_seqlens(2, 7, torch.device("cpu")) is cu_seqlens
+
+    _minwm_uniform_frame_indices.cache_clear()
+    frame_indices = _minwm_uniform_frame_indices(6, 3, torch.device("cpu"))
+    assert frame_indices.tolist() == [0, 0, 1, 1, 2, 2]
+    assert _minwm_uniform_frame_indices(6, 3, torch.device("cpu")) is frame_indices
 
 
 def test_minwm_block_relative_rope_clamps_visible_frame_gaps():

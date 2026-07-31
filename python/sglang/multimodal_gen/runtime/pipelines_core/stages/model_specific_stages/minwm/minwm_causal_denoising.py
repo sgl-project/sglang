@@ -311,9 +311,7 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             "rope_position_mode": str(
                 getattr(arch_config, "rope_position_mode", "absolute")
             ),
-            "rope_max_frame_gap": int(
-                getattr(arch_config, "rope_max_frame_gap", 1)
-            ),
+            "rope_max_frame_gap": int(getattr(arch_config, "rope_max_frame_gap", 1)),
             "prompt_first_frame_pin_enabled": bool(
                 getattr(arch_config, "prompt_first_frame_pin_enabled", False)
             ),
@@ -398,7 +396,11 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         *,
         sequence_shard_enabled: bool,
     ) -> bool:
-        return sequence_shard_enabled
+        del sequence_shard_enabled
+        # MinWM cache selection runs eagerly even on the single-GPU path. Keep
+        # host cursors authoritative so reading 30 layer cursors never forces a
+        # device-to-host synchronization.
+        return True
 
     def _should_reset_realtime_causal_caches(
         self,
@@ -431,8 +433,7 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             or first_cache.sink_tokens != policy.expected_sink_tokens
             or first_cache.rope_position_mode
             != expected.get("rope_position_mode", "absolute")
-            or first_cache.rope_max_frame_gap
-            != expected.get("rope_max_frame_gap", 1)
+            or first_cache.rope_max_frame_gap != expected.get("rope_max_frame_gap", 1)
             or first_cache.prompt_first_frame_pin_enabled
             != expected.get("prompt_first_frame_pin_enabled", False)
             or first_cache.scene_cut_rope_offset
@@ -618,9 +619,7 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 MINWM_CONDITION_SWITCH_CONDITION, "prompt"
             )
             if condition_switch not in {"prompt", "scene_cut"}:
-                raise ValueError(
-                    "MinWM condition switch must be prompt or scene_cut"
-                )
+                raise ValueError("MinWM condition switch must be prompt or scene_cut")
             for cache_block in cache_ctx.kv_cache:
                 if condition_switch == "scene_cut":
                     cache_block.mark_scene_cut()
