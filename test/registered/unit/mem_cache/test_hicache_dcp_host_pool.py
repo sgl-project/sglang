@@ -176,8 +176,11 @@ class TestTransferEntryPointsTranslate(CustomTestCase):
             data_ptrs=torch.zeros(2, dtype=torch.uint64),
             kv_buffer=[torch.zeros(1)] * 2,
         )
+        # create=True: mla.py imports the kernel only under `if _is_cuda or
+        # _is_hip`, so the name is absent on the CPU runner this test targets.
         with mock.patch(
-            "sglang.srt.mem_cache.pool_host.mla.transfer_kv_all_layer_mla"
+            "sglang.srt.mem_cache.pool_host.mla.transfer_kv_all_layer_mla",
+            create=True,
         ) as kernel:
             pool.can_use_jit = False
             pool.can_use_write_back_jit = False
