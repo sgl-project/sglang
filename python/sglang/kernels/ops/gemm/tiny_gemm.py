@@ -53,6 +53,7 @@ def _vec_elems() -> int:
     return 16 if get_jit_cuda_arch().major >= 10 and cuda >= (12, 9) else 8
 
 
+@cache_once
 def _default_split_n(n: int, k: int, max_m: int, device: torch.device) -> int:
     """Smallest divisor of n whose n / split_n blocks fit in one wave, subject
     to the max_m * split_n <= K / vec_elems block-size constraint; falls back
@@ -94,7 +95,8 @@ def tiny_n_gemm_bf16(
     return out
 
 
-def _default_k_split_n(n: int, k: int) -> int:
+@cache_once
+def _default_k_split_n(n: int, k: int, device: torch.device) -> int:
     """Smallest divisor of n whose n / split_n blocks fit one wave, with
     split_n * K-lanes whole-warp aligned and within the block-size limit."""
     lanes = k // 8  # fixed 16-byte vectors in the K variant
@@ -105,7 +107,7 @@ def _default_k_split_n(n: int, k: int) -> int:
     ]
     if not candidates:
         raise RuntimeError(f"tiny_k_gemm: no valid split_n for N={n}, K={k}")
-    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     for d in candidates:
         if n // d <= sm_count:
             return d
@@ -138,7 +140,7 @@ def tiny_k_gemm_bf16(
     else:
         assert out_dtype is None or out_dtype == out.dtype
     if split_n is None:
-        split_n = _default_k_split_n(n, k)
+        split_n = _default_k_split_n(n, k, x.device)
     module = _jit_tiny_k_gemm_module(n, k, max_m, split_n, out.dtype)
     module.run(x, w, out)
     return out

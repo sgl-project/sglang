@@ -5,10 +5,12 @@ from .moe import situ_and_mul_masked_post_quant
 
 _K3_N_GEMM_DISPATCH_MAP = {
     (144, 7168): 16,
+    (136, 7168): 16,
     (896, 7168): 8,
 }
 _K3_K_GEMM_DISPATCH_MAP = {
     (1536, 128): 12,
+    (768, 128): 16,
 }
 
 

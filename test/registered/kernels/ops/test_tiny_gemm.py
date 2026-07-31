@@ -9,7 +9,7 @@ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b
 
 # (n, k) shapes: skinny decode projections; (1536, 512) exercises the
 # multi-wave fallback (split_n capped by the 32-thread block).
-SHAPES = [(144, 7168), (896, 7168), (256, 4096), (1536, 512)]
+SHAPES = [(144, 7168), (136, 7168), (896, 7168), (256, 4096), (1536, 512)]
 
 
 def _ref(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -47,7 +47,7 @@ def test_tiny_gemm_out_param():
     torch.testing.assert_close(out.double(), _ref(x, w), rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("n,k", [(1536, 128), (896, 256)])
+@pytest.mark.parametrize("n,k", [(1536, 128), (768, 128), (896, 256)])
 @pytest.mark.parametrize("m", [1, 2, 7, 16])
 @pytest.mark.parametrize("split_n", [None, 2, 4])
 def test_tiny_k_gemm_correctness(n, k, m, split_n):
