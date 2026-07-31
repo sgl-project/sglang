@@ -161,6 +161,17 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     return img_max_dynamic_patch, vid_max_dynamic_patch
 
 
+# K3 images reach the encoder out of band, as structured `image_url` parts, so an
+# occurrence of this token in text is ordinary user content. Left as-is it would
+# additionally consume an image slot and make the encoder reject the request.
+KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
+KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
+
+
+def neutralize_kimi_k3_image_placeholder(text: str) -> str:
+    return text.replace(KIMI_K3_IMAGE_PLACEHOLDER, KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED)
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -333,11 +344,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 continue
             chunk_type = chunk.get("type")
             if chunk_type in ("text", "input_text"):
-                text = chunk["text"]
-                if "<|kimi_image_placeholder|>" in text:
-                    raise ValueError(
-                        "<|kimi_image_placeholder|> is reserved for Kimi-K3 image input"
-                    )
+                text = neutralize_kimi_k3_image_placeholder(chunk["text"])
                 parts.append({"type": "text", "text": text})
             elif chunk_type in ("image_url", "input_image"):
                 image_obj = chunk.get("image_url") or {}
@@ -1010,6 +1017,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                 elif msg.get("content") is None:
                     msg["content"] = ""
+                elif isinstance(msg.get("content"), str):
+                    # String content (tool results, folded system turns) never
+                    # reaches _flatten_kimi_k3_content, so neutralize here too.
+                    msg["content"] = neutralize_kimi_k3_image_placeholder(
+                        msg["content"]
+                    )
 
             for msg in messages:
                 if msg.get("role") == "developer":
