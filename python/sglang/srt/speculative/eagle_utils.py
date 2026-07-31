@@ -153,7 +153,6 @@ def build_tree_kernel_efficient(
     num_verify_tokens: int,
     tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
     tree_mask_buf: Optional[torch.Tensor] = None,
-    position_buf: Optional[torch.Tensor] = None,
     fill_prefix_mask: bool = True,
 ):
     draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
@@ -215,12 +214,7 @@ def build_tree_kernel_efficient(
     # position: where each token belongs to
     # e.g. if depth of each draft token is [0, 1, 1, 2] and the prompt length is 7
     # then, positions = [7, 8, 8, 9]
-    if position_buf is not None:
-        positions = position_buf
-    else:
-        positions = torch.empty(
-            (bs * num_verify_tokens,), device=device, dtype=torch.long
-        )
+    positions = torch.empty((bs * num_verify_tokens,), device=device, dtype=torch.long)
 
     if _is_npu:
         torch.ops.npu.build_tree_kernel_efficient(

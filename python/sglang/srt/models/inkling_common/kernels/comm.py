@@ -1003,7 +1003,7 @@ def ar_scattered_sconv_fused(
         **norm_kwargs,
     )
     if is_verify:
-        # Save the per-position windows for update_conv_state_after_mtp_verify.
+        # Save the per-position windows for the backend's MTP-verify commit.
         sconv.verify_fused_ar_finish(forward_batch, x_scratch, cache_indices)
     if norm is not None:
         return norm_kwargs["norm_out"], norm_residual

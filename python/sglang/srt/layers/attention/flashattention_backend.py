@@ -18,6 +18,8 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import AttentionType
@@ -179,15 +181,18 @@ class FlashAttentionBackend(AttentionBackend):
             self.max_context_len + self.page_size - 1
         ) // self.page_size
         # Page table is built on-device (build_trtllm_mha_page_table) and the
-        # tree-mask scratch is preallocated (get_verify_buffers_to_fill_after_draft),
-        # so no seq_lens_cpu / seq_lens_sum D2H sync is ever needed.
+        # tree mask is preallocated (see VerifyMask), so no
+        # seq_lens_cpu / seq_lens_sum D2H sync is ever needed.
         self.needs_cpu_seq_lens = False
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        # Unified pool: req_to_token holds VIRTUAL ids but the MLA per-layer views
+        # are DENSE, so every page_table needs remapping. MLA-only -- the MHA/SWA
+        # sub-pools keep the strided envelope layout FA3 cannot read at all.
+        self._unified_hooks = unified_mla_hooks(model_runner.token_to_kv_pool_allocator)
+        self._unified_dense = self._unified_hooks.enabled and self.use_mla
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.ps.attn_cp_size
-        # Preallocated FULL_MASK tree-mask scratch; lets build_tree_kernel_efficient
-        # avoid the seq_lens_sum D2H sync (see get_verify_buffers_to_fill_after_draft).
-        self.cuda_graph_custom_mask = None
+        self._verify_mask = None
         # The worker fetches the tree-mask scratch from the target backend
         # only; draft-side instances must not allocate it.
         self.is_draft_runner = model_runner.is_draft_worker
@@ -1040,6 +1045,26 @@ class FlashAttentionBackend(AttentionBackend):
                         forward_batch.out_cache_loc
                     )
                 )
+
+        # Unified pool: one remap for every eager branch above, which all filled
+        # page_table with VIRTUAL token ids. Rebinding is safe here because those
+        # branches each produced a fresh tensor; the captured path instead folds
+        # the remap into normal_decode_set_metadata, which must write in place.
+        #
+        # Placed BEFORE the `// page_size` reduction, in token space: since
+        # dense(t) = phys_page * (ps * L) + t % ps, dense(page_start) // ps is
+        # phys_page * L, the dense page id the kernel wants. One site then serves
+        # both page sizes, and it inherits translate_kv_loc_dense's tombstone
+        # clamp so an unwritten req_to_token slot lands in the page-0 sink.
+        if self._unified_dense and metadata.page_table is not None:
+            # Flattened: the page_size == 1 translate path uses index_select,
+            # which rejects a 2-D index.
+            pt = metadata.page_table
+            metadata.page_table = (
+                self._unified_hooks.translate_kv_loc_dense(pt.reshape(-1))
+                .to(torch.int32)
+                .view(pt.shape)
+            )
 
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
@@ -2199,17 +2224,16 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             }
 
-            # Worst-case FULL_MASK tree-mask scratch (bool). build_tree_kernel
-            # fills it in-place, so the GPU-only path needs no seq_lens_sum.
-            # Costs max_num_tokens * max_context_len bytes (can reach 100s of
-            # MB at long context) and is fully memset every verify step.
-            if not self.skip_prefill and not self.is_draft_runner:
-                self.cuda_graph_custom_mask = torch.zeros(
-                    max_num_tokens
-                    * (self.max_context_len + self.speculative_num_draft_tokens),
-                    dtype=torch.bool,
-                    device=self.device,
-                )
+            # topk<=1 never extracts the mask; both metadata paths gate on topk > 1.
+            self._verify_mask = maybe_create_verify_mask(
+                is_draft_runner=self.is_draft_runner,
+                skip_prefill=self.skip_prefill,
+                max_bs=max_bs,
+                max_context_len=self.max_context_len,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                device=self.device,
+                is_read=self.topk > 1,
+            )
 
             self.draft_extend_metadata = {
                 "cache_seqlens": torch.zeros(
@@ -2557,16 +2581,9 @@ class FlashAttentionBackend(AttentionBackend):
 
         return metadata, metadata_expand
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        # Return the preallocated FULL_MASK tree-mask scratch so that
-        # build_tree_kernel_efficient fills it in-place and the worker never
-        # needs seq_lens_sum to size a dynamic allocation (no D2H sync).
-        return [self.cuda_graph_custom_mask, None]
-
-    def target_verify_reads_custom_mask(self) -> bool:
-        # topk<=1 verify never extracts from custom_mask (both the eager and
-        # cuda-graph metadata paths gate the extraction on topk > 1).
-        return self.topk > 1
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     @staticmethod
     def _host_max_seq_len(
@@ -2641,6 +2658,12 @@ class FlashAttentionBackend(AttentionBackend):
                             if self.use_sliding_window_kv_pool
                             else None
                         ),
+                        v2p_page_table=(
+                            self._unified_hooks.v2p_page_table
+                            if self._unified_dense
+                            else None
+                        ),
+                        kernel_page_multiplier=self._unified_hooks.kernel_page_multiplier,
                     )
 
                 else:
@@ -2757,6 +2780,12 @@ class FlashAttentionBackend(AttentionBackend):
                             if self.use_sliding_window_kv_pool
                             else None
                         ),
+                        v2p_page_table=(
+                            self._unified_hooks.v2p_page_table
+                            if self._unified_dense
+                            else None
+                        ),
+                        kernel_page_multiplier=self._unified_hooks.kernel_page_multiplier,
                     )
 
                 self._maybe_update_local_attn_metadata_for_replay(

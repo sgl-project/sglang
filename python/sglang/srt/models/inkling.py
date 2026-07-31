@@ -1198,38 +1198,6 @@ class InklingForConditionalGeneration(nn.Module):
             ),
         )
 
-    def update_conv_state_after_mtp_verify(
-        self,
-        req_to_token_pool,
-        req_pool_indices: torch.Tensor,
-        last_correct_step_indices: torch.Tensor,
-        mamba_track_indices: Optional[torch.Tensor],
-        mamba_steps_to_track: Optional[torch.Tensor],
-    ) -> None:
-        """Commit the per-step sconv windows saved during TARGET_VERIFY into the
-        persistent conv caches at each request's last accepted step.
-
-        Inkling bypasses the HybridLinearAttnBackend wrapper (ShortConvolution reads
-        the mamba pool directly), so the model owns this commit instead of an
-        attention-backend hook. The pool is passed in because this runs from the
-        spec worker after the forward context has exited.
-        """
-        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
-            scatter_mamba_states_after_mtp_verify,
-        )
-
-        pool = req_to_token_pool
-        mamba_indices = pool.translate_mamba_indices(
-            pool.get_mamba_indices(req_pool_indices)
-        )
-        scatter_mamba_states_after_mtp_verify(
-            pool.get_speculative_mamba2_params_all_layers(),
-            mamba_indices,
-            last_correct_step_indices,
-            mamba_track_indices,
-            mamba_steps_to_track,
-        )
-
     def _load_regular_param(
         self,
         params_dict: dict[str, torch.nn.Parameter],
