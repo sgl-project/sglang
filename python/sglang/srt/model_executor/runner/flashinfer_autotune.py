@@ -68,18 +68,6 @@ def should_run_flashinfer_autotune(
     if backend_str == "flashinfer_cutedsl" and a2a_backend_str == "deepep":
         return False
 
-    # Draft graph warmup executes FlashInfer A2A dispatch/combine around a
-    # rank-local CuTe DSL tactic search. The ranks can finish tuning at
-    # different times and enter the next collective out of order, which makes
-    # MoeAlltoAll time out. The target model is tuned separately; use the
-    # default CuTe DSL tactic for the online-quantized draft.
-    if (
-        for_speculative_draft
-        and backend_str == "flashinfer_cutedsl"
-        and a2a_backend_str == "flashinfer"
-    ):
-        return False
-
     # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
 
     moe_needs_autotune = backend_str in [
