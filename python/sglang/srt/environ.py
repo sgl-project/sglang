@@ -440,6 +440,15 @@ class Envs:
     # off some TTFT-metric accuracy for less IPC overhead.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
 
+    # Scheduler: diffusion LLM (dLLM)
+    # Denoise forwards per scheduled FDFO round. The batch is frozen for the
+    # inner steps (resolved rows self-freeze; commits, admissions, and result
+    # processing happen once per round), which amortizes the scheduler's
+    # per-round host work over N forwards. Per-row trajectories are unchanged;
+    # the trade-off is up to N-1 rounds of extra emission latency and a few
+    # frozen rows re-forwarded per round.
+    SGLANG_DLLM_FDFO_STEPS_PER_ROUND = EnvInt(1)
+
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
