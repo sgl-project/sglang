@@ -47,7 +47,7 @@ class SWAKVPool(BaseSWAKVPool):
         self.layer_transfer_counter = None
 
         kwargs["page_size"] = page_size
-        kwargs["enable_memory_saver"] = False
+        kwargs.setdefault("enable_memory_saver", False)
         kwargs["head_num"] = head_num
         kwargs["head_dim"] = head_dim
         kwargs["device"] = device
