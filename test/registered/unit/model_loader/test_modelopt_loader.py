@@ -648,6 +648,28 @@ class TestParseQuantHfConfig(CustomTestCase):
             )
         )
 
+    def test_mixed_target_preserves_nvfp4_online_draft(self):
+        self.model_config.quantization = "nvfp4_online"
+        self.model_config.is_draft_model = True
+        with (
+            patch.object(
+                self.model_config,
+                "_parse_quant_hf_config",
+                return_value={
+                    "quant_method": "modelopt_mixed",
+                    "quant_algo": "MIXED_PRECISION",
+                },
+            ),
+            patch.object(
+                self.model_config,
+                "_find_quant_modelslim_config",
+                return_value=None,
+            ),
+        ):
+            self.model_config._verify_quantization()
+
+        self.assertEqual(self.model_config.quantization, "nvfp4_online")
+
     def test_nvfp4_online_uses_runtime_moe_ignore_list(self):
         with envs.SGLANG_FP4_IGNORED_LAYERS.override("model.layers.1"):
             config = NvFp4OnlineConfig.from_config(
