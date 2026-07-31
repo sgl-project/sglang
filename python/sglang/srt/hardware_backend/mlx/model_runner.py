@@ -570,6 +570,12 @@ class MlxModelRunner:
             int(sys_available * self._mem_fraction_static),
         )
         bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * dtype.size
+        if envs.SGLANG_MLX_USE_BLOCK_PAGED_ATTENTION.get():
+            # Block paged attention may keep both the legacy flat pool (for
+            # radix/prefix compatibility) and the block pool (for decode).
+            # Auto-size against both representations so opt-in block mode does
+            # not accidentally reserve roughly two KV budgets.
+            bytes_per_slot *= 2
         pool_size = max(kv_budget // bytes_per_slot, 256)
         logger.info(
             f"Auto-sized attention KV pool: "
@@ -611,14 +617,11 @@ class MlxModelRunner:
             and not self._cache_layout.has_auxiliary_state
         )
         if block_paged_attention_enabled:
-            req_capacity = (
-                int(req_to_token_pool.req_to_token.shape[0])
-                if req_to_token_pool is not None
-                else 0
-            )
-            token_blocks = (
-                self._pool_size + self._block_size - 1
-            ) // self._block_size
+            if req_to_token_pool is not None:
+                req_capacity = int(req_to_token_pool.req_to_token.shape[0])
+            else:
+                req_capacity = int(get_server_args().max_running_requests or 0)
+            token_blocks = (self._pool_size + self._block_size - 1) // self._block_size
             # Blocks are owned per request. Add one partial-block headroom block
             # per request row so token-slot admission does not over-admit many
             # short requests that each need a separate final block.
@@ -1316,7 +1319,9 @@ class MlxModelRunner:
                 lazy_tokens,
                 flat_pool_synced_offsets,
                 block_pool_synced_offsets,
-            ) = self._decode_with_batched_attention(caches, batched_input, list(req_ids))
+            ) = self._decode_with_batched_attention(
+                caches, batched_input, list(req_ids)
+            )
 
         return MlxPendingDecode(
             lazy_tokens=lazy_tokens,
