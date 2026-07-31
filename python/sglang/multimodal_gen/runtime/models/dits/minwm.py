@@ -35,8 +35,8 @@ from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import tensor_parallel_rms_norm
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import NDRotaryEmbedding
 from sglang.multimodal_gen.runtime.layers.usp import (
-    _usp_input_all_to_all,
-    _usp_input_all_to_all_varlen,
+    _usp_input_all_to_all_qkv,
+    _usp_input_all_to_all_varlen_qkv,
     _usp_output_all_to_all,
     _usp_output_all_to_all_varlen,
 )
@@ -82,6 +82,30 @@ _MINWM_CACHE_ROTATED_K = _env_flag("MINWM_CACHE_ROTATED_K", True)
 _MINWM_PRECOMPUTE_CACHE_ROPE = _env_flag("MINWM_PRECOMPUTE_CACHE_ROPE", True)
 _MINWM_CACHE_PACKED_METADATA = _env_flag("MINWM_CACHE_PACKED_METADATA", True)
 _MINWM_ANNOUNCED_ATTENTION_BACKENDS: set[tuple[str, str]] = set()
+
+
+class _MinWMUlyssesWorkspace:
+    """Reusable communication buffers shared by the sequential transformer blocks."""
+
+    def __init__(self) -> None:
+        self._buffers: dict[str, torch.Tensor] = {}
+
+    def get(
+        self,
+        name: str,
+        reference: torch.Tensor,
+        numel: int,
+    ) -> torch.Tensor:
+        buffer = self._buffers.get(name)
+        if (
+            buffer is None
+            or buffer.numel() != numel
+            or buffer.dtype != reference.dtype
+            or buffer.device != reference.device
+        ):
+            buffer = reference.new_empty(numel)
+            self._buffers[name] = buffer
+        return buffer
 
 
 @torch.compiler.disable
@@ -491,6 +515,7 @@ class MinWMCausalSelfAttention(CausalWanSelfAttention):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.ulysses_workspace: _MinWMUlyssesWorkspace | None = None
         ulysses_world_size = max(get_ulysses_parallel_world_size(), 1)
         if self.num_heads % ulysses_world_size != 0:
             raise ValueError(
@@ -574,12 +599,22 @@ class MinWMCausalSelfAttention(CausalWanSelfAttention):
                 )
             seq_splits = list(seq_splits)
             uniform_seq_splits = sequence_splits_are_uniform(seq_splits)
-            qkv = torch.cat([query, key, value], dim=-1)
-            qkv = (
-                _usp_input_all_to_all(qkv, head_dim=2)
-                if uniform_seq_splits
-                else _usp_input_all_to_all_varlen(qkv, seq_splits, head_dim=2)
-            )
+            workspace = getattr(self, "ulysses_workspace", None)
+            if uniform_seq_splits:
+                input_buffer = output_buffer = None
+                if workspace is not None:
+                    packed_numel = 3 * query.numel()
+                    input_buffer = workspace.get("qkv_send", query, packed_numel)
+                    output_buffer = workspace.get("qkv_recv", query, packed_numel)
+                qkv = _usp_input_all_to_all_qkv(
+                    query,
+                    key,
+                    value,
+                    input_buffer=input_buffer,
+                    output_buffer=output_buffer,
+                )
+            else:
+                qkv = _usp_input_all_to_all_varlen_qkv(query, key, value, seq_splits)
             query, key, value = qkv.chunk(3, dim=-1)
 
         cache_view = _minwm_update_and_get_attention_kv(
@@ -660,11 +695,18 @@ class MinWMCausalSelfAttention(CausalWanSelfAttention):
             self._minwm_parity_forward_index = parity_index + 1
         if sequence_shard_enabled:
             assert seq_splits is not None
-            output = (
-                _usp_output_all_to_all(output, head_dim=2)
-                if uniform_seq_splits
-                else _usp_output_all_to_all_varlen(output, seq_splits, head_dim=2)
-            )
+            if uniform_seq_splits:
+                output_buffer = None
+                workspace = getattr(self, "ulysses_workspace", None)
+                if workspace is not None:
+                    output_buffer = workspace.get(
+                        "attention_recv", output, output.numel()
+                    )
+                output = _usp_output_all_to_all(
+                    output, head_dim=2, output_buffer=output_buffer
+                )
+            else:
+                output = _usp_output_all_to_all_varlen(output, seq_splits, head_dim=2)
         return output
 
 
@@ -920,6 +962,7 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
             torch.use_deterministic_algorithms(True)
         super().__init__(config, hf_config, quant_config)
         self.sp_size = get_sp_world_size()
+        ulysses_workspace = _MinWMUlyssesWorkspace() if self.sp_size > 1 else None
         d = self.hidden_size // self.num_attention_heads
         self._sequence_shard_rotary_emb = NDRotaryEmbedding(
             rope_dim_list=[d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)],
@@ -940,6 +983,7 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
         self.condition_embedder.time_embedder = exact_time
         for block in self.blocks:
             block.attn1.rotary_embedding_override = apply_minwm_rotary_embedding
+            block.attn1.ulysses_workspace = ulysses_workspace
             block.norm_q = MinWMRMSNorm(config.hidden_size, eps=config.eps)
             block.norm_k = MinWMRMSNorm(config.hidden_size, eps=config.eps)
             block.attn2.norm_q = MinWMRMSNorm(config.hidden_size, eps=config.eps)

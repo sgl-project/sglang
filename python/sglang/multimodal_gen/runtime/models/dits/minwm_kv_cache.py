@@ -46,6 +46,7 @@ class MinWMCausalAttentionKVPlan:
     selected_len: int
     old_selected_indices: torch.Tensor | None
     new_selected_indices: torch.Tensor | None
+    preserves_all_history: bool
     position_ids: torch.Tensor
     rope_position_ids: torch.Tensor
     token_ids: torch.Tensor
@@ -386,6 +387,7 @@ class MinWMCausalSelfAttentionKVCache(CausalSelfAttentionKVCache):
                 selected_len=local_end,
                 old_selected_indices=None,
                 new_selected_indices=None,
+                preserves_all_history=True,
                 position_ids=self.position_ids,
                 rope_position_ids=self.rope_position_ids,
                 token_ids=self.token_ids,
@@ -425,12 +427,22 @@ class MinWMCausalSelfAttentionKVCache(CausalSelfAttentionKVCache):
         indices = self._select_visible_indices(
             combined_token_ids, combined_position_ids
         )
-        selected_position_ids = combined_position_ids[indices].contiguous()
-        selected_rope_position_ids = combined_rope_position_ids[indices].contiguous()
-        selected_token_ids = combined_token_ids[indices].contiguous()
         selected_len = int(indices.numel())
-        old_selected_indices = indices[indices < local_end]
-        new_selected_indices = indices[indices >= local_end] - local_end
+        preserves_all_history = selected_len == required_tokens
+        if preserves_all_history:
+            selected_position_ids = combined_position_ids
+            selected_rope_position_ids = combined_rope_position_ids
+            selected_token_ids = combined_token_ids
+            old_selected_indices = None
+            new_selected_indices = None
+        else:
+            selected_position_ids = combined_position_ids[indices].contiguous()
+            selected_rope_position_ids = combined_rope_position_ids[
+                indices
+            ].contiguous()
+            selected_token_ids = combined_token_ids[indices].contiguous()
+            old_selected_indices = indices[indices < local_end]
+            new_selected_indices = indices[indices >= local_end] - local_end
 
         if self.pending_scene_cut_pin:
             pin_tokens = min(int(self.sink_tokens), int(current_token_ids.numel()))
@@ -471,6 +483,7 @@ class MinWMCausalSelfAttentionKVCache(CausalSelfAttentionKVCache):
             selected_len=selected_len,
             old_selected_indices=old_selected_indices,
             new_selected_indices=new_selected_indices,
+            preserves_all_history=preserves_all_history,
             position_ids=selected_position_ids,
             rope_position_ids=selected_rope_position_ids,
             token_ids=selected_token_ids,
@@ -536,20 +549,34 @@ class MinWMCausalSelfAttentionKVCache(CausalSelfAttentionKVCache):
         else:
             if self.allow_growth:
                 self._grow_to_fit(plan.required_tokens)
-            old_k = self._head_view(self.k[:, : plan.local_end_before], head_slice)
-            old_v = self._head_view(self.v[:, : plan.local_end_before], head_slice)
-            selected_k = self._select_kv_with_plan(old_k, key, plan)
-            selected_v = self._select_kv_with_plan(old_v, value, plan)
             if plan.selected_len > self.cache_size:
                 raise RuntimeError(
                     f"{debug_name} selected window exceeds cache capacity"
                 )
-            if head_slice is None:
-                self.k[:, : plan.selected_len] = selected_k
-                self.v[:, : plan.selected_len] = selected_v
+            if plan.preserves_all_history:
+                local_start = plan.local_end_before
+                local_stop = plan.selected_len
+                if head_slice is None:
+                    self.k[:, local_start:local_stop] = key
+                    self.v[:, local_start:local_stop] = value
+                else:
+                    self.k[:, local_start:local_stop, head_slice, :] = key
+                    self.v[:, local_start:local_stop, head_slice, :] = value
             else:
-                self.k[:, : plan.selected_len, head_slice, :] = selected_k
-                self.v[:, : plan.selected_len, head_slice, :] = selected_v
+                old_k = self._head_view(
+                    self.k[:, : plan.local_end_before], head_slice
+                )
+                old_v = self._head_view(
+                    self.v[:, : plan.local_end_before], head_slice
+                )
+                selected_k = self._select_kv_with_plan(old_k, key, plan)
+                selected_v = self._select_kv_with_plan(old_v, value, plan)
+                if head_slice is None:
+                    self.k[:, : plan.selected_len] = selected_k
+                    self.v[:, : plan.selected_len] = selected_v
+                else:
+                    self.k[:, : plan.selected_len, head_slice, :] = selected_k
+                    self.v[:, : plan.selected_len, head_slice, :] = selected_v
             self.rotated_k_is_valid = False
 
         self.position_ids = plan.position_ids

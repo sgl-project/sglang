@@ -327,6 +327,25 @@ def test_minwm_cache_plan_is_shared_across_layers_and_reused_for_recompute():
     )
 
 
+def test_minwm_cache_append_does_not_repack_visible_history(monkeypatch):
+    cache = _make_minwm_test_cache(cache_size=6, sink_tokens=1)
+
+    def fail_if_selected(*_args, **_kwargs):
+        raise AssertionError("non-evicting append must not select and repack history")
+
+    monkeypatch.setattr(
+        MinWMCausalSelfAttentionKVCache,
+        "_select_kv_with_plan",
+        staticmethod(fail_if_selected),
+    )
+    _append_minwm_test_frames(cache, [0, 1], token_start=0)
+    _append_minwm_test_frames(cache, [2, 3], token_start=2)
+
+    assert cache.last_attention_plan.preserves_all_history
+    assert cache.token_ids.tolist() == [0, 1, 2, 3]
+    assert cache.k[0, :4, 0, 0].tolist() == [0.0, 1.0, 2.0, 3.0]
+
+
 def test_minwm_fixed_shape_metadata_is_cached():
     _minwm_uniform_cu_seqlens.cache_clear()
     cu_seqlens = _minwm_uniform_cu_seqlens(2, 7, torch.device("cpu"))
@@ -1363,6 +1382,40 @@ def test_minwm_causal_cache_uses_local_ulysses_heads(monkeypatch):
     }
 
 
+def test_minwm_ulysses_qkv_pack_uses_reusable_head_first_buffers(monkeypatch):
+    import sglang.multimodal_gen.runtime.layers.usp as usp_module
+
+    monkeypatch.setattr(usp_module, "get_ulysses_parallel_world_size", lambda: 2)
+    query = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4, 1)
+    key = query + 10
+    value = query + 20
+    send_buffer = torch.empty(3 * query.numel())
+    receive_buffer = torch.empty_like(send_buffer)
+
+    def fake_exchange(packed, output_buffer=None):
+        assert packed.data_ptr() == send_buffer.data_ptr()
+        assert packed.shape == (4, 1, 2, 3)
+        assert output_buffer is receive_buffer
+        output_buffer.copy_(packed.flatten())
+        return output_buffer.view_as(packed)
+
+    monkeypatch.setattr(usp_module, "_usp_all_to_all_single", fake_exchange)
+    output = usp_module._usp_input_all_to_all_qkv(
+        query,
+        key,
+        value,
+        input_buffer=send_buffer,
+        output_buffer=receive_buffer,
+    )
+
+    packed_qkv = torch.cat((query, key, value), dim=-1)
+    expected = torch.cat(
+        (packed_qkv[:, :, :2], packed_qkv[:, :, 2:]),
+        dim=1,
+    )
+    assert torch.equal(output, expected)
+
+
 @pytest.mark.parametrize("seq_splits", [(2, 2), (3, 2)])
 def test_minwm_causal_attention_packs_one_ulysses_collective(monkeypatch, seq_splits):
     import sglang.multimodal_gen.runtime.models.dits.minwm as minwm_module
@@ -1384,10 +1437,14 @@ def test_minwm_causal_attention_packs_one_ulysses_collective(monkeypatch, seq_sp
     monkeypatch.setattr(minwm_module, "_MINWM_ATTENTION_IMPL", "packed")
 
     calls = {"input": 0, "output": 0}
+    communication_buffers = {}
 
-    def fake_input(qkv, *args, **kwargs):
+    def fake_input(query, key, value, *args, **kwargs):
         calls["input"] += 1
-        assert qkv.shape == (1, local_seq, 4, 3 * head_dim)
+        assert query.shape == key.shape == value.shape
+        assert query.shape == (1, local_seq, 4, head_dim)
+        communication_buffers["qkv_send"] = kwargs.get("input_buffer")
+        communication_buffers["qkv_recv"] = kwargs.get("output_buffer")
         return torch.cat(
             [
                 torch.ones(1, global_seq, local_heads, head_dim),
@@ -1400,18 +1457,22 @@ def test_minwm_causal_attention_packs_one_ulysses_collective(monkeypatch, seq_sp
     def fake_output(output, *args, **kwargs):
         calls["output"] += 1
         assert output.shape == (1, global_seq, local_heads, head_dim)
+        communication_buffers["attention_recv"] = kwargs.get("output_buffer")
         return torch.zeros(1, local_seq, 4, head_dim)
 
     if seq_splits[0] == seq_splits[1]:
-        monkeypatch.setattr(minwm_module, "_usp_input_all_to_all", fake_input)
+        monkeypatch.setattr(minwm_module, "_usp_input_all_to_all_qkv", fake_input)
         monkeypatch.setattr(minwm_module, "_usp_output_all_to_all", fake_output)
     else:
-        monkeypatch.setattr(minwm_module, "_usp_input_all_to_all_varlen", fake_input)
+        monkeypatch.setattr(
+            minwm_module, "_usp_input_all_to_all_varlen_qkv", fake_input
+        )
         monkeypatch.setattr(minwm_module, "_usp_output_all_to_all_varlen", fake_output)
 
     attention = MinWMCausalSelfAttention.__new__(MinWMCausalSelfAttention)
     torch.nn.Module.__init__(attention)
     attention.head_start = 0
+    attention.ulysses_workspace = minwm_module._MinWMUlyssesWorkspace()
 
     class IdentityRotary:
         @staticmethod
@@ -1459,6 +1520,25 @@ def test_minwm_causal_attention_packs_one_ulysses_collective(monkeypatch, seq_sp
 
     assert output.shape == (1, local_seq, 4, head_dim)
     assert calls == {"input": 1, "output": 1}
+    if seq_splits[0] == seq_splits[1]:
+        qkv_numel = 3 * local_seq * 4 * head_dim
+        assert communication_buffers["qkv_send"].numel() == qkv_numel
+        assert communication_buffers["qkv_recv"].numel() == qkv_numel
+        assert communication_buffers["attention_recv"].numel() == (
+            1 * global_seq * local_heads * head_dim
+        )
+        assert set(attention.ulysses_workspace._buffers) == {
+            "qkv_send",
+            "qkv_recv",
+            "attention_recv",
+        }
+    else:
+        assert communication_buffers == {
+            "qkv_send": None,
+            "qkv_recv": None,
+            "attention_recv": None,
+        }
+        assert attention.ulysses_workspace._buffers == {}
     assert cache.k[:, :global_seq].shape == (
         1,
         global_seq,
