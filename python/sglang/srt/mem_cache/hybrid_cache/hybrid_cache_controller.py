@@ -33,7 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -230,6 +230,15 @@ class HybridCacheController(BaseHiCacheController):
         )
 
         for entry in host_pools or []:
+            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+
+    def register_host_pool_entry(self, entry: PoolEntry) -> None:
+        if not isinstance(self.mem_pool_host, HostPoolGroup):
+            raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
+        self.mem_pool_host.add_entry(entry)
+        if not entry.is_primary_index_anchor:
+            self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
+        if self.enable_storage and self.storage_backend is not None:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     @staticmethod

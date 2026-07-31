@@ -1532,6 +1532,15 @@ class HostPoolGroup:
             for entry in entries
         )
 
+    def add_entry(self, entry: PoolEntry) -> None:
+        if entry.name in self.entry_map:
+            raise ValueError(f"Host pool {entry.name} is already registered.")
+        self.entries.append(entry)
+        self.entry_map[entry.name] = entry
+        self.can_use_write_back_jit = (
+            self.can_use_write_back_jit and entry.host_pool.can_use_write_back_jit
+        )
+
     @property
     def kv_buffer(self):
         return self.anchor_entry.host_pool.kv_buffer
@@ -1741,9 +1750,7 @@ class DSAIndexerPoolHost(HostKVCache):
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         device_pools = (self.device_pool, *self.mtp_draft_device_pools)
         self.packed_device_index_buffers = [
-            buffer
-            for pool in device_pools
-            for buffer in pool.index_k_with_scale_buffer
+            buffer for pool in device_pools for buffer in pool.index_k_with_scale_buffer
         ]
         self.index_k_device_ptrs = torch.tensor(
             [x.data_ptr() for x in self.packed_device_index_buffers],
@@ -1864,9 +1871,7 @@ class DSAIndexerPoolHost(HostKVCache):
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=[self.index_k_with_scale_buffer[host_layer_id]],
-                    dst_layers=[
-                        device_pool.index_k_with_scale_buffer[device_layer_id]
-                    ],
+                    dst_layers=[device_pool.index_k_with_scale_buffer[device_layer_id]],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     page_size=1,
@@ -1874,9 +1879,7 @@ class DSAIndexerPoolHost(HostKVCache):
             elif self.layout == "page_first_direct":
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.index_k_with_scale_buffer],
-                    dst_ptrs=[
-                        device_pool.index_k_with_scale_buffer[device_layer_id]
-                    ],
+                    dst_ptrs=[device_pool.index_k_with_scale_buffer[device_layer_id]],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     layer_id=host_layer_id,
@@ -1916,9 +1919,7 @@ class DSAIndexerPoolHost(HostKVCache):
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
-                    src_layers=[
-                        device_pool.index_k_with_scale_buffer[device_layer_id]
-                    ],
+                    src_layers=[device_pool.index_k_with_scale_buffer[device_layer_id]],
                     dst_layers=[self.index_k_with_scale_buffer[host_layer_id]],
                     src_indices=device_page_indices,
                     dst_indices=host_page_indices,

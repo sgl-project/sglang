@@ -68,7 +68,8 @@ logger = logging.getLogger(__name__)
 
 
 class MHATokenToKVPoolHost(HostKVCache):
-    device_pool: MHATokenToKVPool
+    device_pool: MHATokenToKVPool | None = None
+    mtp_draft_device_pools: tuple[MHATokenToKVPool, ...] = ()
 
     def __init__(
         self,
@@ -242,10 +243,13 @@ class MHATokenToKVPoolHost(HostKVCache):
         layer_id,
         io_backend,
     ):
-        if not self._is_device_layer_owned(device_pool, layer_id):
-            return
-        host_layer_id = self._host_layer_index(layer_id)
-        device_layer_id = 0 if layer_id >= self.device_pool.layer_num else layer_id
+        if self.device_pool is not None:
+            if not self._is_device_layer_owned(device_pool, layer_id):
+                return
+            host_layer_id = self._host_layer_index(layer_id)
+            device_layer_id = 0 if layer_id >= self.device_pool.layer_num else layer_id
+        else:
+            host_layer_id = device_layer_id = layer_id
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -362,6 +366,10 @@ class MHATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if self.device_pool is None:
+            self.packed_device_k_data_ptrs = device_pool.k_data_ptrs
+            self.packed_device_v_data_ptrs = device_pool.v_data_ptrs
+            self.packed_device_kv_buffers = device_pool.k_buffer + device_pool.v_buffer
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -1111,10 +1119,13 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         layer_id,
         io_backend,
     ):
-        if not self._is_device_layer_owned(device_pool, layer_id):
-            return
-        host_layer_id = self._host_layer_index(layer_id)
-        device_layer_id = 0 if layer_id >= self.device_pool.layer_num else layer_id
+        if self.device_pool is not None:
+            if not self._is_device_layer_owned(device_pool, layer_id):
+                return
+            host_layer_id = self._host_layer_index(layer_id)
+            device_layer_id = 0 if layer_id >= self.device_pool.layer_num else layer_id
+        else:
+            host_layer_id = device_layer_id = layer_id
 
         if io_backend == "kernel":
             if self.layout != "page_first":
@@ -1172,6 +1183,11 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if self.device_pool is None:
+            self.packed_device_k_data_ptrs = device_pool.k_data_ptrs
+            self.packed_device_v_data_ptrs = device_pool.v_data_ptrs
+            self.packed_device_k_buffers = device_pool.k_buffer
+            self.packed_device_v_buffers = device_pool.v_buffer
         if io_backend == "kernel":
             if self.layout != "page_first":
                 raise ValueError(
