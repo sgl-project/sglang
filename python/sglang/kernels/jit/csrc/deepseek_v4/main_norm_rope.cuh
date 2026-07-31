@@ -39,6 +39,14 @@ SGL_DEVICE uint8_t quant_fp4_e2m1(float x) {
 constexpr uint32_t kFusedQBlockSize = 128;
 constexpr uint32_t kFusedQNumWarps = kFusedQBlockSize / device::kWarpThreads;
 
+// 8 warps per block: occupancy-tuned dispatch for the fp8-quant Q kernel. The
+// 4-warp (128-thread) block ran the schedulers at ~38% occupancy on the top
+// long_scoreboard stall; doubling warps/block lifts occupancy to ~86% and is
+// where the win comes from (see FusedQIndexerRopeHadamardQuantKernel).
+constexpr uint32_t kFusedQuantBlockSize = 256;
+constexpr uint32_t kFusedQuantNumWarps = kFusedQuantBlockSize / device::kWarpThreads;
+constexpr uint32_t kFusedQuantMinBlocksPerSM = 16;
+
 // 8 warps per block: block-per-token work-item dispatch (K kernel).
 constexpr uint32_t kFusedKBlockSize = 256;
 constexpr uint32_t kFusedKNumWarps = kFusedKBlockSize / device::kWarpThreads;
@@ -460,8 +468,8 @@ template <
     bool kUsePDL,
     bool kRopeFirst = false,
     bool kHadamard = true,
-    uint32_t kNumWarps = kFusedQNumWarps,
-    uint32_t kMinBlocksPerSM = 16>
+    uint32_t kNumWarps = kFusedQuantNumWarps,
+    uint32_t kMinBlocksPerSM = kFusedQuantMinBlocksPerSM>
 __global__ __launch_bounds__(kNumWarps* device::kWarpThreads, kMinBlocksPerSM) void fused_q_indexer_rope_hadamard_quant(
     const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
   using namespace device;
@@ -597,23 +605,11 @@ __global__ __launch_bounds__(kNumWarps* device::kWarpThreads, kMinBlocksPerSM) v
 
 template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
 struct FusedQIndexerRopeHadamardQuantKernel {
-  // 8 warps/block (256 threads) + resident-block cap 16: the upstream 4-warp
-  // (128-thread) block ran the schedulers at ~38% occupancy on the top
-  // long_scoreboard stall; doubling warps/block lifts occupancy to ~86% and is
-  // where the win comes from. Overridable at compile time; math unchanged.
-  static constexpr uint32_t kNumWarps =
-#ifdef Q_BLOCK_SIZE
-      Q_BLOCK_SIZE / device::kWarpThreads;
-#else
-      8;
-#endif
-  static constexpr uint32_t kBlocksPerSM =
-#ifdef Q_MIN_BLOCKS_PER_SM
-      Q_MIN_BLOCKS_PER_SM;
-#else
-      16;
-#endif
-  static constexpr uint32_t kBlockSize = kNumWarps * device::kWarpThreads;
+  // 8 warps/block + resident-block cap 16 (see kFusedQuantBlockSize): the win is
+  // occupancy, ~38% -> ~86%. Math path is unchanged.
+  static constexpr uint32_t kNumWarps = kFusedQuantNumWarps;
+  static constexpr uint32_t kBlocksPerSM = kFusedQuantMinBlocksPerSM;
+  static constexpr uint32_t kBlockSize = kFusedQuantBlockSize;
 
   template <typename PosT>
   static constexpr auto kernel =
