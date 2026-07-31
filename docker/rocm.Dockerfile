@@ -165,9 +165,8 @@ RUN echo GPU_ARCH="${GPU_ARCH}" \
     && GPU_ARCH_STRIPPED="${GPU_ARCH%%-*}" \
     && echo "GPU_ARCH_LIST=${GPU_ARCH_STRIPPED}" >> /etc/environment \
     && echo "export GPU_ARCH_LIST=${GPU_ARCH_STRIPPED}" >> /etc/bash.bashrc
-ARG GPU_ARCH_LIST_ARG=gfx1250
-ENV GPU_ARCH_LIST=${GPU_ARCH_LIST_ARG}
-ENV PYTORCH_ROCM_ARCH=${GPU_ARCH_LIST_ARG}
+ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
+ENV PYTORCH_ROCM_ARCH="gfx942;gfx950;gfx1250"
 
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGL_DEFAULT="main"
