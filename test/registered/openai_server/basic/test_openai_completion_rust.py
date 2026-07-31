@@ -58,12 +58,8 @@ class TestOpenAICompletionRustParity(CustomTestCase):
         keys = sorted(reference)
         reference_max = max(reference.values())
         candidate_max = max(candidate.values())
-        reference_weights = [
-            math.exp(reference[key] - reference_max) for key in keys
-        ]
-        candidate_weights = [
-            math.exp(candidate[key] - candidate_max) for key in keys
-        ]
+        reference_weights = [math.exp(reference[key] - reference_max) for key in keys]
+        candidate_weights = [math.exp(candidate[key] - candidate_max) for key in keys]
         reference_sum = sum(reference_weights)
         candidate_sum = sum(candidate_weights)
         reference_probabilities = [
