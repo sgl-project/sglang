@@ -50,6 +50,7 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import (
     default_tree_mask_mode,
     get_draft_recurrent_hidden_state_spec,
+    organize_draft_results,
 )
 from sglang.srt.speculative.eagle_worker_common import (
     build_eagle_verify_input,
@@ -132,6 +133,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+
+        self._rebuild_topk1_chain_buffers()
 
         # Set constant
         EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
@@ -442,6 +445,30 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
         maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
 
+        # Chain-style (topk=1, one token per draft step, all of them selected):
+        # _draft_forward_organize's slice/cat/topk/sort/gather is the identity on
+        # topk_index, and parent_list is the constant [-1, 0, .., S-2] per row.
+        parents_prealloc = self._topk1_parents_prealloc
+        if (
+            parents_prealloc is not None
+            and topk_index.shape[1] == self.speculative_num_steps
+            and topk_index.shape[0] <= parents_prealloc.shape[0]
+        ):
+            bs = topk_index.shape[0]
+            return (
+                parents_prealloc[:bs],
+                self._topk1_score_indices_prealloc[:bs],
+                topk_index,
+            )
+
+        return self._draft_forward_organize(topk_p, topk_index, hidden_states)
+
+    def _draft_forward_organize(
+        self,
+        topk_p: torch.Tensor,
+        topk_index: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ):
         # Return values
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
@@ -473,33 +500,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                         )
                     )
 
-        # Organize the results
-        score_list = torch.cat(score_list, dim=1).flatten(
-            1
-        )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
-        ss_token_list = torch.cat(
-            token_list, dim=1
-        )  # b, (self.topk + (num_steps-1) * self.topk)
-        top_scores = torch.topk(
-            score_list, self.speculative_num_draft_tokens - 1, dim=-1
+        return organize_draft_results(
+            score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
-        maybe_detect_oob(
-            top_scores_index,
-            0,
-            ss_token_list.shape[1],
-            "draft_forward: top_scores_index OOB for gather on ss_token_list",
-        )
-        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
-
-        if len(parents_list) > 1:
-            parent_list = torch.cat(parents_list[:-1], dim=1)
-        else:
-            batch_size = parents_list[0].shape[0]
-            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
-
-        return parent_list, top_scores_index, draft_tokens
 
     def draft_extend(self):
         pass
