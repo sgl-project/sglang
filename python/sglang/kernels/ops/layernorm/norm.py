@@ -21,8 +21,10 @@ logger = logging.getLogger(__name__)
 
 
 @cache_once
-def _jit_qknorm_module(head_dim: int, dtype: torch.dtype) -> Module:
-    args = make_cpp_args(head_dim, is_arch_support_pdl(), dtype)
+def _jit_qknorm_module(
+    head_dim: int, dtype: torch.dtype, cast_x_before_out_mul: bool
+) -> Module:
+    args = make_cpp_args(head_dim, is_arch_support_pdl(), cast_x_before_out_mul, dtype)
     return load_jit(
         "qknorm",
         *args,
@@ -98,12 +100,27 @@ def _jit_qknorm_across_heads_module(dtype: torch.dtype) -> Module:
 
 @torch.compiler.assume_constant_result
 @cache_once
-def can_use_fused_inplace_qknorm(head_dim: int, dtype: torch.dtype) -> bool:
+def can_use_fused_inplace_qknorm(
+    head_dim: int,
+    dtype: torch.dtype,
+    *,
+    cast_x_before_out_mul: bool = False,
+) -> bool:
+    """Return whether the JIT Q/K RMSNorm kernel can serve a configuration.
+
+    Args:
+        head_dim: Per-head hidden dimension.
+        dtype: Query and key activation dtype.
+        cast_x_before_out_mul: Use Hugging Face cast-before-weight semantics.
+
+    Returns:
+        ``True`` when the matching CUDA kernel compiles and loads.
+    """
     if head_dim not in [64, 128, 256, 512, 1024]:
         logger.warning(f"Unsupported head_dim={head_dim} for JIT QK-Norm kernel")
         return False
     try:
-        _jit_qknorm_module(head_dim, dtype)
+        _jit_qknorm_module(head_dim, dtype, cast_x_before_out_mul)
         return True
     except Exception as e:
         logger.warning(f"Failed to load JIT QK-Norm kernel: {e}")
@@ -119,9 +136,26 @@ def fused_inplace_qknorm(
     eps: float = 1e-6,
     *,
     head_dim: int = 0,
+    cast_x_before_out_mul: bool = False,
 ) -> None:
+    """Apply per-head RMSNorm to query and key tensors in place.
+
+    Args:
+        q: Query tensor shaped ``[num_tokens, num_query_heads, head_dim]``.
+        k: Key tensor shaped ``[num_tokens, num_key_heads, head_dim]``.
+        q_weight: Query RMSNorm weight shaped ``[head_dim]``.
+        k_weight: Key RMSNorm weight shaped ``[head_dim]``.
+        eps: Variance epsilon.
+        head_dim: Explicit head dimension, inferred from ``q`` when zero.
+        cast_x_before_out_mul: Round normalized activations to their input
+            dtype before multiplying by the learned weights.
+
+    Raises:
+        RuntimeError: If the JIT kernel cannot compile or a tensor layout is
+            unsupported.
+    """
     head_dim = head_dim or q.size(-1)
-    module = _jit_qknorm_module(head_dim, q.dtype)
+    module = _jit_qknorm_module(head_dim, q.dtype, cast_x_before_out_mul)
     module.qknorm(q, k, q_weight, k_weight, eps)
 
 

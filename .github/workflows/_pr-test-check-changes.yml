@@ -25,6 +25,8 @@ on:
         value: ${{ jobs.run.outputs.jit_kernel }}
       multimodal_gen:
         value: ${{ jobs.run.outputs.multimodal_gen }}
+      bagel:
+        value: ${{ jobs.run.outputs.bagel }}
       partitions:
         value: ${{ jobs.run.outputs.partitions }}
       partition_model_sha:
@@ -45,6 +47,7 @@ jobs:
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
+      bagel: ${{ steps.filter.outputs.bagel || steps.run-mode.outputs.run_all_tests }}
       partitions: ${{ steps.partitions.outputs.partitions }}
       partition_model_sha: ${{ steps.partition-model-sha.outputs.sha }}
       runs_on_map: ${{ steps.runner-map.outputs.runs_on_map }}
@@ -99,6 +102,10 @@ jobs:
               - "test/registered/kernels/ops/diffusion/**"
               - "test/registered/kernels/benchmark/diffusion/**"
               - "python/sglang/cli/**"
+            bagel:
+              - ".github/workflows/pr-test-multimodal-gen.yml"
+              - "python/sglang/multimodal_gen/**/*bagel*.py"
+              - "test/registered/kernels/ops/diffusion/**/*bagel*.py"
             jit_kernel:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-jit-kernel.yml"

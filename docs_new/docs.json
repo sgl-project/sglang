@@ -1242,6 +1242,13 @@
                     ]
                   },
                   {
+                    "group": "BAGEL",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/BAGEL/BAGEL"
+                    ]
+                  },
+                  {
                     "group": "Z-Image",
                     "pages": [
                       "cookbook/diffusion/Z-Image/Z-Image-Turbo"

@@ -1,0 +1,657 @@
+---
+title: "BAGEL"
+description: "Serve BAGEL-7B-MoT for generation, editing, Thinking, and image Understanding."
+---
+
+## Overview
+
+[BAGEL-7B-MoT](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) is a
+multimodal mixture-of-transformer-experts model from ByteDance Seed. SGLang's
+native integration supports text-to-image generation, model-generated planning
+before image generation (Thinking), single-image editing, and single-image
+Understanding on NVIDIA CUDA. The three image-generation pipelines can also use
+BAGEL's native request-level TaylorSeer acceleration.
+
+<Warning>
+Run text-to-image generation, Thinking, editing, and Understanding as separate
+pipeline processes. Thinking T2I is selected when the process starts;
+Understanding reasoning is a per-request option on the dedicated Understanding
+process. The current integration does not support editing masks, multiple input
+images, multi-output requests, sequence/CFG parallelism, Cache-DiT, or layer-wise
+offload. Dynamic batching is supported only for compatible pure T2I requests on
+the baseline `BagelPipeline`; Thinking, Editing, and Understanding remain
+singleton-only. Native TaylorSeer is separate from Cache-DiT and is supported by
+T2I, Thinking, and Editing; Understanding rejects it because that pipeline does
+not denoise images. This integration is supported and validated only with TP=1;
+multi-GPU tensor parallelism is outside the current support scope.
+</Warning>
+
+<Note>
+Older BAGEL prototypes selected capabilities with request fields on
+`/v1/images/generations`. Active values now return HTTP 400 on a BAGEL server:
+use `BagelThinkingPipeline` instead of `enable_think`; use `BagelEditPipeline`
+and `/v1/images/edits` instead of `enable_editing`, with `true_cfg_scale`
+replacing `cfg_img_scale`; use `BagelUnderstandingPipeline` and
+`/v1/chat/completions` instead of `enable_understanding`, with
+`max_completion_tokens` replacing `max_understanding_tokens`. Inactive
+boolean selectors set to `False`/`None`, nullable value fields set to `None`,
+and an empty path remain accepted for generic clients. The old HTTP `image_path`
+field is otherwise rejected: send `image` or `url` to the edits endpoint, or
+`image_url` to Chat Completions. Offline `sglang generate --image-path` remains
+supported.
+</Note>
+
+## Prerequisites
+
+- Install SGLang Diffusion by following the
+  [installation guide](/docs/sglang-diffusion/installation).
+- Use one NVIDIA CUDA GPU with enough memory for the BF16 checkpoint and the
+  requested image resolution.
+- Use the official `ByteDance-Seed/BAGEL-7B-MoT` checkpoint. The examples pin a
+  checkpoint revision for reproducibility.
+
+## Start a text-to-image server
+
+Start the OpenAI-compatible image server:
+
+```bash
+sglang serve \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --port 30000
+```
+
+You can also pass a local checkpoint directory. SGLang identifies an arbitrary
+local directory as BAGEL only when it contains all four root-level files:
+`config.json`, `llm_config.json`, `ema.safetensors`, and `ae.safetensors`.
+When `BagelUnderstandingPipeline` is selected explicitly, its slim loader only
+requires the first three files plus tokenizer assets and does not open
+`ae.safetensors`.
+
+## Start an editing server
+
+Select `BagelEditPipeline` explicitly. This process additionally loads the VAE
+encoder and BAGEL vision encoder required for image conditioning:
+
+```bash
+sglang serve \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --pipeline-class-name BagelEditPipeline \
+  --port 30010
+```
+
+One process serves one BAGEL capability. Restart with `BagelPipeline`, or omit
+`--pipeline-class-name`, to return to text-to-image generation.
+
+## Start a Thinking server
+
+Select `BagelThinkingPipeline` explicitly. This process loads the checkpoint's
+language head, generates a request-local plan, and adds that clean plan to the
+image-conditioning context before denoising:
+
+```bash
+sglang serve \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --pipeline-class-name BagelThinkingPipeline \
+  --port 30020
+```
+
+The baseline T2I and Editing processes do not load the language head. Keeping
+Thinking as a separate process therefore avoids adding its roughly 1 GiB BF16
+weight to those pipelines.
+
+## Start an Understanding server
+
+Select `BagelUnderstandingPipeline` explicitly. This process loads only the UND
+transformer expert, language head, image encoder, and tokenizer. It does not load
+the generation expert, VAE, scheduler, or `ae.safetensors`:
+
+```bash
+sglang serve \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --pipeline-class-name BagelUnderstandingPipeline \
+  --port 30030
+```
+
+The slim Understanding weight set is approximately 15 GiB in BF16 before KV
+cache and runtime workspaces. The pipeline applies BAGEL's official outer image
+resize before the independent ViT resize, but never runs VAE encode/decode or a
+denoising loop.
+
+### Vision encoder attention
+
+Editing and Understanding use SGLang's native attention backend selection for
+the BAGEL vision encoder. On SM100 GPUs with `flash_attn.cute` available, inputs
+with at least 2,500 image patches use FA4; shorter inputs stay on Torch SDPA.
+The threshold keeps the marginal 2,304-patch crossover on SDPA and enables FA4
+where checkpoint-backed measurements show a clear benefit. If FA4 CUTE is
+unavailable, or on other GPU architectures, capability checks fall back to
+Torch SDPA.
+
+To force the reference SDPA path for a comparison or a latency-sensitive
+one-shot run, add this component override to either server command:
+
+```bash
+--component-attention-backends image_encoder=torch_sdpa
+```
+
+FA4 uses CUTE JIT compilation, so the first eligible image shape in a process has
+a one-time compilation cost. Repeated requests reuse the compiled kernel. The
+component override affects only the vision encoder; the BAGEL transformer keeps
+its independently selected attention backend.
+
+## Single-GPU execution
+
+All four BAGEL pipeline variants are supported with TP=1. Multi-GPU tensor
+parallelism is not part of the current validated support scope. The explicit
+equivalent of the default server configuration is:
+
+```bash
+sglang serve \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --num-gpus 1 \
+  --tp-size 1 \
+  --port 30000
+```
+
+## Batch compatible pure T2I requests
+
+Dynamic batching is opt-in and is supported only by the baseline
+`BagelPipeline` used in the first server example. Enable it with the standard
+SGLang-Diffusion batching flags:
+
+```bash
+sglang serve \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --batching-mode dynamic \
+  --batching-max-size 2 \
+  --batching-delay-ms 5 \
+  --enable-batching-metrics \
+  --port 30000
+```
+
+`--batching-max-size 1` is the default and keeps singleton dispatch. Increase it
+only as GPU memory allows. Requests merge only when their image geometry,
+generation-affecting sampling parameters, and output handling are compatible;
+prompts and seeds may differ. BAGEL still requires `n=1`: batching merges
+separate concurrent requests and does not enable multiple outputs from one
+request.
+
+`BagelThinkingPipeline`, `BagelEditPipeline`, and
+`BagelUnderstandingPipeline` remain singleton-only even when these server flags
+are present. Batch execution can introduce small numerical differences from
+singleton execution, and there is no automatic OOM retry. See
+[Inference Batching](/docs/sglang-diffusion/dynamic_batching) for admission
+rules, optional `--batching-config` caps, and metrics.
+
+## Generate an image
+
+Send a single-output request through the OpenAI-compatible images API:
+
+```python
+import base64
+
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30000/v1")
+
+response = client.images.generate(
+    model="ByteDance-Seed/BAGEL-7B-MoT",
+    prompt="Doraemon is eating dorayaki",
+    n=1,
+    response_format="b64_json",
+    size="1024x1024",
+    extra_body={
+        "seed": 42,
+        "num_inference_steps": 50,
+        "guidance_scale": 4.0,
+        "flow_shift": 3.0,
+        "generator_device": "cpu",
+    },
+)
+
+image_bytes = base64.b64decode(response.data[0].b64_json)
+with open("bagel.png", "wb") as output_file:
+    output_file.write(image_bytes)
+```
+
+For an offline one-shot generation, use the CLI:
+
+```bash
+sglang generate \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --prompt "Doraemon is eating dorayaki" \
+  --height 1024 \
+  --width 1024 \
+  --seed 42 \
+  --num-inference-steps 50 \
+  --guidance-scale 4.0 \
+  --save-output
+```
+
+The default BAGEL flow shift is `3.0`. The images API accepts `flow_shift` as a
+request field; the offline CLI uses the model default. The fixed-seed example
+uses the CPU generator to match the official BAGEL noise initialization.
+
+## Accelerate denoising with native TaylorSeer
+
+[TaylorSeer](https://github.com/Shenyi-Z/TaylorSeer) forecasts intermediate
+transformer-layer outputs between periodic full evaluations. Enable it per
+request; the default remains disabled. For the offline T2I CLI, add one flag:
+
+```bash
+sglang generate \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --prompt "Doraemon is eating dorayaki" \
+  --height 1024 \
+  --width 1024 \
+  --seed 42 \
+  --num-inference-steps 50 \
+  --enable-taylorseer \
+  --save-output
+```
+
+For the Images API, add the same control to `extra_body`:
+
+```python
+response = client.images.generate(
+    model="ByteDance-Seed/BAGEL-7B-MoT",
+    prompt="Doraemon is eating dorayaki",
+    n=1,
+    response_format="b64_json",
+    size="1024x1024",
+    extra_body={
+        "seed": 42,
+        "num_inference_steps": 50,
+        "enable_taylorseer": True,
+    },
+)
+```
+
+The same request field is accepted by `BagelThinkingPipeline` and by the
+multipart `/v1/images/edits` endpoint served by `BagelEditPipeline`. Each actual
+CFG branch owns an independent cache, and the cache is released before VAE
+decode. The fixed native settings are sixth-order forecasting, five initial
+full evaluations, and a refresh every third active branch evaluation. Under
+SGLang's exact-N contract, an always-active 50-update branch performs 20 full
+and 30 forecast evaluations. CFG branches that are inactive outside their CFG
+interval advance only when they execute. The official BAGEL `num_timesteps=50`
+path performs 49 updates; use 49 SGLang steps when comparing those trajectories.
+
+<Warning>
+TaylorSeer trades memory and exact trajectory parity for speed. Use the default
+50-step schedule when evaluating output quality; very short schedules make each
+forecast span a larger part of the denoising trajectory and can show visible
+artifacts. Schedules of five or fewer updates never reach a forecast step and
+receive no acceleration. At 1024x1024 BF16, the worst-case layer cache is
+approximately 11 GiB for two-way T2I CFG, 17 GiB for three-way Thinking/Editing,
+and 21 GiB for a two-request T2I dynamic batch. These tensors are replicated per
+TP rank. Start with `--batching-max-size 1`, monitor peak memory, and increase
+the dynamic batch cap only after validating the target GPU. Native TaylorSeer
+cannot be combined with the unsupported BAGEL Cache-DiT path.
+</Warning>
+
+## Generate an image with Thinking
+
+Send the same Images API request to the Thinking server and optionally control
+the planning decode through `extra_body`:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30020/v1")
+
+response = client.images.generate(
+    model="ByteDance-Seed/BAGEL-7B-MoT",
+    prompt="Doraemon is eating dorayaki",
+    n=1,
+    response_format="b64_json",
+    size="1024x1024",
+    extra_body={
+        "seed": 42,
+        "num_inference_steps": 50,
+        "guidance_scale": 4.0,
+        "max_think_tokens": 1000,
+        "think_do_sample": False,
+        "think_temperature": 0.3,
+    },
+)
+
+print(response.data[0].revised_prompt)
+```
+
+`revised_prompt` contains the original prompt, a newline, and BAGEL's generated
+planning text—the text actually added to the image-conditioning context. The
+default decode is greedy, so `think_temperature` is used only when
+`think_do_sample=true`. `max_think_tokens` counts the initial
+`<|im_start|>` iteration, matching the official BAGEL implementation.
+
+For offline generation, select the same pipeline explicitly:
+
+```bash
+sglang generate \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --pipeline-class-name BagelThinkingPipeline \
+  --prompt "Doraemon is eating dorayaki" \
+  --height 1024 \
+  --width 1024 \
+  --seed 42 \
+  --max-think-tokens 1000 \
+  --think-temperature 0.3 \
+  --num-inference-steps 50 \
+  --guidance-scale 4.0 \
+  --save-output
+```
+
+## Edit an image
+
+Send one source image to the editing server through the OpenAI-compatible
+images edits API. Omit `size` to preserve the source aspect ratio with BAGEL's
+official resize policy:
+
+```python
+import base64
+
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30010/v1")
+
+with open("input.png", "rb") as input_image:
+    response = client.images.edit(
+        model="ByteDance-Seed/BAGEL-7B-MoT",
+        image=input_image,
+        prompt="Turn the background into a blue sky",
+        n=1,
+        response_format="b64_json",
+        extra_body={
+            "seed": 42,
+            "num_inference_steps": 50,
+            "guidance_scale": 4.0,
+            "true_cfg_scale": 2.0,
+        },
+    )
+
+image_bytes = base64.b64decode(response.data[0].b64_json)
+with open("bagel-edit.png", "wb") as output_file:
+    output_file.write(image_bytes)
+```
+
+For an offline edit, use the same explicit pipeline selection:
+
+```bash
+sglang generate \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --pipeline-class-name BagelEditPipeline \
+  --image-path input.png \
+  --prompt "Turn the background into a blue sky" \
+  --seed 42 \
+  --num-inference-steps 50 \
+  --guidance-scale 4.0 \
+  --true-cfg-scale 2.0 \
+  --save-output
+```
+
+`guidance_scale` controls text CFG. `true_cfg_scale` controls BAGEL's image CFG
+and defaults to `2.0` when omitted. Transparent inputs are composited on a
+white background before encoding, matching the official application path.
+
+## Understand an image
+
+Send one image and one prompt through the non-streaming OpenAI-compatible Chat
+Completions API:
+
+```python
+import base64
+
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30030/v1")
+
+with open("input.png", "rb") as input_file:
+    image_data = base64.b64encode(input_file.read()).decode("utf-8")
+
+response = client.chat.completions.create(
+    model="ByteDance-Seed/BAGEL-7B-MoT",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                },
+                {"type": "text", "text": "Describe this image."},
+            ],
+        }
+    ],
+    max_completion_tokens=511,
+    temperature=0,
+)
+
+print(response.choices[0].message.content)
+```
+
+The public default is greedy with a BAGEL `max_new_tokens` value of `512`.
+BAGEL counts the initial `<|im_start|>` decode iteration, so the default permits
+at most 511 content tokens. Set `reasoning_effort="high"` or pass
+`extra_body={"chat_template_kwargs": {"enable_thinking": True}}` through the
+OpenAI Python SDK to prepend the official VLM reasoning system prompt. The
+returned assistant message remains one string that contains both
+`<think>...</think>` and the answer.
+
+For offline Understanding, the CLI prints the response to stdout:
+
+```bash
+sglang generate \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --pipeline-class-name BagelUnderstandingPipeline \
+  --image-path input.png \
+  --prompt "Describe this image." \
+  --max-new-tokens 512 \
+  --seed 42
+```
+
+## Use `DiffGenerator` from Python
+
+For a local Python workflow without an HTTP server, select the capability when
+constructing the generator. Change `MODE` before starting the process; do not
+reuse one live generator for another BAGEL pipeline. The context manager shuts
+down the local scheduler and workers after the request:
+
+```python
+from pathlib import Path
+
+from sglang.multimodal_gen import DiffGenerator
+
+MODEL_PATH = "ByteDance-Seed/BAGEL-7B-MoT"
+REVISION = "5019f57d168e5816e8f3f701b17cc816bb7cf24b"
+MODE = "t2i"  # t2i | thinking | editing | understanding
+INPUT_PATH = Path("input.png").resolve()
+OUTPUT_PATH = str(Path("bagel-python-output").resolve())
+
+PIPELINES = {
+    "t2i": "BagelPipeline",
+    "thinking": "BagelThinkingPipeline",
+    "editing": "BagelEditPipeline",
+    "understanding": "BagelUnderstandingPipeline",
+}
+
+IMAGE_DEFAULTS = {
+    "num_inference_steps": 50,
+    "guidance_scale": 4.0,
+    "flow_shift": 3.0,
+    "negative_prompt": "",
+    "seed": 42,
+    "generator_device": "cpu",
+    "output_path": OUTPUT_PATH,
+    "save_output": True,
+    "return_file_paths_only": True,
+}
+REQUESTS = {
+    "t2i": {
+        **IMAGE_DEFAULTS,
+        "prompt": "Doraemon is eating dorayaki",
+        "height": 1024,
+        "width": 1024,
+        "output_file_name": "t2i.png",
+    },
+    "thinking": {
+        **IMAGE_DEFAULTS,
+        "prompt": "Doraemon is eating dorayaki",
+        "height": 1024,
+        "width": 1024,
+        "max_think_tokens": 1000,
+        "think_do_sample": False,
+        "think_temperature": 0.3,
+        "output_file_name": "thinking.png",
+    },
+    "editing": {
+        **IMAGE_DEFAULTS,
+        "prompt": "Turn the background into a blue sky",
+        "image_path": str(INPUT_PATH),
+        "true_cfg_scale": 2.0,
+        "output_file_name": "editing.png",
+    },
+    "understanding": {
+        "prompt": "Describe this image.",
+        "image_path": str(INPUT_PATH),
+        "max_new_tokens": 512,
+        "do_sample": False,
+        "enable_thinking": False,
+        "seed": 42,
+        "save_output": False,
+        "return_file_paths_only": False,
+    },
+}
+
+
+def main() -> None:
+    if MODE in {"editing", "understanding"} and not INPUT_PATH.is_file():
+        raise FileNotFoundError(f"BAGEL input image is missing: {INPUT_PATH}")
+
+    with DiffGenerator.from_pretrained(
+        model_path=MODEL_PATH,
+        revision=REVISION,
+        pipeline_class_name=PIPELINES[MODE],
+        num_gpus=1,
+        tp_size=1,
+    ) as generator:
+        result = generator.generate(sampling_params_kwargs=REQUESTS[MODE])
+
+    if result is None or isinstance(result, list):
+        raise RuntimeError("Expected one BAGEL result")
+    if result.text is not None:
+        print(result.text)
+        print(
+            f"finish={result.finish_reason}, prompt_tokens={result.prompt_tokens}, "
+            f"completion_tokens={result.completion_tokens}"
+        )
+    else:
+        print(f"Saved to {result.output_file_path}")
+        if result.revised_prompt is not None:
+            print(f"Conditioning prompt: {result.revised_prompt}")
+
+
+if __name__ == "__main__":
+    # DiffGenerator uses multiprocessing spawn, so script entry must be guarded.
+    main()
+```
+
+`input.png` is required only for Editing and Understanding. Keep
+`num_gpus=1` and `tp_size=1`. Set
+`REQUESTS[MODE]["enable_taylorseer"] = True` for a selected T2I, Thinking, or
+Editing request when native TaylorSeer acceleration is wanted.
+
+## Benchmark all BAGEL pipelines
+
+Run the dedicated offline benchmark to exercise all six BAGEL cases: standard
+T2I, T2I with TaylorSeer, Thinking, Thinking with TaylorSeer, Understanding,
+and Editing.
+
+```bash
+python -m sglang.multimodal_gen.benchmarks.bench_bagel_all_modes \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --image-path input.png \
+  --output-dir bagel-benchmark \
+  --output-json bagel-benchmark/results.json
+```
+
+The benchmark starts `BagelPipeline`, `BagelThinkingPipeline`,
+`BagelUnderstandingPipeline`, and `BagelEditPipeline` sequentially. It shuts
+down each local pipeline before loading the next one, so their model weights do
+not occupy GPU memory at the same time. Each case completes its own warmup
+before timed runs. Pipeline startup time is recorded separately from inference
+latency and is not included in the case latency statistics.
+
+The JSON report records the configuration, startup and per-case latency
+metrics, peak GPU memory, skipped cases, and generated artifact paths. Image
+artifacts are written under `--output-dir`; the Understanding text is stored in
+the JSON report. If `--image-path` is omitted, the four prompt-only generation
+cases still run, while Understanding and Editing are reported as skipped.
+
+Add `--perf-dump-dir` to collect a separate worker timing report for every
+timed request. The reports contain pipeline stage and denoising-step metrics;
+warmup requests remain unprofiled. For synchronized CUDA step timings, enable
+the existing profiling synchronization gate:
+
+```bash
+SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1 \
+python -m sglang.multimodal_gen.benchmarks.bench_bagel_all_modes \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --image-path input.png \
+  --perf-dump-dir bagel-benchmark/worker-perf
+```
+
+Synchronization adds profiling overhead, so compare synchronized runs only
+with other synchronized runs. The main benchmark JSON records the absolute
+worker report path for each sample.
+
+Speedup uses the worker's inference duration, excluding PNG encoding and
+filesystem I/O, and is reported only between comparable requests: T2I with
+TaylorSeer against standard T2I, and Thinking with TaylorSeer against Thinking.
+The report does not compute speedup ratios across different BAGEL capabilities.
+
+The benchmark stops after the first failed case by default and records later
+cases as `not_run`. Add `--continue-on-error` to continue after a case failure
+when that pipeline shuts down successfully. A shutdown failure always stops the
+benchmark to avoid loading another model while the previous worker may still
+hold GPU memory.
+
+## Current request contract
+
+- Send one prompt and request one output (`n=1`).
+- Use an empty or omitted negative prompt. BAGEL's initial T2I path does not
+  implement negative-prompt conditioning.
+- Use `num_inference_steps=50` to execute 50 denoising updates.
+- Keep `guidance_scale=4.0` and `flow_shift=3.0` for the official default path.
+- `enable_taylorseer` defaults to `false` and applies only to image-generation
+  pipelines. It is part of dynamic-batch compatibility, so enabled and disabled
+  requests never merge.
+- Thinking uses the official three-way context: system + prompt + plan, system
+  only, and system + prompt. Its secondary CFG scale is fixed at `1.5`.
+- Thinking defaults to greedy planning. Add `think_do_sample=true` in HTTP or
+  `--think-do-sample` offline to use request-local seeded sampling.
+- Editing accepts exactly one source image and no mask. Omit `size` for
+  automatic official resizing; if supplied, it must equal the calculated
+  preprocessed size.
+- Understanding accepts exactly one image and one non-empty prompt. It returns
+  text directly and does not execute image denoising or decoding stages.
+- Understanding defaults to greedy decode. Positive Chat Completions
+  `temperature` enables request-local seeded sampling; offline callers can use
+  `--do-sample --temperature VALUE`.
+
+See the [BAGEL repository](https://github.com/ByteDance-Seed/Bagel) for the
+upstream model implementation and the
+[SGLang Diffusion API guide](/docs/sglang-diffusion/api/openai_api) for endpoint
+details.

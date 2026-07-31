@@ -277,6 +277,9 @@ class DiffusionTestCase:
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
     run_t2v_input_reference_check: bool = True
+    # Reject the Images API's plain-prompt fallback when plan metadata is required.
+    run_revised_prompt_check: bool = False
+    dynamic_batching_requests: tuple[DiffusionSamplingParams, ...] = ()
     run_lora_basic_api_check: bool = False
     run_lora_dynamic_load_check: bool = False
     run_lora_dynamic_switch_check: bool = False
@@ -288,6 +291,11 @@ class DiffusionTestCase:
                 self,
                 "sampling_params",
                 get_default_sampling_params_for_server_args(self.server_args),
+            )
+
+        if self.dynamic_batching_requests and len(self.dynamic_batching_requests) != 2:
+            raise ValueError(
+                f"{self.id}: dynamic_batching_requests requires exactly two requests"
             )
 
         has_startup_lora = self.server_args.lora_path is not None
@@ -451,6 +459,46 @@ class PerformanceSummary:
 T2I_sampling_params = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
     output_size="1024x1024",
+)
+
+BAGEL_T2I_CI_SAMPLING_PARAMS = DiffusionSamplingParams(
+    prompt="Doraemon is eating dorayaki",
+    output_size="1024x1024",
+    output_format="png",
+    extras={
+        "seed": 42,
+        "num_inference_steps": 50,
+        "guidance_scale": 4.0,
+        "flow_shift": 3.0,
+        "generator_device": "cpu",
+    },
+)
+
+BAGEL_DYNAMIC_BATCHING_CI_REQUESTS = (
+    DiffusionSamplingParams(
+        prompt="A blue cube resting on a white table.",
+        output_size="256x256",
+        output_format="png",
+        extras={
+            "seed": 11,
+            "num_inference_steps": 2,
+            "guidance_scale": 4.0,
+            "flow_shift": 3.0,
+            "generator_device": "cpu",
+        },
+    ),
+    DiffusionSamplingParams(
+        prompt="A tiny red sphere floating above a quiet lake at sunrise.",
+        output_size="256x256",
+        output_format="png",
+        extras={
+            "seed": 22,
+            "num_inference_steps": 2,
+            "guidance_scale": 4.0,
+            "flow_shift": 3.0,
+            "generator_device": "cpu",
+        },
+    ),
 )
 
 IDEOGRAM4_CI_TEXT_PROMPT = "A cat sitting on a bench"

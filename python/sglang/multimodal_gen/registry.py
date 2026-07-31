@@ -43,6 +43,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     WanT2V720PConfig,
     ZImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.bagel import BagelPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ernie_image import (
     ErnieImagePipelineConfig,
@@ -101,6 +102,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
 )
+from sglang.multimodal_gen.configs.sample.bagel import BagelSamplingParams
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.ernie_image import ErnieImageSamplingParams
 from sglang.multimodal_gen.configs.sample.flux import (
@@ -180,7 +182,10 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model_index,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.utils import KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
+from sglang.utils import (
+    BAGEL_MODEL_ID,
+    resolve_non_diffusers_diffusion_pipeline,
+)
 
 logger = init_logger(__name__)
 
@@ -334,17 +339,24 @@ def _normalize_hf_cache_path(path: str) -> str:
 def has_registered_diffusion_model_path(model_path: str) -> bool:
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
+    if resolve_non_diffusers_diffusion_pipeline(model_path) is not None:
+        return True
+
     if model_path in _MODEL_HF_PATH_TO_NAME:
         return True
 
     model_short_name = get_model_short_name(model_path.lower())
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id == BAGEL_MODEL_ID:
+            continue
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
         if registered_model_name in model_short_name:
             return True
 
     normalized_model_path = _normalize_hf_cache_path(model_path)
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id == BAGEL_MODEL_ID:
+            continue
         cache_repo_fragment = (
             f"models--{registered_model_hf_id.lower().replace('/', '--')}"
         )
@@ -386,6 +398,8 @@ def _get_config_info(
     # 2. Partial match: find the best (longest) match against all registered model hf paths.
     model_short_name = get_model_short_name(model_path.lower())
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id == BAGEL_MODEL_ID:
+            continue
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
 
         if registered_model_name in model_short_name:
@@ -404,6 +418,8 @@ def _get_config_info(
     # -> models--black-forest-labs--flux.2-dev-nvfp4 (to match with cache_repo_fragment)
     normalized_model_path = _normalize_hf_cache_path(model_path)
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id == BAGEL_MODEL_ID:
+            continue
         cache_repo_fragment = (
             f"models--{registered_model_hf_id.lower().replace('/', '--')}"
         )
@@ -415,6 +431,19 @@ def _get_config_info(
             )
             model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
             return _CONFIG_REGISTRY.get(model_id)
+
+    # 2c. Resolve native, non-Diffusers layouts before attempting to read a
+    # model_index.json. This covers arbitrary local BAGEL directories whose
+    # identity comes from strict checkpoint markers rather than their basename.
+    non_diffusers_pipeline_name = resolve_non_diffusers_diffusion_pipeline(model_path)
+    if non_diffusers_pipeline_name is not None:
+        for registered_model_hf_id in all_model_hf_paths:
+            if (
+                resolve_non_diffusers_diffusion_pipeline(registered_model_hf_id)
+                == non_diffusers_pipeline_name
+            ):
+                model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
+                return _CONFIG_REGISTRY.get(model_id)
 
     # 3. Use detectors
     config = maybe_download_model_index(model_path)
@@ -638,6 +667,13 @@ def get_model_info(
 
 # Registration of model configs
 def _register_configs():
+    # BAGEL uses a native, non-Diffusers checkpoint layout.
+    register_configs(
+        sampling_param_cls=BagelSamplingParams,
+        pipeline_config_cls=BagelPipelineConfig,
+        hf_model_paths=[BAGEL_MODEL_ID],
+    )
+
     # Pi0.5 / OpenPI / LeRobot action policies.
     register_configs(
         sampling_param_cls=Pi05SamplingParams,
@@ -1149,17 +1185,10 @@ _register_configs()
 
 
 def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
-    model_path_lower = model_path.lower()
-    return any(
-        pattern in model_path_lower
-        for pattern in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
-    )
+    """Return whether a path resolves to a native non-Diffusers pipeline."""
+    return resolve_non_diffusers_diffusion_pipeline(model_path) is not None
 
 
 def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     """Get the pipeline name for a known non-diffusers model."""
-    model_path_lower = model_path.lower()
-    for pattern, pipeline_name in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS.items():
-        if pattern in model_path_lower:
-            return pipeline_name
-    return None
+    return resolve_non_diffusers_diffusion_pipeline(model_path)

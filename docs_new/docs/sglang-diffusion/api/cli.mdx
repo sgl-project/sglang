@@ -100,8 +100,9 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 ### Sampling and output
 
 - `--prompt {PROMPT}` and `--negative-prompt {PROMPT}`
-- `--image-path {PATH} [{PATH} ...]`: input image(s) for image-to-video or image-to-image generation
+- `--image-path {PATH} [{PATH} ...]`: input image(s) for image-to-video, image-to-image, or image-to-text generation
 - `--num-inference-steps {STEPS}` and `--seed {SEED}`
+- `--max-new-tokens {N}`, `--do-sample`, `--temperature {VALUE}`, and `--enable-thinking`: autoregressive text decode controls for multimodal Understanding pipelines
 - `--height {HEIGHT}`, `--width {WIDTH}`, `--num-frames {N}`, `--fps {FPS}`
 - `--output-path {PATH}`, `--output-file-name {NAME}`, `--save-output`, `--return-frames`
 

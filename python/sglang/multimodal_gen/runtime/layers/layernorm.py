@@ -817,10 +817,14 @@ def apply_qk_norm(
     k_norm: "RMSNorm",
     head_dim: int,
     allow_inplace: bool = True,
+    cast_x_before_out_mul: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply QK normalization for query and key tensors.
 
-    Uses JIT fused inplace kernel when available, falls back to standard RMSNorm.
+    Uses the JIT fused in-place kernel when available and falls back to the
+    supplied RMSNorm modules otherwise. ``cast_x_before_out_mul`` selects the
+    Hugging Face RMSNorm ordering, which rounds the normalized activation to
+    the input dtype before applying the learned weight.
     """
 
     batch_size = q.size(0)
@@ -832,9 +836,15 @@ def apply_qk_norm(
         and allow_inplace
         and (q_eps == k_eps)
         and q.dtype in (torch.float16, torch.bfloat16)
+        and q.numel() > 0
+        and k.numel() > 0
         and q_norm.weight.dtype == q.dtype
         and k_norm.weight.dtype == k.dtype
-        and can_use_fused_inplace_qknorm(head_dim, q.dtype)
+        and can_use_fused_inplace_qknorm(
+            head_dim,
+            q.dtype,
+            cast_x_before_out_mul=cast_x_before_out_mul,
+        )
     ):
         fused_inplace_qknorm(
             q=q.view(batch_size, -1, head_dim),
@@ -843,6 +853,7 @@ def apply_qk_norm(
             k_weight=k_norm.weight,
             head_dim=head_dim,
             eps=q_eps,
+            cast_x_before_out_mul=cast_x_before_out_mul,
         )
         return q, k
 

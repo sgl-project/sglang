@@ -280,17 +280,25 @@ class ServerArgsAutoTuner:
             layerwise_components.append(LAYERWISE_OFFLOAD_DIT_GROUP)
 
         changed: list[str] = []
-        if args.text_encoder_cpu_offload and not args.is_arg_explicitly_set(
-            "text_encoder_cpu_offload"
+        if (
+            args.text_encoder_cpu_offload
+            and not args.is_arg_explicitly_set("text_encoder_cpu_offload")
+            and self._allows_implicit_auxiliary_layerwise("text_encoder")
         ):
             layerwise_components.append(LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP)
             changed.append(LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP)
-        if args.image_encoder_cpu_offload and not args.is_arg_explicitly_set(
-            "image_encoder_cpu_offload"
+        if (
+            args.image_encoder_cpu_offload
+            and not args.is_arg_explicitly_set("image_encoder_cpu_offload")
+            and self._allows_implicit_auxiliary_layerwise("image_encoder")
         ):
             layerwise_components.append(LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP)
             changed.append(LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP)
-        if args.vae_cpu_offload and not args.is_arg_explicitly_set("vae_cpu_offload"):
+        if (
+            args.vae_cpu_offload
+            and not args.is_arg_explicitly_set("vae_cpu_offload")
+            and self._allows_implicit_auxiliary_layerwise("vae")
+        ):
             layerwise_components.append(LAYERWISE_OFFLOAD_VAE_GROUP)
             changed.append(LAYERWISE_OFFLOAD_VAE_GROUP)
 
@@ -416,11 +424,23 @@ class ServerArgsAutoTuner:
             for component_name, arg_name in DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES
             if not args.is_arg_explicitly_set(arg_name)
         ]
+        components = [
+            component_name
+            for component_name in components
+            if self._allows_implicit_auxiliary_layerwise(component_name)
+        ]
         components = self._filter_high_memory_resident_components(components)
         if self._should_auto_enable_dit_layerwise_offload():
             components.insert(0, LAYERWISE_OFFLOAD_DIT_GROUP)
             self._set_default_wan_dit_offload_prefetch_size()
         return components
+
+    def _allows_implicit_auxiliary_layerwise(self, component_name: str) -> bool:
+        """Return whether auto-tuning may select an auxiliary component."""
+        allowed = (
+            self._deployment_config().implicit_auxiliary_layerwise_offload_components
+        )
+        return allowed is None or component_name in allowed
 
     def _filter_high_memory_resident_components(
         self, components: list[str]

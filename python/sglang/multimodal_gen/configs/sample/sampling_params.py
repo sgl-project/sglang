@@ -77,6 +77,7 @@ class DataType(Enum):
     VIDEO = auto()
     MESH = auto()
     ACTION = auto()
+    TEXT = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
@@ -85,7 +86,9 @@ class DataType(Enum):
             return "mp4"
         if self == DataType.ACTION:
             return "json"
-        return "glb"
+        if self == DataType.MESH:
+            return "glb"
+        return "txt"
 
 
 @dataclass
@@ -201,7 +204,8 @@ class SamplingParams:
 
     # Misc
     save_output: bool = True
-    return_frames: bool = field(default=False, metadata={"batch_sig_exclude": True})
+    # A merged dynamic batch uses one output transport, so requests must agree.
+    return_frames: bool = False
     rollout: bool = False
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
@@ -249,7 +253,16 @@ class SamplingParams:
 
     def _set_output_file_ext(self):
         # add extension if needed
-        output_extensions = (".mp4", ".jpg", ".png", ".webp", ".obj", ".glb", ".json")
+        output_extensions = (
+            ".mp4",
+            ".jpg",
+            ".png",
+            ".webp",
+            ".obj",
+            ".glb",
+            ".json",
+            ".txt",
+        )
         if not any(self.output_file_name.endswith(ext) for ext in output_extensions):
             self.output_file_name = (
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
@@ -609,7 +622,13 @@ class SamplingParams:
                 "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
-        if pipeline_config.task_type.is_image_gen():
+        if pipeline_config.task_type.is_text_gen():
+            # Text-producing multimodal pipelines do not own a temporal VAE.
+            # Keep the inherited media fields inert instead of entering the
+            # video frame-alignment path below.
+            self.num_frames = 1
+            self.adjust_frames = False
+        elif pipeline_config.task_type.is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
                 logger.debug("Setting `num_frames` to 1 for image generation model")
@@ -784,6 +803,11 @@ class SamplingParams:
             "--enable-teacache",
             action="store_true",
         )
+        add_argument(
+            "--enable-taylorseer",
+            action="store_true",
+            help="Enable BAGEL's native request-local TaylorSeer acceleration",
+        )
 
         # profiling
         add_argument(
@@ -934,6 +958,41 @@ class SamplingParams:
             "--num-inference-steps",
             type=int,
             help="Number of denoising steps",
+        )
+        add_argument(
+            "--max-think-tokens",
+            type=int,
+            help="Maximum BAGEL planning decode iterations, including BOS",
+        )
+        add_argument(
+            "--think-do-sample",
+            action="store_true",
+            help="Sample BAGEL planning text instead of greedy decoding",
+        )
+        add_argument(
+            "--think-temperature",
+            type=float,
+            help="Sampling temperature for BAGEL planning text",
+        )
+        add_argument(
+            "--max-new-tokens",
+            type=int,
+            help="Maximum autoregressive text tokens, including the initial BOS token",
+        )
+        add_argument(
+            "--do-sample",
+            action="store_true",
+            help="Sample autoregressive text instead of greedy decoding",
+        )
+        add_argument(
+            "--temperature",
+            type=float,
+            help="Sampling temperature for autoregressive text",
+        )
+        add_argument(
+            "--enable-thinking",
+            action="store_true",
+            help="Enable BAGEL reasoning before the final Understanding answer",
         )
         add_argument(
             "--guidance-scale",

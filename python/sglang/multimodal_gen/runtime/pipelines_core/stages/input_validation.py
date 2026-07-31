@@ -378,13 +378,18 @@ class InputValidationStage(PipelineStage):
         # for i2v, get image from image_path
         # @TODO(Wei) hard-coded for wan2.2 5b ti2v for now. Should put this in image_encoding stage
         if batch.image_path is not None:
+            image_convert_method = getattr(
+                server_args.pipeline_config,
+                "condition_image_convert_method",
+                None,
+            )
             if isinstance(batch.image_path, list):
                 batch.condition_image = []
                 for path in batch.image_path:
                     if path.endswith(".mp4"):
                         image = load_video(path)[0]
                     else:
-                        image = load_image(path)
+                        image = load_image(path, convert_method=image_convert_method)
                     batch.condition_image.append(image)
 
                 # Use the first image for size reference
@@ -398,7 +403,9 @@ class InputValidationStage(PipelineStage):
                 if batch.image_path.endswith(".mp4"):
                     image = load_video(batch.image_path)[0]
                 else:
-                    image = load_image(batch.image_path)
+                    image = load_image(
+                        batch.image_path, convert_method=image_convert_method
+                    )
                 batch.condition_image = image
                 condition_image_width, condition_image_height = (
                     image.width,

@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     RequestPerfRecord,
     get_diffusion_perf_log_dir,
 )
+from sglang.utils import BAGEL_MODEL_ID
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
@@ -104,6 +105,7 @@ _clip_model_cache: dict[str, Any] = {}
 _consistency_gt_cache: dict[str, Any] = {}
 _official_consistency_gt_outputs_cache: dict[str, frozenset[str]] | None = None
 CONSISTENCY_GT_CASE_ALIASES = {
+    "bagel_t2i": "zimage_image_t2i",
     "fsdp-inference": "zimage_image_t2i_2_gpus",
 }
 OFFICIAL_CONSISTENCY_GT_SKIP_CASES = frozenset(
@@ -159,6 +161,10 @@ def _load_clip_processor_with_roberta_processing_compat(
 
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "Tongyi-MAI/Z-Image-Turbo"
 DEFAULT_AR_MODEL_NAME_FOR_TEST = "zai-org/GLM-Image"
+
+# BAGEL text-to-image model
+DEFAULT_BAGEL_MODEL_NAME_FOR_TEST = BAGEL_MODEL_ID
+DEFAULT_BAGEL_MODEL_REVISION_FOR_TEST = "5019f57d168e5816e8f3f701b17cc816bb7cf24b"
 
 # Cosmos3 generation models
 DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST = "nvidia/Cosmos3-Nano"
@@ -228,12 +234,20 @@ def print_divider(length: int, char: str = "-"):
 
 
 def is_image_url(image_path: str | Path | None) -> bool:
-    """Check if image_path is a URL."""
+    """Check whether an image source is an HTTP(S) or data URL.
+
+    Args:
+        image_path: Candidate image path or URL.
+
+    Returns:
+        ``True`` for remote HTTP(S) images and embedded image data URLs.
+    """
     if image_path is None:
         return False
-    return isinstance(image_path, str) and (
-        image_path.startswith("http://") or image_path.startswith("https://")
-    )
+    if not isinstance(image_path, str):
+        return False
+    normalized = image_path.lower()
+    return normalized.startswith(("http://", "https://", "data:image/"))
 
 
 def probe_port(host="127.0.0.1", port=30010, timeout=2.0) -> bool:
@@ -1200,7 +1214,8 @@ def _load_official_consistency_gt_outputs() -> dict[str, frozenset[str]]:
 
 
 def _official_consistency_gt_outputs_for_case(case_id: str) -> frozenset[str]:
-    return _load_official_consistency_gt_outputs().get(case_id, frozenset())
+    canonical_case_id = get_consistency_gt_case_id(case_id)
+    return _load_official_consistency_gt_outputs().get(canonical_case_id, frozenset())
 
 
 def _is_official_consistency_gt_base_url(base_url: str) -> bool:

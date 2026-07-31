@@ -11,6 +11,10 @@ from sglang.multimodal_gen.configs.models.fsdp import (
     is_module_list_entry_in,
     is_zimage_layer,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.bagel import (
+    BagelEditPipelineConfig,
+    BagelPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
@@ -19,6 +23,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanCo
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
@@ -43,6 +50,7 @@ from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
 )
+from sglang.multimodal_gen.runtime.pipelines.bagel_pipeline import BagelPipeline
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
@@ -788,6 +796,57 @@ class TestOffloadDefaults(unittest.TestCase):
         args = self._from_dict_with_task_type(ModelTaskType.T2V)
 
         self.assertFalse(args.vae_cpu_offload)
+
+    def test_bagel_disables_implicit_layerwise_component_selection(self) -> None:
+        for pipeline_config in (BagelPipelineConfig(), BagelEditPipelineConfig()):
+            with self.subTest(pipeline_config=type(pipeline_config).__name__):
+                args = self._from_dict_with_pipeline_config(pipeline_config)
+
+                self.assertIsNone(args.layerwise_offload_components)
+                self.assertFalse(args.dit_cpu_offload)
+                self.assertFalse(args.image_encoder_cpu_offload)
+                self.assertFalse(args.vae_cpu_offload)
+                BagelPipeline._validate_runtime_capabilities(args)
+
+    def test_implicit_layerwise_component_subset_is_respected(self) -> None:
+        pipeline_config = PipelineConfig()
+        pipeline_config.task_type = ModelTaskType.T2V
+        deployment = ModelDeploymentConfig(
+            implicit_auxiliary_layerwise_offload_components=("image_encoder",)
+        )
+
+        with patch.object(
+            pipeline_config,
+            "get_model_deployment_config",
+            return_value=deployment,
+        ):
+            args = self._from_dict_with_pipeline_config(
+                pipeline_config,
+                memory_gb=40,
+            )
+
+        self.assertEqual(args.layerwise_offload_components, ["image_encoder"])
+
+    def test_bagel_preserves_and_rejects_explicit_layerwise_selection(self) -> None:
+        args = self._from_dict_with_pipeline_config(
+            BagelEditPipelineConfig(),
+            kwargs={"layerwise_offload_components": ["text_encoder"]},
+        )
+
+        self.assertEqual(args.layerwise_offload_components, ["text_encoder"])
+        with self.assertRaisesRegex(ValueError, "layerwise offload"):
+            BagelPipeline._validate_runtime_capabilities(args)
+
+    def test_bagel_memory_mode_reports_supported_boundary(self) -> None:
+        args = self._from_dict_with_pipeline_config(
+            BagelEditPipelineConfig(),
+            kwargs={"performance_mode": "memory"},
+        )
+
+        self.assertIsNone(args.layerwise_offload_components)
+        self.assertTrue(args.dit_cpu_offload)
+        with self.assertRaisesRegex(ValueError, "DiT CPU offload"):
+            BagelPipeline._validate_runtime_capabilities(args)
 
     def test_vae_cpu_offload_defaults_false_on_low_memory_gpu(self):
         args = self._from_dict_with_task_type(

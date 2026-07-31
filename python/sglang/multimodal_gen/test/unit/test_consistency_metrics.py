@@ -419,6 +419,32 @@ def test_consistency_gt_case_alias_reuses_canonical_filename(monkeypatch):
     ]
 
 
+def test_bagel_alias_reuses_official_zimage_t2i_gt(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+    monkeypatch.setattr(
+        test_utils,
+        "_load_official_consistency_gt_outputs",
+        lambda: {
+            "zimage_image_t2i": frozenset({"zimage_image_t2i_1gpu.jpg"}),
+        },
+    )
+    expected_url = (
+        f"{test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE}"
+        "/h100/zimage_image_t2i_1gpu.jpg"
+    )
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url == expected_url,
+    )
+
+    assert test_utils._find_remote_consistency_gt_files(
+        "bagel_t2i",
+        1,
+        is_video=False,
+    ) == [("h100/zimage_image_t2i_1gpu.jpg", expected_url)]
+
+
 def test_action_gt_candidates_prefer_platform_then_default(monkeypatch):
     monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
 

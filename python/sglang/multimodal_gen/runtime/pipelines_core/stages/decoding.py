@@ -321,6 +321,11 @@ class DecodingStage(PipelineStage):
         # Update batch with decoded image
         output_batch = OutputBatch(
             output=frames,
+            revised_prompts=(
+                [batch.extra["revised_prompt"]]
+                if batch.extra.get("revised_prompt") is not None
+                else None
+            ),
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             rollout_trajectory_data=batch.rollout_trajectory_data,

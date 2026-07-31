@@ -100,6 +100,8 @@ class _ExpandedOutputParts:
     trajectory_latents: list[torch.Tensor] = field(default_factory=list)
     noise_preds: list[torch.Tensor] = field(default_factory=list)
     output_file_paths: list[str] = field(default_factory=list)
+    revised_prompts: list[str | None] = field(default_factory=list)
+    text_outputs: list[Any] = field(default_factory=list)
     metrics_list: list[Any] = field(default_factory=list)
     trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
 
@@ -438,22 +440,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ):
                 torch.cuda.empty_cache()
 
-            if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
-                if not req.is_warmup:
-                    PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
-
-            # dump per-request perf report to the server-mode file path.
-            if (
-                req.perf_dump_path is not None
-                and not req.is_warmup
-                and output_batch.metrics is not None
-            ):
-                PerformanceLogger.dump_benchmark_report(
-                    file_path=req.perf_dump_path,
-                    metrics=output_batch.metrics,
-                    meta={"model": self.server_args.model_path},
-                    tag="server_perf_dump",
-                )
+            self._report_request_performance(req, output_batch)
         except Exception as e:
             logger.error(
                 f"Error executing {error_context}: {e}",
@@ -470,12 +457,37 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 torch.cuda.empty_cache()
         return output_batch
 
+    def _report_request_performance(self, req: Req, output_batch: OutputBatch) -> None:
+        """Log and dump completed request metrics from the main worker only.
+
+        Tensor-parallel workers receive the same output path. Restricting writes to
+        rank 0 prevents concurrent JSON truncation and preserves the rank-0 memory
+        snapshots in the final report.
+        """
+        if self.rank != 0 or req.is_warmup:
+            return
+
+        if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
+            PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
+
+        if req.perf_dump_path is not None and output_batch.metrics is not None:
+            PerformanceLogger.dump_benchmark_report(
+                file_path=req.perf_dump_path,
+                metrics=output_batch.metrics,
+                meta={"model": self.server_args.model_path},
+                tag="server_perf_dump",
+            )
+
     def _materialize_output_transport(
         self,
         output_batch: OutputBatch,
         req: Req,
         save_output_paths: Callable[[OutputBatch], None],
     ) -> None:
+        # Autoregressive text is already CPU/IPC-safe and must never enter the
+        # image/video file or frame materialization paths.
+        if output_batch.text_outputs is not None:
+            return
         if req.return_raw_frames:
             self._materialize_raw_frame_transport(output_batch, req)
         elif req.save_output and req.return_file_paths_only:
@@ -725,6 +737,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _req_to_output_batch(result: Req) -> OutputBatch:
         return OutputBatch(
             output=result.output,
+            revised_prompts=(
+                [result.extra["revised_prompt"]]
+                if result.extra.get("revised_prompt") is not None
+                else None
+            ),
             audio=getattr(result, "audio", None),
             audio_sample_rate=getattr(result, "audio_sample_rate", None),
             metrics=result.metrics,
@@ -782,6 +799,28 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.output_file_paths:
             parts.output_file_paths.extend(output_batch.output_file_paths)
         if isinstance(output_batch.output, torch.Tensor):
+            output_count = int(output_batch.output.shape[0])
+        elif output_batch.output is not None:
+            output_count = len(output_batch.output)
+        elif output_batch.text_outputs is not None:
+            output_count = len(output_batch.text_outputs)
+        else:
+            output_count = len(output_batch.output_file_paths or [])
+        if output_batch.revised_prompts is None:
+            parts.revised_prompts.extend([None] * output_count)
+        elif len(output_batch.revised_prompts) != output_count:
+            raise ValueError(
+                "revised_prompts must align one-to-one with expanded outputs"
+            )
+        else:
+            parts.revised_prompts.extend(output_batch.revised_prompts)
+        if output_batch.text_outputs is not None:
+            if len(output_batch.text_outputs) != output_count:
+                raise ValueError(
+                    "text_outputs must align one-to-one with expanded outputs"
+                )
+            parts.text_outputs.extend(output_batch.text_outputs)
+        if isinstance(output_batch.output, torch.Tensor):
             parts.tensor_outputs.append(output_batch.output)
         elif output_batch.output is not None:
             parts.list_outputs.extend(output_batch.output)
@@ -817,6 +856,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         if parts.output_file_paths:
             merged.output_file_paths = parts.output_file_paths
+        if any(prompt is not None for prompt in parts.revised_prompts):
+            merged.revised_prompts = parts.revised_prompts
+        if parts.text_outputs:
+            merged.text_outputs = parts.text_outputs
         if any(metrics is not None for metrics in parts.metrics_list):
             merged.metrics_list = parts.metrics_list
             merged.metrics = next(

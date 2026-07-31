@@ -9,6 +9,7 @@ pynvml. However, it should not initialize cuda context.
 import os
 from collections.abc import Callable
 from functools import lru_cache, wraps
+from importlib import import_module
 from typing import Any, TypeVar
 
 import psutil
@@ -460,6 +461,22 @@ class CudaPlatformBase(Platform):
             )
             return False
 
+        try:
+            fa4_module = import_module("flash_attn.cute")
+        except (ImportError, OSError) as e:
+            logger.info(
+                "Cannot use FlashAttention 4 because flash_attn.cute is "
+                "unavailable: %s. Falling back to Torch SDPA.",
+                e,
+            )
+            return False
+        if not callable(getattr(fa4_module, "flash_attn_varlen_func", None)):
+            logger.info(
+                "Cannot use FlashAttention 4 because flash_attn.cute does not "
+                "provide flash_attn_varlen_func. Falling back to Torch SDPA."
+            )
+            return False
+
         set_fa_ver(4)
         return True
 
@@ -490,7 +507,16 @@ class CudaPlatformBase(Platform):
                 )
 
                 supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
-                if head_size not in supported_sizes:
+                device_capability = cls.get_device_capability()
+                # FA4 CUTE supports BAGEL SigLIP's non-standard head_dim=72 on
+                # SM100. Keep the exception narrow: FA3 and current SM103/SM120
+                # builds do not share that validated kernel contract.
+                supports_sm100_head_72 = (
+                    head_size == 72
+                    and device_capability is not None
+                    and device_capability.to_int() == 100
+                )
+                if head_size not in supported_sizes and not supports_sm100_head_72:
                     logger.info(
                         "Cannot use FlashAttention backend for head size %d.",
                         head_size,

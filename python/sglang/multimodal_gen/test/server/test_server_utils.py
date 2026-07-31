@@ -93,20 +93,34 @@ def _urlopen_with_retry(url: str, timeout: int = 30, max_retries: int = 3) -> by
 
 
 def download_image_from_url(url: str) -> Path:
-    """Download an image from a URL to a temporary file.
+    """Materialize an HTTP(S) or embedded data image in a temporary file.
 
     Args:
-        url: The URL of the image to download
+        url: HTTP(S) or ``data:image`` URL to materialize.
 
     Returns:
-        Path to the downloaded temporary file
+        Path to the temporary image file.
     """
     logger.info(f"Downloading image from URL: {url}")
 
     # Determine file extension from URL
     ext = ".jpg"  # default
-    if url.lower().endswith((".png", ".jpeg", ".jpg", ".webp", ".gif")):
-        ext = url[url.rfind(".") :]
+    normalized_url = url.lower()
+    data_url_extensions = {
+        "data:image/png": ".png",
+        "data:image/jpeg": ".jpg",
+        "data:image/jpg": ".jpg",
+        "data:image/webp": ".webp",
+        "data:image/gif": ".gif",
+    }
+    for prefix, suffix in data_url_extensions.items():
+        if normalized_url.startswith(prefix):
+            ext = suffix
+            break
+    else:
+        path_without_query = normalized_url.split("?", maxsplit=1)[0]
+        if path_without_query.endswith((".png", ".jpeg", ".jpg", ".webp", ".gif")):
+            ext = path_without_query[path_without_query.rfind(".") :]
 
     # Create temporary file
     temp_file = (
@@ -882,10 +896,43 @@ def _extract_async_job_error_message(job: Any) -> str | None:
     return str(error)
 
 
+def _validate_required_revised_prompt(
+    case_id: str,
+    original_prompt: str,
+    revised_prompt: str | None,
+) -> None:
+    """Validate that an image response contains a generated planning suffix.
+
+    Args:
+        case_id: Test case identifier used in assertion messages.
+        original_prompt: Prompt sent to the Images API.
+        revised_prompt: Prompt returned by the Images API.
+
+    Raises:
+        AssertionError: If the response is missing a generated planning suffix.
+    """
+    empty_error = f"{case_id}: revised_prompt must be non-empty"
+    assert isinstance(revised_prompt, str), empty_error
+    assert revised_prompt.strip(), empty_error
+    distinct_error = f"{case_id}: revised_prompt must differ from the input prompt"
+    assert revised_prompt != original_prompt, distinct_error
+    expected_prefix = f"{original_prompt}\n"
+    prefix_error = (
+        f"{case_id}: revised_prompt must start with the input prompt "
+        "followed by a newline"
+    )
+    assert revised_prompt.startswith(expected_prefix), prefix_error
+    planning_suffix = revised_prompt[len(expected_prefix) :]
+    suffix_error = f"{case_id}: revised_prompt must include a non-empty planning suffix"
+    assert planning_suffix.strip(), suffix_error
+
+
 def get_generate_fn(
     model_path: str,
     modality: str,
     sampling_params: DiffusionSamplingParams,
+    *,
+    run_revised_prompt_check: bool = False,
 ) -> Callable[[str, Client], tuple[str, bytes]]:
     """Return appropriate generation function for the case."""
     # Allow override via environment variable (useful for AMD where large resolutions cause slow VAE)
@@ -1031,7 +1078,8 @@ def get_generate_fn(
 
     def generate_image(case_id, client) -> tuple[str, bytes]:
         """T2I: Text to Image generation."""
-        if not sampling_params.prompt:
+        prompt = sampling_params.prompt
+        if not prompt:
             pytest.skip(f"{case_id}: no text prompt configured")
 
         # Request parameters that affect output format
@@ -1043,7 +1091,7 @@ def get_generate_fn(
 
         response = client.images.with_raw_response.generate(
             model=model_path,
-            prompt=sampling_params.prompt,
+            prompt=prompt,
             n=n,
             size=output_size,
             response_format="b64_json",
@@ -1051,6 +1099,12 @@ def get_generate_fn(
             extra_body=extra_body if extra_body else None,
         )
         result = response.parse()
+        if run_revised_prompt_check:
+            _validate_required_revised_prompt(
+                case_id,
+                prompt,
+                result.data[0].revised_prompt,
+            )
         validate_image(result.data[0].b64_json)
 
         rid = result.id
@@ -1084,7 +1138,7 @@ def get_generate_fn(
         upload_file_to_slack(
             case_id=case_id,
             model=model_path,
-            prompt=sampling_params.prompt,
+            prompt=prompt,
             file_path=tmp_path,
         )
         os.remove(tmp_path)

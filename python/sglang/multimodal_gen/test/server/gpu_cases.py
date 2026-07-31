@@ -2,7 +2,12 @@ from dataclasses import replace
 from pathlib import Path
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_warmup import (
+    MINIMUM_PICTURE_BASE64_FOR_WARMUP,
+)
 from sglang.multimodal_gen.test.server.testcase_configs import (
+    BAGEL_DYNAMIC_BATCHING_CI_REQUESTS,
+    BAGEL_T2I_CI_SAMPLING_PARAMS,
     MODELOPT_FLUX1_FP8_TRANSFORMER,
     MODELOPT_FLUX1_NVFP4_TRANSFORMER,
     MODELOPT_FLUX2_FP8_TRANSFORMER,
@@ -40,6 +45,8 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     _with_default_num_gpus,
 )
 from sglang.multimodal_gen.test.test_utils import (
+    DEFAULT_BAGEL_MODEL_NAME_FOR_TEST,
+    DEFAULT_BAGEL_MODEL_REVISION_FOR_TEST,
     DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
@@ -467,6 +474,127 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_t2v_input_reference_check=False,
     ),
 ]
+
+# The regular 1-GPU CUDA PR shard runs on H100 and compares against the pinned
+# official Z-Image T2I output for the same CI prompt as a coarse semantic gate.
+if current_platform.is_cuda():
+    ONE_GPU_CASES.append(
+        DiffusionTestCase(
+            "bagel_t2i",
+            DiffusionServerArgs(
+                model_path=DEFAULT_BAGEL_MODEL_NAME_FOR_TEST,
+                modality="image",
+                extras=[
+                    "--revision",
+                    DEFAULT_BAGEL_MODEL_REVISION_FOR_TEST,
+                    "--batching-mode",
+                    "dynamic",
+                    "--batching-max-size",
+                    "2",
+                    "--batching-delay-ms",
+                    "500",
+                    "--enable-batching-metrics",
+                ],
+            ),
+            BAGEL_T2I_CI_SAMPLING_PARAMS,
+            run_perf_check=False,
+            run_consistency_check=True,
+            run_component_accuracy_check=False,
+            dynamic_batching_requests=BAGEL_DYNAMIC_BATCHING_CI_REQUESTS,
+        )
+    )
+    ONE_GPU_CASES.append(
+        DiffusionTestCase(
+            "bagel_understanding_i2t",
+            DiffusionServerArgs(
+                model_path=DEFAULT_BAGEL_MODEL_NAME_FOR_TEST,
+                modality="text",
+                extras=[
+                    "--revision",
+                    DEFAULT_BAGEL_MODEL_REVISION_FOR_TEST,
+                    "--pipeline-class-name",
+                    "BagelUnderstandingPipeline",
+                ],
+            ),
+            DiffusionSamplingParams(
+                prompt="Describe this image in one short sentence.",
+                image_path=MINIMUM_PICTURE_BASE64_FOR_WARMUP,
+            ),
+            run_perf_check=False,
+            run_consistency_check=False,
+            run_component_accuracy_check=False,
+            run_models_api_check=False,
+            run_t2v_input_reference_check=False,
+        )
+    )
+    ONE_GPU_CASES.append(
+        DiffusionTestCase(
+            "bagel_editing_i2i",
+            DiffusionServerArgs(
+                model_path=DEFAULT_BAGEL_MODEL_NAME_FOR_TEST,
+                modality="image",
+                extras=[
+                    "--revision",
+                    DEFAULT_BAGEL_MODEL_REVISION_FOR_TEST,
+                    "--pipeline-class-name",
+                    "BagelEditPipeline",
+                ],
+            ),
+            DiffusionSamplingParams(
+                prompt="Turn the background into a blue sky.",
+                image_path=MINIMUM_PICTURE_BASE64_FOR_WARMUP,
+                output_size="512x512",
+                output_format="png",
+                extras={
+                    "seed": 42,
+                    "num_inference_steps": 2,
+                    "guidance_scale": 4.0,
+                    "true_cfg_scale": 2.0,
+                    "generator_device": "cpu",
+                },
+            ),
+            run_perf_check=False,
+            run_consistency_check=False,
+            run_component_accuracy_check=False,
+            run_models_api_check=False,
+            run_t2v_input_reference_check=False,
+        )
+    )
+    ONE_GPU_CASES.append(
+        DiffusionTestCase(
+            "bagel_thinking_t2i",
+            DiffusionServerArgs(
+                model_path=DEFAULT_BAGEL_MODEL_NAME_FOR_TEST,
+                modality="image",
+                extras=[
+                    "--revision",
+                    DEFAULT_BAGEL_MODEL_REVISION_FOR_TEST,
+                    "--pipeline-class-name",
+                    "BagelThinkingPipeline",
+                ],
+            ),
+            DiffusionSamplingParams(
+                prompt="A small blue robot holding a red flower.",
+                output_size="512x512",
+                output_format="png",
+                extras={
+                    "seed": 42,
+                    "num_inference_steps": 2,
+                    "guidance_scale": 4.0,
+                    "max_think_tokens": 16,
+                    "think_do_sample": False,
+                    "think_temperature": 0.3,
+                    "generator_device": "cpu",
+                },
+            ),
+            run_perf_check=False,
+            run_consistency_check=False,
+            run_component_accuracy_check=False,
+            run_models_api_check=False,
+            run_t2v_input_reference_check=False,
+            run_revised_prompt_check=True,
+        )
+    )
 
 # Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
 if not current_platform.is_hip():

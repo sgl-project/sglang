@@ -2,14 +2,14 @@
 <img src=https://github.com/lm-sys/lm-sys.github.io/releases/download/test/sgl-diffusion-logo.png width="80%"/>
 </div>
 
-**SGLang diffusion is an inference framework for accelerated image/video generation.**
+**SGLang diffusion is an inference framework for accelerated image/video generation and multimodal understanding.**
 
-SGLang diffusion features an end-to-end unified pipeline for accelerating diffusion models. It is designed to be modular and extensible, allowing users to easily add new models and optimizations.
+SGLang diffusion features an end-to-end unified pipeline for accelerating diffusion and native multimodal models. It is designed to be modular and extensible, allowing users to easily add new models and optimizations.
 
 ## Key Features
 
 SGLang Diffusion has the following features:
-  - Broad model support: Wan, FastWan, FLUX, Qwen-Image, Z-Image, Ideogram 4, Krea-2, Cosmos3, LTX-2/LTX-2.3, LingBot World, SANA-WM, JoyEcho, MOVA, GLM-Image, ERNIE-Image, Hunyuan3D, and more
+  - Broad model support: Wan, FastWan, FLUX, Qwen-Image, Z-Image, Ideogram 4, Krea-2, Cosmos3, LTX-2/LTX-2.3, LingBot World, SANA-WM, JoyEcho, MOVA, GLM-Image, ERNIE-Image, Hunyuan3D, BAGEL (T2I, Thinking, single-image editing, and image Understanding), and more
   - Fast inference speed: empowered by optimized `sgl-kernel` kernels, scheduler/runtime improvements, caching acceleration, and native diffusion hot-path optimizations
   - Ease of use: OpenAI-compatible api, CLI, and python sdk support
   - Multi-platform support:

@@ -231,7 +231,12 @@ class GenerationResult:
     frames: Any = None
     audio: Any = None
     action: Any = None  # [T, raw_action_dim] predicted action (policy/inverse_dynamics)
+    text: str | None = None
+    finish_reason: str | None = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
     prompt: str | None = None
+    revised_prompt: str | None = None
     size: tuple | None = None  # (height, width, num_frames)
     generation_time: float = 0.0
     peak_memory_mb: float = 0.0

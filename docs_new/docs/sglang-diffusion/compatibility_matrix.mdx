@@ -38,6 +38,10 @@ Rows are grouped when a family shares the same runtime path or optimization supp
             <td><div className="sgd-id-list"><code>Qwen/Qwen-Image</code><code>Qwen/Qwen-Image-2512</code><code>Qwen/Qwen-Image-Edit</code><code>Qwen/Qwen-Image-Edit-2509</code><code>Qwen/Qwen-Image-Edit-2511</code><code>Qwen/Qwen-Image-Layered</code></div></td>
           </tr>
           <tr>
+            <td>BAGEL (T2I + Thinking + single-image editing + Understanding)</td>
+            <td><div className="sgd-id-list"><code>ByteDance-Seed/BAGEL-7B-MoT</code></div></td>
+          </tr>
+          <tr>
             <td>SD3 / SD3.5</td>
             <td><div className="sgd-id-list"><code>stabilityai/stable-diffusion-3-medium</code><code>stabilityai/stable-diffusion-3-medium-diffusers</code><code>stabilityai/stable-diffusion-3.5-medium</code><code>stabilityai/stable-diffusion-3.5-medium-diffusers</code><code>stabilityai/stable-diffusion-3.5-large</code><code>stabilityai/stable-diffusion-3.5-large-diffusers</code></div></td>
           </tr>
@@ -169,6 +173,25 @@ Rows are grouped when a family shares the same runtime path or optimization supp
     </div>
   </Tab>
 </Tabs>
+
+<Note>
+BAGEL currently uses its native, non-Diffusers checkpoint layout and supports
+single-output text-to-image generation, Thinking, single-image editing, and
+single-image Understanding on NVIDIA CUDA. Thinking runs as the explicit
+`BagelThinkingPipeline` and returns the generated plan through `revised_prompt`.
+Understanding runs as `BagelUnderstandingPipeline` and returns text through the
+non-streaming Chat Completions API or offline `GenerationResult.text`. Masks,
+multiple image inputs, sequence/CFG parallelism, Cache-DiT, and layer-wise
+offload are not supported. Dynamic batching supports compatible single-output
+pure T2I requests on the baseline `BagelPipeline`; Thinking, editing, and
+Understanding remain singleton-only. BAGEL is supported and validated only
+with TP=1; multi-GPU tensor parallelism is outside the current support scope.
+BAGEL's request-level native
+TaylorSeer is available for T2I, Thinking, and editing, but not Understanding;
+it is independent of the unsupported generic Cache-DiT path. On SM100, the
+vision encoder uses FA4 for inputs with at least 2,500 patches when FA4 CUTE is
+available and retains Torch SDPA for shorter sequences or capability fallback.
+</Note>
 
 <Note>
 Wan2.2 TI2V 5B currently has known quality issues when used for I2V generation.

@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import dataclasses
 import os
 import signal
 import uuid
@@ -14,7 +15,11 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
+from sglang.multimodal_gen.runtime.entrypoints.openai import (
+    chat_api,
+    image_api,
+    video_api,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
 )
@@ -224,7 +229,9 @@ async def model_info_endpoint(request: Request):
             [registry_info.pipeline_cls.__name__] if registry_info else None
         ),
         # Fields matching the LLM engine's /model_info shape
-        "has_image_understanding": task_type.accepts_image_input(),
+        "has_image_understanding": (
+            task_type.accepts_image_input() and task_type.is_text_gen()
+        ),
         "has_audio_understanding": False,
         # Diffusion-specific fields
         "task_type": task_type.name,
@@ -268,6 +275,8 @@ def make_serializable(obj):
     """Recursively converts Tensors to None for JSON serialization."""
     if isinstance(obj, torch.Tensor):
         return None
+    if dataclasses.is_dataclass(obj):
+        return make_serializable(dataclasses.asdict(obj))
     if isinstance(obj, dict):
         return {k: make_serializable(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -289,10 +298,17 @@ async def forward_to_scheduler(
     """Forwards request to scheduler and processes the result."""
     try:
         response = await async_scheduler_client.forward(req_obj)
-        if response.output is None and response.output_file_paths is None:
+        if (
+            response.output is None
+            and response.output_file_paths is None
+            and response.text_outputs is None
+        ):
             raise RuntimeError("Model generation returned no output.")
 
-        if response.output_file_paths:
+        output_file_path = None
+        if response.text_outputs is not None:
+            pass
+        elif response.output_file_paths:
             output_file_path = response.output_file_paths[0]
         else:
             output_file_path = sp.output_file_path()
@@ -400,6 +416,7 @@ def create_app(server_args: ServerArgs):
     from sglang.multimodal_gen.runtime.entrypoints.openai import common_api, mesh_api
 
     app.include_router(common_api.router)
+    app.include_router(chat_api.router)
     app.include_router(image_api.router)
     app.include_router(video_api.router)
     app.include_router(realtime_video_api.router)

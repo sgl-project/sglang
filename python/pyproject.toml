@@ -18,6 +18,7 @@ classifiers = [
 dependencies = [
   "aiohttp",
   "anthropic>=0.20.0",
+  "anyio",
   "apache-tvm-ffi==0.1.11",
   "av==16.1.0 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "blobfile==3.0.0",

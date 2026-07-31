@@ -34,7 +34,7 @@ constexpr uint32_t kWarpsPerBlock = 4;
 constexpr uint32_t kThreadsPerBlock = kWarpsPerBlock * device::kWarpThreads;
 
 // Warp-level kernel for head_dim <= 256
-template <int64_t kHeadDim, bool kUsePDL, typename Float>
+template <int64_t kHeadDim, bool kUsePDL, bool kCastXBeforeOutMul, typename Float>
 __global__ void fused_qknorm_warp(const QKNormParams __grid_constant__ params) {
   using namespace device;
   using Storage = norm::StorageType<Float, kHeadDim>;
@@ -60,7 +60,7 @@ __global__ void fused_qknorm_warp(const QKNormParams __grid_constant__ params) {
     const auto weight = load_q ? q_weight : k_weight;
     const auto input_vec = gmem.load(input);
     const auto weight_vec = gmem.load(weight);
-    const auto output_vec = norm::apply_norm_warp<kHeadDim>(input_vec, weight_vec, eps);
+    const auto output_vec = norm::apply_norm_warp<kHeadDim, kCastXBeforeOutMul>(input_vec, weight_vec, eps);
     gmem.store(input, output_vec);
   }
 
@@ -68,7 +68,7 @@ __global__ void fused_qknorm_warp(const QKNormParams __grid_constant__ params) {
 }
 
 // For CTA level, used for head_dim > 256 (512,1024)
-template <int64_t kHeadDim, bool kUsePDL, typename Float>
+template <int64_t kHeadDim, bool kUsePDL, bool kCastXBeforeOutMul, typename Float>
 __global__ void fused_qknorm_cta(const QKNormParams __grid_constant__ params) {
   using namespace device;
   using Storage = norm::StorageType<Float, kHeadDim>;
@@ -95,7 +95,8 @@ __global__ void fused_qknorm_cta(const QKNormParams __grid_constant__ params) {
     const auto weight = load_q ? q_weight : k_weight;
     const auto input_vec = gmem.load(input);
     const auto weight_vec = gmem.load(weight);
-    const auto output_vec = norm::apply_norm_cta<kHeadDim>(input_vec, weight_vec, eps, smem, kNumWarps);
+    const auto output_vec =
+        norm::apply_norm_cta<kHeadDim, kCastXBeforeOutMul>(input_vec, weight_vec, eps, smem, kNumWarps);
     gmem.store(input, output_vec);
   }
 
@@ -103,11 +104,11 @@ __global__ void fused_qknorm_cta(const QKNormParams __grid_constant__ params) {
 }
 
 // Warp-level kernel struct for head_dim <= 256
-template <int64_t kHeadDim, bool kUsePDL, typename DType>
+template <int64_t kHeadDim, bool kUsePDL, bool kCastXBeforeOutMul, typename DType>
 struct QKNormKernelWarp {
   static_assert(std::is_same_v<DType, fp16_t> || std::is_same_v<DType, bf16_t>);
   static_assert(!host::norm::should_use_cta<DType, kHeadDim>(), "Use QKNormKernelCTA for head_dim > 256");
-  static constexpr auto kernel = fused_qknorm_warp<kHeadDim, kUsePDL, DType>;
+  static constexpr auto kernel = fused_qknorm_warp<kHeadDim, kUsePDL, kCastXBeforeOutMul, DType>;
 
   static void
   run(const tvm::ffi::TensorView q,
@@ -176,11 +177,11 @@ struct QKNormKernelWarp {
 };
 
 // This goes with fused_qknorm_cta
-template <int64_t kHeadDim, bool kUsePDL, typename DType>
+template <int64_t kHeadDim, bool kUsePDL, bool kCastXBeforeOutMul, typename DType>
 struct QKNormKernelCTA {
   static_assert(std::is_same_v<DType, fp16_t> || std::is_same_v<DType, bf16_t>);
   static_assert(host::norm::should_use_cta<DType, kHeadDim>(), "Use QKNormKernelWarp for head_dim <= 256");
-  static constexpr auto kernel = fused_qknorm_cta<kHeadDim, kUsePDL, DType>;
+  static constexpr auto kernel = fused_qknorm_cta<kHeadDim, kUsePDL, kCastXBeforeOutMul, DType>;
   static constexpr auto kNumThreads = host::norm::get_cta_threads<DType, kHeadDim>();
 
   static void
@@ -248,10 +249,10 @@ struct QKNormKernelCTA {
 };
 
 // Unified dispatch: select warp or CTA kernel based on head_dim
-template <int64_t kHeadDim, bool kUsePDL, typename DType>
+template <int64_t kHeadDim, bool kUsePDL, bool kCastXBeforeOutMul, typename DType>
 using QKNormKernel = std::conditional_t<
     host::norm::should_use_cta<DType, kHeadDim>(),
-    QKNormKernelCTA<kHeadDim, kUsePDL, DType>,
-    QKNormKernelWarp<kHeadDim, kUsePDL, DType>>;
+    QKNormKernelCTA<kHeadDim, kUsePDL, kCastXBeforeOutMul, DType>,
+    QKNormKernelWarp<kHeadDim, kUsePDL, kCastXBeforeOutMul, DType>>;
 
 }  // namespace

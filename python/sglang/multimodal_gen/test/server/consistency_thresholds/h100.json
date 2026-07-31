@@ -1,6 +1,12 @@
 {
     "_comment": "Some cases use lower thresholds; raise them if quality/perf improves later.",
     "cases": {
+        "bagel_t2i": {
+            "clip_threshold": 0.8,
+            "ssim_threshold": 0.2,
+            "psnr_threshold": 8.0,
+            "mean_abs_diff_threshold": 70.0
+        },
         "qwen_image_t2i": {
             "clip_threshold": 0.97,
             "ssim_threshold": 0.83,

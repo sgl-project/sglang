@@ -1,9 +1,9 @@
 ---
 title: OpenAI API
 sidebarTitle: OpenAI API
-description: Image and video generation endpoints with LoRA adapter management.
+description: Image, video, and multimodal understanding endpoints with LoRA adapter management.
 ---
-The SGLang diffusion HTTP server implements an OpenAI-compatible API for image and video generation, as well as LoRA adapter management.
+The SGLang diffusion HTTP server implements OpenAI-compatible APIs for image and video generation, multimodal understanding, and LoRA adapter management. Endpoint availability depends on the selected pipeline.
 
 ## Prerequisites
 
@@ -61,6 +61,50 @@ curl -sS -X GET "http://localhost:30010/models"
 ---
 
 ## Endpoints
+
+### Multimodal Understanding
+
+Pipelines with image Understanding support expose a non-streaming Chat
+Completions endpoint.
+
+**Endpoint:** `POST /v1/chat/completions`
+
+The current contract accepts one `user` message containing exactly one
+`image_url` item and one or more `text` items whose combined text is non-empty.
+It returns one assistant text response; streaming and tool calls are not
+supported.
+
+**Python Example:**
+
+```python Python
+import base64
+
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30030/v1")
+
+with open("input.png", "rb") as input_file:
+    image_data = base64.b64encode(input_file.read()).decode("utf-8")
+
+response = client.chat.completions.create(
+    model="ByteDance-Seed/BAGEL-7B-MoT",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                },
+                {"type": "text", "text": "Describe this image."},
+            ],
+        }
+    ],
+    temperature=0,
+)
+
+print(response.choices[0].message.content)
+```
 
 ### Image Generation
 

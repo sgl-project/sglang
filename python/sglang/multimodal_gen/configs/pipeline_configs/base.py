@@ -7,7 +7,7 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import PIL
@@ -60,6 +60,7 @@ class ModelTaskType(Enum):
     TI2I = auto()  # Image to Image or Text-Image to Image
     I2M = auto()  # Image to Mesh
     VLA_ACTION = auto()  # Vision-language-action policy output
+    I2T = auto()  # Image and Text to Text
 
     def is_image_gen(self) -> bool:
         return (
@@ -84,11 +85,15 @@ class ModelTaskType(Enum):
     def is_visual_gen(self) -> bool:
         return self.is_image_gen() or self.is_video_gen()
 
+    def is_text_gen(self) -> bool:
+        return self == ModelTaskType.I2T
+
     def requires_image_input(self) -> bool:
         return (
             self == ModelTaskType.I2V
             or self == ModelTaskType.I2I
             or self == ModelTaskType.I2M
+            or self == ModelTaskType.I2T
         )
 
     def accepts_image_input(self) -> bool:
@@ -99,6 +104,7 @@ class ModelTaskType(Enum):
             or self == ModelTaskType.TI2V
             or self == ModelTaskType.I2M
             or self == ModelTaskType.VLA_ACTION
+            or self == ModelTaskType.I2T
         )
 
     def data_type(self) -> DataType:
@@ -106,6 +112,8 @@ class ModelTaskType(Enum):
             return DataType.ACTION
         if self.is_mesh_gen():
             return DataType.MESH
+        if self.is_text_gen():
+            return DataType.TEXT
         if self.is_image_gen():
             return DataType.IMAGE
         return DataType.VIDEO
@@ -197,6 +205,8 @@ def maybe_unpad_latents(latents, batch):
 @dataclass
 class PipelineConfig:
     """The base configuration class for a generation pipeline."""
+
+    allow_explicit_native_checkpoint_directory: ClassVar[bool] = False
 
     task_type: ModelTaskType = ModelTaskType.I2I
     skip_input_image_preprocess: bool = False
@@ -947,14 +957,38 @@ class PipelineConfig:
         )
         from sglang.multimodal_gen.registry import get_pipeline_config_classes
 
-        # If model_path is a safetensors file and pipeline_class_name is specified,
-        # try to get PipelineConfig from the registry first
-        if is_safetensors_file and pipeline_class_name:
-            config_classes = get_pipeline_config_classes(pipeline_class_name)
+        # An explicit registered pipeline can also identify a local native
+        # checkpoint that has no Diffusers model_index.json. Let the selected
+        # pipeline perform component-level validation instead of requiring the
+        # generic model detector to recognize that directory.
+        explicit_config_classes = (
+            get_pipeline_config_classes(pipeline_class_name)
+            if pipeline_class_name
+            else None
+        )
+        explicit_config_cls = (
+            explicit_config_classes[0] if explicit_config_classes is not None else None
+        )
+        is_supported_native_checkpoint_directory = (
+            os.path.isdir(model_path)
+            and not os.path.isfile(os.path.join(model_path, "model_index.json"))
+            and bool(
+                getattr(
+                    explicit_config_cls,
+                    "allow_explicit_native_checkpoint_directory",
+                    False,
+                )
+            )
+        )
+        if pipeline_class_name and (
+            is_safetensors_file or is_supported_native_checkpoint_directory
+        ):
+            config_classes = explicit_config_classes
             if config_classes is not None:
                 pipeline_config_cls, _ = config_classes
                 logger.info(
-                    f"Detected safetensors file with {pipeline_class_name}, "
+                    f"Using explicit {pipeline_class_name} for native checkpoint "
+                    f"{model_path}; "
                     f"using {pipeline_config_cls.__name__} directly without model_index.json"
                 )
             else:
@@ -973,7 +1007,8 @@ class PipelineConfig:
                     available_pipelines = list(_PIPELINE_CONFIG_REGISTRY.keys())
                     raise ValueError(
                         f"Could not get model info for '{model_path}'. "
-                        f"If using a safetensors file, please specify a valid pipeline_class_name. "
+                        f"Please specify a valid pipeline_class_name for this "
+                        f"native checkpoint. "
                         f"Available pipelines with config classes: {available_pipelines}"
                     )
                 pipeline_config_cls = model_info.pipeline_config_cls

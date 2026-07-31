@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 import base64
+import binascii
 import os
 import re
 
 
-def save_base64_image_to_path(base64_data: str, target_path: str) -> str:
+def save_base64_image_to_path(
+    base64_data: str,
+    target_path: str,
+    *,
+    max_bytes: int | None = None,
+) -> str:
     b64_format_hint = (
         "Failed to decode base64 image. "
         "Expected format: `data:[<media-type>];base64,<data>`"
@@ -31,9 +37,11 @@ def save_base64_image_to_path(base64_data: str, target_path: str) -> str:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     try:
-        image_data = base64.b64decode(data)
-    except Exception as exc:
-        raise Exception(f"Failed to decode base64 image: {str(exc)}") from exc
+        image_data = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"Failed to decode base64 image: {exc}") from exc
+    if max_bytes is not None and len(image_data) > max_bytes:
+        raise ValueError(f"Base64 image exceeds the {max_bytes}-byte limit")
 
     with open(target_path, "wb") as f:
         f.write(image_data)

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 OffloadComponentName = Literal["dit", "text_encoder", "image_encoder", "vae"]
+AuxiliaryOffloadComponentName = Literal["text_encoder", "image_encoder", "vae"]
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,13 @@ class ModelDeploymentConfig:
     # encoders stay offloaded and dit placement stays with the FSDP/dit-layerwise
     # policy
     keep_resident_components: tuple[OffloadComponentName, ...] = ("vae",)
+    # None preserves the global auxiliary-component defaults. An explicit tuple
+    # limits which auxiliary components auto-tuning may move to layerwise
+    # offload; an empty tuple disables that implicit selection entirely. DiT is
+    # controlled separately by auto_dit_layerwise_offload.
+    implicit_auxiliary_layerwise_offload_components: (
+        tuple[AuxiliaryOffloadComponentName, ...] | None
+    ) = None
     fsdp_auto_min_available_memory_gb: float | None = None
     fsdp_auto_requires_cfg: bool = True
     fsdp_auto_requires_default_parallelism: bool = True

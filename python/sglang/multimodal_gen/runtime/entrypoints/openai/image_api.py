@@ -20,7 +20,11 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 
-from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
+from sglang.multimodal_gen.configs.pipeline_configs.bagel import BagelPipelineConfig
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    generate_request_id,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     ImageResponse,
@@ -46,6 +50,25 @@ from sglang.srt.observability.trace import extract_trace_headers
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
 
+_BAGEL_PIPELINE_CLASS_NAMES = frozenset(
+    {
+        "BagelPipeline",
+        "BagelThinkingPipeline",
+        "BagelUnderstandingPipeline",
+        "BagelEditPipeline",
+    }
+)
+_LEGACY_BAGEL_MODE_FIELDS = (
+    "enable_editing",
+    "enable_think",
+    "enable_understanding",
+)
+_LEGACY_BAGEL_VALUE_FIELDS = (
+    "cfg_img_scale",
+    "max_understanding_tokens",
+)
+_LEGACY_BAGEL_PATH_FIELDS = ("image_path",)
+
 
 def _get_extra_field(request, field_name):
     """Get a field from model_extra, with fallback to nested extra_body dict."""
@@ -69,6 +92,74 @@ def _get_request_field_or_extra(request, field_name):
     if value is not None:
         return value
     return _get_extra_field(request, field_name)
+
+
+def _get_extra_field_values(
+    request: ImageGenerationsRequest, field_name: str
+) -> list[Any]:
+    """Return every direct or nested value supplied for an extension field."""
+    extra = request.model_extra or {}
+    values = [extra[field_name]] if field_name in extra else []
+    for container_name in ("extra_body", "extra_json", "extra_args", "extra_params"):
+        nested = _parse_extra_container(extra.get(container_name))
+        if field_name in nested:
+            values.append(nested[field_name])
+    return values
+
+
+def _reject_legacy_bagel_generation_fields(
+    request: ImageGenerationsRequest, server_args: Any
+) -> None:
+    """Reject active request-level mode switches from the BAGEL prototype.
+
+    Args:
+        request: Parsed OpenAI-compatible image generation request.
+        server_args: Active server configuration used to identify BAGEL.
+
+    Raises:
+        HTTPException: If a BAGEL request activates a removed legacy field.
+    """
+    pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
+    pipeline_config = getattr(server_args, "pipeline_config", None)
+    if pipeline_class_name not in _BAGEL_PIPELINE_CLASS_NAMES and not isinstance(
+        pipeline_config, BagelPipelineConfig
+    ):
+        return
+
+    active_fields = [
+        field_name
+        for field_name in _LEGACY_BAGEL_MODE_FIELDS
+        if any(_get_extra_field_values(request, field_name))
+    ]
+    active_fields.extend(
+        field_name
+        for field_name in _LEGACY_BAGEL_VALUE_FIELDS
+        if any(
+            value is not None for value in _get_extra_field_values(request, field_name)
+        )
+    )
+    active_fields.extend(
+        field_name
+        for field_name in _LEGACY_BAGEL_PATH_FIELDS
+        if any(_get_extra_field_values(request, field_name))
+    )
+    if not active_fields:
+        return
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "BAGEL no longer supports legacy per-request mode fields on "
+            f"/v1/images/generations: {', '.join(sorted(active_fields))}. "
+            "Start BagelThinkingPipeline instead of enable_think; use "
+            "BagelEditPipeline with /v1/images/edits and true_cfg_scale instead "
+            "of enable_editing and cfg_img_scale; use BagelUnderstandingPipeline "
+            "with /v1/chat/completions and max_completion_tokens instead of "
+            "enable_understanding and max_understanding_tokens. For HTTP input, "
+            "replace image_path with image or url on the edits endpoint, or with "
+            "image_url on the chat endpoint."
+        ),
+    )
 
 
 def _parse_extra_container(value: Any) -> dict[str, Any]:
@@ -157,6 +248,34 @@ def _raise_if_image_variant_not_found(item: dict, variant: str | None) -> None:
         )
 
 
+def _build_image_sampling_params(
+    request_id: str,
+    *,
+    enable_taylorseer: bool | None,
+    **kwargs: Any,
+) -> SamplingParams:
+    """Build image sampling params with a client-facing TaylorSeer error."""
+    try:
+        # False is the universal default. Drop it before model-specific
+        # SamplingParams construction so non-BAGEL models do not receive an
+        # unknown field when a generic client sends the flag explicitly.
+        return build_sampling_params(
+            request_id,
+            enable_taylorseer=enable_taylorseer or None,
+            **kwargs,
+        )
+    except (TypeError, ValueError) as exc:
+        if enable_taylorseer is True and "enable_taylorseer" in str(exc):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "enable_taylorseer is not supported by the active image "
+                    f"pipeline: {exc}"
+                ),
+            ) from exc
+        raise
+
+
 def _build_image_response_kwargs(
     save_file_path_list: list[str],
     resp_format: str,
@@ -177,6 +296,13 @@ def _build_image_response_kwargs(
     For url: uses cloud_url or fallback_url.
     file_path is omitted when is_persistent=False to avoid exposing stale temp paths.
     """
+    revised_prompts = result.revised_prompts or []
+
+    def revised_prompt_at(index: int) -> str:
+        if index < len(revised_prompts) and revised_prompts[index] is not None:
+            return revised_prompts[index]
+        return prompt
+
     ret = None
     if resp_format == "b64_json":
         if not b64_list:
@@ -184,10 +310,10 @@ def _build_image_response_kwargs(
         data = [
             ImageResponseData(
                 b64_json=b64,
-                revised_prompt=prompt,
+                revised_prompt=revised_prompt_at(index),
                 file_path=os.path.abspath(path) if is_persistent else None,
             )
-            for b64, path in zip(b64_list, save_file_path_list)
+            for index, (b64, path) in enumerate(zip(b64_list, save_file_path_list))
         ]
         ret = {"data": data}
     elif resp_format == "url":
@@ -208,7 +334,7 @@ def _build_image_response_kwargs(
             data.append(
                 ImageResponseData(
                     url=url,
-                    revised_prompt=prompt,
+                    revised_prompt=revised_prompt_at(idx),
                     file_path=os.path.abspath(path) if is_persistent else None,
                 )
             )
@@ -236,6 +362,7 @@ async def generations(
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
+    _reject_legacy_bagel_generation_fields(request, server_args)
     is_cosmos3 = "cosmos3" in (server_args.model_path or "").lower()
     ext = (
         "png"
@@ -244,8 +371,9 @@ async def generations(
     )
 
     with temp_dir_if_disabled(server_args.output_path) as output_dir:
-        sampling = build_sampling_params(
+        sampling = _build_image_sampling_params(
             request_id,
+            enable_taylorseer=request.enable_taylorseer,
             prompt=request.prompt,
             size=request.size,
             width=request.width,
@@ -270,6 +398,9 @@ async def generations(
                 if request.flow_shift is not None
                 else _get_extra_field(request, "flow_shift")
             ),
+            max_think_tokens=request.max_think_tokens,
+            think_do_sample=request.think_do_sample,
+            think_temperature=request.think_temperature,
             use_duration_template=_get_extra_field(request, "use_duration_template"),
             use_resolution_template=_get_extra_field(
                 request, "use_resolution_template"
@@ -387,6 +518,7 @@ async def edits(
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    enable_taylorseer: Optional[bool] = Form(None),
     enable_upscaling: Optional[bool] = Form(False),
     upscaling_model_path: Optional[str] = Form(None),
     upscaling_scale: Optional[int] = Form(4),
@@ -394,6 +526,11 @@ async def edits(
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
+    if mask is not None and server_args.pipeline_class_name == "BagelEditPipeline":
+        raise HTTPException(
+            status_code=400,
+            detail="Image edit masks are not supported by the current endpoint",
+        )
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
     urls = url or url_array
@@ -428,8 +565,9 @@ async def edits(
             )
 
         ext = choose_output_image_ext(output_format, background)
-        sampling = build_sampling_params(
+        sampling = _build_image_sampling_params(
             request_id,
+            enable_taylorseer=enable_taylorseer,
             prompt=prompt,
             size=size,
             num_outputs_per_prompt=max(1, min(int(n or 1), 10)),

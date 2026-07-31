@@ -1,14 +1,17 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-import asyncio
 import inspect
+import ipaddress
 import json
 import os
 import shutil
+import socket
 import tempfile
 import time
 from contextlib import contextmanager
 from typing import Any, Generator, List, Optional, Union
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
+import anyio
 import httpx
 from fastapi import HTTPException, UploadFile
 
@@ -52,6 +55,30 @@ logger = init_logger(__name__)
 OUTPUT_QUALITY_MAPPER = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
 DEFAULT_FPS = 24
 DEFAULT_VIDEO_SECONDS = 4
+_MAX_IMAGE_INPUT_BYTES = 20 * 1024 * 1024
+_MAX_IMAGE_REDIRECTS = 5
+_REMOTE_IMAGE_TIMEOUT = httpx.Timeout(
+    connect=5.0,
+    read=10.0,
+    write=10.0,
+    pool=5.0,
+)
+_REMOTE_IMAGE_CONTENT_TYPES = {
+    "image/bmp": ".bmp",
+    "image/gif": ".gif",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+
+
+class ImageURLValidationError(ValueError):
+    """Raised when an image URL violates the public input policy."""
+
+
+class ImageDownloadError(RuntimeError):
+    """Raised when an allowed remote image cannot be downloaded."""
 
 
 def _bad_request(message: str) -> HTTPException:
@@ -230,41 +257,191 @@ async def _maybe_url_image(
         return None
 
     if img_url.lower().startswith(("http://", "https://")):
-        # Only bypass persistence when the caller explicitly disables input saves.
-        # Otherwise keep the prefetch outside the measured server stages.
+        if prefer_remote_source:
+            await _validate_remote_image_url(img_url)
+            return img_url
+        return await _save_url_image_to_path(img_url, target_path)
+    elif img_url.startswith("data:image/"):
         if prefer_remote_source:
             return img_url
-        # download image from URL and persist on disk
-        input_path = await _save_url_image_to_path(img_url, target_path)
-        return input_path
-    elif img_url.startswith("data:image"):
-        if prefer_remote_source:
-            return img_url
-        # encode image base64 url and persist on disk
-        input_path = save_base64_image_to_path(img_url, target_path)
-        return input_path
+        return save_base64_image_to_path(
+            img_url,
+            target_path,
+            max_bytes=_MAX_IMAGE_INPUT_BYTES,
+        )
     else:
         raise ValueError("Unsupported image url format")
 
 
-async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
-    """Download image from URL and save to target path."""
+async def _resolve_hostname_addresses(host: str, port: int) -> tuple[str, ...]:
+    def resolve() -> tuple[str, ...]:
+        records = socket.getaddrinfo(
+            host,
+            port,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+        )
+        return tuple({record[4][0] for record in records})
 
-    def _is_retryable_download_error(error: Exception) -> bool:
-        if isinstance(error, httpx.HTTPStatusError):
-            status_code = error.response.status_code
-            # Retry on rate limit and transient server-side failures.
-            return status_code == 429 or 500 <= status_code < 600
-        # Retry on transient network/protocol issues.
-        return isinstance(
-            error,
-            (
-                httpx.TimeoutException,
-                httpx.NetworkError,
-                httpx.RemoteProtocolError,
-            ),
+    return await anyio.to_thread.run_sync(resolve)
+
+
+async def _validate_remote_image_url(image_url: str) -> str:
+    try:
+        parsed = urlsplit(image_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ImageURLValidationError("Image URL is malformed") from exc
+
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ImageURLValidationError("Image URL must use http or https")
+    if parsed.username is not None or parsed.password is not None:
+        raise ImageURLValidationError("Image URL must not contain credentials")
+
+    host = parsed.hostname
+    if not host:
+        raise ImageURLValidationError("Image URL must include a hostname")
+    if "%" in host:
+        raise ImageURLValidationError("Image URL must not contain an IPv6 zone ID")
+
+    try:
+        literal_address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            addresses = await _resolve_hostname_addresses(
+                host,
+                port or (443 if scheme == "https" else 80),
+            )
+        except OSError as exc:
+            raise ImageURLValidationError(
+                "Image URL hostname could not be resolved"
+            ) from exc
+        if not addresses:
+            raise ImageURLValidationError("Image URL hostname could not be resolved")
+    else:
+        addresses = (str(literal_address),)
+
+    for address in addresses:
+        try:
+            resolved_address = ipaddress.ip_address(address.split("%", 1)[0])
+        except ValueError as exc:
+            raise ImageURLValidationError(
+                "Image URL hostname resolved to an invalid address"
+            ) from exc
+        if not resolved_address.is_global:
+            raise ImageURLValidationError(
+                "Image URL must resolve only to public IP addresses"
+            )
+
+    return image_url
+
+
+def _image_url_for_log(image_url: str) -> str:
+    parsed = urlsplit(image_url)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def _remote_image_extension(image_url: str, content_type_header: str) -> str:
+    content_type = content_type_header.split(";", 1)[0].strip().lower()
+    if content_type in _REMOTE_IMAGE_CONTENT_TYPES:
+        return _REMOTE_IMAGE_CONTENT_TYPES[content_type]
+
+    url_ext = os.path.splitext(urlsplit(image_url).path)[1].lower()
+    if url_ext == ".jpeg":
+        url_ext = ".jpg"
+    if content_type == "application/octet-stream" and url_ext in {
+        ".bmp",
+        ".gif",
+        ".jpg",
+        ".png",
+        ".webp",
+    }:
+        return url_ext
+
+    raise ImageURLValidationError(
+        f"Remote image has unsupported Content-Type: {content_type or 'missing'}"
+    )
+
+
+def _validate_remote_image_content_length(response: httpx.Response) -> None:
+    raw_content_length = response.headers.get("content-length")
+    if raw_content_length is None:
+        return
+    try:
+        content_length = int(raw_content_length)
+    except ValueError as exc:
+        raise ImageURLValidationError(
+            "Remote image has an invalid Content-Length"
+        ) from exc
+    if content_length < 0:
+        raise ImageURLValidationError("Remote image has an invalid Content-Length")
+    if content_length > _MAX_IMAGE_INPUT_BYTES:
+        raise ImageURLValidationError(
+            f"Remote image exceeds the {_MAX_IMAGE_INPUT_BYTES}-byte limit"
         )
 
+
+async def _download_remote_image(
+    client: httpx.AsyncClient,
+    image_url: str,
+) -> tuple[bytes, str]:
+    current_url = image_url
+    redirect_statuses = {301, 302, 303, 307, 308}
+
+    for redirect_count in range(_MAX_IMAGE_REDIRECTS + 1):
+        await _validate_remote_image_url(current_url)
+        async with client.stream("GET", current_url) as response:
+            if response.status_code in redirect_statuses:
+                location = response.headers.get("location")
+                if not location:
+                    raise ImageURLValidationError(
+                        "Remote image redirect is missing Location"
+                    )
+                if redirect_count == _MAX_IMAGE_REDIRECTS:
+                    raise ImageURLValidationError(
+                        f"Remote image exceeds {_MAX_IMAGE_REDIRECTS} redirects"
+                    )
+                current_url = urljoin(current_url, location)
+                continue
+
+            response.raise_for_status()
+            extension = _remote_image_extension(
+                current_url,
+                response.headers.get("content-type", ""),
+            )
+            _validate_remote_image_content_length(response)
+
+            content = bytearray()
+            async for chunk in response.aiter_bytes():
+                content.extend(chunk)
+                if len(content) > _MAX_IMAGE_INPUT_BYTES:
+                    raise ImageURLValidationError(
+                        f"Remote image exceeds the {_MAX_IMAGE_INPUT_BYTES}-byte limit"
+                    )
+            if not content:
+                raise ImageURLValidationError("Remote image response is empty")
+            return bytes(content), extension
+
+    raise AssertionError("redirect loop terminated without a result")
+
+
+def _is_retryable_download_error(error: Exception) -> bool:
+    if isinstance(error, httpx.HTTPStatusError):
+        status_code = error.response.status_code
+        return status_code == 429 or 500 <= status_code < 600
+    return isinstance(
+        error,
+        (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+        ),
+    )
+
+
+async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
+    """Download a bounded public image URL to *target_path*."""
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     max_attempts = 3
@@ -272,70 +449,47 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
     last_error: Exception | None = None
 
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            follow_redirects=False,
+            timeout=_REMOTE_IMAGE_TIMEOUT,
+            trust_env=False,
+        ) as client:
             for attempt in range(1, max_attempts + 1):
                 try:
-                    response = await client.get(image_url, timeout=10.0)
-                    response.raise_for_status()
-
-                    # Determine file extension from content type or URL after downloading
-                    if not os.path.splitext(target_path)[1]:
-                        content_type = response.headers.get("content-type", "").lower()
-
-                        url_path = image_url.split("?")[0]
-                        _, url_ext = os.path.splitext(url_path)
-                        url_ext = url_ext.lower()
-
-                        if url_ext in {
-                            ".jpg",
-                            ".jpeg",
-                            ".png",
-                            ".webp",
-                            ".gif",
-                            ".bmp",
-                        }:
-                            ext = ".jpg" if url_ext == ".jpeg" else url_ext
-                        elif content_type.startswith("image/"):
-                            if "jpeg" in content_type or "jpg" in content_type:
-                                ext = ".jpg"
-                            elif "png" in content_type:
-                                ext = ".png"
-                            elif "webp" in content_type:
-                                ext = ".webp"
-                            else:
-                                ext = ".jpg"  # Default to jpg
-                        elif content_type == "application/octet-stream":
-                            # for octet-stream, if we couldn't get it from URL, default to jpg
-                            ext = ".jpg"
-                        else:
-                            raise ValueError(
-                                f"URL does not point to an image. Content-Type: {content_type}"
-                            )
-                        target_path = f"{target_path}{ext}"
-
-                    with open(target_path, "wb") as f:
-                        f.write(response.content)
-
-                    return target_path
-                except Exception as e:
-                    last_error = e
-                    if attempt == max_attempts or not _is_retryable_download_error(e):
+                    content, extension = await _download_remote_image(client, image_url)
+                    output_path = target_path
+                    if not os.path.splitext(output_path)[1]:
+                        output_path = f"{output_path}{extension}"
+                    with open(output_path, "wb") as file:
+                        file.write(content)
+                    return output_path
+                except ImageURLValidationError:
+                    raise
+                except Exception as error:
+                    last_error = error
+                    if attempt == max_attempts or not _is_retryable_download_error(
+                        error
+                    ):
                         raise
                     wait_s = backoff_seconds * (2 ** (attempt - 1))
                     logger.warning(
-                        "Retrying image download (%s/%s) for %s after %.1fs due to: %s",
+                        "Retrying image download (%s/%s) for %s after %.1fs due to %s",
                         attempt,
                         max_attempts,
-                        image_url,
+                        _image_url_for_log(image_url),
                         wait_s,
-                        e,
+                        type(error).__name__,
                     )
-                    await asyncio.sleep(wait_s)
-    except Exception as e:
-        final_error = last_error or e
-        raise Exception(
-            f"Failed to download image from URL {image_url}: {str(final_error)}"
-        )
+                    await anyio.sleep(wait_s)
+    except ImageURLValidationError:
+        raise
+    except Exception as error:
+        final_error = last_error or error
+        if isinstance(final_error, httpx.HTTPStatusError):
+            reason = f"HTTP {final_error.response.status_code}"
+        else:
+            reason = type(final_error).__name__
+        raise ImageDownloadError(f"Remote image download failed: {reason}") from error
 
 
 async def process_generation_batch(
@@ -350,6 +504,7 @@ async def process_generation_batch(
             result.output is None
             and result.output_file_paths is None
             and result.raw_frame_batches is None
+            and result.text_outputs is None
         ):
             error_msg = result.error or "Unknown error"
             raise RuntimeError(
@@ -381,9 +536,10 @@ async def process_generation_batch(
 
     total_time = time.perf_counter() - total_start_time
     if get_global_server_args().batching_max_size > 1:
+        completed_outputs = len(result.text_outputs or save_file_path_list)
         log_batch_completion(
             logger,
-            len(save_file_path_list),
+            completed_outputs,
             total_time,
         )
 

@@ -7,6 +7,8 @@ Each collected request prints a performance log before validation.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import queue
@@ -36,9 +38,11 @@ from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerContext,
     ServerManager,
     get_generate_fn,
+    parse_dimensions,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
+    DiffusionSamplingParams,
     DiffusionTestCase,
     PerformanceSummary,
     ScenarioConfig,
@@ -51,6 +55,7 @@ from sglang.multimodal_gen.test.test_utils import (
     _get_consistency_gt_dir,
     action_gt_exists,
     compare_with_gt,
+    detect_image_format,
     extract_key_frames_from_video,
     get_action_consistency_gt_candidates,
     get_action_consistency_gt_remote_files,
@@ -64,6 +69,7 @@ from sglang.multimodal_gen.test.test_utils import (
     load_action_consistency_gt,
     load_consistency_gt,
     save_consistency_failure_artifact,
+    validate_image,
     wait_for_req_perf_record,
 )
 
@@ -80,6 +86,15 @@ _SERVER_EXIT_POLL_INTERVAL_SECS = float(
 )
 _CONTROL_API_TIMEOUT_SECS = float(
     os.environ.get("SGLANG_TEST_CONTROL_API_TIMEOUT_SECS", "300")
+)
+_DYNAMIC_BATCH_LOG_TIMEOUT_SECS = float(
+    os.environ.get("SGLANG_TEST_DYNAMIC_BATCH_LOG_TIMEOUT_SECS", "10")
+)
+_DYNAMIC_BATCH_REQUEST_TIMEOUT_SECS = float(
+    os.environ.get("SGLANG_TEST_DYNAMIC_BATCH_REQUEST_TIMEOUT_SECS", "120")
+)
+_DYNAMIC_BATCH_THREAD_JOIN_TIMEOUT_SECS = float(
+    os.environ.get("SGLANG_TEST_DYNAMIC_BATCH_THREAD_JOIN_TIMEOUT_SECS", "5")
 )
 _SERVER_FATAL_LOG_PATTERNS = (
     "terminate called after throwing an instance of",
@@ -299,14 +314,367 @@ class DiffusionServerBase:
         """Capture pytest config for use in teardown_class."""
         self.__class__._pytest_config = request.config
 
-    def _client(self, ctx: ServerContext) -> OpenAI:
-        """Get OpenAI client for the server."""
+    def _client(
+        self,
+        ctx: ServerContext,
+        *,
+        timeout: float | None = None,
+    ) -> OpenAI:
+        """Get an OpenAI client for the server.
+
+        Args:
+            ctx: Running server context whose API should receive requests.
+            timeout: Optional per-request timeout in seconds.
+
+        Returns:
+            Configured OpenAI client with retries disabled.
+        """
         return OpenAI(
             api_key="sglang-anything",
             base_url=f"http://localhost:{ctx.port}/v1",
-            timeout=_OPENAI_REQUEST_TIMEOUT_SECS,
+            timeout=(_OPENAI_REQUEST_TIMEOUT_SECS if timeout is None else timeout),
             max_retries=0,
         )
+
+    def _test_chat_completion_smoke(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+    ) -> None:
+        """Validate a text-generating diffusion server through the Chat API.
+
+        Args:
+            ctx: Running server context for the test case.
+            case: Image-to-text test case with one prompt and one image URL.
+
+        Raises:
+            AssertionError: If the request inputs or response contract are invalid.
+        """
+        sampling_params = case.sampling_params
+        assert sampling_params is not None
+        prompt = sampling_params.prompt
+        image_url = sampling_params.image_path
+        assert (
+            isinstance(prompt, str) and prompt.strip()
+        ), f"{case.id}: chat smoke requires a non-empty prompt"
+        assert (
+            isinstance(image_url, str) and image_url.strip()
+        ), f"{case.id}: chat smoke requires one image URL"
+
+        def generate_fn(
+            case_id: str,
+            client: openai.Client,
+        ) -> tuple[str, bytes]:
+            response = client.chat.completions.create(
+                model=case.server_args.model_path,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": image_url},
+                            },
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ],
+                max_completion_tokens=64,
+                temperature=0,
+            )
+
+            assert (
+                isinstance(response.id, str) and response.id
+            ), f"{case_id}: chat completion must return a request id"
+            assert (
+                len(response.choices) == 1
+            ), f"{case_id}: expected exactly one chat completion choice"
+            choice = response.choices[0]
+            content = choice.message.content
+            assert (
+                isinstance(content, str) and content.strip()
+            ), f"{case_id}: assistant content must be non-empty text"
+            assert choice.finish_reason in (
+                "stop",
+                "length",
+            ), f"{case_id}: unsupported finish reason {choice.finish_reason!r}"
+
+            usage = response.usage
+            assert usage is not None, f"{case_id}: token usage must be present"
+            assert (
+                usage.prompt_tokens > 0
+            ), f"{case_id}: prompt token count must be positive"
+            assert (
+                usage.completion_tokens > 0
+            ), f"{case_id}: completion token count must be positive"
+            assert usage.total_tokens == (
+                usage.prompt_tokens + usage.completion_tokens
+            ), f"{case_id}: total token count must equal prompt plus completion"
+            return response.id, content.encode("utf-8")
+
+        client = self._client(ctx)
+        self._run_generation_with_server_watchdog(
+            ctx,
+            case.id,
+            generate_fn,
+            client,
+        )
+
+    def _test_dynamic_batching_smoke(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+    ) -> None:
+        """Prove that two independent image requests run as one dynamic batch.
+
+        Args:
+            ctx: Running server context for the test case.
+            case: Image generation case with two compatible batching requests.
+
+        Raises:
+            AssertionError: If responses, output images, or batching evidence are invalid.
+        """
+        requests_to_batch = case.dynamic_batching_requests
+        assert (
+            len(requests_to_batch) == 2
+        ), f"{case.id}: dynamic batching smoke requires exactly two requests"
+
+        def generate_image_response(
+            index: int,
+            sampling_params: DiffusionSamplingParams,
+            client: openai.Client,
+        ) -> tuple[str, bytes]:
+            """Issue one Images API request and validate its response contract."""
+            prompt = sampling_params.prompt
+            assert (
+                isinstance(prompt, str) and prompt.strip()
+            ), f"{case.id}: dynamic batching request {index} needs a prompt"
+            response = client.images.with_raw_response.generate(
+                model=case.server_args.model_path,
+                prompt=prompt,
+                n=1,
+                size=sampling_params.output_size,
+                response_format="b64_json",
+                output_format=sampling_params.output_format,
+                extra_body=(
+                    dict(sampling_params.extras) if sampling_params.extras else None
+                ),
+            )
+            parsed = response.parse()
+            assert (
+                isinstance(parsed.id, str) and parsed.id
+            ), f"{case.id}: dynamic batching response {index} needs an id"
+            assert (
+                len(parsed.data) == 1
+            ), f"{case.id}: dynamic batching response {index} must contain one image"
+            image_b64 = parsed.data[0].b64_json
+            assert isinstance(
+                image_b64, str
+            ), f"{case.id}: dynamic batching response {index} needs base64 image data"
+            validate_image(image_b64)
+            image_bytes = base64.b64decode(image_b64)
+            requested_format = sampling_params.output_format
+            if requested_format is not None:
+                normalized_format = (
+                    "jpeg"
+                    if requested_format.lower() == "jpg"
+                    else requested_format.lower()
+                )
+                assert detect_image_format(image_bytes) == normalized_format, (
+                    f"{case.id}: dynamic batching response {index} ignored requested "
+                    f"output format {requested_format!r}"
+                )
+            image_array = image_bytes_to_numpy(image_bytes)
+            expected_width, expected_height = parse_dimensions(
+                sampling_params.output_size
+            )
+            assert expected_width is not None and expected_height is not None
+            assert image_array.shape[:2] == (expected_height, expected_width), (
+                f"{case.id}: dynamic batching response {index} has shape "
+                f"{image_array.shape[:2]}, expected "
+                f"{(expected_height, expected_width)}"
+            )
+            return parsed.id, image_bytes
+
+        def image_distance(first: bytes, second: bytes) -> float:
+            """Return mean absolute RGB pixel distance for request identity checks."""
+            first_array = image_bytes_to_numpy(first).astype("int16")
+            second_array = image_bytes_to_numpy(second).astype("int16")
+            assert first_array.shape == second_array.shape, (
+                f"{case.id}: reference and batched outputs have different shapes: "
+                f"{first_array.shape} vs {second_array.shape}"
+            )
+            return float(abs(first_array - second_array).mean())
+
+        def read_new_server_log(log_offset: int) -> str:
+            """Read server log bytes written after the singleton references."""
+            with ctx.stdout_file.open("rb") as log_file:
+                log_file.seek(log_offset)
+                return log_file.read().decode("utf-8", errors="ignore")
+
+        client_count = len(requests_to_batch) * 2
+        clients = [
+            self._client(ctx, timeout=_DYNAMIC_BATCH_REQUEST_TIMEOUT_SECS)
+            for _ in range(client_count)
+        ]
+        reference_clients = clients[: len(requests_to_batch)]
+        batch_clients = clients[len(requests_to_batch) :]
+        threads: list[threading.Thread] = []
+        start_barrier: threading.Barrier | None = None
+
+        try:
+            # Singleton controls make a swapped request/output mapping observable
+            # without requiring numerically identical batch and singleton kernels.
+            references = [
+                generate_image_response(index, params, reference_clients[index])[1]
+                for index, params in enumerate(requests_to_batch)
+            ]
+
+            # Ignore singleton dispatches and only inspect the concurrent requests.
+            log_offset = ctx.stdout_file.stat().st_size
+            start_barrier = threading.Barrier(len(requests_to_batch))
+            result_queue: queue.Queue[tuple[int, tuple[str, bytes] | BaseException]] = (
+                queue.Queue(maxsize=len(requests_to_batch))
+            )
+
+            def send_request(
+                index: int,
+                sampling_params: DiffusionSamplingParams,
+                client: openai.Client,
+            ) -> None:
+                try:
+                    start_barrier.wait(timeout=10)
+                    result_queue.put(
+                        (
+                            index,
+                            generate_image_response(index, sampling_params, client),
+                        )
+                    )
+                except BaseException as exc:
+                    result_queue.put((index, exc))
+
+            threads = [
+                threading.Thread(
+                    target=send_request,
+                    args=(index, sampling_params, batch_clients[index]),
+                    name=f"dynamic-batching-{case.id}-{index}",
+                    daemon=True,
+                )
+                for index, sampling_params in enumerate(requests_to_batch)
+            ]
+
+            # Release both HTTP requests together so they share one admission window.
+            for thread in threads:
+                thread.start()
+
+            # Watch the server while collecting both responses in request order.
+            results: dict[int, tuple[str, bytes]] = {}
+            request_deadline = time.monotonic() + _DYNAMIC_BATCH_REQUEST_TIMEOUT_SECS
+            while len(results) < len(requests_to_batch):
+                remaining = request_deadline - time.monotonic()
+                if remaining <= 0:
+                    pytest.fail(f"{case.id}: dynamic batching requests timed out")
+                try:
+                    index, payload = result_queue.get(
+                        timeout=min(_SERVER_EXIT_POLL_INTERVAL_SECS, remaining)
+                    )
+                except queue.Empty:
+                    self._fail_if_server_stopped_or_crashed(ctx, case.id)
+                    continue
+                if isinstance(payload, BaseException):
+                    self._fail_if_server_stopped_or_crashed(ctx, case.id)
+                    raise payload
+                results[index] = payload
+
+            ordered_results = [results[index] for index in range(len(results))]
+            request_ids = [request_id for request_id, _ in ordered_results]
+            assert len(set(request_ids)) == len(
+                request_ids
+            ), f"{case.id}: dynamic batching response ids must be distinct"
+            image_hashes = {
+                hashlib.sha256(image_bytes).hexdigest()
+                for _, image_bytes in ordered_results
+            }
+            assert len(image_hashes) == len(
+                ordered_results
+            ), f"{case.id}: dynamic batching outputs must be distinct"
+
+            # Each batched output must match its own prompt/seed control more closely
+            # than the other request's control, catching swapped split/routing results.
+            identity_distances: list[tuple[float, float]] = []
+            for index, (_, image_bytes) in enumerate(ordered_results):
+                own_distance = image_distance(image_bytes, references[index])
+                cross_distance = image_distance(image_bytes, references[1 - index])
+                identity_distances.append((own_distance, cross_distance))
+                assert own_distance < cross_distance, (
+                    f"{case.id}: dynamic batching response {index} maps to the wrong "
+                    f"request (own MAE={own_distance:.4f}, "
+                    f"cross MAE={cross_distance:.4f})"
+                )
+
+            dispatch_marker = "Dynamic batch dispatch: size=2/2, user_max=2"
+            processed_marker = "Processed dynamic batch of 2/2 request(s)"
+            log_deadline = time.monotonic() + _DYNAMIC_BATCH_LOG_TIMEOUT_SECS
+
+            # Require both scheduler admission and post-forward split evidence.
+            while True:
+                log_slice = read_new_server_log(log_offset)
+                if "Dynamic batching failed" in log_slice:
+                    pytest.fail(
+                        f"{case.id}: server reported a dynamic batching failure:\n"
+                        f"{log_slice}"
+                    )
+                if dispatch_marker in log_slice and processed_marker in log_slice:
+                    break
+                self._fail_if_server_stopped_or_crashed(ctx, case.id)
+                remaining = log_deadline - time.monotonic()
+                if remaining <= 0:
+                    # One final read closes the race where markers arrive after the
+                    # previous poll but before the timeout boundary.
+                    log_slice = read_new_server_log(log_offset)
+                    if dispatch_marker in log_slice and processed_marker in log_slice:
+                        break
+                    missing_markers = [
+                        marker
+                        for marker in (dispatch_marker, processed_marker)
+                        if marker not in log_slice
+                    ]
+                    pytest.fail(
+                        f"{case.id}: missing dynamic batching server evidence: "
+                        + ", ".join(missing_markers)
+                    )
+                time.sleep(min(0.1, remaining))
+
+            logger.info(
+                "[Dynamic batching] %s merged two requests with output hashes %s "
+                "and identity distances %s",
+                case.id,
+                sorted(image_hashes),
+                identity_distances,
+            )
+        finally:
+            # Closing the clients interrupts in-flight HTTP reads on failure. Join
+            # every worker before fixture teardown so no request can outlive the test.
+            if start_barrier is not None:
+                start_barrier.abort()
+            close_errors: list[str] = []
+            for client in clients:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception as exc:
+                        close_errors.append(str(exc))
+            for thread in threads:
+                thread.join(timeout=_DYNAMIC_BATCH_THREAD_JOIN_TIMEOUT_SECS)
+            live_threads = [thread.name for thread in threads if thread.is_alive()]
+            assert not live_threads, (
+                f"{case.id}: dynamic batching request threads did not exit after "
+                f"client close: {live_threads}"
+            )
+            assert (
+                not close_errors
+            ), f"{case.id}: failed to close dynamic batching clients: {close_errors}"
 
     def _fail_if_server_stopped_or_crashed(
         self, ctx: ServerContext, case_id: str
@@ -1332,6 +1700,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         case: DiffusionTestCase,
         diffusion_server: ServerContext,
     ):
+        task_type = get_model_task_type_for_server_args(case.server_args)
+        if task_type.is_text_gen():
+            # Text generation has no media payload or diffusion perf record.
+            # Exercise its native OpenAI endpoint and stop before image/video checks.
+            self._test_chat_completion_smoke(diffusion_server, case)
+            return
+
         # Check if we're in GT generation mode
         is_gt_gen_mode = os.environ.get("SGLANG_GEN_GT", "0") == "1"
 
@@ -1343,6 +1718,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             model_path=case.server_args.model_path,
             modality=case.server_args.modality,
             sampling_params=case.sampling_params,
+            run_revised_prompt_check=case.run_revised_prompt_check,
         )
 
         # Single generation - output is reused for both validations
@@ -1460,3 +1836,8 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 + "\n\n".join(formatted_failures),
                 pytrace=False,
             )
+
+        # Dynamic batching launches concurrent HTTP requests, so run it last and
+        # let any failure immediately hand control to the server fixture teardown.
+        if case.dynamic_batching_requests:
+            self._test_dynamic_batching_smoke(diffusion_server, case)
