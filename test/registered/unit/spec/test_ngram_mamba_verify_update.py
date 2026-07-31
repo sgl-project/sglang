@@ -371,8 +371,7 @@ class TestConvWindowDedupLayout(CustomTestCase):
 class TestMtpVerifyHookSignature(CustomTestCase):
     """Every ``update_mamba_state_after_mtp_verify`` override must accept the full
     keyword call the spec workers make, or it raises TypeError at verify time on
-    whatever hardware it serves (how the Ascend override was missed when
-    ``req_pool_indices`` was added).
+    whatever hardware it serves.
 
     Parses sources rather than importing: the accelerator backends defining
     overrides are exactly the ones whose deps are absent on most hosts, so an

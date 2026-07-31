@@ -1113,9 +1113,9 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         """Update mamba states after MTP verify via a fused gather-scatter kernel.
 
-        ``req_pool_indices`` is for implementations that must re-derive the state
-        slot ids rather than reuse this step's ``forward_metadata`` (see Inkling's
-        override); the scatter below reads the metadata it just planned.
+        ``req_pool_indices`` serves implementations that must re-derive the state
+        slot ids instead of reusing this step's ``forward_metadata``; the scatter
+        below reads the metadata it just planned.
         """
         del req_pool_indices
         request_number = last_correct_step_indices.shape[0]

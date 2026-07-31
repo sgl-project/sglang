@@ -61,9 +61,8 @@ class DraftBackendFactory:
         if self.speculative_num_steps <= 1:
             return None
 
-        # This returns a per-step CONTAINER, not an AttentionBackend, so
-        # attn_backend_wrapper_for_draft_extend cannot give it a conv sidecar; a
-        # draft needing one would fail deep in the first inner forward.
+        # Returns a per-step CONTAINER, not an AttentionBackend, so
+        # attn_backend_wrapper_for_draft_extend cannot give it a conv sidecar.
         _assert_draft_needs_no_conv_sidecar(self.draft_model_runner)
 
         backend_map = {

@@ -20,17 +20,16 @@ through ``forward_decode`` / ``forward_extend``.
 
 On top of what :class:`ShortConvAttnBackend` owns, Inkling's kernels take a
 precomputed ``cache_mask`` / ``safe_idx`` / ``cu`` / ``si`` set plus the extend
-``track_conv_indices``. All step-global, so it is resolved once per step instead of
-once per conv module (a decoder layer holds FOUR of them).
+``track_conv_indices``. All of it is step-global, so it is resolved once per step
+and shared by every conv module in the step (a decoder layer holds four).
 
-Hook split, which is a decode-latency cliff rather than a style choice:
-``init_forward_metadata_in_graph`` is *recorded* into the decode / target-verify /
-draft-extend graphs, so prep there replays for free -- doing it out of graph
-measured ~7% off decode throughput. ``init_forward_metadata_out_graph`` takes only
-what a phase cannot record: full-cuda-graph prefill (no in-graph hook) and the
-unified pool's slot translate. Prep is therefore no longer inside the graph, so
-every tensor a captured kernel reads lives in a graph-static buffer refilled in
-place.
+The hook split is a decode-latency decision. ``init_forward_metadata_in_graph`` is
+*recorded* into the decode / target-verify / draft-extend graphs, so prep placed
+there replays for free; out of graph it lands on the per-step CPU path that a
+captured graph exists to avoid. ``init_forward_metadata_out_graph`` therefore takes
+only what a phase cannot record: full-cuda-graph prefill (no in-graph hook) and the
+unified pool's slot translate. Prep consequently sits outside the graph, so every
+tensor a captured kernel reads lives in a graph-static buffer refilled in place.
 """
 
 from __future__ import annotations
@@ -323,8 +322,8 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
 
         # Captured kernels bake their token extent at CAPTURE (the prefill bucket)
         # while replay reports only the live count, so fill the WHOLE seq-index
-        # buffer -- the kernel clamps the tail to B - 1, as the old in-graph prep
-        # did. target_verify's B * draft_token_num is exact either way.
+        # buffer; the kernel clamps the tail to B - 1. target_verify's
+        # B * draft_token_num is exact either way.
         fill_T = T
         out = None
         if on_graph_path:
@@ -479,8 +478,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
 
         Slot ids come from ``req_pool_indices``, not the per-step
         ``self._cache_indices``: this runs after the forward context exits, so that
-        buffer may already belong to a later forward -- trusting it is what makes
-        the generic mamba commit fail here (``dst=15 vs step=16``).
+        buffer may already belong to a later forward.
         """
         pool = self.req_to_token_pool
         scatter_mamba_states_after_mtp_verify(

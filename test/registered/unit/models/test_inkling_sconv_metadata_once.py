@@ -1,11 +1,11 @@
 """Inkling's short-conv metadata must be resolved exactly ONCE per forward step.
 
-A decoder layer holds FOUR ``ShortConvolution`` modules, so the pre-backend
-"layer 0 owns the metadata" rule recomputed the whole set four times per step.
-Pinned here: one resolution per step however many modules ask, every module gets
-the *same* tensors, and the graph-path destinations stay address-stable across
-steps -- including across a later ``init_cuda_graph_state``, where reallocating
-would move an address an already-captured prefill graph reads.
+A decoder layer holds FOUR ``ShortConvolution`` modules, and per-layer ownership
+would recompute the whole set once per module. Pinned here: one resolution per step
+however many modules ask, every module gets the *same* tensors, and the graph-path
+destinations stay address-stable across steps -- including across a later
+``init_cuda_graph_state``, where reallocating would move an address an
+already-captured prefill graph reads.
 """
 
 import unittest
@@ -264,8 +264,9 @@ class TestInklingSconvMetadataOnce(CustomTestCase):
 
 class TestInklingMtpVerifyCommit(CustomTestCase):
     """The commit runs after the forward context exits, so the per-step slot buffer
-    may already belong to a later forward -- the generic mamba path sources slot ids
-    from ``forward_metadata`` and died on the length mismatch (dst=15 vs step=16).
+    may already belong to a later forward. Sourcing slot ids from
+    ``forward_metadata`` (as the generic mamba path does) therefore mismatches the
+    verify batch; they must come from the passed ``req_pool_indices``.
     """
 
     @classmethod
