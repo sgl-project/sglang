@@ -111,6 +111,10 @@ class MambaPoolHost(HostKVCache):
 
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
+        # This pool holds per-request state rather than token-interleaved KV, so
+        # DCP never widens it; it sets its own fields instead of going through
+        # HostKVCache.__init__, so mirror the physical size explicitly.
+        self.logical_size = self.size
 
         if self.size <= device_pool.size:
             logger.warning(
@@ -650,6 +654,9 @@ class LogicalHostPool:
                 f"got size={size}, page_size={page_size}"
             )
         self.size = size
+        # Stands in for a host pool (including as a group anchor), so it carries
+        # the same logical/physical capacity pair. DCP does not widen this path.
+        self.logical_size = size
         self.page_size = page_size
         self.device = "cpu"
         self.layout = layout
@@ -1528,6 +1535,10 @@ class HostPoolGroup:
         self.page_size = self.anchor_entry.host_pool.page_size
         self.device = self.anchor_entry.host_pool.device
         self.size = self.anchor_entry.host_pool.size
+        # Logical (DCP-widened) capacity travels with the physical one: metrics
+        # and any other slot accounting read it off whichever object stands in
+        # for the host pool, and this group is one of them.
+        self.logical_size = self.anchor_entry.host_pool.logical_size
         self.can_use_write_back_jit = all(
             getattr(entry.host_pool, "can_use_write_back_jit", False)
             for entry in entries
