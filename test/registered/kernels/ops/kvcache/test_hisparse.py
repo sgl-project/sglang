@@ -100,6 +100,7 @@ def _run_kernel(
     seq_lens_dtype: torch.dtype = torch.int32,
     req_pool_indices: torch.Tensor | None = None,
     num_real_reqs: int | None = None,
+    output_fill_value: int = -1,
 ) -> torch.Tensor:
     batch_size = top_k_tokens.shape[0]
     if req_pool_indices is None:
@@ -111,7 +112,7 @@ def _run_kernel(
     if num_real_reqs is None:
         num_real_reqs = batch_size
 
-    out = torch.full_like(top_k_tokens, -1)
+    out = torch.full_like(top_k_tokens, output_fill_value)
     load_cache_to_device_buffer_mla(
         top_k_tokens=top_k_tokens,
         device_buffer_tokens=device_buffer_tokens,
@@ -312,6 +313,19 @@ def test_load_cache_to_device_buffer_fast_path(seq_lens_dtype: torch.dtype) -> N
     assert torch.equal(device_buffer.cpu(), device_buffer_before.cpu())
 
 
+def test_load_cache_to_device_buffer_fast_path_overwrites_stale_output() -> None:
+    state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [4])
+
+    out = _run_kernel(
+        top_k_tokens=torch.tensor([[1, -1, 0, 0]], dtype=torch.int32, device=DEVICE),
+        seq_len=2,
+        output_fill_value=123456,
+        **state,
+    )
+
+    assert torch.equal(out.cpu(), torch.tensor([[7, -1, -1, -1]], dtype=torch.int32))
+
+
 def test_load_cache_to_device_buffer_hits_newest_and_updates_lru() -> None:
     state = _long_case()
 
@@ -427,6 +441,7 @@ def test_load_cache_to_device_buffer_batched_with_padding() -> None:
         ),
         seq_lens=torch.tensor([8, 3, 8], dtype=torch.int32, device=DEVICE),
         num_real_reqs=2,
+        output_fill_value=123456,
         **state,
     )
 

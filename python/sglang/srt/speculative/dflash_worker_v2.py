@@ -32,6 +32,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
@@ -48,6 +49,9 @@ from sglang.srt.speculative.draft_worker_common import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    SIMULATE_ACC_LEN,
+    SIMULATE_ACC_METHOD,
+    SIMULATE_ACC_TOKEN_MODE,
     GrammarTree,
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
@@ -1728,6 +1732,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         candidates = draft_tokens
         new_seq_lens = None
+        # Only the greedy branch sets target_predict; the simulated-acceptance
+        # override below checks for it.
+        target_predict = None
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
@@ -1810,6 +1817,34 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens.scatter_(
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
+
+        if SIMULATE_ACC_LEN > 0:
+            if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
+                raise ValueError(
+                    "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
+                    f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or "
+                    "'real-draft-token'."
+                )
+
+            if SIMULATE_ACC_TOKEN_MODE == "real-draft-token" and target_predict is None:
+                # The sampling-verify branch does not materialize the target argmax.
+                target_predict = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).view(bs, int(self.block_size))
+            apply_dflash_simulated_acceptance(
+                candidates=candidates,
+                target_predict=target_predict,
+                accept_len=accept_len,
+                commit_lens=commit_lens,
+                bonus=bonus,
+                out_tokens=out_tokens,
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_method=SIMULATE_ACC_METHOD,
+                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+            )
+            # The Triton path may have written new_seq_lens from the real
+            # accept_len; recompute it from the forced commit_lens.
+            new_seq_lens = None
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
