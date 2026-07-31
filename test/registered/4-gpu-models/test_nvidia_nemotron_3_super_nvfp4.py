@@ -42,7 +42,7 @@ DP_ATTENTION_EP_ARGS = [
     "flashinfer_cutedsl",
     "--mamba-full-memory-ratio",
     "5.0",
-    "--mamba-scheduler-strategy",
+    "--mamba-radix-cache-strategy",
     "extra_buffer",
     "--attention-backend",
     "trtllm_mha",
@@ -53,6 +53,13 @@ DP_ATTENTION_EP_ARGS = [
     "--max-prefill-tokens",
     "8192",
 ]
+
+# CuteDSL A2A rejects launch unless per-rank dispatch capacity * ep_size covers
+# the largest MoE forward, i.e. 8192 / ep 4 here.
+DP_ATTENTION_EP_ENV = {
+    "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "2048",
+    "SGLANG_FLASHINFER_WORKSPACE_SIZE": "1073741824",
+}
 
 MTP_ARGS = [
     "--speculative-algorithm",
@@ -139,15 +146,13 @@ class TestNvidiaNemotron3SuperNVFP4DPAttentionEP(CustomTestCase):
     def setUpClass(cls):
         cls.model = NEMOTRON_3_SUPER_NVFP4_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with (
-            envs.SGLANG_ENABLE_ASYNC_ASSERT.override(0),
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.override(1024 * 1024 * 1024),
-        ):
+        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(0):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=NEMOTRON_3_SUPER_NVFP4_ARGS + DP_ATTENTION_EP_ARGS,
+                env=DP_ATTENTION_EP_ENV,
             )
 
     @classmethod
