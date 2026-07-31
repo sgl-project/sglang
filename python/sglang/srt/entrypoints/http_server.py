@@ -271,17 +271,30 @@ async def lifespan(fast_api_app: FastAPI):
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
+        warmup_thread_target = fast_api_app.warmup_thread_target
         thread_label = "Tokenizer"
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
         warmup_thread_kwargs = dict(server_args=server_args)
+        warmup_thread_target = _wait_and_warmup
         thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
 
     # Apps built by `build_app` carry their own engine binding on
     # `app.state.global_state` (set by `init_app_state`); the module-level app
-    # relies on the process-global state set by `set_global_state`.
-    global_state = getattr(fast_api_app.state, "global_state", None) or _global_state
+    # relies on the process-global state set by `set_global_state`. Both
+    # attributes are read with a default because this lifespan can also be
+    # attached to an app that neither `build_app` nor this module created, and
+    # a Starlette `State` raises AttributeError for names that were never set.
+    global_state = getattr(fast_api_app.state, "global_state", None)
+    if global_state is None:
+        if getattr(fast_api_app.state, "built_by_build_app", False):
+            raise RuntimeError(
+                "This app was created by build_app but no engine was bound to "
+                "it. Call init_app_state(engine, app.state) before serving "
+                "the app."
+            )
+        global_state = _global_state
     if global_state is None:
         raise RuntimeError(
             "SGLang global state is not initialized. When embedding the app in "
@@ -413,7 +426,7 @@ async def lifespan(fast_api_app: FastAPI):
 
         # Execute the general warmup
         warmup_thread = threading.Thread(
-            target=_wait_and_warmup,
+            target=warmup_thread_target,
             kwargs=warmup_thread_kwargs,
         )
         warmup_thread.start()
@@ -437,6 +450,10 @@ app = FastAPI(
 # (`set_global_state`); apps built by `build_app` get a per-app binding via
 # `init_app_state`. `None` means "fall back to the process-global state".
 app.state.global_state = None
+# Apps created by `build_app` set this to True so the lifespan can refuse to
+# start them when no engine was bound, instead of silently falling back to the
+# process-global state.
+app.state.built_by_build_app = False
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -2081,7 +2098,10 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
-def _execute_server_warmup(server_args: ServerArgs):
+def _execute_server_warmup(
+    server_args: ServerArgs,
+    kill_process_on_failure: bool = True,
+):
     headers = {}
     url = server_args.url()
     if server_args.api_key:
@@ -2106,7 +2126,8 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     if not success:
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_process_tree(os.getpid())
+        if kill_process_on_failure:
+            kill_process_tree(os.getpid())
         return success
 
     model_info = res.json()
@@ -2226,7 +2247,8 @@ def _execute_server_warmup(server_args: ServerArgs):
     except Exception:
         last_traceback = get_exception_traceback()
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_process_tree(os.getpid())
+        if kill_process_on_failure:
+            kill_process_tree(os.getpid())
         return False
 
     return success
@@ -2367,6 +2389,7 @@ def _configure_single_tokenizer_app(
     *,
     server_args: ServerArgs,
     warmup_thread_kwargs: Dict,
+    warmup_thread_target: Callable = _wait_and_warmup,
 ) -> None:
     """Bind ``server_args`` to the app and add server-args-dependent middleware.
 
@@ -2379,6 +2402,7 @@ def _configure_single_tokenizer_app(
     fast_api_app.is_single_tokenizer_mode = True
     fast_api_app.server_args = server_args
     fast_api_app.warmup_thread_kwargs = warmup_thread_kwargs
+    fast_api_app.warmup_thread_target = warmup_thread_target
 
     # Add api key authorization
     # This is only supported in single tokenizer mode.
@@ -2401,11 +2425,33 @@ def _configure_single_tokenizer_app(
         )
 
 
-def build_app(server_args: ServerArgs) -> FastAPI:
+def _embedded_app_warmup(server_args: ServerArgs, run_http_warmup: bool) -> None:
+    """Warmup thread body for apps built by ``build_app``.
+
+    When ``run_http_warmup`` is False (the default for embedded apps), no HTTP
+    requests are sent and the engine is simply marked ready, exactly as if
+    ``skip_server_warmup`` were set. When it is True, the regular HTTP warmup
+    runs against ``server_args.host`` and ``server_args.port``. Unlike the
+    standalone server path, a warmup failure never kills the process, because
+    the process belongs to the external host that embeds the app.
+    """
+    if run_http_warmup and not server_args.skip_server_warmup:
+        if not _execute_server_warmup(server_args, kill_process_on_failure=False):
+            logger.error(
+                "Warmup of the embedded SGLang app failed. The engine was not "
+                "marked ready. The host process keeps running."
+            )
+            return
+    else:
+        _global_state.tokenizer_manager.server_status = ServerStatus.Up
+    logger.info("The server is fired up and ready to roll!")
+
+
+def build_app(server_args: ServerArgs, warmup: bool = False) -> FastAPI:
     """Build a fresh FastAPI app serving the SGLang HTTP API for an in-process engine.
 
-    Use this to embed SGLang's OpenAI-compatible server in an external ASGI
-    host (e.g. Ray Serve) without touching the module-level ``app``:
+    Use this to embed SGLang's OpenAI compatible server in an external ASGI
+    host (e.g. Ray Serve) without touching the module level ``app``:
 
     .. code-block:: python
 
@@ -2415,20 +2461,27 @@ def build_app(server_args: ServerArgs) -> FastAPI:
 
         engine = sglang.Engine(**engine_kwargs)
         app = build_app(engine.server_args)
-        init_app_state(engine, app.state, server_args=engine.server_args)
+        init_app_state(engine, app.state)
         uvicorn.run(app, host="0.0.0.0", port=30000)
 
     The returned app carries the same routes, exception handlers, and
     middleware configuration as the app served by ``launch_server`` (both are
     configured through ``_configure_single_tokenizer_app``). Notes:
 
-    - The host must run the ASGI lifespan: the serving handlers on
-      ``app.state`` are created at startup by ``lifespan``.
-    - The built-in warmup issues HTTP requests to ``server_args.host:port``;
-      hosts that do not listen there should run the engine with
-      ``skip_server_warmup=True``.
-    - Only single-tokenizer mode is supported; multi-tokenizer mode requires
-      the shared-memory bootstrap in ``launch_server``.
+    1. The host must run the ASGI lifespan: the serving handlers on
+       ``app.state`` are created at startup by ``lifespan``, and the lifespan
+       refuses to start when ``init_app_state`` was never called.
+    2. By default no warmup HTTP requests are sent; the engine is marked
+       ready as soon as the app starts. Passing ``warmup=True`` enables the
+       built in warmup, which sends HTTP requests carrying
+       ``server_args.api_key`` to ``server_args.host`` and
+       ``server_args.port``. Only enable it when the app is actually served
+       at that address.
+    3. The app installs a CORS policy that allows every origin with
+       credentials, the same as ``launch_server``. When the app is mounted
+       inside a host application, that policy applies to the mounted subtree.
+    4. Only single tokenizer mode is supported; multi tokenizer mode requires
+       the shared memory bootstrap in ``launch_server``.
     """
     if server_args.tokenizer_worker_num != 1:
         raise ValueError(
@@ -2445,6 +2498,7 @@ def build_app(server_args: ServerArgs) -> FastAPI:
         ),
     )
     fast_api_app.state.global_state = None
+    fast_api_app.state.built_by_build_app = True
     fast_api_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -2476,7 +2530,11 @@ def build_app(server_args: ServerArgs) -> FastAPI:
     _configure_single_tokenizer_app(
         fast_api_app,
         server_args=server_args,
-        warmup_thread_kwargs=dict(server_args=server_args),
+        warmup_thread_kwargs=dict(
+            server_args=server_args,
+            run_http_warmup=warmup,
+        ),
+        warmup_thread_target=_embedded_app_warmup,
     )
     return fast_api_app
 
@@ -2493,12 +2551,32 @@ def init_app_state(
     handlers) and publishes the same objects as the process-global state used
     by the native endpoints (``/generate``, ``/health``, ...).
 
+    ``server_args`` is optional and exists only for symmetry with similar
+    factory APIs. When given, it must equal ``engine.server_args``; the engine
+    is always bound with the arguments it was created with.
+
     Known limitation: because the native endpoints still read the
-    process-global state, one engine-bound app per process is supported. The
-    last ``init_app_state`` call wins for those endpoints.
+    process-global state, only one engine per process can be bound. Binding a
+    different engine raises instead of silently repointing the native
+    endpoints of already running apps.
     """
+    if server_args is not None and server_args != engine.server_args:
+        raise ValueError(
+            "server_args does not match engine.server_args. init_app_state "
+            "always binds the engine with the arguments the engine was "
+            "created with, so pass engine.server_args or omit the parameter."
+        )
     if server_args is None:
         server_args = engine.server_args
+    if (
+        _global_state is not None
+        and _global_state.tokenizer_manager is not engine.tokenizer_manager
+    ):
+        raise RuntimeError(
+            "A different engine is already bound in this process. The native "
+            "endpoints read one process wide engine binding, so only one "
+            "engine per process can serve SGLang apps."
+        )
     global_state = _GlobalState(
         tokenizer_manager=engine.tokenizer_manager,
         template_manager=engine.template_manager,
