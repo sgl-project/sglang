@@ -40,13 +40,18 @@ __device__ __forceinline__ void transfer_item_warp(
   const auto src = static_cast<const char*>(src_addr);
   auto dst = static_cast<char*>(dst_addr);
 
-  // Wide path: one 128-bit dwordx4 per lane instead of two 64-bit dwordx2.
-  // The source is usually pinned host DRAM, so every miss pays a round trip
-  // over the host interconnect; halving the load/store instruction count
-  // halves the serialized round trips per item and raises per-warp
-  // memory-level parallelism, which is what actually hides that latency.
-  // The CUDA branch below already issues 128-bit paired loads -- this brings
-  // ROCm to parity.
+  // Wide path: one 128-bit dwordx4 per lane instead of two 64-bit dwordx2,
+  // which halves the load/store instruction count and the number of serialized
+  // round trips per item. The source is usually pinned host DRAM, so those
+  // round trips are what the copy is actually paying for.
+  //
+  // Gated on item_size_bytes >= WARP_SIZE * 16, and this gate is load-bearing:
+  // a 16B-per-lane step only covers item_size_bytes/16 lanes, so below that
+  // threshold the wide path idles part of the wavefront while needing the same
+  // number of iterations as the 8B path. Measured on MI355X (gfx950, wave64)
+  // with 512B items, ungated widening was 14-22% SLOWER because 512/16 = 32
+  // lanes work instead of 512/8 = 64. At 1024B (= WARP_SIZE * 16) the whole
+  // wavefront stays busy and the item moves in a single instruction per lane.
   //
   // The load is non-temporal because these items are streamed in once; there
   // is no reuse to preserve and they should not evict resident lines from
@@ -54,7 +59,8 @@ __device__ __forceinline__ void transfer_item_warp(
   // device buffer that the attention kernel reads immediately afterwards.
   int64_t byte_pos = 0;
   const bool aligned_16b = ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 0xF) == 0;
-  if (aligned_16b) {
+  const bool wide_fills_wave = item_size_bytes >= static_cast<int64_t>(WARP_SIZE) * 16;
+  if (aligned_16b && wide_fills_wave) {
     constexpr int64_t kVecBytes = static_cast<int64_t>(sizeof(TransferVec4));
     const int64_t vec_count = item_size_bytes / kVecBytes;
     const auto src_vec = reinterpret_cast<const TransferVec4*>(src);
