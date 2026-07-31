@@ -34,6 +34,24 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "overhead without improving prefill performance."
         )
 
+    if (
+        server_args.disaggregation_mode == "decode"
+        and server_args.enable_hierarchical_cache
+        and not server_args.disaggregation_decode_enable_radix_cache
+        and server_args.hicache_storage_backend is not None
+    ):
+        # PD Decode defaults to ChunkCache. Its L3 integration is the
+        # request-lifecycle offload path: Decode archives newly generated pages
+        # for a later Prefill request instead of matching prefixes locally.
+        # Normalize the legacy/generated HiCache recipe onto that path.
+        server_args.enable_hierarchical_cache = False
+        server_args.disaggregation_decode_enable_offload_kvcache = True
+        logger.warning(
+            "PD Decode uses chunk cache; treating "
+            "--enable-hierarchical-cache with --hicache-storage-backend as "
+            "--disaggregation-decode-enable-offload-kvcache."
+        )
+
     if server_args.disaggregation_mode == "decode" and server_args.dcp_size > 1:
         if server_args.disaggregation_transfer_backend not in ("mooncake", "nixl"):
             raise ValueError(

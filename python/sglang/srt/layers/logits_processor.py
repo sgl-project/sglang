@@ -51,7 +51,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -69,6 +69,34 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedLinearMethod",
     "PackWeightMethod",
 }
+
+
+def should_enable_multimem_logits_all_gather(
+    config,
+    *,
+    do_tensor_parallel_all_gather: bool,
+    use_attn_tp_group: bool,
+    dcp_enabled: bool,
+) -> bool:
+    """Return whether the logits TP gather can use torch symmetric memory.
+
+    Kimi-K3 DCP already disables ``--enable-symm-mem`` because its decode
+    CUDA-graph path is not compatible with symmetric memory.  The logits
+    gatherer allocates torch symmetric memory independently of that flag, so
+    it must observe the same restriction or the first real forward can hang in
+    ``torch.distributed._symmetric_memory.rendezvous``.
+    """
+    architectures = getattr(config, "architectures", None) or ()
+    is_kimi_k3 = (
+        getattr(config, "model_type", None) in ("kimi_k3", "kimi_linear")
+        or "KimiK3ForConditionalGeneration" in architectures
+        or "KimiLinearForCausalLM" in architectures
+    )
+    return (
+        do_tensor_parallel_all_gather
+        and not use_attn_tp_group
+        and not (is_kimi_k3 and dcp_enabled)
+    )
 
 
 def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
@@ -377,11 +405,30 @@ class LogitsProcessor(nn.Module):
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
 
+        enable_multimem_logits_gather = should_enable_multimem_logits_all_gather(
+            self.config,
+            do_tensor_parallel_all_gather=self.do_tensor_parallel_all_gather,
+            use_attn_tp_group=self.use_attn_tp_group,
+            # RuntimeContext.dcp_enabled depends on the DCP process group
+            # already being published. ServerArgs is authoritative while
+            # model layers are being constructed.
+            dcp_enabled=get_server_args().dcp_size > 1,
+        )
+        if (
+            self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not enable_multimem_logits_gather
+        ):
+            logger.info(
+                "Kimi-K3 DCP disables multimem logits all-gather; "
+                "falling back to NCCL."
+            )
+
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=False, floor=128
             ),
-            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
+            enabled=enable_multimem_logits_gather,
             skip_entry_sync=True,
         )
 

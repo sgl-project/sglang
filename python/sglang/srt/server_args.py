@@ -7153,15 +7153,40 @@ class ServerArgs:
         self._resolve_hicache_dcp_compatibility()
 
     def _resolve_hicache_dcp_compatibility(self):
-        if self.dcp_size <= 1 or not self.enable_hierarchical_cache:
+        if self.dcp_size <= 1:
+            return
+
+        def is_supported_kimi_hybrid() -> tuple[bool, list[str]]:
+            model_arches = self.get_model_config().hf_config.architectures
+            supported = {"KimiLinearForCausalLM", "KimiK3ForConditionalGeneration"}
+            return bool(supported.intersection(model_arches)), model_arches
+
+        if self.disaggregation_decode_enable_offload_kvcache:
+            supported, model_arches = is_supported_kimi_hybrid()
+            if not supported:
+                raise ValueError(
+                    "Decode KV offload with --dcp-size > 1 is only supported "
+                    "for the Kimi MLA+KDA hybrid models, got "
+                    f"{model_arches}."
+                )
+            logger.info(
+                "PD Decode ChunkCache + DCP L3 offload enabled: every DCP "
+                "rank archives its MLA shard and KDA state."
+            )
+            return
+        if not self.enable_hierarchical_cache:
             return
         if self.hicache_storage_backend is not None:
-            raise NotImplementedError(
-                "--hicache-storage-backend (L3) with --dcp-size > 1 is not "
-                "supported yet: under DCP each rank holds a distinct "
-                "interleaved MLA KV shard, so the rank-0-only replicated-MLA "
-                "backup and the storage keys must become dcp_rank-aware "
-                "first. Run HiCache+DCP with L1/L2 only."
+            supported, model_arches = is_supported_kimi_hybrid()
+            if not supported:
+                raise NotImplementedError(
+                    "--hicache-storage-backend (L3) with --dcp-size > 1 is "
+                    "only supported for the Kimi MLA+KDA hybrid models, got "
+                    f"{model_arches}."
+                )
+            logger.info(
+                "Kimi HiCache + DCP L3 enabled: every DCP rank stores its "
+                "MLA shard and rank-local KDA state."
             )
         if self.speculative_algorithm is not None:
             raise NotImplementedError(

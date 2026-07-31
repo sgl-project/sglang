@@ -35,6 +35,8 @@ class HiCacheStorageConfig:
     enable_storage_metrics: bool
     is_page_first_layout: bool
     model_name: Optional[str]
+    attn_dcp_rank: int = 0
+    attn_dcp_size: int = 1
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None

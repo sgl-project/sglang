@@ -471,11 +471,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        assert self.dcp_size == 1, (
-            "HiCache L3 storage paths are not yet DCP-aware (per-rank shards "
-            "need dcp_rank-scoped keys); --hicache-storage-backend with "
-            "--dcp-size > 1 should have been rejected at server start."
-        )
+        index = self._storage_physical_page_start(index)
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
@@ -503,6 +499,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        index = self._storage_physical_page_start(index)
         if self.layout == "layer_first":
             self.kv_buffer[:, index : index + self.page_size, :, :] = data_page.reshape(
                 self.layer_num,
@@ -533,10 +530,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         """
         meta data for zero copy
         """
-        assert len(indices) % self.page_size == 0
+        assert len(indices) % self.logical_page_size == 0
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
-        indices = indices.tolist()
+        indices = self.dcp_kernel_indices(indices).tolist()
+        assert len(indices) % self.page_size == 0
         if self.layout == "layer_first":
             for index in range(0, len(indices), self.page_size):
                 for layer_id in range(self.layer_num):
@@ -568,6 +566,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+    def _storage_physical_page_start(self, logical_index: int) -> int:
+        """Map a logical L3 page start to this DCP rank's physical host row."""
+        logical_index = int(logical_index)
+        assert logical_index % self.logical_page_size == 0, (
+            "HiCache storage operations must start on a logical page boundary: "
+            f"index={logical_index}, logical_page_size={self.logical_page_size}."
+        )
+        return logical_index // self.dcp_size
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         """Return True if per-page strides are multiples of *page_size_bytes*.

@@ -69,6 +69,8 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager.ongoing_offload = {}
     manager.ongoing_backup = {}
     manager.offload_inflight = {}
+    manager.is_hybrid_mamba = False
+    manager.canonical_storage_layout = False
 
     return manager, freed_indices
 
@@ -278,12 +280,15 @@ class TestReleaseFinishedReq(unittest.TestCase):
             0.0,
             4,
             8,
+            None,
         )
         manager.cache_controller = MagicMock()
         manager.cache_controller.ack_write_queue = [
             HiCacheAck(None, _FinishedEvent(), [7])
         ]
-        manager._trigger_backup = MagicMock(return_value="last_hash")
+        manager._trigger_backup = MagicMock(
+            return_value=("last_hash", "storage_last_hash")
+        )
 
         manager._check_offload_progress(1)
 
@@ -294,6 +299,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
     def test_offload_kv_cache_tracks_inflight_write_until_ack(self):
         manager, freed = _make_manager(pool_size=32, page_size=4)
         manager.cache_controller = MagicMock()
+        manager.cache_controller.storage_page_size = manager.page_size
         manager.cache_controller.get_hash_str = MagicMock(return_value="prefill_hash")
         manager.cache_controller.write = MagicMock(
             return_value=torch.arange(4, 8, dtype=torch.int64)
@@ -319,7 +325,9 @@ class TestReleaseFinishedReq(unittest.TestCase):
         manager.cache_controller.ack_write_queue = [
             HiCacheAck(None, _FinishedEvent(), [1])
         ]
-        manager._trigger_backup = MagicMock(return_value="last_hash")
+        manager._trigger_backup = MagicMock(
+            return_value=("last_hash", "storage_last_hash")
+        )
 
         manager._check_offload_progress(1)
 
@@ -359,12 +367,15 @@ class TestReleaseFinishedReq(unittest.TestCase):
             0.0,
             4,
             8,
+            None,
         )
         manager.cache_controller = MagicMock()
         manager.cache_controller.ack_write_queue = [
             HiCacheAck(None, _FinishedEvent(), [8])
         ]
-        manager._trigger_backup = MagicMock(return_value="last_hash")
+        manager._trigger_backup = MagicMock(
+            return_value=("last_hash", "storage_last_hash")
+        )
 
         manager._check_offload_progress(1)
 
@@ -391,12 +402,15 @@ class TestReleaseFinishedReq(unittest.TestCase):
             0.0,
             8,
             12,
+            None,
         )
         manager.cache_controller = MagicMock()
         manager.cache_controller.ack_write_queue = [
             HiCacheAck(None, _FinishedEvent(), [9])
         ]
-        manager._trigger_backup = MagicMock(return_value="last_hash")
+        manager._trigger_backup = MagicMock(
+            return_value=("last_hash", "storage_last_hash")
+        )
 
         manager._check_offload_progress(1)
 

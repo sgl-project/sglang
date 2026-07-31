@@ -1528,6 +1528,15 @@ class HostPoolGroup:
 
         self.layout = self.anchor_entry.host_pool.layout
         self.page_size = self.anchor_entry.host_pool.page_size
+        # The primary pool exposes a widened logical page under DCP while its
+        # backing buffer uses the per-rank physical page. Storage backends see
+        # HostPoolGroup rather than the primary pool directly, so preserve both
+        # units at this wrapper boundary.
+        self.logical_page_size = getattr(
+            self.anchor_entry.host_pool,
+            "logical_page_size",
+            self.page_size,
+        )
         self.device = self.anchor_entry.host_pool.device
         self.size = self.anchor_entry.host_pool.size
         self.logical_size = self.anchor_entry.host_pool.logical_size

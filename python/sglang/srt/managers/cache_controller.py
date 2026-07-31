@@ -331,6 +331,7 @@ class HiCacheController:
 
         self.prefetch_sync_groups = []
         seen_rank_sets = set()
+        world_size = torch.distributed.get_world_size()
 
         if self.attn_cp_group is not None or self.attn_tp_group is not None:
             base_groups = [self.attn_cp_group, self.attn_tp_group]
@@ -344,11 +345,20 @@ class HiCacheController:
             if group_ranks in seen_rank_sets:
                 continue
             seen_rank_sets.add(group_ranks)
-            self.prefetch_sync_groups.append(
-                create_custom_parallel_group(
+            if group_ranks == tuple(range(world_size)):
+                # Avoid the object all-gather in create_custom_parallel_group
+                # when every world rank participates. Decode-side cache
+                # offloading attaches storage late in scheduler startup, where
+                # an extra default-group collective can race with other rank
+                # initialization and deadlock before the Gloo group is created.
+                sync_group = torch.distributed.new_group(
+                    ranks=list(group_ranks), backend="gloo"
+                )
+            else:
+                sync_group = create_custom_parallel_group(
                     group_ranks=list(group_ranks), backend="gloo"
                 )
-            )
+            self.prefetch_sync_groups.append(sync_group)
 
     def _destroy_prefetch_sync_groups(self) -> None:
         for group in self.prefetch_sync_groups:
@@ -471,6 +481,9 @@ class HiCacheController:
             self.storage_config.is_mla_model
             # todo: load balancing
             and self.storage_config.tp_rank != 0
+            # MLA KV is TP-replicated in the ordinary layout, but each DCP
+            # rank owns a distinct interleaved token shard.
+            and self.storage_config.attn_dcp_size == 1
         )
 
         # Use storage backend factory for dynamic backend creation
@@ -627,6 +640,7 @@ class HiCacheController:
             )
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+        parallel = get_parallel()
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
@@ -640,6 +654,8 @@ class HiCacheController:
             enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
+            attn_dcp_rank=parallel.attn_dcp_rank,
+            attn_dcp_size=parallel.attn_dcp_size,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
