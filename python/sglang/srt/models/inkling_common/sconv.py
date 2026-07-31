@@ -131,8 +131,11 @@ class ShortConvolution(nn.Module):
         """
         return get_attn_backend().conv_state_metadata(self.layer_id, forward_batch)
 
+    def _layer_cache(self, meta):
+        return meta.layer_cache(self.layer_id)
+
     def _sconv_cache(self, meta) -> torch.Tensor:
-        return meta.layer_cache.conv[self.sconv_type.value]
+        return self._layer_cache(meta).conv[self.sconv_type.value]
 
     def _weight_2d(self) -> torch.Tensor:
         return rearrange(self.weight, "d 1 w -> d w")
@@ -293,7 +296,7 @@ class ShortConvolution(nn.Module):
             meta.cache_indices[:b],
             meta.has_initial_state,
             self._weight_2d(),
-            meta.layer_cache.intermediate_conv_window[self.sconv_type.value],
+            self._layer_cache(meta).intermediate_conv_window[self.sconv_type.value],
         )
 
     def extend_fused_ar_inputs(self, forward_batch: ForwardBatch):
@@ -349,7 +352,7 @@ class ShortConvolution(nn.Module):
         meta = self._conv_state(forward_batch)
         self._save_intermediate_conv_windows(
             forward_batch=forward_batch,
-            cache=meta.layer_cache,
+            cache=self._layer_cache(meta),
             sconv_cache=self._sconv_cache(meta),
             cache_indices=cache_indices,
             hidden_states=x_scratch,
@@ -391,7 +394,7 @@ class ShortConvolution(nn.Module):
             )
             self._save_intermediate_conv_windows(
                 forward_batch=forward_batch,
-                cache=meta.layer_cache,
+                cache=self._layer_cache(meta),
                 sconv_cache=sconv_cache,
                 cache_indices=cache_indices,
                 hidden_states=hidden_states,

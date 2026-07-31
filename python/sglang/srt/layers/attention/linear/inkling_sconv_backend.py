@@ -34,8 +34,9 @@ tensor a captured kernel reads lives in a graph-static buffer refilled in place.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional
+from typing import TYPE_CHECKING, Optional
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
@@ -67,21 +68,26 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-class InklingShortConvMetadata(NamedTuple):
-    """Per-(layer, step) conv-state handle handed to Inkling's conv kernels.
-
-    ``layer_cache`` holds this layer's pool views indexed by ``SconvType``; the
-    rest is step-global, and on the graph path is a static buffer refilled in place.
+class InklingShortConvMetadata(msgspec.Struct):
+    """The step's conv-state metadata, resolved during metadata prep and shared by
+    every conv module in the step. On the graph path each tensor is a static buffer
+    refilled in place.
     """
 
-    layer_cache: Any
-    cache_indices: torch.Tensor  # per-request slot ids, int32
+    cache_indices: Optional[torch.Tensor] = None  # per-request slot ids, int32
     query_start_loc: Optional[torch.Tensor] = None  # cu-seqlens, int32
     has_initial_state: Optional[torch.Tensor] = None  # "resumes a cached prefix"
     precomputed: Optional[SconvExtendMetadata | SconvDecodeMetadata] = None
     # [B, conv_kernel - 1] input positions whose conv window feeds the prefix
     # cache. Extend only, and only when tracking is on.
     track_conv_indices: Optional[torch.Tensor] = None
+    # layer id -> that layer's pool views, indexed by ``SconvType``. Filled on
+    # first ask, not up front: ``mamba2_layer_cache`` carries the HiCache
+    # layer-transfer wait, which has to stay just ahead of that layer's forward.
+    layer_caches: dict = {}
+
+    def layer_cache(self, layer_id: int):
+        return self.layer_caches[layer_id]
 
 
 class InklingShortConvAttnBackend(ShortConvAttnBackend):
@@ -106,10 +112,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             is HybridReqToTokenPool.translate_mamba_indices
         )
 
-        self._query_start_loc: Optional[torch.Tensor] = None
-        self._precomputed: Optional[SconvExtendMetadata | SconvDecodeMetadata] = None
-        self._track_conv_indices: Optional[torch.Tensor] = None
-        self._layer_caches: dict = {}
+        self.sconv_metadata = InklingShortConvMetadata()
 
         self._alloc_graph_buffers()
 
@@ -187,10 +190,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
 
     def _reset_step_state(self):
         super()._reset_step_state()
-        self._query_start_loc = None
-        self._precomputed = None
-        self._track_conv_indices = None
-        self._layer_caches.clear()
+        self.sconv_metadata = InklingShortConvMetadata()
 
     @staticmethod
     def _phase_records_metadata(forward_batch: ForwardBatch) -> bool:
@@ -266,6 +266,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
     ):
         if self._cache_indices is None:
             return
+        self.sconv_metadata.cache_indices = self._cache_indices
         mode = forward_batch.forward_mode
         if mode.is_decode_or_idle():
             self._refresh_decode_metadata(forward_batch, on_graph_path)
@@ -281,10 +282,11 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self, forward_batch: ForwardBatch, on_graph_path: bool
     ):
         B = forward_batch.batch_size
+        md = self.sconv_metadata
         (
-            self._query_start_loc,
-            self._has_initial_state,
-            self._precomputed,
+            md.query_start_loc,
+            md.has_initial_state,
+            md.precomputed,
         ) = fused_decode_sconv_metadata(
             B=B,
             cache_indices=self._cache_indices,
@@ -367,9 +369,10 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
                 cu=precomputed["cu"],
                 si=precomputed["si"][:T],
             )
-        self._query_start_loc = query_start_loc
-        self._has_initial_state = has_initial_state
-        self._precomputed = precomputed
+        md = self.sconv_metadata
+        md.query_start_loc = query_start_loc
+        md.has_initial_state = has_initial_state
+        md.precomputed = precomputed
 
     def _unfused_extend_metadata(self, forward_batch: ForwardBatch):
         """Unfused query_start_loc / has_initial_state prep; fallback only."""
@@ -424,7 +427,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         if forward_batch.mamba_track_mask is None:
             return
         rows = forward_batch.batch_size
-        query_start_loc = self._query_start_loc
+        query_start_loc = self.sconv_metadata.query_start_loc
         live = min(
             rows,
             forward_batch.mamba_track_seqlens.shape[0],
@@ -466,7 +469,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         )
         if live < rows:
             out[live:].zero_()
-        self._track_conv_indices = out
+        self.sconv_metadata.track_conv_indices = out
 
     def commit_conv_state_after_mtp_verify(
         self,
@@ -491,34 +494,24 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             mamba_steps_to_track,
         )
 
-    def _layer_cache(self, layer_id: int):
-        """This layer's pool views, resolved once per step.
-
-        Every ``ShortConvolution`` in a layer asks for the same handle, and
-        ``mamba2_layer_cache`` rebuilds a ``State`` over all conv streams per call
-        (plus a HiCache layer-transfer wait). Hold it for the step so the layer sees
-        one build and one wait, as single-mixer models do.
-        """
-        cached = self._layer_caches.get(layer_id)
-        if cached is None:
-            cached = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-            self._layer_caches[layer_id] = cached
-        return cached
-
     def conv_state_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> InklingShortConvMetadata:
-        """``layer_id``'s handle for this step: a pure read, so every conv layer
-        shares one gather, one fused launch and one track-index build."""
+        """The step's metadata, with ``layer_id``'s pool views resolved into it.
+
+        Everything else was resolved during metadata prep, so every conv layer
+        shares one gather, one fused launch and one track-index build. The pool
+        views are resolved once per LAYER: all four of a layer's convs ask for the
+        same handle, and ``mamba2_layer_cache`` rebuilds a ``State`` over the pool's
+        conv streams per call (plus a HiCache layer-transfer wait).
+        """
         del forward_batch
-        return InklingShortConvMetadata(
-            layer_cache=self._layer_cache(layer_id),
-            cache_indices=self._cache_indices,
-            query_start_loc=self._query_start_loc,
-            has_initial_state=self._has_initial_state,
-            precomputed=self._precomputed,
-            track_conv_indices=self._track_conv_indices,
-        )
+        md = self.sconv_metadata
+        if layer_id not in md.layer_caches:
+            md.layer_caches[layer_id] = self.req_to_token_pool.mamba2_layer_cache(
+                layer_id
+            )
+        return md
 
 
 class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
