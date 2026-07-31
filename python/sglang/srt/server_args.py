@@ -7459,6 +7459,14 @@ class ServerArgs:
         return self._mamba_cache_chunk_size
 
     def _check_two_batch_overlap(self):
+        # dLLM model forward paths do not implement the model-specific TBO
+        # operation strategies.
+        if self.enable_two_batch_overlap and self.dllm_algorithm is not None:
+            raise ValueError(
+                "--enable-two-batch-overlap is not supported with diffusion LLM "
+                "inference (--dllm-algorithm)."
+            )
+
         # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
         # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
         # the other ubatch's compute), which requires DP attention. Enabling it
