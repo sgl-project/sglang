@@ -26,18 +26,26 @@ logger = logging.getLogger(__name__)
 
 _SYNC_DECL = (
     "void spin_wait(torch::Tensor flag, torch::Tensor target, torch::Tensor timed_out,"
-    " int64_t deadline_cycles);\n"
+    " int64_t budget_ns);\n"
     "void bump_signal(torch::Tensor seq, torch::Tensor peer_flag);"
 )
 _SYNC_SRC = """
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+__device__ __forceinline__ unsigned long long now_ns() {
+    // %globaltimer is a nanosecond wall clock, so the budget needs no SM-clock
+    // conversion -- cudaDevAttrClockRate is not dependable across architectures
+    // (B200 reports 120 MHz, which would shrink the timeout ~16x).
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
 __global__ void spin_wait_kernel(volatile int* flag, const int* target,
-                                 int* timed_out, long long deadline) {
+                                 int* timed_out, unsigned long long budget_ns) {
     int t = *target;
-    long long start = clock64();
+    unsigned long long start = now_ns();
     while (*flag < t) {
-        if (clock64() - start > deadline) {
+        if (now_ns() - start > budget_ns) {
             // Give up rather than hang the stream forever. The peer never
             // published, so this exchange's data is incomplete; the host reads
             // the flag outside capture and disables the transport.
@@ -54,10 +62,10 @@ __global__ void bump_signal_kernel(int* seq, volatile int* peer_flag) {
     *peer_flag = v;
 }
 void spin_wait(torch::Tensor flag, torch::Tensor target, torch::Tensor timed_out,
-               int64_t deadline_cycles) {
+               int64_t budget_ns) {
     spin_wait_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
         (volatile int*)flag.data_ptr<int>(), target.data_ptr<int>(),
-        timed_out.data_ptr<int>(), (long long)deadline_cycles);
+        timed_out.data_ptr<int>(), (unsigned long long)budget_ns);
 }
 void bump_signal(torch::Tensor seq, torch::Tensor peer_flag) {
     bump_signal_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -80,7 +88,7 @@ class IpcA2AState:
         self.peer_flag = None
         self.my_seq = None
         self.timed_out = None
-        self.deadline_cycles = 0
+        self.budget_ns = 0
         self.max_buffers = 0
         self.calls = 0
         self.rank = None
@@ -142,13 +150,7 @@ class IpcA2AState:
         self.flag = torch.zeros(1, dtype=torch.int32, device="cuda")
         self.my_seq = torch.zeros(1, dtype=torch.int32, device="cuda")
         self.timed_out = torch.zeros(1, dtype=torch.int32, device="cuda")
-        # clock64() counts SM cycles. Convert with the max clock: under a power
-        # cap the SM runs slower, so the real budget only ever comes out longer
-        # than asked, which is the safe direction for a watchdog.
-        cycles_per_ms = torch.cuda.clock_rate(dev) * 1000
-        self.deadline_cycles = int(
-            envs.SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS * cycles_per_ms
-        )
+        self.budget_ns = int(envs.SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS * 1e6)
         self.max_buffers = envs.SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS
         self.peer_flag = self._share(self.flag, group)
         self.inited = True
@@ -206,7 +208,7 @@ class IpcA2AState:
         self.ops.bump_signal(self.my_seq, self.peer_flag)
 
     def wait(self):
-        self.ops.spin_wait(self.flag, self.my_seq, self.timed_out, self.deadline_cycles)
+        self.ops.spin_wait(self.flag, self.my_seq, self.timed_out, self.budget_ns)
 
     def check_timeout(self) -> bool:
         """Read the timeout flag (a device sync, so call this between requests,
