@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import logging
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -25,6 +27,9 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.verify_mask import VerifyMask
 
 logger = logging.getLogger(__name__)
 
@@ -920,16 +925,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.on_after_cuda_graph_warmup()
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        # Verify tree-mask / position buffers live on the full-attn child (the
-        # linear side consumes no mask). Handing them out lets the draft stage
-        # write straight into the captured verify buffers instead of allocating
-        # a fresh mask every step.
-        return self.full_attn_backend.get_verify_buffers_to_fill_after_draft()
-
-    def target_verify_reads_custom_mask(self) -> bool:
-        # Same child that hands out the mask buffer answers whether it is read.
-        return self.full_attn_backend.target_verify_reads_custom_mask()
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        # The mask lives on the full-attn child; the linear side reads none.
+        return self.full_attn_backend.verify_mask
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
