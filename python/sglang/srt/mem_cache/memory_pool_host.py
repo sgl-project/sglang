@@ -650,8 +650,7 @@ class LogicalHostPool:
                 f"got size={size}, page_size={page_size}"
             )
         self.size = size
-        # Stands in for a host pool (including as a group anchor), so it carries
-        # the same logical/physical capacity pair. DCP does not widen this path.
+        # Stands in for a host pool (and group anchor); DCP never widens it.
         self.logical_size = size
         self.page_size = page_size
         self.device = "cpu"
@@ -1531,9 +1530,6 @@ class HostPoolGroup:
         self.page_size = self.anchor_entry.host_pool.page_size
         self.device = self.anchor_entry.host_pool.device
         self.size = self.anchor_entry.host_pool.size
-        # Logical (DCP-widened) capacity travels with the physical one: metrics
-        # and any other slot accounting read it off whichever object stands in
-        # for the host pool, and this group is one of them.
         self.logical_size = self.anchor_entry.host_pool.logical_size
         self.can_use_write_back_jit = all(
             getattr(entry.host_pool, "can_use_write_back_jit", False)

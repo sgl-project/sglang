@@ -119,7 +119,7 @@ class HostKVCache(abc.ABC):
             )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
-        # Align up the host memory pool size to the (physical) page size
+        # Align up the host memory pool size to the page size
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
         self.start_layer = device_pool.start_layer
