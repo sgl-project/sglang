@@ -1,3 +1,4 @@
+import os
 from typing import Any, Optional
 
 import numpy as np
@@ -14,6 +15,64 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.state_capturer.base import BaseTopkCapturer
+
+_ROUTED_EXPERTS_DTYPE_ENV = "SGLANG_ROUTED_EXPERTS_DTYPE"
+_ROUTED_EXPERTS_WIRE_DTYPES = {
+    "int32": np.dtype(np.int32),
+    "uint16": np.dtype(np.uint16),
+    "uint8": torch.uint8,
+}
+
+
+def get_routed_experts_wire_dtype():
+    dtype_name = get_routed_experts_wire_dtype_name()
+    return _ROUTED_EXPERTS_WIRE_DTYPES[dtype_name]
+
+
+def get_routed_experts_wire_dtype_name():
+    dtype_name = os.environ.get(_ROUTED_EXPERTS_DTYPE_ENV, "int32").strip().lower()
+    if dtype_name not in _ROUTED_EXPERTS_WIRE_DTYPES:
+        raise ValueError(
+            f"Unsupported {_ROUTED_EXPERTS_DTYPE_ENV}={dtype_name!r}. "
+            f"Supported values are: {', '.join(_ROUTED_EXPERTS_WIRE_DTYPES)}."
+        )
+    return dtype_name
+
+
+def _get_routed_experts_wire_dtype_from_meta_info(meta_info: dict):
+    dtype_name = meta_info.get("routed_experts_dtype")
+    if dtype_name is None:
+        return get_routed_experts_wire_dtype()
+
+    if not isinstance(dtype_name, str):
+        raise ValueError("routed_experts_dtype must be a string when provided.")
+
+    dtype_name = dtype_name.strip().lower()
+    if dtype_name not in _ROUTED_EXPERTS_WIRE_DTYPES:
+        raise ValueError(
+            f"Unsupported routed_experts_dtype={dtype_name!r}. "
+            f"Supported values are: {', '.join(_ROUTED_EXPERTS_WIRE_DTYPES)}."
+        )
+    return _ROUTED_EXPERTS_WIRE_DTYPES[dtype_name]
+
+
+def encode_routed_experts_for_wire(routed_experts: torch.Tensor) -> str:
+    """Encode row-major routings as a flat base64 wire payload."""
+    routed_experts_np = routed_experts.numpy().reshape(-1)
+    wire_dtype = get_routed_experts_wire_dtype()
+    dtype_name = get_routed_experts_wire_dtype_name()
+
+    if dtype_name in ("uint16", "uint8") and routed_experts_np.size:
+        np_dtype = np.dtype(np.uint16) if dtype_name == "uint16" else np.dtype(np.uint8)
+        info = np.iinfo(np_dtype)
+        if routed_experts_np.min() < info.min or routed_experts_np.max() > info.max:
+            raise ValueError(
+                f"Cannot encode routed experts as {dtype_name} because at least one "
+                f"expert id is outside [{info.min}, {info.max}]."
+            )
+
+    routed_experts_np = routed_experts_np.astype(wire_dtype, copy=False)
+    return pybase64.b64encode(routed_experts_np.tobytes()).decode("utf-8")
 
 
 class RoutedExpertsCapturer(BaseTopkCapturer):
@@ -145,15 +204,36 @@ def set_global_experts_capturer(capturer: Optional[RoutedExpertsCapturer]):
     get_resources().experts_capturer = capturer
 
 
-def extract_routed_experts_from_meta_info(data):
-    # To solve the performance issue, we return the experts_ids in base64
-    # We left this function for user to change it back to normal int32
-    # See detokenizer_manager::_extract_routed_experts
-    routed_experts_base64 = data["meta_info"].get("routed_experts", None)
+def extract_routed_experts_from_meta_info(
+    data,
+    num_layers: Optional[int] = None,
+    topk: Optional[int] = None,
+):
+    """Decode routed experts from response metadata.
+
+    SGLang returns a flat row-major buffer where row p contains the routing that
+    produced token p + 1. When num_layers and topk are provided, the return value
+    is reshaped to (positions, num_layers * topk) using the advertised wire dtype.
+    """
+    meta_info = data["meta_info"]
+    routed_experts_base64 = meta_info.get("routed_experts", None)
+    wire_dtype = _get_routed_experts_wire_dtype_from_meta_info(meta_info)
     routed_experts = np.frombuffer(
-        pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32
+        pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=wire_dtype
     )
-    return routed_experts
+
+    if num_layers is None and topk is None:
+        return routed_experts
+    if num_layers is None or topk is None:
+        raise ValueError("num_layers and topk must be provided together.")
+
+    row_width = num_layers * topk
+    if row_width <= 0:
+        raise ValueError(
+            f"Expected positive routed experts row width, got {row_width}."
+        )
+
+    return routed_experts.reshape(-1, row_width)
 
 
 def disable_routed_experts_capture_for_draft(model: Any) -> None:
