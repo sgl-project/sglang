@@ -32,9 +32,10 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
-    # opt-in; engages only on 2 ranks with peer-to-peer access, and falls back
-    # to NCCL when unavailable. The runtime default lives in the resolver below.
-    SGLANG_DIFFUSION_IPC_A2A: bool = False
+    # on by default; engages only on 2 ranks with peer-to-peer access and falls
+    # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
+    # the resolver below -- that is the value the runtime reads.
+    SGLANG_DIFFUSION_IPC_A2A: bool = True
     # a deadlock backstop, not a per-step budget: a rank can legitimately stall
     # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
     # retires the transport on every rank and fails the request
@@ -230,7 +231,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference
     # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
-    "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "false"),
+    "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
     "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS": _lazy_float(
         "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS", 10000.0
     ),
