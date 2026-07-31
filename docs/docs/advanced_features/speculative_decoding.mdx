@@ -204,7 +204,7 @@ To enable EAGLE speculative decoding the following parameters are relevant:
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-model-quantization</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quantization method for the draft model. <code>nvfp4_online</code> requires online per-token FP32 activation scales. Use <code>modelopt_fp4</code> for online-capable NVFP4 with static per-tensor FP32 activation scales; missing scales default to <code>1.0</code>. Use <code>"unquant"</code> to force no quantization.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quantization method for the draft model. Use <code>"unquant"</code> to force no quantization even when the target model is quantized.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Same as target model</td>
     </tr>
     <tr>
@@ -842,7 +842,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-model-quantization</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Same as target</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quantization for the draft model. <code>nvfp4_online</code> is per-token; <code>modelopt_fp4</code> is online-capable and uses static per-tensor activation scales (<code>1.0</code> when absent); <code>"unquant"</code> disables draft quantization.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quantization for the draft model (<code>"unquant"</code> to disable)</td>
     </tr>
   </tbody>
 </table>
