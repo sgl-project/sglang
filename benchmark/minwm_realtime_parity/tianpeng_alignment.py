@@ -72,8 +72,7 @@ def _video_boundary_to_latent(boundary: int, temporal_factor: int) -> int:
         return 0
     if (boundary - 1) % temporal_factor:
         raise ValueError(
-            f"prompt boundary {boundary} is not aligned to VAE factor "
-            f"{temporal_factor}"
+            f"prompt boundary {boundary} is not aligned to VAE factor {temporal_factor}"
         )
     return 1 + (boundary - 1) // temporal_factor
 
@@ -149,8 +148,7 @@ def load_contract(base_url: str) -> dict:
         segments[0]["start"] != 0
         or segments[-1]["end"] != output["frames"]
         or any(
-            left["end"] != right["start"]
-            for left, right in zip(segments, segments[1:])
+            left["end"] != right["start"] for left, right in zip(segments, segments[1:])
         )
     ):
         raise ValueError("director prompt segments are not contiguous")
@@ -281,9 +279,7 @@ def _run_ffmpeg_metric(metric: str, baseline: Path, candidate: Path) -> dict:
         "null",
         "-",
     ]
-    completed = subprocess.run(
-        command, check=True, capture_output=True, text=True
-    )
+    completed = subprocess.run(command, check=True, capture_output=True, text=True)
     line = next(
         line for line in reversed(completed.stderr.splitlines()) if metric in line
     )
