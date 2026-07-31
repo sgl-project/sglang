@@ -7,10 +7,11 @@ import torch.nn as nn
 
 from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 from sglang.srt.layers.parameter import PerTensorScaleParameter
-from sglang.srt.layers.quantization import modelopt_quant
+from sglang.srt.layers.quantization import modelopt_quant, nvfp4_online
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
+    ModelOptNvFp4FusedMoEMethod,
 )
 from sglang.srt.layers.quantization.nvfp4_online import (
     ModelOptNvFp4OnlineFusedMoEMethod,
@@ -125,7 +126,7 @@ class TestModelOptNvfp4(CustomTestCase):
                 config.get_quant_method(FakeFusedMoE(), "model.layers.0.mlp.experts")
             )
 
-    def test_online_config_selects_online_weight_moe_method(self):
+    def test_online_config_selects_modelopt_moe_method(self):
         config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=False,
             group_size=16,
@@ -139,8 +140,8 @@ class TestModelOptNvfp4(CustomTestCase):
         with (
             patch("sglang.srt.layers.moe.fused_moe_triton.FusedMoE", FakeFusedMoE),
             patch(
-                "sglang.srt.layers.quantization.nvfp4_online."
-                "ModelOptNvFp4OnlineFusedMoEMethod",
+                "sglang.srt.layers.quantization.modelopt_quant."
+                "ModelOptNvFp4FusedMoEMethod",
                 return_value=sentinel,
             ) as online_weight_method,
         ):
@@ -148,7 +149,7 @@ class TestModelOptNvfp4(CustomTestCase):
                 config.get_quant_method(FakeFusedMoE(), "model.layers.0.mlp"),
                 sentinel,
             )
-        online_weight_method.assert_called_once_with(config, "model.layers.0.mlp")
+        online_weight_method.assert_called_once_with(config)
 
     @patch(
         "sglang.srt.layers.quantization.modelopt_quant.envs."
@@ -189,31 +190,37 @@ class TestModelOptNvfp4(CustomTestCase):
         wraps=modelopt_quant._make_per_tensor_scale_parameter,
     )
     def test_moe_input_scale_fill_matches_quantization_interface(self, make_scale):
-        configs_and_fills = (
-            (ModelOptFp4Config(group_size=16), 1.0),
-            (NvFp4OnlineConfig(), None),
+        methods_configs_and_fills = (
+            (
+                ModelOptNvFp4FusedMoEMethod,
+                ModelOptFp4Config(group_size=16),
+                1.0,
+            ),
+            (ModelOptNvFp4OnlineFusedMoEMethod, NvFp4OnlineConfig(), None),
         )
-        method = object.__new__(ModelOptNvFp4OnlineFusedMoEMethod)
-        method.enable_flashinfer_trtllm_moe = True
-        method.layer_log_name = "model.layers.0.mlp.experts"
 
-        for config, expected_fill in configs_and_fills:
+        for method_cls, config, expected_fill in methods_configs_and_fills:
             with self.subTest(config=config.get_name()):
                 make_scale.reset_mock()
+                method = object.__new__(method_cls)
                 method.quant_config = config
+                method.enable_flashinfer_trtllm_moe = True
                 layer = nn.Module()
                 layer.num_experts = 1
                 layer.num_local_experts = 1
                 layer.moe_runner_config = SimpleNamespace(is_gated=True)
 
-                method.create_weights(
-                    layer,
-                    num_experts=1,
-                    hidden_size=16,
-                    intermediate_size_per_partition=16,
-                    params_dtype=torch.bfloat16,
-                    weight_loader=MagicMock(),
-                )
+                with patch.object(
+                    method, "prepare_weight_loader", return_value=MagicMock()
+                ):
+                    method.create_weights(
+                        layer,
+                        num_experts=1,
+                        hidden_size=16,
+                        intermediate_size_per_partition=16,
+                        params_dtype=torch.bfloat16,
+                        weight_loader=MagicMock(),
+                    )
 
                 self.assertEqual(
                     [call.kwargs["fill_value"] for call in make_scale.call_args_list],
@@ -221,13 +228,6 @@ class TestModelOptNvfp4(CustomTestCase):
                 )
 
     def test_non_gated_w1_is_quantized_without_pairing(self):
-        method = object.__new__(ModelOptNvFp4OnlineFusedMoEMethod)
-        method.quant_config = ModelOptFp4Config(
-            is_checkpoint_nvfp4_serialized=False,
-            group_size=16,
-            use_per_token_activation=False,
-        )
-        method.layer_log_name = "mtp.layers.0.mixer.experts"
         layer = SimpleNamespace(
             moe_runner_config=SimpleNamespace(is_gated=False),
             w13_weight_scale=object(),
@@ -240,12 +240,14 @@ class TestModelOptNvfp4(CustomTestCase):
         weight_scale_2 = torch.ones((), dtype=torch.float32)
 
         with patch.object(
-            method,
-            "_quantize_weight_nvfp4",
+            nvfp4_online,
+            "quantize_nvfp4_weight",
             return_value=(fp4_weight, weight_scale, weight_scale_2),
         ) as quantize:
-            weight_loader = method.get_online_weight_loader(
-                layer, original_weight_loader
+            weight_loader = nvfp4_online.make_nvfp4_online_weight_loader(
+                layer=layer,
+                original_weight_loader=original_weight_loader,
+                layer_prefix="mtp.layers.0.mixer.experts",
             )
             weight_loader(
                 param,
@@ -267,15 +269,12 @@ class TestModelOptNvfp4(CustomTestCase):
             layer.w13_weight_scale_2,
         )
 
-    def test_online_modelopt_config_rejects_fp8_source_weight(self):
-        method = object.__new__(ModelOptNvFp4OnlineFusedMoEMethod)
-        method.quant_config = ModelOptFp4Config(
-            is_checkpoint_nvfp4_serialized=False,
-            group_size=16,
-            use_per_token_activation=False,
+    def test_online_loader_rejects_fp8_without_dequantizer(self):
+        weight_loader = nvfp4_online.make_nvfp4_online_weight_loader(
+            layer=SimpleNamespace(),
+            original_weight_loader=MagicMock(),
+            layer_prefix="mtp.layers.0.mlp.experts",
         )
-        method.layer_log_name = "mtp.layers.0.mlp.experts"
-        weight_loader = method.get_online_weight_loader(SimpleNamespace(), MagicMock())
 
         with self.assertRaisesRegex(ValueError, "does not declare serialized FP8"):
             weight_loader(
@@ -285,6 +284,27 @@ class TestModelOptNvfp4(CustomTestCase):
                 "w2",
                 None,
             )
+
+    def test_online_modelopt_method_uses_standalone_loader(self):
+        method = object.__new__(ModelOptNvFp4FusedMoEMethod)
+        method.quant_config = ModelOptFp4Config(group_size=16)
+        layer = SimpleNamespace()
+        original_weight_loader = MagicMock()
+        sentinel = object()
+
+        with patch.object(
+            nvfp4_online,
+            "make_nvfp4_online_weight_loader",
+            return_value=sentinel,
+        ) as make_loader:
+            self.assertIs(
+                method.prepare_weight_loader(layer, original_weight_loader), sentinel
+            )
+
+        make_loader.assert_called_once_with(
+            layer=layer,
+            original_weight_loader=original_weight_loader,
+        )
 
 
 if __name__ == "__main__":

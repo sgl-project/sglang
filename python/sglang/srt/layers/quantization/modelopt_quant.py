@@ -1416,9 +1416,6 @@ class ModelOptFp4Config(ModelOptQuantConfig):
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        from sglang.srt.layers.quantization.nvfp4_online import (
-            ModelOptNvFp4OnlineFusedMoEMethod,
-        )
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         if not self.is_checkpoint_nvfp4_serialized:
@@ -1429,7 +1426,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if isinstance(layer, FusedMoE):
                 if self.is_layer_excluded(prefix):
                     return None
-                return ModelOptNvFp4OnlineFusedMoEMethod(self, prefix)
+                return ModelOptNvFp4FusedMoEMethod(self)
             return None
 
         return self._get_quant_method(
@@ -2066,13 +2063,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         return self.enable_flashinfer_cutedsl_moe and not self._is_cutedsl_v1_deepep
 
     def prepare_weight_loader(self, layer, weight_loader):
-        """Return the loader for ordinary serialized ModelOpt FP4 tensors."""
-        if not self.quant_config.is_checkpoint_nvfp4_serialized:
-            raise ValueError(
-                "The ordinary ModelOpt FP4 method requires serialized NVFP4 "
-                "weights; floating MoE weights require its online-weight loader."
-            )
-        return weight_loader
+        if self.quant_config.is_checkpoint_nvfp4_serialized:
+            return weight_loader
+        from sglang.srt.layers.quantization.nvfp4_online import (
+            make_nvfp4_online_weight_loader,
+        )
+
+        return make_nvfp4_online_weight_loader(
+            layer=layer,
+            original_weight_loader=weight_loader,
+        )
 
     def _uses_serialized_fp8_source(self) -> bool:
         # ModelOptFp4Config intentionally has no FP8-source state. The online
