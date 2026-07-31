@@ -117,11 +117,16 @@ def main() -> None:
     expected_config = {
         "height": 480,
         "width": 832,
+        "num_frame_first_block": 1,
         "num_frame_per_block": 4,
+        "denoising_step_list": [1000, 750, 500, 250],
+        "denoising_step_list_first_block": [1000, 750, 500, 250],
+        "guidance_scale": 0.0,
         "local_attn_size": 32,
         "sink_size": 8,
         "rope_position_mode": "block_relative",
         "rope_max_frame_gap": 12,
+        "prompt_first_frame_pin_enabled": True,
         "action_type": "primitive_token_residual",
         "action_output_format": "primitive_float",
         "action_effective_ratio": 0.0,
@@ -130,11 +135,22 @@ def main() -> None:
     actual_config = {
         "height": int(pipeline.config.height),
         "width": int(pipeline.config.width),
+        "num_frame_first_block": int(pipeline.config.num_frame_first_block),
         "num_frame_per_block": int(pipeline.config.num_frame_per_block),
+        "denoising_step_list": list(pipeline.config.denoising_step_list),
+        "denoising_step_list_first_block": list(
+            pipeline.config.denoising_step_list_first_block
+        ),
+        "guidance_scale": float(pipeline.config.guidance_scale),
         "local_attn_size": int(pipeline.config.generator_config.local_attn_size),
         "sink_size": int(pipeline.config.generator_config.sink_size),
         "rope_position_mode": str(pipeline.config.generator_config.rope_position_mode),
         "rope_max_frame_gap": int(pipeline.config.generator_config.rope_max_frame_gap),
+        "prompt_first_frame_pin_enabled": bool(
+            pipeline.config.multi_shot_config["condition_switch"][
+                "prompt_first_frame_pin_enabled"
+            ]
+        ),
         "action_type": str(pipeline.config.action_config.type),
         "action_output_format": str(processor.action_output_format),
         "action_effective_ratio": float(processor.action_effective_ratio),

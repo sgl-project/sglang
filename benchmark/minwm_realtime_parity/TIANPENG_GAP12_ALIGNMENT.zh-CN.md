@@ -2,7 +2,8 @@
 
 更新时间：2026-07-31
 
-状态：实现与 CPU 语义门已完成；GPU 全量 1089 帧对齐待本页“实测结果”补齐。
+状态：实现与 CPU 语义门已完成；L40S 全量 1089 帧诊断已完成，但尚未达到
+数值对齐；B200/B300 同机原生 baseline 门正在等待 Local Zone Spot 容量。
 
 ## 1. 本次对齐对象
 
@@ -249,15 +250,53 @@ python3 python/sglang/multimodal_gen/tools/convert_minwm_checkpoint.py \
 
 ## 8. GPU 实测结果
 
-待完整运行后补充：
+### 8.1 L40S 诊断
 
-- SGLang commit 与容器 image；
-- GPU、实例、AZ；
-- 1089 帧是否完整；
-- PSNR / SSIM；
-- block/chunk 吞吐与 TTFF；
-- 是否达到 decoded-video numerical parity；
-- GPU 资源是否已释放。
+已在单张 L40S 上完成 69 chunk / 1089 帧：
+
+| 项目 | 结果 |
+| --- | --- |
+| PSNR | 20.829439 dB |
+| SSIM | 0.580779 |
+| 端到端 wall time | 243.277 秒 |
+| 原始视频帧吞吐 | 4.48 FPS |
+| 稳态 chunk | 约 3.2 秒 / 16 视频帧 |
+| DiT | 约 2.08 秒 / chunk |
+| peak GPU memory | 约 33.3 GiB |
+
+结果页：
+
+<https://leap-world-us-east-2.s3.us-east-2.amazonaws.com/world-model/sft/prompt_compare/detailmix_director_gap12_20260729_094145/sglang-alignment/20260731-l40s-02/index.html>
+
+这个结果与先前 B300 诊断几乎相同，说明差异不是 L40S/B300 硬件本身造成的。
+该运行用完整 `pip install` 启动 SGLang，数值依赖从基线镜像的
+Torch 2.12 / Transformers 4.56 / Diffusers 0.35 漂到了
+Torch 2.11 / Transformers 5.12 / Diffusers 0.37，因此它只能定位“仍有差异”，
+不能作为最终同依赖栈 parity 结论。
+
+### 8.2 同机、同依赖栈强门
+
+新增一个双容器 Job，固定使用与天鹏运行相同的不可变镜像；两个容器各申请一张
+GPU，并在同一台 8×B200/B300 节点上串行执行：
+
+1. MinWM `4220c8a` 原生 `DirectedSession` 重放 69 个 block；
+2. SGLang 使用同一份 checkpoint、donor、Torch、Transformers、Diffusers 和
+   FlashAttention 重放同一请求；
+3. 对两路 `uint8` 原始 RGB 逐值比较，再生成“已发布 baseline / 原生 MinWM /
+   SGLang”三路同步播放页。
+
+节点资源划分为：
+
+| 用途 | GPU |
+| --- | ---: |
+| Realtime Studio 临时实例 | 1 |
+| 原生 MinWM baseline | 1 |
+| SGLang parity | 1 |
+| 保留给其他任务 | 5 |
+
+目标是 `us-east-1-atl-2a` 的 Local Zone Spot
+`p6-b200.48xlarge / p6-b300.48xlarge`。截至本次记录时间，Karpenter 正在因
+`UnfulfillableCapacity` 重试；不能把 Pending 状态误报为已经完成对齐。
 
 ## 9. 交给克君部署前的检查
 
