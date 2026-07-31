@@ -65,7 +65,7 @@ def _load_from_tensors_req() -> LoadLoRAAdapterFromTensorsReqInput:
     return LoadLoRAAdapterFromTensorsReqInput(
         lora_name="adapter_a",
         config_dict={"r": 8},
-        serialized_tensors="",
+        serialized_named_tensors=[b"tp0-bytes"],
     )
 
 
