@@ -115,6 +115,21 @@ git_clone_with_retry() {
   return 1
 }
 
+# Detect ROCm version inside the CI container to select the correct
+# compressed-tensors extra (rocm_legacy=0.15.0 vs rocm_rock=0.16.0).
+# Same detection pattern used by the AITER and MORI blocks below.
+CI_ROCM_VERSION=$(docker exec ci_sglang bash -c 'cat $ROCM_HOME/.info/version 2>/dev/null || cat /opt/rocm/.info/version 2>/dev/null || echo unknown')
+echo "Detected ROCm version inside container: ${CI_ROCM_VERSION}"
+
+if [[ "${CI_ROCM_VERSION}" != "unknown" ]] && \
+   [[ "$(printf '%s\n' "7.15.0" "${CI_ROCM_VERSION}" | sort -V | head -n1)" == "7.15.0" ]]; then
+  CT_EXTRA="rocm_rock"
+else
+  CT_EXTRA="rocm_legacy"
+fi
+echo "Using compressed-tensors extra: ${CT_EXTRA}"
+EXTRAS="${EXTRAS},${CT_EXTRA}"
+
 # Install checkout sglang
 if [ -n "$SKIP_SGLANG_BUILD" ]; then
   echo "Didn't build checkout SGLang"
