@@ -10,7 +10,9 @@ and the sigmoid-gated output RMSNorm.
 Kernel body vendored from the NVIDIA x Moonshot Kimi K3 optimization package
 (see csrc/attention/kda_fused_decode.cuh for provenance and the list of
 integration patches). Specialized for the K3 KDA decode regime:
-H = HV = 12, K = V = 128, kernel width 4, no lower bound, T = 1 per request.
+K = V = 128, kernel width 4, no lower bound, T = 1 per request.
+The JIT currently instantiates local head counts H = HV in {12, 6, 3}
+(TP8, TP16, and TP32).
 
 The model must hand off the output-norm gate (attempt-and-verify stash on the
 attention layer, see kimi_k3.py), and a covered() check gates supported inputs.
@@ -33,9 +35,7 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-_H = 12  # q/k/v heads per rank (TP8) — the compiled static layout
-_SEG = _H * 128  # 1536: per-segment width of q, k and v
-_CONV_DIM = 3 * _SEG
+_SUPPORTED_HEADS = {3, 6, 12}
 _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
 
 
@@ -60,25 +60,30 @@ def covered(
     cache_indices: torch.Tensor,
     onorm_g: torch.Tensor,
 ) -> bool:
-    """The kernel is compiled for the K3 KDA decode regime: 12 heads of 128,
-    packed [T, 4608] qkv rows, transposed [slots, 3, 4608] conv pool, fp32
-    [slots, 12, 128, 128] ssm pool (inner-contiguous, any slot pitch — the
+    """The kernel is compiled for the K3 KDA decode regime: H heads of 128,
+    packed [T, 3*H*128] qkv rows, transposed [slots, 3, 3*H*128] conv pool, fp32
+    [slots, H, 128, 128] ssm pool (inner-contiguous, any slot pitch — the
     kernel reads the real slot stride), one token per request."""
-    if mixed_qkv.ndim != 2 or mixed_qkv.shape[-1] != _CONV_DIM:
+    if ssm_states.ndim < 4:
         return False
-    HV, V, K = ssm_states.shape[-3:]
+    H, V, K = ssm_states.shape[-3:]
+    if H not in _SUPPORTED_HEADS:
+        return False
+    seg = H * 128
+    conv_dim = 3 * seg
+    if mixed_qkv.ndim != 2 or mixed_qkv.shape[-1] != conv_dim:
+        return False
     return (
-        HV == _H
-        and V == 128
+        V == 128
         and K == 128
         and a.ndim == 2
-        and a.shape[-1] == _SEG
+        and a.shape[-1] == seg
         and b.ndim == 2
-        and b.shape[-1] == _H
+        and b.shape[-1] == H
         and onorm_g.ndim == 2
-        and onorm_g.shape[-1] == _SEG
+        and onorm_g.shape[-1] == seg
         and conv_states.ndim == 3
-        and conv_states.shape[-2:] == (_CONV_STATE_W, _CONV_DIM)
+        and conv_states.shape[-2:] == (_CONV_STATE_W, conv_dim)
         and mixed_qkv.dtype == torch.bfloat16
         and a.dtype == torch.bfloat16
         and b.dtype == torch.bfloat16
@@ -129,7 +134,9 @@ def kda_fused_decode(
     attention output [1, B, HV, V] (the packed-decode output layout).
     Caller must have checked covered()."""
     B = mixed_qkv.shape[0]
-    out = torch.empty((B, _SEG), dtype=torch.bfloat16, device=mixed_qkv.device)
+    H = ssm_states.shape[-3]
+    seg = H * 128
+    out = torch.empty((B, seg), dtype=torch.bfloat16, device=mixed_qkv.device)
     _jit_kda_fused_decode_module().run(
         mixed_qkv,
         a,
@@ -145,7 +152,7 @@ def kda_fused_decode(
         onorm_weight,
         # Pass the pool view as-is (already [slots, HV, V, K]); the kernel
         # binding reads its real slot stride via state.stride(0). A
-        # .view(-1, _H, 128, 128) here would break on envelope-strided pools
+        # .view(-1, H, 128, 128) here would break on envelope-strided pools
         # (unified / page-major) — the reshape can't fold a non-dense slot
         # pitch and would raise / silently copy.
         ssm_states,
@@ -156,4 +163,4 @@ def kda_fused_decode(
         float(lower_bound) if lower_bound is not None else 0.0,
         lower_bound is not None,
     )
-    return out.view(1, B, _H, 128)
+    return out.view(1, B, H, 128)
