@@ -52,3 +52,24 @@ python -m sglang.launch_server \
   --port 30000 \
   --chat-template ./my_model_template.jinja
 ```
+## Sanitizing User Content in Chat Templates
+
+Chat templates can opt in to safer tokenization of user-provided message content
+with the `sanitize_content` Jinja filter. This prevents strings inside user
+content that look like special tokens (e.g., `<|im_end|>`) from being tokenized
+as the model's special tokens.
+
+Only apply this filter to user-controlled content, not to the template's own
+control tokens or role markers:
+
+```jinja Chat Template
+{%- for message in messages %}
+    {{- '<|im_start|>' + message.role + '\n' -}}
+    {{- message.content | sanitize_content -}}
+    {{- '<|im_end|>\n' -}}
+{%- endfor %}
+```
+
+Do not sanitize the template markers themselves. The filter is explicit opt-in:
+templates that do not use `sanitize_content` keep the existing HuggingFace chat
+template behavior.
