@@ -24,6 +24,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+LOGIT_BIAS_SPARSE_ENTRY_FACTOR = 16
+
+
+def _use_sparse_logit_bias(num_entries: int, batch_size: int, vocab_size: int) -> bool:
+    return 0 < num_entries * LOGIT_BIAS_SPARSE_ENTRY_FACTOR <= batch_size * vocab_size
+
+
+def _materialize_logit_bias(
+    bias: Optional[torch.Tensor],
+    rows: Optional[torch.Tensor],
+    token_ids: Optional[torch.Tensor],
+    batch_size: int,
+    vocab_size: int,
+    device: str,
+) -> Optional[torch.Tensor]:
+    if bias is None or rows is None:
+        return bias
+    dense = torch.zeros(batch_size, vocab_size, dtype=bias.dtype, device=device)
+    dense[rows, token_ids] = bias
+    return dense
+
 
 @dataclasses.dataclass
 class SamplingBatchInfo:
@@ -82,6 +103,9 @@ class SamplingBatchInfo:
 
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
+    logit_bias_rows: Optional[torch.Tensor] = None
+    logit_bias_token_ids: Optional[torch.Tensor] = None
+    logit_bias_rows_cpu: Optional[List[int]] = None
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -132,13 +156,41 @@ class SamplingBatchInfo:
             else None
         )
 
+        num_bias_entries = sum(
+            len(req.sampling_params.logit_bias or {}) for req in reqs
+        )
         logit_bias = None
-        if any(r.sampling_params.logit_bias is not None for r in reqs):
+        logit_bias_rows = None
+        logit_bias_token_ids = None
+        logit_bias_rows_cpu = None
+        use_sparse_logit_bias = getattr(
+            global_server_args, "speculative_algorithm", None
+        ) is None and _use_sparse_logit_bias(num_bias_entries, len(reqs), vocab_size)
+        if use_sparse_logit_bias:
+            logit_bias_rows_cpu = []
+            token_ids = []
+            values = []
+            for row, req in enumerate(reqs):
+                if req.sampling_params.logit_bias is not None:
+                    for token_id, value in req.sampling_params.logit_bias.items():
+                        logit_bias_rows_cpu.append(row)
+                        token_ids.append(int(token_id))
+                        values.append(value)
+            logit_bias = torch.tensor(values, dtype=torch.float, pin_memory=_pin).to(
+                device, non_blocking=True
+            )
+            logit_bias_rows = torch.tensor(
+                logit_bias_rows_cpu, dtype=torch.long, pin_memory=_pin
+            ).to(device, non_blocking=True)
+            logit_bias_token_ids = torch.tensor(
+                token_ids, dtype=torch.long, pin_memory=_pin
+            ).to(device, non_blocking=True)
+        elif num_bias_entries:
             logit_bias = torch.zeros(len(reqs), vocab_size, device=device)
-            for i, r in enumerate(reqs):
-                if r.sampling_params.logit_bias is not None:
-                    for key, value in r.sampling_params.logit_bias.items():
-                        logit_bias[i, int(key)] = value
+            for row, req in enumerate(reqs):
+                if req.sampling_params.logit_bias is not None:
+                    for token_id, value in req.sampling_params.logit_bias.items():
+                        logit_bias[row, int(token_id)] = value
 
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
@@ -214,6 +266,9 @@ class SamplingBatchInfo:
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
             logit_bias=logit_bias,
+            logit_bias_rows=logit_bias_rows,
+            logit_bias_token_ids=logit_bias_token_ids,
+            logit_bias_rows_cpu=logit_bias_rows_cpu,
             return_sampling_masks=return_sampling_masks,
             sampling_mask_max_top_k=sampling_mask_max_top_k,
         )
@@ -298,7 +353,12 @@ class SamplingBatchInfo:
             self.grammar_mask.apply(logits)
 
         if self.logit_bias is not None:
-            logits.add_(self.logit_bias)
+            if self.logit_bias_rows is None:
+                logits.add_(self.logit_bias)
+            else:
+                logits[
+                    self.logit_bias_rows, self.logit_bias_token_ids
+                ] += self.logit_bias
 
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)
@@ -318,7 +378,50 @@ class SamplingBatchInfo:
                 setattr(self, item, value[keep_indices_device])
 
         if self.logit_bias is not None:
-            self.logit_bias = self.logit_bias[keep_indices_device]
+            if self.logit_bias_rows_cpu is None:
+                self.logit_bias = self.logit_bias[keep_indices_device]
+            else:
+                entries_by_row = {}
+                for entry, row in enumerate(self.logit_bias_rows_cpu):
+                    entries_by_row.setdefault(row, []).append(entry)
+                entry_indices = []
+                new_rows = []
+                for new_row, old_row in enumerate(keep_indices):
+                    selected = entries_by_row.get(old_row, [])
+                    entry_indices.extend(selected)
+                    new_rows.extend([new_row] * len(selected))
+
+                if not entry_indices:
+                    self.logit_bias = None
+                    self.logit_bias_rows = None
+                    self.logit_bias_token_ids = None
+                    self.logit_bias_rows_cpu = None
+                else:
+                    entry_indices_device = torch.tensor(
+                        entry_indices, dtype=torch.long, device=self.logit_bias.device
+                    )
+                    self.logit_bias = self.logit_bias[entry_indices_device]
+                    self.logit_bias_token_ids = self.logit_bias_token_ids[
+                        entry_indices_device
+                    ]
+                    self.logit_bias_rows_cpu = new_rows
+                    self.logit_bias_rows = torch.tensor(
+                        new_rows, dtype=torch.long, device=self.logit_bias.device
+                    )
+                    if not _use_sparse_logit_bias(
+                        len(new_rows), len(keep_indices), self.vocab_size
+                    ):
+                        self.logit_bias = _materialize_logit_bias(
+                            self.logit_bias,
+                            self.logit_bias_rows,
+                            self.logit_bias_token_ids,
+                            len(keep_indices),
+                            self.vocab_size,
+                            self.device,
+                        )
+                        self.logit_bias_rows = None
+                        self.logit_bias_token_ids = None
+                        self.logit_bias_rows_cpu = None
         if self.return_sampling_masks is not None:
             self.return_sampling_masks = [
                 self.return_sampling_masks[i] for i in keep_indices
@@ -412,11 +515,76 @@ class SamplingBatchInfo:
         self_len = len(self)
         other_len = len(other)
 
-        # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
-        # See note below on len(self) and len(other).
-        self.logit_bias = merge_bias_tensor(
-            self.logit_bias, other.logit_bias, self_len, other_len, self.device, 0.0
-        )
+        # Merge logit bias before temperatures, because __len__ uses temperatures.
+        self_sparse = self.logit_bias_rows_cpu is not None
+        other_sparse = other.logit_bias_rows_cpu is not None
+        if (self.logit_bias is None or self_sparse) and (
+            other.logit_bias is None or other_sparse
+        ):
+            biases = []
+            token_ids = []
+            rows_cpu = []
+            if self_sparse:
+                biases.append(self.logit_bias)
+                token_ids.append(self.logit_bias_token_ids)
+                rows_cpu.extend(self.logit_bias_rows_cpu)
+            if other_sparse:
+                biases.append(other.logit_bias)
+                token_ids.append(other.logit_bias_token_ids)
+                rows_cpu.extend([row + self_len for row in other.logit_bias_rows_cpu])
+
+            if not biases:
+                self.logit_bias = None
+                self.logit_bias_rows = None
+                self.logit_bias_token_ids = None
+                self.logit_bias_rows_cpu = None
+            else:
+                self.logit_bias = torch.cat(biases)
+                self.logit_bias_token_ids = torch.cat(token_ids)
+                self.logit_bias_rows_cpu = rows_cpu
+                self.logit_bias_rows = torch.tensor(
+                    rows_cpu, dtype=torch.long, device=self.logit_bias.device
+                )
+                if not _use_sparse_logit_bias(
+                    len(rows_cpu), self_len + other_len, self.vocab_size
+                ):
+                    self.logit_bias = _materialize_logit_bias(
+                        self.logit_bias,
+                        self.logit_bias_rows,
+                        self.logit_bias_token_ids,
+                        self_len + other_len,
+                        self.vocab_size,
+                        self.device,
+                    )
+                    self.logit_bias_rows = None
+                    self.logit_bias_token_ids = None
+                    self.logit_bias_rows_cpu = None
+        else:
+            self.logit_bias = merge_bias_tensor(
+                _materialize_logit_bias(
+                    self.logit_bias,
+                    self.logit_bias_rows,
+                    self.logit_bias_token_ids,
+                    self_len,
+                    self.vocab_size,
+                    self.device,
+                ),
+                _materialize_logit_bias(
+                    other.logit_bias,
+                    other.logit_bias_rows,
+                    other.logit_bias_token_ids,
+                    other_len,
+                    other.vocab_size,
+                    other.device,
+                ),
+                self_len,
+                other_len,
+                self.device,
+                0.0,
+            )
+            self.logit_bias_rows = None
+            self.logit_bias_token_ids = None
+            self.logit_bias_rows_cpu = None
         if (
             self.return_sampling_masks is not None
             or other.return_sampling_masks is not None
