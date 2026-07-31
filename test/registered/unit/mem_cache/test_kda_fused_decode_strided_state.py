@@ -159,9 +159,7 @@ class TestKdaFusedDecodeStridedState(unittest.TestCase):
                 # .view(...).is_contiguous() would reject this and drop decode
                 # to the unfused chain.
                 self.assertTrue(
-                    covered(
-                        mixed_qkv, a, b, conv_states, ssm, cache_indices, onorm_g
-                    ),
+                    covered(mixed_qkv, a, b, conv_states, ssm, cache_indices, onorm_g),
                     "covered() rejected the envelope-strided ssm pool (fused decode "
                     "would silently fall back to the unfused chain)",
                 )
