@@ -42,13 +42,24 @@ case "${SERVER_MODE}" in
       --speculative-num-draft-tokens "${DRAFT_TOKENS}"
     )
     ;;
+  eagle)
+    SPECULATIVE_ALGORITHM="DECODE_VERIFY_ROLLBACK_EAGLE"
+    DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-${MODEL_PATH}}"
+    DRAFT_TOKENS="${DRAFT_TOKENS:-2}"
+    spec_args+=(
+      --enable-deterministic-inference
+      --speculative-algorithm "${SPECULATIVE_ALGORITHM}"
+      --speculative-draft-model-path "${DRAFT_MODEL_PATH}"
+      --speculative-num-draft-tokens "${DRAFT_TOKENS}"
+    )
+    ;;
   *)
-    echo "SERVER_MODE must be normal, deterministic, or self." >&2
+    echo "SERVER_MODE must be normal, deterministic, self, or eagle." >&2
     exit 2
     ;;
 esac
 
-if [[ "${SERVER_MODE}" == "self" ]]; then
+if [[ "${SERVER_MODE}" =~ ^(self|eagle)$ ]]; then
   if ((DRAFT_TOKENS < 2)); then
     echo "DRAFT_TOKENS must be at least 2." >&2
     exit 2

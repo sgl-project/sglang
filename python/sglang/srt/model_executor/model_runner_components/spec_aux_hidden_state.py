@@ -55,7 +55,11 @@ def _resolve_eagle_aux_hidden_state(
     is_draft_worker: bool,
 ) -> None:
     if (
-        (spec_algorithm.is_eagle() or spec_algorithm.is_standalone())
+        (
+            spec_algorithm.is_eagle()
+            or spec_algorithm.is_dvr_eagle()
+            or spec_algorithm.is_standalone()
+        )
         and not is_draft_worker
         and server_args.speculative_draft_model_path
     ):

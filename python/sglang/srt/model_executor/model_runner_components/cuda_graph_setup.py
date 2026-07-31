@@ -169,7 +169,10 @@ def capture_prefill_graph(
     # captures FULL for EAGLE target in PrefillCudaGraphRunner.__init__
     # (restored from #25795), so it does NOT need this skip.
     if (
-        model_runner.spec_algorithm.is_eagle()
+        (
+            model_runner.spec_algorithm.is_eagle()
+            or model_runner.spec_algorithm.is_dvr_eagle()
+        )
         and not model_runner.is_draft_worker
         and not model_runner.server_args.enable_return_hidden_states
         and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
