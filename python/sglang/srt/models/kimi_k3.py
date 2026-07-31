@@ -130,11 +130,11 @@ def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-# MegaMoE SiTU sentinel: DeepGEMM 0.1.5.post1+ selects the K3 SiTU
+# MegaMoE SiTU sentinel: the patched deep_gemm mega kernel selects the K3 SiTU
 # activation when activation_clamp == 0.03125 (2^-5: exactly representable and
 # unused by any legitimate swiglu clamp; the host asserts clamp >= 0 so a
 # negative sentinel is impossible). beta=4.0 / linear_beta=25.0 are baked into
-# the DeepGEMM kernel.
+# the kernel patch — see p0-wideep/scripts/v2/apply_deepgemm_situ_patch.py.
 _K3_MEGA_SITU_SENTINEL_CLAMP = 0.03125
 
 
@@ -468,9 +468,9 @@ class KimiK3MoE(nn.Module):
         # through it when enabled — the megamoe backend's non-mega fallback is
         # a StandardDispatcher without a2a, which is wrong for scattered
         # tokens — so SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK must
-        # cover the per-rank prefill chunk. SiTU is selected inside the
-        # DeepGEMM mega kernel via a sentinel activation_clamp with the K3
-        # constants baked in.
+        # cover the per-rank prefill chunk. SiTU is selected inside the patched
+        # mega kernel via a sentinel activation_clamp with the K3 constants
+        # baked in (see p0-wideep scripts/v2/apply_deepgemm_situ_patch.py).
         self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
         self._mega_intermediate_size = moe_intermediate_size
         self._mega_top_k = config.num_experts_per_token
@@ -742,8 +742,9 @@ class KimiK3MoE(nn.Module):
             buf,
             recipe=(1, 1, 32),
             activation="swiglu",
-            # Sentinel: selects the K3 SiTU branch in the DeepGEMM mega kernel
-            # (beta=4.0 / linear_beta=25.0 baked in).
+            # sentinel: selects the K3 SiTU branch in the patched mega kernel
+            # (beta=4.0 / linear_beta=25.0 baked in); see
+            # p0-wideep/scripts/v2/apply_deepgemm_situ_patch.py
             activation_clamp=_K3_MEGA_SITU_SENTINEL_CLAMP,
             fast_math=True,
         )
