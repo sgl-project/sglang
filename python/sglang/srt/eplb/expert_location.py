@@ -560,8 +560,11 @@ def _compute_logical_to_all_physical_map(
                 physical_expert_id
             )
 
-    # Replace by the physical expert on local GPU or node if possible
-    if moe_ep_rank is not None:
+    # Replace by the physical expert on local GPU or node if possible. Skipped
+    # without an a2a backend, where all EP ranks must agree on the pick: this
+    # collapse is per-rank, and the full candidate list is what lets the dispatch
+    # spread a hot expert over its replicas. See ExpertLocationDispatchInfo.
+    if moe_ep_rank is not None and server_args.moe_a2a_backend != "none":
         num_local_gpu_physical_experts = num_physical_experts // ep_size
         prefer_same_node = _prefer_same_node_experts(server_args)
         num_gpus_per_node = (

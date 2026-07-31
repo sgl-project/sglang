@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -241,7 +242,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
-        self.cuda_graph_custom_mask = None
+        self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
@@ -356,19 +357,24 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
-        if self.num_draft_tokens and not self.skip_prefill and not self.is_draft_runner:
-            # Worst-case FULL_MASK tree-mask scratch (bool); build_tree writes it
-            # in-place so the gpu_only path needs no seq_lens_sum.
-            self.cuda_graph_custom_mask = torch.zeros(
-                max_num_tokens * (self.max_context_len + self.num_draft_tokens),
-                dtype=torch.bool,
-                device=self.device,
-            )
+        # Target verify never reaches the parent's mask read: it is excluded from
+        # every super() dispatch (init_forward_metadata, _out_graph, forward_extend)
+        # and runs the trtllm-gen kernel, which takes no mask.
+        self._verify_mask = maybe_create_verify_mask(
+            is_draft_runner=self.is_draft_runner,
+            skip_prefill=self.skip_prefill,
+            max_bs=max_bs,
+            max_context_len=self.max_context_len,
+            num_draft_tokens=self.num_draft_tokens,
+            device=self.device,
+            is_read=False,
+        )
 
         super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        return [self.cuda_graph_custom_mask, None]
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     def _init_cuda_graph_metadata(
         self,
