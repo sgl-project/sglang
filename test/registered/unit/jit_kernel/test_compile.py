@@ -10,6 +10,7 @@ no compiler or GPU is required.
 
 import contextlib
 import pathlib
+import re
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -245,6 +246,38 @@ class TestStagedJitBuild(CustomTestCase):
             mock_tvm.load_module.assert_called_once_with(str(final_so))
             self.assertEqual(result, ("loaded", str(final_so)))
 
+    def test_library_published_during_the_compile_is_kept_and_loaded(self):
+        """A library that appears mid compile is kept, and this host loads it.
+
+        Two hosts start cold at the same time and the other host publishes
+        while this host is still compiling. This host must leave the published
+        library alone, because another host may already have loaded it, and it
+        must load that published copy instead of its own staged one.
+        """
+        with _jit_test_env(hostname="host-a") as (cache_dir, mock_cpp, mock_tvm):
+            shared = _shared_dir(cache_dir, "midflightmod")
+            build_staged_so = mock_cpp.build_inline.side_effect
+
+            def _build_then_other_host_publishes(name, **kwargs):
+                staged_so = build_staged_so(name, **kwargs)
+                shared.mkdir(parents=True, exist_ok=True)
+                (shared / f"{name}.so").write_bytes(b"published-by-host-b")
+                return staged_so
+
+            mock_cpp.build_inline.side_effect = _build_then_other_host_publishes
+
+            result = jit_compile.load_jit("midflightmod")
+
+            final_so = shared / "sgl_kernel_jit_midflightmod.so"
+            self.assertEqual(final_so.read_bytes(), b"published-by-host-b")
+            mock_tvm.load_module.assert_called_once_with(str(final_so))
+            self.assertEqual(result, ("loaded", str(final_so)))
+            # The staged copy is cleaned up rather than left behind.
+            staging = shared / "stage__host-a"
+            self.assertEqual(
+                sorted(entry.name for entry in staging.iterdir()), ["lock"]
+            )
+
     def test_lost_race_publish_loads_the_published_target(self):
         """A rank whose staged file was already published loads the target.
 
@@ -318,8 +351,31 @@ class TestStagedJitBuild(CustomTestCase):
             self.assertEqual(jit_compile._host_tag(), "node_1_gpu_cluster")
         with patch("socket.gethostname", return_value="node-1.example.com"):
             self.assertEqual(jit_compile._host_tag(), "node-1.example.com")
-        with patch("socket.gethostname", return_value=""):
-            self.assertEqual(jit_compile._host_tag(), "unknown-host")
+
+    def test_host_tag_falls_back_when_hostname_is_unavailable(self):
+        """A host name lookup that fails or is empty must not break the build.
+
+        The fallback stays unique to this process on purpose. One fixed
+        fallback name would put every host that cannot report a name back into
+        a single shared staging directory, which is exactly the cross host
+        build race this staging step exists to prevent.
+        """
+        for failure in (
+            {"return_value": ""},
+            {"side_effect": OSError("host name lookup is not permitted")},
+        ):
+            with self.subTest(failure=failure):
+                with patch("socket.gethostname", **failure):
+                    tag = jit_compile._host_tag()
+
+                    # Recognizable, but not a value another host can share.
+                    self.assertTrue(tag.startswith("unknown-host"))
+                    self.assertNotEqual(tag, "unknown-host")
+                    # Still a usable directory name.
+                    self.assertIsNotNone(re.fullmatch(r"[0-9A-Za-z._-]+", tag))
+                    # Stable within this process, so repeated loads on one
+                    # host reuse a single staging directory.
+                    self.assertEqual(tag, jit_compile._host_tag())
 
 
 if __name__ == "__main__":

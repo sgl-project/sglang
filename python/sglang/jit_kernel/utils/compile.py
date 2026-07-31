@@ -10,6 +10,7 @@ import pathlib
 import re
 import shutil
 import socket
+import uuid
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Tuple, TypeAlias, Union
 
@@ -170,10 +171,34 @@ def _jit_build_dir_name(module_name: str) -> str:
     return f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}"
 
 
+# Used when this process cannot get a host name from the operating system.
+# The random part keeps the value unique to this process, and it is computed
+# once so that every build in this process still shares one staging directory.
+_UNKNOWN_HOST_TAG = f"unknown-host_{uuid.uuid4().hex}"
+
+
 def _host_tag() -> str:
-    """Filesystem-safe per-host tag used to keep staging build dirs host-private."""
-    hostname = socket.gethostname() or "unknown-host"
-    return re.sub(r"[^0-9A-Za-z._-]", "_", hostname)
+    """Filesystem safe per host tag that keeps staging build dirs host private.
+
+    Some containerized, sandboxed or otherwise restricted environments refuse
+    the host name lookup, so a failure here falls back to a value that is
+    unique to this process instead of one fixed name. A single fixed fallback
+    name would put every host that cannot report a name back into one shared
+    staging directory, which is the cross host build race this staging step
+    exists to prevent. The price of the unique fallback is one extra compile
+    per process on such a host, on a cold cache only, which is far cheaper
+    than a failed startup.
+    """
+    try:
+        hostname = socket.gethostname()
+    except Exception:
+        logger.debug(
+            "Could not read the host name for the JIT staging directory. "
+            "Falling back to a name that is unique to this process.",
+            exc_info=True,
+        )
+        hostname = ""
+    return re.sub(r"[^0-9A-Za-z._-]", "_", hostname or _UNKNOWN_HOST_TAG)
 
 
 def _publish_first_wins(staged_so: pathlib.Path, target_so: pathlib.Path) -> None:
