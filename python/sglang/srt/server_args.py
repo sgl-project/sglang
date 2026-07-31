@@ -3422,6 +3422,11 @@ class ServerArgs:
         self._resolved_overrides = []
 
         self._handle_return_hidden_states_mode()
+
+        # Reject an explicitly enabled but incompatible hardware runtime before
+        # model path resolution, downloads, or the dummy-model short circuit.
+        self._handle_hardware_runtime_validation()
+
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -4170,6 +4175,13 @@ class ServerArgs:
                     "torch_native" if is_host_cpu_arm64() else "intel_amx"
                 )
             self.sampling_backend = "pytorch"
+
+    def _handle_hardware_runtime_validation(self):
+        # This is intentionally independent of self.device: setting
+        # SGLANG_USE_MLX opts into the MLX backend and must fail immediately if
+        # the environment cannot honor that request. With the flag unset,
+        # use_mlx() remains lazy and does not import MLX.
+        use_mlx()
 
     def _handle_npu_backends(self):
         if self.device == "npu":
