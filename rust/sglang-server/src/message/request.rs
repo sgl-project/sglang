@@ -486,6 +486,10 @@ fn fan_out<T: OneOrManyItem + Clone + HeapBytes>(
 mod tests {
     use super::*;
 
+    /// Vocab size for tests that aren't about the vocab bound (see
+    /// `sampling::tests::TEST_VOCAB`).
+    const TEST_VOCAB: u64 = 1000;
+
     fn requests(body: &str) -> Result<(Vec<GenerateRequest>, bool), Error> {
         serde_json::from_str::<GenerateBody>(body)
             .unwrap()
@@ -558,7 +562,7 @@ mod tests {
         // Parallel sampling is rejected where Python reads it — in the params,
         // at normalization (the ingress step), not here.
         let (mut ps, _) = requests(r#"{"text": "a", "sampling_params": {"n": 2}}"#).unwrap();
-        assert!(ps[0].sampling_params.normalize(false, None).is_err());
+        assert!(ps[0].sampling_params.normalize(false, TEST_VOCAB).is_err());
     }
 
     /// Unported `GenerateReqInput` fields are IGNORED, not rejected.
