@@ -44,9 +44,9 @@ Both entries dispatch to one of:
 import math
 from typing import Optional
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cuda.bindings.driver as cuda
 import torch
 from cutlass.cute.runtime import from_dlpack
 
@@ -170,6 +170,11 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     per_request_accepted_steps: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     per_token_pool_scatter_flat: cutlass.Constexpr[bool],
+    replayssm_rawv: cute.Tensor,
+    replayssm_rawk: cute.Tensor,
+    replayssm_g: cute.Tensor,
+    replayssm_beta: cute.Tensor,
+    CACHE_RING: cutlass.Constexpr[bool],
 ):
     """MTP kernel (ILP=4) for BF16 state — higher occupancy at small batch.
 
@@ -212,6 +217,7 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     # h0_source[(cache_idx, i_hv, None, None)] uses cute's stride-aware addressing
     # and works correctly regardless of the per-slot stride. See PR #3268.
     cache_idx = h0_indices[i_n]
+    ring_slot = cache_idx
     if cutlass.const_expr(same_pool):
         # Single-pool: alias write to read; nvcc DCEs the write-side LDG /
         # IMAD / local_tile entirely in this compile path.
@@ -300,6 +306,18 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                     )
                     cute.autovec_copy(k_tile_pre, r_k_bf16)
 
+                    if cutlass.const_expr(CACHE_RING):
+                        if ring_slot >= 0 and i_v == 0:
+                            if i_hv % (HV // H) == 0:
+                                for i in cutlass.range_constexpr(vec_size):
+                                    replayssm_rawk[
+                                        (ring_slot, i_h, i_t_pre, k_start + i)
+                                    ] = r_k_bf16[i]
+                            for i in cutlass.range_constexpr(vec_size):
+                                replayssm_rawv[
+                                    (ring_slot, i_hv, i_t_pre, k_start + i)
+                                ] = v[(i_n, i_t_pre, i_hv, k_start + i)]
+
                     if cutlass.const_expr(not disable_output):
                         for i in cutlass.range_constexpr(vec_size):
                             r_q[i] = cutlass.Float32(r_q_bf16[i])
@@ -372,6 +390,10 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                         if lane_in_group == 0:
                             sGB[(i_t_pre, 0)] = r_g_pre
                             sGB[(i_t_pre, 1)] = r_beta_pre
+                        if cutlass.const_expr(CACHE_RING):
+                            if ring_slot >= 0 and i_v == 0 and lane_in_group == 0:
+                                replayssm_g[(ring_slot, i_hv, i_t_pre)] = r_g_value_pre
+                                replayssm_beta[(ring_slot, i_hv, i_t_pre)] = r_beta_pre
 
                 cute.arch.barrier()
 
@@ -895,6 +917,11 @@ def gdn_wide_vec_kernel(
     per_request_accepted_steps: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     per_token_pool_scatter_flat: cutlass.Constexpr[bool],
+    replayssm_rawv: cute.Tensor,
+    replayssm_rawk: cute.Tensor,
+    replayssm_g: cute.Tensor,
+    replayssm_beta: cute.Tensor,
+    CACHE_RING: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     lane_in_warp = tidx % 32
@@ -952,6 +979,7 @@ def gdn_wide_vec_kernel(
     # h0_source[(cache_idx, i_hv, None, None)] uses cute's stride-aware addressing
     # and works correctly regardless of the per-slot stride. See PR #3268.
     cache_idx = h0_indices[i_n]
+    ring_slot = cache_idx
 
     r_A_log = cutlass.Float32(A_log[i_hv])
     r_dt_bias = cutlass.Float32(dt_bias[i_hv])
@@ -1120,6 +1148,18 @@ def gdn_wide_vec_kernel(
                     k, (1, 1, 1, vec), (i_n, i_t_pre, i_h, member_pre)
                 )
                 cute.autovec_copy(k_tile_pre, r_k_bf16)
+
+                if cutlass.const_expr(CACHE_RING):
+                    if ring_slot >= 0 and i_v == 0:
+                        if i_hv % (HV // H) == 0:
+                            for i in cutlass.range_constexpr(vec):
+                                replayssm_rawk[
+                                    (ring_slot, i_h, i_t_pre, k_start_pre + i)
+                                ] = r_k_bf16[i]
+                        for i in cutlass.range_constexpr(vec):
+                            replayssm_rawv[
+                                (ring_slot, i_hv, i_t_pre, k_start_pre + i)
+                            ] = v[(i_n, i_t_pre, i_hv, k_start_pre + i)]
                 if cutlass.const_expr(do_q_pass):
                     for i in cutlass.range_constexpr(vec):
                         r_q[i] = cutlass.Float32(r_q_bf16[i])
@@ -1186,9 +1226,8 @@ def gdn_wide_vec_kernel(
                     use_softplus_pre * softplus_val_pre
                     + (cutlass.Float32(1.0) - use_softplus_pre) * x_pre
                 )
-                r_g_pre = cute.exp(
-                    -cute.exp(r_A_log, fastmath=True) * softplus_x_pre, fastmath=True
-                )
+                r_g_value_pre = -cute.exp(r_A_log, fastmath=True) * softplus_x_pre
+                r_g_pre = cute.exp(r_g_value_pre, fastmath=True)
                 r_beta_pre = cutlass.Float32(1.0) / (
                     cutlass.Float32(1.0) + cute.exp(-r_b_pre, fastmath=True)
                 )
@@ -1196,6 +1235,10 @@ def gdn_wide_vec_kernel(
                 if lane_in_warp == 0:
                     sGB[(i_t_pre, 0)] = r_g_pre
                     sGB[(i_t_pre, 1)] = r_beta_pre
+                if cutlass.const_expr(CACHE_RING):
+                    if ring_slot >= 0 and i_v == 0 and lane_in_warp == 0:
+                        replayssm_g[(ring_slot, i_hv, i_t_pre)] = r_g_value_pre
+                        replayssm_beta[(ring_slot, i_hv, i_t_pre)] = r_beta_pre
 
             cute.arch.barrier()
 
@@ -2457,6 +2500,11 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     per_request_accepted_steps: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     per_token_pool_scatter_flat: cutlass.Constexpr[bool],
+    replayssm_rawv: cute.Tensor,
+    replayssm_rawk: cute.Tensor,
+    replayssm_g: cute.Tensor,
+    replayssm_beta: cute.Tensor,
+    CACHE_RING: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Launch the MTP kernel (ILP=4) for BF16 state."""
@@ -2513,6 +2561,11 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         per_request_accepted_steps,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
+        CACHE_RING,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[MTP_NUM_THREADS, 1, 1],
@@ -2561,6 +2614,11 @@ def _run_wide_vec(
     per_request_accepted_steps: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     per_token_pool_scatter_flat: cutlass.Constexpr[bool],
+    replayssm_rawv: cute.Tensor,
+    replayssm_rawk: cute.Tensor,
+    replayssm_g: cute.Tensor,
+    replayssm_beta: cute.Tensor,
+    CACHE_RING: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     # B derived dynamically from q (mark_compact_shape_dynamic on dim 0) so the
@@ -2609,6 +2667,11 @@ def _run_wide_vec(
         per_request_accepted_steps,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
+        CACHE_RING,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS, 1, 1],
@@ -2656,10 +2719,7 @@ def _run_wide_vec_t1(
     B = cute.size(q.shape[0])
     grid_size = B * HV * num_v_tiles
     smem_bytes = (
-        4 * T * (K + 8)  # sQ FP32
-        + 4 * T * (K + 8)  # sK FP32
-        + 4 * T * 3  # sGB
-        + 256
+        4 * T * (K + 8) + 4 * T * (K + 8) + 4 * T * 3 + 256  # sQ FP32  # sK FP32  # sGB
     )
     gdn_wide_vec_kernel_t1(
         h0_source,
@@ -2951,6 +3011,11 @@ def gated_delta_rule_mtp_wide_vec(
     tile_v: int = 128,
     disable_output: bool = False,
     recovery_steps: int = 0,
+    cache_ring: bool = False,
+    replayssm_rawv: Optional[torch.Tensor] = None,
+    replayssm_rawk: Optional[torch.Tensor] = None,
+    replayssm_g: Optional[torch.Tensor] = None,
+    replayssm_beta: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Wide-vector BF16 GDN MTP decode.
 
@@ -2981,9 +3046,45 @@ def gated_delta_rule_mtp_wide_vec(
     assert K_val == 128 and V_val == 128
     assert initial_state_source.dtype == torch.bfloat16
     assert tile_v in (32, 64, 128), f"tile_v must be 32/64/128, got {tile_v}"
-    assert V_val % tile_v == 0 and (tile_v // NUM_GROUPS) % ILP_ROWS == 0, (
-        f"tile_v={tile_v} incompatible with 8 groups × ILP=4 layout"
-    )
+    assert (
+        V_val % tile_v == 0 and (tile_v // NUM_GROUPS) % ILP_ROWS == 0
+    ), f"tile_v={tile_v} incompatible with 8 groups × ILP=4 layout"
+
+    if cache_ring:
+        assert replayssm_rawv is not None and replayssm_rawk is not None
+        assert replayssm_g is not None and replayssm_beta is not None
+        assert T_val >= 3, f"cache_ring requires T >= 3, got T={T_val}"
+        assert (
+            replayssm_rawv.dim() == 4
+            and replayssm_rawv.shape[1] == HV_val
+            and replayssm_rawv.shape[2] >= T_val
+            and replayssm_rawv.dtype == torch.bfloat16
+        ), "cache_ring: rawv must be a per-layer [slots, HV, >=T, V] bf16 view"
+        assert (
+            replayssm_rawk.dim() == 4
+            and replayssm_rawk.shape[1] == H_val
+            and replayssm_rawk.shape[2] >= T_val
+            and replayssm_rawk.dtype == torch.bfloat16
+        ), "cache_ring: rawk must be a per-layer [slots, H, >=T, K] bf16 view"
+        assert (
+            replayssm_g.dim() == 3
+            and replayssm_g.dtype == torch.float32
+            and replayssm_beta.dim() == 3
+            and replayssm_beta.dtype == torch.float32
+        ), "cache_ring: g/beta must be per-layer [slots, HV, >=T] fp32 views"
+    else:
+        replayssm_rawv = torch.zeros(
+            1, HV_val, T_val, V_val, device=q.device, dtype=torch.bfloat16
+        )
+        replayssm_rawk = torch.zeros(
+            1, H_val, T_val, K_val, device=q.device, dtype=torch.bfloat16
+        )
+        replayssm_g = torch.zeros(
+            1, HV_val, T_val, device=q.device, dtype=torch.float32
+        )
+        replayssm_beta = torch.zeros(
+            1, HV_val, T_val, device=q.device, dtype=torch.float32
+        )
 
     if scale is None:
         scale = 1.0 / math.sqrt(K_val)
@@ -3059,13 +3160,13 @@ def gated_delta_rule_mtp_wide_vec(
     )
 
     # Validate recovery_steps for fused recovery+decode mode.
-    assert 0 <= recovery_steps <= T_val, (
-        f"recovery_steps must be in [0, T={T_val}], got {recovery_steps}"
-    )
+    assert (
+        0 <= recovery_steps <= T_val
+    ), f"recovery_steps must be in [0, T={T_val}], got {recovery_steps}"
     if recovery_steps > 0:
-        assert not cache_intermediate_states, (
-            "recovery_steps > 0 is incompatible with intermediate state caching"
-        )
+        assert (
+            not cache_intermediate_states
+        ), "recovery_steps > 0 is incompatible with intermediate state caching"
         assert not disable_state_update, (
             "recovery_steps > 0 requires state writeback "
             "(disable_state_update=False); the boundary writeback at i_t=K-1 "
@@ -3085,12 +3186,12 @@ def gated_delta_rule_mtp_wide_vec(
     # accepted_steps[i] is the per-request phase boundary.
     per_request_accepted_steps = accepted_steps is not None
     if per_request_accepted_steps:
-        assert accepted_steps.shape == (B_val,), (
-            f"accepted_steps must have shape [B={B_val}], got {accepted_steps.shape}"
-        )
-        assert accepted_steps.dtype == torch.int32, (
-            f"accepted_steps must be int32, got {accepted_steps.dtype}"
-        )
+        assert accepted_steps.shape == (
+            B_val,
+        ), f"accepted_steps must have shape [B={B_val}], got {accepted_steps.shape}"
+        assert (
+            accepted_steps.dtype == torch.int32
+        ), f"accepted_steps must be int32, got {accepted_steps.dtype}"
         assert accepted_steps.device == q.device
 
     # FLA-style per-token pool scatter (vLLM API compat). When the public
@@ -3101,15 +3202,15 @@ def gated_delta_rule_mtp_wide_vec(
     # this entry point hit the same fail-fast errors.
     per_token_pool_scatter = ssm_state_indices is not None
     if per_token_pool_scatter:
-        assert intermediate_states_buffer is None, (
-            "ssm_state_indices and intermediate_states_buffer are mutually exclusive"
-        )
-        assert not disable_state_update, (
-            "ssm_state_indices requires state writes; disable_state_update must be False"
-        )
-        assert recovery_steps == 0, (
-            "ssm_state_indices + recovery_steps>0 not yet supported (MVP exclusion)"
-        )
+        assert (
+            intermediate_states_buffer is None
+        ), "ssm_state_indices and intermediate_states_buffer are mutually exclusive"
+        assert (
+            not disable_state_update
+        ), "ssm_state_indices requires state writes; disable_state_update must be False"
+        assert (
+            recovery_steps == 0
+        ), "ssm_state_indices + recovery_steps>0 not yet supported (MVP exclusion)"
         assert T_val >= 2, (
             f"ssm_state_indices requires T >= 2 (got T={T_val}); "
             f"for T=1 use output_state_indices"
@@ -3118,9 +3219,9 @@ def gated_delta_rule_mtp_wide_vec(
             f"ssm_state_indices must have shape [B={B_val}, T={T_val}], "
             f"got {tuple(ssm_state_indices.shape)}"
         )
-        assert ssm_state_indices.dtype == torch.int32, (
-            f"ssm_state_indices must be int32, got {ssm_state_indices.dtype}"
-        )
+        assert (
+            ssm_state_indices.dtype == torch.int32
+        ), f"ssm_state_indices must be int32, got {ssm_state_indices.dtype}"
         assert ssm_state_indices.device == q.device
 
     # Contiguous pool -> sentinel keys + slot dim marked dynamic (pool-size
@@ -3155,6 +3256,7 @@ def gated_delta_rule_mtp_wide_vec(
         per_request_accepted_steps,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
+        cache_ring,
     )
 
     if cache_key not in _compiled_kernels_wide_vec:
@@ -3205,6 +3307,17 @@ def gated_delta_rule_mtp_wide_vec(
             else _placeholder_ssm_state_indices
         )
 
+        if cache_ring:
+            rawv_ = _mark_slot_dynamic(replayssm_rawv)
+            rawk_ = _mark_slot_dynamic(replayssm_rawk)
+            g_ = _mark_slot_dynamic(replayssm_g)
+            beta_ = _mark_slot_dynamic(replayssm_beta)
+        else:
+            rawv_ = from_dlpack(replayssm_rawv, assumed_align=32, enable_tvm_ffi=True)
+            rawk_ = from_dlpack(replayssm_rawk, assumed_align=32, enable_tvm_ffi=True)
+            g_ = from_dlpack(replayssm_g, assumed_align=32, enable_tvm_ffi=True)
+            beta_ = from_dlpack(replayssm_beta, assumed_align=32, enable_tvm_ffi=True)
+
         _compiled_kernels_wide_vec[cache_key] = {
             "compiled": cute.compile(
                 _run_wide_vec,
@@ -3241,6 +3354,11 @@ def gated_delta_rule_mtp_wide_vec(
                 per_request_accepted_steps,
                 per_token_pool_scatter,
                 per_token_pool_scatter_flat,
+                rawv_,
+                rawk_,
+                g_,
+                beta_,
+                cache_ring,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
@@ -3295,6 +3413,10 @@ def gated_delta_rule_mtp_wide_vec(
         output_state_indices,
         accepted_steps_arg,
         ssm_state_indices_arg,
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
         stream,
     )
     return output
@@ -3354,9 +3476,9 @@ def gated_delta_rule_t1_wide_vec(
     assert K_val == 128 and V_val == 128
     assert initial_state_source.dtype == torch.bfloat16
     assert tile_v in (32, 64, 128), f"tile_v must be 32/64/128, got {tile_v}"
-    assert V_val % tile_v == 0 and (tile_v // NUM_GROUPS) % ILP_ROWS == 0, (
-        f"tile_v={tile_v} incompatible with 8 groups × ILP=4 layout"
-    )
+    assert (
+        V_val % tile_v == 0 and (tile_v // NUM_GROUPS) % ILP_ROWS == 0
+    ), f"tile_v={tile_v} incompatible with 8 groups × ILP=4 layout"
 
     if scale is None:
         scale = 1.0 / math.sqrt(K_val)
@@ -3562,6 +3684,11 @@ def gated_delta_rule_mtp(
     output: Optional[torch.Tensor] = None,
     disable_output: bool = False,
     recovery_steps: int = 0,
+    cache_ring: bool = False,
+    replayssm_rawv: Optional[torch.Tensor] = None,
+    replayssm_rawk: Optional[torch.Tensor] = None,
+    replayssm_g: Optional[torch.Tensor] = None,
+    replayssm_beta: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     GDN MTP (Multiple Token Processing) with BF16 state.
@@ -3608,6 +3735,34 @@ def gated_delta_rule_mtp(
         "Non-pool mode is no longer supported by the BF16 GDN MTP kernels."
     )
 
+    if cache_ring:
+        assert replayssm_rawv is not None and replayssm_rawk is not None
+        assert replayssm_g is not None and replayssm_beta is not None
+        assert T >= 3, f"cache_ring requires T >= 3, got T={T}"
+        assert (
+            replayssm_rawv.dim() == 4
+            and replayssm_rawv.shape[1] == HV
+            and replayssm_rawv.shape[2] >= T
+            and replayssm_rawv.dtype == torch.bfloat16
+        ), "cache_ring: rawv must be a per-layer [slots, HV, >=T, V] bf16 view"
+        assert (
+            replayssm_rawk.dim() == 4
+            and replayssm_rawk.shape[1] == H
+            and replayssm_rawk.shape[2] >= T
+            and replayssm_rawk.dtype == torch.bfloat16
+        ), "cache_ring: rawk must be a per-layer [slots, H, >=T, K] bf16 view"
+        assert (
+            replayssm_g.dim() == 3
+            and replayssm_g.dtype == torch.float32
+            and replayssm_beta.dim() == 3
+            and replayssm_beta.dtype == torch.float32
+        ), "cache_ring: g/beta must be per-layer [slots, HV, >=T] fp32 views"
+    else:
+        replayssm_rawv = torch.zeros(1, HV, T, V, device=q.device, dtype=torch.bfloat16)
+        replayssm_rawk = torch.zeros(1, H, T, K, device=q.device, dtype=torch.bfloat16)
+        replayssm_g = torch.zeros(1, HV, T, device=q.device, dtype=torch.float32)
+        replayssm_beta = torch.zeros(1, HV, T, device=q.device, dtype=torch.float32)
+
     if scale is None:
         scale = 1.0 / math.sqrt(K)
 
@@ -3631,9 +3786,9 @@ def gated_delta_rule_mtp(
             f"intermediate_states_buffer dim 0 ({buffer_size}) must equal "
             f"batch size B={B}; the buffer is batch-scoped, not pool-scoped"
         )
-        assert cache_steps >= T, (
-            f"intermediate_states_buffer dim 1 ({cache_steps}) must be >= T={T}"
-        )
+        assert (
+            cache_steps >= T
+        ), f"intermediate_states_buffer dim 1 ({cache_steps}) must be >= T={T}"
         assert intermediate_states_buffer.dtype == torch.bfloat16
         intermediate_states = intermediate_states_buffer.reshape(
             B * cache_steps * HV, V, K
@@ -3664,28 +3819,28 @@ def gated_delta_rule_mtp(
     # results/2026-06-03/FLA_SCATTER_MODE_PLAN.md.
     per_token_pool_scatter = ssm_state_indices is not None
     if per_token_pool_scatter:
-        assert intermediate_states_buffer is None, (
-            "ssm_state_indices and intermediate_states_buffer are mutually exclusive"
-        )
-        assert not disable_state_update, (
-            "ssm_state_indices requires state writes; disable_state_update must be False"
-        )
-        assert recovery_steps == 0, (
-            "ssm_state_indices + recovery_steps>0 not yet supported (MVP exclusion)"
-        )
-        assert T >= 2, (
-            f"ssm_state_indices requires T >= 2 (got T={T}); for T=1 use output_state_indices"
-        )
+        assert (
+            intermediate_states_buffer is None
+        ), "ssm_state_indices and intermediate_states_buffer are mutually exclusive"
+        assert (
+            not disable_state_update
+        ), "ssm_state_indices requires state writes; disable_state_update must be False"
+        assert (
+            recovery_steps == 0
+        ), "ssm_state_indices + recovery_steps>0 not yet supported (MVP exclusion)"
+        assert (
+            T >= 2
+        ), f"ssm_state_indices requires T >= 2 (got T={T}); for T=1 use output_state_indices"
         assert ssm_state_indices.shape == (B, T), (
             f"ssm_state_indices must have shape [B={B}, T={T}], "
             f"got {tuple(ssm_state_indices.shape)}"
         )
-        assert ssm_state_indices.dtype == torch.int32, (
-            f"ssm_state_indices must be int32, got {ssm_state_indices.dtype}"
-        )
-        assert ssm_state_indices.device == q.device, (
-            f"ssm_state_indices device {ssm_state_indices.device} != q device {q.device}"
-        )
+        assert (
+            ssm_state_indices.dtype == torch.int32
+        ), f"ssm_state_indices must be int32, got {ssm_state_indices.dtype}"
+        assert (
+            ssm_state_indices.device == q.device
+        ), f"ssm_state_indices device {ssm_state_indices.device} != q device {q.device}"
 
     # Dispatch to the wide_vec kernel when work_units (B*HV) amortizes its
     # lower per-CTA parallelism. ``_select_wide_vec_tile_v`` picks tile_v
@@ -3740,6 +3895,11 @@ def gated_delta_rule_mtp(
             tile_v=wv_tile_v,
             disable_output=disable_output,
             recovery_steps=recovery_steps,
+            cache_ring=cache_ring,
+            replayssm_rawv=replayssm_rawv,
+            replayssm_rawk=replayssm_rawk,
+            replayssm_g=replayssm_g,
+            replayssm_beta=replayssm_beta,
         )
 
     # Wide_vec didn't fire (work_units < 128 at T>=2, or T=1 small batch
@@ -3759,12 +3919,12 @@ def gated_delta_rule_mtp(
     # Per-request K opt-in (see gated_delta_rule_mtp_wide_vec for full rationale).
     per_request_accepted_steps = accepted_steps is not None
     if per_request_accepted_steps:
-        assert accepted_steps.shape == (B,), (
-            f"accepted_steps must have shape [B={B}], got {accepted_steps.shape}"
-        )
-        assert accepted_steps.dtype == torch.int32, (
-            f"accepted_steps must be int32, got {accepted_steps.dtype}"
-        )
+        assert accepted_steps.shape == (
+            B,
+        ), f"accepted_steps must have shape [B={B}], got {accepted_steps.shape}"
+        assert (
+            accepted_steps.dtype == torch.int32
+        ), f"accepted_steps must be int32, got {accepted_steps.dtype}"
         assert accepted_steps.device == q.device
 
     # Contiguous pool -> sentinel keys + slot dim marked dynamic (pool-size
@@ -3799,6 +3959,7 @@ def gated_delta_rule_mtp(
         per_request_accepted_steps,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
+        cache_ring,
     )
 
     if cache_key not in _compiled_kernels_mtp:
@@ -3849,6 +4010,17 @@ def gated_delta_rule_mtp(
             else _placeholder_ssm_state_indices
         )
 
+        if cache_ring:
+            rawv_ = _mark_slot_dynamic(replayssm_rawv)
+            rawk_ = _mark_slot_dynamic(replayssm_rawk)
+            g_ = _mark_slot_dynamic(replayssm_g)
+            beta_ = _mark_slot_dynamic(replayssm_beta)
+        else:
+            rawv_ = from_dlpack(replayssm_rawv, assumed_align=32, enable_tvm_ffi=True)
+            rawk_ = from_dlpack(replayssm_rawk, assumed_align=32, enable_tvm_ffi=True)
+            g_ = from_dlpack(replayssm_g, assumed_align=32, enable_tvm_ffi=True)
+            beta_ = from_dlpack(replayssm_beta, assumed_align=32, enable_tvm_ffi=True)
+
         _compiled_kernels_mtp[cache_key] = {
             "compiled": cute.compile(
                 run_gdn_decode_bf16state_mtp_ilp4,
@@ -3884,6 +4056,11 @@ def gated_delta_rule_mtp(
                 per_request_accepted_steps,
                 per_token_pool_scatter,
                 per_token_pool_scatter_flat,
+                rawv_,
+                rawk_,
+                g_,
+                beta_,
+                cache_ring,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
@@ -3932,6 +4109,10 @@ def gated_delta_rule_mtp(
         output_state_indices,
         accepted_steps_arg,
         ssm_state_indices_arg,
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
         stream,
     )
 

@@ -188,6 +188,7 @@ class GDNKernelDispatcher:
             self.verify_kernel = flashinfer_kernel
         else:
             self.verify_kernel = triton_kernel
+        self.verify_kernel_is_flashinfer = self.verify_kernel is flashinfer_kernel
 
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False
@@ -712,9 +713,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query_start_loc: torch.Tensor,
         retrieve_parent_token: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Recurrent verify + fused ring-write; the commit fold replays the
-        accepted prefix into ``temporal``. Called directly, not via the kernel
-        dispatcher: the ring-write exists only in the Triton kernel."""
+        """Ring-writing verify; the commit fold replays the accepted prefix
+        into ``temporal``. Uses the vendored CuTe DSL MTP kernel when the
+        dispatcher selected the FlashInfer bf16-state verify, else the Triton
+        recurrent kernel (both store the same raw window)."""
         from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
             fused_sigmoid_gating_delta_rule_update,
         )
@@ -723,6 +725,38 @@ class GDNAttnBackend(MambaAttnBackendBase):
             "ReplaySSM fold-every-commit supports a linear draft chain only "
             "(topk <= 1); EAGLE tree verify must use the recurrent verify."
         )
+        if (
+            self.kernel_dispatcher.verify_kernel_is_flashinfer
+            and ssm_states.dtype == torch.bfloat16
+        ):
+            from sglang.kernels.ops.attention.cutedsl_gdn_mtp_ring import (
+                gated_delta_rule_mtp,
+            )
+
+            seq_len = query.shape[1]
+            batch_size = query_start_loc.shape[0] - 1
+            draft_token_num = seq_len // batch_size
+            num_v_heads = value.shape[2]
+            head_v_dim = value.shape[3]
+            out = gated_delta_rule_mtp(
+                A_log=layer.A_log.detach(),
+                a=a.view(batch_size, draft_token_num, num_v_heads),
+                dt_bias=layer.dt_bias.detach(),
+                q=query.view(batch_size, draft_token_num, *query.shape[2:]),
+                k=key.view(batch_size, draft_token_num, *key.shape[2:]),
+                v=value.view(batch_size, draft_token_num, num_v_heads, head_v_dim),
+                b=b.view(batch_size, draft_token_num, num_v_heads),
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                use_qk_l2norm_in_kernel=True,
+                disable_state_update=True,
+                cache_ring=True,
+                replayssm_rawv=layer_cache.replayssm_rawv,
+                replayssm_rawk=layer_cache.replayssm_rawk,
+                replayssm_g=layer_cache.replayssm_g,
+                replayssm_beta=layer_cache.replayssm_beta,
+            )
+            return out.view(1, seq_len, num_v_heads, head_v_dim)
         return fused_sigmoid_gating_delta_rule_update(
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
