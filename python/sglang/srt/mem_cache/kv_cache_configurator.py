@@ -678,6 +678,12 @@ class KVCacheConfigurator:
             enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
             mamba_size=self.server_args.max_mamba_cache_size,
             start_layer=self.layer_info.start_layer,
+            linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
+            mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
+            enable_gdn_replayssm_spec=(
+                self.server_args.enable_gdn_replayssm_spec
+                and self.hybrid_gdn_config is not None
+            ),
         )
         return req_to_token_pool
 
@@ -734,10 +740,6 @@ class KVCacheConfigurator:
             enable_linear_replayssm=self.server_args.enable_linear_replayssm,
             linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
             mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
-            # ReplaySSM spec-verify is GDN-only: activate the pool machinery
-            # (rings + cursors + the intermediate_ssm gate) only for GDN-hybrid
-            # models, so any other mamba-ish model (Mamba2/Nemotron, lightning,
-            # ...) run with the flag set stays byte-identical to flag-off.
             enable_gdn_replayssm_spec=(
                 self.server_args.enable_gdn_replayssm_spec
                 and self.hybrid_gdn_config is not None
@@ -1727,6 +1729,24 @@ class KVCacheConfigurator:
         assert config is not None
 
         has_spec_dec = not self.spec_algorithm.is_none()
+        # The ring is allocated per slot but is not part of mamba_cache_per_req;
+        # the solve must charge it too or num_slots is over-provisioned.
+        replayssm_active = (
+            server_args.enable_gdn_replayssm_spec and self.hybrid_gdn_config is not None
+        )
+        if replayssm_active:
+            record_len = (
+                server_args.max_speculative_num_draft_tokens
+                if server_args.max_speculative_num_draft_tokens is not None
+                else server_args.linear_replayssm_cache_len
+            )
+            replayssm_ring_per_req = (
+                config.mamba2_cache_params.replayssm_ring_bytes_per_req(
+                    record_len=record_len
+                )
+            )
+        else:
+            replayssm_ring_per_req = 0
         if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
@@ -1739,7 +1759,7 @@ class KVCacheConfigurator:
                 // self.ps.attn_dp_size,
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1 padding slot)
-            if has_spec_dec:
+            if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     server_args.max_running_requests // self.ps.attn_dp_size,
@@ -1762,7 +1782,7 @@ class KVCacheConfigurator:
                 // self.ps.attn_dp_size,
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1 padding slot)
-            if has_spec_dec:
+            if has_spec_dec and not replayssm_active:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
                     * (server_args.max_mamba_cache_size + 1)
@@ -1784,7 +1804,7 @@ class KVCacheConfigurator:
             )
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
-            if has_spec_dec:
+            if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
                 D = server_args.speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
@@ -1804,9 +1824,12 @@ class KVCacheConfigurator:
                 intermediate_size = per_req * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
+                per_slot = per_req + replayssm_ring_per_req
                 server_args.override(
                     "mamba_pool.memory_budget",
-                    max_mamba_cache_size=int((mamba_budget_bytes - per_req) // per_req),
+                    max_mamba_cache_size=int(
+                        (mamba_budget_bytes - per_slot) // per_slot
+                    ),
                 )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
@@ -1828,7 +1851,7 @@ class KVCacheConfigurator:
         # +1: the pool's padding slot
         mamba_state_memory = (
             (server_args.max_mamba_cache_size + 1)
-            * config.mamba2_cache_params.mamba_cache_per_req
+            * (config.mamba2_cache_params.mamba_cache_per_req + replayssm_ring_per_req)
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory

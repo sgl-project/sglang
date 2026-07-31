@@ -485,12 +485,13 @@ class MambaPool:
         self.debug_memory_pool = envs.SGLANG_DEBUG_MEMORY_POOL.get()
         self.enable_linear_replayssm = enable_linear_replayssm
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
-        # ReplaySSM spec-verify (Part B of #28511) REUSES the linear_replayssm ring
-        # (replayssm_d/k/g + write_pos) and ADDS two per-slot cursors
-        # (replayssm_cache_base + replayssm_is_flush). Enabling the spec-verify path
-        # therefore implies the ring, so the d/k/g + write_pos allocation gates on
-        # `_replayssm_on` (either flag). GDN-only is enforced upstream + below.
+        # ReplaySSM: the decode ring (--enable-linear-replayssm) allocates the
+        # chunked (d, k) records + write_pos; the spec-verify flag
+        # (--enable-gdn-replayssm-spec) always uses fold-every-commit and
+        # allocates only the raw (v, k, g, beta) window -- no chunked records,
+        # no cursors. The shared g allocation gates on `_replayssm_on`.
         self.enable_gdn_replayssm_spec = enable_gdn_replayssm_spec
+        self.replayssm_spec_fold = bool(enable_gdn_replayssm_spec)
         _replayssm_on = enable_linear_replayssm or enable_gdn_replayssm_spec
 
         # for disagg with nvlink
@@ -587,23 +588,32 @@ class MambaPool:
                 # SSM dtype to halve the ring traffic. g stays fp32 everywhere
                 # (exact-fold input). The two flags are mutually exclusive.
                 ring_dtype = conv_dtype if enable_gdn_replayssm_spec else ssm_dtype
-                replayssm_d = torch.zeros(
-                    size=(num_mamba_layers, num_slots, hv, L, v_dim),
-                    dtype=ring_dtype,
-                    device=device,
-                )
-                replayssm_k = torch.zeros(
-                    size=(num_mamba_layers, num_slots, h_k, L, k_dim),
-                    dtype=ring_dtype,
-                    device=device,
-                )
+                # Fold-every-commit: one verify window, no chunked (d, k) records.
+                if self.replayssm_spec_fold:
+                    record_len = (
+                        speculative_num_draft_tokens
+                        if speculative_num_draft_tokens is not None
+                        else L
+                    )
+                else:
+                    record_len = L
+                    replayssm_d = torch.zeros(
+                        size=(num_mamba_layers, num_slots, hv, L, v_dim),
+                        dtype=ring_dtype,
+                        device=device,
+                    )
+                    replayssm_k = torch.zeros(
+                        size=(num_mamba_layers, num_slots, h_k, L, k_dim),
+                        dtype=ring_dtype,
+                        device=device,
+                    )
                 # The log-decay gate ring (fp32): per-head SCALAR for the GDN
-                # gate -> [.., L]; per-K VECTOR for the KDA gate -> [.., L, K]
-                # (k_dim == temporal_state_shape[-1] for both).
+                # gate -> [.., record_len]; per-K VECTOR for the KDA gate ->
+                # [.., record_len, K] (k_dim == temporal_state_shape[-1] for both).
                 g_shape = (
-                    (num_mamba_layers, num_slots, hv, L, k_dim)
+                    (num_mamba_layers, num_slots, hv, record_len, k_dim)
                     if cache_params.is_kda
-                    else (num_mamba_layers, num_slots, hv, L)
+                    else (num_mamba_layers, num_slots, hv, record_len)
                 )
                 replayssm_g = torch.zeros(
                     size=g_shape,
@@ -617,32 +627,18 @@ class MambaPool:
                 # (bit-identical to the recurrent baseline) instead of folding
                 # the chunked `d` records open-loop.
                 if enable_gdn_replayssm_spec:
-                    # Backstop for the spec-verify ring invariants; this pool
-                    # is sized with the final adaptive-aware draft maximum.
-                    if L & (L - 1) != 0:
-                        raise ValueError(
-                            f"spec-verify ring length must be a power of two, got {L}"
-                        )
-                    if (
-                        speculative_num_draft_tokens is not None
-                        and L < 2 * speculative_num_draft_tokens
-                    ):
-                        raise ValueError(
-                            f"spec-verify ring too small: {L} < "
-                            f"2 * {speculative_num_draft_tokens} (early-flush margin)"
-                        )
                     replayssm_rawv = torch.zeros(
-                        size=(num_mamba_layers, num_slots, hv, L, v_dim),
+                        size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
                         dtype=conv_dtype,
                         device=device,
                     )
                     replayssm_rawk = torch.zeros(
-                        size=(num_mamba_layers, num_slots, h_k, L, k_dim),
+                        size=(num_mamba_layers, num_slots, h_k, record_len, k_dim),
                         dtype=conv_dtype,
                         device=device,
                     )
                     replayssm_beta = torch.zeros(
-                        size=(num_mamba_layers, num_slots, hv, L),
+                        size=(num_mamba_layers, num_slots, hv, record_len),
                         dtype=torch.float32,
                         device=device,
                     )
@@ -790,10 +786,10 @@ class MambaPool:
                 )
             if _replayssm_on:
                 logger.info(
-                    f"GDN ReplaySSM ring buffers allocated (L="
-                    f"{linear_replayssm_cache_len}): "
-                    f"d={get_tensor_size_bytes(replayssm_d) / GB:.3f}GB, "
-                    f"k={get_tensor_size_bytes(replayssm_k) / GB:.3f}GB, "
+                    f"GDN ReplaySSM ring buffers allocated "
+                    f"(record_len={record_len}, fold={self.replayssm_spec_fold}): "
+                    f"d={get_tensor_size_bytes(replayssm_d) / GB if replayssm_d is not None else 0.0:.3f}GB, "
+                    f"k={get_tensor_size_bytes(replayssm_k) / GB if replayssm_k is not None else 0.0:.3f}GB, "
                     f"g={get_tensor_size_bytes(replayssm_g) / GB:.3f}GB "
                     + (
                         f"rawv={get_tensor_size_bytes(replayssm_rawv) / GB:.3f}GB, "
@@ -813,23 +809,21 @@ class MambaPool:
             # the worker (spec-verify ring). Index 0..size; reset on slot (re)alloc.
             self.replayssm_write_pos = (
                 torch.zeros((size + 1,), dtype=torch.int32, device=device)
-                if _replayssm_on
+                if _replayssm_on and not self.replayssm_spec_fold
                 else None
             )
             # ReplaySSM spec-verify (Part B of #28511) extra per-slot cursors. The
             # circular ring's rolling origin (cache_base) + the per-slot flush flag
             # (is_flush). Block-keyed (indexed by the physical mamba slot), shared by
             # all GDN layers of one verify step; advanced by commit_gdn_replayssm_spec.
-            # Only allocated for the spec-verify ring (the decode ring does not use
-            # a circular buffer); None otherwise.
             self.replayssm_cache_base = (
                 torch.zeros((size + 1,), dtype=torch.int32, device=device)
-                if enable_gdn_replayssm_spec
+                if enable_gdn_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
             self.replayssm_is_flush = (
                 torch.zeros((size + 1,), dtype=torch.int8, device=device)
-                if enable_gdn_replayssm_spec
+                if enable_gdn_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
