@@ -58,24 +58,16 @@ def should_ignore_layer(
             for shard_proj_name in shard_proj_names
         ]
 
-        # Layer should be ignored if shards are ignored.
-        should_ignore_layer = None
-        for shard_name in shard_names:
-            should_ignore_shard = check_equal_or_regex_match(
-                layer_name=shard_name, targets=ignore
-            )
-
-            # If shard_idx=0, set layer ignore to match shard.
-            if should_ignore_layer is None:
-                should_ignore_layer = should_ignore_shard
-
-            # If shard_idx=1+ confirm scheme matches prior shards.
-            elif should_ignore_shard != should_ignore_layer:
-                raise ValueError(
-                    f"Found different quantization schemes for "
-                    f"{shard_proj_names} in {layer_name}. SGLang "
-                    "requires all to use the same scheme."
-                )
+        # A fused layer is ignored (left unquantized) if ANY of its shards is
+        # listed in `ignore`. Requiring every shard to agree breaks models whose
+        # fused module legitimately has fewer shards on disk than the mapping
+        # lists: MiniMax-M3's DSA disables the index-value projection on layers
+        # 3+, so `index_v_proj` does not exist there while `index_q_proj` and
+        # `index_k_proj` are both excluded, which raised on an absent shard.
+        should_ignore_layer = any(
+            check_equal_or_regex_match(layer_name=shard_name, targets=ignore)
+            for shard_name in shard_names
+        )
 
     # Unfused layers like down_proj and o_proj will match
     # the safetensors checkpoint already.
