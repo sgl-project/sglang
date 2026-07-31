@@ -409,7 +409,33 @@ where
             let mut exit_reason = "upstream_end";
             let mut on_first_byte = on_first_byte;
             let mut s = stream;
-            while let Some(chunk) = s.next().await {
+            loop {
+                // Await the next upstream chunk, but break immediately if the
+                // client has disconnected. Without the `tx.closed()` arm, a pump
+                // blocked here on a stalled/slow upstream holds this request's
+                // entire state — the load + active-load guards, the read-ahead
+                // channel, and (when armed) the capture buffer — until
+                // STREAM_IDLE_TIMEOUT (~180 s) reaps it. Under a flood of clients
+                // that give up while upstreams aren't responding, ~180 s of that
+                // retained per-request state accumulates and walks the router
+                // into an OOM. Breaking on disconnect frees it in ~0 s. (The
+                // send-path `select!` below already covers a disconnect while
+                // blocked SENDING to a slow-but-connected client; this covers a
+                // disconnect while blocked RECEIVING from the upstream.)
+                let chunk = tokio::select! {
+                    biased;
+                    _ = tx.closed() => {
+                        tracing::debug!("SSE client disconnected while awaiting upstream");
+                        outcome_setter.lock().client_disconnect = true;
+                        exit_reason = "client_disconnect_await_upstream";
+                        set_abort_reason(&abort_reason_for_pump, AbortReason::StreamClientGone);
+                        break;
+                    }
+                    chunk = s.next() => match chunk {
+                        Some(chunk) => chunk,
+                        None => break,
+                    },
+                };
                 let item: Result<Bytes, std::io::Error> = chunk.map_err(|e| {
                     let msg = e.to_string();
                     tracing::warn!(error = %msg, "upstream SSE stream errored mid-flight");
@@ -1594,6 +1620,52 @@ mod tests {
         assert!(
             dropped.load(Ordering::SeqCst),
             "stalled upstream must release stream_guards via the idle timeout",
+        );
+    }
+
+    /// A client that disconnects while the upstream is STALLED (no bytes, not
+    /// ended) must release the stream guards immediately — via the client-
+    /// disconnect break, NOT by waiting out the (long) idle timeout. This is the
+    /// retention path that walks the router into an OOM under a flood of clients
+    /// giving up against non-responding upstreams: without the `tx.closed()` arm
+    /// on the upstream await, each such request pins its guards + buffers for the
+    /// full STREAM_IDLE_TIMEOUT.
+    #[tokio::test]
+    async fn client_disconnect_during_upstream_stall_releases_guards_promptly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard: Box<dyn Send + 'static> = Box::new(DropFlag(Arc::clone(&dropped)));
+
+        // Upstream that never yields a byte and never ends, wrapped in a LONG
+        // (10 s) idle timeout so the ONLY prompt release path is the client
+        // disconnect — not the idle timeout.
+        let stalled = idle_timeout_stream(
+            stream::pending::<Result<Bytes, std::io::Error>>(),
+            std::time::Duration::from_secs(10),
+        );
+        let body = bytes_stream_to_body(stalled, Some(guard), None, None, None, None);
+        // Client disconnects while the pump is blocked awaiting the upstream.
+        drop(body);
+
+        // The guard must drop well within the 10 s idle timeout.
+        for _ in 0..100 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "a client disconnect during an upstream stall must release guards \
+             promptly via the disconnect break, not wait for the idle timeout",
         );
     }
 
