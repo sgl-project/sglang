@@ -1,15 +1,23 @@
 //! Focused unit tests for the OpenAI endpoint adapters.
 
-use axum::http::StatusCode;
+use std::sync::Arc;
+
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::response::Response;
 use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
-use dynamo_protocols::types::responses::CreateResponse;
+use dynamo_protocols::types::responses::{CreateResponse, Status};
 use dynamo_protocols::types::{
     ChatCompletionRequestMessage, ChatCompletionToolChoiceOption, Choice,
     CreateChatCompletionRequest, CreateCompletionRequest, CreateCompletionResponse, Prompt,
 };
 use futures::StreamExt;
+use serde_json::json;
 use tokio::sync::mpsc;
+use tower::util::ServiceExt;
 
+use super::super::AppState;
 use super::super::guard::AbortGuard;
 use super::chat::{chat_event_stream, chat_logprobs, chat_sampling_params, unary_chat};
 use super::completions::{
@@ -17,12 +25,14 @@ use super::completions::{
     completion_response_value, unary_completion,
 };
 use super::new_response_store;
-use super::response_stream::responses_event_stream;
+use super::response_stream::{response_object, responses_event_stream};
 use super::responses::{responses_chat_request, unary_responses};
 use super::tools::{apply_tool_constraint, parse_chat_tool_calls};
+use super::{StoredResponse, routes, unix_seconds};
 use crate::ids::Rid;
 use crate::message::{ChunkEvent, ChunkExtras, EgressItem, SamplingParams};
-use crate::tokenizer_manager::Senders;
+use crate::runtime::ServerArgs;
+use crate::tokenizer_manager::{AbortSource, Senders};
 
 fn senders() -> Senders {
     Senders {
@@ -794,4 +804,360 @@ async fn streaming_responses_emits_function_call_events() {
     assert!(event_types.contains(&"response.function_call_arguments.done".into()));
     assert!(event_types.contains(&"response.output_item.done".into()));
     assert!(event_types.contains(&"response.completed".into()));
+}
+
+// ---------------------------------------------------------------------
+// Handler-level tests: full router, real extractors, no scheduler. A
+// request that reaches `submit` with an OPEN tm lane would wait on the
+// egress receiver forever, so submission-reaching cases use `senders_closed`
+// (503) and everything else fails validation before submit.
+// ---------------------------------------------------------------------
+
+fn server_args(api_key: Option<&str>) -> Arc<ServerArgs> {
+    let mut value = serde_json::json!({ "served_model_name": "model" });
+    if let Some(key) = api_key {
+        value["api_key"] = serde_json::json!(key);
+    }
+    Arc::new(serde_json::from_value(value).expect("ServerArgs must deserialize"))
+}
+
+fn app_state(senders: Senders, api_key: Option<&str>) -> AppState {
+    AppState {
+        senders,
+        egress_buf: 8,
+        server_args: server_args(api_key),
+        tokenizer: None,
+        chat_formatter: None,
+        chat_tokenizer: None,
+        response_store: new_response_store(),
+        egress_activity: Default::default(),
+    }
+}
+
+fn senders_closed() -> Senders {
+    // Dropping the receivers disconnects the channels; the senders stay
+    // valid (moveable) but every send reports `Err`, the shutdown state
+    // `submit` surfaces as a 503.
+    let (tm_tx, tm_rx) = flume::unbounded();
+    drop(tm_rx);
+    let (abort_tx, abort_rx) = flume::unbounded();
+    drop(abort_rx);
+    let (tok_tx, tok_rx) = flume::unbounded();
+    drop(tok_rx);
+    Senders {
+        tm: tm_tx,
+        abort: abort_tx,
+        tok: tok_tx,
+        detok: vec![],
+    }
+}
+
+fn senders_with_abort_rx() -> (Senders, flume::Receiver<AbortSource>) {
+    let (tm_tx, _tm_rx) = flume::unbounded();
+    let (abort_tx, abort_rx) = flume::unbounded();
+    let (tok_tx, _tok_rx) = flume::unbounded();
+    (
+        Senders {
+            tm: tm_tx,
+            abort: abort_tx,
+            tok: tok_tx,
+            detok: vec![],
+        },
+        abort_rx,
+    )
+}
+
+fn request(method: &str, path: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(path)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Serve one request through the full router (extractors, auth, routing).
+/// `with_state` consumes the state into a `Router<()>`, which is what
+/// implements `tower::Service`.
+async fn oneshot(app: Router<()>, req: Request<Body>) -> Response {
+    app.oneshot(req).await.unwrap()
+}
+
+async fn post_json(app: Router<()>, path: &str, body: serde_json::Value) -> Response {
+    let req = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    oneshot(app, req).await
+}
+
+async fn body_json(response: Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn bearer_auth_gates_openai_routes() {
+    let app = routes().with_state(app_state(senders_closed(), Some("sk-test")));
+    // Missing key → 401 on every endpoint, before any body handling.
+    for (method, path) in [
+        ("GET", "/v1/models"),
+        ("GET", "/v1/models/model"),
+        ("POST", "/v1/completions"),
+        ("POST", "/v1/chat/completions"),
+        ("POST", "/v1/responses"),
+        ("GET", "/v1/responses/resp_x"),
+        ("POST", "/v1/responses/resp_x/cancel"),
+    ] {
+        let response = oneshot(app.clone(), request(method, path)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}"
+        );
+    }
+    // Wrong key → 401.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/models")
+        .header("authorization", "Bearer wrong")
+        .body(Body::empty())
+        .unwrap();
+    let response = oneshot(app.clone(), req).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // Correct key passes auth: the closed tm inbox turns the submit into a
+    // 503, proving the request got past the gate (not a 401).
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer sk-test")
+        .body(Body::from(r#"{"model":"model","prompt":"hi"}"#))
+        .unwrap();
+    let response = oneshot(app.clone(), req).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    // /v1/models with the right key is fully served.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/models")
+        .header("authorization", "Bearer sk-test")
+        .body(Body::empty())
+        .unwrap();
+    let response = oneshot(app.clone(), req).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = body_json(response).await;
+    assert_eq!(value["data"][0]["id"], "model");
+}
+
+#[tokio::test]
+async fn completions_handler_validates_before_submit() {
+    let app = routes().with_state(app_state(senders(), None));
+    let cases = [
+        (json!({"model": "other", "prompt": "hi"}), "unknown model"),
+        (json!({"model": "model", "prompt": "hi", "n": 0}), "n=0"),
+        (
+            json!({"model": "model", "prompt": "hi", "max_tokens": 0}),
+            "max_tokens=0",
+        ),
+        (json!({"model": "model", "prompt": ""}), "empty prompt"),
+        (
+            json!({"model": "model", "prompt": "hi", "best_of": 2}),
+            "best_of>1",
+        ),
+        (
+            json!({"model": "model", "prompt": "hi", "suffix": "x"}),
+            "suffix",
+        ),
+        (
+            json!({"model": "model", "prompt": "hi", "prompt_embeds": [[1.0]]}),
+            "prompt_embeds",
+        ),
+    ];
+    for (body, label) in cases {
+        let response = post_json(app.clone(), "/v1/completions", body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+    }
+    // Malformed JSON → 400 (JsonRejection path).
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header("content-type", "application/json")
+        .body(Body::from("not json"))
+        .unwrap();
+    let response = oneshot(app.clone(), req).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // A closed tm inbox (shutdown) surfaces as 503.
+    let app = routes().with_state(app_state(senders_closed(), None));
+    let response = post_json(
+        app.clone(),
+        "/v1/completions",
+        json!({"model": "model", "prompt": "hi"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn chat_handler_validates_before_submit() {
+    let app = routes().with_state(app_state(senders(), None));
+    let cases = [
+        (
+            json!({"model": "other", "messages": [{"role": "user", "content": "hi"}]}),
+            "unknown model",
+        ),
+        (json!({"model": "model", "messages": []}), "empty messages"),
+        (
+            json!({"model": "model", "messages": [{"role": "user", "content": "hi"}], "n": 0}),
+            "n=0",
+        ),
+        (
+            json!({"model": "model", "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "http://example.com/x.png"}}]}]}),
+            "media content",
+        ),
+        (
+            json!({"model": "model", "messages": [{"role": "user", "content": "hi"}], "function_call": "auto"}),
+            "deprecated function_call",
+        ),
+        (
+            json!({"model": "model", "messages": [{"role": "user", "content": "hi"}], "audio": {"input_audio": {"data": "x", "format": "wav"}}}),
+            "audio",
+        ),
+        (
+            json!({"model": "model", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 0}),
+            "max_completion_tokens=0",
+        ),
+    ];
+    for (body, label) in cases {
+        let response = post_json(app.clone(), "/v1/chat/completions", body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+    }
+    // A valid request with no loaded chat template → 400 (template gate).
+    let response = post_json(
+        app.clone(),
+        "/v1/chat/completions",
+        json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn responses_handler_validates_before_submit() {
+    let app = routes().with_state(app_state(senders(), None));
+    let cases = [
+        (json!({"model": "other", "input": "hi"}), "unknown model"),
+        (
+            json!({"input": "hi", "max_output_tokens": 0}),
+            "max_output_tokens=0",
+        ),
+        (json!({"input": "hi", "conversation": {}}), "conversation"),
+        (json!({"input": "hi", "prompt": "x"}), "prompt template"),
+        (json!({"input": "hi", "include": ["reasoning"]}), "include"),
+        (
+            json!({"input": "hi", "max_tool_calls": 3}),
+            "max_tool_calls",
+        ),
+        (
+            json!({"input": "hi", "truncation": "auto"}),
+            "truncation auto",
+        ),
+        (
+            json!({"input": "hi", "reasoning": {"summary": "x"}}),
+            "reasoning summary",
+        ),
+        (
+            json!({"input": "hi", "previous_response_id": "nope"}),
+            "bad previous_response_id",
+        ),
+        (
+            json!({"input": [{"type": "item_reference", "item_id": "x"}]}),
+            "item reference",
+        ),
+        (json!({"input": []}), "empty input"),
+        (
+            json!({"input": "hi", "background": true, "stream": true}),
+            "background+stream",
+        ),
+    ];
+    for (body, label) in cases {
+        let response = post_json(app.clone(), "/v1/responses", body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+    }
+    // Unknown previous_response_id → 404 (store lookup).
+    let response = post_json(
+        app.clone(),
+        "/v1/responses",
+        json!({"input": "hi", "previous_response_id": "resp_missing"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // A valid request without a chat template → 400 (template gate).
+    let response = post_json(app.clone(), "/v1/responses", json!({"input": "hi"})).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn response_retrieve_and_cancel_lifecycle() {
+    let (senders, abort_rx) = senders_with_abort_rx();
+    let state = app_state(senders, None);
+    let app = routes().with_state(state.clone());
+
+    // Unknown / malformed ids.
+    let response = oneshot(app.clone(), request("GET", "/v1/responses/resp_missing")).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = oneshot(app.clone(), request("GET", "/v1/responses/nope")).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Seed an in-progress response directly: a background request would
+    // need a real scheduler behind the tm lane. `Rid::from_client` mints a
+    // fresh uniquified rid per call, so capture the one the store holds.
+    let seeded_rid = Rid::from_client("resp_seeded");
+    state.response_store.write().await.insert(
+        "resp_seeded".into(),
+        StoredResponse {
+            response: response_object(
+                "resp_seeded",
+                "model",
+                &response_request(false),
+                unix_seconds(),
+                Status::InProgress,
+                vec![],
+                None,
+            ),
+            messages: vec![],
+            rid: Some(seeded_rid.clone()),
+        },
+    );
+
+    // Retrieve returns the stored object.
+    let response = oneshot(app.clone(), request("GET", "/v1/responses/resp_seeded")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = body_json(response).await;
+    assert_eq!(value["object"], "response");
+    assert_eq!(value["status"], "in_progress");
+
+    // Cancel → Cancelled, and the abort reaches the scheduler lane.
+    let response = oneshot(
+        app.clone(),
+        request("POST", "/v1/responses/resp_seeded/cancel"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = body_json(response).await;
+    assert_eq!(value["status"], "cancelled");
+    assert!(matches!(abort_rx.try_recv(), Ok(AbortSource::Guard(rid)) if rid == seeded_rid));
+
+    // The store reflects the cancellation; cancelling again is a 400.
+    let response = oneshot(app.clone(), request("GET", "/v1/responses/resp_seeded")).await;
+    let value = body_json(response).await;
+    assert_eq!(value["status"], "cancelled");
+    let response = oneshot(
+        app.clone(),
+        request("POST", "/v1/responses/resp_seeded/cancel"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }

@@ -108,7 +108,7 @@ async fn cancel_response(
     if !matches!(stored.response.status, Status::Queued | Status::InProgress) {
         return openai_error(
             StatusCode::BAD_REQUEST,
-            "Cannot cancel a synchronous response.",
+            "Response is no longer cancellable.",
         );
     }
     stored.response.status = Status::Cancelled;

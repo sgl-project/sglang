@@ -8,7 +8,7 @@ use axum::{
     routing::get,
 };
 
-use super::{AppState, authorize, openai_error, unix_seconds};
+use super::{AppState, authorize, openai_error, unix_seconds_u32};
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
@@ -48,7 +48,7 @@ fn model_card(state: &AppState) -> serde_json::Value {
     serde_json::json!({
         "id": name,
         "object": "model",
-        "created": unix_seconds(),
+        "created": unix_seconds_u32(),
         "owned_by": "sglang",
         "root": name,
         "parent": serde_json::Value::Null,

@@ -191,58 +191,6 @@ pub(super) fn responses_event_stream(
                 continue;
             };
             for choice in response.choices {
-                if let Some(ChatCompletionMessageContent::Text(delta)) = choice.delta.content
-                    && !delta.is_empty()
-                {
-                    if open_message.is_none() {
-                        let item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-                        let output_index =
-                            u32::try_from(completed_items.len()).unwrap_or(u32::MAX);
-                        let pending = text_response_message(
-                            item_id.clone(),
-                            String::new(),
-                            OutputStatus::InProgress,
-                        );
-                        yield serialize_response_event(
-                            ResponseStreamEvent::ResponseOutputItemAdded(
-                                ResponseOutputItemAddedEvent {
-                                    sequence_number: sequence,
-                                    output_index,
-                                    item: pending,
-                                },
-                            ),
-                        );
-                        sequence += 1;
-                        yield serialize_response_event(
-                            ResponseStreamEvent::ResponseContentPartAdded(
-                                ResponseContentPartAddedEvent {
-                                    sequence_number: sequence,
-                                    item_id: item_id.clone(),
-                                    output_index,
-                                    content_index: 0,
-                                    part: text_output_content(String::new()),
-                                },
-                            ),
-                        );
-                        sequence += 1;
-                        open_message = Some((item_id, output_index, String::new()));
-                    }
-                    if let Some((item_id, output_index, text)) = open_message.as_mut() {
-                        text.push_str(&delta);
-                        yield serialize_response_event(
-                            ResponseStreamEvent::ResponseOutputTextDelta(ResponseTextDeltaEvent {
-                                sequence_number: sequence,
-                                item_id: item_id.clone(),
-                                output_index: *output_index,
-                                content_index: 0,
-                                delta,
-                                logprobs: None,
-                            }),
-                        );
-                        sequence += 1;
-                    }
-                }
-
                 let mut calls = choice.delta.tool_calls.unwrap_or_default();
                 if !request.parallel_tool_calls.unwrap_or(true) {
                     if tool_call_emitted {
@@ -348,6 +296,57 @@ pub(super) fn responses_event_stream(
                         );
                         sequence += 1;
                         completed_items.push(item);
+                    }
+                }
+                if let Some(ChatCompletionMessageContent::Text(delta)) = choice.delta.content
+                    && !delta.is_empty()
+                {
+                    if open_message.is_none() {
+                        let item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+                        let output_index =
+                            u32::try_from(completed_items.len()).unwrap_or(u32::MAX);
+                        let pending = text_response_message(
+                            item_id.clone(),
+                            String::new(),
+                            OutputStatus::InProgress,
+                        );
+                        yield serialize_response_event(
+                            ResponseStreamEvent::ResponseOutputItemAdded(
+                                ResponseOutputItemAddedEvent {
+                                    sequence_number: sequence,
+                                    output_index,
+                                    item: pending,
+                                },
+                            ),
+                        );
+                        sequence += 1;
+                        yield serialize_response_event(
+                            ResponseStreamEvent::ResponseContentPartAdded(
+                                ResponseContentPartAddedEvent {
+                                    sequence_number: sequence,
+                                    item_id: item_id.clone(),
+                                    output_index,
+                                    content_index: 0,
+                                    part: text_output_content(String::new()),
+                                },
+                            ),
+                        );
+                        sequence += 1;
+                        open_message = Some((item_id, output_index, String::new()));
+                    }
+                    if let Some((item_id, output_index, text)) = open_message.as_mut() {
+                        text.push_str(&delta);
+                        yield serialize_response_event(
+                            ResponseStreamEvent::ResponseOutputTextDelta(ResponseTextDeltaEvent {
+                                sequence_number: sequence,
+                                item_id: item_id.clone(),
+                                output_index: *output_index,
+                                content_index: 0,
+                                delta,
+                                logprobs: None,
+                            }),
+                        );
+                        sequence += 1;
                     }
                 }
             }
