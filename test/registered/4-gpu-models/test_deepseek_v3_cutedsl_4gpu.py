@@ -7,6 +7,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST,
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -15,6 +16,9 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb300")
+
+# Keep rendezvous ports below the ephemeral range on the 4-GPU GB300 runner.
+NCCL_PORT_BASE = DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 100
 
 
 class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
@@ -42,6 +46,8 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
             "--moe-dense-tp-size",
             "1",
             "--enable-dp-attention",
+            "--nccl-port",
+            str(NCCL_PORT_BASE),
             "--quantization",
             "modelopt_fp4",
             "--attention-backend",
@@ -114,6 +120,8 @@ class TestDummyWithSBO(CustomTestCase):
             "--moe-dense-tp-size",
             "1",
             "--enable-dp-attention",
+            "--nccl-port",
+            str(NCCL_PORT_BASE + 1),
             "--quantization",
             "modelopt_fp4",
             "--attention-backend",
