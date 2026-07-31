@@ -134,7 +134,7 @@ def _jit_module() -> Module:
     return load_jit(
         "moe_front",
         *args,
-        cuda_files=["moe/moe_front.cuh"],
+        cuda_files=["moe/route_radix.cuh"],
         cuda_wrappers=[
             ("front_epilogue", f"FusedFrontEpilogueKernel<{args}>::run"),
         ],

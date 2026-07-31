@@ -49,4 +49,20 @@ SGL_DEVICE void multimem_store_relaxed(uint32_t* ptr, uint32_t val) {
   asm volatile("multimem.st.relaxed.sys.global.b32 [%0], %1;" : : "l"(ptr), "r"(val) : "memory");
 }
 
+SGL_DEVICE void multimem_red_add_relaxed(uint32_t* mc_flag) {
+#if SGL_ARCH_HOPPER_OR_GREATER
+  asm volatile("multimem.red.relaxed.sys.global.add.u32 [%0], 1;" ::"l"(mc_flag) : "memory");
+#else
+  assert(false && "multimem red is only supported on Hopper or later architecture");
+#endif
+}
+
+SGL_DEVICE void multimem_red_add_release(uint32_t* mc_flag) {
+#if SGL_ARCH_HOPPER_OR_GREATER
+  asm volatile("multimem.red.release.sys.global.add.u32 [%0], 1;" ::"l"(mc_flag) : "memory");
+#else
+  assert(false && "multimem red is only supported on Hopper or later architecture");
+#endif
+}
+
 }  // namespace device::distributed

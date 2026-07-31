@@ -174,4 +174,21 @@ SGL_DEVICE void copy_bytes(const void* __restrict__ src, void* __restrict__ dst)
   }
 }
 
+// One elected lane, via elect.sync. Raw PTX rather than cute::elect_one_sync,
+// which would drag the whole CuTe include path into elementwise JIT modules;
+// cuda::ptx has no elect_sync in CUDA 13.0. Use this to gate a single-thread
+// TMA issue instead of a lane-index predicate.
+SGL_DEVICE bool elect_one_lane() {
+  uint32_t pred;
+  asm volatile(
+      "{\n"
+      "  .reg .pred p;\n"
+      "  .reg .b32  r;\n"
+      "  elect.sync r|p, 0xFFFFFFFF;\n"
+      "  selp.b32 %0, 1, 0, p;\n"
+      "}\n"
+      : "=r"(pred));
+  return pred != 0;
+}
+
 }  // namespace device::warp

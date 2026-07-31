@@ -19,21 +19,6 @@ using namespace device;
 
 constexpr uint32_t kTinyNGemmVecSize = kMaxVecBytes / sizeof(bf16_t);
 
-// bf16 x bf16 -> fp32 fused multiply-add. The mixed-precision PTX instruction
-// saves the explicit converts; the fallback is bit-identical (bf16 -> f32
-// conversion is exact, both round once).
-SGL_DEVICE float fma_f32_bf16(bf16_t a, bf16_t b, float acc) {
-#if SGL_ARCH_BLACKWELL_OR_GREATER
-  const uint16_t a_bits = __bfloat16_as_ushort(a);
-  const uint16_t b_bits = __bfloat16_as_ushort(b);
-  float result;
-  asm("fma.rn.f32.bf16 %0, %1, %2, %3;" : "=f"(result) : "h"(a_bits), "h"(b_bits), "f"(acc));
-  return result;
-#else
-  return fmaf(cast<fp32_t>(a), cast<fp32_t>(b), acc);
-#endif
-}
-
 template <uint32_t M, uint32_t N, uint32_t K, uint32_t N_SPLIT, typename OutT, bool kUsePDL>
 __global__ __launch_bounds__(K / kTinyNGemmVecSize, 1)  // 1 block per SM
     void tiny_n_gemm_kernel(OutT* __restrict__ out, const bf16_t* __restrict__ x, const bf16_t* __restrict__ w) {
@@ -72,7 +57,7 @@ __global__ __launch_bounds__(K / kTinyNGemmVecSize, 1)  // 1 block per SM
 #if SGL_ARCH_BLACKWELL_OR_GREATER
 #pragma unroll
       for (uint32_t i = 0; i < kTinyNGemmVecSize; ++i) {
-        acc = fma_f32_bf16(xv[m][i], wv[n][i], acc);
+        acc = device::math::fma_f32_bf16(xv[m][i], wv[n][i], acc);
       }
 #else
       for (uint32_t i = 0; i < kTinyNGemmVecSize / 2; ++i) {
@@ -150,7 +135,7 @@ __global__ __launch_bounds__(N_SPLIT* K / kTinyKGemmVecSize, 1)  // control the 
     float acc = 0.0f;
 #pragma unroll
     for (uint32_t i = 0; i < kTinyKGemmVecSize; ++i) {
-      acc = fma_f32_bf16(xv[m][i], wv[i], acc);
+      acc = device::math::fma_f32_bf16(xv[m][i], wv[i], acc);
     }
     // Broadcast store: every lane of the group holds the reduced sum.
     out[m * N + n_idx] = cast<OutT>(warp::reduce_sum<kNumKLanes>(acc));

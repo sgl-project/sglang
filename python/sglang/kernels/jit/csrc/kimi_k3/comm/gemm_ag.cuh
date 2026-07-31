@@ -29,18 +29,6 @@ constexpr uint32_t kVecSize = 32 / sizeof(bf16_t);  // 16 bf16 per 32B vector
 constexpr uint32_t kSpinBlock = 128;                // consumer threads per block
 constexpr uint32_t kSpinVec = 16 / sizeof(bf16_t);  // 8 bf16 (16B) per consumer thread
 
-SGL_DEVICE float fma_f32_bf16(bf16_t a, bf16_t b, float acc) {
-#if SGL_ARCH_BLACKWELL_OR_GREATER
-  const uint16_t a_bits = __bfloat16_as_ushort(a);
-  const uint16_t b_bits = __bfloat16_as_ushort(b);
-  float result;
-  asm("fma.rn.f32.bf16 %0, %1, %2, %3;" : "=f"(result) : "h"(a_bits), "h"(b_bits), "f"(acc));
-  return result;
-#else
-  return fmaf(device::cast<fp32_t>(a), device::cast<fp32_t>(b), acc);
-#endif
-}
-
 // Producer: per-rank column-slice GEMV, multicast store with Lamport markers.
 
 struct ProducerParams {
@@ -104,7 +92,7 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
       float acc = 0.0f;
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize; ++i) {
-        acc = fma_f32_bf16(input_vec[m][i], weight_vec[n][i], acc);
+        acc = device::math::fma_f32_bf16(input_vec[m][i], weight_vec[n][i], acc);
       }
       s_acc[warp_id][m * N_SPLIT + n] = warp::reduce_sum(acc);
     }

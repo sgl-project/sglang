@@ -184,7 +184,7 @@ def set_mla_kv_concat_q_fp8_module(use_pdl: bool) -> Module:
     return load_jit(
         "set_mla_kv_concat_q_fp8",
         *args,
-        cuda_files=["elementwise/set_mla_kv_concat_q_fp8.cuh"],
+        cuda_files=["elementwise/set_mla_kv_concat_q.cuh"],
         cuda_wrappers=[
             ("set_mla_kv_concat_q_fp8", f"SetMlaKVConcatQFp8Kernel<{args}>::run"),
         ],
