@@ -228,6 +228,19 @@ class TestFastInputLogprobs(CustomTestCase):
                 logprob.cpu(), expected.expand(4), rtol=1e-5, atol=1e-5
             )
 
+    def test_fast_path_emits_fp32_logprobs(self):
+        # Chosen dtype policy: the fast path returns fp32 token logprobs
+        # regardless of logits dtype (the normalizer is fp32, so fp32 is the
+        # true precision of the result), while the log_softmax path keeps
+        # the logits dtype. Runs on CPU CI so the policy is pinned even
+        # where the CUDA kernels never execute.
+        proc = InputLogprobProcessor()
+        batch = _build_batch([(4, 1), (3, 0)], torch.bfloat16)
+        got, _ = _run(proc, batch, True, None)
+        self.assertEqual(got.token_logprobs.dtype, torch.float32)
+        ref, _ = _run(proc, batch, False, None)
+        self.assertEqual(ref.token_logprobs.dtype, torch.bfloat16)
+
     def test_logsumexp_module_imports(self):
         # Runs on CPU CI too: catches import rot in the CUDA-only kernel
         # module, whose imports otherwise only execute on GPU machines.
