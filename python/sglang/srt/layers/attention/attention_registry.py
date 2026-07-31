@@ -367,6 +367,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             from sglang.srt.layers.attention.linear.gdn_backend import (
                 GDNAttnBackend,
                 flashinfer_gdn_prefill_default,
+                is_hip_gdn_decode_supported,
             )
         else:
             from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
@@ -380,14 +381,19 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
 
         check_environments()
+        is_gdn = hybrid_gdn_config(runner.model_config) is not None
         prefill_default = None
-        if hybrid_gdn_config(runner.model_config) is not None and not is_npu():
+        hip_decode_supported = False
+        if is_gdn and not is_npu():
             prefill_default = flashinfer_gdn_prefill_default(runner)
+            hip_decode_supported = is_hip_gdn_decode_supported(runner)
         runner.linear_attn_backends = resolve_linear_attn_backends(
-            prefill_default=prefill_default
+            prefill_default=prefill_default,
+            is_gdn=is_gdn,
+            hip_decode_supported=hip_decode_supported,
         )
         hybrid_backend_cls = HybridLinearAttnBackend
-        if hybrid_gdn_config(runner.model_config) is not None:
+        if is_gdn:
             if is_blackwell():
                 if is_sm120_supported():
                     allowed = {"triton", "trtllm_mha", "flashinfer"}

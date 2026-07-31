@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 class LinearAttnKernelBackend(Enum):
     TRITON = "triton"
+    HIP = "hip"
     CUTEDSL = "cutedsl"
     NV_CUTEDSL = "nv_cutedsl"
     FLASHINFER = "flashinfer"
@@ -29,6 +30,9 @@ class LinearAttnKernelBackend(Enum):
 
     def is_triton(self):
         return self == LinearAttnKernelBackend.TRITON
+
+    def is_hip(self):
+        return self == LinearAttnKernelBackend.HIP
 
     def is_cutedsl(self):
         return self == LinearAttnKernelBackend.CUTEDSL
@@ -71,18 +75,46 @@ class LinearAttnBackends(msgspec.Struct, frozen=True):
 
 def resolve_linear_attn_backends(
     prefill_default: Optional[str] = None,
+    *,
+    is_gdn: bool = False,
+    hip_decode_supported: bool = False,
 ) -> LinearAttnBackends:
     """This runner's kernel choice from the published leaves.
 
     ``prefill_default`` is the caller's own auto-default (the SM100 GDN
     domain); an explicitly configured ``--linear-attn-prefill-backend`` wins.
+    HIP decode is accepted only for GDN, and is currently activated only when
+    the caller confirms the validated gfx950, Qwen3.5, non-speculative scope.
     """
     mamba = get_exec().mamba
     base = mamba.linear_attn_backend
+
+    if base == "hip":
+        raise ValueError(
+            "--linear-attn-backend hip is not supported: HIP is GDN decode-only. "
+            "Use --linear-attn-decode-backend hip instead."
+        )
+    if mamba.linear_attn_prefill_backend == "hip":
+        raise ValueError(
+            "--linear-attn-prefill-backend hip is not supported: HIP is "
+            "GDN decode-only."
+        )
+
     decode = LinearAttnKernelBackend(mamba.linear_attn_decode_backend or base)
     prefill = LinearAttnKernelBackend(
         mamba.linear_attn_prefill_backend or prefill_default or base
     )
+
+    if decode.is_hip() and not is_gdn:
+        raise ValueError(
+            "--linear-attn-decode-backend hip is supported only for GDN models."
+        )
+    if decode.is_hip() and not hip_decode_supported:
+        rank0_log(
+            "GDN HIP decode currently supports only non-speculative Qwen3.5 "
+            "on ROCm gfx950; falling back to Triton decode."
+        )
+        decode = LinearAttnKernelBackend.TRITON
 
     # Unset verify follows decode (flashinfer -> its recurrent kernel, else triton).
     verify = mamba.linear_attn_verify_backend

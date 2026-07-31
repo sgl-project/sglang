@@ -8,6 +8,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+from sglang.srt.configs.model_config import is_qwen3_5
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -19,7 +20,14 @@ from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 from sglang.srt.utils.common import rank0_log
 
 _is_hip = is_hip()
@@ -103,6 +111,22 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     return "flashinfer"
 
 
+def is_hip_gdn_decode_supported(model_runner: ModelRunner) -> bool:
+    """Whether this runner is inside the currently validated HIP GDN scope.
+
+    The AITER packed kernel is currently enabled only for a non-speculative
+    Qwen3.5 target runner on gfx950. The explicit predicate keeps future
+    Qwen3.8 and MTP enablement local to one capability boundary.
+    """
+    return (
+        is_hip()
+        and is_gfx95_supported()
+        and is_qwen3_5(model_runner.model_config.hf_config)
+        and not model_runner.is_draft_worker
+        and model_runner.server_args.speculative_algorithm is None
+    )
+
+
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
 
@@ -118,6 +142,21 @@ class GDNKernelDispatcher:
         cutedsl_kernel = None
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
+        elif decode_backend.is_hip():
+            if not is_hip():
+                raise ValueError("GDN HIP backend requires ROCm")
+            if not is_gfx95_supported():
+                self.decode_kernel = triton_kernel
+                rank0_log(
+                    "GDN HIP decode backend requires ROCm gfx95; "
+                    "falling back to Triton decode."
+                )
+            else:
+                from sglang.srt.layers.attention.linear.kernels.gdn_hip import (
+                    HipGDNKernel,
+                )
+
+                self.decode_kernel = HipGDNKernel()
         elif decode_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("GDN CuTe DSL backend requires CUDA")
