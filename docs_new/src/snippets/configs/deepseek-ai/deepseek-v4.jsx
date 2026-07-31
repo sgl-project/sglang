@@ -308,6 +308,8 @@ sgl-eval run aime25 \\
 
     // ----- Card 5: "PD Disaggregation" -----
     pdDisagg: {
+      showWhen: (base) => base.specAlgorithm !== "DSPARK",
+      incompatibleSpeculativeAlgorithms: ["DSPARK"],
       modes: [
         { id: "off",     label: "Off" },
         { id: "prefill", label: "Prefill role" },
@@ -411,7 +413,7 @@ sgl-eval run aime25 \\
       {
         id: "dsparkDraftTokens",
         title: "DSpark Proposed Draft Tokens",
-        showWhen: (base) => base.variant === "flash-official",
+        showWhen: (base) => base.variant === "flash-official" && base.specAlgorithm === "DSPARK",
         control: "slider",
         stripPrefixes: ["--speculative-dspark-block-size"],
         options: [
