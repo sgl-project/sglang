@@ -1,3 +1,4 @@
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -149,6 +150,12 @@ class ComponentResidencyManager:
         self._current_use_index: int = -1
         self._active_use: ComponentUse | None = None
         self._active_use_module: nn.Module | None = None
+        # stages a pipeline declared mutually independent may enter their
+        # active-use intervals from concurrent threads; the timeline slot
+        # stays consistent under this lock, and resident components make the
+        # interleaved finish/prepare transitions metadata-only (executors
+        # fall back to sequential levels whenever offload is enabled)
+        self._use_lock = threading.RLock()
         self._active_nvtx_key: tuple[str, str, str | None] | None = None
         self._nvtx_hooks_by_use_key: dict[
             tuple[str, str, str | None], tuple[int, DiffusionNvtxHooks]
@@ -236,6 +243,12 @@ class ComponentResidencyManager:
         2. Prepare the current component.
         3. Wait until the current component is ready, then prefetch the next heavy use.
         """
+        with self._use_lock:
+            self._begin_use_locked(use, module)
+
+    def _begin_use_locked(
+        self, use: ComponentUse, module: nn.Module | None = None
+    ) -> None:
         if self._active_use is not None and self._same_use(self._active_use, use):
             if self._use_key(self._active_use) != self._use_key(use):
                 self._mark_current_use(use)
@@ -273,6 +286,12 @@ class ComponentResidencyManager:
         2. Clear it as the active use.
         3. Prefetch the next memory-intensive use without waiting.
         """
+        with self._use_lock:
+            self._end_use_locked(use, module)
+
+    def _end_use_locked(
+        self, use: ComponentUse, module: nn.Module | None = None
+    ) -> None:
         if self._active_use is None or not self._same_use(self._active_use, use):
             return
         self._disable_active_nvtx()

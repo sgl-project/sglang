@@ -677,6 +677,35 @@ class ComposedPipelineBase(ABC):
                 self.add_stage(item)
         return self
 
+    def add_parallel_stages(
+        self, stages: list[PipelineStage | tuple[PipelineStage, str]]
+    ) -> "ComposedPipelineBase":
+        """Declare mutually independent stages that executors may overlap.
+
+        Order-based dependencies with the rest of the pipeline are kept: the
+        group starts after every earlier stage completes, and later stages
+        start after every member completes. Members must be independent of
+        each other — no member may read request state another member writes,
+        each must return the request object it received, and at most one
+        member may issue collective communication (collectives issued
+        concurrently from one process can be ordered differently across
+        ranks and deadlock). Executors without concurrency support run the
+        members in declaration order, which is always a valid schedule.
+        """
+        group_token = f"parallel_group_{len(self._stages)}"
+        for item in stages:
+            stages_before = len(self._stages)
+            if isinstance(item, tuple):
+                stage, name = item
+                self.add_stage(stage, name)
+            else:
+                stage = item
+                self.add_stage(stage)
+            # add_stage may drop the stage for this disaggregation role
+            if len(self._stages) > stages_before:
+                stage.set_execution_group(group_token)
+        return self
+
     def add_stage_if(
         self,
         condition: bool | Callable[[], bool],
