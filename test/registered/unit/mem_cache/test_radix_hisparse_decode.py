@@ -273,7 +273,7 @@ class TestRadixHiSparseDecodeWriteBack(CustomTestCase):
         self.assertTrue(torch.equal(args.args[2], l0_locs))
         self.assertEqual(args.kwargs, {"io_backend": "kernel"})
 
-    def test_next_l0_mapping_waits_for_previous_write_back(self):
+    def test_next_l0_mapping_does_not_wait_for_previous_write_back(self):
         order = []
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.is_radix_hisparse = True
@@ -305,12 +305,41 @@ class TestRadixHiSparseDecodeWriteBack(CustomTestCase):
             req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
         )
 
-        self.assertEqual(order, ["wait", "map"])
+        self.assertEqual(order, ["map"])
+        coordinator.wait_for_radix_decode_backup.assert_not_called()
         coordinator._eager_backup_previous_token.assert_not_called()
         self.assertEqual(
             int(coordinator.mem_pool_device.full_to_hisparse_device_index_mapping[7]),
             3,
         )
+
+    def test_model_forward_wait_dispatches_to_radix_write_back(self):
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.is_radix_hisparse = True
+        coordinator.wait_for_radix_decode_backup = MagicMock()
+
+        coordinator.wait_for_pending_backup()
+
+        coordinator.wait_for_radix_decode_backup.assert_called_once_with()
+
+    def test_model_forward_wait_preserves_legacy_backup_event(self):
+        event = _FakeEvent()
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.is_radix_hisparse = False
+        coordinator._has_pending_backup = True
+        coordinator._backup_done_event = event
+
+        fake_device_module = SimpleNamespace(
+            current_stream=MagicMock(return_value="forward-stream")
+        )
+        with patch(
+            "sglang.srt.managers.hisparse_coordinator.device_module",
+            fake_device_module,
+        ):
+            coordinator.wait_for_pending_backup()
+
+        self.assertEqual(event.order, [("wait", "forward-stream")])
+        self.assertFalse(coordinator._has_pending_backup)
 
     def test_finish_fences_write_back_before_l0_release(self):
         order = []

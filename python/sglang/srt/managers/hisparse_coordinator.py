@@ -547,11 +547,7 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
-        if self.is_radix_hisparse:
-            # The reserved L0 row is reused by the next decode forward. Order
-            # that write after the previous row has reached CPU L1.
-            self.wait_for_radix_decode_backup()
-        else:
+        if not self.is_radix_hisparse:
             self._eager_backup_previous_token(
                 seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
             )
@@ -699,6 +695,12 @@ class HiSparseCoordinator:
         self._has_pending_backup = True
 
     def wait_for_pending_backup(self) -> None:
+        if self.is_radix_hisparse:
+            # Keep L0 growth/remapping overlapped with the all-layer D2H. The
+            # existing ModelRunner call places this dependency immediately
+            # before decode graph replay/eager forward can reuse the L0 row.
+            self.wait_for_radix_decode_backup()
+            return
         if not self._has_pending_backup:
             return
         self._backup_done_event.wait(device_module.current_stream())
