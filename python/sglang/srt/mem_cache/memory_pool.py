@@ -3836,12 +3836,17 @@ class HybridLinearKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        loc_is_dense: bool = False,
     ):
         assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
         # Model-level MLA entry point: `loc` is a VIRTUAL loc under the unified
-        # pool (eager prefill only; the decode write goes through set_kv_buffer's
-        # pre-translated `full_loc`), so translate to the dense id space here.
-        loc = self._full_translate(loc)
+        # pool, so translate to the dense id space here.
+        #
+        # `loc_is_dense`: the caller already translated `loc` (the unified-pool
+        # cuda-graph decode precomputes it out-of-graph into a capture-stable
+        # buffer, so the in-graph write does not capture a translate allocation).
+        if not loc_is_dense:
+            loc = self._full_translate(loc)
         with self._transfer_id_context(layer):
             self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
 
