@@ -13,13 +13,9 @@ faithful raw window, so the anchor is:
     bitwise anchor.
 """
 
-import sys
 import unittest
-from pathlib import Path
 
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
 from sglang.kernels.ops.attention.cutedsl_gdn_mtp_ring import gated_delta_rule_mtp
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
