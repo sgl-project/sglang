@@ -677,6 +677,63 @@ class TestNixlReceiverPoll(CustomTestCase):
         self.assertEqual(receiver.conclude_state, KVPoll.Success)
 
 
+class TestNixlReceiverStateExpectation(CustomTestCase):
+    def _make_receiver(self):
+        room = 19
+        mgr = SimpleNamespace(
+            enable_staging=False,
+            local_ip="127.0.0.1",
+            rank_port=12345,
+            agent=SimpleNamespace(name="decode-agent"),
+            kv_args=SimpleNamespace(engine_rank=0),
+            transfer_statuses=defaultdict(TransferStatus),
+            update_status=MagicMock(),
+            record_failure=MagicMock(),
+        )
+        receiver = object.__new__(NixlKVReceiver)
+        receiver.kv_mgr = mgr
+        receiver.bootstrap_room = room
+        receiver.bootstrap_infos = [
+            {
+                "is_dummy": False,
+                "rank_ip": "127.0.0.1",
+                "rank_port": 23456,
+            }
+        ]
+        receiver.required_dst_info_num = 1
+        receiver.conclude_state = None
+        receiver.started_transfer = False
+        receiver.init_time = None
+        receiver._connect_to_bootstrap_server = MagicMock(
+            return_value=(MagicMock(), MagicMock())
+        )
+        return receiver, mgr
+
+    def test_empty_state_components_do_not_wait_for_notifications(self):
+        receiver, mgr = self._make_receiver()
+
+        receiver.send_metadata(
+            np.empty((0,), dtype=np.int32),
+            aux_index=0,
+            state_indices=[np.empty((0,), dtype=np.int32)],
+            decode_prefix_len=64,
+        )
+
+        self.assertFalse(mgr.transfer_statuses[19].expects_state)
+
+    def test_nonempty_state_component_still_requires_notification(self):
+        receiver, mgr = self._make_receiver()
+
+        receiver.send_metadata(
+            np.empty((0,), dtype=np.int32),
+            aux_index=0,
+            state_indices=[np.array([3], dtype=np.int32)],
+            decode_prefix_len=64,
+        )
+
+        self.assertTrue(mgr.transfer_statuses[19].expects_state)
+
+
 class TestNixlNodeFailure(CustomTestCase):
     def _make_manager(self):
         mgr = object.__new__(NixlKVManager)

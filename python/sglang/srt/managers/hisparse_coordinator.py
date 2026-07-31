@@ -337,9 +337,16 @@ class HiSparseCoordinator:
           buffer.  In the staging path this is correct (prefill filled the buffer),
           but here the buffer is empty.
         """
+        host_len = self.host_token_len(req.kv.kv_allocated_len)
+        if self.is_radix_hisparse:
+            # Radix canonicalization may replace a transferred duplicate's L1
+            # suffix. Rebuild the int64 compatibility row from the canonical
+            # request table before L0 preload paths consume it.
+            l1_locs = self.req_to_token_pool.req_to_token[req.req_pool_idx, :host_len]
+            self.bind_l1_host_locs(req.req_pool_idx, 0, l1_locs)
+
         self.alloc_device_buffer(req)
 
-        host_len = self.host_token_len(req.kv.kv_allocated_len)
         if host_len <= self.device_buffer_size:
             # Short sequences (seq_len <= device_buffer_size): the kernel fast path
             # returns device_buffer_locs directly without any host loading, so we

@@ -1470,7 +1470,7 @@ class SchedulerPPMixin:
             released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
                 release_rids
             )
-            if self.enable_hisparse:
+            if self.enable_hisparse and not self.hisparse_coordinator.is_radix_hisparse:
                 for req in released_reqs:
                     self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(released_reqs)

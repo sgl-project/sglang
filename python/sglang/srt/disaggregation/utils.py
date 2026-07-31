@@ -34,6 +34,7 @@ if TYPE_CHECKING:
         CommonKVSender,
     )
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.server_args import ServerArgs
 
 if is_npu():
@@ -95,6 +96,20 @@ def get_dsv4_c128_state_indices(
     pages_per_req = ring_size // 128
     page = int(req_pool_idx) * pages_per_req + ((seq_len - 1) % ring_size) // 128
     return np.array([page], dtype=np.int32)
+
+
+def get_dsa_state_page_indices(
+    req_to_token_pool: ReqToTokenPool,
+    req_pool_idx: int,
+    start_pos: int,
+    end_pos: int,
+    page_size: int,
+) -> np.ndarray:
+    """Return page IDs for the DSA indexer state in a token-position range."""
+    from sglang.srt.mem_cache.common import kv_to_page_indices
+
+    token_indices = req_to_token_pool.req_to_token[req_pool_idx, start_pos:end_pos]
+    return kv_to_page_indices(token_indices, page_size)
 
 
 class DisaggregationMode(Enum):
