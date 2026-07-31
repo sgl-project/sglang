@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.layernorm.elementwise import fused_gate_sigmoid_mul_add
+from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_pp_group,
@@ -68,6 +68,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
     is_deepep_class_backend,
+    uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -249,6 +250,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 self.num_shared_experts > 0
                 and can_fuse_shared_expert(config, quant_config)
             )
+        if (
+            self.enable_shared_expert_fusion
+            and uses_per_rank_fused_shared_slots()
+            and get_parallel().moe_ep_size > 1
+        ):
+            logger.warning_once(
+                "Disabling Qwen shared-expert fusion: it uses a single global "
+                "shared slot with a per-token gate, which is incompatible with "
+                "per-rank EP shared-slot backends (e.g. DeepEP/MoRI) at "
+                "moe_ep_size=%d. Using the separate shared-expert MLP instead.",
+                get_parallel().moe_ep_size,
+            )
+            self.enable_shared_expert_fusion = False
+
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
 
@@ -429,7 +444,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         shared_output,
                     )
                 elif _is_hip:
-                    from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+                    from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
                         sigmoid_gate_mul_broadcast,
                     )
 
