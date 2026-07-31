@@ -795,15 +795,24 @@ class SelfBenchmark:
             new_lengths, kv_lengths, prompt_lengths = self._prefill_lengths(point)
         except ValueError:
             return False
+        page_size = max(1, self.scheduler.page_size)
+        scheduled_new_lengths = [
+            ((length + page_size - 1) // page_size) * page_size
+            for length in new_lengths
+        ]
+        # PrefillAdder accounts the page-aligned token total against one shared
+        # chunk budget. A point that changes shape during admission cannot yield
+        # the single exact FPM required by self-benchmarking.
+        if sum(scheduled_new_lengths) != point.total_prefill_tokens:
+            return False
         chunk_size = getattr(self.scheduler.server_args, "chunked_prefill_size", None)
         if chunk_size is not None and chunk_size > 0:
-            if any(length > chunk_size for length in new_lengths):
+            if sum(scheduled_new_lengths) > chunk_size:
                 return False
         if any(
             prompt_len > self._max_valid_input_len() for prompt_len in prompt_lengths
         ):
             return False
-        page_size = max(1, self.scheduler.page_size)
         required = sum(
             ((prompt_len + 1 + page_size - 1) // page_size) * page_size
             for prompt_len in prompt_lengths
@@ -989,7 +998,11 @@ class SelfBenchmark:
         # max_total_num_tokens is KV capacity, not transient forward/logits
         # headroom. Keep optional startup benchmarking within the scheduler's
         # normal prefill-forward token budget.
-        return max(0, getattr(self.scheduler, "max_prefill_tokens", 0))
+        limit = max(0, getattr(self.scheduler, "max_prefill_tokens", 0))
+        chunk_size = getattr(self.scheduler.server_args, "chunked_prefill_size", None)
+        if chunk_size is not None and chunk_size > 0:
+            limit = min(limit, int(chunk_size))
+        return limit
 
     def _max_generated_prefill_tokens(self) -> int:
         """Return the largest schedulable generated-grid prefill total.

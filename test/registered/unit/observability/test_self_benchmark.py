@@ -583,7 +583,7 @@ class TestSelfBenchmark(CustomTestCase):
             all("engine_limit" in p.sample_reasons for p in max_batch_points)
         )
 
-    def test_prefill_grid_respects_chunked_prefill_per_request(self):
+    def test_prefill_grid_respects_shared_chunked_prefill_budget(self):
         scheduler = self._scheduler()
         scheduler.server_args.benchmark_mode = "prefill"
         scheduler.server_args.chunked_prefill_size = 8
@@ -594,12 +594,47 @@ class TestSelfBenchmark(CustomTestCase):
 
         prefill_points = [p for p in benchmark._grid if p.point_type == "prefill"]
         self.assertGreater(len(prefill_points), 0)
-        self.assertEqual(max(p.total_prefill_tokens for p in prefill_points), 32)
+        self.assertEqual(max(p.total_prefill_tokens for p in prefill_points), 8)
         self.assertTrue(any(p.batch_size > 1 for p in prefill_points))
         self.assertTrue(all(p.total_kv_read_tokens == 0 for p in prefill_points))
         for point in prefill_points:
-            new_lengths, _, _ = benchmark._prefill_lengths(point)
-            self.assertTrue(all(length <= 8 for length in new_lengths))
+            self.assertLessEqual(point.total_prefill_tokens, 8)
+
+    def test_prefill_feasibility_requires_exact_page_aligned_shape(self):
+        scheduler = self._scheduler()
+        scheduler.server_args.benchmark_mode = "prefill"
+        scheduler.server_args.chunked_prefill_size = 64
+        scheduler.page_size = 16
+        scheduler.max_req_input_len = 128
+        benchmark = SelfBenchmark(scheduler)
+
+        self.assertFalse(
+            benchmark._prefill_point_feasible(
+                BenchmarkPoint(
+                    point_type="prefill",
+                    total_prefill_tokens=4,
+                    batch_size=1,
+                )
+            )
+        )
+        self.assertTrue(
+            benchmark._prefill_point_feasible(
+                BenchmarkPoint(
+                    point_type="prefill",
+                    total_prefill_tokens=32,
+                    batch_size=2,
+                )
+            )
+        )
+        self.assertFalse(
+            benchmark._prefill_point_feasible(
+                BenchmarkPoint(
+                    point_type="prefill",
+                    total_prefill_tokens=64,
+                    batch_size=3,
+                )
+            )
+        )
 
     def test_prefill_grid_is_capped_by_forward_token_budget(self):
         scheduler = self._scheduler()
@@ -641,7 +676,8 @@ class TestSelfBenchmark(CustomTestCase):
         scheduler.page_size = 8
         scheduler.server_args.benchmark_mode = "prefill"
         scheduler.server_args.benchmark_prefill_kv_read_granularity = 4
-        scheduler.max_req_input_len = 40
+        scheduler.max_req_input_len = 128
+        scheduler.max_total_num_tokens = 256
 
         benchmark = SelfBenchmark(scheduler)
 
