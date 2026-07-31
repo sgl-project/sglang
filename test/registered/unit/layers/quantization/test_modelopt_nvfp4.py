@@ -190,14 +190,13 @@ class TestModelOptNvfp4(CustomTestCase):
         weight_scale_2 = torch.ones((), dtype=torch.float32)
 
         with patch.object(
-            nvfp4_online,
-            "quantize_nvfp4_weight",
+            ModelOptNvFp4OnlineFusedMoEMethod,
+            "_quantize_weight_nvfp4",
             return_value=(fp4_weight, weight_scale, weight_scale_2),
         ) as quantize:
             weight_loader = nvfp4_online.make_nvfp4_online_weight_loader(
                 layer=layer,
                 original_weight_loader=original_weight_loader,
-                layer_prefix="mtp.layers.0.mixer.experts",
             )
             weight_loader(
                 param,
@@ -223,7 +222,6 @@ class TestModelOptNvfp4(CustomTestCase):
         weight_loader = nvfp4_online.make_nvfp4_online_weight_loader(
             layer=SimpleNamespace(),
             original_weight_loader=MagicMock(),
-            layer_prefix="mtp.layers.0.mlp.experts",
         )
 
         with self.assertRaisesRegex(ValueError, "does not declare serialized FP8"):
