@@ -40,7 +40,10 @@ class WanImageToVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        self.add_standard_ti2v_stages()
+        # text (UMT5), CLIP image, and image-VAE encodes read only request
+        # inputs and write disjoint fields; overlap engages when every
+        # member is replicated (see PipelineStage.concurrency_safe)
+        self.add_standard_ti2v_stages(overlap_condition_encoders=True)
 
 
 EntryClass = WanImageToVideoPipeline

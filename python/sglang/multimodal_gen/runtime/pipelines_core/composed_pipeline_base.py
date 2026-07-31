@@ -960,29 +960,43 @@ class ComposedPipelineBase(ABC):
         prepare_extra_timestep_kwargs: list[Callable] | None = None,
         denoising_stage_factory: Callable[[], PipelineStage] | None = None,
         denoising_stage_name: str = "denoising_stage",
+        overlap_condition_encoders: bool = False,
     ) -> "ComposedPipelineBase":
         if include_input_validation:
             self.add_stage(
                 InputValidationStage(vae_image_processor=vae_image_processor)
             )
 
-        self.add_standard_text_encoding_stage(
-            text_encoder_key=text_encoder_key,
-            tokenizer_key=tokenizer_key,
-        )
-
         image_encoder = self.get_module(image_encoder_key, None)
         image_processor = self.get_module(image_processor_key, None)
-        self.add_stage_if(
-            image_encoder is not None and image_processor is not None,
-            ImageEncodingStage(
-                image_encoder=image_encoder,
-                image_processor=image_processor,
-            ),
-        )
-
-        if image_vae_encoding_position == "before_timestep":
-            self.add_stage(
+        # the text, image, and image-VAE encoders read only request inputs
+        # and write disjoint request state, so a pipeline that has verified
+        # those invariants for its stages can declare them overlappable; the
+        # executor still keeps declaration order unless every member also
+        # reports itself concurrency-safe at runtime (replicated, no VLM
+        # prompt rewrite)
+        if overlap_condition_encoders and image_vae_encoding_position != (
+            "before_timestep"
+        ):
+            raise ValueError(
+                "overlap_condition_encoders requires "
+                "image_vae_encoding_position='before_timestep'"
+            )
+        if overlap_condition_encoders:
+            members: list[PipelineStage] = [
+                TextEncodingStage(
+                    text_encoders=[self.get_module(text_encoder_key)],
+                    tokenizers=[self.get_module(tokenizer_key)],
+                )
+            ]
+            if image_encoder is not None and image_processor is not None:
+                members.append(
+                    ImageEncodingStage(
+                        image_encoder=image_encoder,
+                        image_processor=image_processor,
+                    )
+                )
+            members.append(
                 ImageVAEEncodingStage(
                     vae=self.get_module(image_vae_key),
                     **{
@@ -991,6 +1005,31 @@ class ComposedPipelineBase(ABC):
                     },
                 )
             )
+            self.add_parallel_stages(members)
+        else:
+            self.add_standard_text_encoding_stage(
+                text_encoder_key=text_encoder_key,
+                tokenizer_key=tokenizer_key,
+            )
+
+            self.add_stage_if(
+                image_encoder is not None and image_processor is not None,
+                ImageEncodingStage(
+                    image_encoder=image_encoder,
+                    image_processor=image_processor,
+                ),
+            )
+
+            if image_vae_encoding_position == "before_timestep":
+                self.add_stage(
+                    ImageVAEEncodingStage(
+                        vae=self.get_module(image_vae_key),
+                        **{
+                            "component_name": image_vae_key,
+                            **(image_vae_stage_kwargs or {}),
+                        },
+                    )
+                )
 
         self.add_standard_latent_preparation_stage()
         self.add_standard_timestep_preparation_stage(

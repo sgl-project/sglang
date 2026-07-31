@@ -840,6 +840,10 @@ class ImageVAEEncodingStage(PipelineStage):
     input format (e.g., image_latents).
     """
 
+    # local VAE encode: no cross-rank communication, writes only the
+    # image-latent fields
+    concurrency_safe = True
+
     deduplicated_output_fields = (
         "image_latent",
         "condition_image_latent_ids",
