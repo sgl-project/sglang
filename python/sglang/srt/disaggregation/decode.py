@@ -1553,14 +1553,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 uses_swa_tail=self._uses_swa_tail_prealloc(),
                 swa_tail_len=self._swa_tail_len(fill_len),
             )
-            # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
-                coordinator.req_to_host_pool,
-                coordinator.req_to_host_pool_allocated_len,
-                req.req_pool_idx,
-                0,
-                coordinator.host_token_len(fill_len),
-            )
+            # Radix L1 indices directly address CPU full-KV rows. Legacy
+            # HiSparse keeps its independent request-private host allocation.
+            if coordinator.is_radix_hisparse:
+                host_indices = coordinator.bind_l1_host_locs(
+                    req.req_pool_idx,
+                    0,
+                    kv_loc[: coordinator.host_token_len(fill_len)],
+                )
+            else:
+                host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
+                    coordinator.req_to_host_pool,
+                    coordinator.req_to_host_pool_allocated_len,
+                    req.req_pool_idx,
+                    0,
+                    coordinator.host_token_len(fill_len),
+                )
         else:
             uses_swa_tail = self._uses_swa_tail_prealloc() and prefix_len == 0
             swa_tail_len = self._swa_tail_len(fill_len)

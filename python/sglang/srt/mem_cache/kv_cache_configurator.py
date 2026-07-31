@@ -35,6 +35,9 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.radix_hisparse import (
+    RadixHiSparseTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -249,13 +252,25 @@ class KVCacheConfigurator:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
 
+        # GPU profiling sizes the bounded L0 full-KV pool. In Radix HiSparse,
+        # scheduler/Radix admission instead consumes the larger composite L1
+        # namespace (CPU full KV + GPU indexer K).
+        max_total_num_tokens = (
+            pools.token_to_kv_pool_allocator.l1_capacity
+            if isinstance(
+                pools.token_to_kv_pool_allocator,
+                RadixHiSparseTokenToKVPoolAllocator,
+            )
+            else sizes.max_total_num_tokens
+        )
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
         return KVCacheConfigResult(
-            max_total_num_tokens=sizes.max_total_num_tokens,
+            max_total_num_tokens=max_total_num_tokens,
             max_running_requests=sizes.max_running_requests,
             full_max_total_num_tokens=sizes.full_max_total_num_tokens,
             swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
@@ -1497,7 +1512,18 @@ class KVCacheConfigurator:
                         )
 
                         hisparse_cfg = parse_hisparse_config(self.server_args)
-                        token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
+                        # The combined mode remains behind the existing argument
+                        # guards until its parallel coordinator path is wired.
+                        use_radix_hisparse_allocator = (
+                            self.server_args.disaggregation_mode == "decode"
+                            and self.server_args.disaggregation_decode_enable_radix_cache
+                        )
+                        allocator_cls = (
+                            RadixHiSparseTokenToKVPoolAllocator
+                            if use_radix_hisparse_allocator
+                            else HiSparseTokenToKVPoolAllocator
+                        )
+                        token_to_kv_pool_allocator = allocator_cls(
                             sizes.max_total_num_tokens,
                             page_size=get_schedule().page_size,
                             dtype=self.kv_cache_dtype,

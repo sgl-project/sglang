@@ -14,6 +14,9 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.radix_hisparse import (
+    RadixHiSparseTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
 )
@@ -49,6 +52,7 @@ class HiSparseCoordinator:
         token_to_kv_pool_allocator: Union[
             HiSparseTokenToKVPoolAllocator,
             DeepSeekV4HiSparseTokenToKVPoolAllocator,
+            RadixHiSparseTokenToKVPoolAllocator,
         ],
         top_k: int,
         device_buffer_size: int,
@@ -68,6 +72,11 @@ class HiSparseCoordinator:
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
+        self.is_radix_hisparse = isinstance(
+            self.token_to_kv_pool_allocator, RadixHiSparseTokenToKVPoolAllocator
+        )
+        if self.is_radix_hisparse:
+            assert self.compress_ratio == 1
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
@@ -88,6 +97,12 @@ class HiSparseCoordinator:
                 self.mem_pool_device.kv_cache_total_dim
                 * self.mem_pool_device.store_dtype.itemsize
             )
+        elif self.is_radix_hisparse:
+            # The facade owns the identity-indexed CPU L1 pool. The coordinator
+            # borrows it and continues to own only L0 scheduling/data movement.
+            self.mem_pool_device = self.token_to_kv_pool_allocator.get_kvcache()
+            self.mem_pool_host = self.token_to_kv_pool_allocator.get_l1_host_pool()
+            self.item_size_bytes = self.mem_pool_host.token_stride_size
         else:
             assert isinstance(
                 self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
@@ -194,7 +209,10 @@ class HiSparseCoordinator:
         # See HostKVCache.destroy for why the explicit unregister matters.
         self.write_staging_stream.synchronize()
         self.decode_backup_stream.synchronize()
-        self.mem_pool_host.destroy()
+        if self.is_radix_hisparse:
+            self.token_to_kv_pool_allocator.destroy()
+        else:
+            self.mem_pool_host.destroy()
 
     def get_token_stats(self) -> HiSparseTokenStats:
         device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
@@ -213,6 +231,63 @@ class HiSparseCoordinator:
             ),
         )
 
+    def bind_l1_host_locs(
+        self,
+        req_pool_idx: int,
+        start_pos: int,
+        l1_locs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Bind request positions to identity-addressed CPU L1 rows.
+
+        Radix owns the L1 rows, so this only publishes request-local lookup
+        metadata for the current swap kernel. It never allocates host slots.
+        """
+        if not self.is_radix_hisparse:
+            raise RuntimeError("identity host locations require Radix HiSparse")
+
+        end_pos = start_pos + l1_locs.numel()
+        if end_pos > self.req_to_host_pool.shape[1]:
+            raise ValueError("identity host locations exceed the request table")
+
+        host_locs = self.token_to_kv_pool_allocator.full_kv_host_locs(l1_locs)
+        self.req_to_host_pool[req_pool_idx, start_pos:end_pos] = host_locs
+        allocated_len = int(self.req_to_host_pool_allocated_len[req_pool_idx])
+        if end_pos > allocated_len:
+            self.req_to_host_pool_allocated_len[req_pool_idx] = end_pos
+        return self.req_to_host_pool[req_pool_idx, start_pos:end_pos]
+
+    def _alloc_or_bind_host_locs(
+        self,
+        req_pool_idx: int,
+        start_pos: int,
+        length: int,
+    ) -> torch.Tensor:
+        if self.is_radix_hisparse:
+            l1_locs = self.req_to_token_pool.req_to_token[
+                req_pool_idx, start_pos : start_pos + length
+            ]
+            return self.bind_l1_host_locs(req_pool_idx, start_pos, l1_locs)
+        return self.mem_pool_host.alloc_paged_token_slots(
+            self.req_to_host_pool,
+            self.req_to_host_pool_allocated_len,
+            req_pool_idx,
+            start_pos,
+            length,
+        )
+
+    def _clear_request_host_locs(self, req_pool_idx: int) -> None:
+        if not self.is_radix_hisparse:
+            host_indices = self.mem_pool_host.allocated_host_indices(
+                self.req_to_host_pool,
+                req_pool_idx,
+                self.req_to_host_pool_allocated_len[req_pool_idx],
+            )
+            if host_indices.numel() > 0:
+                self.mem_pool_host.free(host_indices)
+
+        self.req_to_host_pool[req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req_pool_idx] = 0
+
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True
 
@@ -226,13 +301,12 @@ class HiSparseCoordinator:
         )
 
         prefill_len = len(device_indices)
-        host_indices = self.mem_pool_host.alloc_paged_token_slots(
-            self.req_to_host_pool,
-            self.req_to_host_pool_allocated_len,
-            req.req_pool_idx,
-            0,
-            prefill_len,
-        )
+        if self.is_radix_hisparse:
+            host_indices = self.bind_l1_host_locs(req.req_pool_idx, 0, full_kv_indices)
+        else:
+            host_indices = self._alloc_or_bind_host_locs(
+                req.req_pool_idx, 0, prefill_len
+            )
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -585,13 +659,7 @@ class HiSparseCoordinator:
         for i in backup_indices:
             req_idx = int(req_pool_indices_cpu[i])
             start_pos = (int(seq_lens_cpu[i]) - 1) // self.compress_ratio - 1
-            host_locs = self.mem_pool_host.alloc_paged_token_slots(
-                self.req_to_host_pool,
-                self.req_to_host_pool_allocated_len,
-                req_idx,
-                start_pos,
-                1,
-            )
+            host_locs = self._alloc_or_bind_host_locs(req_idx, start_pos, 1)
             host_locs_list.append(host_locs)
         host_locs = torch.cat(host_locs_list)
 
@@ -735,16 +803,8 @@ class HiSparseCoordinator:
         ]
         self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
 
-        # Free host memory that was allocated during admit_request_into_staging
-        host_indices = self.mem_pool_host.allocated_host_indices(
-            self.req_to_host_pool,
-            req.req_pool_idx,
-            self.req_to_host_pool_allocated_len[req.req_pool_idx],
-        )
-        if host_indices.numel() > 0:
-            self.mem_pool_host.free(host_indices)
-        self.req_to_host_pool[req.req_pool_idx, :] = -1
-        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
+        # Radix L1 rows remain owned by RadixCache; legacy host rows are freed.
+        self._clear_request_host_locs(req.req_pool_idx)
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
 
@@ -784,21 +844,15 @@ class HiSparseCoordinator:
         )
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
 
-        host_indices = self.mem_pool_host.allocated_host_indices(
-            self.req_to_host_pool,
-            req.req_pool_idx,
-            self.req_to_host_pool_allocated_len[req.req_pool_idx],
-        )
-        if host_indices.numel() > 0:
-            self.mem_pool_host.free(host_indices)
+        # Radix L1 rows remain alive for prefix insertion/rematching. Only the
+        # request-local host lookup metadata is cleared here.
+        self._clear_request_host_locs(req.req_pool_idx)
 
         # clear req info
         self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
         self.req_to_device_buffer[req.req_pool_idx, :] = 0
         self.req_device_buffer_size[req.req_pool_idx] = 0
-        self.req_to_host_pool[req.req_pool_idx, :] = -1
-        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
 
