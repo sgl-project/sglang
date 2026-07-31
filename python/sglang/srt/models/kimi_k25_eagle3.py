@@ -123,7 +123,7 @@ class Eagle3MLADecoderLayer(nn.Module):
         )
         # Recompute fused-proj-dependent flags so they reflect the new input dim.
         attn.has_fused_proj = True
-        attn.use_min_latency_fused_a_gemm = False
+        attn._use_min_latency_fused_a_gemm = False
         quant_method = getattr(attn.fused_qkv_a_proj_with_mqa, "quant_method", None)
         attn.is_packed_weight = (
             quant_method is not None
