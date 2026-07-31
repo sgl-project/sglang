@@ -191,6 +191,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    owns_attention_graph_state = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -259,22 +261,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         # --- capture mode + tokens-per-bs ------------------------------
-        self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
-        # Static capture width.
-        self.captured_req_width = model_runner.decode_num_tokens_per_req(
-            num_draft_tokens=self.speculative_num_draft_tokens
+        self.capture_forward_mode, self.captured_req_width = (
+            self._resolve_capture_layout()
         )
-        if model_runner.spec_algorithm.is_speculative():
-            if self.model_runner.is_draft_worker:
-                # Draft workers can use TARGET_VERIFY mode.
-                if (
-                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
-                ):
-                    raise RuntimeError("This should not happen")
-            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-        elif self.is_dllm:
-            self.capture_forward_mode = ForwardMode.DLLM_EXTEND
 
         # --- bucket sizes ---------------------------------------------
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
@@ -313,7 +303,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
-        self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        if self.owns_attention_graph_state:
+            self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -440,6 +431,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _cache_loc_dtype(self):
         return torch.int64
+
+    def _resolve_capture_layout(self):
+        req_width = self.model_runner.decode_num_tokens_per_req(
+            num_draft_tokens=self.speculative_num_draft_tokens
+        )
+        if self.model_runner.spec_algorithm.is_speculative():
+            if (
+                self.model_runner.is_draft_worker
+                and not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
+            ):
+                raise RuntimeError("This should not happen")
+            return ForwardMode.TARGET_VERIFY, req_width
+        if self.is_dllm:
+            return ForwardMode.DLLM_EXTEND, req_width
+        return ForwardMode.DECODE, req_width
 
     def _make_graph_key(self, size, stream_idx=None, variant_label=None):
         return ShapeKey(
