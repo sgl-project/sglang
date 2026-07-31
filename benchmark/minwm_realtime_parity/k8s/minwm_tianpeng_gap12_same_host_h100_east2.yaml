@@ -84,6 +84,7 @@ spec:
             - |
               set -euo pipefail
               mkdir -p /parity/native
+              rm -f /parity/native/FAILED /parity/native/SUCCESS
               trap 'touch /parity/native/FAILED' ERR
 
               clone_at() {
@@ -218,6 +219,7 @@ spec:
             - |
               set -euo pipefail
               mkdir -p /parity/sglang /parity/player
+              rm -f /parity/sglang/FAILED /parity/sglang/SUCCESS
               trap 'touch /parity/sglang/FAILED' ERR
 
               for _ in $(seq 1 2700); do

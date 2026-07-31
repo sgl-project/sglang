@@ -14,7 +14,6 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-import msgspec.msgpack
 import numpy as np
 
 from common import save_video, sha256_file, write_json
@@ -227,6 +226,7 @@ async def run_request(
     expected_chunks: int,
     timeout: float,
 ) -> tuple[np.ndarray, list[dict], dict]:
+    import msgspec.msgpack
     import websockets
 
     frames = []
