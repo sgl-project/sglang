@@ -1109,8 +1109,16 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
+        req_pool_indices: Optional[torch.Tensor] = None,
     ):
-        """Update mamba states after MTP verify via a fused gather-scatter kernel."""
+        """Update mamba states after MTP verify via a fused gather-scatter kernel.
+
+        ``req_pool_indices`` is the verify batch's request slots, for
+        implementations that must re-derive the state slot ids rather than reuse
+        this step's ``forward_metadata`` (see Inkling's override); the mamba
+        scatter below keeps reading the metadata it just planned.
+        """
+        del req_pool_indices
         request_number = last_correct_step_indices.shape[0]
 
         state_indices_tensor = (

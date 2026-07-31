@@ -78,6 +78,9 @@ class _MockReqToTokenPool:
     def mamba2_layer_cache(self, layer_id: int):
         return self.mamba_pool.mamba2_layer_cache(layer_id)
 
+    def get_speculative_mamba2_params_all_layers(self):
+        return self.mamba_pool.mamba_cache
+
 
 def _decode_batch(bs: int):
     return SimpleNamespace(
@@ -271,6 +274,95 @@ class TestInklingSconvMetadataOnce(CustomTestCase):
                 h1.precomputed["si"].data_ptr(),
             ),
         )
+
+
+class TestInklingMtpVerifyCommit(CustomTestCase):
+    """Inkling's accepted-verify conv commit must not use this step's metadata.
+
+    The commit runs after the forward context exits, so the sidecar's per-step
+    slot buffer may already have been refilled by a later forward -- the generic
+    mamba path sources its slot ids from ``forward_metadata`` and died on the
+    resulting length mismatch (dst=15 vs step=16). The override must instead
+    re-derive them from the ``req_pool_indices`` it is handed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("Inkling's conv-state kernels are CUDA-only.")
+        TestInklingSconvMetadataOnce.setUpClass()
+
+    def _build_wrapper(self):
+        from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
+            InklingShortConvAttnBackend,
+            InklingShortConvHybridAttnBackend,
+        )
+        from sglang.srt.runtime_context import get_server_args
+
+        pool = _MockReqToTokenPool()
+        runner = SimpleNamespace(
+            device="cuda",
+            server_args=get_server_args(),
+            is_draft_worker=False,
+            req_to_token_pool=pool,
+            token_to_kv_pool=None,
+        )
+        sidecar = InklingShortConvAttnBackend(runner)
+        full = SimpleNamespace(
+            token_to_kv_pool=None,
+            req_to_token_pool=pool,
+            needs_cpu_seq_lens=True,
+        )
+        wrapper = InklingShortConvHybridAttnBackend(
+            full, sidecar, list(range(NUM_LAYERS))
+        )
+        return wrapper, sidecar, pool
+
+    def test_commit_uses_passed_req_pool_indices_not_step_metadata(self):
+        wrapper, sidecar, pool = self._build_wrapper()
+
+        # Simulate the hazard: the last forward left a SHORTER slot buffer behind
+        # than the verify batch the commit is for.
+        sidecar.init_forward_metadata(_decode_batch(bs=3))
+        self.assertEqual(sidecar._cache_indices.shape[0], 3)
+
+        seen = {}
+
+        def fake_scatter(caches, state_indices, last_correct, track, steps):
+            seen["state_indices"] = state_indices
+
+        import sglang.srt.layers.attention.linear.inkling_sconv_backend as mod
+
+        real = mod.scatter_mamba_states_after_mtp_verify
+        mod.scatter_mamba_states_after_mtp_verify = fake_scatter
+        self.addCleanup(setattr, mod, "scatter_mamba_states_after_mtp_verify", real)
+
+        req_pool_indices = torch.arange(5, dtype=torch.int64, device="cuda")
+        wrapper.update_mamba_state_after_mtp_verify(
+            last_correct_step_indices=torch.zeros(5, dtype=torch.int64, device="cuda"),
+            mamba_track_indices=None,
+            mamba_steps_to_track=None,
+            model=None,
+            req_pool_indices=req_pool_indices,
+        )
+        # 5 rows, from req_pool_indices -- not the 3 left on the step buffer.
+        self.assertEqual(seen["state_indices"].shape[0], 5)
+        self.assertTrue(
+            torch.equal(seen["state_indices"], pool.get_mamba_indices(req_pool_indices))
+        )
+
+    def test_commit_requires_req_pool_indices(self):
+        """The generic caller signature makes it optional; Inkling cannot guess it."""
+        wrapper, _sidecar, _pool = self._build_wrapper()
+        with self.assertRaises(AssertionError):
+            wrapper.update_mamba_state_after_mtp_verify(
+                last_correct_step_indices=torch.zeros(
+                    2, dtype=torch.int64, device="cuda"
+                ),
+                mamba_track_indices=None,
+                mamba_steps_to_track=None,
+                model=None,
+            )
 
 
 if __name__ == "__main__":

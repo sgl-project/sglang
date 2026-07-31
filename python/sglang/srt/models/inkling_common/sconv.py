@@ -199,8 +199,8 @@ class ShortConvolution(nn.Module):
         Builds a padded sequence [initial_conv_state | draft_tokens] and extracts
         sliding windows of size (kernel_size - 1) after each draft token position.
         These intermediate states are consumed by
-        InklingForConditionalGeneration.update_conv_state_after_mtp_verify
-        to restore the correct conv state for the number of accepted tokens.
+        InklingShortConvAttnBackend.commit_conv_state_after_mtp_verify to restore
+        the correct conv state for the number of accepted tokens.
         """
         save_intermediate_conv_windows(
             sconv_cache=sconv_cache,
@@ -346,7 +346,7 @@ class ShortConvolution(nn.Module):
     ) -> None:
         """Target-verify finish for the fused {AR + scattered sconv} path: no
         working-cache update; save the per-position windows (consumed by
-        update_conv_state_after_mtp_verify), exactly as the verify branch of
+        commit_conv_state_after_mtp_verify), exactly as the verify branch of
         ``forward`` does -- on the reduced pre-conv x."""
         meta = self._conv_state(forward_batch)
         self._save_intermediate_conv_windows(

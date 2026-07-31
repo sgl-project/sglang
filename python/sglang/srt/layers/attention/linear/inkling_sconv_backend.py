@@ -67,6 +67,9 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 import torch
 
+from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    scatter_mamba_states_after_mtp_verify,
+)
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     ShortConvHybridAttnBackend,
 )
@@ -564,6 +567,37 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self._track_conv_indices = out
 
     # ------------------------------------------------------------------
+    # speculative-decoding state commit
+    # ------------------------------------------------------------------
+
+    def commit_conv_state_after_mtp_verify(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+    ) -> None:
+        """Commit the per-step conv windows saved during TARGET_VERIFY into the
+        persistent conv caches at each request's last accepted step.
+
+        The slot ids are re-derived from ``req_pool_indices`` instead of reusing
+        the per-step ``self._cache_indices``: this runs after the forward context
+        has exited, by which point another forward may already have refilled that
+        buffer. Trusting it is what makes the generic mamba commit fail here
+        (``dst_indices=15 vs step_indices=16``), so the authoritative request
+        identity has to come in as an argument.
+        """
+        pool = self.req_to_token_pool
+        scatter_mamba_states_after_mtp_verify(
+            pool.get_speculative_mamba2_params_all_layers(),
+            self._translate_mamba_indices(pool.get_mamba_indices(req_pool_indices)),
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+        )
+
+    # ------------------------------------------------------------------
     # handle handed to the model
     # ------------------------------------------------------------------
 
@@ -602,34 +636,39 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
       conv layers, unlike the mamba models the base's skip was written for;
     * the capability surface the model and the runners read off the full-attention
       backend has to stay visible through the wrapper;
-    * the generic mamba MTP-verify commit must stay HIDDEN (see
-      :meth:`update_mamba_state_after_mtp_verify`).
+    * the MTP-verify state commit is Inkling's own (see
+      :meth:`update_mamba_state_after_mtp_verify`), not the generic mamba scatter.
     """
 
     def _is_full_attn(self, layer=None, layer_id: Optional[int] = None) -> bool:
         del layer, layer_id
         return True
 
-    @property
-    def update_mamba_state_after_mtp_verify(self):
-        """Hidden on purpose: raising ``AttributeError`` makes ``hasattr`` False.
+    def update_mamba_state_after_mtp_verify(
+        self,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+        model=None,
+        req_pool_indices: Optional[torch.Tensor] = None,
+    ):
+        """Commit accepted verify state through the conv sidecar.
 
-        The spec workers commit accepted verify state with
-        ``if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"): ...
-        elif hasattr(model, "update_conv_state_after_mtp_verify"): ...``. Inkling
-        belongs in the second branch -- its conv state is six per-stream caches
-        with their own intermediate-window layout, which the generic mamba
-        gather/scatter cannot express (it dies on an index-length mismatch). That
-        used to fall out for free because Inkling ran on a bare full-attention
-        backend; now that the conv sidecar rides in a ``HybridLinearAttnBackend``,
-        the generic entry point is inherited and would win the dispatch. Hiding it
-        here keeps the choice in the class that knows about it, instead of
-        reordering probes in shared spec code.
+        Overrides the generic mamba scatter, which sources its slot ids from
+        ``linear_attn_backend.forward_metadata`` -- stale by the time this runs,
+        since the commit happens after the forward context exits. The sidecar
+        re-derives them from ``req_pool_indices`` instead.
         """
-        raise AttributeError(
-            "InklingShortConvHybridAttnBackend intentionally does not provide "
-            "update_mamba_state_after_mtp_verify; Inkling commits its conv state "
-            "through the model's update_conv_state_after_mtp_verify."
+        del model
+        assert req_pool_indices is not None, (
+            "Inkling's conv-state commit needs req_pool_indices; the caller must "
+            "pass the verify batch's request slots."
+        )
+        self.short_conv_backend.commit_conv_state_after_mtp_verify(
+            req_pool_indices=req_pool_indices,
+            last_correct_step_indices=last_correct_step_indices,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
