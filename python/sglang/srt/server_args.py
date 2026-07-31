@@ -7060,9 +7060,7 @@ class ServerArgs:
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
 
-        # Step 3: DCP compatibility. The L2 (device<->host) path translates
-        # the widened logical indices to per-rank physical rows at the host
-        # pool boundary; only the MLA host pool carries that translation.
+        # Step 3: DCP compatibility for the L2 (device<->host) path.
         self._resolve_hicache_dcp_compatibility()
 
     def _resolve_hicache_dcp_compatibility(self):

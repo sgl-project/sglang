@@ -276,9 +276,6 @@ class HostKVCache(abc.ABC):
     @synchronized
     def clear(self):
         # Initialize memory states and tracking structures.
-        # All slot accounting is in the logical space (== physical when
-        # dcp_size == 1): the radix tree stores one host slot per logical
-        # token; the physical buffer row is derived at transfer time.
         self.mem_state = torch.zeros(
             (self.logical_size,), dtype=torch.uint8, device=self.device
         )
@@ -317,14 +314,9 @@ class HostKVCache(abc.ABC):
         return self.page_size * self.dcp_size
 
     def dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        """Translate logical slot indices to this rank's physical buffer rows.
+        """Transfer kernels index per-rank rows; callers hold widened logical slots.
 
-        Identity when dcp_size == 1. Under DCP, keeps the owned interleaved
-        subset (index % dcp_size == dcp_rank) and collapses it onto physical
-        rows (// dcp_size) — the same owner rule the device-side KV write and
-        page-table kernels use. For runs made of whole widened pages every
-        rank keeps exactly 1/dcp_size of the slots, covering its full
-        physical pages.
+        Keep this rank's slots (% dcp_size == dcp_rank), then collapse (// dcp_size).
         """
         if self.dcp_size == 1:
             return indices
