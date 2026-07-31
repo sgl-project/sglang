@@ -370,16 +370,13 @@ class TestConvWindowDedupLayout(CustomTestCase):
 
 class TestMtpVerifyHookSignature(CustomTestCase):
     """Every ``update_mamba_state_after_mtp_verify`` override must accept the full
-    call the spec workers make.
+    keyword call the spec workers make, or it raises TypeError at verify time on
+    whatever hardware it serves (how the Ascend override was missed when
+    ``req_pool_indices`` was added).
 
-    ``spec_utils.commit_mamba_states_after_verify`` and the DFlash verify path call
-    this hook by keyword, so an override that omits a parameter raises TypeError at
-    verify time on whatever hardware it serves. Found in review after
-    ``req_pool_indices`` was added and the Ascend override was missed.
-
-    Parses the sources rather than importing them: the accelerator backends that
-    define overrides are exactly the ones whose deps are absent on most hosts, so
-    an import-based check would skip the cases that matter.
+    Parses sources rather than importing: the accelerator backends defining
+    overrides are exactly the ones whose deps are absent on most hosts, so an
+    import-based check would skip the cases that matter.
     """
 
     CALL_KWARGS = {

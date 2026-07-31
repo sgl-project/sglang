@@ -1,15 +1,11 @@
 """Inkling's short-conv metadata must be resolved exactly ONCE per forward step.
 
-``InklingShortConvAttnBackend`` owns the step-global conv metadata and hands it out
-through ``conv_state_metadata``. Inkling has FOUR ``ShortConvolution`` modules per
-decoder layer, so the pre-backend "layer 0 owns the metadata" rule recomputed the
-whole set once per conv module of layer 0. These tests pin:
-
-1. one resolution per step no matter how many conv modules ask;
-2. every module gets the *same* tensors back;
-3. the graph-path destinations stay address-stable across steps, including across
-   a later ``init_cuda_graph_state`` (reallocating there would move the address an
-   already-captured prefill graph reads).
+A decoder layer holds FOUR ``ShortConvolution`` modules, so the pre-backend
+"layer 0 owns the metadata" rule recomputed the whole set four times per step.
+Pinned here: one resolution per step however many modules ask, every module gets
+the *same* tensors, and the graph-path destinations stay address-stable across
+steps -- including across a later ``init_cuda_graph_state``, where reallocating
+would move an address an already-captured prefill graph reads.
 """
 
 import unittest
@@ -226,19 +222,15 @@ class TestInklingSconvMetadataOnce(CustomTestCase):
                 self._check_address_stable(slots_in_graph)
 
     def _check_address_stable(self, slots_in_graph: bool):
-        """A captured graph holds the address of every metadata tensor its conv
-        kernels read, so each step must refill those buffers in place -- and a
-        later ``init_cuda_graph_state`` (the decode runner reports its bounds only
-        after the prefill graphs are captured) must not reallocate them.
-        """
+        """A captured graph holds each metadata tensor's address, so steps refill in
+        place and a later ``init_cuda_graph_state`` must not reallocate."""
         backend, _pool = self._build_backend()
-        # Cover the recorded-slot-lookup split too (the mock pool's translate is
-        # not the base one, so the backend would otherwise keep slots eager).
+        # Cover both halves of the slot split (the mock's translate is not the base
+        # one, so slots would otherwise always stay eager).
         backend._slot_gather_recordable = slots_in_graph
         fb = _decode_batch(bs=2)
 
-        # Mirrors the decode runner: out-of-graph replay prep, then the recorded
-        # in-graph hook.
+        # Mirrors the decode runner: out-of-graph prep, then the recorded hook.
         backend.init_forward_metadata_out_graph(fb, in_capture=True)
         backend.init_forward_metadata_in_graph(fb)
         h0 = backend.conv_state_metadata(0, fb)
@@ -271,12 +263,9 @@ class TestInklingSconvMetadataOnce(CustomTestCase):
 
 
 class TestInklingMtpVerifyCommit(CustomTestCase):
-    """Inkling's accepted-verify conv commit must not use this step's metadata.
-
-    The commit runs after the forward context exits, so the sidecar's per-step slot
-    buffer may already have been refilled by a later forward -- the generic mamba
-    path sources slot ids from ``forward_metadata`` and died on the resulting length
-    mismatch (dst=15 vs step=16).
+    """The commit runs after the forward context exits, so the per-step slot buffer
+    may already belong to a later forward -- the generic mamba path sources slot ids
+    from ``forward_metadata`` and died on the length mismatch (dst=15 vs step=16).
     """
 
     @classmethod
@@ -314,8 +303,8 @@ class TestInklingMtpVerifyCommit(CustomTestCase):
     def test_commit_uses_passed_req_pool_indices_not_step_metadata(self):
         wrapper, sidecar, pool = self._build_wrapper()
 
-        # Simulate the hazard: the last forward left a SHORTER slot buffer behind
-        # than the verify batch the commit is for.
+        # The hazard: a later forward left a SHORTER slot buffer than the verify
+        # batch this commit is for.
         sidecar.init_forward_metadata(_decode_batch(bs=3))
         self.assertEqual(sidecar._cache_indices.shape[0], 3)
 
@@ -338,7 +327,7 @@ class TestInklingMtpVerifyCommit(CustomTestCase):
             model=None,
             req_pool_indices=req_pool_indices,
         )
-        # 5 rows, from req_pool_indices -- not the 3 left on the step buffer.
+        # 5 rows from req_pool_indices, not the 3 on the step buffer.
         self.assertEqual(seen["state_indices"].shape[0], 5)
         self.assertTrue(
             torch.equal(seen["state_indices"], pool.get_mamba_indices(req_pool_indices))

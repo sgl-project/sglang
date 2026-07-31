@@ -282,10 +282,9 @@ def attn_backend_wrapper_for_draft_extend(
 ):
     """Apply the model's attention wrapper to a DRAFT-EXTEND backend, if it needs one.
 
-    ``DraftBackendFactory`` builds draft backends directly, skipping
-    :func:`attn_backend_wrapper`. That is right for the mamba-style hybrids, whose
-    MTP draft carries only softmax-attention layers. Inkling's MTP draft has its
-    own short convs, so its draft backend must expose ``conv_state_metadata`` too.
+    ``DraftBackendFactory`` skips :func:`attn_backend_wrapper`, which is right for
+    the mamba hybrids whose MTP draft is all softmax attention. Inkling's draft has
+    its own short convs, so it must expose ``conv_state_metadata`` too.
     """
     from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
 

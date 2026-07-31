@@ -13,37 +13,24 @@
 # ==============================================================================
 """Inkling's short-conv state backend.
 
-A :mod:`~sglang.srt.layers.attention.linear.short_conv_backend` sidecar: every
-Inkling layer is softmax attention, and four short convs per decoder layer
-(``k_sconv`` / ``v_sconv`` around that layer's attention, plus the ``attn`` and
-``mlp`` output streams) keep per-request conv state in the centralized
-``MambaPool``. The model reaches it via :meth:`conv_state_metadata`; it never
-serves ``forward_decode`` / ``forward_extend``.
+A :mod:`~sglang.srt.layers.attention.linear.short_conv_backend` sidecar. Four short
+convs per decoder layer keep per-request conv state in the centralized
+``MambaPool``; the model reaches this via :meth:`conv_state_metadata`, never
+through ``forward_decode`` / ``forward_extend``.
 
-Beyond what :class:`ShortConvAttnBackend` owns, Inkling's conv kernels take a
-*precomputed* metadata set (``cache_mask`` / ``safe_idx`` / ``cu`` / ``si``) that
-its fused kernel emits alongside ``query_start_loc`` / ``has_initial_state``, plus
-the extend prefix-cache ``track_conv_indices``. All of it is step-global, so it is
-resolved ONCE per step and every conv layer reads the cached handle. Ownership used
-to be keyed on ``layer_id == 0``, but a decoder layer holds FOUR
-``ShortConvolution`` modules, so each prep ran four times per step.
+On top of what :class:`ShortConvAttnBackend` owns, Inkling's kernels take a
+precomputed ``cache_mask`` / ``safe_idx`` / ``cu`` / ``si`` set plus the extend
+``track_conv_indices``. All step-global, so it is resolved once per step instead of
+once per conv module (a decoder layer holds FOUR of them).
 
-Which hook resolves what follows the graph contract, and matters for decode
-latency:
-
-* ``init_forward_metadata_in_graph`` is *recorded* into the decode /
-  target-verify / draft-extend graphs, so prep there replays for free. Both the
-  slot lookup and the fused metadata launch go here -- resolving them out of graph
-  measured ~7% off decode throughput.
-* ``init_forward_metadata_out_graph`` takes only what a phase cannot record: the
-  full-cuda-graph prefill (no in-graph hook) and the unified pool's slot translate
-  (an allocator lookup, not a table gather).
-* ``init_forward_metadata`` covers the eager path and does both.
-
-Since prep no longer sits in the model it no longer sits in the graph, so every
-tensor a captured conv kernel reads lives in a graph-static buffer refilled in
-place -- same contract as ``ShortConvAttnBackend._cache_indices_buf`` and the
-full-attention backend's ``swa_out_cache_loc_buf``.
+Hook split, which is a decode-latency cliff rather than a style choice:
+``init_forward_metadata_in_graph`` is *recorded* into the decode / target-verify /
+draft-extend graphs, so prep there replays for free -- doing it out of graph
+measured ~7% off decode throughput. ``init_forward_metadata_out_graph`` takes only
+what a phase cannot record: full-cuda-graph prefill (no in-graph hook) and the
+unified pool's slot translate. Prep is therefore no longer inside the graph, so
+every tensor a captured kernel reads lives in a graph-static buffer refilled in
+place.
 """
 
 from __future__ import annotations
@@ -84,11 +71,8 @@ if TYPE_CHECKING:
 class InklingShortConvMetadata(NamedTuple):
     """Per-(layer, step) conv-state handle handed to Inkling's conv kernels.
 
-    ``layer_cache`` exposes this layer's pool views, indexed by ``SconvType``:
-    ``conv`` is a stream's conv state, ``intermediate_conv_window`` its
-    per-draft-token snapshots. Everything else is step-global and already
-    resolved; on the graph path those tensors are static buffers refilled in place
-    before each replay.
+    ``layer_cache`` holds this layer's pool views indexed by ``SconvType``; the
+    rest is step-global, and on the graph path is a static buffer refilled in place.
     """
 
     layer_cache: Any
@@ -129,18 +113,10 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
 
         self._alloc_graph_buffers()
 
-    # ------------------------------------------------------------------
-    # graph-static metadata buffers
-    # ------------------------------------------------------------------
-
     def _alloc_graph_buffers(self):
-        """Allocate the graph-path metadata destinations.
-
-        Sized from the *configured* capture shapes, once, and never reallocated:
-        growing a buffer after a graph captured it would move the address that
-        graph reads, and the prefill graph is captured before the decode runner
-        reports its own bounds.
-        """
+        """Sized from the CONFIGURED capture shapes, once, never reallocated:
+        growing a buffer after a graph captured it moves the address that graph
+        reads, and prefill captures before the decode runner reports its bounds."""
         server_args = get_server_args()
         cuda_graph_config = server_args.cuda_graph_config
         decode_bs: list[int] = []
@@ -177,16 +153,12 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         super().init_cuda_graph_state(max_bs, max_num_tokens)
-        # Fail at startup, not at the first replay, if a phase outgrows __init__'s
-        # bounds.
+        # Fail now, not at the first replay, if a phase outgrew __init__'s bounds.
         self._graph_metadata_out(B=max_bs, T=max_num_tokens)
 
     def _graph_metadata_out(self, *, B: int, T: int) -> SconvMetadataOut:
-        """Graph-static destinations sliced to this step.
-
-        Asserts instead of falling back to a fresh allocation, which would leave
-        the captured kernels reading a dead address.
-        """
+        """Graph-static destinations sliced to this step. Asserts rather than
+        allocating, which would leave captured kernels on a dead address."""
         bufs = self._graph_bufs
         assert B + 1 <= bufs["query_start_loc"].shape[0] and T <= bufs["si"].shape[0], (
             f"short-conv metadata buffers too small for a captured shape: "
@@ -202,18 +174,10 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             si=bufs["si"][:T],
         )
 
-    # ------------------------------------------------------------------
-    # per-step metadata prep
-    # ------------------------------------------------------------------
-
     def _forward_metadata(self, forward_batch: ForwardBatch) -> ForwardMetadata:
-        """Resolve the per-request conv-state slot ids for this step.
-
-        Leaner than ``MambaAttnBackendBase._forward_metadata`` on purpose: Inkling
-        has no SSM state (its ``track_ssm_*`` prep also syncs), its conv window
-        sits on a different axis than the shared ``_init_track_conv_indices``
-        assumes, and its ``query_start_loc`` comes out of the fused kernel.
-        """
+        """Slot ids only. Leaner than ``MambaAttnBackendBase._forward_metadata``
+        on purpose: no SSM state (whose track prep also syncs), a conv window on a
+        different axis, and ``query_start_loc`` from the fused kernel."""
         return ForwardMetadata(
             query_start_loc=None,
             mamba_cache_indices=self._translate_mamba_indices(
@@ -229,12 +193,9 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
 
     @staticmethod
     def _phase_records_metadata(forward_batch: ForwardBatch) -> bool:
-        """True when this phase's runner records ``init_forward_metadata_in_graph``.
-
-        The decode / target-verify / draft-extend runners do, so prep placed there
-        replays for free; resolving it out of graph measured ~7% off decode
-        throughput. The full-cuda-graph prefill runner has no such hook.
-        """
+        """True when this phase's runner records ``init_forward_metadata_in_graph``
+        (decode / target-verify / draft-extend do; full-cuda-graph prefill does
+        not)."""
         mode = forward_batch.forward_mode
         return (
             mode.is_decode_or_idle()
@@ -243,19 +204,15 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Eager path: nothing downstream is captured, so the kernels may
-        allocate."""
+        """Eager path: nothing downstream is captured, so kernels may allocate."""
         self._prepare_slot_indices(forward_batch)
         self._refresh_sconv_metadata(forward_batch, on_graph_path=False)
 
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
-        """Out-of-graph replay prep: whatever this phase cannot record.
-
-        Runs before *every* graph replay, so the common path is one predicate and
-        a return.
-        """
+        """Whatever this phase cannot record. Runs before EVERY replay, so the
+        common path is one predicate and a return."""
         del in_capture
         if self._phase_records_metadata(forward_batch):
             if not self._slot_gather_recordable:
@@ -265,9 +222,8 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self._refresh_sconv_metadata(forward_batch, on_graph_path=True)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        """Graph-recorded prep: writes into the graph-static destinations, so the
-        recorded launches refill them at every replay (and never allocate, as the
-        hook's contract requires)."""
+        """Recorded into the graph: writes the static destinations, so the launches
+        refill them every replay and never allocate (the hook's contract)."""
         if not self._phase_records_metadata(forward_batch):
             return
         if self._slot_gather_recordable:
@@ -286,15 +242,10 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         n = req_pool_indices.shape[0]
         buf = self._cache_indices_buf
         if self._slot_gather_recordable and n <= buf.shape[0]:
-            # One launch: gather straight into the graph-static buffer. The base's
-            # gather-then-copy would add a second recorded kernel per step for
-            # nothing -- the pool's table already has this buffer's dtype.
-            #
-            # No PAD sentinel for the padded tail, unlike the generic mamba
-            # backend: a graph runner zero-fills padded req_pool_indices, and
-            # MambaSlotAllocator.clear reserves slot 0 as the dummy write target
-            # (live requests start at 1), so the mapping already sends padded rows
-            # there. Poisoning would only add a fill_ per padded step.
+            # One launch; the base's gather-then-copy would add a second recorded
+            # kernel per step (the pool's table already has this dtype). No PAD
+            # sentinel needed: MambaSlotAllocator.clear reserves slot 0 as the dummy
+            # write target, so zero-filled padded rows already land there.
             torch.index_select(
                 self.req_to_token_pool.req_index_to_mamba_index_mapping,
                 0,
@@ -342,13 +293,11 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
     def _refresh_extend_metadata(
         self, forward_batch: ForwardBatch, on_graph_path: bool
     ):
-        """Fused ``(query_start_loc, has_initial_state, SconvExtendMetadata)`` in
-        one launch; unfused op sequence off-CUDA / past the kernel's batch
-        bound."""
+        """One fused launch; unfused fallback off-CUDA / past the batch bound."""
         B = forward_batch.batch_size
         if forward_batch.forward_mode.is_target_verify():
-            # target_verify does not populate extend_seq_lens/extend_prefix_lens;
-            # the lens are a constant draft_token_num per request.
+            # target_verify has no extend_seq_lens/extend_prefix_lens; the lens are
+            # a constant draft_token_num per request.
             draft_token_num = forward_batch.spec_info.draft_token_num
             T = B * draft_token_num
             his_kwargs = dict(his_mode=HIS_ONES, draft_token_num=draft_token_num)
@@ -372,11 +321,10 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
                 his_src=his_src,
             )
 
-        # Captured conv kernels bake their token extent at CAPTURE (the prefill
-        # bucket) while replay only reports the live count, so fill the WHOLE
-        # seq-index buffer: the kernel writes the real mapping for t < T and clamps
-        # the tail to B - 1, which is what the old in-graph prep produced past the
-        # live extent. target_verify's B * draft_token_num is exact either way.
+        # Captured kernels bake their token extent at CAPTURE (the prefill bucket)
+        # while replay reports only the live count, so fill the WHOLE seq-index
+        # buffer -- the kernel clamps the tail to B - 1, as the old in-graph prep
+        # did. target_verify's B * draft_token_num is exact either way.
         fill_T = T
         out = None
         if on_graph_path:
@@ -423,8 +371,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self._precomputed = precomputed
 
     def _unfused_extend_metadata(self, forward_batch: ForwardBatch):
-        """Multi-kernel query_start_loc/has_initial_state prep; fused fallback
-        only."""
+        """Unfused query_start_loc / has_initial_state prep; fallback only."""
         device = forward_batch.req_pool_indices.device
         if forward_batch.forward_mode.is_target_verify():
             draft_token_num = forward_batch.spec_info.draft_token_num
@@ -465,24 +412,18 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
     def _refresh_track_conv_indices(
         self, forward_batch: ForwardBatch, on_graph_path: bool
     ):
-        """Input positions of the conv windows to snapshot for prefix caching.
+        """Input positions of the conv windows to snapshot for prefix caching: the
+        last ``conv_kernel - 1`` tokens up to the last complete
+        ``mamba_cache_chunk_size`` boundary.
 
-        After a prefill chunk the last ``conv_kernel - 1`` tokens of the tracked
-        region must be saved, up to the last complete ``mamba_cache_chunk_size``
-        boundary (where the chunk scan checkpoints).
-
-        Under the padded prefill graph the captured gather reads all ``batch_size``
-        rows while the per-request track lengths only cover the live requests, so
-        the tail is ZEROED rather than left stale -- every row the kernel may read
-        has to index inside *this* replay's token buffer, which the old in-graph
-        build got from clamping the whole padded range to
-        ``query_start_loc[-1] - 1``.
+        The padded tail is ZEROED, not left stale: the captured gather reads all
+        ``batch_size`` rows while the track lengths cover only live requests, and
+        every row it may read must index inside *this* replay's token buffer.
         """
         if forward_batch.mamba_track_mask is None:
             return
         rows = forward_batch.batch_size
         query_start_loc = self._query_start_loc
-        # The graph path pads batch_size past the live per-request lengths.
         live = min(
             rows,
             forward_batch.mamba_track_seqlens.shape[0],
@@ -515,8 +456,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             self._track_window_offsets,
             out=out[:live],
         )
-        # 1-element tensors, never [-1] scalars: a 0-d -> Python conversion would
-        # sync, and is unrecordable under capture.
+        # 1-element tensors, never [-1]: a 0-d -> Python conversion would sync.
         torch.clamp(
             out[:live],
             min=self._track_index_floor,
@@ -527,10 +467,6 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             out[live:].zero_()
         self._track_conv_indices = out
 
-    # ------------------------------------------------------------------
-    # speculative-decoding state commit
-    # ------------------------------------------------------------------
-
     def commit_conv_state_after_mtp_verify(
         self,
         *,
@@ -539,14 +475,12 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
     ) -> None:
-        """Commit the per-step conv windows saved during TARGET_VERIFY into the
-        persistent conv caches at each request's last accepted step.
+        """Commit the TARGET_VERIFY conv windows at each request's last accepted step.
 
-        Slot ids are re-derived from ``req_pool_indices``, not read off the
-        per-step ``self._cache_indices``: this runs after the forward context has
-        exited, by which point another forward may already have refilled that
-        buffer. Trusting it is what makes the generic mamba commit fail here
-        (``dst_indices=15 vs step_indices=16``).
+        Slot ids come from ``req_pool_indices``, not the per-step
+        ``self._cache_indices``: this runs after the forward context exits, so that
+        buffer may already belong to a later forward -- trusting it is what makes
+        the generic mamba commit fail here (``dst=15 vs step=16``).
         """
         pool = self.req_to_token_pool
         scatter_mamba_states_after_mtp_verify(
@@ -557,18 +491,11 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             mamba_steps_to_track,
         )
 
-    # ------------------------------------------------------------------
-    # handle handed to the model
-    # ------------------------------------------------------------------
-
     def conv_state_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> InklingShortConvMetadata:
-        """Return ``layer_id``'s conv-state handle for the current step.
-
-        A pure read of ``self._*``: every conv layer in the step shares one gather,
-        one fused metadata launch and one track-index build.
-        """
+        """``layer_id``'s handle for this step: a pure read, so every conv layer
+        shares one gather, one fused launch and one track-index build."""
         del forward_batch
         return InklingShortConvMetadata(
             layer_cache=self.req_to_token_pool.mamba2_layer_cache(layer_id),
@@ -583,19 +510,15 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
 class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
     """Full-attention backend plus Inkling's conv-state sidecar.
 
-    Inkling has NO linear-attention layers -- the short convs preprocess q/k and
-    the attn/mlp output streams around softmax attention -- so every layer routes
-    to the full-attention child and the sidecar is reached only through
-    :meth:`conv_state_metadata`. Hence four departures from
-    :class:`ShortConvHybridAttnBackend`:
-
-    * every layer is full attention, including the draft model's (the base's
-      ``full_attn_layers = [0]`` draft-worker assumption does not hold);
-    * DRAFT_EXTEND_V2 must still init the sidecar -- the draft model runs its own
-      conv layers, unlike the mamba models the base's skip was written for;
-    * the capability surface the model and the runners read off the full-attention
-      backend stays visible through the wrapper;
-    * the MTP-verify commit is Inkling's own, not the generic mamba scatter.
+    Inkling has NO linear-attention layers, so every layer routes to the
+    full-attention child and the sidecar is reached only via
+    :meth:`conv_state_metadata`. Four departures from
+    :class:`ShortConvHybridAttnBackend`: every layer is full attention (including
+    the draft's, so the base's ``full_attn_layers = [0]`` does not hold);
+    DRAFT_EXTEND_V2 still inits the sidecar (the draft runs its own convs, unlike
+    the mamba models the base's skip was written for); the full-attention backend's
+    capability surface stays visible through the wrapper; and the MTP-verify commit
+    is Inkling's own, not the generic mamba scatter.
     """
 
     def _is_full_attn(self, layer=None, layer_id: Optional[int] = None) -> bool:
@@ -610,12 +533,8 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
         model=None,
         req_pool_indices: Optional[torch.Tensor] = None,
     ):
-        """Commit accepted verify state through the conv sidecar.
-
-        Overrides the generic mamba scatter, which sources slot ids from
-        ``linear_attn_backend.forward_metadata`` -- stale here, since the commit
-        runs after the forward context exits.
-        """
+        """Overrides the generic mamba scatter, which sources slot ids from
+        ``forward_metadata`` -- stale once the forward context has exited."""
         del model
         assert req_pool_indices is not None, (
             "Inkling's conv-state commit needs req_pool_indices; the caller must "
@@ -634,8 +553,8 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
 
     @property
     def forward_metadata(self):
-        # Unambiguous: the sidecar's metadata is reached via conv_state_metadata,
-        # so this means the attention one (KV write locs, the SWA loc translate).
+        # The sidecar's is reached via conv_state_metadata, so this is the attention
+        # one (KV write locs, the SWA loc translate).
         return self.full_attn_backend.forward_metadata
 
     @property

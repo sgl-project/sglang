@@ -61,12 +61,9 @@ class DraftBackendFactory:
         if self.speculative_num_steps <= 1:
             return None
 
-        # Multi-step decode returns a per-step CONTAINER, not an AttentionBackend,
-        # so attn_backend_wrapper_for_draft_extend cannot add a conv sidecar to it.
-        # A draft whose layers need one would fail deep inside the first inner
-        # forward instead; refuse up front. Reachable only for an Inkling checkpoint
-        # without mtp_local_layer_ids, since a banded MTP head already requires
-        # --enable-multi-layer-eagle (which never builds this backend).
+        # This returns a per-step CONTAINER, not an AttentionBackend, so
+        # attn_backend_wrapper_for_draft_extend cannot give it a conv sidecar; a
+        # draft needing one would fail deep in the first inner forward.
         _assert_draft_needs_no_conv_sidecar(self.draft_model_runner)
 
         backend_map = {
