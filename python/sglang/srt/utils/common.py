@@ -186,6 +186,11 @@ def is_npu() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_dgx_spark() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 1)
+
+
+@lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (

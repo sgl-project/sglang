@@ -11,6 +11,7 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.helion_utils import (
     get_model_depths,
     helion_aot_autotune,
 )
+from sglang.srt.utils.common import is_dgx_spark
 
 DEFAULT_BLOCK_SIZE = 4096
 BLOCK_SIZE_M = 128
@@ -896,6 +897,11 @@ def grouped_gemm_triton(
             "num_warps": 8,
             "num_stages": 3,
         }
+
+    # sm_121 (GB10 / DGX Spark) has less shared memory headroom; drop one stage.
+    if is_dgx_spark():
+        config["num_stages"] -= 1
+
     # Set grid_m to the max number of M blocks and skip padding-only blocks
     # in the kernel based on expert_block_offs[-1]
     grid_m = expert_block_schedule.numel()
