@@ -9,7 +9,7 @@
 
 #include <cfloat>
 #include <cstdint>
-#if defined(__HIP_PLATFORM_AMD__)
+#ifdef USE_ROCM
 static constexpr unsigned long long kWarpSyncMask = 0xFFFFFFFFFFFFFFFFull;
 #else
 #include <math_constants.h>
@@ -72,7 +72,7 @@ struct TopKTrait {
       for (uint32_t offset = 1; offset < device::kWarpThreads; offset *= 2) {
         // Width-32 up-shuffle. On wave64 HIP the un-suffixed __shfl_up takes the
         // logical-warp width directly; CUDA needs the active mask.
-#if defined(__HIP_PLATFORM_AMD__)
+#ifdef USE_ROCM
         uint32_t n = __shfl_up(val, offset, device::kWarpThreads);
 #else
         uint32_t n = __shfl_up_sync(kWarpSyncMask, val, offset, device::kWarpThreads);
@@ -319,7 +319,7 @@ __global__ void minimax_decode_topk_block_kernel(
   static_assert(TopKTrait::kMaxTopK <= 2 * device::kWarpThreads);
   const auto warp_id = tx / device::kWarpThreads;
   const auto lane_id = tx % device::kWarpThreads;
-#if defined(__HIP_PLATFORM_AMD__)
+#ifdef USE_ROCM
   // wave64: __ballot spans the full 64-lane wave (would count the sibling
   // 32-lane logical warp too); use the file's width-32 shuffle reduction.
   const auto count_lt = [](int32_t x, int32_t v) { return device::warp::reduce_sum(static_cast<int>(x < v)); };
