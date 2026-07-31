@@ -10,6 +10,10 @@ import torch
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.multimodal_gen.configs.sample.glmimage import (
+    GLM_IMAGE_RESOLUTION_ALIGNMENT,
+    align_glm_image_resolution,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -221,7 +225,6 @@ class GlmImageAR(PipelineStage):
         width: int,
         server_args: ServerArgs,
         image: Optional[List[PIL.Image.Image]] = None,
-        factor: int = 32,
     ) -> Tuple[torch.Tensor, int, int]:
         """
         Generate prior tokens using the AR (vision_language_encoder) model.
@@ -237,8 +240,14 @@ class GlmImageAR(PipelineStage):
             - pixel_width: Image width in pixels
         """
         device = get_local_torch_device()
-        height = (height // factor) * factor
-        width = (width // factor) * factor
+        if (
+            height % GLM_IMAGE_RESOLUTION_ALIGNMENT != 0
+            or width % GLM_IMAGE_RESOLUTION_ALIGNMENT != 0
+        ):
+            raise ValueError(
+                "GLM-Image dimensions must be aligned before AR token generation, "
+                f"got {width}x{height}"
+            )
 
         is_text_to_image = image is None or len(image) == 0
         # Build messages for processor
@@ -411,6 +420,20 @@ class GlmImageAR(PipelineStage):
         if ar_condition_images is not None:
             height = height or ar_condition_images[0].height
             width = width or ar_condition_images[0].width
+
+        requested_width = width
+        requested_height = height
+        width, height = align_glm_image_resolution(width, height)
+        if (width, height) != (requested_width, requested_height):
+            logger.warning(
+                "GLM-Image requires dimensions divisible by %s; adjusted "
+                "runtime resolution from %sx%s to %sx%s",
+                GLM_IMAGE_RESOLUTION_ALIGNMENT,
+                requested_width,
+                requested_height,
+                width,
+                height,
+            )
 
         time_start = time.time()
         num_outputs = _num_outputs_per_prompt(batch)
