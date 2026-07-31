@@ -87,6 +87,12 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
     - Decode/spec_v2: gather from FutureMap (last iter's sampled token).
     """
+    # Backends that do not consume a CPU sequence-length mirror resolve the
+    # exact accepted lengths here, on the forward stream. The scheduler can
+    # therefore stay ahead using request-side reserved bounds without waiting
+    # for the previous speculative accept/finalize step on the host.
+    future_map.resolve_seq_lens_device(batch)
+
     if batch.prefill_input_ids_cpu is not None:
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
         if batch.mix_running_indices is not None:
@@ -156,11 +162,23 @@ class ConfidenceRelay(msgspec.Struct):
     req_pool_size: int
     pool: Any
     confidence_buf: Optional[torch.Tensor] = None
+    confidence_snapshot_ring: Optional[torch.Tensor] = None
     conf_ring: Optional[torch.Tensor] = None
     gen_ring: Optional[torch.Tensor] = None
+    snapshot_ready: Optional[list] = None
     copy_done: Optional[list] = None
+    copy_issued: Optional[list] = None
+    last_snapshot_slot: int = -1
     ring_pos: int = 0
     initialized: bool = False
+
+    def reset(self) -> None:
+        # req_generation restarts when the request pool is flushed. Forget
+        # every pre-flush publication so an old generation cannot match a
+        # newly allocated request slot (ABA).
+        self.ring_pos = 0
+        if self.gen_ring is not None:
+            self.gen_ring.fill_(-1)
 
     def _lazy_init(self, confidence: torch.Tensor) -> None:
         self.initialized = True
@@ -168,32 +186,58 @@ class ConfidenceRelay(msgspec.Struct):
         self.confidence_buf = torch.empty(
             (self.req_pool_size, gamma), dtype=torch.float32, device=self.device
         )
-        if _is_cuda:
+        if _is_cuda or _is_hip:
             depth = CONFIDENCE_RELAY_RING_DEPTH
+            self.confidence_snapshot_ring = torch.empty(
+                (depth, self.req_pool_size, gamma),
+                dtype=torch.float32,
+                device=self.device,
+            )
             self.conf_ring = torch.empty(
                 (depth, self.req_pool_size, gamma),
                 dtype=torch.float32,
                 pin_memory=True,
             )
             self.gen_ring = torch.zeros((depth, self.req_pool_size), dtype=torch.int64)
-            self.copy_done = [
-                torch.get_device_module(self.device).Event() for _ in range(depth)
-            ]
+            device_module = torch.get_device_module(self.device)
+            self.snapshot_ready = [device_module.Event() for _ in range(depth)]
+            self.copy_done = [device_module.Event() for _ in range(depth)]
+            self.copy_issued = [False] * depth
 
     def scatter(self, indices: torch.Tensor, confidence: torch.Tensor) -> None:
         if not self.initialized:
             self._lazy_init(confidence)
         self.confidence_buf[indices] = confidence.to(self.confidence_buf.dtype)
 
-    def issue_ring_copy(self, *, stream, publish_ready) -> None:
-        if not self.initialized or stream is None or publish_ready is None:
+    def wait_for_previous_snapshot(self, stream) -> None:
+        if not self.initialized or stream is None or self.last_snapshot_slot < 0:
+            return
+        stream.wait_event(self.snapshot_ready[self.last_snapshot_slot])
+
+    def issue_ring_copy(self, *, stream, publish_stream) -> None:
+        if not self.initialized or stream is None or publish_stream is None:
             return
         slot = self.ring_pos % CONFIDENCE_RELAY_RING_DEPTH
-        stream.wait_event(publish_ready)
-        with torch.get_device_module(self.device).stream(stream):
-            self.conf_ring[slot].copy_(self.confidence_buf, non_blocking=True)
+        device_module = torch.get_device_module(self.device)
+
+        # Reusing a snapshot slot must wait for its prior D2H reader. Keep this
+        # as a device dependency: reset() can wrap back to slot zero while a
+        # pre-flush copy is still in flight.
+        if self.copy_issued[slot]:
+            publish_stream.wait_event(self.copy_done[slot])
+        with device_module.stream(publish_stream):
+            self.confidence_snapshot_ring[slot].copy_(self.confidence_buf)
+            self.snapshot_ready[slot].record()
+        self.last_snapshot_slot = slot
+
+        stream.wait_event(self.snapshot_ready[slot])
+        with device_module.stream(stream):
+            self.conf_ring[slot].copy_(
+                self.confidence_snapshot_ring[slot], non_blocking=True
+            )
             self.copy_done[slot].record()
         self.gen_ring[slot].copy_(self.pool.req_generation)
+        self.copy_issued[slot] = True
         self.ring_pos += 1
 
     def resolve(
@@ -268,10 +312,10 @@ class FutureMap:
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
         # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
-        # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
-        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
-        # platforms have no barrier and use the plain .cpu() bootstrap path.
-        if _is_cuda:
+        # D2H pulls (gated only on publish, off the schedule stream). CUDA-like
+        # devices share the pinned relay; other platforms use the plain .cpu()
+        # bootstrap path.
+        if _is_cuda or _is_hip:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
@@ -284,6 +328,7 @@ class FutureMap:
         self.dsa_topk_indices_buf = None
 
         self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
+        self._publish_stream = None
         # Debug consume-once state: armed by a recording publish, consumed by
         # resolve; arm/consume strictly alternate across all batch interleavings.
         self._publish_fresh = False
@@ -420,6 +465,15 @@ class FutureMap:
         fi = draft_input.future_indices
         if fi is None:
             return
+
+        if not self.needs_cpu_seq_lens:
+            # Exact lengths are gathered later on the forward stream by
+            # resolve_seq_lens_device(). Do not make the schedule stream wait
+            # for the previous forward merely to install a device tensor view.
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+            return
+
         if self.publish_ready is not None:
             if _DEBUG_ASSERT:
                 # Consume-once: every event wait must be re-armed by a fresh
@@ -432,18 +486,6 @@ class FutureMap:
             else:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
-
-        if not self.needs_cpu_seq_lens:
-            # GPU gather above is kept (SB.seq_lens must advance each verify);
-            # skip the .cpu() D2H. Downstream takes the GPU-only path.
-            batch.seq_lens_cpu = None
-            batch.seq_lens_sum = None
-            if _DEBUG_ASSERT:
-                # Poison consumed rows: each row must be re-published/seeded
-                # before the next resolve gathers it (safe here: the forward's
-                # re-publish is fenced behind this stream via wait_stream).
-                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
-            return
 
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
@@ -467,6 +509,47 @@ class FutureMap:
             # mirror is not poisoned.
             _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
 
+    def resolve_seq_lens_device(self, batch: ScheduleBatch) -> None:
+        """Gather exact speculative lengths without blocking the host.
+
+        This is the GPU-only counterpart of resolve_seq_lens_cpu(). It runs
+        inside the persistent forward-stream context. A device event wait is
+        sufficient for bootstrap/off-stream publications; in steady decode the
+        event was recorded by the preceding forward on this same stream.
+        """
+        if self.needs_cpu_seq_lens:
+            return
+        draft_input = batch.spec_info
+        if draft_input is None:
+            return
+        fi = draft_input.future_indices
+        if fi is None:
+            return
+
+        if self.publish_ready is not None:
+            if _DEBUG_ASSERT:
+                assert self._publish_fresh, "resolve without a fresh forward publish"
+                self._publish_fresh = False
+            current_stream = torch.get_device_module(self.device).current_stream()
+            if (
+                self._publish_stream is not None
+                and current_stream != self._publish_stream
+            ):
+                # Bootstrap/off-stream seeding still needs a device dependency;
+                # steady speculative decode publishes and consumes on the same
+                # forward stream and therefore needs no HIP event wait at all.
+                current_stream.wait_event(self.publish_ready)
+        batch.seq_lens = self.new_seq_lens_buf[fi]
+        if _DEBUG_ASSERT:
+            _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
+
+    def reset(self) -> None:
+        """Drop cross-iteration publications after an idle cache flush."""
+        self.publish_ready = None
+        self._publish_stream = None
+        self._publish_fresh = False
+        self.confidence_relay.reset()
+
     def publish(
         self,
         future_indices: torch.Tensor,
@@ -476,27 +559,39 @@ class FutureMap:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
-        self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         publish_confidence = self.needs_confidence_relay and confidence is not None
-        if publish_confidence:
-            self.confidence_relay.scatter(indices, confidence)
-        # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
+        current_stream = None
+
+        # Chain off-stream publishers before they touch shared relay buffers.
+        # The event is recorded below only after the confidence snapshot has
+        # been enqueued, so the next publisher cannot overtake that snapshot.
         if self.spec_algo.is_some():
             device_module = torch.get_device_module(self.device)
+            current_stream = device_module.current_stream()
             if self.publish_ready is None:
                 self.publish_ready = device_module.Event()
-            else:
+            elif (
+                self._publish_stream is not None
+                and current_stream != self._publish_stream
+            ):
                 # Chain the records: event fire implies every prior publish is
                 # visible, so an off-forward-stream publish (PD-decode prebuilt
                 # seeding) cannot drop the in-flight forward's fence.
-                device_module.current_stream().wait_event(self.publish_ready)
-            self.publish_ready.record()
-            self._publish_fresh = True
+                current_stream.wait_event(self.publish_ready)
+
+        self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         if publish_confidence:
+            self.confidence_relay.wait_for_previous_snapshot(current_stream)
+            self.confidence_relay.scatter(indices, confidence)
             self.confidence_relay.issue_ring_copy(
                 stream=self.fwd_prepare_d2h_stream,
-                publish_ready=self.publish_ready,
+                publish_stream=current_stream,
             )
+
+        if self.spec_algo.is_some():
+            self.publish_ready.record()
+            self._publish_stream = current_stream
+            self._publish_fresh = True
 
     def stash(self, future_indices: torch.Tensor, payload: RelayPayload) -> None:
         if self.spec_algo.is_ngram():

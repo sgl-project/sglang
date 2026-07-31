@@ -926,9 +926,23 @@ class DeepseekV4AttnBackend(
         block_size: int,
     ) -> DSV4Metadata:
         if seq_lens_cpu is None:
-            seq_lens_cpu_list = seq_lens.tolist()
-        else:
-            seq_lens_cpu_list = [int(x) for x in seq_lens_cpu.tolist()]
+            seq_lens_casual = self._dspark_seq_lens_casual(
+                seq_lens=seq_lens, block_size=block_size
+            )
+            req_pool_indices_repeated = req_pool_indices.repeat_interleave(block_size)
+            core_attn_metadata = self.make_core_attn_metadata(
+                req_to_token=self.req_to_token,
+                req_pool_indices_repeated=req_pool_indices_repeated,
+                seq_lens_casual=seq_lens_casual,
+                max_seq_len=max_seq_len,
+                out_loc=out_cache_loc,
+                need_compress=False,
+                is_prefill=True,
+                dspark_block_size=block_size,
+            )
+            return DSV4Metadata(core_attn_metadata, indexer_metadata=None)
+
+        seq_lens_cpu_list = [int(x) for x in seq_lens_cpu.tolist()]
         lengths = compute_uniform_extend_lengths(
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu_list,
