@@ -38,8 +38,14 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import get_buffer, get_parallel, get_server_args
-from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_flashinfer_available,
+    is_float4_e2m1fn_x2,
+)
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if is_flashinfer_available():
     import flashinfer
@@ -278,8 +284,31 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
-        """Initialize CUDA graph state for TRTLLM MLA."""
+        """Initialize CUDA graph state for TRTLLM MLA.
 
+        The persistent buffers allocated here (KV block-index table, padded q/out
+        scratch, tree mask, and the base-class buffers) are capture-time-initialized
+        device state that graph replays read via captured pointers but never
+        rewrite. Under colocated RL, torch_memory_saver frees them on sleep; without
+        a host backup they resume as garbage and replays fault with `CUDA error:
+        misaligned address` after a few steps. Allocate them in the TMS cuda_graph
+        region with cpu-backup -- same tag/mechanism as the graph pool backup in
+        FullCudaGraphBackend (#32718). Wrapping here (not at the runner call site)
+        covers the target decode runner AND the EAGLE draft / draft-extend / MTP
+        runners, which each call this method on their own attention backend.
+        """
+        with TorchMemorySaverAdapter.create(
+            enable=get_server_args().enable_memory_saver
+            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+        ).region(GPU_MEMORY_TYPE_CUDA_GRAPH, enable_cpu_backup=True):
+            self._init_cuda_graph_state_impl(max_bs, max_num_tokens, kv_indices_buf)
+
+    def _init_cuda_graph_state_impl(
+        self,
+        max_bs: int,
+        max_num_tokens: int,
+        kv_indices_buf: Optional[torch.Tensor] = None,
+    ):
         max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
 
         self.decode_cuda_graph_kv_indices = torch.full(
