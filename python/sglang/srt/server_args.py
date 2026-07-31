@@ -41,6 +41,7 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
+from sglang.srt.arg_groups.overrides import resolved_view
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
@@ -4207,6 +4208,7 @@ class ServerArgs:
     def _handle_cuda_graph_config(self):
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
+        self._apply_deepep_adjustments()
         self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()
         # Warn on the final resolved config (not inside the compat cascade —
@@ -4217,6 +4219,30 @@ class ServerArgs:
                 "cuda_graph_config[prefill].backend='full' is experimental. "
                 "Use breakable or tc_piecewise for production workloads."
             )
+
+    def _apply_deepep_adjustments(self):
+        """Config adjustments required by the DeepEP a2a backend."""
+        if resolved_view(self).moe_a2a_backend != "deepep":
+            return
+
+        # Non-multiple-of-8 prefill buckets can hang DeepEP a2a capture under
+        # breakable CUDA graph
+        if self.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
+            bs = self.cuda_graph_config.prefill.bs
+            if bs is None:
+                # 2048 = documented prefill default; max_bs unresolved here.
+                max_bs = self.cuda_graph_config.prefill.max_bs or 2048
+                bs = self._generate_prefill_cuda_graph_batch_sizes(max_bs)
+            aligned = sorted({((b + 7) // 8) * 8 for b in bs})
+            if aligned != sorted(bs):
+                logger.info(
+                    "Breakable prefill CUDA graph with DeepEP requires bucket "
+                    "sizes divisible by 8; aligning %s -> %s.",
+                    sorted(bs),
+                    aligned,
+                )
+                self.cuda_graph_config.prefill.bs = aligned
+                self.cuda_graph_config.prefill.max_bs = aligned[-1]
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
@@ -4321,8 +4347,6 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _disable_tc_piecewise_cudagraph_if_incompatible(self):
-        from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
-
         """TcPiecewise (torch.compile + piecewise) is incompatible with
         these configurations. Most are torch.compile / dynamo limitations.
         """
@@ -4346,7 +4370,7 @@ class ServerArgs:
             ),
             (
                 "MoE A2A backend",
-                lambda: _resolved_view(self).moe_a2a_backend != "none",
+                lambda: resolved_view(self).moe_a2a_backend != "none",
             ),
             # Dynamo blocks LoRA under tc_piecewise (per-batch LoRABatchInfo
             # rebinds break guards); breakable/full support LoRA.
@@ -4359,7 +4383,7 @@ class ServerArgs:
             (
                 "GGUF quantization",
                 lambda: self.load_format == "gguf"
-                or _resolved_view(self).quantization == "gguf"
+                or resolved_view(self).quantization == "gguf"
                 or check_gguf_file(self.model_path),
             ),
             ("DLLM (diffusion LLM)", lambda: self.dllm_algorithm is not None),
@@ -4398,17 +4422,21 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _disable_breakable_cudagraph_if_incompatible(self):
-        from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
-
         """Breakable (segmented capture, no torch.compile). Breakable enforces
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
-        from sglang.srt.configs.model_config import is_deepseek_v4
+        from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
         rules = [
-            # MLA prefill takes a different attn-forward path under BCG.
-            ("MLA attention", lambda: self.use_mla_backend()),
+            # MLA prefill under BCG takes forward_mha, which has no eager
+            # breaks. DSA is exempt: BCG forces the sparse path, whose
+            # indexer already splits eagerly.
+            (
+                "MLA attention (non-DSA)",
+                lambda: self.use_mla_backend()
+                and not is_deepseek_dsa(self.get_model_config().hf_config),
+            ),
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
             (
@@ -4425,10 +4453,15 @@ class ServerArgs:
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
             ),
-            # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
+            # TBO capture is unsupported.
             (
-                "MoE A2A backend",
-                lambda: _resolved_view(self).moe_a2a_backend != "none",
+                "two-batch overlap",
+                lambda: self.enable_two_batch_overlap,
+            ),
+            # Only DeepEP's a2a is validated under BCG.
+            (
+                "non-DeepEP a2a backend",
+                lambda: resolved_view(self).moe_a2a_backend not in ("none", "deepep"),
             ),
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
@@ -4826,12 +4859,19 @@ class ServerArgs:
                 # MLA backend overhead is much higher than expected with fa3.
                 reserved_mem += 1.5 * 1024
 
+            if (
+                prefill_cuda_graph_config.backend == Backend.BREAKABLE
+                and resolved_view(self).moe_a2a_backend == "deepep"
+            ):
+                # Prefill-BCG DeepEP delta (bridge pool + NVL first-touch
+                # during capture); decode-side DeepEP is a baseline cost.
+                reserved_mem += 1 * 1024
+
         return reserved_mem
 
     def reserve_for_deepep_a2a_mb(self) -> float:
         # DeepEP all-to-all buffers captured in the decode graph are real extra
         # allocations, reserved on top of the floor.
-        from sglang.srt.arg_groups.overrides import resolved_view
 
         decode_cuda_graph_config = self.cuda_graph_config.decode
         if (
@@ -4991,7 +5031,6 @@ class ServerArgs:
         # flags tier.
         from sglang.srt.arg_groups.overrides import (
             collect_model_override_declarations,
-            resolved_view,
             validate_declarations,
         )
 
@@ -5524,7 +5563,6 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import (
             _mamba_radix_cache_resolution,
             mamba_extra_buffer_of,
-            resolved_view,
             run_post_process_pass,
         )
 
@@ -5574,7 +5612,6 @@ class ServerArgs:
 
         if not use_mla_backend:
             # MHA architecture
-            from sglang.srt.arg_groups.overrides import resolved_view
 
             if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(
                 resolved_view(self)
@@ -5637,7 +5674,6 @@ class ServerArgs:
             _fa4_page_constraint,
             _intel_xpu_page_constraint,
             _mla_backend_page_constraints,
-            resolved_view,
             run_post_process_pass,
         )
 
@@ -5748,7 +5784,6 @@ class ServerArgs:
 
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
-        from sglang.srt.arg_groups.overrides import resolved_view
 
         if self.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
             return
@@ -6014,7 +6049,6 @@ class ServerArgs:
                 )
             from sglang.srt.arg_groups.overrides import (
                 mamba_extra_buffer_of,
-                resolved_view,
             )
 
             if mamba_extra_buffer_of(resolved_view(self)):
@@ -6374,7 +6408,6 @@ class ServerArgs:
             _cutlass_moe_env_override,
             _moe_runner_backend_quant_constraints,
             _moe_runner_fusion_disable,
-            resolved_view,
             run_post_process_pass,
         )
 
@@ -6493,7 +6526,6 @@ class ServerArgs:
         """Fail fast if the FlashInfer A2A dispatcher workspace cannot cover the
         largest CuteDSL MoE forward. Runs after speculative decoding is resolved
         so cutedsl_moe_max_num_tokens() sees the final num_tokens_per_req."""
-        from sglang.srt.arg_groups.overrides import resolved_view
 
         view = resolved_view(self)
         if not (
@@ -6536,7 +6568,6 @@ class ServerArgs:
             _a2a_backend_overrides,
             _a2a_ep_size,
             _a2a_fusion_adjustments,
-            resolved_view,
             run_post_process_pass,
         )
 
@@ -7022,7 +7053,6 @@ class ServerArgs:
         still None, backends haven't settled yet and the resolved (prefill,
         decode) pair would be a stale (None, None).
         """
-        from sglang.srt.arg_groups.overrides import resolved_view
 
         if not self.prefill_only_disable_kv_cache:
             return
@@ -7595,7 +7625,6 @@ class ServerArgs:
             from sglang.srt.arg_groups.overrides import (
                 _deterministic_attention_backend,
                 _deterministic_sampling_backend,
-                resolved_view,
                 run_post_process_pass,
             )
 
@@ -7841,7 +7870,6 @@ class ServerArgs:
             )
 
     def _handle_other_validations(self):
-        from sglang.srt.arg_groups.overrides import resolved_view
 
         # Handle optimistic prefill validation
         if (
@@ -8276,7 +8304,6 @@ class ServerArgs:
     def _resolved(self):
         """Read-only view of the resolving configuration: declared fields
         resolve from the declaration stash."""
-        from sglang.srt.arg_groups.overrides import resolved_view
 
         return resolved_view(self)
 
@@ -8338,7 +8365,6 @@ class ServerArgs:
         view so declared fields resolve from the declaration stash."""
         from sglang.srt.arg_groups.overrides import (
             attention_backends_of,
-            resolved_view,
         )
 
         return attention_backends_of(resolved_view(self))
@@ -8406,7 +8432,6 @@ class ServerArgs:
         # (or mamba_chunk_size if it is defined in the model's config) and page_size.
         # It is used to determine the caching point in a sequence during prefill.
         if not hasattr(self, "_mamba_cache_chunk_size"):
-            from sglang.srt.arg_groups.overrides import resolved_view
 
             hf_config = self.get_model_config().hf_config
             chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
