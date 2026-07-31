@@ -171,6 +171,7 @@ class QueueMetrics(msgspec.Struct, array_like=True):
     grammar: int
     paused: int
     retracted: int
+    prealloc_ready: int
 
 
 # LoadSnapshot's nested sub-struct fields; every other struct field is a flat
