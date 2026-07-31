@@ -85,7 +85,7 @@ spec:
               set -euo pipefail
               mkdir -p /parity/native
               rm -f /parity/native/FAILED /parity/native/SUCCESS
-              trap 'touch /parity/native/FAILED' ERR
+              trap 'touch /parity/native/FAILED; sleep infinity' ERR
 
               clone_at() {
                 local repository="$1" destination="$2" revision="$3"
@@ -220,7 +220,7 @@ spec:
               set -euo pipefail
               mkdir -p /parity/sglang /parity/player
               rm -f /parity/sglang/FAILED /parity/sglang/SUCCESS
-              trap 'touch /parity/sglang/FAILED' ERR
+              trap 'touch /parity/sglang/FAILED; sleep infinity' ERR
 
               for _ in $(seq 1 2700); do
                 if [[ -f /parity/native/SUCCESS ]]; then
@@ -228,7 +228,8 @@ spec:
                 fi
                 if [[ -f /parity/native/FAILED ]]; then
                   echo "native minWM lane failed"
-                  exit 1
+                  touch /parity/sglang/FAILED
+                  sleep infinity
                 fi
                 sleep 10
               done
@@ -307,7 +308,7 @@ spec:
                 kill -TERM "${SERVER_PID}" 2>/dev/null || true
                 wait "${SERVER_PID}" 2>/dev/null || true
               }
-              trap 'cleanup; touch /parity/sglang/FAILED' ERR
+              trap 'cleanup; touch /parity/sglang/FAILED; sleep infinity' ERR
               trap cleanup EXIT INT TERM
 
               for _ in $(seq 1 900); do
@@ -317,7 +318,8 @@ spec:
                 fi
                 if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
                   tail -300 /parity/sglang/server.log
-                  exit 1
+                  touch /parity/sglang/FAILED
+                  sleep infinity
                 fi
                 sleep 2
               done
@@ -343,6 +345,8 @@ spec:
 
               rm -f /parity/sglang/FAILED
               touch /parity/sglang/SUCCESS
+              echo "parity artifacts are ready; waiting for external harvest"
+              sleep infinity
           resources:
             requests:
               cpu: "32"
