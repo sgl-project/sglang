@@ -804,7 +804,9 @@ def test_minwm_unipc_scheduler_matches_native_shift_contract():
     assert scheduler.config.shift == 1.0
     scheduler.set_timesteps(4, device="cpu", shift=5.0)
     assert scheduler.sigmas.device.type == "cpu"
-    assert scheduler.timesteps.tolist() == [999, 936, 832, 624]
+    # This is the exact NumPy FP64 schedule produced by minWM 4220c8a from
+    # its FP32 sigma bounds. The previous 936/832 expectation was stale.
+    assert scheduler.timesteps.tolist() == [999, 937, 833, 624]
 
 
 def test_minwm_unipc_stage_steps_in_native_bfchw_layout():

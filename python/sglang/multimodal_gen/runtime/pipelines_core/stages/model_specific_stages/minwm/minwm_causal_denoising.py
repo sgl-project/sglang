@@ -826,10 +826,9 @@ class MinWMCausalVaeDecodingStage(CausalVaeDecodingStage):
     def forward(self, batch: Req, server_args: ServerArgs):
         generated_latents = batch.latents
         original_block_idx = batch.block_idx
+        session = getattr(batch, "session", None)
         causal_state = (
-            get_realtime_causal_dit_state(batch.session)
-            if batch.session is not None
-            else None
+            get_realtime_causal_dit_state(session) if session is not None else None
         )
         if batch.block_idx == 0 and causal_state is not None:
             causal_state.runtime_cache.pop(MINWM_T2V_FIRST_LATENT_CACHE, None)
