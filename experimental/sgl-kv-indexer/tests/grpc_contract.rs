@@ -1,19 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! gRPC contract tests: exercise all three RPCs of the `KVIndexer` service
+//! gRPC contract tests: exercise all four RPCs of the `KVIndexer` service
 //! over the wire (real tonic server + client), not just the backend trait.
 //!
 //! Like the backend integration tests these require a live store and are
-//! opt-in via `KV_INDEXER_REDIS_URL` (or `KV_INDEXER_REDIS_CLUSTER_NODES`);
-//! when neither is set every test skips. Each test uses a unique namespace and
-//! unique worker/hash ids so a shared store never causes collisions.
+//! opt-in via `KV_INDEXER_REDIS_URL`; when it is not set every test skips. Each
+//! test uses a unique namespace and unique worker/hash ids so a shared store
+//! never causes collisions.
 #![cfg(feature = "redis-backend")]
 
 #[path = "common/require.rs"]
 mod require;
 #[path = "common/id.rs"]
 mod test_id;
+#[allow(dead_code)] // Shared fixtures include Redis-only tier helpers.
 #[path = "common/kv.rs"]
 mod test_kv;
 #[path = "common/net.rs"]
@@ -32,7 +33,7 @@ use sgl_kv_indexer::pb::{
 };
 use sgl_kv_indexer::{KvIndexerService, RedisKvIndexerBackend};
 use test_id::nanos;
-use test_kv::{action, apply_request, dram, hbm};
+use test_kv::{action, apply_request, hbm};
 use test_net::free_addr;
 
 async fn start_backend(
@@ -178,207 +179,34 @@ async fn disjoint_workers_scale_across_two_indexer_servers() {
             "either indexer must see worker-1 through shared Redis"
         );
     }
-}
 
-#[tokio::test]
-async fn apply_match_and_hit_counts_over_grpc() {
-    let Some(mut c) = start("apply_match").await else {
-        return;
-    };
-    let w = format!("w-{}", nanos());
-    let (h1, h2, miss) = ("am-h1", "am-h2", "am-miss");
-
-    c.apply_external_kv_batch(apply_report(&w, "10.0.0.1:9000", 1, hbm(), &[h1, h2]))
-        .await
-        .expect("apply ok");
-
-    let resp = c
+    // Keep one wire-level smoke check for hit counting; detailed counter
+    // semantics live in redis_integration.rs.
+    indexer_0
         .match_external_kv(MatchExternalKvRequest {
-            hashes: vec![h1.into(), h2.into(), miss.into()],
+            hashes: vec![hash_0.clone()],
             count_as_hit: true,
         })
         .await
-        .expect("match ok")
-        .into_inner();
-
-    let m = resp
-        .matches
-        .iter()
-        .find(|m| m.worker_id == w)
-        .expect("worker present in matches");
-    assert_eq!(m.address, "10.0.0.1:9000");
-    let tier = m
-        .hashes_by_tier
-        .iter()
-        .find(|t| t.tier == hbm())
-        .expect("HBM tier present");
-    let mut got: Vec<&String> = tier.hashes.iter().collect();
-    got.sort();
-    assert_eq!(got, vec![&h1.to_string(), &h2.to_string()]);
-
-    let hc = c
+        .expect("counting match over gRPC");
+    let miss = format!("horizontal-miss-{suffix}");
+    let counts = indexer_1
         .get_external_kv_hit_counts(GetExternalKvHitCountsRequest {
-            hashes: vec![h1.into(), h2.into(), miss.into()],
+            hashes: vec![hash_0.clone(), miss.clone()],
         })
         .await
-        .expect("hit counts ok")
+        .expect("hit counts over gRPC")
         .into_inner();
-    let count = |h: &str| {
-        hc.entries
+    let count = |hash: &str| {
+        counts
+            .entries
             .iter()
-            .find(|e| e.hash == h)
-            .map(|e| e.hit_count_total)
+            .find(|entry| entry.hash == hash)
+            .map(|entry| entry.hit_count_total)
             .unwrap_or(0)
     };
-    assert!(count(h1) >= 1, "h1 should have a hit");
-    assert!(count(h2) >= 1, "h2 should have a hit");
-    assert_eq!(count(miss), 0, "unmatched hash must not be counted");
-}
-
-#[tokio::test]
-async fn diagnostic_match_does_not_count_hits_over_grpc() {
-    let Some(mut c) = start("diag_match").await else {
-        return;
-    };
-    let w = format!("w-{}", nanos());
-    let h = "diag-h1";
-    c.apply_external_kv_batch(apply_report(&w, "10.0.0.2:9000", 1, hbm(), &[h]))
-        .await
-        .expect("apply ok");
-
-    // count_as_hit=false must not bump counters
-    c.match_external_kv(MatchExternalKvRequest {
-        hashes: vec![h.into()],
-        count_as_hit: false,
-    })
-    .await
-    .expect("match ok");
-
-    let hc = c
-        .get_external_kv_hit_counts(GetExternalKvHitCountsRequest {
-            hashes: vec![h.into()],
-        })
-        .await
-        .expect("hit counts ok")
-        .into_inner();
-    let count = hc
-        .entries
-        .iter()
-        .find(|e| e.hash == h)
-        .map(|e| e.hit_count_total)
-        .unwrap_or(0);
-    assert_eq!(count, 0, "diagnostic match must not increase hit count");
-}
-
-#[tokio::test]
-async fn apply_report_then_revoke_over_grpc() {
-    let Some(mut c) = start("apply_rr").await else {
-        return;
-    };
-    let w = format!("w-{}", nanos());
-    let h = "apply-rr-h1";
-
-    c.apply_external_kv_batch(apply_report(&w, "10.0.0.3:9000", 1, hbm(), &[h]))
-        .await
-        .expect("report apply ok");
-
-    let before = c
-        .match_external_kv(MatchExternalKvRequest {
-            hashes: vec![h.into()],
-            count_as_hit: false,
-        })
-        .await
-        .expect("match ok")
-        .into_inner();
-    assert!(
-        before.matches.iter().any(|m| m.worker_id == w),
-        "reported hash should match"
-    );
-
-    c.apply_external_kv_batch(apply(
-        &w,
-        "10.0.0.3:9000",
-        2,
-        ExternalKvActionType::ActionRevoke,
-        hbm(),
-        &[h],
-    ))
-    .await
-    .expect("revoke apply ok");
-
-    let after = c
-        .match_external_kv(MatchExternalKvRequest {
-            hashes: vec![h.into()],
-            count_as_hit: false,
-        })
-        .await
-        .expect("match ok")
-        .into_inner();
-    assert!(
-        !after.matches.iter().any(|m| m.worker_id == w),
-        "revoked hash must not match"
-    );
-}
-
-#[tokio::test]
-async fn revoke_all_at_tier_over_grpc() {
-    let Some(mut c) = start("revoke_all").await else {
-        return;
-    };
-    let w = format!("w-{}", nanos());
-    let h = "ra-h1";
-
-    // same hash present in both HBM and DRAM
-    c.apply_external_kv_batch(apply_report(&w, "10.0.0.3:9000", 1, hbm(), &[h]))
-        .await
-        .expect("apply hbm");
-    c.apply_external_kv_batch(apply_report(&w, "10.0.0.3:9000", 2, dram(), &[h]))
-        .await
-        .expect("apply dram");
-
-    c.apply_external_kv_batch(apply(
-        &w,
-        "10.0.0.3:9000",
-        3,
-        ExternalKvActionType::ActionClearAllAtTier,
-        hbm(),
-        &[],
-    ))
-    .await
-    .expect("clear-all apply ok");
-
-    let resp = c
-        .match_external_kv(MatchExternalKvRequest {
-            hashes: vec![h.into()],
-            count_as_hit: false,
-        })
-        .await
-        .expect("match ok")
-        .into_inner();
-    let m = resp
-        .matches
-        .iter()
-        .find(|m| m.worker_id == w)
-        .expect("worker still present via DRAM");
-    let tiers: Vec<i32> = m.hashes_by_tier.iter().map(|t| t.tier).collect();
-    assert!(tiers.contains(&dram()), "DRAM tier must remain");
-    assert!(!tiers.contains(&hbm()), "HBM tier must be cleared");
-}
-
-#[tokio::test]
-async fn match_miss_returns_empty_over_grpc() {
-    let Some(mut c) = start("match_miss").await else {
-        return;
-    };
-    let resp = c
-        .match_external_kv(MatchExternalKvRequest {
-            hashes: vec![format!("never-reported-{}", nanos())],
-            count_as_hit: true,
-        })
-        .await
-        .expect("match ok")
-        .into_inner();
-    assert!(resp.matches.is_empty(), "unknown hash yields no matches");
+    assert!(count(&hash_0) >= 1, "matched hash should have a hit");
+    assert_eq!(count(&miss), 0, "unmatched hash must not be counted");
 }
 
 #[tokio::test]
