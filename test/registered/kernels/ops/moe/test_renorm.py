@@ -1,5 +1,5 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/main/tests/test_sampling.py
-# and /sgl-workspace/sglang/sgl-kernel/tests/test_sampling.py
+# and /sgl-workspace/sglang/python/sglang/kernels/aot/tests/test_sampling.py
 
 import sys
 

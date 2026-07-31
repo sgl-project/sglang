@@ -365,7 +365,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if (
             self.use_deep_gemm
             and layer.w13_weight.dtype == torch.bfloat16
-            and get_moe_a2a_backend().is_deepep()
+            and (get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_pplx())
             and not _is_npu
             and not _is_hip
             and hasattr(layer, "dispatcher")
@@ -438,10 +438,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 layer.num_local_experts, *new_shape_w2
             )
         if _is_npu:
+            # The kernels set the dispatcher output dtype themselves -- they are
+            # the ones that know what their gmms expect. NPUUnquantMoEMethod
+            # already sets bf16 here, and hardcoding it a second time would
+            # clobber a subclass that attached a quantized kernel instead.
             layer.w13_kernel.process_weights_after_loading(layer, "w13")
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
-            if hasattr(layer, "dispatcher"):
-                layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
         return
 
