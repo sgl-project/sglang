@@ -111,7 +111,7 @@ def _run_unfused_reference(
         cache_indices,
         use_qk_l2norm_in_kernel=True,
     )
-    return rms_norm_gated(
+    ref = rms_norm_gated(
         out,
         onorm_g.view(1, _BATCH, heads, _HEAD_DIM),
         onorm_weight,
@@ -119,6 +119,7 @@ def _run_unfused_reference(
         activation="sigmoid",
         eps=1e-6,
     )
+    return ref.transpose(0, 1).contiguous()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
