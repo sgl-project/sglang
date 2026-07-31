@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.pad import (
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
+    mla_quantize_without_rope_for_fp8,
 )
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashmla_kv_indices_triton,
@@ -149,6 +150,7 @@ class TRTLLMMLADecodeMetadata:
     cu_seqlens_q: Optional[torch.Tensor] = None
     seq_lens_q: Optional[torch.Tensor] = None
     seq_lens_k: Optional[torch.Tensor] = None
+    global_seq_lens_k: Optional[torch.Tensor] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -381,6 +383,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if forward_mode.is_target_verify():
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
+            metadata.global_seq_lens_k = torch.zeros(
+                (bs,), dtype=torch.int32, device=device
+            )
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.num_draft_tokens
             metadata.max_seq_len_q = num_tokens_per_req
@@ -422,7 +427,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if forward_mode.is_target_verify():
             # Intentional int64 -> int32 same-kind out= downcast.
-            torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
+            torch.add(
+                seq_lens[:bs],
+                self.num_draft_tokens,
+                out=metadata.global_seq_lens_k,
+            )
+            metadata.seq_lens_k.copy_(metadata.global_seq_lens_k)
             seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.num_draft_tokens
@@ -568,6 +578,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq = max_seq + self.num_draft_tokens
                 seq_lens = seq_lens + self.num_draft_tokens
                 self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
+                self.forward_decode_metadata.global_seq_lens_k = (
+                    self.forward_decode_metadata.seq_lens_k
+                )
             elif forward_batch.forward_mode.is_draft_extend_v2():
                 sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
                 max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
@@ -760,22 +773,23 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Run forward for decode using TRTLLM MLA kernel."""
         merge_query = q_rope is not None
         if self.data_type == torch.float8_e4m3fn:
-            # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
-            # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
-            assert all(
-                x is not None for x in [q_rope, k_rope, cos_sin_cache]
-            ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
-            q, k, k_rope = mla_quantize_and_rope_for_fp8(
-                q,
-                q_rope,
-                k.squeeze(1),
-                k_rope.squeeze(1),
-                forward_batch.positions,
-                cos_sin_cache,
-                is_neox,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-            )
+            assert q_rope is not None and k_rope is not None
+            if cos_sin_cache is None:
+                q, k, k_rope = mla_quantize_without_rope_for_fp8(
+                    q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+                )
+            else:
+                q, k, k_rope = mla_quantize_and_rope_for_fp8(
+                    q,
+                    q_rope,
+                    k.squeeze(1),
+                    k_rope.squeeze(1),
+                    forward_batch.positions,
+                    cos_sin_cache,
+                    is_neox,
+                    self.kv_lora_rank,
+                    self.qk_rope_head_dim,
+                )
             merge_query = False
 
         # Save KV cache if requested
@@ -855,8 +869,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
+        # The fallback belongs to genuine extend forwards only. Target-verify /
+        # draft-extend must never honor it: `forward_prefill_metadata` is a
+        # stale leftover from the last prefill there (eager init clears it,
+        # but decode-graph capture does not), and capturing verify through the
+        # flashinfer path binds the graph to prefill-planned wrapper buffers,
+        # which fault (illegal address) at replay.
         if (
-            self.forward_prefill_metadata is not None
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and self.forward_prefill_metadata is not None
             and self.forward_prefill_metadata.fallback_to_flashinfer_impl
         ):
             return super().forward_extend(
@@ -868,22 +891,23 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             self.data_type == torch.float8_e4m3fn
         ) and forward_batch.forward_mode.is_target_verify():
-            # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
-            # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
-            assert all(
-                x is not None for x in [q_rope, k_rope, cos_sin_cache]
-            ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
-            q, k, k_rope = mla_quantize_and_rope_for_fp8(
-                q,
-                q_rope,
-                k.squeeze(1),
-                k_rope.squeeze(1),
-                forward_batch.positions,
-                cos_sin_cache,
-                is_neox,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-            )
+            assert q_rope is not None and k_rope is not None
+            if cos_sin_cache is None:
+                q, k, k_rope = mla_quantize_without_rope_for_fp8(
+                    q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+                )
+            else:
+                q, k, k_rope = mla_quantize_and_rope_for_fp8(
+                    q,
+                    q_rope,
+                    k.squeeze(1),
+                    k_rope.squeeze(1),
+                    forward_batch.positions,
+                    cos_sin_cache,
+                    is_neox,
+                    self.kv_lora_rank,
+                    self.qk_rope_head_dim,
+                )
             merge_query = False
 
         # Save KV cache if requested
@@ -939,8 +963,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q = q.to(self.data_type)
 
             if forward_batch.forward_mode.is_target_verify():
-                max_seq_len = (
-                    metadata.max_seq_len_k + forward_batch.spec_info.draft_token_num
+                draft_token_num = forward_batch.spec_info.draft_token_num
+                dcp_enabled = get_parallel().dcp_enabled
+                max_seq_len = metadata.max_seq_len_k + (
+                    0 if dcp_enabled else draft_token_num
                 )
                 # For target_verify, all sequences have the same number of draft tokens
                 q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
@@ -993,6 +1019,44 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     unpad_sum_seq_lens_q = total_tokens
 
             assert kv_cache.dtype == self.data_type
+
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and get_parallel().dcp_enabled
+            ):
+                raw_out, lse = self._run_decode_kernel(
+                    query=q,
+                    kv_cache=kv_cache,
+                    block_tables=metadata.block_kv_indices,
+                    seq_lens=metadata.seq_lens_k,
+                    max_seq_len=max_seq_len,
+                    layer=layer,
+                    causal_seqs=metadata.global_seq_lens_k,
+                    cp_world=get_parallel().dcp_size,
+                    cp_rank=get_parallel().dcp_rank,
+                    return_lse=True,
+                )
+                output = raw_out.view(
+                    bs * draft_token_num,
+                    layer.tp_q_head_num,
+                    layer.v_head_dim,
+                )
+                lse = lse.view(bs * draft_token_num, layer.tp_q_head_num)
+                dense_q_indptr = torch.arange(
+                    0,
+                    (bs + 1) * draft_token_num,
+                    draft_token_num,
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                fixup_zero_kv_rows(
+                    output,
+                    lse,
+                    metadata.seq_lens_k,
+                    dense_q_indptr,
+                    draft_token_num,
+                )
+                return output.flatten(1), lse
 
             raw_out = self._run_decode_kernel(
                 query=q,

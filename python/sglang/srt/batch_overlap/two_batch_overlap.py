@@ -30,6 +30,7 @@ from sglang.srt.layers.moe.token_dispatcher import (
     MooncakeEPDispatcher,
     MoriEPDispatcher,
     NixlEPDispatcher,
+    PplxDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -783,6 +784,7 @@ class TboForwardBatchPreparer:
                 original_global_num_tokens_cpu=None,
                 _original_batch_size=None,
                 _original_forward_mode=None,
+                _original_num_tokens=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
                 global_dp_buffer_len=global_dp_buffer_len,
@@ -795,6 +797,7 @@ class TboForwardBatchPreparer:
                 mm_inputs=None,
                 top_logprobs_nums=None,
                 token_ids_logprobs=None,
+                extend_input_logprob_token_ids_gpu=None,
                 next_token_logits_buffer=None,
                 return_hidden_states_before_norm=False,
                 # TBO children start unplanned — planned by the TBO-aware init
@@ -1088,6 +1091,10 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         elif get_moe_a2a_backend().is_nixl():
             self._inners = [
                 NixlEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_pplx():
+            self._inners = [
+                PplxDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
             ]
 
     @property
