@@ -135,6 +135,7 @@ class BaseKVSender(ABC):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
