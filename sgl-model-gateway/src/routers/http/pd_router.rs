@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
@@ -81,7 +84,135 @@ struct PDRequestContext<'a> {
 #[derive(Clone, Copy)]
 struct BreakerOutcomesRecorded;
 
+fn token_handoff_response_headers(mut headers: HeaderMap) -> HeaderMap {
+    // These headers originate from the client request. Reusing its framing
+    // headers on the merged Prefill+Decode body truncates the SSE stream to
+    // the request body's Content-Length. Let Hyper frame the dynamic response.
+    headers.remove(CONTENT_LENGTH);
+    headers.remove(TRANSFER_ENCODING);
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    headers
+}
+
+fn token_handoff_prefill_frame_is_terminal(frame: &[u8]) -> bool {
+    let Ok(frame) = std::str::from_utf8(frame) else {
+        return false;
+    };
+    let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) else {
+        return false;
+    };
+    if data == "[DONE]" {
+        return false;
+    }
+    let Ok(event) = serde_json::from_str::<Value>(data) else {
+        return false;
+    };
+    if event.get("error").is_some() {
+        return true;
+    }
+    event
+        .get("choices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|choice| choice.get("finish_reason"))
+        .filter_map(Value::as_str)
+        .any(|reason| reason != "length")
+}
+
+fn token_handoff_prefill_frame_for_client(frame: bytes::Bytes) -> Option<bytes::Bytes> {
+    let Ok(frame_text) = std::str::from_utf8(&frame) else {
+        return Some(frame);
+    };
+    let Some(data) = frame_text
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+    else {
+        return Some(frame);
+    };
+    if data == "[DONE]" {
+        return None;
+    }
+
+    let Ok(mut event) = serde_json::from_str::<Value>(data) else {
+        return Some(frame);
+    };
+    let mut changed = false;
+    let mut has_visible_output = false;
+    if let Some(choices) = event.get_mut("choices").and_then(Value::as_array_mut) {
+        for choice in choices {
+            has_visible_output |= choice
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty());
+            has_visible_output |= choice
+                .get("delta")
+                .and_then(|delta| delta.get("content"))
+                .and_then(Value::as_str)
+                .is_some_and(|content| !content.is_empty());
+            if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
+                choice["finish_reason"] = Value::Null;
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return Some(frame);
+    }
+    if !has_visible_output {
+        return Some(bytes::Bytes::new());
+    }
+
+    match serde_json::to_string(&event) {
+        Ok(event) => Some(bytes::Bytes::from(format!("data: {event}\n\n"))),
+        Err(_) => Some(frame),
+    }
+}
+
 impl PDRouter {
+    fn inject_token_handoff_request_id(request: &mut Value) -> Result<String, String> {
+        let object = request
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+        let rid = format!("token-handoff-{}", uuid::Uuid::new_v4());
+        object.insert("rid".to_string(), Value::String(rid.clone()));
+        Ok(rid)
+    }
+
+    async fn abort_token_handoff_worker(client: &Client, worker_url: &str, rid: &str) {
+        let abort_url = api_path(worker_url, "/abort_request");
+        match client
+            .post(&abort_url)
+            .json(&json!({ "rid": rid }))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => warn!(
+                "Token handoff abort returned {} worker_url={} rid={}",
+                response.status(),
+                worker_url,
+                rid
+            ),
+            Err(error) => warn!(
+                "Token handoff abort failed worker_url={} rid={} error={}",
+                worker_url, rid, error
+            ),
+        }
+    }
+
+    async fn abort_token_handoff_pair(
+        client: &Client,
+        prefill_url: &str,
+        decode_url: &str,
+        rid: &str,
+    ) {
+        tokio::join!(
+            Self::abort_token_handoff_worker(client, prefill_url, rid),
+            Self::abort_token_handoff_worker(client, decode_url, rid)
+        );
+    }
+
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
         api_path(worker.base_url(), endpoint)
     }
@@ -646,7 +777,7 @@ impl PDRouter {
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
-        json_request: Value,
+        mut json_request: Value,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
@@ -662,6 +793,19 @@ impl PDRouter {
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
+
+        let token_handoff_enabled = context.is_stream
+            && context.batch_size.is_none()
+            && !context.return_logprob
+            && std::env::var_os("SGLANG_PD_TOKEN_HANDOFF").is_some();
+        let token_handoff_rid = if token_handoff_enabled {
+            match Self::inject_token_handoff_request_id(&mut json_request) {
+                Ok(rid) => Some(rid),
+                Err(error) => return Self::handle_serialization_error(error),
+            }
+        } else {
+            None
+        };
 
         let (prepared_prefill, prepared_decode) = match Self::prepare_pd_worker_requests(
             context.route,
@@ -693,6 +837,17 @@ impl PDRouter {
             headers,
             false,
         );
+
+        if token_handoff_enabled {
+            return self.create_token_handoff_streaming_response(
+                prefill_request,
+                decode_request,
+                headers.cloned(),
+                prefill,
+                decode,
+                token_handoff_rid.expect("token handoff request id must be initialized"),
+            );
+        }
 
         // Run both in this handler task (not a detached tokio::spawn) so a client
         // disconnect cancels the pending decode request too, keeping the
@@ -1113,7 +1268,7 @@ impl PDRouter {
     ) -> Response {
         use crate::core::AttachedBody;
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, String>>();
 
         // Uses select! to race stream.next() against tx.closed() so that
         // when the client disconnects the upstream HTTP connection is dropped
@@ -1210,6 +1365,207 @@ impl PDRouter {
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
+        AttachedBody::wrap_response(response, guards)
+    }
+
+    fn create_token_handoff_streaming_response(
+        &self,
+        prefill_request: reqwest::RequestBuilder,
+        decode_request: reqwest::RequestBuilder,
+        headers: Option<HeaderMap>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+        rid: String,
+    ) -> Response {
+        use crate::core::AttachedBody;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, String>>();
+        let prefill_for_task = Arc::clone(&prefill);
+        let decode_for_task = Arc::clone(&decode);
+        let client = self.client.clone();
+        let prefill_url = prefill.url().to_string();
+        let decode_url = decode.url().to_string();
+
+        tokio::spawn(async move {
+            // Start Decode immediately so it can bootstrap and register its KV
+            // destination while Prefill computes and streams bridge tokens.
+            let decode_task = tokio::spawn(async move { decode_request.send().await });
+
+            let prefill_response = match prefill_request.send().await {
+                Ok(response) if response.status().is_success() => response,
+                Ok(response) => {
+                    prefill_for_task.record_outcome(response.status().is_client_error());
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!(
+                        "data: {{\"error\":\"token handoff prefill returned {}\"}}\n\n\
+                         data: [DONE]\n\n",
+                        response.status()
+                    ))));
+                    Self::abort_token_handoff_worker(&client, &decode_url, &rid).await;
+                    decode_task.abort();
+                    return;
+                }
+                Err(error) => {
+                    prefill_for_task.record_outcome(false);
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!(
+                        "data: {{\"error\":\"token handoff prefill failed: {}\"}}\n\n\
+                         data: [DONE]\n\n",
+                        error
+                    ))));
+                    Self::abort_token_handoff_worker(&client, &decode_url, &rid).await;
+                    decode_task.abort();
+                    return;
+                }
+            };
+
+            let mut prefill_stream = prefill_response.bytes_stream();
+            let mut pending = bytes::BytesMut::new();
+            let mut prefill_finished_request = false;
+            let mut reached_prefill_done = false;
+            loop {
+                let chunk_result = tokio::select! {
+                    chunk_result = prefill_stream.next() => chunk_result,
+                    _ = tx.closed() => {
+                        Self::abort_token_handoff_pair(
+                            &client,
+                            &prefill_url,
+                            &decode_url,
+                            &rid,
+                        ).await;
+                        decode_task.abort();
+                        return;
+                    }
+                };
+                let Some(chunk_result) = chunk_result else {
+                    if !pending.is_empty() {
+                        let _ = tx.send(Ok(pending.freeze()));
+                    }
+                    break;
+                };
+                let chunk = match chunk_result {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        prefill_for_task.record_outcome(false);
+                        let _ = tx.send(Ok(bytes::Bytes::from(format!(
+                            "data: {{\"error\":\"token handoff prefill stream failed: {}\"}}\n\n\
+                             data: [DONE]\n\n",
+                            error
+                        ))));
+                        Self::abort_token_handoff_worker(&client, &decode_url, &rid).await;
+                        decode_task.abort();
+                        return;
+                    }
+                };
+
+                pending.extend_from_slice(&chunk);
+                while let Some(frame_end) = memmem::find(&pending, b"\n\n") {
+                    let frame = pending.split_to(frame_end + 2).freeze();
+                    prefill_finished_request |= token_handoff_prefill_frame_is_terminal(&frame);
+                    let Some(frame) = token_handoff_prefill_frame_for_client(frame) else {
+                        reached_prefill_done = true;
+                        break;
+                    };
+                    if frame.is_empty() {
+                        continue;
+                    }
+                    if tx.send(Ok(frame)).is_err() {
+                        Self::abort_token_handoff_pair(&client, &prefill_url, &decode_url, &rid)
+                            .await;
+                        decode_task.abort();
+                        return;
+                    }
+                }
+                if reached_prefill_done {
+                    break;
+                }
+            }
+            prefill_for_task.record_outcome(true);
+
+            if prefill_finished_request {
+                let _ = tx.send(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")));
+                Self::abort_token_handoff_worker(&client, &decode_url, &rid).await;
+                decode_task.abort();
+                return;
+            }
+
+            let decode_response = match decode_task.await {
+                Ok(Ok(response)) if response.status().is_success() => response,
+                Ok(Ok(response)) => {
+                    decode_for_task.record_outcome(response.status().is_client_error());
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!(
+                        "data: {{\"error\":\"token handoff decode returned {}\"}}\n\n\
+                         data: [DONE]\n\n",
+                        response.status()
+                    ))));
+                    return;
+                }
+                Ok(Err(error)) => {
+                    decode_for_task.record_outcome(false);
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!(
+                        "data: {{\"error\":\"token handoff decode failed: {}\"}}\n\n\
+                         data: [DONE]\n\n",
+                        error
+                    ))));
+                    return;
+                }
+                Err(error) => {
+                    decode_for_task.record_outcome(false);
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!(
+                        "data: {{\"error\":\"token handoff decode task failed: {}\"}}\n\n\
+                         data: [DONE]\n\n",
+                        error
+                    ))));
+                    return;
+                }
+            };
+
+            let mut decode_stream = decode_response.bytes_stream();
+            loop {
+                let chunk_result = tokio::select! {
+                    chunk_result = decode_stream.next() => chunk_result,
+                    _ = tx.closed() => {
+                        Self::abort_token_handoff_worker(&client, &decode_url, &rid).await;
+                        return;
+                    },
+                };
+                let Some(chunk_result) = chunk_result else {
+                    break;
+                };
+                match chunk_result {
+                    Ok(chunk) => {
+                        let done = memmem::find(&chunk, b"data: [DONE]").is_some();
+                        if tx.send(Ok(chunk)).is_err() {
+                            Self::abort_token_handoff_worker(&client, &decode_url, &rid).await;
+                            return;
+                        }
+                        if done {
+                            decode_for_task.record_outcome(true);
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        decode_for_task.record_outcome(false);
+                        let _ = tx.send(Ok(bytes::Bytes::from(format!(
+                            "data: {{\"error\":\"token handoff decode stream failed: {}\"}}\n\n\
+                             data: [DONE]\n\n",
+                            error
+                        ))));
+                        return;
+                    }
+                }
+            }
+            decode_for_task.record_outcome(true);
+        });
+
+        let stream = UnboundedReceiverStream::new(rx);
+        let body = Body::from_stream(stream);
+        let guards = vec![
+            WorkerLoadGuard::new(prefill, headers.as_ref()),
+            WorkerLoadGuard::new(decode, headers.as_ref()),
+        ];
+        let mut response = Response::new(body);
+        *response.status_mut() = StatusCode::OK;
+        let response_headers = token_handoff_response_headers(headers.unwrap_or_default());
+        *response.headers_mut() = response_headers;
         AttachedBody::wrap_response(response, guards)
     }
 
@@ -1739,6 +2095,94 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[test]
+    fn test_token_handoff_response_headers_drop_request_framing() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("123"));
+        headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+
+        let headers = token_handoff_response_headers(headers);
+
+        assert!(!headers.contains_key(CONTENT_LENGTH));
+        assert!(!headers.contains_key(TRANSFER_ENCODING));
+        assert_eq!(
+            headers.get(CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/event-stream"))
+        );
+    }
+
+    #[test]
+    fn test_token_handoff_prefill_terminal_frame_stops_chaining() {
+        assert!(token_handoff_prefill_frame_is_terminal(
+            br#"data: {"choices":[{"finish_reason":"stop"}]}
+
+"#
+        ));
+        assert!(token_handoff_prefill_frame_is_terminal(
+            br#"data: {"error":"prefill failed"}
+
+"#
+        ));
+        assert!(!token_handoff_prefill_frame_is_terminal(
+            br#"data: {"choices":[{"finish_reason":"length"}]}
+
+"#
+        ));
+        assert!(!token_handoff_prefill_frame_is_terminal(
+            b"data: [DONE]\n\n"
+        ));
+    }
+
+    #[test]
+    fn test_token_handoff_prefill_boundary_is_not_client_terminal() {
+        let boundary = bytes::Bytes::from_static(
+            br#"data: {"choices":[{"text":" bridge","finish_reason":"length"}]}
+
+"#,
+        );
+        let sanitized =
+            token_handoff_prefill_frame_for_client(boundary).expect("boundary data frame");
+        let event: Value = serde_json::from_slice(
+            sanitized
+                .strip_prefix(b"data: ")
+                .expect("SSE data prefix")
+                .strip_suffix(b"\n\n")
+                .expect("SSE frame suffix"),
+        )
+        .expect("valid JSON");
+
+        assert_eq!(event["choices"][0]["text"], " bridge");
+        assert!(event["choices"][0]["finish_reason"].is_null());
+        assert!(
+            token_handoff_prefill_frame_for_client(bytes::Bytes::from_static(
+                br#"data: {"choices":[{"text":"","finish_reason":"length"}]}
+
+"#
+            ))
+            .expect("empty boundary frame")
+            .is_empty()
+        );
+        assert!(
+            token_handoff_prefill_frame_for_client(bytes::Bytes::from_static(b"data: [DONE]\n\n"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_token_handoff_request_id_is_scalar_and_replaced() {
+        let mut request = json!({
+            "model": "test-model",
+            "stream": true,
+            "rid": "client-supplied"
+        });
+
+        let rid =
+            PDRouter::inject_token_handoff_request_id(&mut request).expect("request id injection");
+
+        assert!(rid.starts_with("token-handoff-"));
+        assert_eq!(request["rid"], Value::String(rid));
     }
 
     #[test]
