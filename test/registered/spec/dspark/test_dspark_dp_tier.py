@@ -1,6 +1,7 @@
 import random
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -69,7 +70,11 @@ class TestDraftDpSyncMetadata(CustomTestCase):
             can_run_dp_cuda_graph=True,
         )
 
-        proposer._fill_dp_moe_sync_metadata(forward_batch, batch)
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft.enable_num_token_non_padded",
+            return_value=True,
+        ):
+            proposer._fill_dp_moe_sync_metadata(forward_batch, batch)
 
         self.assertEqual(
             forward_batch.original_global_num_tokens_cpu,
