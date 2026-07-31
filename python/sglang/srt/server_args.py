@@ -6755,14 +6755,19 @@ class ServerArgs:
         if self.cuda_graph_config.prefill.backend != Backend.BREAKABLE:
             return
 
-        prefill_backend, _ = self.get_attention_backends()
+        # Read declarations before materialization to configure exact dLLM buckets.
+        prefill_backend, _ = self._resolved_attention_backends()
         if prefill_backend != "flashinfer":
             return
 
+        from sglang.srt.arg_groups.overrides import resolved_view
         from sglang.srt.dllm.config import DllmConfig
 
-        dllm_config = DllmConfig.from_server_args(self)
-        alignment = math.lcm(self.page_size, dllm_config.block_size)
+        view = resolved_view(self)
+        dllm_config = DllmConfig.from_server_args(view)
+        # Use the resolved page size before declarations are materialized.
+        page_size = view.page_size
+        alignment = math.lcm(page_size, dllm_config.block_size)
         max_tokens = dllm_config.prefill_block_size * dllm_config.max_running_requests
 
         # PrefillAdder cannot schedule beyond either the per-round prefill
