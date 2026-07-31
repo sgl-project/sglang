@@ -26,14 +26,16 @@ def tree_mask_numel(
     return bs * per_req
 
 
-class VerifyMask(msgspec.Struct):
+class VerifyMask(msgspec.Struct, frozen=True):
     """The target-verify mask.
 
     ``build_tree_kernel_efficient`` writes the buffer in place after draft, which
-    is what lets the worker skip the ``seq_lens_sum`` D2H sync. Keep the three
+    is what lets the worker skip the ``seq_lens_sum`` D2H sync. Keep them
     together: taking the buffer without its layout has the kernel write a shape
-    the reader does not expect. The kernel writes every cell even when unread, so
-    the buffer is always allocated.
+    the reader does not expect, and without its ``max_bs`` there is nothing left
+    to bound reuse by. The kernel writes every cell even when unread, so the
+    buffer is always allocated. Frozen so the fields cannot drift apart -- swap
+    the whole struct to resize.
 
     Temporary home -- a phase-level buffer with no owner today (``spec_info`` is a
     per-phase union the graph registry cannot slot).
@@ -41,14 +43,16 @@ class VerifyMask(msgspec.Struct):
 
     buffer: torch.Tensor
     mode: TreeMaskMode
-    max_context_len: int
+    max_bs: int
     is_read: bool = True
 
-    def fits(self, bs: int, num_draft_tokens: int) -> bool:
-        """Whether this batch's writes stay inside the buffer."""
-        return self.buffer.numel() >= tree_mask_numel(
-            self.mode, bs, num_draft_tokens, self.max_context_len
-        )
+    def fits(self, bs: int) -> bool:
+        """Whether this batch's writes stay inside the buffer.
+
+        Every layout is sized per request off worst-case per-request bounds
+        (FULL_MASK's spans max_context_len), so max_bs bounds them all.
+        """
+        return bs <= self.max_bs
 
 
 def maybe_create_verify_mask(
@@ -73,6 +77,6 @@ def maybe_create_verify_mask(
             device=device,
         ),
         mode=mode,
-        max_context_len=max_context_len,
+        max_bs=max_bs,
         is_read=is_read,
     )
