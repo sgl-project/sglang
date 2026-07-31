@@ -52,15 +52,19 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 if _is_cuda:
     from sglang.kernels.ops.attention.fused_qknorm_rope import (
         can_use_fused_qk_norm_rope,
         fused_qk_norm_rope,
     )
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
 logger = logging.getLogger(__name__)
 
@@ -258,10 +262,26 @@ class MellumAttention(Qwen3MoeAttention):
         self.alt_stream = alt_stream
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
-        raise NotImplementedError(
-            "Mellum per-layer RoPE is incompatible with the shared rotary "
-            "cos/sin priming in Qwen3MoeAttention.forward_prepare_npu"
+        qkv, _ = self.qkv_proj(hidden_states)
+        # Mellum uses per-layer RoPE — each layer has its own rotary_emb, so
+        # cos/sin must be computed for every layer instead of sharing via
+        # the start_layer priming trick used in the parent class.
+        self.rotary_emb.get_cos_sin_with_position(positions)
+        q, k, v = split_qkv_rmsnorm_rope(
+            qkv,
+            self.rotary_emb.position_sin,
+            self.rotary_emb.position_cos,
+            self.q_size,
+            self.kv_size,
+            self.head_dim,
+            eps=self.q_norm.variance_epsilon,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            q_bias=getattr(self.q_norm, "bias", None),
+            k_bias=getattr(self.k_norm, "bias", None),
         )
+        inner_state = q, k, v, forward_batch
+        return None, forward_batch, inner_state
 
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
         # Overridden to use pre-computed per-layer YaRN params.
