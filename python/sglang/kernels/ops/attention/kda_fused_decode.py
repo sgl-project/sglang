@@ -11,8 +11,8 @@ Kernel body vendored from the NVIDIA x Moonshot Kimi K3 optimization package
 (see csrc/attention/kda_fused_decode.cuh for provenance and the list of
 integration patches). Specialized for the K3 KDA decode regime:
 K = V = 128, kernel width 4, no lower bound, T = 1 per request.
-The JIT currently instantiates local head counts H = HV in {12, 6, 3}
-(TP8, TP16, and TP32).
+The JIT instantiates local head counts H = HV in {24, 12, 6, 3}
+(TP4, TP8, TP16, and TP32).
 
 The model must hand off the output-norm gate (attempt-and-verify stash on the
 attention layer, see kimi_k3.py), and a covered() check gates supported inputs.
@@ -35,7 +35,7 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-_SUPPORTED_HEADS = {3, 6, 12}
+_SUPPORTED_HEADS = {3, 6, 12, 24}
 _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
 
 
