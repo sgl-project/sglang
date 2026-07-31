@@ -67,16 +67,16 @@ class TestVerifyMaskCapacity(CustomTestCase):
     def test_compact_layout_fits_up_to_max_bs(self):
         # is_read=False pins QLEN_ONLY; the read layout is build-dependent.
         mask = _create(is_read=False)
-        self.assertTrue(mask.fits(_MAX_BS))
-        self.assertTrue(mask.fits(1))
+        self.assertTrue(mask.fits(_MAX_BS, _DRAFT))
+        self.assertTrue(mask.fits(1, _DRAFT))
 
     def test_compact_layout_does_not_fit_beyond_max_bs(self):
         mask = _create(is_read=False)
-        self.assertFalse(mask.fits(_MAX_BS + 1))
+        self.assertFalse(mask.fits(_MAX_BS + 1, _DRAFT))
 
     def test_full_mask_does_not_fit_beyond_max_bs(self):
         """The context dimension is per-request slack, not spare room for extra
-        requests: reusing FULL_MASK past max_bs reads off the end of the buffer.
+        requests: reusing FULL_MASK past max_bs runs off the end of the buffer.
         Built explicitly because default_tree_mask_mode() is host-dependent."""
         mask = VerifyMask(
             buffer=torch.zeros(
@@ -86,11 +86,11 @@ class TestVerifyMaskCapacity(CustomTestCase):
                 dtype=torch.bool,
             ),
             mode=TreeMaskMode.FULL_MASK,
-            max_bs=_MAX_BS,
+            max_context_len=_MAX_CONTEXT_LEN,
         )
 
-        self.assertTrue(mask.fits(_MAX_BS))
-        self.assertFalse(mask.fits(_MAX_BS + 1))
+        self.assertTrue(mask.fits(_MAX_BS, _DRAFT))
+        self.assertFalse(mask.fits(_MAX_BS + 1, _DRAFT))
 
 
 class TestVerifyMaskGate(CustomTestCase):
@@ -114,11 +114,11 @@ class _FakeAttnBackend:
         self.verify_mask = verify_mask
 
 
-def _mask(numel, *, max_bs=_MAX_BS, **kwargs):
+def _mask(numel, **kwargs):
     return VerifyMask(
         buffer=torch.zeros(numel, dtype=torch.bool),
         mode=TreeMaskMode.QLEN_ONLY,
-        max_bs=max_bs,
+        max_context_len=_MAX_CONTEXT_LEN,
         **kwargs,
     )
 
@@ -160,7 +160,7 @@ class TestHybridAttnBackendHandsOutSelectedChildMask(CustomTestCase):
     def test_capacity_check_needs_nothing_from_the_backend(self):
         backend = _make_hybrid_backend("prefill", _mask(64, is_read=False), None)
 
-        self.assertTrue(backend.verify_mask.fits(_MAX_BS))
+        self.assertTrue(backend.verify_mask.fits(_MAX_BS, _DRAFT))
 
 
 class TestTreeMaskNumel(CustomTestCase):
