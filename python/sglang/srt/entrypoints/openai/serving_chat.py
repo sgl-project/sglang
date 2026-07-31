@@ -813,6 +813,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Apply chat template and its stop strings
         tools = None
+        tool_call_stop = None
+        required_parsed_natively = False
         if request.tools and request.tool_choice != "none":
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
@@ -834,11 +836,18 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                     thinking_mode=xgrammar_reasoning,
                 )
+                required_parsed_natively = parser.detector.parses_required_natively()
+                if self.chat_encoding_spec == "kimi_k3":
+                    tool_call_stop = parser.detector.eot_token
             # Fallback: use generic JSON schema for required/named tool choice
             # only when no parser-specific constraint was set
-            if tool_call_constraint is None and (
-                request.tool_choice == "required"
-                or isinstance(request.tool_choice, ToolChoice)
+            if (
+                tool_call_constraint is None
+                and not required_parsed_natively
+                and (
+                    request.tool_choice == "required"
+                    or isinstance(request.tool_choice, ToolChoice)
+                )
             ):
                 json_schema = get_json_schema_constraint(
                     request.tools,
@@ -863,6 +872,16 @@ class OpenAIServingChat(OpenAIServingBase):
             result = self._apply_jinja_template(request, tools, is_multimodal)
         else:
             result = self._apply_conversation_template(request, is_multimodal)
+
+        if tool_call_stop is not None:
+            if isinstance(result.stop, str):
+                result.stop = [result.stop]
+            elif result.stop is None:
+                result.stop = []
+            else:
+                result.stop = list(result.stop)
+            if tool_call_stop not in result.stop:
+                result.stop.append(tool_call_stop)
 
         result.tool_call_constraint = tool_call_constraint
         return result
