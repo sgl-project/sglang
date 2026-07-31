@@ -455,6 +455,40 @@ class TestEngineBindingGuards(HttpServerAppFactoryTestBase):
             with TestClient(app):
                 pass
 
+    def test_lifespan_falls_back_when_state_has_no_global_state_attribute(self):
+        """Bug regression: the lifespan read app.state.global_state directly,
+        which raises AttributeError on an app whose state never had that name
+        set. A host that builds its own FastAPI app and configures it through
+        the shared helper must start and use the process global state instead.
+        """
+        server_args = ServerArgs(model_path="dummy", skip_server_warmup=True)
+        plain_app = FastAPI(lifespan=http_server.lifespan)
+        _configure_single_tokenizer_app(
+            plain_app,
+            server_args=server_args,
+            warmup_thread_kwargs=dict(server_args=server_args),
+        )
+        # Nothing ever set these two names on this app.
+        self.assertFalse(hasattr(plain_app.state, "global_state"))
+        self.assertFalse(hasattr(plain_app.state, "built_by_build_app"))
+
+        engine = _fake_engine(server_args)
+        set_global_state(
+            http_server._GlobalState(
+                tokenizer_manager=engine.tokenizer_manager,
+                template_manager=engine.template_manager,
+                scheduler_info={"max_req_input_len": 128},
+            )
+        )
+
+        with TestClient(plain_app):
+            pass
+
+        self.assertIs(
+            plain_app.state.openai_serving_completion.tokenizer_manager,
+            engine.tokenizer_manager,
+        )
+
     def test_init_app_state_server_args_must_match_engine(self):
         """The optional server_args parameter of init_app_state must match the
         arguments the engine was built with; a mismatch would silently imply a
