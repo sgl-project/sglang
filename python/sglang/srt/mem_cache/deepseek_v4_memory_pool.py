@@ -166,6 +166,92 @@ class DeepSeekV4SingleKVPool(KVCache):
         raise NotImplementedError("Use get_key_buffer instead.")
 
 
+class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
+    """Uniform 512-dim FP8 (e4m3) variant of the DSv4 single-KV pool.
+
+    Layout required by the trtllm-gen sparse MLA kernel: every token is 512
+    contiguous e4m3 values (448 nope + 64 rope, both FP8), with no in-cache
+    scales and no per-page padding -- the kernel addresses the cache at token
+    granularity as ``flat_index * 512`` bytes. The per-tensor dequant scale
+    is delivered externally via the kernel's bmm scales.
+    """
+
+    def get_bytes_per_token(self) -> int:
+        return self.qk_nope_head_dim + self.qk_rope_head_dim
+
+    def create_buffer(self, *, num_pages: int):
+        bytes_per_token = self.get_bytes_per_token()
+        assert bytes_per_token == 512, (
+            "DSV4 uniform-FP8 KV layout: qk_nope_head_dim (448) + "
+            "qk_rope_head_dim (64), all e4m3 = 512 bytes/token"
+        )
+        self.kv_cache_total_dim = bytes_per_token
+        self.bytes_per_page_padded = self.page_size * bytes_per_token
+
+        return torch.zeros(
+            num_pages,
+            self.page_size * bytes_per_token,
+            dtype=torch.float8_e4m3fn,
+            device=self.device,
+        )
+
+    def get_key_buffer(self, layer_id: int):
+        return self.kv_buffer[layer_id - self.start_layer]
+
+    def set_key_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+    ):
+        raise NotImplementedError(
+            "The packed NopeFp8RopeBf16Pack store does not apply to the "
+            "uniform-FP8 pool; use set_key_buffer_fused."
+        )
+
+    def set_key_buffer_fused(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        """Store already-normed/roped rows as plain e4m3 with a fixed scale of
+        1.0 (the backend's bmm scales assume this - change both together).
+
+        Uses uint8 views to work around index_put not supporting fp8 dtypes.
+        """
+
+        assert cache_k.dim() == 2 and cache_k.shape[1] == self.kv_cache_total_dim
+        self.kv_buffer[layer_id].view(torch.uint8).view(-1, self.kv_cache_total_dim)[
+            loc.long()
+        ] = cache_k.to(torch.float8_e4m3fn).view(torch.uint8)
+
+    def set_key_buffer_norm_rope_quant(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        kv: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Fused RMSNorm + RoPE + e4m3 quantize (scale 1.0) + scatter."""
+        from sglang.kernels.ops.attention.deepseek_v4_rope import (
+            fused_norm_rope_quant_store_triton,
+        )
+
+        fused_norm_rope_quant_store_triton(
+            kv,
+            weight,
+            eps,
+            freqs_cis,
+            out_cache=self.kv_buffer[layer_id].view(-1, self.kv_cache_total_dim),
+            loc=loc,
+            positions=positions,
+        )
+
+
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
 
     def __init__(
@@ -570,6 +656,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self._unified_kv = is_unified_kv_triton()
+        # Uniform 512-dim e4m3 layout for the trtllm attention backend
+        self.uniform_fp8 = (
+            not self._unified_kv
+        ) and get_global_server_args().dsv4_attn_backend == "trtllm"
 
         if self._unified_kv:
             self.swa_kv_pool = None
@@ -599,6 +689,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.unified_swa_pages = self.unified_kv_pool.swa_pages
         else:
             self.unified_kv_pool = None
+            kv_pool_cls: type = DeepSeekV4SingleKVPool
+            if self.uniform_fp8:
+                assert dtype == torch.float8_e4m3fn, (
+                    "--dsv4-attn-backend trtllm requires "
+                    f"kv_cache_dtype=fp8_e4m3, got {dtype}"
+                )
+                kv_pool_cls = DeepSeekV4UniformFP8KVPool
             self.swa_kv_pool = self._make_kv_pool(
                 size=swa_size,
                 page_size=swa_page_size,
@@ -607,10 +704,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
+                cls=kv_pool_cls,
             )
 
-            c4_kv_pool_type = DeepSeekV4SingleKVPool
+            c4_kv_pool_type = kv_pool_cls
             if enable_hisparse:
+                assert not self.uniform_fp8, (
+                    "enable_hisparse is not supported with "
+                    "--dsv4-attn-backend trtllm."
+                )
                 c4_kv_pool_type = HiSparseC4DevicePool
             self.c4_kv_pool = self._make_kv_pool(
                 size=c4_size,
@@ -631,6 +733,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=page_size,
+                cls=kv_pool_cls,
             )
 
         indexer_size = self.c4_logical_size
@@ -1181,6 +1284,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
+        if self.uniform_fp8:
+            self.swa_kv_pool.set_key_buffer_norm_rope_quant(
+                self._swa_local_layer_id(layer_id),
+                swa_loc,
+                kv,
+                kv_weight,
+                eps,
+                freqs_cis,
+                positions,
+            )
+            return
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,
@@ -1201,6 +1315,22 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         return compress_kv_pool.set_key_buffer_fused(compress_layer_id, loc, cache_k)
+
+    def set_extra_key_buffer_norm_rope_quant(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        kv: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
+        assert isinstance(compress_kv_pool, DeepSeekV4UniformFP8KVPool)
+        compress_kv_pool.set_key_buffer_norm_rope_quant(
+            compress_layer_id, loc, kv, weight, eps, freqs_cis, positions
+        )
 
     def set_index_k_fused(
         self,
