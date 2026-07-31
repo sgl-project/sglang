@@ -40,8 +40,12 @@ def minimax_sparse_prefill(
     k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged main)
     v_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged main)
     sink: Optional[torch.Tensor],  # [num_q_heads, qk_head_dim]
-    idx_q: torch.Tensor,  # [total_extend_tokens, num_idx_heads, idx_head_dim]
-    idx_k_cache: torch.Tensor,  # [max_slots, 1, idx_head_dim] (paged index)
+    idx_q: Optional[
+        torch.Tensor
+    ],  # [total_extend_tokens, num_idx_heads, idx_head_dim]
+    idx_k_cache: Optional[
+        torch.Tensor
+    ],  # [max_slots, 1, idx_head_dim] (paged index)
     idx_v_cache: Optional[
         torch.Tensor
     ],  # [max_slots, 1, idx_head_dim] (paged index); None when disable_index_value
@@ -67,7 +71,8 @@ def minimax_sparse_prefill(
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
     seqlens_cpu: Optional[List[int]] = None,
-):
+    shared_topk_idx: Optional[torch.Tensor] = None,
+) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
     """Run MiniMax-M3 sparse prefill.
 
     ``cu_seqblocks_q``, ``max_seqblock_q``, and ``all_seqblock_q`` are optional
@@ -81,40 +86,53 @@ def minimax_sparse_prefill(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
         )
 
-    # All seqlen is less than topk, use full attention
-    # Step 1: Flash attention with topk index (using index head)
-    idx_o, topk_idx = flash_prefill_with_topk_index(
-        q=idx_q,
-        k_cache=idx_k_cache,
-        v_cache=idx_v_cache,
-        sink=idx_sink,
-        req_to_token=req_to_token,
-        slot_ids=slot_ids,
-        cu_seqlens=cu_seqlens,
-        seq_lens=seq_lens,
-        prefix_lens=prefix_lens,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        block_size_q=block_size_q,
-        block_size_k=block_size_k,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
-        sm_scale=idx_sm_scale,
-        score_type=score_type,
-        disable_index_value=disable_index_value,
-        cu_seqblocks_q=cu_seqblocks_q,
-        max_seqblock_q=max_seqblock_q,
-        all_seqblock_q=all_seqblock_q,
-    )
-    # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
-    num_idx_heads = idx_q.shape[1]
-    num_kv_heads = k_cache.shape[1]
-    idx_group_size = num_idx_heads // num_kv_heads
-    if idx_group_size > 1:
-        topk_idx = topk_index_reduce(
-            topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
+    if shared_topk_idx is None:
+        if idx_q is None or idx_k_cache is None:
+            raise RuntimeError(
+                "MiniMax-M3 sparse index selection missing on a sharing layer"
+            )
+        # All seqlen is less than topk, use full attention
+        # Step 1: Flash attention with topk index (using index head)
+        idx_o, topk_idx = flash_prefill_with_topk_index(
+            q=idx_q,
+            k_cache=idx_k_cache,
+            v_cache=idx_v_cache,
+            sink=idx_sink,
+            req_to_token=req_to_token,
+            slot_ids=slot_ids,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            block_size_q=block_size_q,
+            block_size_k=block_size_k,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            sm_scale=idx_sm_scale,
+            score_type=score_type,
+            disable_index_value=disable_index_value,
+            cu_seqblocks_q=cu_seqblocks_q,
+            max_seqblock_q=max_seqblock_q,
+            all_seqblock_q=all_seqblock_q,
         )
+        # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
+        num_idx_heads = idx_q.shape[1]
+        num_kv_heads = k_cache.shape[1]
+        idx_group_size = num_idx_heads // num_kv_heads
+        if idx_group_size > 1:
+            topk_idx = topk_index_reduce(
+                topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
+            )
+    else:
+        if not disable_index_value:
+            raise RuntimeError(
+                "MiniMax-M3 sparse index sharing requires the index-value path "
+                "to be disabled"
+            )
+        idx_o = None
+        topk_idx = shared_topk_idx
     # Step 3: Sparse attention using topk index (main head). The MSA path only
     # replaces this step; the indexer above is unchanged. MSA has no attn-sink
     # input, so keep the Triton path when sink is present.
@@ -174,7 +192,7 @@ def minimax_sparse_prefill(
             cu_seqblocks_q=cu_seqblocks_q,
             max_seqblock_q=max_seqblock_q,
         )
-    return idx_o, o
+    return idx_o, o, topk_idx
 
 
 def minimax_sparse_decode(
@@ -182,9 +200,11 @@ def minimax_sparse_decode(
     sink: Optional[torch.Tensor],  # [num_q_heads, qk_head_dim]
     k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged)
     v_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged)
-    idx_q: torch.Tensor,  # [batch_size, num_idx_heads, idx_head_dim], num_idx_heads >= num_kv_heads
+    idx_q: Optional[
+        torch.Tensor
+    ],  # [batch_size, num_idx_heads, idx_head_dim], num_idx_heads >= num_kv_heads
     idx_sink: Optional[torch.Tensor],  # [num_idx_heads, idx_head_dim]
-    idx_k_cache: torch.Tensor,  # [max_slots, 1, idx_head_dim] (paged)
+    idx_k_cache: Optional[torch.Tensor],  # [max_slots, 1, idx_head_dim] (paged)
     idx_v_cache: Optional[
         torch.Tensor
     ],  # [max_slots, 1, idx_head_dim] (paged); None when disable_index_value
@@ -208,42 +228,63 @@ def minimax_sparse_decode(
         torch.Tensor
     ] = None,  # per-forward MSA page table (cached)
     msa_plan=None,  # per-forward MSA fmha_sm100 plan (cached)
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    # Step 1: Flash decode with topk index (using index head). When the dense main
-    # attention is used, the indexer emits the page table directly (fused
-    # transform) instead of block ids, plus the per-query effective KV length.
-    idx_o, topk_idx, real_seq_lens = flash_decode_with_topk_idx(
-        q=idx_q,
-        sink=idx_sink,
-        k_cache=idx_k_cache,
-        v_cache=idx_v_cache,
-        req_to_token=req_to_token,
-        seq_lens=seq_lens,
-        max_seqlen=max_seqlen,
-        slot_ids=slot_ids,
-        block_size=block_size_k,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
-        sm_scale=idx_sm_scale,
-        score_type=score_type,
-        disable_index_value=disable_index_value,
-        use_dense_main_attn=dense_main_attn_fn is not None,
-        page_size=page_size,
-    )
-    num_idx_heads = idx_q.shape[1]
-    num_kv_heads = k_cache.shape[1]
-    idx_group_size = num_idx_heads // num_kv_heads
-    if dense_main_attn_fn is not None:
-        # topk_idx is the page table; real_seq_lens is the per-query cache_seqlens
-        assert idx_group_size == 1
-        o = dense_main_attn_fn(q, topk_idx, real_seq_lens)
-    else:
-        # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
-        if idx_group_size > 1:
+    shared_indexer_output: Optional[
+        Tuple[torch.Tensor, Optional[torch.Tensor]]
+    ] = None,
+) -> Tuple[
+    Optional[torch.Tensor],
+    torch.Tensor,
+    Tuple[torch.Tensor, Optional[torch.Tensor]],
+]:
+    if shared_indexer_output is None:
+        if idx_q is None or idx_k_cache is None:
+            raise RuntimeError(
+                "MiniMax-M3 sparse index selection missing on a sharing layer"
+            )
+        # Step 1: Flash decode with topk index (using index head). When the dense main
+        # attention is used, the indexer emits the page table directly (fused
+        # transform) instead of block ids, plus the per-query effective KV length.
+        idx_o, topk_idx, real_seq_lens = flash_decode_with_topk_idx(
+            q=idx_q,
+            sink=idx_sink,
+            k_cache=idx_k_cache,
+            v_cache=idx_v_cache,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+            max_seqlen=max_seqlen,
+            slot_ids=slot_ids,
+            block_size=block_size_k,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            sm_scale=idx_sm_scale,
+            score_type=score_type,
+            disable_index_value=disable_index_value,
+            use_dense_main_attn=dense_main_attn_fn is not None,
+            page_size=page_size,
+        )
+        num_idx_heads = idx_q.shape[1]
+        num_kv_heads = k_cache.shape[1]
+        idx_group_size = num_idx_heads // num_kv_heads
+        if dense_main_attn_fn is None and idx_group_size > 1:
+            # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads.
             topk_idx = topk_index_reduce(
                 topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
             )
+    else:
+        if not disable_index_value:
+            raise RuntimeError(
+                "MiniMax-M3 sparse index sharing requires the index-value path "
+                "to be disabled"
+            )
+        idx_o = None
+        topk_idx, real_seq_lens = shared_indexer_output
+
+    if dense_main_attn_fn is not None:
+        # topk_idx is the page table; real_seq_lens is the per-query cache_seqlens
+        assert real_seq_lens is not None
+        o = dense_main_attn_fn(q, topk_idx, real_seq_lens)
+    else:
         # Step 3: Sparse attention using topk index (main head). The MSA path
         # only replaces this step; keep the Triton path when sink is present.
         if use_msa and sink is None:
@@ -290,4 +331,4 @@ def minimax_sparse_decode(
                 topk_idx=topk_idx,
                 sm_scale=sm_scale,
             )
-    return idx_o, o
+    return idx_o, o, (topk_idx, real_seq_lens)
