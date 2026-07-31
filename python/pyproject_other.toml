@@ -24,6 +24,7 @@ runtime_common = [
   "av",
   "blobfile==3.0.0",
   "build",
+  "compressed-tensors",
   "datasets",
   "easydict",
   "einops",
@@ -112,9 +113,9 @@ diffusion_hip = [
 ]
 
 # Per-ROCm-SDK compressed-tensors version extras.
-# compressed-tensors is intentionally absent from runtime_common so that these
-# per-platform extras can pin different versions without causing a
-# ResolutionImpossible conflict.
+# runtime_common carries a bare (unpinned) compressed-tensors so that
+# non-AMD platforms (HPU, MUSA, MPS/MLX) can resolve whatever version is
+# available for their platform.  These AMD extras add the precise pin on top:
 #
 #   rocm_legacy = ROCm 7.0 / 7.2  (gfx942/gfx950)         → 0.15.0
 #   rocm_rock   = ROCm 7.15+ / AMD "rock" SDK (gfx1250+)   → 0.16.0
@@ -130,11 +131,10 @@ rocm_rock   = ["compressed-tensors==0.16.0"]
 
 # For Intel Gaudi(device : hpu) follow the installation guide
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
-srt_hpu = ["sglang[runtime_common]", "compressed-tensors==0.15.0"]
+srt_hpu = ["sglang[runtime_common]"]
 
 # https://docs.sglang.io/platforms/mthreads_gpu.md
 srt_musa = [
-  "compressed-tensors==0.15.0",
   "deep-gemm>=0.1.3",
   "flash_attn_3>=0.1.4",
   "mate>=0.2.0",
@@ -156,7 +156,6 @@ diffusion_musa = [
 
 # https://docs.sglang.io/platforms/mps.md
 srt_mps = [
-    "compressed-tensors==0.15.0",
     "mlx",
     "mlx-lm",
     "sglang[runtime_common]",
