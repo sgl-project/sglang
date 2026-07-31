@@ -392,8 +392,16 @@ On SM100/SM103 with CUDA 13+, SGLang automatically selects FlashInfer for GDN pr
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅ linear chain; tree falls back to Triton</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>FlashQLA (CUDA, SM90+)</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+    </tr>
   </tbody>
 </table>
+
+`flashqla` wraps the [FlashQLA](https://github.com/QwenLM/FlashQLA) TileLang GDN chunked-prefill kernels (2-3x over the Triton prefill kernel on long sequences). It is prefill-only, so select it with `--linear-attn-prefill-backend flashqla` (decode and target-verify stay on Triton). Requires an SM90+ (Hopper) or SM100 (Blackwell) GPU and the `flash-qla` package (`pip install flash-qla`, needs CUDA 12.8+ and PyTorch 2.8+). Short batches fall back to Triton automatically, so it is best paired with a large `--chunked-prefill-size` for long-context serving.
 
 <Warning>
 GDN models are hybrid: the full-attention layers still require a standard `--attention-backend`. Platform constraints for the full-attention backend on hybrid GDN models:
