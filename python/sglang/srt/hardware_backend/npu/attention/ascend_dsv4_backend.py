@@ -2088,7 +2088,6 @@ class DeepseekV4AscendAttnBackend(
             sinks=attn_sink,
             metadata=fm.kernel_metadata["c1a_metadata"],
             softmax_scale=layer.scaling,
-            cmp_ratio=1,
         )
         if self._is_dspark_draft_worker:
             attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
