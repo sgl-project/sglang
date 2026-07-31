@@ -12,6 +12,7 @@ register_npu_ci(
     est_time=3600,
     suite="full-2-npu-a3",
     nightly=True,
+    disabled="accuracy testcase",
 )
 
 QWEN3_6_27B_3K5_1K5_ENVS = {

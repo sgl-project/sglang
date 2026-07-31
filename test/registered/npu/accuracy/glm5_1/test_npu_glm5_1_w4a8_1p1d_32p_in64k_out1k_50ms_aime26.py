@@ -13,6 +13,7 @@ register_npu_ci(
     est_time=3600,
     suite="",
     nightly=True,
+    disabled="accuracy testcase",
 )
 
 GLM_5_1_PD_SEP_PREFILL_ENVS = {

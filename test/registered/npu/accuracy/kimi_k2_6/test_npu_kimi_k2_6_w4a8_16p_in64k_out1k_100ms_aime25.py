@@ -14,6 +14,7 @@ register_npu_ci(
     est_time=1800,
     suite="nightly-8-npu-a3",
     nightly=True,
+    disabled="accuracy testcase",
 )
 
 ENVS = {

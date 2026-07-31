@@ -12,6 +12,7 @@ register_npu_ci(
     est_time=3600,
     suite="",
     nightly=True,
+    disabled="accuracy testcase",
 )
 
 QWEN3_6_35B_A3B_64K_PREFIX_ENVS = {

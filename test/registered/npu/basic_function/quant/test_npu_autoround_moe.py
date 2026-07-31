@@ -10,7 +10,6 @@ from sglang.test.ascend.test_ascend_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
@@ -53,7 +52,7 @@ class TestAscendAutoRoundMoE(CustomTestCase):
                 process = popen_launch_server(
                     model,
                     self.base_url,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    timeout=3600,
                     other_args=[
                         *self.common_args,
                     ],

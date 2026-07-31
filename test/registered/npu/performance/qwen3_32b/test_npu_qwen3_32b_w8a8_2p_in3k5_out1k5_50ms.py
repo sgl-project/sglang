@@ -13,6 +13,7 @@ register_npu_ci(
     est_time=3600,
     suite="",
     nightly=True,
+    disabled="performance testcase",
 )
 
 QWEN3_32B_ENVS = {

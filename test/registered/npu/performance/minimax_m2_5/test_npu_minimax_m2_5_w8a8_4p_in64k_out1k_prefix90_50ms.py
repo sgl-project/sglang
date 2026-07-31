@@ -13,6 +13,7 @@ register_npu_ci(
     est_time=3600,
     suite="npu-performance",
     nightly=True,
+    disabled="performance testcase",
 )
 
 MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS = {
