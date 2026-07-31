@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 
 """
 end to end attention solution with aiter kernels
@@ -148,8 +148,8 @@ class AiterAttnBackend(AttentionBackend):
 
         self.device = model_runner.device
         self.is_multimodal = model_runner.model_config.is_multimodal
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
-        self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
+        self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = topk
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size

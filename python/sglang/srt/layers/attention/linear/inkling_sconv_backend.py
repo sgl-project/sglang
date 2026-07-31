@@ -60,7 +60,7 @@ from sglang.srt.models.inkling_common.kernels.sconv import (
     fused_extend_sconv_metadata,
     precompute_helion_extend_metadata,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_server_args, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 
 if TYPE_CHECKING:
@@ -117,7 +117,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         growing a buffer after a graph captured it moves the address that graph
         reads, and prefill captures before the decode runner reports its bounds."""
         server_args = get_server_args()
-        cuda_graph_config = server_args.cuda_graph_config
+        cuda_graph_config = get_exec().graph.cuda_graph_config
         decode_bs: list[int] = []
         prefill_tokens: list[int] = []
         decode_max_bs = 0
@@ -125,7 +125,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             decode_bs = list(cuda_graph_config.decode.bs or [])
             prefill_tokens = list(cuda_graph_config.prefill.bs or [])
             decode_max_bs = cuda_graph_config.decode.max_bs or 0
-        draft_token_num = server_args.speculative_num_draft_tokens or 1
+        draft_token_num = get_spec().speculative_num_draft_tokens or 1
         # req_to_token_pool.size is the runner's max_bs for both graph phases.
         max_bs = max([self.req_to_token_pool.size, decode_max_bs, *decode_bs])
         max_tokens = max([max_bs, *prefill_tokens, max_bs * draft_token_num])
