@@ -605,22 +605,11 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 def _dispatch_auto_backend() -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
     # Priority order for auto selection:
-    # 0. Hopper: flashinfer swapAB for M < 32 + DeepGEMM for M >= 32, which
-    #    needs both halves present. Mirrors vLLM, where the equivalent
-    #    FlashInferFp8DeepGEMMDynamicBlockScaledKernel is the first CUDA
-    #    candidate, ahead of plain DeepGEMM.
     # 1. DeepGEMM (if enabled and available)
     # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
     # 3. CUTLASS (if SM120 GPU and CUDA 12.8+)
     # 4. AITER (if AMD GPU with AITER enabled)
     # 5. Triton (fallback)
-
-    if (
-        deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-        and is_sm90_supported()
-        and is_flashinfer_available()
-    ):
-        return flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
