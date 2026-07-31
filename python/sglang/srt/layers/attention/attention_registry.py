@@ -277,6 +277,29 @@ def create_dual_chunk_flash_attn_backend(runner):
     return DualChunkFlashAttentionBackend(runner)
 
 
+def attn_backend_wrapper_for_draft_extend(
+    runner: "ModelRunner", full_attn_backend: "AttentionBackend"
+):
+    """Apply the model's attention wrapper to a DRAFT-EXTEND backend, if it needs one.
+
+    ``DraftBackendFactory`` builds draft backends directly and does not go through
+    :func:`attn_backend_wrapper`. For the mamba-style hybrids that is right: their
+    MTP draft carries only softmax-attention layers, which is also why
+    ``HybridLinearAttnBackend.init_forward_metadata`` skips the linear child on
+    DRAFT_EXTEND_V2.
+
+    Inkling breaks that assumption -- its MTP draft has its own short convs (the
+    checkpoint ships ``model.mtp.layers.*.k_sconv`` / ``v_sconv``), so the draft
+    backend must expose ``conv_state_metadata`` too. Restricted to the models that
+    need it so every other draft backend stays exactly as built.
+    """
+    from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
+
+    if isinstance(runner.model_config.hf_config, (InklingModelConfig, InklingMMConfig)):
+        return attn_backend_wrapper(runner, full_attn_backend)
+    return full_attn_backend
+
+
 def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBackend"):
     """
     Wrapper for special models like hybrid GDN, so we don't
@@ -305,7 +328,16 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         if isinstance(
             runner.model_config.hf_config, (InklingModelConfig, InklingMMConfig)
         ):
-            return full_attn_backend
+            from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
+                InklingShortConvAttnBackend,
+                InklingShortConvHybridAttnBackend,
+            )
+
+            return InklingShortConvHybridAttnBackend(
+                full_attn_backend,
+                InklingShortConvAttnBackend(runner),
+                cfg.full_attention_layer_ids,
+            )
 
         from sglang.kernels.ops.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend

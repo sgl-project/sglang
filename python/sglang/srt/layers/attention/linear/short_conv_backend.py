@@ -85,6 +85,17 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
     # always populated for extend regardless of this flag.)
     needs_cpu_seq_lens: bool = False
 
+    # dtype of the slot-index view handed to the model's conv kernel. int64 is
+    # canonical (the CUDA causal_conv1d narrows at its own boundary); a subclass
+    # whose kernels take int32 sets int32 so the narrowing cast does not re-run
+    # per conv layer.
+    cache_indices_dtype: torch.dtype = torch.int64
+
+    # Whether the extend path needs the ``slot_ids_cpu`` / ``has_prefix_cpu``
+    # host mirrors. They cost a device->host sync per extend step, so only
+    # models whose extend path runs a host loop (ZAYA1 v1) ask for them.
+    needs_extend_host_mirrors: bool = True
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
@@ -107,19 +118,30 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         self._has_prefix_cpu = None
 
     def _alloc_cache_indices_buf(self, max_bs: int):
-        # Persistent int64 index buffer, refilled in place per step so the
-        # captured (cuda or cpu) graph reads a stable address.
+        # Persistent index buffer, refilled in place per step so the captured
+        # (cuda or cpu) graph reads a stable address. Grow-only and never
+        # reallocated at the same size: a graph that already captured this
+        # buffer's address must keep reading the same memory, and the cuda- and
+        # cpu-graph state hooks can both run (in either order, and after another
+        # phase's graphs were captured).
+        buf = self._cache_indices_buf
+        if buf is not None and buf.shape[0] >= max_bs:
+            return
+        assert buf is None, (
+            f"cache-indices buffer must be sized before any graph capture: have "
+            f"{buf.shape[0]}, need {max_bs}"
+        )
         self._cache_indices_buf = torch.empty(
-            max_bs, dtype=torch.int64, device=self.device
+            max_bs, dtype=self.cache_indices_dtype, device=self.device
         )
 
     def _refresh_cache_indices(self):
-        # Resolve the int64 slot-index view ONCE per step, shared by every conv
-        # layer. When a graph index buffer is allocated and large enough, refill
-        # it IN PLACE and hand out a view -- the captured graph then reads a
-        # stable address that this (pre-replay) hook keeps current, so it is
-        # cuda- and cpu-graph safe. Otherwise (eager, or bs beyond the buffer)
-        # a fresh cast is fine.
+        # Resolve the slot-index view ONCE per step, shared by every conv layer.
+        # When a graph index buffer is allocated and large enough, refill it IN
+        # PLACE and hand out a view -- the captured graph then reads a stable
+        # address that this (pre-replay) hook keeps current, so it is cuda- and
+        # cpu-graph safe. Otherwise (eager, or bs beyond the buffer) a fresh
+        # cast is fine.
         md = self.forward_metadata
         idx = md.mamba_cache_indices if md is not None else None
         buf = self._cache_indices_buf
@@ -130,7 +152,7 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
             buf[:n].copy_(idx)
             self._cache_indices = buf[:n]
         else:
-            self._cache_indices = idx.to(torch.long)
+            self._cache_indices = idx.to(self.cache_indices_dtype)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         super().init_cuda_graph_state(max_bs, max_num_tokens)
@@ -153,7 +175,7 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
             and not mode.is_draft_extend_v2()
         ):
             self._has_initial_state = forward_batch.extend_prefix_lens > 0
-            if self._cache_indices is not None:
+            if self.needs_extend_host_mirrors and self._cache_indices is not None:
                 self._slot_ids_cpu = self._cache_indices.tolist()
                 self._has_prefix_cpu = [
                     int(p) > 0 for p in forward_batch.extend_prefix_lens_cpu

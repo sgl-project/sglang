@@ -96,11 +96,18 @@ class DraftBackendFactory:
             if self.server_args.speculative_attention_mode == "decode"
             else "prefill_attention_backend"
         )
-        return self._create_backend(
+        backend = self._create_backend(
             backend_name,
             backend_map,
             "EAGLE is not supported in attention backend {backend_type}",
         )
+        # A draft model with linear/conv layers of its own (Inkling's short convs)
+        # needs its sidecar here too; a no-op for every other model.
+        from sglang.srt.layers.attention.attention_registry import (
+            attn_backend_wrapper_for_draft_extend,
+        )
+
+        return attn_backend_wrapper_for_draft_extend(self.draft_model_runner, backend)
 
     def _create_dsa_decode_backend(self):
         from sglang.srt.layers.attention.dsa_backend import (
