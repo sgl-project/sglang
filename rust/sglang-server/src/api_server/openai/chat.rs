@@ -13,6 +13,7 @@ use axum::{
     },
     routing::post,
 };
+use dynamo_parsers::reasoning::{ReasoningParser as _, ReasoningParserWrapper};
 use dynamo_parsers::tool_calling::jail::Annotated;
 use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
@@ -27,6 +28,7 @@ use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
 use super::completions::completion_usage;
+use super::reasoning::build_reasoning_parser;
 use super::tools::{
     apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name,
     parse_chat_tool_calls, parse_streaming_tool_calls,
@@ -122,6 +124,10 @@ async fn chat_completions(
             "tool calls require --tool-call-parser",
         );
     }
+    // Python gates the split on `request.separate_reasoning` (default true);
+    // the Dynamo request type has no such field, so it is always on when the
+    // server was launched with `--reasoning-parser`.
+    let reasoning_parser = state.server_args.reasoning_parser.clone();
     let tools = request.tools.as_ref().map(|tools| {
         tools
             .iter()
@@ -162,7 +168,11 @@ async fn chat_completions(
         Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
     };
 
-    let mut sampling = match chat_sampling_params(&request) {
+    let mut sampling = match chat_sampling_params(
+        &request,
+        &SamplingDefaults::CHAT
+            .with_model_defaults(&state.server_args.model_config.default_sampling_params),
+    ) {
         Ok(sampling) => sampling,
         Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
     };
@@ -244,6 +254,7 @@ async fn chat_completions(
             want_logprobs,
             include_usage,
             parser,
+            reasoning_parser,
             tools,
             stream_tool_choice,
             uses_tool_call_structural_tag,
@@ -261,6 +272,7 @@ async fn chat_completions(
             created,
             want_logprobs,
             parser,
+            reasoning_parser,
             tools,
             parallel_tool_calls,
             service_tier,
@@ -270,10 +282,15 @@ async fn chat_completions(
 }
 
 pub(super) async fn prepare_chat_request(
-    request: CreateChatCompletionRequest,
+    mut request: CreateChatCompletionRequest,
     formatter: ChatFormatter,
     tokenizer: dynamo_tokenizers::Tokenizer,
 ) -> Result<(CreateChatCompletionRequest, Vec<i32>), String> {
+    // Template stops first, then the request's own — Python
+    // `_apply_conversation_template` (`conv.stop_str` + `request.stop`). A
+    // token-id stop cannot be merged into the string list (Python has no such
+    // field), so it is kept alone.
+    merge_template_stops(&mut request, &formatter);
     tokio::task::spawn_blocking(move || {
         let prompt = formatter
             .render(&request)
@@ -292,9 +309,76 @@ pub(super) async fn prepare_chat_request(
     .map_err(|error| format!("chat preparation failed: {error}"))?
 }
 
+/// Merge the formatter's template stops into the request's `stop`.
+///
+/// Python `_apply_conversation_template`: `stop = copy.copy(conv.stop_str or [])
+/// + request.stop` (a string request stop appends as one entry). Without this,
+/// generation with a legacy/builtin template would run past the template's own
+/// delimiters (e.g. chatml's `<|im_end|>`) whenever they are not model EOS ids.
+fn merge_template_stops(request: &mut CreateChatCompletionRequest, formatter: &ChatFormatter) {
+    let Some(template_stops) = formatter.stop_strs() else {
+        return;
+    };
+    let mut stops = match template_stops {
+        OneOrMany::One(one) => vec![one],
+        OneOrMany::Many(many) => many,
+    };
+    match &request.stop {
+        Some(Stop::String(one)) => stops.push(one.clone()),
+        Some(Stop::StringArray(many)) => stops.extend(many.iter().cloned()),
+        Some(Stop::TokenIdArray(_)) => return,
+        None => {}
+    }
+    request.stop = Some(Stop::StringArray(stops));
+}
+
+/// Where an omitted `temperature` / `top_p` gets its value. Mirrors Python's
+/// `to_sampling_params` priority: user value > model generation_config (when
+/// `--sampling-defaults model`) > OpenAI terminal default
+/// (`_DEFAULT_SAMPLING_PARAMS`, which differs per endpoint: chat 1.0/1.0,
+/// responses 0.7/1.0).
+pub(super) struct SamplingDefaults {
+    /// Model defaults; `None` when the model config doesn't set them or when
+    /// `--sampling-defaults openai` (the Python dump is then empty).
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    /// OpenAI terminal defaults for this endpoint.
+    fallback_temperature: f64,
+    fallback_top_p: f64,
+}
+
+impl SamplingDefaults {
+    /// `protocol.py` chat `_DEFAULT_SAMPLING_PARAMS`: temperature 1.0, top_p 1.0.
+    pub(super) const CHAT: SamplingDefaults = SamplingDefaults {
+        temperature: None,
+        top_p: None,
+        fallback_temperature: 1.0,
+        fallback_top_p: 1.0,
+    };
+    /// `protocol.py` responses `_DEFAULT_SAMPLING_PARAMS`: temperature 0.7, top_p 1.0.
+    pub(super) const RESPONSES: SamplingDefaults = SamplingDefaults {
+        temperature: None,
+        top_p: None,
+        fallback_temperature: 0.7,
+        fallback_top_p: 1.0,
+    };
+
+    /// The resolved model defaults (empty in `--sampling-defaults openai`
+    /// mode), which slot between the user's values and the OpenAI terminals.
+    pub(super) fn with_model_defaults(
+        mut self,
+        model: &crate::runtime::DefaultSamplingParams,
+    ) -> SamplingDefaults {
+        self.temperature = model.temperature;
+        self.top_p = model.top_p;
+        self
+    }
+}
+
 #[allow(deprecated)]
 pub(super) fn chat_sampling_params(
     request: &CreateChatCompletionRequest,
+    defaults: &SamplingDefaults,
 ) -> Result<SamplingParams, String> {
     let mut stop = None;
     let mut stop_token_ids = None;
@@ -328,8 +412,16 @@ pub(super) fn chat_sampling_params(
             .map(i64::from),
         stop,
         stop_token_ids,
-        temperature: request.temperature.unwrap_or(1.0) as f64,
-        top_p: request.top_p.unwrap_or(1.0) as f64,
+        temperature: request
+            .temperature
+            .map(f64::from)
+            .or(defaults.temperature)
+            .unwrap_or(defaults.fallback_temperature),
+        top_p: request
+            .top_p
+            .map(f64::from)
+            .or(defaults.top_p)
+            .unwrap_or(defaults.fallback_top_p),
         frequency_penalty: request.frequency_penalty.unwrap_or(0.0) as f64,
         presence_penalty: request.presence_penalty.unwrap_or(0.0) as f64,
         n: 1,
@@ -349,6 +441,7 @@ pub(super) async fn unary_chat(
     created: u32,
     want_logprobs: bool,
     parser: Option<String>,
+    reasoning_parser: Option<String>,
     tools: Option<Vec<ToolDefinition>>,
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
@@ -369,8 +462,23 @@ pub(super) async fn unary_chat(
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
         let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
         let finish_reason = chat_finish_reason(&output);
+        // Split reasoning markers out of the content first (Python splits
+        // before tool-call parsing too), then parse tool calls on the clean
+        // normal text.
+        let (reasoning_text, text) = if let Some(name) = reasoning_parser.as_deref() {
+            let mut reasoning_parser = build_reasoning_parser(name);
+            let token_ids = output
+                .token_ids
+                .iter()
+                .filter_map(|&id| u32::try_from(id).ok())
+                .collect::<Vec<_>>();
+            let split = reasoning_parser.detect_and_parse_reasoning(&output.text, &token_ids);
+            (split.reasoning_text, split.normal_text)
+        } else {
+            (String::new(), output.text)
+        };
         let (content, tool_calls) = parse_chat_tool_calls(
-            output.text,
+            text,
             parser.as_deref(),
             tools.as_deref(),
             parallel_tool_calls,
@@ -389,7 +497,8 @@ pub(super) async fn unary_chat(
             role: Role::Assistant,
             function_call: None,
             audio: None,
-            reasoning_content: None,
+            // Python: `reasoning_text if reasoning_text else None`.
+            reasoning_content: (!reasoning_text.is_empty()).then_some(reasoning_text),
         };
         choices.push(ChatChoice {
             index: u32::try_from(index).unwrap_or(u32::MAX),
@@ -425,6 +534,7 @@ pub(super) fn chat_event_stream(
     want_logprobs: bool,
     include_usage: bool,
     parser: Option<String>,
+    reasoning_parser: Option<String>,
     tools: Option<Vec<ToolDefinition>>,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
     uses_tool_call_structural_tag: bool,
@@ -438,6 +548,11 @@ pub(super) fn chat_event_stream(
         let mut streams = Vec::with_capacity(count);
         let mut prompt_tokens = 0u32;
         let mut completion_tokens = 0u64;
+        // One stateful reasoning parser per choice, built lazily on the first
+        // content delta (Python keeps a `reasoning_parser_dict` per index).
+        let mut reasoning_parsers: Vec<Option<ReasoningParserWrapper>> =
+            if reasoning_parser.is_some() { (0..count).map(|_| None).collect() } else { vec![] };
+        let reasoning_name = reasoning_parser.as_deref();
 
         for (index, rid, rx) in submitted {
             rids.push(rid);
@@ -447,7 +562,7 @@ pub(super) fn chat_event_stream(
                     id: response_id.clone(),
                     choices: vec![ChatChoiceStream {
                         index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(None, Some(Role::Assistant), None),
+                        delta: chat_delta(None, Some(Role::Assistant), None, None),
                         finish_reason: None,
                         logprobs: None,
                     }],
@@ -516,32 +631,98 @@ pub(super) fn chat_event_stream(
             }
             completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
             let finish_reason = chat_finish_reason(&output);
-            yield Annotated {
-                data: Some(CreateChatCompletionStreamResponse {
-                    id: response_id.clone(),
-                    choices: vec![ChatChoiceStream {
+            // Split the step's text into (reasoning, normal) deltas when
+            // `--reasoning-parser` is set. Mirrors Python's per-step emission:
+            // reasoning chunk first (logprobs ride it), then the content chunk.
+            let mut emitted = Vec::with_capacity(2);
+            if let Some(name) = reasoning_name {
+                let parser = reasoning_parsers[index]
+                    .get_or_insert_with(|| build_reasoning_parser(name));
+                let token_ids = output
+                    .token_ids
+                    .iter()
+                    .filter_map(|&id| u32::try_from(id).ok())
+                    .collect::<Vec<_>>();
+                let split = parser.parse_reasoning_streaming_incremental(&output.text, &token_ids);
+                let mut remaining_logprobs =
+                    want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
+                if !split.reasoning_text.is_empty() {
+                    emitted.push(ChatChoiceStream {
                         index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(
-                            (!output.text.is_empty()).then_some(output.text),
-                            None,
-                            None,
-                        ),
-                        finish_reason,
-                        logprobs: want_logprobs
-                            .then(|| chat_logprobs(output.extras.as_deref())),
-                    }],
-                    created,
-                    model: model.clone(),
-                    service_tier: service_tier.clone(),
-                    system_fingerprint: None,
-                    object: "chat.completion.chunk".into(),
-                    usage: None,
-                }),
-                id: None,
-                event: None,
-                comment: None,
-                error: None,
+                        delta: chat_delta(None, None, None, Some(split.reasoning_text)),
+                        finish_reason: None,
+                        logprobs: remaining_logprobs.clone(),
+                    });
+                    remaining_logprobs = None;
+                }
+                if !split.normal_text.is_empty() {
+                    emitted.push(ChatChoiceStream {
+                        index: u32::try_from(index).unwrap_or(u32::MAX),
+                        delta: chat_delta(Some(split.normal_text), None, None, None),
+                        finish_reason: None,
+                        logprobs: remaining_logprobs,
+                    });
+                }
+            } else {
+                emitted.push(ChatChoiceStream {
+                    index: u32::try_from(index).unwrap_or(u32::MAX),
+                    delta: chat_delta(
+                        (!output.text.is_empty()).then_some(output.text),
+                        None,
+                        None,
+                        None,
+                    ),
+                    finish_reason: None,
+                    logprobs: want_logprobs.then(|| chat_logprobs(output.extras.as_deref())),
+                });
             };
+            // Flush the choice's buffered reasoning tail before its terminal
+            // frame (Python `parse_stream_end`, which skips aborts — abort
+            // frames already became error chunks above).
+            if reasoning_name.is_some()
+                && finish_reason.is_some()
+                && let Some(parser) = reasoning_parsers[index].as_mut()
+            {
+                let tail = parser.finish_reasoning_stream();
+                if !tail.reasoning_text.is_empty() {
+                    emitted.push(ChatChoiceStream {
+                        index: u32::try_from(index).unwrap_or(u32::MAX),
+                        delta: chat_delta(None, None, None, Some(tail.reasoning_text)),
+                        finish_reason: None,
+                        logprobs: None,
+                    });
+                }
+            }
+            // The finish reason rides the last emitted chunk (the wire format
+            // the equivalence tests pin); a step whose text was entirely
+            // buffered inside the parser still gets a finish-only frame.
+            match emitted.last_mut() {
+                Some(last) => last.finish_reason = finish_reason,
+                None => emitted.push(ChatChoiceStream {
+                    index: u32::try_from(index).unwrap_or(u32::MAX),
+                    delta: chat_delta(None, None, None, None),
+                    finish_reason,
+                    logprobs: None,
+                }),
+            }
+            for choice in emitted {
+                yield Annotated {
+                    data: Some(CreateChatCompletionStreamResponse {
+                        id: response_id.clone(),
+                        choices: vec![choice],
+                        created,
+                        model: model.clone(),
+                        service_tier: service_tier.clone(),
+                        system_fingerprint: None,
+                        object: "chat.completion.chunk".into(),
+                        usage: None,
+                    }),
+                    id: None,
+                    event: None,
+                    comment: None,
+                    error: None,
+                };
+            }
         }
 
         if include_usage {
@@ -681,5 +862,154 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
     ChatChoiceLogprobs {
         content: Some(content),
         refusal: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::DefaultSamplingParams;
+
+    fn request() -> CreateChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap()
+    }
+
+    /// Python `to_sampling_params` priority: user value > model generation
+    /// config (`--sampling-defaults model`) > OpenAI terminal default.
+    #[test]
+    fn sampling_defaults_follow_python_priority_chain() {
+        let model = DefaultSamplingParams {
+            temperature: Some(0.6),
+            top_p: Some(0.9),
+            ..Default::default()
+        };
+        // Omitted → model defaults, not the 1.0 OpenAI terminals.
+        let sampling = chat_sampling_params(
+            &request(),
+            &SamplingDefaults::CHAT.with_model_defaults(&model),
+        )
+        .unwrap();
+        assert_eq!(sampling.temperature, 0.6);
+        assert_eq!(sampling.top_p, 0.9);
+        // Explicit request values win. `Option<f32>` loses precision in f64 —
+        // compare with tolerance.
+        let mut request = request();
+        request.temperature = Some(0.2);
+        request.top_p = Some(0.5);
+        let sampling = chat_sampling_params(
+            &request,
+            &SamplingDefaults::CHAT.with_model_defaults(&model),
+        )
+        .unwrap();
+        assert!((sampling.temperature - 0.2).abs() < 1e-6);
+        assert!((sampling.top_p - 0.5).abs() < 1e-6);
+    }
+
+    /// `--sampling-defaults openai` resolves an empty model-config slice, so the
+    /// conversion falls back to the OpenAI terminal defaults.
+    #[test]
+    fn sampling_defaults_fall_back_to_openai_terminals_in_openai_mode() {
+        let openai_mode = DefaultSamplingParams::default();
+        let sampling = chat_sampling_params(
+            &request(),
+            &SamplingDefaults::CHAT.with_model_defaults(&openai_mode),
+        )
+        .unwrap();
+        assert_eq!(sampling.temperature, 1.0);
+        assert_eq!(sampling.top_p, 1.0);
+    }
+
+    /// The responses endpoint has its own OpenAI terminal default (0.7), from
+    /// `protocol.py` `_DEFAULT_SAMPLING_PARAMS` — 1.0 must not leak in.
+    #[test]
+    fn responses_terminal_default_is_0_7_not_1_0() {
+        let openai_mode = DefaultSamplingParams::default();
+        let sampling = chat_sampling_params(
+            &request(),
+            &SamplingDefaults::RESPONSES.with_model_defaults(&openai_mode),
+        )
+        .unwrap();
+        assert_eq!(sampling.temperature, 0.7);
+        assert_eq!(sampling.top_p, 1.0);
+    }
+
+    /// Python `_apply_conversation_template`: template `stop_str` first, then
+    /// the request's own stops.
+    #[test]
+    fn template_stops_merge_before_request_stops() {
+        let chatml = super::super::template::builtin_template("chatml").unwrap();
+        let formatter = super::super::ChatFormatter::Legacy(Box::new(
+            super::super::template::LegacyFormatter { spec: chatml },
+        ));
+        assert_eq!(
+            formatter.stop_strs(),
+            Some(crate::message::OneOrMany::Many(vec![
+                "<|endoftext|>".into(),
+                "<|im_end|>".into()
+            ]))
+        );
+        // No request stop → the template's delimiters alone.
+        let mut req = request();
+        merge_template_stops(&mut req, &formatter);
+        assert_eq!(
+            req.stop,
+            Some(Stop::StringArray(vec![
+                "<|endoftext|>".into(),
+                "<|im_end|>".into()
+            ]))
+        );
+        // A string request stop appends as one entry.
+        let mut req = request();
+        req.stop = Some(Stop::String("<stop>".into()));
+        merge_template_stops(&mut req, &formatter);
+        assert_eq!(
+            req.stop,
+            Some(Stop::StringArray(vec![
+                "<|endoftext|>".into(),
+                "<|im_end|>".into(),
+                "<stop>".into()
+            ]))
+        );
+        // A list request stop extends the list.
+        let mut req = request();
+        req.stop = Some(Stop::StringArray(vec!["a".into(), "b".into()]));
+        merge_template_stops(&mut req, &formatter);
+        assert_eq!(
+            req.stop,
+            Some(Stop::StringArray(vec![
+                "<|endoftext|>".into(),
+                "<|im_end|>".into(),
+                "a".into(),
+                "b".into()
+            ]))
+        );
+        // Token-id stops cannot be merged (Python has no such field) — kept alone.
+        let mut req = request();
+        req.stop = Some(Stop::TokenIdArray(vec![2, 3]));
+        merge_template_stops(&mut req, &formatter);
+        assert_eq!(req.stop, Some(Stop::TokenIdArray(vec![2, 3])));
+    }
+
+    /// The HuggingFace renderer carries no template stops (Python's jinja path
+    /// keeps only the request's stops), so the request is left unchanged.
+    #[test]
+    fn huggingface_formatter_leaves_request_stops_alone() {
+        let mut req = request();
+        req.stop = Some(Stop::String("x".into()));
+        // A prompt formatter is not constructible here without a tokenizer; the
+        // empty-legacy-spec twin proves the merge is formatter-gated, and the
+        // `HuggingFace` arm returns `None` by construction (see `stop_strs`).
+        let legacy = super::super::ChatFormatter::Legacy(Box::new(
+            super::super::template::LegacyFormatter {
+                spec: super::super::template::LegacySpec::default(),
+            },
+        ));
+        assert!(legacy.stop_strs().is_none());
+        merge_template_stops(&mut req, &legacy);
+        assert_eq!(req.stop, Some(Stop::String("x".into())));
     }
 }

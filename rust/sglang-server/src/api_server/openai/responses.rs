@@ -34,7 +34,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
-use super::chat::{chat_sampling_params, prepare_chat_request};
+use super::chat::{SamplingDefaults, chat_sampling_params, prepare_chat_request};
 use super::response_stream::{
     response_object, response_status, responses_event_stream, responses_usage,
     text_response_message,
@@ -59,6 +59,19 @@ fn invalid_response_id(response_id: &str) -> Option<String> {
     (!response_id.starts_with("resp_")).then(|| {
         format!("Invalid 'response_id': '{response_id}'. Expected an ID that begins with 'resp'.")
     })
+}
+
+/// Build the axum SSE event for one Responses stream frame. Python
+/// `_send_event` uses the payload's `type` field as the `event:` name; frames
+/// without one (`[DONE]`, error payloads) stay data-only.
+pub(super) fn sse_frame(data: String) -> Event {
+    match serde_json::from_str::<serde_json::Value>(&data)
+        .ok()
+        .and_then(|value| value["type"].as_str().map(str::to_owned))
+    {
+        Some(name) => Event::default().event(name).data(data),
+        None => Event::default().data(data),
+    }
 }
 
 async fn retrieve_response(
@@ -536,7 +549,11 @@ async fn responses(
         };
     let response_messages = chat_request.messages.clone();
     let stream_tool_choice = chat_request.tool_choice.clone();
-    let mut sampling = match chat_sampling_params(&chat_request) {
+    let mut sampling = match chat_sampling_params(
+        &chat_request,
+        &SamplingDefaults::RESPONSES
+            .with_model_defaults(&state.server_args.model_config.default_sampling_params),
+    ) {
         Ok(sampling) => sampling,
         Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
     };
@@ -688,7 +705,12 @@ async fn responses(
             state.response_store,
             response_messages,
         )
-        .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
+        // Python `_send_event` frames each event as
+        // `event: {type}\ndata: {payload}` — the event name is the payload's
+        // `type` field, so consumers can dispatch on it instead of receiving
+        // only generic `message` events. `[DONE]` and error frames carry no
+        // `type` and stay data-only (as in Python).
+        .map(|data| Ok::<_, Infallible>(sse_frame(data)));
         Sse::new(event_stream).into_response()
     } else {
         unary_responses(

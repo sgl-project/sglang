@@ -93,6 +93,11 @@ pub struct ServerArgs {
     /// Parser selected by `--tool-call-parser`.
     #[serde(default)]
     pub tool_call_parser: Option<String>,
+    /// Reasoning splitter selected by `--reasoning-parser` (e.g. deepseek-r1).
+    /// When set, chat completions strip the model's reasoning markers out of
+    /// `content` into `reasoning_content` — both unary and streaming.
+    #[serde(default)]
+    pub reasoning_parser: Option<String>,
     /// Python's global default for whether an SSE stream ends with a usage chunk.
     #[serde(default)]
     pub stream_response_default_include_usage: bool,
@@ -151,6 +156,37 @@ pub struct ModelConfig {
     /// boot ([`ServerArgs::validate_mandatory`]).
     #[serde(default)]
     pub vocab_size: Option<u64>,
+    /// Resolved default sampling parameters, stamped by
+    /// `RustServer._build_server_args` from Python's
+    /// `ModelConfig.get_default_sampling_params()`. Already gated on
+    /// `--sampling-defaults`: holds the model's generation_config.json values
+    /// in "model" mode, and is empty in "openai" mode. Consumed when the chat /
+    /// responses request omits `temperature`/`top_p` — the conversion must not
+    /// skip straight to the OpenAI terminal defaults.
+    #[serde(default)]
+    pub default_sampling_params: DefaultSamplingParams,
+}
+
+/// One `SamplingParams` field per key `get_default_sampling_params()` may emit
+/// (`repetition_penalty`, `temperature`, `top_k`, `top_p`, `min_p`), filtered
+/// to values the generation config actually sets — hence all `Option`.
+///
+/// `top_k` / `min_p` / `repetition_penalty` are parsed for parity with the
+/// Python dict but not yet consumed: the Dynamo chat request type only carries
+/// `temperature` and `top_p`, so the conversion resolves just those two.
+#[derive(Debug, Default, serde::Deserialize)]
+#[allow(dead_code)]
+pub struct DefaultSamplingParams {
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub top_k: Option<i64>,
+    #[serde(default)]
+    pub min_p: Option<f64>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f64>,
 }
 
 fn default_host() -> String {

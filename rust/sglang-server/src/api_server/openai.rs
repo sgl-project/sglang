@@ -21,6 +21,7 @@ use tokio::sync::{RwLock, mpsc};
 mod chat;
 mod completions;
 mod models;
+mod reasoning;
 mod response_stream;
 mod responses;
 mod template;
@@ -73,16 +74,20 @@ pub(super) fn load_chat_support(
     ) else {
         return (None, None);
     };
-    let Some(config_file) = crate::tokenizer::resolve_model_file(
+    // `tokenizer_config.json` is only needed for the HF-template sources —
+    // a built-in `--chat-template` name and a model-path-inferred legacy
+    // template resolve without it, so its absence must not disable chat.
+    let config_file = crate::tokenizer::resolve_model_file(
         &server_args.tokenizer_path,
         server_args.revision.as_deref(),
         "tokenizer_config.json",
-    ) else {
-        return (None, None);
-    };
+    );
 
-    let formatter =
-        template::load_chat_formatter(&config_file, server_args.chat_template.as_deref());
+    let formatter = template::load_chat_formatter(
+        config_file.as_deref(),
+        (!server_args.model_path.is_empty()).then_some(server_args.model_path.as_str()),
+        server_args.chat_template.as_deref(),
+    );
     let tokenizer = dynamo_tokenizers::Tokenizer::from_file_with_options(
         &tokenizer_file,
         dynamo_tokenizers::TokenizerOptions {
@@ -93,7 +98,10 @@ pub(super) fn load_chat_support(
 
     let error = match (formatter, tokenizer) {
         (Ok(formatter), Ok(tokenizer)) => {
-            tracing::info!(%config_file, "loaded OpenAI chat template");
+            tracing::info!(
+                config = ?config_file.as_deref().unwrap_or("<built-in / inferred>"),
+                "loaded OpenAI chat template"
+            );
             return (Some(formatter), Some(tokenizer));
         }
         (Err(error), _) => error.to_string(),

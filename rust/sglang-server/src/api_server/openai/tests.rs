@@ -19,14 +19,16 @@ use tower::util::ServiceExt;
 
 use super::super::AppState;
 use super::super::guard::AbortGuard;
-use super::chat::{chat_event_stream, chat_logprobs, chat_sampling_params, unary_chat};
+use super::chat::{
+    SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params, unary_chat,
+};
 use super::completions::{
     ChoiceExtensions, SubmittedChoice, completion_event_stream, completion_logprobs,
     completion_response_value, unary_completion,
 };
 use super::new_response_store;
 use super::response_stream::{response_object, responses_event_stream};
-use super::responses::{responses_chat_request, unary_responses};
+use super::responses::{responses_chat_request, sse_frame, unary_responses};
 use super::tools::{apply_tool_constraint, parse_chat_tool_calls};
 use super::{StoredResponse, routes, unix_seconds};
 use crate::ids::Rid;
@@ -259,6 +261,7 @@ async fn unary_chat_fans_in_choices_and_usage() {
         false,
         None,
         None,
+        None,
         true,
         None,
     )
@@ -276,6 +279,95 @@ async fn unary_chat_fans_in_choices_and_usage() {
 }
 
 #[tokio::test]
+async fn unary_chat_separates_reasoning_content_with_parser_configured() {
+    let (choice, tx) = chat_submitted(0, "r0");
+    tx.send(chunk(
+        "r0",
+        "<think>because Paris is famous</think>Paris",
+        true,
+    ))
+    .await
+    .unwrap();
+
+    let response = unary_chat(
+        vec![choice],
+        AbortGuard::new_empty(senders()),
+        "chatcmpl-test".into(),
+        "model".into(),
+        1,
+        false,
+        None,
+        Some("deepseek-r1".into()),
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        value["choices"][0]["message"]["reasoning_content"],
+        "because Paris is famous"
+    );
+    assert_eq!(value["choices"][0]["message"]["content"], "Paris");
+    assert!(value["choices"][0]["message"]["reasoning_content"].is_string());
+}
+
+#[tokio::test]
+async fn streaming_chat_separates_reasoning_into_own_deltas() {
+    let (choice, tx) = chat_submitted(0, "r0");
+    // Force mode starts in reasoning, so the opener is stripped and the first
+    // reasoning fragment streams immediately.
+    tx.send(chunk("r0", "<think>be", false)).await.unwrap();
+    tx.send(chunk("r0", "cause</think>Par", false))
+        .await
+        .unwrap();
+    tx.send(chunk("r0", "is", true)).await.unwrap();
+
+    let stream = chat_event_stream(
+        vec![choice],
+        AbortGuard::new_empty(senders()),
+        "chatcmpl-test".into(),
+        "model".into(),
+        1,
+        false,
+        true,
+        None,
+        Some("deepseek-r1".into()),
+        None,
+        None,
+        false,
+        true,
+        None,
+    );
+    futures::pin_mut!(stream);
+    let frames: Vec<String> = stream.collect().await;
+    let role: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+    let first_reasoning: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+    let second_reasoning: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
+    let content: serde_json::Value = serde_json::from_str(&frames[3]).unwrap();
+    let terminal: serde_json::Value = serde_json::from_str(&frames[4]).unwrap();
+    assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(
+        first_reasoning["choices"][0]["delta"]["reasoning_content"],
+        "be"
+    );
+    assert!(first_reasoning["choices"][0]["delta"]["content"].is_null());
+    assert_eq!(
+        second_reasoning["choices"][0]["delta"]["reasoning_content"],
+        "cause"
+    );
+    assert_eq!(content["choices"][0]["delta"]["content"], "Par");
+    assert!(content["choices"][0]["delta"]["reasoning_content"].is_null());
+    assert_eq!(terminal["choices"][0]["delta"]["content"], "is");
+    assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
+    assert_eq!(frames.len(), 7);
+}
+
+#[tokio::test]
 async fn streaming_chat_emits_role_deltas_usage_and_done() {
     let (choice, tx) = chat_submitted(0, "r0");
     tx.send(chunk("r0", "Par", false)).await.unwrap();
@@ -289,6 +381,7 @@ async fn streaming_chat_emits_role_deltas_usage_and_done() {
         1,
         false,
         true,
+        None,
         None,
         None,
         None,
@@ -336,6 +429,7 @@ async fn streaming_chat_buffers_and_parses_function_calls() {
         Some("llama3".into()),
         None,
         None,
+        None,
         false,
         true,
         None,
@@ -368,6 +462,7 @@ async fn streaming_chat_with_tools_does_not_buffer_normal_text() {
         false,
         false,
         Some("llama3".into()),
+        None,
         None,
         None,
         false,
@@ -413,6 +508,7 @@ async fn streaming_chat_holds_only_a_split_tool_marker() {
         Some("llama3".into()),
         None,
         None,
+        None,
         false,
         true,
         None,
@@ -451,6 +547,7 @@ async fn streaming_chat_releases_an_incomplete_marker_at_done() {
         false,
         false,
         Some("llama3".into()),
+        None,
         None,
         None,
         false,
@@ -492,6 +589,7 @@ async fn streaming_chat_emits_a_complete_tool_call_before_done() {
         false,
         false,
         Some("llama3".into()),
+        None,
         None,
         None,
         false,
@@ -549,7 +647,12 @@ fn chat_without_a_token_limit_stays_unbounded() {
         "messages": [{"role": "user", "content": "hello"}]
     }))
     .unwrap();
-    assert_eq!(chat_sampling_params(&request).unwrap().max_new_tokens, None);
+    assert_eq!(
+        chat_sampling_params(&request, &SamplingDefaults::CHAT)
+            .unwrap()
+            .max_new_tokens,
+        None
+    );
 }
 
 #[test]
@@ -734,6 +837,39 @@ async fn streaming_responses_emits_lifecycle_and_text_deltas() {
     assert_eq!(completed["response"]["created_at"], 1_234_567_890);
     assert_eq!(completed["response"]["usage"]["output_tokens"], 2);
     assert_eq!(frames.last().unwrap(), "[DONE]");
+}
+
+/// Python `_send_event` frames each event as `event: {type}\ndata: {payload}`.
+/// Assert the actual SSE wire bytes: lifecycle frames carry their event name;
+/// `[DONE]` and error frames stay data-only.
+#[tokio::test]
+async fn responses_sse_frames_carry_event_names() {
+    use axum::response::IntoResponse;
+    use std::convert::Infallible;
+
+    let payload = r#"{"type":"response.created","sequence_number":0,"response":{}}"#.to_string();
+    let stream = futures::stream::iter(vec![
+        Ok::<_, Infallible>(sse_frame(payload)),
+        Ok::<_, Infallible>(sse_frame("[DONE]".into())),
+        Ok::<_, Infallible>(sse_frame(r#"{"error":{"message":"boom"}}"#.into())),
+    ]);
+    let response = axum::response::Sse::new(stream).into_response();
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let mut frames = text.split("\n\n");
+    let first = frames.next().unwrap();
+    assert!(
+        first.contains("event: response.created"),
+        "missing event name in {text:?}"
+    );
+    assert!(
+        first.contains("response.created"),
+        "missing payload in {text:?}"
+    );
+    assert!(!frames.next().unwrap().contains("event:"));
+    assert!(!frames.next().unwrap().contains("event:"));
 }
 
 #[tokio::test]

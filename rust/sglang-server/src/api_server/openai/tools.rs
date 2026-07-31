@@ -86,7 +86,7 @@ where
                         state.parsing_tool = false;
                         emitted.push(ChatChoiceStream {
                             index: choice.index,
-                            delta: chat_delta(Some(text), choice.delta.role, None),
+                            delta: chat_delta(Some(text), choice.delta.role, None, None),
                             finish_reason: Some(if state.emitted_calls == 0 {
                                 choice.finish_reason.unwrap_or(OpenAIFinishReason::Stop)
                             } else {
@@ -124,7 +124,7 @@ where
                             state.buffered.drain(..position);
                             emitted.push(ChatChoiceStream {
                                 index: choice.index,
-                                delta: chat_delta(Some(prefix), choice.delta.role, None),
+                                delta: chat_delta(Some(prefix), choice.delta.role, None, None),
                                 finish_reason: None,
                                 logprobs: choice.logprobs.clone(),
                             });
@@ -146,7 +146,7 @@ where
                             state.buffered.drain(..safe_len);
                             emitted.push(ChatChoiceStream {
                                 index: choice.index,
-                                delta: chat_delta(Some(text), choice.delta.role, None),
+                                delta: chat_delta(Some(text), choice.delta.role, None, None),
                                 finish_reason: choice.finish_reason.map(|reason| {
                                     if state.emitted_calls == 0 {
                                         reason
@@ -207,6 +207,7 @@ where
                                 normal.filter(|text| !text.is_empty()),
                                 choice.delta.role,
                                 Some(tool_calls),
+                                None,
                             ),
                             finish_reason: choice
                                 .finish_reason
@@ -221,6 +222,7 @@ where
                             delta: chat_delta(
                                 (!text.is_empty()).then_some(text),
                                 choice.delta.role,
+                                None,
                                 None,
                             ),
                             finish_reason: choice.finish_reason.map(|reason| {
@@ -369,6 +371,7 @@ pub(super) fn chat_delta(
     content: Option<String>,
     role: Option<Role>,
     tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
+    reasoning_content: Option<String>,
 ) -> ChatCompletionStreamResponseDelta {
     ChatCompletionStreamResponseDelta {
         content: content.map(ChatCompletionMessageContent::Text),
@@ -376,7 +379,7 @@ pub(super) fn chat_delta(
         tool_calls,
         role,
         refusal: None,
-        reasoning_content: None,
+        reasoning_content,
     }
 }
 

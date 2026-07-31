@@ -108,6 +108,7 @@ pub(super) fn responses_event_stream(
                             (!output.text.is_empty()).then_some(output.text),
                             None,
                             None,
+                            None,
                         ),
                         finish_reason,
                         logprobs: None,
