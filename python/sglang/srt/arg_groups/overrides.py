@@ -261,19 +261,14 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
 
 def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
     """Declare a load-time resolved field (model-file config overrides,
-    weight-resolved dtypes) on the published ``server_args``: resolution has
-    already materialized, so the declaration writes through, joining the
-    declaration stash for provenance and republish consistency."""
+    weight-resolved dtypes): validated against the resolvable whitelist, then
+    written to the config bags via ``get_context().override``; ``server_args``
+    stays the pristine startup record."""
     from sglang.srt.runtime_context import get_context
 
-    server_args = get_context().server_args
-    validate_declarations(server_args, [(source, dict(declared))])
-    override = getattr(server_args, "override", None)
-    if override is not None:
-        override(source, **declared)
-    else:
-        # Config-shaped fixtures without the mutation entry point.
-        _apply_fields(server_args, declared)
+    context = get_context()
+    validate_declarations(context.server_args, [(source, dict(declared))])
+    context.override(source, **declared)
 
 
 def collect_model_override_declarations(
@@ -528,6 +523,11 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             page_resolved = 128
         if server_args.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
             overrides["moe_runner_backend"] = "deep_gemm"
+        elif (
+            server_args.moe_runner_backend == "auto"
+            and quant_resolved == "modelopt_mixed"
+        ):
+            overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
         logger.info(
             "MiniMax-M3 on SM100: attention_backend="
             f"{overrides.get('attention_backend', server_args.attention_backend)}, page_size={page_resolved}, "
@@ -2146,7 +2146,16 @@ def _cutlass_moe_env_override(view: Any) -> dict:
 
 # Every A2A backend that forces expert parallelism to span the TP group.
 _A2A_EP_SPANNING_BACKENDS = frozenset(
-    {"megamoe", "deepep", "mooncake", "nixl", "ascend_fuseep", "flashinfer", "mori"}
+    {
+        "megamoe",
+        "deepep",
+        "mooncake",
+        "nixl",
+        "ascend_fuseep",
+        "flashinfer",
+        "mori",
+        "pplx",
+    }
 )
 
 
