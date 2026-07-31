@@ -63,7 +63,7 @@ from sglang.srt.observability.trace import (
     process_tracing_init,
     trace_set_thread_info,
 )
-from sglang.srt.runtime_context import publish
+from sglang.srt.runtime_context import get_disagg, get_exec, get_mm, publish
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -352,7 +352,7 @@ class MMEncoder:
             [], dtype=self._embedding_dtype
         ).element_size()
 
-        if self.server_args.enable_mm_global_cache:
+        if get_mm().enable_mm_global_cache:
             from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
                 EmbeddingCacheController,
             )
@@ -370,15 +370,15 @@ class MMEncoder:
             self.mm_global_cache = None
 
         # Pre-compute embedding metadata (needed by all ranks for mooncake)
-        if self.server_args.encoder_transfer_backend == "mooncake":
+        if get_disagg().encoder_transfer_backend == "mooncake":
             self._embedding_dims = self._infer_embedding_dims()
 
         if self.rank == 0:
             logger.info(
-                f"Using transfer backend: {self.server_args.encoder_transfer_backend}"
+                f"Using transfer backend: {get_disagg().encoder_transfer_backend}"
             )
 
-            if self.server_args.encoder_transfer_backend == "mooncake":
+            if get_disagg().encoder_transfer_backend == "mooncake":
                 self.local_ip = get_local_ip_auto()
 
                 self.engine = get_mooncake_transfer_engine()
@@ -391,8 +391,8 @@ class MMEncoder:
                         hostname=self.local_ip,
                         gpu_id=self.gpu_id,
                         ib_device=(
-                            self.server_args.disaggregation_ib_device
-                            or self.server_args.mooncake_ib_device
+                            get_disagg().disaggregation_ib_device
+                            or get_exec().moe.mooncake_ib_device
                         ),
                     )
 
@@ -401,7 +401,7 @@ class MMEncoder:
             self.encode_dispatch_lock = asyncio.Lock()
 
             # Async mooncake state: track background VIT forward completion
-            if self.server_args.encoder_transfer_backend == "mooncake":
+            if get_disagg().encoder_transfer_backend == "mooncake":
                 self._forward_ready_events: Dict[str, asyncio.Event] = {}
                 self._forward_results: Dict[str, dict] = {}
                 # when multiple decoder TP ranks call
@@ -415,12 +415,12 @@ class MMEncoder:
 
         # Bind unified encode entry point based on backend and cache config
         if self.mm_global_cache is not None:
-            if self.server_args.encoder_transfer_backend == "mooncake":
+            if get_disagg().encoder_transfer_backend == "mooncake":
                 self._encode_fn = self.encode_with_global_cache_mooncake
             else:
                 self._encode_fn = self.encode_with_global_cache
         else:
-            if self.server_args.encoder_transfer_backend == "mooncake":
+            if get_disagg().encoder_transfer_backend == "mooncake":
                 self._encode_fn = self.encode_with_mooncake
             else:
                 self._encode_fn = self.encode
@@ -1710,7 +1710,7 @@ class MMEncoder:
                 mm_item.set(k, _convert(v))
 
             cache_hit = False
-            use_mm_cache = self.server_args.enable_prefix_mm_cache and log_metrics
+            use_mm_cache = get_mm().enable_prefix_mm_cache and log_metrics
             if use_mm_cache:
                 mm_item.set_pad_value()
                 mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
@@ -1806,7 +1806,7 @@ class MMEncoder:
         embedding_port=None,
         url=None,
     ):
-        if self.server_args.encoder_transfer_backend == "mooncake":
+        if get_disagg().encoder_transfer_backend == "mooncake":
             # Wait for async VIT forward completion if needed
             req_id = mm_data.req_id
             if req_id in self._forward_ready_events:
@@ -1878,7 +1878,7 @@ class MMEncoder:
         logger.info(f"{endpoint = }")
 
         # Serialize data
-        if self.server_args.encoder_transfer_backend == "mooncake":
+        if get_disagg().encoder_transfer_backend == "mooncake":
             # Mooncake already pushed the embedding via RDMA;
             new_mm_data = mm_data.copy_without_embedding()
             serialized_data = pickle.dumps(new_mm_data)
@@ -1910,11 +1910,11 @@ class MMEncoder:
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
         if (
             encoder_metrics_collector is not None
-            and self.server_args.encoder_transfer_backend != "mooncake"
+            and get_disagg().encoder_transfer_backend != "mooncake"
         ):
             encoder_metrics_collector.observe_transfer(
                 time.perf_counter() - _zmq_xfer_start,
-                backend=self.server_args.encoder_transfer_backend,
+                backend=get_disagg().encoder_transfer_backend,
             )
 
     async def encode(

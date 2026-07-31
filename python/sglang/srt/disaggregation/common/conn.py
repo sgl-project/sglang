@@ -36,7 +36,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
 )
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -148,6 +148,7 @@ class CommonKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
+        self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
@@ -533,11 +534,11 @@ class CommonKVManager(BaseKVManager):
 
         if (
             info.kv_cache_dtype is not None
-            and info.kv_cache_dtype != get_model().kv_cache_dtype
+            and info.kv_cache_dtype != self.kv_cache_dtype_str
         ):
             raise RuntimeError(
                 f"KV cache dtype mismatch: prefill server has kv_cache_dtype={info.kv_cache_dtype}, "
-                f"but decode server has kv_cache_dtype={get_model().kv_cache_dtype}. "
+                f"but decode server has kv_cache_dtype={self.kv_cache_dtype_str}. "
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
@@ -701,7 +702,7 @@ class CommonKVManager(BaseKVManager):
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
-            "kv_cache_dtype": get_model().kv_cache_dtype,
+            "kv_cache_dtype": self.kv_cache_dtype_str,
             "load_balance_method": self.server_args.load_balance_method,
             "enable_dsa_cache_layer_split": getattr(
                 self.server_args, "enable_dsa_cache_layer_split", False
@@ -709,7 +710,7 @@ class CommonKVManager(BaseKVManager):
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
-            "prefill_http_port": self.server_args.port,
+            "prefill_http_port": get_serving().port,
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
