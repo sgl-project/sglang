@@ -1660,11 +1660,11 @@ class DeepseekSparseAttnBackend(
             total_extend_len = self.speculative_num_draft_tokens * bs
 
             if is_cuda() and not _is_hip:
-                from sglang.kernels.ops.attention.dsa_metadata import (
-                    fused_dsa_draft_extend_metadata,
+                from sglang.kernels.ops.attention.dsa_draft_extend import (
+                    fused_dsa_uniform_draft_extend_metadata,
                 )
 
-                fused_dsa_draft_extend_metadata(
+                fused_dsa_uniform_draft_extend_metadata(
                     seq_lens=seq_lens,
                     req_pool_indices=req_pool_indices,
                     req_to_token=self.req_to_token,
