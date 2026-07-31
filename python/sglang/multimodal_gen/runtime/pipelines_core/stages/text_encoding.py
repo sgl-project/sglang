@@ -165,6 +165,20 @@ class TextEncodingStage(ConditionEncodingStage):
         self._negative_text_cache_value = None
         self._dp_choice_logged = False
 
+    @property
+    def concurrency_safe(self) -> bool:
+        """Overlappable only while every encoder runs replicated.
+
+        A folded encoder all-reduces per layer and a dp encode all-gathers,
+        so those deployments must keep this stage in declaration order.
+        """
+        if self.server_args.encoder_parallel == "dp":
+            return False
+        return all(
+            encoder.config.parallel_folding_mode is None
+            for encoder in self.text_encoders
+        )
+
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:

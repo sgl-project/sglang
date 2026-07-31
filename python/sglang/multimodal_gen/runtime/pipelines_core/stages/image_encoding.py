@@ -150,6 +150,21 @@ class ImageEncodingStage(PipelineStage):
         self.image_encoder = image_encoder
         self.text_encoder = text_encoder
 
+    @property
+    def concurrency_safe(self) -> bool:
+        """Overlappable only as a pure image encoder on a replicated model.
+
+        With a text_encoder this stage writes prompt embeddings — state the
+        text encoding stage owns — and a folded encoder communicates across
+        ranks; both must keep declaration order.
+        """
+        if self.text_encoder is not None:
+            return False
+        return (
+            self.image_encoder is None
+            or self.image_encoder.config.parallel_folding_mode is None
+        )
+
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
