@@ -17,6 +17,8 @@
 //! The egress edges (Streaming/Finalizing/Completed) are driven on the egress
 //! side (see `egress` + `detokenizer`).
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 
 use crate::error::Error;
@@ -26,6 +28,7 @@ use crate::message::{
     AbortReq, ControlRequest, DetokMsg, EgressItem, GenerateRequest, IngressMsg, Request,
     RequestKind,
 };
+use crate::metrics::{MetricsState, RequestKindLabel, RequestStageLabel, TerminalOutcomeLabel};
 use crate::ring::IngressProducer;
 use crate::runtime::{Runnable, ServerArgs};
 use crate::tokenizer_manager::{AbortSource, Senders, TmEvent};
@@ -41,6 +44,7 @@ pub struct Ingress {
     senders: Senders,
     ingress: IngressProducer,
     limits: Limits,
+    metrics: Arc<MetricsState>,
     shutdown: flume::Receiver<()>,
 }
 
@@ -104,6 +108,7 @@ impl Ingress {
         senders: Senders,
         ingress: IngressProducer,
         limits: Limits,
+        metrics: Arc<MetricsState>,
         shutdown: flume::Receiver<()>,
     ) -> Self {
         Self {
@@ -112,6 +117,7 @@ impl Ingress {
             senders,
             ingress,
             limits,
+            metrics,
             shutdown,
         }
     }
@@ -163,16 +169,18 @@ impl Ingress {
     /// holds that key — a concurrent request's sink — leaving that client with no
     /// terminal frame and a hung connection. Python cannot hit this because it
     /// validates before `rid_to_state[obj.rid] = state`.
-    fn fail(&self, req: &mut Request, err: Error, registered: bool) {
+    fn fail(&self, req: &mut Request, err: Error, registered: bool, stage: RequestStageLabel) {
         // Log only server faults (500); 4xx/499/503 are expected and would spam.
         if err.http_status() == 500 {
             tracing::error!(rid = %req.rid, error = %err, "ingress rejected request");
         }
+        self.metrics.request_error(stage, err.http_status());
         let _ = req.state.apply(Event::Error(err.clone()));
         let _ = req.sink.try_send(EgressItem::Error(err)); // client may be gone
         if registered {
             let _ = self.senders.detok_for(&req.rid).send(DetokMsg::Deregister {
                 rid: req.rid.clone(),
+                outcome: Some(TerminalOutcomeLabel::Error),
             });
         }
     }
@@ -192,14 +200,17 @@ impl Ingress {
                 // Failures move to `Failed` and fall through to the reject arm.
                 RequestState::Received => {
                     if let Err(e) = validate(&mut req, &self.limits) {
-                        let _ = req.state.apply(Event::Error(e)); // → Failed
-                        continue;
+                        self.fail(&mut req, e, registered, RequestStageLabel::Validate);
+                        return;
                     }
                     if !self.register_detok(&req) {
-                        let _ = req
-                            .state
-                            .apply(Event::Error(Error::Internal("detok shard gone".into())));
-                        continue;
+                        self.fail(
+                            &mut req,
+                            Error::Internal("detok shard gone".into()),
+                            registered,
+                            RequestStageLabel::Submit,
+                        );
+                        return;
                     }
                     registered = true;
                     // `validate` advanced Received → Validating; keep driving.
@@ -227,6 +238,7 @@ impl Ingress {
                                 &mut req,
                                 Error::Internal("non-generate request in Normalizing".into()),
                                 registered,
+                                RequestStageLabel::Normalize,
                             );
                             return;
                         };
@@ -244,7 +256,8 @@ impl Ingress {
                     };
                     match outcome {
                         Err(e) => {
-                            let _ = req.state.apply(Event::Error(e)); // → Failed
+                            self.fail(&mut req, e, registered, RequestStageLabel::Normalize);
+                            return;
                         }
                         Ok(o) => {
                             // AlreadyTokenized → Queued, NeedsTokenize → Tokenizing.
@@ -264,6 +277,7 @@ impl Ingress {
                             &mut req,
                             Error::Internal("tokenizer pool gone".into()),
                             true,
+                            RequestStageLabel::Tokenize,
                         );
                     }
                     return;
@@ -277,8 +291,8 @@ impl Ingress {
                     if let RequestKind::Generate(g) = &mut req.kind
                         && let Err(e) = check_total_tokens(g, &self.limits)
                     {
-                        let _ = req.state.apply(Event::Error(e)); // → Failed
-                        continue;
+                        self.fail(&mut req, e, registered, RequestStageLabel::PreSend);
+                        return;
                     }
                     let _ = req.state.apply(Event::PreSendValidated); // → Queued
                 }
@@ -295,7 +309,13 @@ impl Ingress {
                 }
                 // The single reject path for every post-register failure.
                 RequestState::Failed(e) => {
-                    self.fail(&mut req, e, registered);
+                    let stage = match &e {
+                        Error::Tokenize(_) => RequestStageLabel::Tokenize,
+                        Error::QueueFull => RequestStageLabel::Queue,
+                        Error::Detokenize(_) => RequestStageLabel::Detokenize,
+                        _ => RequestStageLabel::Validate,
+                    };
+                    self.fail(&mut req, e, registered, stage);
                     return;
                 }
                 // Unreachable (egress states never reach here). Reject via `fail`/
@@ -305,6 +325,7 @@ impl Ingress {
                         &mut req,
                         Error::Internal(format!("unexpected ingress state: {other:?}")),
                         registered,
+                        RequestStageLabel::Validate,
                     );
                     return;
                 }
@@ -329,6 +350,7 @@ impl Ingress {
             .detok_for(&req.rid)
             .send(DetokMsg::Register {
                 rid: req.rid.clone(),
+                kind: request_kind_label(&req.kind),
                 sink: req.sink.clone(),
                 decode_logprob_text,
                 no_stop_trim,
@@ -349,16 +371,20 @@ impl Ingress {
         let header = match encode {
             Ok(b) => b,
             Err(e) => {
-                self.fail(&mut req, e, true); // on the push path: registered
+                self.fail(&mut req, e, true, RequestStageLabel::Queue); // on the push path: registered
                 return;
             }
         };
         // Control requests carry no tensor cell — empty `ids`.
-        if !self.ingress.try_push(IngressMsg {
+        if self.ingress.try_push(IngressMsg {
             header,
             ids: Bytes::new(),
         }) {
-            self.fail(&mut req, Error::QueueFull, true); // registered
+            self.metrics.ingress_ring_push(RequestKindLabel::Control);
+        } else {
+            self.metrics
+                .ingress_ring_backpressure(RequestKindLabel::Control);
+            self.fail(&mut req, Error::QueueFull, true, RequestStageLabel::Queue); // registered
         }
     }
 
@@ -372,19 +398,27 @@ impl Ingress {
     /// ([`Rid::from_client`]), so no later request can ever answer to it.
     fn on_abort(&self, source: AbortSource) {
         let rid = source.rid().clone();
-        let _ = self
-            .senders
-            .detok_for(&rid)
-            .send(DetokMsg::Deregister { rid: rid.clone() });
+        let outcome = match &source {
+            AbortSource::Guard(_) => Some(TerminalOutcomeLabel::Disconnect),
+            AbortSource::Detok(_) => None,
+        };
+        let _ = self.senders.detok_for(&rid).send(DetokMsg::Deregister {
+            rid: rid.clone(),
+            outcome,
+        });
 
         // The ring is BOUNDED and drops pushes under exactly the load this matters
         // for, so report the miss rather than assuming the scheduler was told.
         match ControlRequest::AbortReq(AbortReq::new(rid.as_str().to_string(), false)).encode() {
             Ok(header) => {
-                if !self.ingress.try_push(IngressMsg {
+                if self.ingress.try_push(IngressMsg {
                     header,
                     ids: Bytes::new(),
                 }) {
+                    self.metrics.ingress_ring_push(RequestKindLabel::Control);
+                } else {
+                    self.metrics
+                        .ingress_ring_backpressure(RequestKindLabel::Control);
                     tracing::error!(
                         rid = %rid,
                         "abort dropped: ingress ring full; the scheduler keeps generating \
@@ -414,16 +448,34 @@ impl Ingress {
         let (header, ids) = match serialized {
             Ok(v) => v,
             Err(e) => {
-                self.fail(&mut req, e, true); // on the push path: registered
+                self.fail(&mut req, e, true, RequestStageLabel::Queue); // on the push path: registered
                 return;
             }
         };
 
-        if !self.ingress.try_push(IngressMsg { header, ids }) {
-            self.fail(&mut req, Error::QueueFull, true); // registered
+        let kind = request_kind_label(&req.kind);
+        if self.ingress.try_push(IngressMsg { header, ids }) {
+            self.metrics.ingress_ring_push(kind);
+        } else {
+            self.metrics.ingress_ring_backpressure(kind);
+            self.fail(&mut req, Error::QueueFull, true, RequestStageLabel::Queue); // registered
         }
         // On success the scheduler owns the request (egress arrives by rid); we
         // drop our `Request` here — the detok shard holds the sink.
+    }
+}
+
+fn request_kind_label(kind: &RequestKind) -> RequestKindLabel {
+    match kind {
+        RequestKind::Generate(g)
+            if g.rid
+                .as_str()
+                .starts_with(crate::ids::HEALTH_CHECK_RID_PREFIX) =>
+        {
+            RequestKindLabel::HealthGenerate
+        }
+        RequestKind::Generate(_) => RequestKindLabel::Generate,
+        RequestKind::Control(_) => RequestKindLabel::Control,
     }
 }
 
@@ -570,8 +622,13 @@ mod tests {
     use super::*;
     use crate::fsm::RequestState;
     use crate::message::{EgressSink, GenerateRequest, SamplingParams};
+    use crate::metrics::MetricsState;
     use crate::ring::{IngressConsumer, ingress_ring};
     use tokio::sync::mpsc;
+
+    fn metrics() -> Arc<MetricsState> {
+        Arc::new(MetricsState::new())
+    }
 
     /// An `Ingress` plus its detok-shard receiver, ring consumer (keep alive —
     /// dropping it closes the ring → false QueueFull), and tm inbox sender.
@@ -625,13 +682,21 @@ mod tests {
             tok: tok_tx,
             detok: vec![detok_tx],
         };
-        let (ingress_producer, consumer) = ingress_ring(16);
+        let (ingress_producer, consumer) = ingress_ring(16, metrics());
         let (tm_tx, tm_rx) = flume::unbounded();
         // Keep the shutdown sender alive (leak) so its branch never fires — tests
         // end `run` by dropping `tm_tx`, not by shutdown.
         let (sd_tx, sd_rx) = flume::unbounded::<()>();
         std::mem::forget(sd_tx);
-        let ingress = Ingress::new(tm_rx, abort_rx, senders, ingress_producer, limits, sd_rx);
+        let ingress = Ingress::new(
+            tm_rx,
+            abort_rx,
+            senders,
+            ingress_producer,
+            limits,
+            metrics(),
+            sd_rx,
+        );
         (ingress, detok_rx, consumer, tm_tx)
     }
 
@@ -651,7 +716,7 @@ mod tests {
             AbortSource::Detok("x".into()),
         ] {
             let (detok_tx, detok_rx) = flume::unbounded::<DetokMsg>();
-            let (ingress_producer, consumer) = ingress_ring(16);
+            let (ingress_producer, consumer) = ingress_ring(16, metrics());
             let (sd_tx, sd_rx) = flume::unbounded::<()>();
             std::mem::forget(sd_tx);
             let ingress = Ingress::new(
@@ -665,13 +730,14 @@ mod tests {
                 },
                 ingress_producer,
                 test_limits(),
+                metrics(),
                 sd_rx,
             );
 
             ingress.on_abort(source.clone());
 
             assert!(
-                matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "x"),
+                matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid, .. }) if rid.as_str() == "x"),
                 "{source:?} must drop the detok entry",
             );
             assert_eq!(
@@ -934,7 +1000,7 @@ mod tests {
             "registered before the check",
         );
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "33"),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid, .. }) if rid.as_str() == "33"),
             "must deregister on reject",
         );
         assert!(
@@ -963,11 +1029,19 @@ mod tests {
             tok: tok_tx,
             detok: vec![detok_tx],
         };
-        let (producer, _consumer) = ingress_ring(1);
+        let (producer, _consumer) = ingress_ring(1, metrics());
         let (_tm_tx, tm_rx) = flume::unbounded();
         let (sd_tx, sd_rx) = flume::unbounded::<()>();
         std::mem::forget(sd_tx);
-        let ingress = Ingress::new(tm_rx, abort_rx, senders, producer, test_limits(), sd_rx);
+        let ingress = Ingress::new(
+            tm_rx,
+            abort_rx,
+            senders,
+            producer,
+            test_limits(),
+            metrics(),
+            sd_rx,
+        );
 
         ingress.on_abort(AbortSource::Guard("pushed".into()));
         ingress.on_abort(AbortSource::Guard("dropped".into()));
@@ -975,7 +1049,7 @@ mod tests {
         // Both deregisters land regardless of whether the ring accepted the push.
         for expected in ["pushed", "dropped"] {
             assert!(
-                matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == expected),
+                matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid, .. }) if rid.as_str() == expected),
                 "{expected}: the detok entry must be dropped even when the ring is full",
             );
         }
@@ -1049,7 +1123,7 @@ mod tests {
             "expected Register for rid 7",
         );
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "7"),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid, .. }) if rid.as_str() == "7"),
             "expected Deregister for rid 7 (leak fix)",
         );
         assert!(
@@ -1137,7 +1211,7 @@ mod tests {
         ingress.run();
 
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "11"),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid, .. }) if rid.as_str() == "11"),
             "tokenize failure must deregister rid 11",
         );
         assert!(detok_rx.try_recv().is_err(), "no further shard messages");
@@ -1156,7 +1230,7 @@ mod tests {
         ingress.run();
 
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "rid-13"),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid, .. }) if rid.as_str() == "rid-13"),
             "abort must deregister by rid",
         );
         assert!(detok_rx.try_recv().is_err(), "no further shard messages");
@@ -1202,7 +1276,7 @@ mod tests {
             "expected Register for rid 21",
         );
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "21"),
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid, .. }) if rid.as_str() == "21"),
             "pool-gone hand-off must deregister rid 21",
         );
         assert!(detok_rx.try_recv().is_err(), "no further shard messages");

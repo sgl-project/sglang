@@ -30,6 +30,7 @@ use bytes::Bytes;
 
 use crate::fsm::RequestState;
 use crate::ids::Rid;
+use crate::metrics::{RequestKindLabel, TerminalOutcomeLabel};
 
 /// The owned request as it travels ingress stages (single owner, so `state` is
 /// mutated lock-free). Common fields here; variant data in [`RequestKind`].
@@ -65,6 +66,8 @@ pub enum DetokMsg {
         /// Client-visible rid string — kept in `DetokState` so the shard can
         /// emit `TmEvent::Abort(rid)` (the wire needs the string, not the hash).
         rid: Rid,
+        /// Low-cardinality request kind, used only for metrics.
+        kind: RequestKindLabel,
         sink: EgressSink,
         /// Decode logprob token ids to text here (CPU-bound) not on the api threads.
         decode_logprob_text: bool,
@@ -81,5 +84,8 @@ pub enum DetokMsg {
     /// Drop the `rid -> sink` entry for a request rejected before the scheduler
     /// (the rejecting stage already answered the client); else `Register` leaks one
     /// entry.
-    Deregister { rid: Rid },
+    Deregister {
+        rid: Rid,
+        outcome: Option<TerminalOutcomeLabel>,
+    },
 }

@@ -17,6 +17,7 @@ use super::AppState;
 use super::guard::AbortGuard;
 use super::submit::submit;
 use crate::message::{ControlRequest, EgressItem, GetInternalStateReq, RequestKind};
+use crate::metrics::{InputSourceLabel, RequestKindLabel};
 use crate::runtime::ServerArgs;
 
 /// The routes this module owns, mounted by `api_server::serve`.
@@ -38,6 +39,9 @@ async fn await_control_result(
     state: &AppState,
     control: ControlRequest,
 ) -> Result<bytes::Bytes, Response> {
+    state
+        .metrics
+        .request_received(RequestKindLabel::Control, InputSourceLabel::Control, false);
     let (rid, mut rx) = submit(state, RequestKind::Control(Box::new(control)), false).await?;
     // Control requests register a detok entry like any other, and only
     // `handle_result` removes it — so a request that never produces one (a stalled

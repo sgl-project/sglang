@@ -7,6 +7,7 @@ mod common;
 mod frame;
 mod guard;
 mod log;
+mod metrics_endpoint;
 mod native_api;
 mod openai;
 mod submit;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 
 use axum::Router;
 
+use crate::metrics::MetricsState;
 use crate::runtime::ServerArgs;
 use crate::tokenizer_manager::ActivityCounter;
 use crate::tokenizer_manager::Senders;
@@ -26,6 +28,7 @@ struct AppState {
     senders: Senders,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
+    metrics: Arc<MetricsState>,
     /// Egress heartbeat (bumped per drained ring frame).
     egress_activity: ActivityCounter,
 }
@@ -36,6 +39,7 @@ pub async fn serve(
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
     egress_activity: ActivityCounter,
+    metrics: Arc<MetricsState>,
     // The SAME set ingress releases from — see `Ingress::on_abort`. Constructing a
     // local one here would leave the api server admitting rids that nothing ever
     // releases.
@@ -45,13 +49,18 @@ pub async fn serve(
         senders,
         egress_buf,
         server_args: server_args.clone(),
+        metrics: metrics.clone(),
         egress_activity,
     };
     // Each endpoint module registers its own routes and merges here.
-    let app = Router::new()
+    let mut app = Router::new()
         .merge(common::routes())
         .merge(native_api::routes())
-        .merge(openai::routes())
+        .merge(openai::routes());
+    if server_args.enable_metrics {
+        app = app.merge(metrics_endpoint::routes());
+    }
+    let app = app
         // TODO(auth): no API-key boundary yet. Python gates every route (except
         // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,
         // a configured `api_key` does NOT protect these routes.
@@ -59,6 +68,11 @@ pub async fn serve(
         // No body limit, matching the Python server.
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state);
+    let app = if server_args.enable_metrics {
+        metrics_endpoint::apply_http_metrics(app, metrics)
+    } else {
+        app
+    };
     let app = log::apply(app, &server_args);
 
     // The listener was already bound synchronously in `runtime::start` (so a port

@@ -22,12 +22,14 @@
 //!   ChunkEvent{finish:Some}  -> step ids -> delta -> final frame
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::Error;
 use crate::fsm::{Event, RequestState};
 use crate::ids::Rid;
 use crate::message::DetokMsg;
 use crate::message::{ChunkEvent, EgressItem, EgressSink, Matched, SinkError, TokenIds};
+use crate::metrics::{MetricsState, RequestKindLabel, RequestStageLabel, TerminalOutcomeLabel};
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::AbortSource;
 
@@ -112,6 +114,7 @@ impl DetokenizerBackend {
 
 struct DetokState {
     sink: EgressSink,
+    kind: RequestKindLabel,
     /// `return_text_in_logprobs`: whether to decode this request's logprob token
     /// ids to text (in this shard) for the `[logprob, token_id, text]` tuples.
     decode_logprob_text: bool,
@@ -141,6 +144,7 @@ pub struct DetokenizerWorker {
     /// Unbounded abort lane, used to abort a request the shard had to drop
     /// (client backpressure) so the scheduler stops generating for it.
     abort: flume::Sender<AbortSource>,
+    metrics: Arc<MetricsState>,
 }
 
 impl DetokenizerWorker {
@@ -149,12 +153,14 @@ impl DetokenizerWorker {
         rx: flume::Receiver<DetokMsg>,
         backend: DetokenizerBackend,
         abort: flume::Sender<AbortSource>,
+        metrics: Arc<MetricsState>,
     ) -> Self {
         Self {
             shard,
             rx,
             backend,
             abort,
+            metrics,
         }
     }
 }
@@ -172,34 +178,46 @@ impl Runnable for DetokenizerWorker {
             match msg {
                 DetokMsg::Register {
                     rid,
+                    kind,
                     sink,
                     decode_logprob_text,
                     no_stop_trim,
                 } => {
-                    table.insert(
+                    if let Some(old) = table.insert(
                         rid.clone(),
                         DetokState {
                             sink,
+                            kind,
                             decode_logprob_text,
                             no_stop_trim,
                             decoder: self.backend.new_decoder(),
                             // Registered == handed to the scheduler == Queued.
                             fsm: RequestState::Queued,
                         },
-                    );
+                    ) {
+                        self.metrics.inflight_dec(old.kind);
+                    }
+                    self.metrics.inflight_inc(kind);
                 }
                 // One decode step's chunks for this shard, batched by tm-egress.
                 DetokMsg::Chunks(evs) => {
                     for ev in evs {
-                        handle_chunk(&mut table, ev, &self.backend, &self.abort);
+                        handle_chunk(&mut table, ev, &self.backend, &self.abort, &self.metrics);
                     }
                 }
-                DetokMsg::Result { rid, payload } => handle_result(&mut table, &rid, payload),
-                DetokMsg::Fail { rid, message } => {
-                    handle_fail(&mut table, &rid, message, &self.abort)
+                DetokMsg::Result { rid, payload } => {
+                    handle_result(&mut table, &rid, payload, &self.metrics)
                 }
-                DetokMsg::Deregister { rid } => {
-                    table.remove(&rid);
+                DetokMsg::Fail { rid, message } => {
+                    handle_fail(&mut table, &rid, message, &self.abort, &self.metrics)
+                }
+                DetokMsg::Deregister { rid, outcome } => {
+                    if let Some(st) = table.remove(&rid) {
+                        self.metrics.inflight_dec(st.kind);
+                        if let Some(outcome) = outcome {
+                            self.metrics.request_terminal(st.kind, outcome);
+                        }
+                    }
                 }
             }
         }
@@ -208,12 +226,19 @@ impl Runnable for DetokenizerWorker {
 
 /// Control-request result: deliver the JSON payload to the sink verbatim as a
 /// single `Done` frame — no detokenization, no streaming.
-fn handle_result(table: &mut HashMap<Rid, DetokState>, rid: &Rid, payload: bytes::Bytes) {
+fn handle_result(
+    table: &mut HashMap<Rid, DetokState>,
+    rid: &Rid,
+    payload: bytes::Bytes,
+    metrics: &MetricsState,
+) {
     if let Some(mut st) = table.remove(rid) {
         let _ = st.sink.try_send(EgressItem::Control(payload));
         // Egress FSM: a control request goes straight to Completed (no Streaming
         // / Finalizing states — single response, never streamed).
         st.fsm = RequestState::Completed;
+        metrics.inflight_dec(st.kind);
+        metrics.request_terminal(st.kind, TerminalOutcomeLabel::ControlResult);
     }
 }
 
@@ -228,6 +253,7 @@ fn handle_fail(
     rid: &Rid,
     message: String,
     abort: &flume::Sender<AbortSource>,
+    metrics: &MetricsState,
 ) {
     if let Some(mut st) = table.remove(rid) {
         // Abort first: `try_send` on the sink can release the handler, which frees
@@ -237,6 +263,9 @@ fn handle_fail(
             .sink
             .try_send(EgressItem::Error(Error::Internal(message)));
         st.fsm = RequestState::Completed;
+        metrics.inflight_dec(st.kind);
+        metrics.request_error(RequestStageLabel::Egress, 500);
+        metrics.request_terminal(st.kind, TerminalOutcomeLabel::Error);
     }
 }
 
@@ -245,6 +274,7 @@ fn handle_chunk(
     mut ev: ChunkEvent,
     backend: &DetokenizerBackend,
     abort: &flume::Sender<AbortSource>,
+    metrics: &MetricsState,
 ) {
     // Copied once: `ev` is moved into the sink below, but the rid is still
     // needed to look the request up and to remove it.
@@ -290,7 +320,11 @@ fn handle_chunk(
                 let _ = st.fsm.apply(Event::Error(e.clone()));
                 let _ = abort.send(AbortSource::Detok(rid.clone()));
                 let _ = st.sink.try_send(EgressItem::Error(e));
+                let kind = st.kind;
                 table.remove(&rid);
+                metrics.inflight_dec(kind);
+                metrics.request_error(RequestStageLabel::Detokenize, 500);
+                metrics.request_terminal(kind, TerminalOutcomeLabel::Error);
                 return;
             }
         },
@@ -332,7 +366,17 @@ fn handle_chunk(
         } else {
             Event::Disconnect
         });
+        let kind = st.kind;
         table.remove(&rid);
+        metrics.inflight_dec(kind);
+        metrics.request_terminal(
+            kind,
+            if sent {
+                TerminalOutcomeLabel::Success
+            } else {
+                TerminalOutcomeLabel::Disconnect
+            },
+        );
     } else {
         // Every intermediate chunk emits its delta frame. A failed send means the
         // client can't receive it — `Closed` (gone) or `Full` (backpressure: not
@@ -363,7 +407,16 @@ fn handle_chunk(
             if matches!(e, SinkError::Full) {
                 let _ = abort.send(AbortSource::Detok(rid.clone()));
             }
+            let kind = st.kind;
             table.remove(&rid);
+            metrics.inflight_dec(kind);
+            metrics.request_terminal(
+                kind,
+                match e {
+                    SinkError::Full => TerminalOutcomeLabel::ClientBackpressure,
+                    SinkError::Closed => TerminalOutcomeLabel::Disconnect,
+                },
+            );
         }
     }
 }
@@ -394,7 +447,75 @@ fn trim_stop_str(text: &mut String, stop: &str, no_stop_trim: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
+
+    fn metrics() -> Arc<MetricsState> {
+        Arc::new(MetricsState::new())
+    }
+
+    fn eventually(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if predicate() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(predicate(), "condition was not met before timeout");
+    }
+
+    fn state(tx: mpsc::Sender<EgressItem>) -> DetokState {
+        DetokState {
+            sink: EgressSink::Local(tx),
+            kind: RequestKindLabel::Generate,
+            decode_logprob_text: false,
+            no_stop_trim: false,
+            decoder: None,
+            fsm: RequestState::Queued,
+        }
+    }
+
+    #[test]
+    fn register_and_deregister_keep_inflight_exact() {
+        let (detok_tx, detok_rx) = flume::unbounded::<DetokMsg>();
+        let (abort_tx, _abort_rx) = flume::unbounded::<AbortSource>();
+        let metrics = metrics();
+        let worker = DetokenizerWorker::new(
+            0,
+            detok_rx,
+            DetokenizerBackend::Skip,
+            abort_tx,
+            metrics.clone(),
+        );
+        let handle = std::thread::spawn(move || worker.run());
+        let (sink_tx, _sink_rx) = mpsc::channel::<EgressItem>(1);
+
+        detok_tx
+            .send(DetokMsg::Register {
+                rid: Rid::from("1"),
+                kind: RequestKindLabel::Generate,
+                sink: EgressSink::Local(sink_tx),
+                decode_logprob_text: false,
+                no_stop_trim: false,
+            })
+            .unwrap();
+        eventually(|| metrics.inflight_requests(RequestKindLabel::Generate) == 1);
+
+        detok_tx
+            .send(DetokMsg::Deregister {
+                rid: Rid::from("1"),
+                outcome: Some(TerminalOutcomeLabel::Success),
+            })
+            .unwrap();
+        eventually(|| {
+            metrics.inflight_requests(RequestKindLabel::Generate) == 0
+                && metrics.terminal_total(RequestKindLabel::Generate, TerminalOutcomeLabel::Success)
+                    == 1
+        });
+        drop(detok_tx);
+        handle.join().unwrap();
+    }
 
     /// A non-terminal chunk that can't be delivered (sink full → client
     /// backpressure) drops the request AND aborts scheduler work — it does not
@@ -407,24 +528,17 @@ mod tests {
             .unwrap();
 
         let mut table = HashMap::new();
-        table.insert(
-            Rid::from("1"),
-            DetokState {
-                sink: EgressSink::Local(tx),
-                decode_logprob_text: false,
-                no_stop_trim: false,
-                decoder: None,
-                fsm: RequestState::Queued,
-            },
-        );
+        table.insert(Rid::from("1"), state(tx));
 
         let (tm_tx, tm_rx) = flume::unbounded::<AbortSource>();
+        let metrics = metrics();
         let ev = ChunkEvent {
             rid: Rid::from("1"),
             token_ids: vec![5],
             ..Default::default() // finish_reason None → non-terminal
         };
-        handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx);
+        metrics.inflight_inc(RequestKindLabel::Generate);
+        handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx, &metrics);
 
         // Request removed (no lingering state to be mistaken for success)...
         assert!(!table.contains_key(&Rid::from("1")));
@@ -433,6 +547,14 @@ mod tests {
             tm_rx.try_recv(),
             Ok(AbortSource::Detok(rid)) if rid == Rid::from("1")
         ));
+        assert_eq!(metrics.inflight_requests(RequestKindLabel::Generate), 0);
+        assert_eq!(
+            metrics.terminal_total(
+                RequestKindLabel::Generate,
+                TerminalOutcomeLabel::ClientBackpressure
+            ),
+            1
+        );
     }
 
     /// `trim_stop_str` reproduces the base's stop-string semantics: `stop: "3"` on
@@ -474,16 +596,10 @@ mod tests {
         let (tx_a, mut rx_a) = mpsc::channel::<EgressItem>(4);
         let (tx_b, mut rx_b) = mpsc::channel::<EgressItem>(4);
         let mut table = HashMap::new();
-        let state = |tx| DetokState {
-            sink: EgressSink::Local(tx),
-            decode_logprob_text: false,
-            no_stop_trim: false,
-            decoder: None,
-            fsm: RequestState::Queued,
-        };
         table.insert(Rid::from("alice"), state(tx_a));
         table.insert(Rid::from("bob"), state(tx_b));
         let (tm_tx, _tm_rx) = flume::unbounded::<AbortSource>();
+        let metrics = metrics();
 
         let chunk = |rid: &str, id: i32| ChunkEvent {
             rid: Rid::from(rid.to_string()),
@@ -495,12 +611,14 @@ mod tests {
             chunk("alice", 11),
             &DetokenizerBackend::Skip,
             &tm_tx,
+            &metrics,
         );
         handle_chunk(
             &mut table,
             chunk("bob", 22),
             &DetokenizerBackend::Skip,
             &tm_tx,
+            &metrics,
         );
 
         let ids = |rx: &mut mpsc::Receiver<EgressItem>| match rx.try_recv() {
@@ -532,14 +650,12 @@ mod tests {
         table.insert(
             Rid::from("1"),
             DetokState {
-                sink: EgressSink::Local(tx),
-                decode_logprob_text: false,
                 no_stop_trim,
-                decoder: None, // skip mode → output_ids passthrough
-                fsm: RequestState::Queued,
+                ..state(tx)
             },
         );
         let (tm_tx, _tm_rx) = flume::unbounded::<AbortSource>();
+        let metrics = metrics();
         let ev = ChunkEvent {
             rid: Rid::from("1"),
             token_ids: ids,
@@ -550,7 +666,7 @@ mod tests {
             ),
             ..Default::default()
         };
-        handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx);
+        handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx, &metrics);
         match rx.try_recv() {
             Ok(EgressItem::Done(out)) => out,
             other => panic!("expected Done, got {other:?}"),

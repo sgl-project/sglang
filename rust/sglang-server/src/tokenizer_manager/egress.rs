@@ -18,6 +18,7 @@ use crate::message::DetokMsg;
 use crate::message::{
     ChunkEvent, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, for_each_chunk,
 };
+use crate::metrics::{EgressFrameLabel, MetricsState, RequestStageLabel};
 use crate::ring::EgressConsumer;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::{Senders, recv};
@@ -34,6 +35,7 @@ pub struct Egress {
     egress: EgressConsumer,
     senders: Senders,
     activity: ActivityCounter,
+    metrics: Arc<MetricsState>,
     shutdown: flume::Receiver<()>,
 }
 
@@ -42,12 +44,14 @@ impl Egress {
         egress: EgressConsumer,
         senders: Senders,
         activity: ActivityCounter,
+        metrics: Arc<MetricsState>,
         shutdown: flume::Receiver<()>,
     ) -> Self {
         Self {
             egress,
             senders,
             activity,
+            metrics,
             shutdown,
         }
     }
@@ -60,13 +64,16 @@ impl Runnable for Egress {
         let mut buckets: Vec<Vec<ChunkEvent>> = (0..shards).map(|_| Vec::new()).collect();
 
         while let Some(bytes) = recv(self.egress.receiver(), &self.shutdown) {
+            self.metrics.egress_depth_dec(1);
             let Some((&tag, body)) = bytes.split_first() else {
+                self.metrics.egress_frame(EgressFrameLabel::Unknown);
                 continue;
             };
             match tag {
                 // A whole decode batch: bucket each request by the shard owning its
                 // rid, then hand each shard its chunks in one send.
                 EGRESS_TAG_BATCH => {
+                    self.metrics.egress_frame(EgressFrameLabel::Batch);
                     for b in buckets.iter_mut() {
                         b.clear();
                     }
@@ -82,6 +89,7 @@ impl Runnable for Egress {
                     // logprobs — the corruption the decoder's bounds checks exist to
                     // prevent. Better a lost frame than a silently wrong one.
                     if !decoded.ok {
+                        self.metrics.egress_frame(EgressFrameLabel::BadBatch);
                         // Dropping the frame keeps wrong data off the wire, but a
                         // request whose chunk was in it would otherwise wait forever:
                         // mid-stream it gets a hole, and if its FINAL chunk was here
@@ -126,6 +134,7 @@ impl Runnable for Egress {
                         }
                         let chunks = DetokMsg::Chunks(std::mem::take(b));
                         if self.senders.detok[i].send(chunks).is_err() {
+                            self.metrics.request_error(RequestStageLabel::Egress, 500);
                             tracing::error!("egress: detok shard closed");
                         }
                     }
@@ -133,16 +142,25 @@ impl Runnable for Egress {
                     self.activity.fetch_add(1, Ordering::Relaxed);
                 }
                 EGRESS_TAG_RESULT => {
+                    self.metrics.egress_frame(EgressFrameLabel::Result);
                     if let Some((rid, msg)) = decode_result(body) {
                         self.route(&rid, msg);
+                    } else {
+                        self.metrics.egress_frame(EgressFrameLabel::Unknown);
                     }
                 }
                 EGRESS_TAG_ERROR => {
+                    self.metrics.egress_frame(EgressFrameLabel::Error);
                     if let Some((rid, msg)) = decode_error(body) {
                         self.route(&rid, msg);
+                    } else {
+                        self.metrics.egress_frame(EgressFrameLabel::Unknown);
                     }
                 }
-                other => tracing::warn!(tag = other, "egress: unknown frame tag"),
+                other => {
+                    self.metrics.egress_frame(EgressFrameLabel::Unknown);
+                    tracing::warn!(tag = other, "egress: unknown frame tag");
+                }
             }
         }
     }
@@ -154,6 +172,7 @@ impl Egress {
     #[inline]
     fn route(&self, rid: &Rid, msg: DetokMsg) {
         if self.senders.detok_for(rid).send(msg).is_err() {
+            self.metrics.request_error(RequestStageLabel::Egress, 500);
             tracing::error!("egress: detok shard closed");
         }
     }

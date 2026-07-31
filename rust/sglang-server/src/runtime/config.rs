@@ -83,6 +83,9 @@ pub struct ServerArgs {
     pub log_level: String,
     #[serde(default)]
     pub log_level_http: Option<String>,
+    /// Enable the Rust `/metrics` endpoint and frontend metrics exposition.
+    #[serde(default)]
+    pub enable_metrics: bool,
     /// Pinned tokenizer threads / detok shards (Python asserts both ≥ 1).
     #[serde(default = "default_worker_num")]
     pub tokenizer_worker_num: usize,

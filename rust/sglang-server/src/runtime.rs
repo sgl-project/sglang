@@ -22,6 +22,7 @@ mod threads;
 pub use config::{RuntimeConfig, RustServerServerArgs, ServerArgs};
 
 use crate::message::DetokMsg;
+use crate::metrics::{MetricsState, RingLabel, ThreadPoolLabel};
 use crate::ring::{
     EgressConsumer, EgressProducer, IngressConsumer, IngressProducer, egress_ring, ingress_ring,
 };
@@ -37,6 +38,7 @@ pub use runnable::Runnable;
 pub struct Runtime {
     pub ingress: IngressConsumer,
     pub egress: EgressProducer,
+    pub metrics: Arc<MetricsState>,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
@@ -103,12 +105,32 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
     let plan = plan_cores(&cfg);
+    let metrics = Arc::new(MetricsState::new());
+    metrics.set_ring_capacity(
+        RingLabel::Ingress,
+        cfg.rust_server_args.ingress_ring_cap as u64,
+    );
+    metrics.set_ring_capacity(
+        RingLabel::Egress,
+        cfg.rust_server_args.egress_ring_cap as u64,
+    );
+    metrics.set_ring_capacity(RingLabel::Channel, cfg.rust_server_args.channel_cap as u64);
+    metrics.set_threads(
+        ThreadPoolLabel::Api,
+        cfg.rust_server_args.api_worker_num as u64,
+    );
+    metrics.set_threads(
+        ThreadPoolLabel::Detokenizer,
+        cfg.server_args.detokenizer_worker_num as u64,
+    );
+    metrics.set_threads(ThreadPoolLabel::TmIngress, 1);
+    metrics.set_threads(ThreadPoolLabel::TmEgress, 1);
 
     // --- rings (Rust ↔ Python) ---
     let (ingress_tx, ingress_rx): (IngressProducer, IngressConsumer) =
-        ingress_ring(cfg.rust_server_args.ingress_ring_cap);
+        ingress_ring(cfg.rust_server_args.ingress_ring_cap, metrics.clone());
     let (egress_tx, egress_rx): (EgressProducer, EgressConsumer) =
-        egress_ring(cfg.rust_server_args.egress_ring_cap);
+        egress_ring(cfg.rust_server_args.egress_ring_cap, metrics.clone());
 
     // --- inter-stage channels ---
     let (tm_tx, tm_rx) = flume::bounded::<TmEvent>(cfg.rust_server_args.channel_cap);
@@ -147,6 +169,14 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         cfg.server_args.revision.as_deref(),
         skip_tokenizer_init,
     )?;
+    metrics.set_threads(
+        ThreadPoolLabel::Tokenizer,
+        if dyn_tokenizer.is_some() {
+            cfg.server_args.tokenizer_worker_num as u64
+        } else {
+            0
+        },
+    );
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
@@ -162,12 +192,14 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         // owned `detok_rx` Vec is moved out element-by-element via the iterator.
         let count = detok_rx.len();
         let mut rxs = detok_rx.into_iter();
+        let metrics = metrics.clone();
         spawn_pool("detokenizer", detok_cores, count, &mut threads, |i| {
             detokenizer::DetokenizerWorker::new(
                 i,
                 rxs.next().unwrap(),
                 backend.clone(),
                 abort_tx.clone(),
+                metrics.clone(),
             )
         });
     }
@@ -206,12 +238,14 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .map(|c| vec![c]);
         let mut egress_rx = Some(egress_rx); // moved into the single worker
         let activity = egress_activity.clone();
+        let metrics = metrics.clone();
         let shutdown_rx = shutdown_rx.clone();
         spawn_pool("tm-egress", cores, 1, &mut threads, |_| {
             tokenizer_manager::Egress::new(
                 egress_rx.take().unwrap(),
                 senders.clone(),
                 activity.clone(),
+                metrics.clone(),
                 shutdown_rx.clone(),
             )
         });
@@ -228,6 +262,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let limits = tokenizer_manager::Limits::try_from(&*cfg.server_args)
             .map_err(|e| format!("ingress limits: {e}"))?;
         let mut parts = Some((tm_rx, ingress_tx)); // moved into the single worker
+        let metrics = metrics.clone();
         let shutdown_rx = shutdown_rx.clone();
         spawn_pool("tm-ingress", cores, 1, &mut threads, |_| {
             let (tm_rx, ingress_tx) = parts.take().unwrap();
@@ -237,6 +272,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 senders.clone(),
                 ingress_tx,
                 limits.clone(),
+                metrics.clone(),
                 shutdown_rx.clone(),
             )
         });
@@ -248,6 +284,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let senders = senders.clone();
         let api_activity = egress_activity.clone();
+        let api_metrics = metrics.clone();
         let shutdown_rx = shutdown_rx.clone();
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
@@ -273,6 +310,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     cfg.server_args.clone(),
                     // Egress heartbeat watched by `/health_generate`.
                     api_activity,
+                    api_metrics,
                     shutdown_rx,
                 ))
             })
@@ -283,6 +321,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     Ok(Runtime {
         ingress: ingress_rx,
         egress: egress_tx,
+        metrics,
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
     })

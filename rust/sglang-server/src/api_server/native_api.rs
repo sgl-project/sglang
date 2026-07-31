@@ -30,8 +30,10 @@ use super::frame::{
 use super::guard::AbortGuard;
 use super::submit::{pre_submit_error, submit};
 use crate::environ::env_bool;
+use crate::ids::HEALTH_CHECK_RID_PREFIX;
 use crate::ids::Rid;
 use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams};
+use crate::metrics::{InputSourceLabel, RequestKindLabel, RequestStageLabel};
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
@@ -93,6 +95,11 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
         stream: false,
         ..Default::default()
     };
+    state.metrics.request_received(
+        RequestKindLabel::HealthGenerate,
+        InputSourceLabel::InputIds,
+        false,
+    );
     let (rid, _keepalive) =
         match submit(&state, RequestKind::Generate(Box::new(probe)), false).await {
             // Hold the receiver so the probe's sink stays open until it completes.
@@ -138,6 +145,7 @@ async fn generate(
         // can only answer unary — as Python's does (FastAPI rejects before its
         // handler runs).
         Err(rejection) => {
+            state.metrics.request_error(RequestStageLabel::Parse, 400);
             return pre_submit_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
         }
     };
@@ -149,9 +157,19 @@ async fn generate(
         // The error carries its own status (a bad batch is `Validation` → 400).
         Err(e) => {
             let code = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::BAD_REQUEST);
+            state
+                .metrics
+                .request_error(RequestStageLabel::Validate, code.as_u16());
             return pre_submit_error(code, &e.to_string(), stream);
         }
     };
+    for payload in &payloads {
+        state.metrics.request_received(
+            request_kind_label(payload),
+            input_source_label(payload),
+            stream,
+        );
+    }
     if !is_batch {
         // `into_requests` guarantees exactly one payload for a non-batch body.
         let payload = payloads
@@ -161,6 +179,22 @@ async fn generate(
         generate_single(&state, payload, stream).await
     } else {
         generate_batch(&state, payloads, stream).await
+    }
+}
+
+fn request_kind_label(req: &GenerateRequest) -> RequestKindLabel {
+    if req.rid.as_str().starts_with(HEALTH_CHECK_RID_PREFIX) {
+        RequestKindLabel::HealthGenerate
+    } else {
+        RequestKindLabel::Generate
+    }
+}
+
+fn input_source_label(req: &GenerateRequest) -> InputSourceLabel {
+    if req.already_tokenized() {
+        InputSourceLabel::InputIds
+    } else {
+        InputSourceLabel::Text
     }
 }
 

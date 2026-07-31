@@ -10,12 +10,13 @@
 //! ever push/drain raw `Bytes` — neither side touches a `PyObject` off-thread,
 //! so the producer threads never need the GIL.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 
 use crate::message::IngressMsg;
+use crate::metrics::MetricsState;
 
 /// Ingress: TokenizerManager → scheduler `recv_requests`.
 /// Producers are Rust TM workers; the single consumer is the Python thread.
@@ -24,10 +25,12 @@ use crate::message::IngressMsg;
 #[derive(Clone)]
 pub struct IngressProducer {
     tx: flume::Sender<IngressMsg>,
+    metrics: Arc<MetricsState>,
 }
 
 pub struct IngressConsumer {
     rx: flume::Receiver<IngressMsg>,
+    metrics: Arc<MetricsState>,
     /// One-slot buffer holding a message consumed by a blocking [`wait`] so the
     /// scheduler can park on idle without losing it — the next [`drain`] returns
     /// it first. Only ever touched by the single consumer (the Python thread),
@@ -60,7 +63,11 @@ impl IngressProducer {
     /// caller can fail the request rather than block a worker thread.
     #[inline]
     pub fn try_push(&self, msg: IngressMsg) -> bool {
-        self.tx.try_send(msg).is_ok()
+        let ok = self.tx.try_send(msg).is_ok();
+        if ok {
+            self.metrics.ingress_depth_inc();
+        }
+        ok
     }
 }
 
@@ -81,7 +88,10 @@ impl IngressConsumer {
         }
         while batch.headers.len() < max {
             match self.rx.try_recv() {
-                Ok(m) => push_msg(&mut batch, m),
+                Ok(m) => {
+                    self.metrics.ingress_depth_dec(1);
+                    push_msg(&mut batch, m);
+                }
                 Err(_) => break, // Empty or Disconnected -> stop now
             }
         }
@@ -100,6 +110,7 @@ impl IngressConsumer {
         }
         match self.rx.recv_timeout(timeout) {
             Ok(m) => {
+                self.metrics.ingress_depth_dec(1);
                 *self.stash.lock().unwrap() = Some(m);
                 true
             }
@@ -122,6 +133,7 @@ fn push_msg(batch: &mut IngressColumns, m: IngressMsg) {
 #[derive(Clone)]
 pub struct EgressProducer {
     tx: flume::Sender<Bytes>,
+    metrics: Arc<MetricsState>,
 }
 
 pub struct EgressConsumer {
@@ -136,7 +148,11 @@ impl EgressProducer {
     /// `false` only when the consumer is gone (runtime shutdown), where the frame
     /// is unavoidably lost.
     pub fn push(&self, msg: Bytes) -> bool {
-        self.tx.send(msg).is_ok()
+        let ok = self.tx.send(msg).is_ok();
+        if ok {
+            self.metrics.egress_depth_inc();
+        }
+        ok
     }
 
     /// Non-blocking push, so the pyo3 boundary can try to hand the frame over
@@ -151,7 +167,10 @@ impl EgressProducer {
     #[inline]
     pub fn try_push(&self, msg: Bytes) -> Result<(), Option<Bytes>> {
         match self.tx.try_send(msg) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.metrics.egress_depth_inc();
+                Ok(())
+            }
             Err(flume::TrySendError::Full(msg)) => Err(Some(msg)),
             Err(flume::TrySendError::Disconnected(_)) => Err(None),
         }
@@ -167,25 +186,34 @@ impl EgressConsumer {
 }
 
 /// Build both halves of a bounded ring.
-pub fn ingress_ring(cap: usize) -> (IngressProducer, IngressConsumer) {
+pub fn ingress_ring(cap: usize, metrics: Arc<MetricsState>) -> (IngressProducer, IngressConsumer) {
     let (tx, rx) = flume::bounded(cap);
     (
-        IngressProducer { tx },
+        IngressProducer {
+            tx,
+            metrics: metrics.clone(),
+        },
         IngressConsumer {
             rx,
+            metrics,
             stash: Mutex::new(None),
         },
     )
 }
 
-pub fn egress_ring(cap: usize) -> (EgressProducer, EgressConsumer) {
+pub fn egress_ring(cap: usize, metrics: Arc<MetricsState>) -> (EgressProducer, EgressConsumer) {
     let (tx, rx) = flume::bounded(cap);
-    (EgressProducer { tx }, EgressConsumer { rx })
+    (EgressProducer { tx, metrics }, EgressConsumer { rx })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::MetricsState;
+
+    fn metrics() -> Arc<MetricsState> {
+        Arc::new(MetricsState::new())
+    }
 
     fn msg(h: &'static [u8]) -> IngressMsg {
         IngressMsg {
@@ -198,12 +226,15 @@ mod tests {
     /// non-destructively, and the next `drain` returns it.
     #[test]
     fn wait_stashes_then_drain_returns_it() {
-        let (tx, rx) = ingress_ring(8);
+        let metrics = metrics();
+        let (tx, rx) = ingress_ring(8, metrics.clone());
         // Empty ring → times out, nothing stashed.
         assert!(!rx.wait(Duration::from_millis(1)));
         // Push one, then wait stashes it (returns true).
         assert!(tx.try_push(msg(b"a")));
+        assert_eq!(metrics.ingress_depth(), 1);
         assert!(rx.wait(Duration::from_millis(200)));
+        assert_eq!(metrics.ingress_depth(), 0);
         // Idempotent: already stashed, returns true without touching the ring.
         assert!(rx.wait(Duration::from_millis(1)));
         // Drain yields the stashed message, then the ring is empty.
@@ -214,7 +245,7 @@ mod tests {
     /// A blocked `wait` is woken the instant a producer pushes (no polling).
     #[test]
     fn wait_wakes_on_push() {
-        let (tx, rx) = ingress_ring(8);
+        let (tx, rx) = ingress_ring(8, metrics());
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             let _ = tx.try_push(msg(b"a"));
@@ -229,22 +260,28 @@ mod tests {
     /// committed frame is delivered in order, never dropped.
     #[test]
     fn egress_push_blocks_until_drained() {
-        let (tx, rx) = egress_ring(1);
+        let metrics = metrics();
+        let (tx, rx) = egress_ring(1, metrics.clone());
         assert!(tx.push(Bytes::from_static(b"a"))); // fits; ring now full
+        assert_eq!(metrics.egress_depth(), 1);
         let t = std::thread::spawn(move || tx.push(Bytes::from_static(b"b")));
         // The parked push can't have completed while the ring is full.
         std::thread::sleep(Duration::from_millis(20));
         // Drain one → frees a slot → the parked push lands.
         assert_eq!(rx.receiver().recv().unwrap(), Bytes::from_static(b"a"));
+        metrics.egress_depth_dec(1);
         assert!(t.join().unwrap(), "push should succeed once space frees");
+        assert_eq!(metrics.egress_depth(), 1);
         assert_eq!(rx.receiver().recv().unwrap(), Bytes::from_static(b"b"));
+        metrics.egress_depth_dec(1);
+        assert_eq!(metrics.egress_depth(), 0);
     }
 
     /// A closed ring (consumer gone → shutdown) returns `false` instead of
     /// parking forever, so a scheduler blocked in `push` unblocks on teardown.
     #[test]
     fn egress_push_returns_false_when_closed() {
-        let (tx, rx) = egress_ring(1);
+        let (tx, rx) = egress_ring(1, metrics());
         drop(rx);
         assert!(!tx.push(Bytes::from_static(b"x")));
     }

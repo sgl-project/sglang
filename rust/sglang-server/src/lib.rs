@@ -17,6 +17,7 @@ mod error;
 mod fsm;
 mod ids;
 mod message;
+mod metrics;
 mod ring;
 mod runtime;
 mod tokenizer;
@@ -185,19 +186,31 @@ impl Server {
     /// committed to. It essentially never fires — measured headroom is ~100×.
     fn push_batch(&self, py: Python<'_>, header: &[u8], data_cols: Vec<PyBackedBytes>) -> bool {
         let cols: Vec<&[u8]> = data_cols.iter().map(|d| d.as_ref()).collect();
-        self.push_frame(py, crate::message::frame_egress_batch_cols(header, &cols))
+        self.push_frame(
+            py,
+            crate::message::frame_egress_batch_cols(header, &cols),
+            crate::metrics::EgressFrameLabel::Batch,
+        )
     }
 
     /// Push a control-request result. Blocks for backpressure; `False` only on
     /// shutdown.
     fn push_result(&self, py: Python<'_>, rid: &str, payload: &[u8]) -> bool {
-        self.push_frame(py, crate::message::frame_egress_result(rid, payload))
+        self.push_frame(
+            py,
+            crate::message::frame_egress_result(rid, payload),
+            crate::metrics::EgressFrameLabel::Result,
+        )
     }
 
     /// Route a terminal failure back to request `rid`. Blocks for backpressure;
     /// `False` only on shutdown.
     fn push_error(&self, py: Python<'_>, rid: &str, message: &str) -> bool {
-        self.push_frame(py, crate::message::frame_egress_error(rid, message))
+        self.push_frame(
+            py,
+            crate::message::frame_egress_error(rid, message),
+            crate::metrics::EgressFrameLabel::Error,
+        )
     }
 
     /// Signal all threads to stop (best effort).
@@ -211,14 +224,29 @@ impl Server {
     /// detaching only to park on a full ring. Shared by every push path — they
     /// differ solely in how the frame is built. `false` only on shutdown.
     #[inline]
-    fn push_frame(&self, py: Python<'_>, frame: bytes::Bytes) -> bool {
+    fn push_frame(
+        &self,
+        py: Python<'_>,
+        frame: bytes::Bytes,
+        frame_label: crate::metrics::EgressFrameLabel,
+    ) -> bool {
         match self.rt.egress.try_push(frame) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.rt.metrics.egress_ring_push(frame_label);
+                true
+            }
             // Consumer gone (shutdown): the frame is unavoidably lost.
             Err(None) => false,
             // Full: the scheduler must block here so backpressure reaches it, and
             // blocking is exactly when releasing the GIL pays for itself.
-            Err(Some(frame)) => py.detach(|| self.rt.egress.push(frame)),
+            Err(Some(frame)) => {
+                self.rt.metrics.egress_ring_backpressure(frame_label);
+                let ok = py.detach(|| self.rt.egress.push(frame));
+                if ok {
+                    self.rt.metrics.egress_ring_push(frame_label);
+                }
+                ok
+            }
         }
     }
 }

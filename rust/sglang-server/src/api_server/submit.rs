@@ -19,6 +19,7 @@ use super::frame::error_value;
 use crate::fsm::RequestState;
 use crate::ids::Rid;
 use crate::message::{EgressItem, EgressSink, Request, RequestKind};
+use crate::metrics::RequestStageLabel;
 use crate::tokenizer_manager::TmEvent;
 
 /// Submit one request; returns the rid, its hashed routing key, and the egress
@@ -58,6 +59,10 @@ pub(super) async fn submit(
         // `SendError` has a single meaning — the channel is disconnected.
         Err(_) => {
             tracing::error!(%rid, "tm inbox closed; request rejected");
+            state.metrics.request_error(
+                RequestStageLabel::Submit,
+                StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            );
             // Return 503 so the client can retry.
             Err(pre_submit_error(
                 StatusCode::SERVICE_UNAVAILABLE,
