@@ -319,10 +319,14 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install \
     && cd ../../../.. \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
+    && case "${GPU_ARCH}" in \
+         *rocm7_15*|*rocm10*) CT_EXTRA="rocm_rock" ;; \
+         *)                   CT_EXTRA="rocm_legacy" ;; \
+       esac \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[srt_hip,diffusion_hip]"; \
+         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[srt_hip,diffusion_hip,${CT_EXTRA}]"; \
        else \
-         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[all_hip]"; \
+         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[all_hip,${CT_EXTRA}]"; \
        fi
 
 RUN python -m pip cache purge
