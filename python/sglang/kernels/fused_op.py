@@ -322,7 +322,8 @@ class BaseFusedOp(ABC):
             self.capabilities.get(backend, frozenset()), _platform()
         )
 
-    def _resolve_backend(self, *args, **kwargs) -> KernelBackend:
+    def resolve_backend(self, *args, **kwargs) -> KernelBackend:
+        """Pick the highest-priority backend eligible for this call."""
         forced = get_fused_op_backend()
         if forced is not None:
             return forced
@@ -331,21 +332,12 @@ class BaseFusedOp(ABC):
                 return backend
         return KernelBackend.TORCH
 
-    def resolve_backend(self, *args, **kwargs) -> KernelBackend:
-        """Public entry point for :meth:`_resolve_backend`.
-
-        Lets callers bind a specific backend once (e.g. to cache
-        ``functools.partial(op.forward, backend=op.resolve_backend())`` for the
-        lifetime of a layer) instead of re-resolving on every ``forward()`` call.
-        """
-        return self._resolve_backend(*args, **kwargs)
-
     # --- dispatch ---
 
     def forward(self, *args, backend: Optional[KernelBackend] = None, **kwargs):
         """Run the op on ``backend``, or on the best eligible one when omitted."""
         if backend is None:
-            backend = self._resolve_backend(*args, **kwargs)
+            backend = self.resolve_backend(*args, **kwargs)
         result = getattr(self, BACKEND_METHODS[backend])(*args, **kwargs)
         if _trace_enabled:
             _trace_records.append(

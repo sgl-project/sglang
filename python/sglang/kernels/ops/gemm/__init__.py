@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partialmethod
 from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
@@ -137,13 +138,9 @@ def dsv3_router_gemm(
 class Nvfp4GemmOp(BaseFusedOp):
     """NVFP4 dense GEMM: one FlashInfer ``mm_fp4`` sub-kernel per backend.
 
-    All four backends share one underlying call (``flashinfer.mm_fp4``) with
-    a different ``backend=`` string; each is still registered as its own
-    :class:`KernelBackend` so callers (e.g. ``--fp4-gemm-backend``) can force
-    one explicitly via ``forward(..., backend=KernelBackend.FLASHINFER_CUTLASS)``.
-    A Marlin weight-only fallback exists but is a structurally different,
-    dequant-based code path selected upstream by the caller, so it is not a
-    backend of this op.
+    All four backends call ``flashinfer.mm_fp4`` with a different ``backend=``
+    string, each registered as its own :class:`KernelBackend` so callers can
+    force one explicitly.
     """
 
     op = "gemm.nvfp4"
@@ -200,17 +197,10 @@ class Nvfp4GemmOp(BaseFusedOp):
             input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
         )
 
-    def forward_flashinfer_cutedsl(self, *args, **kwargs) -> torch.Tensor:
-        return self._call_flashinfer(*args, **kwargs, backend="cute-dsl")
-
-    def forward_flashinfer_cutlass(self, *args, **kwargs) -> torch.Tensor:
-        return self._call_flashinfer(*args, **kwargs, backend="cutlass")
-
-    def forward_flashinfer_trtllm(self, *args, **kwargs) -> torch.Tensor:
-        return self._call_flashinfer(*args, **kwargs, backend="trtllm")
-
-    def forward_flashinfer_cudnn(self, *args, **kwargs) -> torch.Tensor:
-        return self._call_flashinfer(*args, **kwargs, backend="cudnn")
+    forward_flashinfer_cutedsl = partialmethod(_call_flashinfer, backend="cute-dsl")
+    forward_flashinfer_cutlass = partialmethod(_call_flashinfer, backend="cutlass")
+    forward_flashinfer_trtllm = partialmethod(_call_flashinfer, backend="trtllm")
+    forward_flashinfer_cudnn = partialmethod(_call_flashinfer, backend="cudnn")
 
 
 _NVFP4_GEMM = register_fused_op(Nvfp4GemmOp(), __name__, "_NVFP4_GEMM")

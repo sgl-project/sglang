@@ -274,7 +274,7 @@ For block-quantized checkpoints (e.g. DeepSeek-style `weight_block_size`).
 
 #### Per-tensor / per-channel FP8 GEMM
 
-For non-blockwise checkpoints (e.g. most ModelOpt and W8A8 FP8 models). This path supports only the backends below; any other value falls back to `auto`.
+For non-blockwise checkpoints (e.g. most ModelOpt and W8A8 FP8 models). This path supports only the backends below; any other value is rejected at startup.
 
 <table>
   <thead>
