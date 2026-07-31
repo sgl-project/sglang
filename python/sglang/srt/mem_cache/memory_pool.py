@@ -850,21 +850,11 @@ class MambaPool:
         return self.mamba_cache
 
     def mamba2_layer_cache(self, layer_id: int):
-        # The per-layer views are pool-stable (mamba_cache is only bound at
-        # construction), so each layer's State is built once.
-        cached = self._layer_cache_by_id.get(layer_id)
-        if cached is None:
-            cached = self.mamba_cache.at_layer_idx(layer_id)
-            self._layer_cache_by_id[layer_id] = cached
-        return cached
+        return self.mamba_cache.at_layer_idx(layer_id)
 
-    # These properties are pool-stable (conv tensors don't move after allocation)
-    # so they're cached per instance on first use. Defined as cached_property
-    # rather than set in __init__ because UnifiedMambaPool skips super().__init__.
-    @cached_property
-    def _layer_cache_by_id(self) -> dict:
-        return {}
-
+    # Pool-stable (conv tensors don't move after allocation) so cached per instance
+    # on first use. A cached_property rather than set in __init__ because
+    # UnifiedMambaPool skips super().__init__.
     @cached_property
     def _conv_fuse_ok(self) -> bool:
         """Whether clear/copy may use the fused kernel: CUDA bf16 contiguous conv.

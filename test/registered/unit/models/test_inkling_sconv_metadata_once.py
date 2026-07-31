@@ -59,6 +59,7 @@ class _MockReqToTokenPool:
             POOL_SLOTS + 1, dtype=torch.int32, device="cuda"
         )
         self.gather_calls = 0
+        self.layer_cache_calls = 0
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         self.gather_calls += 1
@@ -68,6 +69,7 @@ class _MockReqToTokenPool:
         return mamba_indices
 
     def mamba2_layer_cache(self, layer_id: int):
+        self.layer_cache_calls += 1
         return self.mamba_pool.mamba2_layer_cache(layer_id)
 
     def get_speculative_mamba2_params_all_layers(self):
@@ -179,6 +181,9 @@ class TestInklingSconvMetadataOnce(CustomTestCase):
         self.assertEqual(counts["decode"], 1)
         self.assertEqual(pool.gather_calls, 1)
         self.assertEqual(len(handles), NUM_LAYERS * NUM_MODULES_PER_LAYER)
+        # One pool view per LAYER, not per module: mamba2_layer_cache rebuilds a
+        # State over every conv stream and waits on the HiCache layer transfer.
+        self.assertEqual(pool.layer_cache_calls, NUM_LAYERS)
         first = handles[0]
         for h in handles[1:]:
             self.assertIs(h.cache_indices, first.cache_indices)

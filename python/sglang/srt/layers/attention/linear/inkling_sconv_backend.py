@@ -109,6 +109,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self._query_start_loc: Optional[torch.Tensor] = None
         self._precomputed: Optional[SconvExtendMetadata | SconvDecodeMetadata] = None
         self._track_conv_indices: Optional[torch.Tensor] = None
+        self._layer_caches: dict = {}
 
         self._alloc_graph_buffers()
 
@@ -189,6 +190,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self._query_start_loc = None
         self._precomputed = None
         self._track_conv_indices = None
+        self._layer_caches.clear()
 
     @staticmethod
     def _phase_records_metadata(forward_batch: ForwardBatch) -> bool:
@@ -489,6 +491,20 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             mamba_steps_to_track,
         )
 
+    def _layer_cache(self, layer_id: int):
+        """This layer's pool views, resolved once per step.
+
+        Every ``ShortConvolution`` in a layer asks for the same handle, and
+        ``mamba2_layer_cache`` rebuilds a ``State`` over all conv streams per call
+        (plus a HiCache layer-transfer wait). Hold it for the step so the layer sees
+        one build and one wait, as single-mixer models do.
+        """
+        cached = self._layer_caches.get(layer_id)
+        if cached is None:
+            cached = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+            self._layer_caches[layer_id] = cached
+        return cached
+
     def conv_state_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> InklingShortConvMetadata:
@@ -496,7 +512,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         shares one gather, one fused launch and one track-index build."""
         del forward_batch
         return InklingShortConvMetadata(
-            layer_cache=self.req_to_token_pool.mamba2_layer_cache(layer_id),
+            layer_cache=self._layer_cache(layer_id),
             cache_indices=self._cache_indices,
             query_start_loc=self._query_start_loc,
             has_initial_state=self._has_initial_state,
