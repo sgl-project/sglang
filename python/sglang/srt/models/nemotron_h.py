@@ -261,9 +261,6 @@ class NemotronHMoE(nn.Module):
             self.fc1_latent_proj = None
             self.fc2_latent_proj = None
 
-        # Resolved on first forward, not here: quant methods rewrite
-        # fc1_latent_proj.weight in process_weights_after_loading (e.g. bf16 ->
-        # float8_e4m3fn), so the dtype is not final at construction time.
         self._use_min_latency_fc1_gemm: bool | None = None
 
     def _apply_fc1_latent_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
