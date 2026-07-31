@@ -24,6 +24,7 @@ class StateType(str, enum.Enum):
     SWA_RING = "swa_ring"
     # DeepSeek-V4 online C128 request-scoped state.
     C128_STATE = "c128_state"
+    DSPARK_DRAFT_KV = "dspark_draft_kv"
 
 
 @dataclasses.dataclass
