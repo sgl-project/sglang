@@ -119,6 +119,7 @@ def _make_hybrid_backend(speculative_attention_mode, prefill_mask, decode_mask):
         server_args=SimpleNamespace(
             speculative_attention_mode=speculative_attention_mode
         ),
+        model_config=SimpleNamespace(context_len=_MAX_CONTEXT_LEN),
     )
     return HybridAttnBackend(
         model_runner,
@@ -145,8 +146,6 @@ class TestHybridAttnBackendHandsOutSelectedChildMask(CustomTestCase):
         self.assertIs(backend.verify_mask, prefill_mask)
 
     def test_capacity_check_needs_nothing_from_the_backend(self):
-        """A composite backend carries no max_context_len of its own: fits()
-        reaching back through the backend would raise AttributeError here."""
         backend = _make_hybrid_backend("prefill", _mask(64, is_read=False), None)
 
         self.assertTrue(backend.verify_mask.fits(_MAX_BS, _DRAFT))
