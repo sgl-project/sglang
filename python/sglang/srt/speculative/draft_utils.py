@@ -9,6 +9,21 @@ from sglang.srt.utils.common import (
 )
 
 
+def _assert_draft_needs_no_conv_sidecar(draft_model_runner) -> None:
+    """Refuse a multi-step draft decode backend for a draft with conv layers."""
+    from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
+
+    if isinstance(
+        draft_model_runner.model_config.hf_config,
+        (InklingModelConfig, InklingMMConfig),
+    ):
+        raise NotImplementedError(
+            "Inkling's draft model runs its own short convs, which need the "
+            "conv-state sidecar the multi-step draft decode backend cannot carry. "
+            "Use --enable-multi-layer-eagle."
+        )
+
+
 class DraftBackendFactory:
     def __init__(
         self,
@@ -45,6 +60,14 @@ class DraftBackendFactory:
         # No multi-step draft backend for steps=0 (nospec) or steps=1.
         if self.speculative_num_steps <= 1:
             return None
+
+        # Multi-step decode returns a per-step CONTAINER, not an AttentionBackend,
+        # so attn_backend_wrapper_for_draft_extend cannot add a conv sidecar to it.
+        # A draft whose layers need one would fail deep inside the first inner
+        # forward instead; refuse up front. Reachable only for an Inkling checkpoint
+        # without mtp_local_layer_ids, since a banded MTP head already requires
+        # --enable-multi-layer-eagle (which never builds this backend).
+        _assert_draft_needs_no_conv_sidecar(self.draft_model_runner)
 
         backend_map = {
             "flashinfer": self._create_flashinfer_decode_backend,

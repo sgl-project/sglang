@@ -289,6 +289,12 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             # One launch: gather straight into the graph-static buffer. The base's
             # gather-then-copy would add a second recorded kernel per step for
             # nothing -- the pool's table already has this buffer's dtype.
+            #
+            # No PAD sentinel for the padded tail, unlike the generic mamba
+            # backend: a graph runner zero-fills padded req_pool_indices, and
+            # MambaSlotAllocator.clear reserves slot 0 as the dummy write target
+            # (live requests start at 1), so the mapping already sends padded rows
+            # there. Poisoning would only add a fill_ per padded step.
             torch.index_select(
                 self.req_to_token_pool.req_index_to_mamba_index_mapping,
                 0,
