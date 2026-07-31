@@ -46,6 +46,11 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_xpu,
+    is_npu,
+    is_npu_before_atlas_a5,
+    is_sm90_supported,
+    is_sm100_supported,
+    is_sm120_supported,
     offloader,
 )
 from sglang.srt.utils.common import torch_release
@@ -60,6 +65,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
+_is_npu = is_npu()
 
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
@@ -782,7 +788,8 @@ def _dispatch_auto_backend() -> Callable:
     # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
     # 3. CUTLASS (if SM120 GPU and CUDA 12.8+)
     # 4. AITER (if AMD GPU with AITER enabled)
-    # 5. Triton (fallback)
+    # 5. NPU (Ascend)
+    # 6. Triton (fallback)
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
@@ -792,6 +799,16 @@ def _dispatch_auto_backend() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
+    elif _is_npu and not is_npu_before_atlas_a5():
+        # A5 only: the NPU implementation is an MXFP8 GEMM, which earlier parts
+        # do not have — they keep the Triton fallback below.
+        # Imported here, not at module scope: the NPU module is only importable
+        # once torch_npu has registered torch.ops.npu.
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            npu_w8a8_block_fp8_linear,
+        )
+
+        return npu_w8a8_block_fp8_linear
     else:
         return triton_w8a8_block_fp8_linear
 
