@@ -666,9 +666,20 @@ class RealtimeConnection:
         # the wire send doesn't reach the peer.
         try:
             await self._send_error(code, message, error_type=error_type)
-        except (WebSocketDisconnect, RuntimeError):
+        except WebSocketDisconnect:
             pass
+        except RuntimeError:
+            logger.debug(
+                "[realtime] send error %s before close failed", code, exc_info=True
+            )
         try:
             await self.websocket.close(code=close_code)
-        except (WebSocketDisconnect, RuntimeError):
+        except WebSocketDisconnect:
             pass
+        except RuntimeError:
+            logger.debug(
+                "[realtime] close %d after %s failed",
+                close_code,
+                code,
+                exc_info=True,
+            )

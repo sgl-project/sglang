@@ -379,12 +379,12 @@ def is_cjk_char(c: str) -> bool:
     if 0xFFA0 <= cp <= 0xFFDC:  # halfwidth Hangul jamo -- Korean is space-delimited
         return False
     return (
-        0x3000 <= cp <= 0x303F  # CJK Symbols and Punctuation
+        0x3000 <= cp <= 0x303F  # CJK Symbols and Punctuation (，。、《》「」…)
         or 0x3040 <= cp <= 0x309F  # Hiragana
-        or 0x30A0 <= cp <= 0x30FF  # Katakana (incl. ー / ・)
+        or 0x30A0 <= cp <= 0x30FF  # Katakana
         or 0x3400 <= cp <= 0x4DBF  # CJK Unified Ideographs Ext A
         or 0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
-        or 0xFF00 <= cp <= 0xFFEF  # Halfwidth & Fullwidth Forms
+        or 0xFF00 <= cp <= 0xFFEF  # Halfwidth/Fullwidth Forms (incl. fullwidth ASCII)
     )
 
 
