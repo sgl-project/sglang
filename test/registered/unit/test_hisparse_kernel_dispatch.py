@@ -13,20 +13,6 @@ class TestHiSparseHostCacheLocsDispatch(unittest.TestCase):
     def tearDown(self):
         hisparse._jit_sparse_module.cache_clear()
 
-    def test_accepts_contiguous_int32_and_int64_tables(self):
-        hisparse._validate_host_cache_locs(torch.zeros((2, 3), dtype=torch.int32))
-        hisparse._validate_host_cache_locs(torch.zeros((2, 3), dtype=torch.int64))
-
-    def test_rejects_unsupported_or_ambiguous_layouts(self):
-        with self.assertRaisesRegex(TypeError, "torch.int32 or torch.int64"):
-            hisparse._validate_host_cache_locs(torch.zeros((2, 3), dtype=torch.float32))
-        with self.assertRaisesRegex(ValueError, "must be 2D"):
-            hisparse._validate_host_cache_locs(torch.zeros(3, dtype=torch.int32))
-        with self.assertRaisesRegex(ValueError, "must be contiguous"):
-            hisparse._validate_host_cache_locs(
-                torch.zeros((2, 3), dtype=torch.int32).transpose(0, 1)
-            )
-
     def test_dtype_selects_a_distinct_cpp_specialization(self):
         int32_module = object()
         int64_module = object()

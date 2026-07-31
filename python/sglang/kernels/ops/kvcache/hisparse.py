@@ -51,20 +51,6 @@ def _jit_sparse_module(
     )
 
 
-def _validate_host_cache_locs(host_cache_locs: torch.Tensor) -> None:
-    if host_cache_locs.dtype not in (torch.int32, torch.int64):
-        raise TypeError(
-            "host_cache_locs must use torch.int32 or torch.int64, "
-            f"got {host_cache_locs.dtype}"
-        )
-    if host_cache_locs.ndim != 2:
-        raise ValueError(
-            f"host_cache_locs must be 2D, got {host_cache_locs.ndim} dimensions"
-        )
-    if not host_cache_locs.is_contiguous():
-        raise ValueError("host_cache_locs must be contiguous")
-
-
 @functools.cache
 def _jit_dsv4_transfer_module(block_size: int) -> Module:
     template_args = make_cpp_args(block_size)
@@ -121,7 +107,6 @@ def _load_cache_to_device_buffer_mla(
     assert (
         hot_buffer_size >= num_top_k
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
-    _validate_host_cache_locs(host_cache_locs)
 
     module = _jit_sparse_module(
         item_size_bytes,

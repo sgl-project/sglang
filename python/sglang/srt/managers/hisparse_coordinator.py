@@ -149,6 +149,13 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len = torch.zeros(
             max_num_req_slots, dtype=torch.int64, device="cpu"
         )
+        # Select once so the CUDA-graph hot path has neither a dtype conversion
+        # nor a Radix/legacy branch.
+        self._swap_host_cache_locs = (
+            self.req_to_token_pool.req_to_token
+            if self.is_radix_hisparse
+            else self.req_to_host_pool
+        )
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
@@ -240,15 +247,10 @@ class HiSparseCoordinator:
         """Bind request positions to identity-addressed CPU L1 rows.
 
         Radix owns the L1 rows, so this only publishes request-local lookup
-        metadata for the current swap kernel. It never allocates host slots.
+        metadata for transfer paths that still consume the int64 host table.
+        It never allocates host slots.
         """
-        if not self.is_radix_hisparse:
-            raise RuntimeError("identity host locations require Radix HiSparse")
-
         end_pos = start_pos + l1_locs.numel()
-        if end_pos > self.req_to_host_pool.shape[1]:
-            raise ValueError("identity host locations exceed the request table")
-
         host_locs = self.token_to_kv_pool_allocator.full_kv_host_locs(l1_locs)
         self.req_to_host_pool[req_pool_idx, start_pos:end_pos] = host_locs
         allocated_len = int(self.req_to_host_pool_allocated_len[req_pool_idx])
@@ -288,16 +290,6 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req_pool_idx] = 0
 
-    def get_swap_host_cache_locs(self) -> torch.Tensor:
-        """Return the request-position-to-CPU-L1 table used by swap-in.
-
-        Radix reuses ReqToTokenPool's canonical int32 L1 table directly. The
-        legacy path keeps its independent int64 request-to-host allocation.
-        """
-        if self.is_radix_hisparse:
-            return self.req_to_token_pool.req_to_token
-        return self.req_to_host_pool
-
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True
 
@@ -311,12 +303,7 @@ class HiSparseCoordinator:
         )
 
         prefill_len = len(device_indices)
-        if self.is_radix_hisparse:
-            host_indices = self.bind_l1_host_locs(req.req_pool_idx, 0, full_kv_indices)
-        else:
-            host_indices = self._alloc_or_bind_host_locs(
-                req.req_pool_idx, 0, prefill_len
-            )
+        host_indices = self._alloc_or_bind_host_locs(req.req_pool_idx, 0, prefill_len)
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -886,7 +873,7 @@ class HiSparseCoordinator:
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
-            host_cache_locs=self.get_swap_host_cache_locs(),
+            host_cache_locs=self._swap_host_cache_locs,
             device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
             host_cache=self.mem_pool_host.kv_buffer[layer_id],
             device_buffer=self.mem_pool_device.kv_buffer[layer_id],
