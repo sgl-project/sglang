@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.dcp import (
     DecodeContextParallelMetadata,
     update_local_kv_lens_for_dcp,
@@ -63,51 +64,6 @@ if is_flashinfer_available():
     from flashinfer import (
         BatchMLAPagedAttentionWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
-    )
-
-
-@dataclass(frozen=True)
-class UnifiedMLAHooks:
-    """Allocator hooks the paged MLA backends need under the unified memory pool.
-
-    All-``None``/1/``False`` for the statically-partitioned pool, where
-    ``req_to_token`` already holds physical ids.
-    """
-
-    # Page-level virtual->physical table, gathered through by the block-table kernel.
-    v2p_page_table: Optional[torch.Tensor]
-    # Virtual token id -> DENSE kernel-facing id.
-    translate_kv_loc_dense: Optional[Callable[..., torch.Tensor]]
-    # Dense page stride scale (= number of full-attention MLA layers).
-    kernel_page_multiplier: int
-    enabled: bool
-
-
-def unified_mla_hooks(allocator) -> UnifiedMLAHooks:
-    """Probe ``allocator`` for the unified-pool dense-view hooks.
-
-    Detection keys on the page-level v2p table, NOT on
-    ``kernel_page_multiplier > 1``: a configuration with exactly ONE
-    full-attention layer (e.g. a pipeline-parallel rank that owns a single MLA
-    layer) has multiplier 1 while its ``req_to_token`` still holds VIRTUAL ids.
-    With multiplier 1 the dense id collapses onto the physical id, so the v2p
-    gather alone is the whole translation -- skipping it would leave the block
-    table and the KV write loc in virtual space and silently address the wrong
-    pages once virtual and physical diverge (e.g. after compaction).
-    """
-    v2p = getattr(allocator, "full_v2p_page_table", None)
-    if v2p is None:
-        return UnifiedMLAHooks(
-            v2p_page_table=None,
-            translate_kv_loc_dense=None,
-            kernel_page_multiplier=1,
-            enabled=False,
-        )
-    return UnifiedMLAHooks(
-        v2p_page_table=v2p,
-        translate_kv_loc_dense=getattr(allocator, "translate_kv_loc_dense", None),
-        kernel_page_multiplier=getattr(allocator, "kernel_page_multiplier", 1),
-        enabled=True,
     )
 
 

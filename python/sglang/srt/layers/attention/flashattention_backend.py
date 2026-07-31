@@ -18,6 +18,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
@@ -184,6 +185,11 @@ class FlashAttentionBackend(AttentionBackend):
         # seq_lens_cpu / seq_lens_sum D2H sync is ever needed.
         self.needs_cpu_seq_lens = False
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        # Unified pool: req_to_token holds VIRTUAL ids but the MLA per-layer views
+        # are DENSE, so every page_table needs remapping. MLA-only -- the MHA/SWA
+        # sub-pools keep the strided envelope layout FA3 cannot read at all.
+        self._unified_hooks = unified_mla_hooks(model_runner.token_to_kv_pool_allocator)
+        self._unified_dense = self._unified_hooks.enabled and self.use_mla
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.ps.attn_cp_size
         self._verify_mask = None
@@ -1039,6 +1045,26 @@ class FlashAttentionBackend(AttentionBackend):
                         forward_batch.out_cache_loc
                     )
                 )
+
+        # Unified pool: one remap for every eager branch above, which all filled
+        # page_table with VIRTUAL token ids. Rebinding is safe here because those
+        # branches each produced a fresh tensor; the captured path instead folds
+        # the remap into normal_decode_set_metadata, which must write in place.
+        #
+        # Placed BEFORE the `// page_size` reduction, in token space: since
+        # dense(t) = phys_page * (ps * L) + t % ps, dense(page_start) // ps is
+        # phys_page * L, the dense page id the kernel wants. One site then serves
+        # both page sizes, and it inherits translate_kv_loc_dense's tombstone
+        # clamp so an unwritten req_to_token slot lands in the page-0 sink.
+        if self._unified_dense and metadata.page_table is not None:
+            # Flattened: the page_size == 1 translate path uses index_select,
+            # which rejects a 2-D index.
+            pt = metadata.page_table
+            metadata.page_table = (
+                self._unified_hooks.translate_kv_loc_dense(pt.reshape(-1))
+                .to(torch.int32)
+                .view(pt.shape)
+            )
 
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
@@ -2632,6 +2658,12 @@ class FlashAttentionBackend(AttentionBackend):
                             if self.use_sliding_window_kv_pool
                             else None
                         ),
+                        v2p_page_table=(
+                            self._unified_hooks.v2p_page_table
+                            if self._unified_dense
+                            else None
+                        ),
+                        kernel_page_multiplier=self._unified_hooks.kernel_page_multiplier,
                     )
 
                 else:
@@ -2748,6 +2780,12 @@ class FlashAttentionBackend(AttentionBackend):
                             if self.use_sliding_window_kv_pool
                             else None
                         ),
+                        v2p_page_table=(
+                            self._unified_hooks.v2p_page_table
+                            if self._unified_dense
+                            else None
+                        ),
+                        kernel_page_multiplier=self._unified_hooks.kernel_page_multiplier,
                     )
 
                 self._maybe_update_local_attn_metadata_for_replay(
