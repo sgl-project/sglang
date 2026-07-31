@@ -1018,7 +1018,7 @@ struct KdaFusedDecodeKernel {
     }
     auto kernel = kH == 3 ? select_kda_fused_decode_k3_kernel<3, kUsePDL>(use_lower_bound, tma_stages)
                           : (kH == 6 ? select_kda_fused_decode_k3_kernel<6, kUsePDL>(use_lower_bound, tma_stages)
-                                      : select_kda_fused_decode_k3_kernel<12, kUsePDL>(use_lower_bound, tma_stages));
+                                     : select_kda_fused_decode_k3_kernel<12, kUsePDL>(use_lower_bound, tma_stages));
     const int smem_stages = tma_stages == 0 ? 2 : tma_stages;
     const size_t smem_bytes = static_cast<size_t>(smem_stages) * kChunkV * kDimK * sizeof(float);
     host::RuntimeDeviceCheck(
