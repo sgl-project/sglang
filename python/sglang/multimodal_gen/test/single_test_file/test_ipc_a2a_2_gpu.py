@@ -97,6 +97,7 @@ def _worker() -> int:
         sequence_model_parallel_all_to_all_4D as all_to_all_4D,
     )
 
+    staged_before_a2a4d = len(IPC_A2A.staging)
     for b, s_local, h_global, d in shapes:
         torch.manual_seed(4321)
         for scatter_dim in (1, 2):
@@ -127,6 +128,14 @@ def _worker() -> int:
                 failures.append(
                     f"a2a4d scatter={scatter_dim} {(b, s_local, h_global, d)}"
                 )
+
+    # A parity check that never reached the IPC branch would pass while proving
+    # nothing, and these shapes are new, so they must have staged new buffers.
+    if len(IPC_A2A.staging) == staged_before_a2a4d:
+        failures.append(
+            "AllToAll4D never took the IPC path "
+            f"(staged keys stayed at {staged_before_a2a4d})"
+        )
 
     # the transport must survive a shape it has never staged before, and the
     # eviction that a capped cache performs
