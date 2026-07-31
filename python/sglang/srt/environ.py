@@ -745,6 +745,13 @@ class Envs:
     # Most per-request states the detokenizer keeps; past it, the oldest is
     # evicted. See https://github.com/sgl-project/sglang/issues/2812
     SGLANG_DETOKENIZER_MAX_STATES = EnvInt(1 << 16)
+    # Denoise forwards per scheduled FDFO round. The batch is frozen for the
+    # inner steps (resolved rows self-freeze; commits, admissions, and result
+    # processing happen once per round), which amortizes the scheduler's
+    # per-round host work over N forwards. Per-row trajectories are unchanged;
+    # the trade-off is up to N-1 rounds of extra emission latency and a few
+    # frozen rows re-forwarded per round.
+    SGLANG_DLLM_FDFO_STEPS_PER_ROUND = EnvInt(1)
 
     # ===================================================================
     # Beam search

@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.dllm.algorithm import get_algorithm
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -42,6 +43,7 @@ class DllmAlgorithm:
         self.block_size = config.block_size
         self.mask_id = config.mask_id
         self.fdfo = config.first_done_first_out_mode
+        self.fdfo_steps_per_round = max(1, envs.SGLANG_DLLM_FDFO_STEPS_PER_ROUND.get())
 
     @staticmethod
     def from_server_args(server_args: ServerArgs):
@@ -84,6 +86,33 @@ class DllmAlgorithm:
         until a forward has persisted their final tokens. Algorithms with a
         separate context pass may emit immediately because that block KV is
         discarded and encoded causally in the next round.
+        """
+        raise NotImplementedError
+
+    def fdfo_batched_begin(
+        self, forward_batch: ForwardBatch, states: List[Any]
+    ) -> Optional[Any]:
+        """Gather per-request FDFO states into batched device tensors for the
+        multi-step inner loop, or return None if the algorithm has no batched
+        path (the per-step ``step`` loop is used instead). Must be equivalent
+        to running ``step`` per forward: same math, only without the per-step
+        host gather/scatter and sync.
+        """
+        return None
+
+    def fdfo_batched_step(
+        self, forward_batch: ForwardBatch, full_logits: torch.Tensor, ctx: Any
+    ) -> None:
+        """One denoise step on the batched context. Must not sync the host."""
+        raise NotImplementedError
+
+    def fdfo_batched_all_finished(self, ctx: Any) -> bool:
+        """Scalar sync: True if every row in the batched context is finished."""
+        raise NotImplementedError
+
+    def fdfo_batched_end(self, ctx: Any, states: List[Any]) -> List[bool]:
+        """Scatter the batched context back onto per-request states and return
+        the per-row done flags (complete-on-entry semantics, as ``step``).
         """
         raise NotImplementedError
 
@@ -158,9 +187,54 @@ class DllmAlgorithm:
             else:
                 states.append(carried)
 
+        # Inner steps: keep denoising the same frozen batch (finished rows
+        # self-freeze inside the step), so the scheduler's per-round host work
+        # is paid once per fdfo_steps_per_round forwards instead of per
+        # forward. A row that finishes on an inner step is emitted with this
+        # round's accept, at most fdfo_steps_per_round - 1 forwards late.
+        #
+        # The batched path is preferred even for single-step rounds: begin
+        # gathers the states before the forward, so its blocking H2D copies hit
+        # an empty stream instead of draining the in-flight forward, and the
+        # round's only sync is the done-flag readback in end. Algorithms with
+        # no batched path return None and keep the per-step ``step`` loop.
+        ctx = self.fdfo_batched_begin(forward_batch, states)
         self.prepare_inputs(model_runner, forward_batch, states)
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-        done = self.step(forward_batch, out.logits_output.full_logits, states)
+
+        inner_steps = self.fdfo_steps_per_round - 1
+        if inner_steps and (
+            _is_npu or (self.reuse_forward_metadata and out.can_run_graph)
+        ):
+            # The forward above has planned the fixed canvas's attention
+            # metadata; the inner forwards reuse it -- same as _run_sync.
+            forward_batch.mark_forward_metadata_ready(replan_equivalent=not _is_npu)
+
+        if ctx is None:
+            done = self.step(forward_batch, out.logits_output.full_logits, states)
+            for _ in range(inner_steps):
+                if all(done):
+                    break
+                self.prepare_inputs(model_runner, forward_batch, states)
+                out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+                done = self.step(forward_batch, out.logits_output.full_logits, states)
+        else:
+            # Batched-state inner loop: per-request states live in batched
+            # device tensors for the whole round, so an inner step costs no
+            # host gather/scatter and only a scalar all-finished sync.
+            self.fdfo_batched_step(forward_batch, out.logits_output.full_logits, ctx)
+            for _ in range(inner_steps):
+                # One scalar sync per inner step, and it is worth it at every
+                # batch size measured: skipping it (on the theory that a wide
+                # batch never resolves every row mid-round) issues no-op
+                # forwards during the tail of a run and measured slower.
+                if self.fdfo_batched_all_finished(ctx):
+                    break
+                out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+                self.fdfo_batched_step(
+                    forward_batch, out.logits_output.full_logits, ctx
+                )
+            done = self.fdfo_batched_end(ctx, states)
 
         accept_length_per_req_cpu = [self.block_size if d else 0 for d in done]
         next_token_ids_list = forward_batch.input_ids.view(
