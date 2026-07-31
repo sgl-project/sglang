@@ -552,5 +552,115 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         torch.testing.assert_close(call.args[4], plan.ke)
         self.assertEqual(call.kwargs, {"clean_logits": False, "max_seqlen_k": 128})
 
+    def test_topk_v2_plan_rebuilt_once_after_cp_padding_is_trimmed(self):
+        physical_query_rows = 3
+        logical_query_rows = 2
+        page_table = torch.tensor([[3], [3], [0]], dtype=torch.int32)
+        physical_c4_seq_lens = torch.tensor([9, 11, 0], dtype=torch.int32)
+        initial_topk_plan = torch.tensor(
+            [[100, 3], [0, 9], [1, 11], [2, 0]], dtype=torch.int32
+        )
+        rebuilt_topk_plan = torch.tensor(
+            [[200, 2], [0, 9], [1, 11]], dtype=torch.int32
+        )
+
+        nonpaged_plan = NonPagedIndexerPlan(
+            page_table=page_table[:1],
+            gather_seq_lens=torch.tensor([11], dtype=torch.int32),
+            ks=torch.zeros(logical_query_rows, dtype=torch.int32),
+            ke=physical_c4_seq_lens[:logical_query_rows],
+            seq_len_sum=11,
+            max_seq_len=11,
+            max_seqlen_k=64,
+            query_rows=logical_query_rows,
+        )
+        q_indexer = torch.zeros(
+            (physical_query_rows, 2, 128), dtype=torch.float32
+        )
+        weights = torch.ones((physical_query_rows, 2, 1), dtype=torch.float32)
+        logits = torch.zeros((logical_query_rows, 16), dtype=torch.float32)
+        c4_sparse_page_indices = torch.full(
+            (physical_query_rows, 512), -1, dtype=torch.int32
+        )
+        core_metadata = SimpleNamespace(
+            positions=torch.arange(physical_query_rows),
+            page_table=page_table,
+            c4_sparse_page_indices=c4_sparse_page_indices,
+            c4_sparse_raw_indices=None,
+        )
+        backend = SimpleNamespace(
+            token_to_kv_pool=MagicMock(),
+            forward_metadata=None,
+            _forward_prepare_normal=MagicMock(return_value=(q_indexer, weights)),
+            _get_nonpaged_indexer_plan=MagicMock(return_value=nonpaged_plan),
+            _forward_nonpaged_indexer=MagicMock(return_value=logits),
+            debug_use_external_c4_sparse_indices=False,
+            hisparse_coordinator=None,
+            dsa_topk_backend=SimpleNamespace(
+                is_torch=MagicMock(return_value=False),
+                is_flashinfer=MagicMock(return_value=False),
+            ),
+        )
+        c4_indexer = SimpleNamespace(use_fp4_indexer=False, layer_id=17)
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        deep_gemm = SimpleNamespace(
+            get_num_sms=MagicMock(return_value=1),
+            get_paged_mqa_logits_metadata=MagicMock(
+                return_value=torch.zeros(
+                    (physical_query_rows, 2), dtype=torch.int32
+                )
+            ),
+            fp8_paged_mqa_logits=MagicMock(),
+        )
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
+            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
+            envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(False),
+            envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+            envs.SGLANG_TOPK_TRANSFORM_512_TORCH.override(False),
+            patch(
+                "sglang.kernels.ops.attention.dsv4.plan_topk_v2",
+                return_value=initial_topk_plan,
+            ) as initial_plan,
+            patch(f"{_INDEXER}.plan_topk_v2", return_value=rebuilt_topk_plan) as replan,
+            patch(f"{_INDEXER}.topk_transform_512_v2") as transform,
+            patch(f"{_INDEXER}.get_global_indexer_capturer", return_value=None),
+        ):
+            indexer_metadata = PagedIndexerMetadata(
+                page_size=256,
+                page_table=page_table,
+                c4_seq_lens=physical_c4_seq_lens,
+            )
+            backend.forward_metadata = SimpleNamespace(
+                indexer_metadata=indexer_metadata,
+                core_metadata=core_metadata,
+            )
+
+            for _ in range(2):
+                C4IndexerBackendMixin.forward_c4_indexer(
+                    backend,
+                    x=torch.zeros((physical_query_rows, 1)),
+                    q_lora=torch.zeros((physical_query_rows, 1)),
+                    c4_indexer=c4_indexer,
+                    forward_batch=forward_batch,
+                )
+
+        initial_plan.assert_called_once_with(physical_c4_seq_lens)
+        replan.assert_called_once()
+        torch.testing.assert_close(
+            replan.call_args.args[0], physical_c4_seq_lens[:logical_query_rows]
+        )
+        self.assertIs(indexer_metadata.topk_metadata, rebuilt_topk_plan)
+        self.assertEqual(transform.call_count, 2)
+        for call in transform.call_args_list:
+            torch.testing.assert_close(
+                call.args[1], physical_c4_seq_lens[:logical_query_rows]
+            )
+            self.assertIs(call.args[5], rebuilt_topk_plan)
+
+
 if __name__ == "__main__":
     unittest.main()

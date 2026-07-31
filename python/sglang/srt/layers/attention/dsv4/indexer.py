@@ -900,6 +900,9 @@ class C4IndexerBackendMixin:
                 core_metadata.c4_sparse_raw_indices, value=-1
             )
 
+        # The nonpaged CP path may trim padded query rows after metadata creation.
+        # Rebuild here because top-k v2 requires a plan built from the exact
+        # c4_seq_lens it sees.
         if (
             nonpaged_plan is not None
             and query_rows != physical_query_rows
