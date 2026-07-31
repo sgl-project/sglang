@@ -1114,7 +1114,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # Calculate first full attention layer ID based on config
         # Calculate once for each pp group
         if (self.attn.layer_id + 1) % self.config.full_attention_interval == 0:
-            if self.pp_group.rank_in_group not in calculated_pp_groups:
+            if self.pp_group.rank_in_group not in self.calculated_pp_groups:
                 self.rotary_emb.get_cos_sin_with_position(positions)
                 self.calculated_pp_groups.append(self.pp_group.rank_in_group)
 
