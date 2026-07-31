@@ -104,8 +104,31 @@ if TYPE_CHECKING:
 
 if is_flashinfer_available():
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+
+    import inspect as _inspect
+
+    try:
+        from flashinfer.fused_moe import (
+            trtllm_fp4_block_scale_moe as _fp4_fn,
+            trtllm_fp4_block_scale_routed_moe as _fp4_routed_fn,
+        )
+
+        _FP4_TRTLLM_HAS_FUSED_SHARED = (
+            "num_fused_shared_experts" in _inspect.signature(_fp4_fn).parameters
+        )
+        _FP4_TRTLLM_ROUTED_HAS_FUSED_SHARED = (
+            "num_fused_shared_experts"
+            in _inspect.signature(_fp4_routed_fn).parameters
+        )
+        del _fp4_fn, _fp4_routed_fn
+    except Exception:
+        _FP4_TRTLLM_HAS_FUSED_SHARED = False
+        _FP4_TRTLLM_ROUTED_HAS_FUSED_SHARED = False
+    del _inspect
 else:
     fp4_quantize = None
+    _FP4_TRTLLM_HAS_FUSED_SHARED = False
+    _FP4_TRTLLM_ROUTED_HAS_FUSED_SHARED = False
 
 _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8: dict[
     tuple, dict[str, torch.Tensor]
@@ -946,6 +969,20 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         f"got '{runner_config.activation}'."
     )
 
+    num_fused_shared = runner_config.num_fused_shared_experts or 0
+    if num_fused_shared > 0:
+        if not _FP4_TRTLLM_HAS_FUSED_SHARED:
+            raise RuntimeError(
+                "FP4 shared-expert fusion requires a newer FlashInfer that exposes "
+                "num_fused_shared_experts on trtllm_fp4_block_scale_moe. "
+                "Upgrade FlashInfer or pass --disable-shared-experts-fusion."
+            )
+        if quant_info.local_num_experts < quant_info.global_num_experts:
+            raise NotImplementedError(
+                "FP4 fused shared-expert fusion is not supported with expert "
+                "parallelism. Pass --disable-shared-experts-fusion or disable EP."
+            )
+
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
@@ -1045,7 +1082,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
     if use_routed_topk:
         packed_topk_ids = _get_packed_topk_ids_for_flashinfer_routed(topk_output)
-        result = trtllm_fp4_block_scale_routed_moe(
+        routed_kwargs = dict(
             topk_ids=packed_topk_ids,
             routing_bias=None,
             hidden_states=hs_fp4,
@@ -1077,7 +1114,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             output=symm_output,
             enable_pdl=hs_fp4.shape[0] <= _TRTLLM_MOE_PDL_MAX_TOKENS,
-        )[0]
+        )
+        if num_fused_shared > 0 and _FP4_TRTLLM_ROUTED_HAS_FUSED_SHARED:
+            routed_kwargs["num_fused_shared_experts"] = num_fused_shared
+        result = trtllm_fp4_block_scale_routed_moe(**routed_kwargs)[0]
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
@@ -1124,6 +1164,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         )
         if not defer_finalize:
             moe_kwargs["output"] = symm_output
+        if num_fused_shared > 0:
+            moe_kwargs["num_fused_shared_experts"] = num_fused_shared
 
         result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:
