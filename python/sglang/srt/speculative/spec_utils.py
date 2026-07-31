@@ -957,16 +957,7 @@ def commit_mamba_states_after_verify(
                 mamba_track_indices=batch.mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=model_runner.model,
-            )
-        elif hasattr(model_runner.model, "update_conv_state_after_mtp_verify"):
-            # Models whose conv layers bypass the attention-backend wrapper
-            # (Inkling) own the commit themselves.
-            model_runner.model.update_conv_state_after_mtp_verify(
-                req_to_token_pool=model_runner.req_to_token_pool,
                 req_pool_indices=batch.req_pool_indices[:bs],
-                last_correct_step_indices=last_correct_step_indices,
-                mamba_track_indices=batch.mamba_track_indices,
-                mamba_steps_to_track=mamba_steps_to_track,
             )
 
 

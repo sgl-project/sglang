@@ -9,6 +9,21 @@ from sglang.srt.utils.common import (
 )
 
 
+def _assert_draft_needs_no_conv_sidecar(draft_model_runner) -> None:
+    """Refuse a multi-step draft decode backend for a draft with conv layers."""
+    from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
+
+    if isinstance(
+        draft_model_runner.model_config.hf_config,
+        (InklingModelConfig, InklingMMConfig),
+    ):
+        raise NotImplementedError(
+            "Inkling's draft model runs its own short convs, which need the "
+            "conv-state sidecar the multi-step draft decode backend cannot carry. "
+            "Use --enable-multi-layer-eagle."
+        )
+
+
 class DraftBackendFactory:
     def __init__(
         self,
@@ -45,6 +60,10 @@ class DraftBackendFactory:
         # No multi-step draft backend for steps=0 (nospec) or steps=1.
         if self.speculative_num_steps <= 1:
             return None
+
+        # Returns a per-step CONTAINER, not an AttentionBackend, so
+        # attn_backend_wrapper_for_draft_extend cannot give it a conv sidecar.
+        _assert_draft_needs_no_conv_sidecar(self.draft_model_runner)
 
         backend_map = {
             "flashinfer": self._create_flashinfer_decode_backend,
@@ -96,11 +115,17 @@ class DraftBackendFactory:
             if self.server_args.speculative_attention_mode == "decode"
             else "prefill_attention_backend"
         )
-        return self._create_backend(
+        backend = self._create_backend(
             backend_name,
             backend_map,
             "EAGLE is not supported in attention backend {backend_type}",
         )
+        # A draft with conv layers of its own (Inkling) needs its sidecar here too.
+        from sglang.srt.layers.attention.attention_registry import (
+            attn_backend_wrapper_for_draft_extend,
+        )
+
+        return attn_backend_wrapper_for_draft_extend(self.draft_model_runner, backend)
 
     def _create_dsa_decode_backend(self):
         from sglang.srt.layers.attention.dsa_backend import (
