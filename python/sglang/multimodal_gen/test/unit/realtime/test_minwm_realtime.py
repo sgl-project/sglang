@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.models.dits.minwm import (
     _frame_modulation,
     _minwm_adaln_modulation,
     _minwm_adaln_op,
+    _minwm_apply_qk_op,
     _minwm_frame_indices,
     _minwm_layer_norm,
     _minwm_packed_attention_backend,
@@ -213,9 +214,7 @@ def test_minwm_primitive_rope_action_binary_windows_match_labels():
         dim=24, embed_dim=8, hidden_dim=16, kernel_size=3
     )
     labels = torch.tensor([[0, 9, 10, 1]])
-    windows = (
-        action_labels_to_primitive_bits(labels).unsqueeze(2).expand(-1, -1, 4, -1)
-    )
+    windows = action_labels_to_primitive_bits(labels).unsqueeze(2).expand(-1, -1, 4, -1)
     torch.testing.assert_close(
         encoder.frame_states(windows),
         encoder.frame_states(labels),
@@ -979,15 +978,14 @@ def test_minwm_t2v_first_latent_is_noop_without_consuming_pixel_actions():
     first = adapter.sample_chunk_inputs(
         session, server_args, SimpleNamespace(index=0), chunk_size=1
     )
-    assert first.condition_inputs[MINWM_ACTION_WEIGHTS_CONDITION] == [
-        [[0.0] * 8] * 4
-    ]
+    assert first.condition_inputs[MINWM_ACTION_WEIGHTS_CONDITION] == [[[0.0] * 8] * 4]
     second = adapter.sample_chunk_inputs(
         session, server_args, SimpleNamespace(index=1), chunk_size=4
     )
-    assert second.condition_inputs[MINWM_ACTION_WEIGHTS_CONDITION] == [
-        [first_action] * 4
-    ] * 4
+    assert (
+        second.condition_inputs[MINWM_ACTION_WEIGHTS_CONDITION]
+        == [[first_action] * 4] * 4
+    )
 
 
 def test_minwm_scheduled_prompt_and_seed_target_exact_chunk():
@@ -1034,9 +1032,7 @@ def test_minwm_scheduled_prompt_and_seed_target_exact_chunk():
         if chunk_index == 3:
             assert inputs.prompt == "night"
             assert inputs.condition_inputs[MINWM_PROMPT_UPDATED_CONDITION] is True
-            assert (
-                inputs.condition_inputs[MINWM_CONDITION_SWITCH_CONDITION] == "prompt"
-            )
+            assert inputs.condition_inputs[MINWM_CONDITION_SWITCH_CONDITION] == "prompt"
         else:
             assert inputs.prompt == "day"
 
@@ -1595,9 +1591,7 @@ def test_minwm_fused_segments_match_main_eager_formulas():
     separated_query = apply_minwm_rotary_embedding(
         raw_query, rope[..., 0], rope[..., 1]
     )
-    separated_key = apply_minwm_rotary_embedding(
-        raw_key, rope[..., 0], rope[..., 1]
-    )
+    separated_key = apply_minwm_rotary_embedding(raw_key, rope[..., 0], rope[..., 1])
     torch.testing.assert_close(separated_query, actual_query, rtol=0, atol=0)
     torch.testing.assert_close(separated_key, actual_key, rtol=0, atol=0)
 
@@ -1624,6 +1618,49 @@ def test_minwm_fused_segments_match_main_eager_formulas():
         actual_query, expected(query, query_weight), rtol=0, atol=0
     )
     torch.testing.assert_close(actual_key, expected(key, key_weight), rtol=0, atol=0)
+
+
+def test_minwm_cache_qk_norm_stays_eager(monkeypatch):
+    import sglang.multimodal_gen.runtime.models.dits.minwm as minwm_module
+
+    compile_calls = []
+
+    def fake_get(_cls, operation, use_compile):
+        compile_calls.append(use_compile)
+        return operation
+
+    monkeypatch.setattr(
+        minwm_module._MinWMSegmentCompile,
+        "get",
+        classmethod(fake_get),
+    )
+
+    def operation(value):
+        return value + 1
+
+    value = torch.tensor(2)
+
+    assert (
+        _minwm_apply_qk_op(
+            operation,
+            [value],
+            use_cache=True,
+            use_compile=True,
+        ).item()
+        == 3
+    )
+    assert compile_calls == []
+
+    assert (
+        _minwm_apply_qk_op(
+            operation,
+            [value],
+            use_cache=False,
+            use_compile=True,
+        ).item()
+        == 3
+    )
+    assert compile_calls == [True]
 
 
 def test_minwm_rotary_embedding_matches_main_explicit_formula():

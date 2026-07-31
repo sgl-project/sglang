@@ -2,9 +2,10 @@
 
 更新时间：2026-07-31
 
-状态：实现与 CPU 语义门已完成；L40S 全量 1089 帧诊断已完成，但尚未达到
-数值对齐；产品临时实例和同机原生 baseline 门正在 Phoenix Local Zone 的
-8×H200 Spot 上运行。
+状态：实现、CPU 语义门和 Phoenix Local Zone H200 同机强门均已完成。
+原生 MinWM、SGLang 和天鹏发布视频的 1089 帧三路结果已经发布；当前结论是
+**解码视频数值对齐，未达到 bitwise**。公网 Realtime Studio/API 继续运行，
+供产品和算法同事实时体验。
 
 ## 1. 本次对齐对象
 
@@ -169,6 +170,14 @@ request horizon 扩大 cache。这会静默覆盖 checkpoint 的 `local_attn_siz
 6. 部署 manifest 曾把短 SHA `fc9d1e7621` 手工补成错误的完整 SHA，导致第一次
    checkout 失败。部署合同现在只接受直接复制的 `git rev-parse HEAD` 完整
    输出；禁止凭短 SHA 手工补全。
+7. baseline 镜像没有与其 Torch ABI 匹配的 `sglang-kernel`。强行安装当前
+   SGLang pin 的 wheel 会在 import 时出现 undefined symbol。parity 环境现在
+   保留镜像依赖；SGLang RMSNorm 在预编译 kernel 不可用或 ABI 不兼容时回退到
+   PyTorch native 实现。
+8. SGLang 原实现把 cache inference 的 Q/K RMSNorm 也送入了 segment
+   `torch.compile`，而 MinWM `4220c8a` 在 cache 路径中是 eager。BF16 reduction
+   的 rounding boundary 因此不同。修复后 cache 路径保持 eager；无 cache 的
+   训练/双向路径仍可编译。
 
 ## 5. 已完成的语义门
 
@@ -381,18 +390,69 @@ Phoenix Local Zone 不能直接作为区域 NLB 的 target。把 Local Zone subn
   `install_parity_dependencies.py` 递归补齐，并在启动 server 前再次比较
   Torch、Transformers、Diffusers、FlashAttention 和 TorchVision 版本。
 
-第一轮 H200 原生 baseline 已完整跑完 69 block：
+最终 H200 原生 baseline 已完整跑完 69 block：
 
 | 项目 | 结果 |
 | --- | ---: |
-| generation | 867.665 秒 |
-| VAE decode | 27.317 秒 |
-| 1089 帧端到端吞吐 | 1.217 FPS |
-| 第 1 block | 16.333 秒 |
-| 最后 1 block | 17.834 秒 |
+| generation | 851.410 秒 |
+| VAE decode | 27.237 秒 |
+| 1089 帧端到端吞吐 | 1.239 FPS |
+| 第 1 block | 16.229 秒 |
+| 最后 1 block | 16.543 秒 |
 
 原生耗时随历史逐块增长，说明当前 `4220c8a` baseline 的 window attention
 执行仍有需要单独剖析的性能问题；它不影响本轮“同输入、同依赖栈”的数值比较。
+
+### 8.3 H200 同机最终数值与性能结果
+
+最终三路同步页：
+
+<https://leap-world-us-east-2.s3.us-east-2.amazonaws.com/world-model/sft/prompt_compare/detailmix_director_gap12_20260729_094145/sglang-alignment/20260731-h200-same-stack-qkfix/index.html>
+
+三路都使用 832×480、24 FPS、1089 帧；原生 MinWM 与 SGLang 位于同一台 H200
+主机、使用同一 checkpoint、donor 和数值依赖。SGLang 关闭 whole-DiT
+`torch.compile`，保留与 source config 相同的 segment compile；两路 packed
+attention 都实际选择 FA2。
+
+| 对比 | PSNR | SSIM |
+| --- | ---: | ---: |
+| 天鹏发布 MP4 vs 原生 MinWM 重跑 | 21.637946 dB | 0.607780 |
+| 天鹏发布 MP4 vs SGLang | 21.406803 dB | 0.591320 |
+| 原生 MinWM 重跑 vs SGLang | 20.799225 dB | 0.576889 |
+
+原生重跑本身没有复现天鹏发布 MP4 的 bitwise 结果；两者即使 checkpoint、commit、
+配置、action 和 seed 合同相同，编码视频 PSNR 也只有 21.638 dB。SGLang 相对发布
+视频为 21.407 dB，比原生重跑低 0.231 dB。因此合理结论是：SGLang 已接近本次
+可观测的 baseline 重放精度，但在算法侧没有提供 latent/cache dump 的前提下，
+不能宣称 latent 或视频 bitwise parity。
+
+原生 MinWM 和 SGLang 的未编码 `uint8 RGB` 直接比较结果是：
+
+| 项目 | 结果 |
+| --- | ---: |
+| bitwise equal | false |
+| exact frames | 0 / 1089 |
+| raw RGB PSNR | 17.509618 dB |
+| mean absolute difference | 24.5213 |
+| max absolute difference | 255 |
+
+逐张量定位确认 checkpoint 权重、首个 latent input、prompt embedding、timestep、
+action、patch embedding、首层 self-attention Q/K/V linear 都能 exact equal。
+修复 cache Q/K RMSNorm 的 eager/compile 差异后，首层 self-attention 的
+Q/K norm、RoPE 和 attention output 也可 exact equal；剩余误差从后续
+compiled AdaLN/cross-attention 的 BF16 rounding 开始累积。调试 hook 本身会改变
+Inductor 编译/自动调优路径，因此只用来定位首个算子差异，最终结论始终取无 hook
+的完整 69-block 运行。
+
+SGLang 最终端到端 wall time 为 123.049 秒，1089 帧吞吐约 8.85 FPS；稳态
+16 帧 chunk 多数为 1.75～1.85 秒。相同 H200 上原生 MinWM 是 878.647 秒
+（generation + decode），因此本次 SGLang 实现端到端约快 7.14×。这不是
+实时 24 FPS，但已经明确快于当前 `4220c8a` 原生 baseline；进一步达到 24 FPS
+需要 SP/compile/kernel 级性能工作，不能靠降低 parity 约束来声称已经实现。
+
+视频、指标和复现 evidence 落盘并校验后，双容器 parity Job 已删除，释放了
+它占用的 2 张 H200。当前节点只保留 Realtime Studio/API 的 1 张 GPU，其余
+7 张可供同事复用。
 
 部署 overlay：
 
@@ -443,3 +503,7 @@ kubectl kustomize --load-restrictor LoadRestrictionsNone \
 11. 产品实时部署时，哪些参数属于模型合同，哪些输入只用于 parity replay？
 12. 如果新 checkpoint 改成 `primitive_rope_token_residual`，converter 和运行时各
     如何识别并加载它？
+13. 为什么 cache inference 的 Q/K RMSNorm 必须保持 eager，而训练/双向路径仍
+    可以 segment compile？
+14. 本次为什么把“21.407 dB 接近 21.638 dB”表述为数值对齐证据，而不是
+    bitwise parity 证明？

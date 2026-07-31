@@ -325,9 +325,7 @@ def _minwm_qk_norm_rope_op(
     rope: torch.Tensor,
     num_heads: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    query, key = _minwm_qk_norm_op(
-        query, key, query_weight, key_weight, eps, num_heads
-    )
+    query, key = _minwm_qk_norm_op(query, key, query_weight, key_weight, eps, num_heads)
 
     def apply(hidden_states: torch.Tensor) -> torch.Tensor:
         sequence_length = hidden_states.shape[-3]
@@ -359,6 +357,19 @@ def _minwm_qk_norm_op(
     query = query.reshape(*leading, num_heads, dim // num_heads)
     key = key.reshape(*leading, num_heads, dim // num_heads)
     return query, key
+
+
+def _minwm_apply_qk_op(
+    qk_op,
+    qk_args: list,
+    *,
+    use_cache: bool,
+    use_compile: bool,
+):
+    """Keep cache inference eager, matching minWM main's BF16 reduction."""
+    if use_cache:
+        return qk_op(*qk_args)
+    return _MinWMSegmentCompile.get(qk_op, use_compile)(*qk_args)
 
 
 def _minwm_packed_varlen_attention(
@@ -550,13 +561,32 @@ class MinWMCausalSelfAttention(CausalWanSelfAttention):
         key_cos, key_sin = self._minwm_rotary_emb.forward_uncached(
             cache_view.key_position_ids
         )
-        roped_query = apply_minwm_rotary_embedding(
-            query, query_cos, query_sin
-        ).type_as(value)
+        roped_query = apply_minwm_rotary_embedding(query, query_cos, query_sin).type_as(
+            value
+        )
         attention_key = apply_minwm_rotary_embedding(
             cache_view.k, key_cos, key_sin
         ).type_as(value)
         attention_value = cache_view.v
+        parity_dump_dir = getattr(self, "_minwm_parity_dump_dir", None)
+        parity_index = getattr(self, "_minwm_parity_forward_index", 0)
+        if parity_dump_dir is not None and parity_index < 2:
+            torch.save(
+                query.detach().cpu(),
+                parity_dump_dir / f"self_q_norm_{parity_index:03d}.pt",
+            )
+            torch.save(
+                cache_view.k.detach().cpu(),
+                parity_dump_dir / f"self_k_norm_{parity_index:03d}.pt",
+            )
+            torch.save(
+                roped_query.detach().cpu(),
+                parity_dump_dir / f"self_q_roped_{parity_index:03d}.pt",
+            )
+            torch.save(
+                attention_key.detach().cpu(),
+                parity_dump_dir / f"self_k_roped_{parity_index:03d}.pt",
+            )
         if _MINWM_ATTENTION_IMPL == "dense":
             output = (self.ulysses_attn if sequence_shard_enabled else self.attn)(
                 roped_query, attention_key, attention_value
@@ -565,6 +595,13 @@ class MinWMCausalSelfAttention(CausalWanSelfAttention):
             output = _minwm_packed_varlen_attention(
                 roped_query, attention_key, attention_value
             )
+        if parity_dump_dir is not None:
+            if parity_index < 2:
+                torch.save(
+                    output.detach().cpu(),
+                    parity_dump_dir / f"self_attention_output_{parity_index:03d}.pt",
+                )
+            self._minwm_parity_forward_index = parity_index + 1
         if sequence_shard_enabled:
             assert seq_splits is not None
             output = (
@@ -706,11 +743,7 @@ class MinWMCausalTransformerBlock(CausalWanTransformerBlock):
             key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
             qk_already_roped = False
         else:
-            qk_op = (
-                _minwm_qk_norm_rope_op
-                if kv_cache is None
-                else _minwm_qk_norm_op
-            )
+            qk_op = _minwm_qk_norm_rope_op if kv_cache is None else _minwm_qk_norm_op
             qk_args = [
                 query.squeeze(1),
                 key.squeeze(1),
@@ -721,7 +754,14 @@ class MinWMCausalTransformerBlock(CausalWanTransformerBlock):
             if kv_cache is None:
                 qk_args.append(torch.stack(freqs_cis, dim=-1))
             qk_args.append(self.local_num_heads)
-            query, key = _MinWMSegmentCompile.get(qk_op, query.is_cuda)(*qk_args)
+            # minWM main's inference/cache path calls qk_norm_op eagerly.
+            # Compiling this reduction changes its BF16 rounding boundary.
+            query, key = _minwm_apply_qk_op(
+                qk_op,
+                qk_args,
+                use_cache=kv_cache is not None,
+                use_compile=query.is_cuda,
+            )
             qk_already_roped = kv_cache is None
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         attn_output = self.attn1(
@@ -750,8 +790,7 @@ class MinWMCausalTransformerBlock(CausalWanTransformerBlock):
             if parity_index < 2:
                 torch.save(
                     hidden_states.detach().cpu(),
-                    parity_dump_dir
-                    / f"self_residual_norm_input_{parity_index:03d}.pt",
+                    parity_dump_dir / f"self_residual_norm_input_{parity_index:03d}.pt",
                 )
             self._minwm_parity_forward_index = parity_index + 1
 
@@ -906,14 +945,11 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
             _, patch_height, patch_width = self.patch_size
             grid_height = latent_height // patch_height
             grid_width = latent_width // patch_width
-            temporal = (
-                torch.arange(
-                    num_frames,
-                    device=hidden_states.device,
-                    dtype=torch.long,
-                )
-                + int(start_frame)
-            )
+            temporal = torch.arange(
+                num_frames,
+                device=hidden_states.device,
+                dtype=torch.long,
+            ) + int(start_frame)
             temporal = temporal[:, None, None].expand(
                 num_frames, grid_height, grid_width
             )
@@ -927,9 +963,7 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
                 [temporal, height_ids, width_ids], dim=-1
             ).reshape(-1, 3)
             for cache_block in kv_cache:
-                if not isinstance(
-                    cache_block, MinWMCausalSelfAttentionKVCache
-                ):
+                if not isinstance(cache_block, MinWMCausalSelfAttentionKVCache):
                     raise TypeError(
                         "MinWM transformer requires position-aware raw-K caches"
                     )
@@ -1127,10 +1161,24 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
 
             def hook(_module, hook_args, output, detail_name=name):
                 index = counters[detail_name]
-                if index < 2 and detail_name in {"self_q", "cross_q"}:
+                if index < 2 and detail_name in {
+                    "self_q",
+                    "self_out",
+                    "cross_q",
+                    "cross_out",
+                }:
                     torch.save(
                         hook_args[0].detach().cpu(),
                         dump_dir / f"{detail_name}_input_{index:03d}.pt",
+                    )
+                if index == 0 and detail_name == "self_q":
+                    torch.save(
+                        _module.weight.detach().cpu(),
+                        dump_dir / "self_q_weight.pt",
+                    )
+                    torch.save(
+                        _module.bias.detach().cpu(),
+                        dump_dir / "self_q_bias.pt",
                     )
                 dump(detail_name, output)
 
@@ -1139,6 +1187,8 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
         block0 = self.blocks[0]
         block0._minwm_parity_dump_dir = dump_dir
         block0._minwm_parity_forward_index = 0
+        block0.attn1._minwm_parity_dump_dir = dump_dir
+        block0.attn1._minwm_parity_forward_index = 0
         detail_modules = {
             "time_embed": self.condition_embedder.time_embedder,
             "time_projection": self.condition_embedder.time_modulation,
@@ -1146,10 +1196,14 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
             "self_q": block0.to_q,
             "self_k": block0.to_k,
             "self_v": block0.to_v,
+            "self_norm_q": block0.norm_q,
+            "self_norm_k": block0.norm_k,
             "self_out": block0.to_out,
             "cross_q": block0.attn2.to_q,
             "cross_k": block0.attn2.to_k,
             "cross_v": block0.attn2.to_v,
+            "cross_norm_q": block0.attn2.norm_q,
+            "cross_norm_k": block0.attn2.norm_k,
             "cross_out": block0.attn2.to_out,
             "ffn": block0.ffn,
         }

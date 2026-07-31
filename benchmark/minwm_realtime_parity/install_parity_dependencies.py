@@ -20,7 +20,9 @@ except ImportError:
 # Packages that must remain exactly as supplied by the baseline image. Most are
 # numerical; ``kernels`` is also preserved because its SGLang-pinned release
 # targets Transformers 5 and changes the import path of baseline Transformers
-# 4.56 even though MinWM never uses that LLM integration.
+# 4.56 even though MinWM never uses that LLM integration. ``sglang-kernel`` is
+# also preserved because the SGLang-pinned wheel is compiled against SGLang's
+# pinned Torch and may be ABI-incompatible with the baseline Torch.
 PRESERVED_PACKAGES = {
     "diffusers",
     "flash-attn-4",

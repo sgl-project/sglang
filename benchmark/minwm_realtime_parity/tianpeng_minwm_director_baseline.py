@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -32,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", required=True)
     parser.add_argument("--results", required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--max-chunks",
+        type=int,
+        help="Stop after this many DirectorSession blocks for parity debugging.",
+    )
     return parser.parse_args()
 
 
@@ -114,6 +120,159 @@ def main() -> None:
             low_memory=False,
         )
     )
+    dump_root = os.environ.get("MINWM_PARITY_DUMP_DIR")
+    if dump_root:
+        dump_dir = Path(dump_root) / "baseline"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        original_model_flow = pipeline._model_flow
+        forward_index = 0
+        counters: dict[str, int] = {}
+
+        from wan.modules import flex_attn as minwm_flex_attn
+
+        original_qk_norm = minwm_flex_attn.qk_norm_op
+        qk_norm_index = 0
+
+        def qk_norm_with_dump(*qk_args, **qk_kwargs):
+            nonlocal qk_norm_index
+            query, key = original_qk_norm(*qk_args, **qk_kwargs)
+            if qk_norm_index < 2:
+                torch.save(
+                    query.detach().cpu(),
+                    dump_dir / f"self_q_norm_{qk_norm_index:03d}.pt",
+                )
+                torch.save(
+                    key.detach().cpu(),
+                    dump_dir / f"self_k_norm_{qk_norm_index:03d}.pt",
+                )
+            qk_norm_index += 1
+            return query, key
+
+        minwm_flex_attn.qk_norm_op = qk_norm_with_dump
+        original_apply_rope = minwm_flex_attn.apply_rope_varlen_op
+        rope_index = 0
+
+        def apply_rope_with_dump(*rope_args, **rope_kwargs):
+            nonlocal rope_index
+            value = original_apply_rope(*rope_args, **rope_kwargs)
+            forward = rope_index // 2
+            if forward < 2:
+                kind = "k" if rope_index % 2 == 0 else "q"
+                torch.save(
+                    value.detach().cpu(),
+                    dump_dir / f"self_{kind}_roped_{forward:03d}.pt",
+                )
+            rope_index += 1
+            return value
+
+        minwm_flex_attn.apply_rope_varlen_op = apply_rope_with_dump
+
+        def dump_output(name: str, *, include_input: bool = False):
+            counters[name] = 0
+
+            def hook(_module, hook_args, output):
+                index = counters[name]
+                if index < 2:
+                    value = output[0] if isinstance(output, tuple) else output
+                    torch.save(
+                        value.detach().cpu(),
+                        dump_dir / f"{name}_output_{index:03d}.pt",
+                    )
+                    if include_input:
+                        torch.save(
+                            hook_args[0].detach().cpu(),
+                            dump_dir / f"{name}_input_{index:03d}.pt",
+                        )
+                counters[name] = index + 1
+
+            return hook
+
+        block0 = pipeline.generator.blocks[0]
+        torch.save(
+            block0.self_attn.q.weight.detach().cpu(),
+            dump_dir / "self_q_weight.pt",
+        )
+        torch.save(
+            block0.self_attn.q.bias.detach().cpu(),
+            dump_dir / "self_q_bias.pt",
+        )
+        detail_modules = {
+            "patch": pipeline.generator.patch_embedding,
+            "block0": block0,
+            "time_embed": pipeline.generator.time_embedding,
+            "time_projection": pipeline.generator.time_projection,
+            "text_embed": pipeline.generator.text_embedding,
+            "self_q": block0.self_attn.q,
+            "self_k": block0.self_attn.k,
+            "self_v": block0.self_attn.v,
+            "self_norm_q": block0.self_attn.norm_q,
+            "self_norm_k": block0.self_attn.norm_k,
+            "self_out": block0.self_attn.o,
+            "self_residual_norm": block0.norm3,
+            "cross_q": block0.cross_attn.q,
+            "cross_k": block0.cross_attn.k,
+            "cross_v": block0.cross_attn.v,
+            "cross_norm_q": block0.cross_attn.norm_q,
+            "cross_norm_k": block0.cross_attn.norm_k,
+            "cross_out": block0.cross_attn.o,
+            "ffn": block0.ffn,
+        }
+        for name, module in detail_modules.items():
+            module.register_forward_hook(
+                dump_output(
+                    name,
+                    include_input=name
+                    in {
+                        "block0",
+                        "self_q",
+                        "self_out",
+                        "self_residual_norm",
+                        "cross_q",
+                        "cross_out",
+                    },
+                )
+            )
+
+        def model_flow_with_dump(
+            latents,
+            conditional_dict,
+            timestep,
+            action,
+            cache,
+            self_cache_update,
+            condition_switch=None,
+        ):
+            nonlocal forward_index
+            output = original_model_flow(
+                latents,
+                conditional_dict,
+                timestep,
+                action,
+                cache,
+                self_cache_update,
+                condition_switch,
+            )
+            torch.save(
+                {
+                    "latent_model_input": latents.detach().cpu(),
+                    "prompt_embeds": (
+                        conditional_dict["flat_prompt_embeds"].detach().cpu()
+                        if forward_index == 0
+                        else None
+                    ),
+                    "prompt_lens": conditional_dict["prompt_lens"],
+                    "timestep": timestep.detach().cpu(),
+                    "action": None if action is None else action.detach().cpu(),
+                    "self_cache_update": self_cache_update,
+                    "condition_switch": condition_switch,
+                    "output": output.detach().cpu(),
+                },
+                dump_dir / f"forward_{forward_index:03d}.pt",
+            )
+            forward_index += 1
+            return output
+
+        pipeline._model_flow = model_flow_with_dump
     expected_config = {
         "height": 480,
         "width": 832,
@@ -172,6 +331,9 @@ def main() -> None:
     step_timings = []
     torch.cuda.synchronize()
     started = time.perf_counter()
+    max_chunks = args.max_chunks
+    if max_chunks is not None and not 1 <= max_chunks <= len(block_lengths):
+        raise ValueError(f"max_chunks must be in [1, {len(block_lengths)}]")
     for segment_index, segment in enumerate(segments):
         segment_start = _video_boundary_to_latent(
             int(segment["start"]), temporal_factor
@@ -201,10 +363,14 @@ def main() -> None:
             )
             latent_cursor = block_end
             block_cursor += 1
+            if max_chunks is not None and block_cursor >= max_chunks:
+                break
         session.commit()
+        if max_chunks is not None and block_cursor >= max_chunks:
+            break
     torch.cuda.synchronize()
     generation_seconds = time.perf_counter() - started
-    if block_cursor != len(block_lengths):
+    if max_chunks is None and block_cursor != len(block_lengths):
         raise ValueError("not every director block was generated")
 
     torch.cuda.synchronize()
@@ -222,7 +388,8 @@ def main() -> None:
         .cpu()
         .numpy()
     )
-    expected_shape = (1089, 480, 832, 3)
+    expected_frames = 1 + (latent_cursor - 1) * temporal_factor
+    expected_shape = (expected_frames, 480, 832, 3)
     if frames.shape != expected_shape:
         raise ValueError(f"native output {frames.shape} != {expected_shape}")
 
@@ -254,11 +421,15 @@ def main() -> None:
         "native_video_sha256": sha256_file(results / "native_minwm.mp4"),
         "native_latents_sha256": sha256_file(results / "native_minwm_latents.pt"),
         "published_baseline_sha256": sha256_file(baseline),
-        "published_baseline_psnr": _run_ffmpeg_metric(
-            "psnr", baseline, results / "native_minwm.mp4"
+        "published_baseline_psnr": (
+            _run_ffmpeg_metric("psnr", baseline, results / "native_minwm.mp4")
+            if max_chunks is None
+            else None
         ),
-        "published_baseline_ssim": _run_ffmpeg_metric(
-            "ssim", baseline, results / "native_minwm.mp4"
+        "published_baseline_ssim": (
+            _run_ffmpeg_metric("ssim", baseline, results / "native_minwm.mp4")
+            if max_chunks is None
+            else None
         ),
         "gpu": subprocess.check_output(
             [
