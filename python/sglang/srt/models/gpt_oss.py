@@ -1329,19 +1329,18 @@ class GptOssForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return
 
+        num_layers = self.config.num_hidden_layers
         if layer_ids is None:
             self.capture_aux_hidden_states = True
-            num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
             self.capture_aux_hidden_states = True
-            # EAGLE3 configs use either output-layer IDs (starting at 1) or
-            # hidden-state boundary IDs. Mirror DeepseekV2ForCausalLM:
-            # convert the former to boundary indices and preserve the latter.
-            if layer_ids and layer_ids[0] == 1:
-                self.model.layers_to_capture = [val + 1 for val in layer_ids]
-            else:
+            # Preserve IDs that already include the final hidden-state
+            # boundary; otherwise retain the legacy output-layer conversion.
+            if layer_ids and max(layer_ids) == num_layers:
                 self.model.layers_to_capture = list(layer_ids)
+            else:
+                self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
         if not self.pp_group.is_last_rank:
