@@ -261,15 +261,20 @@ class NemotronHMoE(nn.Module):
             self.fc1_latent_proj = None
             self.fc2_latent_proj = None
 
-        self.use_min_latency_fc1_gemm = (
-            self.use_latent_moe
-            and self.fc1_latent_proj is not None
-            and _is_cuda
-            and fused_a_gemm_weight_eligible(self.fc1_latent_proj)
-        )
+        # Resolved on first forward, not here: quant methods rewrite
+        # fc1_latent_proj.weight in process_weights_after_loading (e.g. bf16 ->
+        # float8_e4m3fn), so the dtype is not final at construction time.
+        self._use_min_latency_fc1_gemm: bool | None = None
 
     def _apply_fc1_latent_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.use_min_latency_fc1_gemm:
+        if self._use_min_latency_fc1_gemm is None:
+            self._use_min_latency_fc1_gemm = (
+                self.use_latent_moe
+                and self.fc1_latent_proj is not None
+                and _is_cuda
+                and fused_a_gemm_weight_eligible(self.fc1_latent_proj)
+            )
+        if self._use_min_latency_fc1_gemm:
             return linear_with_fused_a_gemm(self.fc1_latent_proj, hidden_states)
         return self.fc1_latent_proj(hidden_states)[0]
 
