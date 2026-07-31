@@ -1,7 +1,7 @@
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
-  name: minwm-tianpeng-l40s-spot
+  name: minwm-tianpeng-l40s-ondemand
   labels:
     seedleap.ai/task: minwm-realtime-parity
     seedleap.ai/owner: chenshengdong
@@ -14,7 +14,7 @@ spec:
   template:
     metadata:
       labels:
-        seedleap.ai/capacity-pool: minwm-tianpeng-l40s
+        seedleap.ai/capacity-pool: minwm-tianpeng-l40s-ondemand
         seedleap.ai/task: minwm-realtime-parity
     spec:
       expireAfter: 2h
@@ -26,7 +26,7 @@ spec:
         - key: karpenter.sh/capacity-type
           operator: In
           values:
-            - spot
+            - on-demand
         - key: kubernetes.io/arch
           operator: In
           values:
@@ -34,20 +34,75 @@ spec:
         - key: topology.kubernetes.io/zone
           operator: In
           values:
+            - us-east-2a
             - us-east-2b
+            - us-east-2c
         - key: node.kubernetes.io/instance-type
           operator: In
           values:
             - g6e.4xlarge
+            - g6e.8xlarge
       taints:
         - key: seedleap.ai/capacity-pool
-          value: minwm-tianpeng-l40s
+          value: minwm-tianpeng-l40s-ondemand
           effect: NoSchedule
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: minwm-tianpeng-nvidia-device-plugin
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: minwm-tianpeng-nvidia-device-plugin
+    seedleap.ai/task: minwm-realtime-parity
+    seedleap.ai/owner: chenshengdong
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-tianpeng-nvidia-device-plugin
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-tianpeng-nvidia-device-plugin
+        seedleap.ai/task: minwm-realtime-parity
+    spec:
+      priorityClassName: system-node-critical
+      nodeSelector:
+        seedleap.ai/capacity-pool: minwm-tianpeng-l40s-ondemand
+      tolerations:
+        - key: seedleap.ai/capacity-pool
+          operator: Equal
+          value: minwm-tianpeng-l40s-ondemand
+          effect: NoSchedule
+      containers:
+        - name: nvidia-device-plugin
+          image: nvcr.io/nvidia/k8s-device-plugin:v0.19.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - nvidia-device-plugin
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: kubelet-device-plugins
+              mountPath: /var/lib/kubelet/device-plugins
+      volumes:
+        - name: kubelet-device-plugins
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory
 ---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: minwm-tianpeng-gap12-l40s-20260731-01
+  name: minwm-tianpeng-gap12-l40s-20260731-02
   namespace: ray
   labels:
     app.kubernetes.io/name: minwm-tianpeng-gap12-l40s
@@ -59,7 +114,7 @@ metadata:
     seedleap.ai/alignment-code-ref: 386f8c242704db4c848bae14097b89cfebc5ae4e
     seedleap.ai/checkpoint-version-id: sL6CTylRv4QWY98mVTkuLoe5REbKHlvd
     seedleap.ai/checkpoint-sha256: 18a48a2709d74b93ce26f0b808f381d191553853aae81dd72d2438430251d379
-    seedleap.ai/capacity-type: spot
+    seedleap.ai/capacity-type: on-demand
 spec:
   backoffLimit: 0
   activeDeadlineSeconds: 7200
@@ -76,14 +131,12 @@ spec:
         seLinuxOptions:
           type: spc_t
       nodeSelector:
-        seedleap.ai/capacity-pool: minwm-tianpeng-l40s
-        node.kubernetes.io/instance-type: g6e.4xlarge
-        topology.kubernetes.io/zone: us-east-2b
-        karpenter.sh/capacity-type: spot
+        seedleap.ai/capacity-pool: minwm-tianpeng-l40s-ondemand
+        karpenter.sh/capacity-type: on-demand
       tolerations:
         - key: seedleap.ai/capacity-pool
           operator: Equal
-          value: minwm-tianpeng-l40s
+          value: minwm-tianpeng-l40s-ondemand
           effect: NoSchedule
       containers:
         - name: parity
@@ -109,7 +162,7 @@ spec:
             - name: CHECKPOINT_BYTES
               value: "20014120667"
             - name: RESULT_RUN_ID
-              value: 20260731-l40s-01
+              value: 20260731-l40s-02
             - name: MINWM_PARITY_DETERMINISTIC
               value: "0"
             - name: MINWM_DETERMINISTIC_ATTENTION
