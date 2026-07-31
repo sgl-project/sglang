@@ -38,6 +38,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         num_v_heads: int,
         head_v_dim: int,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Packed decode fast path: feed the conv-1d output ``mixed_qkv``
@@ -68,8 +69,10 @@ class TritonKDAKernel(LinearAttnKernelBase):
             and replayssm_write_pos is not None
         ):
             K = ssm_states.shape[-1]  # ssm_states: [num_slots, HV, V, K]
+            # lower_bound is now supported in the ReplaySSM kernel
             fused_recurrent_linear_replayssm_decode(
                 mixed_qkv=mixed_qkv,
+                lower_bound=lower_bound,
                 a=a.reshape(B, num_v_heads, K).contiguous(),
                 b=b.reshape(B, num_v_heads).contiguous(),
                 A_log=A_log.reshape(-1),
@@ -105,6 +108,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             out=out,
             ssm_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
+            lower_bound=lower_bound,
         )
         # [B, 1, HV, V] -> [1, B, HV, V] view to match existing decode layout.
         return out.transpose(0, 1)
@@ -122,6 +126,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         return fused_sigmoid_gating_delta_rule_update(
@@ -139,6 +144,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             softplus_beta=1.0,
             softplus_threshold=20.0,
             is_kda=True,
+            lower_bound=lower_bound,
         )
 
     def target_verify(

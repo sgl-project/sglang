@@ -93,6 +93,8 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     MAX_CACHE_LEN: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    lower_bound_val: tl.constexpr,
     HAS_FORCE_FLUSH: tl.constexpr,
     IS_KDA: tl.constexpr,
 ):
@@ -286,10 +288,13 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             b_a_c = tl.load(p_a_c, mask=mask_kt, other=0.0).to(tl.float32)
             b_dt_c = tl.load(p_dt_c, mask=mask_kt, other=0.0).to(tl.float32)
             x_c = b_a_c + b_dt_c
-            softplus_c = tl.where(
-                x_c <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x_c)), x_c
-            )
-            g_cur_c = -tl.exp(A_log_val) * softplus_c  # [BKT]
+            if USE_LOWER_BOUND:
+                g_cur_c = lower_bound_val * tl.sigmoid(tl.exp(A_log_val) * x_c)
+            else:
+                softplus_c = tl.where(
+                    x_c <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x_c)), x_c
+                )
+                g_cur_c = -tl.exp(A_log_val) * softplus_c  # [BKT]
             alpha_cur_c = tl.exp(g_cur_c)
             q_eff = q_cs * alpha_cur_c
             k_eff = k_c * alpha_cur_c
@@ -449,6 +454,7 @@ def fused_recurrent_linear_replayssm_decode(
     write_pos: torch.Tensor,
     force_flush: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    lower_bound: float | None = None,
     is_kda: bool = False,
     block_v: int | None = None,
     num_warps: int = 1,
@@ -611,6 +617,8 @@ def fused_recurrent_linear_replayssm_decode(
         MAX_CACHE_LEN=max_cache_len,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        USE_LOWER_BOUND=lower_bound is not None,
+        lower_bound_val=float(lower_bound) if lower_bound is not None else 0.0,
         HAS_FORCE_FLUSH=force_flush is not None,
         IS_KDA=is_kda,
         num_warps=num_warps,
