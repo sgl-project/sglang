@@ -309,9 +309,7 @@ def sparse_mla_q8kv8_prefill_fwd(
         )
 
     if h_kv != 1:
-        raise ValueError(
-            f"sparse_mla_q8kv8_prefill_fwd requires h_kv=1, got {h_kv}"
-        )
+        raise ValueError(f"sparse_mla_q8kv8_prefill_fwd requires h_kv=1, got {h_kv}")
 
     if d_qk not in (512, 576):
         raise ValueError(

@@ -150,6 +150,7 @@ def gather_dequant_requant_fp8_paged(
     )
     return out
 
+
 def q8kv8_padded_num_heads(num_heads: int) -> int:
     """Return a Q-head count supported by the SM90 Q8KV8 kernel."""
     if num_heads <= 0:
@@ -162,6 +163,7 @@ def q8kv8_padded_num_heads(num_heads: int) -> int:
         "DeepSeek-V4 Q8KV8 sparse prefill supports at most 128 local "
         f"query heads, got {num_heads}"
     )
+
 
 def cast_q_fp8_for_q8kv8_prefill(
     q: torch.Tensor,
@@ -198,7 +200,11 @@ def cast_q_fp8_for_q8kv8_prefill(
             device=q.device,
         )
     else:
-        if out.shape != expected_shape or out.dtype != fp8_dtype or out.device != q.device:
+        if (
+            out.shape != expected_shape
+            or out.dtype != fp8_dtype
+            or out.device != q.device
+        ):
             raise ValueError(
                 "Q8KV8 Q output must have shape/dtype/device "
                 f"{expected_shape}/{fp8_dtype}/{q.device}, got "
@@ -211,6 +217,7 @@ def cast_q_fp8_for_q8kv8_prefill(
     q_fp8[:, :num_heads].copy_(q)
     q_scale = torch.ones((), dtype=torch.float32, device=q.device)
     return q_fp8, q_scale
+
 
 @triton.jit
 def _dequantize_k_cache_paged_kernel(

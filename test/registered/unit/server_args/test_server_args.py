@@ -50,9 +50,7 @@ class TestPrepareServerArgs(CustomTestCase):
         default_args = parser.parse_args([])
         self.assertEqual(default_args.dsv4_prefill_backend, "auto")
 
-        q8_args = parser.parse_args(
-            ["--dsv4-prefill-backend", "flashmla_sparse_q8"]
-        )
+        q8_args = parser.parse_args(["--dsv4-prefill-backend", "flashmla_sparse_q8"])
         self.assertEqual(q8_args.dsv4_prefill_backend, "flashmla_sparse_q8")
 
         with self.assertRaises(SystemExit):
