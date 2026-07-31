@@ -110,6 +110,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 )
 
         self.page_size = params.page_size
+        self.storage_page_size = self.page_size
         self.hybrid_kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
         if not isinstance(self.hybrid_kv_cache, HybridLinearKVPool):
             raise ValueError(
@@ -154,6 +155,8 @@ class HiMambaRadixCache(MambaRadixCache):
             load_cache_event=self.load_cache_event,
             enable_storage_metrics=self.enable_storage_metrics,
         )
+        if self.enable_storage:
+            self.storage_page_size = self.cache_controller.storage_page_size
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
             prefetch_threshold=prefetch_threshold,
@@ -956,6 +959,12 @@ class HiMambaRadixCache(MambaRadixCache):
         self.mamba_evictable_size_ += len(mamba_value)
         if self.enable_storage or self.enable_kv_cache_events:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+        if self.enable_storage:
+            new_node.storage_hash_value = compute_node_hash_values(
+                new_node,
+                self.storage_page_size,
+                hash_attr="storage_hash_value",
+            )
         self._record_store_event(new_node, medium=StorageMedium.GPU)
         self._update_full_device_leaf_status(new_node)
         self._update_full_device_leaf_status(parent)
@@ -1111,8 +1120,13 @@ class HiMambaRadixCache(MambaRadixCache):
             return self._split_evicted_node(key, child, split_len)
 
         self.evictable_full_device_leaves.discard(child)
+        storage_parent_hashes, storage_child_hashes = split_node_hash_value(
+            child.storage_hash_value, split_len, self.storage_page_size
+        )
 
         new_node = super()._split_node(key, child, split_len)
+        new_node.storage_hash_value = storage_parent_hashes
+        child.storage_hash_value = storage_child_hashes
 
         if child.backuped:
             new_node.host_value = child.host_value[:split_len].clone()
@@ -1143,6 +1157,9 @@ class HiMambaRadixCache(MambaRadixCache):
 
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
+        )
+        new_node.storage_hash_value, child.storage_hash_value = split_node_hash_value(
+            child.storage_hash_value, split_len, self.storage_page_size
         )
 
         child.last_access_time = get_last_access_time()
@@ -1388,6 +1405,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 storage_backend_extra_config=extra_config,
                 host_pools=self.host_pool_group.entries,
             )
+            self.storage_page_size = self.cache_controller.storage_page_size
         except Exception as e:
             logger.exception(
                 f"Failed to attach storage backend '{storage_backend}': {e}"
@@ -1796,6 +1814,7 @@ class HiMambaRadixCache(MambaRadixCache):
             node.key,
             node.hash_value,
             prefix_keys,
+            storage_hash_value=node.storage_hash_value,
             extra_pools=extra_pools,
         )
         mamba_host_protected = extra_pools is not None
@@ -1839,6 +1858,11 @@ class HiMambaRadixCache(MambaRadixCache):
             new_input_tokens,
             last_hash,
             prefix_keys,
+            storage_last_hash=(
+                last_host_node.storage_hash_value[-1]
+                if last_host_node.storage_hash_value
+                else None
+            ),
             extra_pools=extra_pools,
         )
         self.ongoing_prefetch[req_id] = (
@@ -1907,6 +1931,10 @@ class HiMambaRadixCache(MambaRadixCache):
             ),
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
+            operation.storage_hash_value[
+                : (min_completed_tokens // self.page_size)
+                * self.cache_controller.storage_hashes_per_page
+            ],
             mamba_host_indices,
             mamba_loaded,
         )
@@ -1948,6 +1976,7 @@ class HiMambaRadixCache(MambaRadixCache):
         key: RadixKey,
         host_value,
         hash_value,
+        storage_hash_value,
         mamba_host_value: Optional[torch.Tensor] = None,
         mamba_loaded: bool = False,
     ):
@@ -1968,6 +1997,9 @@ class HiMambaRadixCache(MambaRadixCache):
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
+            storage_hash_value = storage_hash_value[
+                prefix_len // self.storage_page_size :
+            ]
             matched_length += prefix_len
 
             if prefix_len < len(node.key):
@@ -1986,6 +2018,7 @@ class HiMambaRadixCache(MambaRadixCache):
             new_node.mamba_value = None
             new_node.host_value = host_value.clone()
             new_node.hash_value = hash_value
+            new_node.storage_hash_value = storage_hash_value
             node.children[child_key] = new_node
             leaf_node = new_node
             self._update_full_host_leaf_status(new_node)

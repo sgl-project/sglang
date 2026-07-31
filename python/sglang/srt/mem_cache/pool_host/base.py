@@ -325,14 +325,16 @@ class HostKVCache(abc.ABC):
 
         Keep this rank's slots (% dcp_size == dcp_rank), then collapse (// dcp_size).
         """
-        if self.dcp_size == 1:
+        dcp_size = getattr(self, "dcp_size", 1)
+        dcp_rank = getattr(self, "dcp_rank", 0)
+        if dcp_size == 1:
             return indices
-        owned = indices[indices % self.dcp_size == self.dcp_rank] // self.dcp_size
-        assert owned.numel() * self.dcp_size == indices.numel(), (
+        owned = indices[indices % dcp_size == dcp_rank] // dcp_size
+        assert owned.numel() * dcp_size == indices.numel(), (
             "HiCache DCP translation expects runs of whole widened pages "
             f"(every residue class equally represented); got {indices.numel()} "
             f"logical slots -> {owned.numel()} owned rows with dcp_size="
-            f"{self.dcp_size}."
+            f"{dcp_size}."
         )
         return owned
 

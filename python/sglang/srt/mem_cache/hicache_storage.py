@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -21,6 +22,44 @@ logger = logging.getLogger(__name__)
 
 # Max pages per batched storage IO call.
 STORAGE_BATCH_SIZE = 128
+
+
+def load_hicache_storage_backend_extra_config(
+    storage_backend_extra_config: Optional[str],
+) -> dict:
+    """Load HiCache storage configuration from inline JSON or an @file."""
+    if not storage_backend_extra_config:
+        return {}
+
+    if not storage_backend_extra_config.startswith("@"):
+        extra_config = json.loads(storage_backend_extra_config)
+    else:
+        path = storage_backend_extra_config[1:]
+        ext = os.path.splitext(path)[1].lower()
+        with open(path, "rb" if ext == ".toml" else "r") as f:
+            if ext == ".json":
+                extra_config = json.load(f)
+            elif ext == ".toml":
+                import tomllib
+
+                extra_config = tomllib.load(f)
+            elif ext in (".yaml", ".yml"):
+                import yaml
+
+                extra_config = yaml.safe_load(f)
+            else:
+                raise ValueError(
+                    f"Unsupported config file {path} (config format: {ext})"
+                )
+
+    if extra_config is None:
+        return {}
+    if not isinstance(extra_config, dict):
+        raise ValueError(
+            "HiCache storage backend extra config must contain a mapping, got "
+            f"{type(extra_config).__name__}."
+        )
+    return extra_config
 
 
 @dataclass

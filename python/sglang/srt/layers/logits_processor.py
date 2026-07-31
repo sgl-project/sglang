@@ -77,14 +77,15 @@ def should_enable_multimem_logits_all_gather(
     do_tensor_parallel_all_gather: bool,
     use_attn_tp_group: bool,
     dcp_enabled: bool,
+    disaggregation_mode: str,
 ) -> bool:
     """Return whether the logits TP gather can use torch symmetric memory.
 
     Kimi-K3 DCP already disables ``--enable-symm-mem`` because its decode
-    CUDA-graph path is not compatible with symmetric memory.  The logits
-    gatherer allocates torch symmetric memory independently of that flag, so
-    it must observe the same restriction or the first real forward can hang in
-    ``torch.distributed._symmetric_memory.rendezvous``.
+    CUDA-graph path is not compatible with symmetric memory.  A disaggregated
+    Kimi prefill worker can hit the same rendezvous hang even with DCP=1.
+    The logits gatherer allocates torch symmetric memory independently of that
+    flag, so it must observe both restrictions.
     """
     architectures = getattr(config, "architectures", None) or ()
     is_kimi_k3 = (
@@ -95,7 +96,10 @@ def should_enable_multimem_logits_all_gather(
     return (
         do_tensor_parallel_all_gather
         and not use_attn_tp_group
-        and not (is_kimi_k3 and dcp_enabled)
+        and not (
+            is_kimi_k3
+            and (dcp_enabled or disaggregation_mode == "prefill")
+        )
     )
 
 
@@ -413,6 +417,7 @@ class LogitsProcessor(nn.Module):
             # already being published. ServerArgs is authoritative while
             # model layers are being constructed.
             dcp_enabled=get_server_args().dcp_size > 1,
+            disaggregation_mode=get_server_args().disaggregation_mode,
         )
         if (
             self.do_tensor_parallel_all_gather
@@ -420,7 +425,7 @@ class LogitsProcessor(nn.Module):
             and not enable_multimem_logits_gather
         ):
             logger.info(
-                "Kimi-K3 DCP disables multimem logits all-gather; "
+                "Kimi-K3 DCP/disaggregation disables multimem logits all-gather; "
                 "falling back to NCCL."
             )
 

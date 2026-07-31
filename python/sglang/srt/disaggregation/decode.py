@@ -1145,13 +1145,33 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             seq_len = origin_input_len
 
             def _mamba_payload():
-                return [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        decode_req.req.req_pool_idx
-                    ]
-                    .cpu()
-                    .numpy()
+                req = decode_req.req
+                indices = [
+                    int(
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            req.req_pool_idx
+                        ].item()
+                    )
                 ]
+                decode_offload_enabled = (
+                    self.scheduler.server_args
+                    .disaggregation_decode_enable_offload_kvcache
+                )
+                if (
+                    decode_offload_enabled
+                    and req.mamba_ping_pong_track_buffer is not None
+                ):
+                    interval = self.scheduler.server_args.mamba_track_interval
+                    checkpoint_len = seq_len // interval * interval
+                    if checkpoint_len > 0:
+                        keep_idx = (
+                            self.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
+                        )
+                        indices.append(
+                            int(req.mamba_ping_pong_track_buffer[keep_idx].item())
+                        )
+                        req.mamba_last_track_seqlen = checkpoint_len
+                return indices
 
             def _swa_payload():
                 window_size = self.scheduler.sliding_window_size

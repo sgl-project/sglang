@@ -357,6 +357,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Tag HiCache enablement on the TreeCore.
         if self.cache_controller is not None:
             self.tree_core.set_hicache_enabled()
+            self.tree_core.storage_page_size = (
+                self.cache_controller.storage_page_size
+            )
             if self.supports_swa():
                 swa = self.components[ComponentType.SWA]
                 self.tree_core.has_swa_host_pool = swa._swa_kv_pool_host is not None
@@ -1178,6 +1181,7 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.token_ids,
             spec.hash_value,
             spec.prefix_keys,
+            storage_hash_value=spec.storage_hash_value,
             extra_pools=aux_xfers or None,
         )
         self.ongoing_backup[operation_id] = (
@@ -1265,6 +1269,9 @@ class UnifiedRadixCache(BasePrefixCache):
             prefetch_key,
             last_hash,
             prefix_keys,
+            storage_last_hash=self.tree_core.node_by_id(
+                last_host_node_id
+            ).get_last_storage_hash_value(),
             extra_pools=aux_xfers or None,
         )
         self.ongoing_prefetch[req_id] = _OngoingPrefetch(
@@ -1363,6 +1370,10 @@ class UnifiedRadixCache(BasePrefixCache):
             fetched_key,
             host_indices[:min_completed_tokens],
             hash_value[: min_completed_tokens // self.page_size],
+            operation.storage_hash_value[
+                : min_completed_tokens
+                // self.cache_controller.storage_page_size
+            ],
         )
 
         # Apply the host-insert walk's actions before the transfer commit.
@@ -2083,6 +2094,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def release_radix_session(self, session_id: str) -> int:
         return self.session_refs.release_radix_session(session_id)
+
+    def get_mamba_device_value(self, node: NodeId) -> Optional[torch.Tensor]:
+        if not self.is_mamba_enabled:
+            return None
+        return self.tree_core.get_component_device_value(node, ComponentType.MAMBA)
 
     # ---- Streaming session API (delegates to composed StreamingSession) ----
 

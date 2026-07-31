@@ -36,6 +36,22 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
 
     if (
         server_args.disaggregation_mode == "decode"
+        and server_args.dcp_size > 1
+        and server_args.hicache_storage_backend is not None
+        and server_args.hicache_storage_backend != "mooncake"
+        and (
+            server_args.enable_hierarchical_cache
+            or server_args.disaggregation_decode_enable_offload_kvcache
+        )
+    ):
+        raise ValueError(
+            "PD decode DCP L3 offload currently requires "
+            "--hicache-storage-backend mooncake, got "
+            f"{server_args.hicache_storage_backend!r}."
+        )
+
+    if (
+        server_args.disaggregation_mode == "decode"
         and server_args.enable_hierarchical_cache
         and not server_args.disaggregation_decode_enable_radix_cache
         and server_args.hicache_storage_backend is not None

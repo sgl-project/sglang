@@ -586,6 +586,35 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
 
             self.storage_config = storage_config
+            extra_config = storage_config.extra_config or {}
+            self.canonical_dcp_size = int(extra_config.get("canonical_dcp_size", 0))
+            self.canonical_page_size = int(extra_config.get("canonical_page_size", 0))
+            if self.canonical_dcp_size:
+                if self.canonical_page_size <= 0:
+                    raise ValueError(
+                        "canonical_page_size is required when canonical_dcp_size "
+                        "is enabled."
+                    )
+                if self.attn_dcp_size not in (1, self.canonical_dcp_size):
+                    raise ValueError(
+                        "Mooncake canonical DCP layout currently supports only "
+                        "DCP1 or the canonical DCP size itself: "
+                        f"local={self.attn_dcp_size}, "
+                        f"canonical={self.canonical_dcp_size}."
+                    )
+                self.canonical_mla_scope = (
+                    f"canonv1_tp{storage_config.tp_size}_"
+                    f"pp{self.pp_rank}of{self.pp_size}"
+                )
+                # Hybrid sidecars (Mamba/KDA state) must use the same
+                # cross-DCP namespace on both DCP1 and DCP-N.  The legacy
+                # mha_suffix does not encode the canonical geometry, so it can
+                # collide with non-canonical objects or another canonical N.
+                self.canonical_hybrid_scope = (
+                    f"{self.canonical_mla_scope}_"
+                    f"dcp{self.canonical_dcp_size}_"
+                    f"page{self.canonical_page_size}"
+                )
             self.should_split_heads = storage_config.should_split_heads
             self.split_factor = 0
             if self.should_split_heads:
@@ -764,9 +793,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
             # its temporal pointer under the same condition to stay aligned.
             conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
+            mamba_scope = (
+                f"{self.canonical_hybrid_scope}_rank{self.mha_suffix}"
+                if self.canonical_dcp_size
+                else self.mha_suffix
+            )
+            suffixes = [f"_{mamba_scope}_conv_{i}" for i in range(conv_num)]
             if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
-                suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
+                suffixes = [f"_{mamba_scope}_temporal"] + suffixes
         elif pool_name == PoolName.DRAFT:
             # Draft pool's MLA/MHA layout is independent from the target
             # (e.g. EAGLE-MHA draft on top of an MLA target), so pick the
@@ -829,12 +863,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
+        sidecar_keys = keys
+        canonical_hashes = self._canonical_hashes(extra_info)
+        if canonical_hashes:
+            hashes_per_page = len(canonical_hashes) // len(keys)
+            sidecar_keys = [
+                canonical_hashes[(page + 1) * hashes_per_page - 1]
+                for page in range(len(keys))
+            ]
 
         for transfer in pool_transfers or []:
             if final_pages == 0:
                 break
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
+                sidecar_keys, transfer
             )
             component_keys = self._tag_keys(component_keys)
             ex = self._batch_exist(component_keys)
@@ -994,6 +1036,112 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
+    def _canonical_hashes(
+        self, extra_info: Optional[HiCacheStorageExtraInfo]
+    ) -> Optional[List[str]]:
+        if not self.canonical_dcp_size or extra_info is None:
+            return None
+        return (extra_info.extra_info or {}).get("canonical_hashes")
+
+    def _canonical_mla_keys(self, canonical_hashes: List[str]) -> List[str]:
+        if self.attn_dcp_size == 1:
+            return [
+                (
+                    f"{page_hash}_{self.canonical_mla_scope}_"
+                    f"dcp{shard}of{self.canonical_dcp_size}_k"
+                )
+                for page_hash in canonical_hashes
+                for shard in range(self.canonical_dcp_size)
+            ]
+        return [
+            (
+                f"{page_hash}_{self.canonical_mla_scope}_"
+                f"dcp{self.attn_dcp_rank}of{self.canonical_dcp_size}_k"
+            )
+            for page_hash in canonical_hashes
+        ]
+
+    def _get_canonical_mla_buffer_meta(
+        self, canonical_hashes: List[str], host_indices: torch.Tensor
+    ):
+        """Map DCP1/DCP-N host pages to canonical N-way token-shard objects.
+
+        A canonical page is split by token position modulo N.  DCP-N owns one
+        contiguous component per rank; DCP1 exposes the same object as a
+        multi-buffer made of N-strided token rows.  Mooncake concatenates or
+        scatters those rows without an intermediate copy.
+        """
+        pool_group = self.mem_pool_host
+        host_pool = getattr(
+            getattr(pool_group, "anchor_entry", None),
+            "host_pool",
+            pool_group,
+        )
+        if pool_group.layout != "page_first":
+            raise ValueError(
+                "Mooncake canonical DCP layout currently requires "
+                "--hicache-mem-layout page_first."
+            )
+        logical_page_size = pool_group.logical_page_size
+        logical_pages = len(host_indices) // logical_page_size
+        hashes_per_page = logical_page_size // self.canonical_page_size
+        if len(canonical_hashes) != logical_pages * hashes_per_page:
+            raise ValueError(
+                "Canonical hash/page mismatch: "
+                f"hashes={len(canonical_hashes)}, logical_pages={logical_pages}, "
+                f"hashes_per_page={hashes_per_page}."
+            )
+        tokens_per_shard = self.canonical_page_size // self.canonical_dcp_size
+        if tokens_per_shard <= 0:
+            raise ValueError(
+                "canonical_page_size must be at least canonical_dcp_size."
+            )
+
+        indices = host_indices.tolist()
+        base_ptr = host_pool.kv_buffer.data_ptr()
+        row_bytes = (
+            host_pool.layer_num
+            * host_pool.kv_cache_dim
+            * host_pool.dtype.itemsize
+        )
+        ptrs = []
+        sizes = []
+        for logical_page in range(logical_pages):
+            logical_start = int(indices[logical_page * logical_page_size])
+            physical_start = host_pool._storage_physical_page_start(logical_start)
+            if self.attn_dcp_size == 1:
+                for _canonical_page in range(hashes_per_page):
+                    canonical_start = physical_start + (
+                        _canonical_page * self.canonical_page_size
+                    )
+                    for shard in range(self.canonical_dcp_size):
+                        shard_ptrs = [
+                            base_ptr
+                            + (
+                                canonical_start
+                                + shard
+                                + token_idx * self.canonical_dcp_size
+                            )
+                            * row_bytes
+                            for token_idx in range(tokens_per_shard)
+                        ]
+                        ptrs.append(shard_ptrs)
+                        sizes.append([row_bytes] * tokens_per_shard)
+            else:
+                for canonical_page in range(hashes_per_page):
+                    component_start = (
+                        physical_start + canonical_page * tokens_per_shard
+                    )
+                    ptrs.append(base_ptr + component_start * row_bytes)
+                    sizes.append(tokens_per_shard * row_bytes)
+
+        keys = self._canonical_mla_keys(canonical_hashes)
+        if len(keys) != len(ptrs):
+            raise RuntimeError(
+                f"Canonical Mooncake key/buffer mismatch: {len(keys)} != {len(ptrs)}"
+            )
+        return keys, ptrs, sizes
+
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
         logical_page_size = getattr(
@@ -1054,7 +1202,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+        canonical_hashes = self._canonical_hashes(extra_info)
+        if self.is_mla_backend and canonical_hashes:
+            canonical_hashes = self._tag_keys(canonical_hashes)
+            key_strs, buffer_ptrs, buffer_sizes = (
+                self._get_canonical_mla_buffer_meta(canonical_hashes, host_indices)
+            )
+            key_multiplier = self.canonical_dcp_size
+        else:
+            key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+                keys, host_indices
+            )
+            key_multiplier = None
 
         start_time = time.perf_counter()
         get_results = self._get_batch_zero_copy_impl(
@@ -1068,7 +1227,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 len(keys) / (end_time - start_time) * self.gb_per_page
             )
 
-        return self._batch_postprocess(get_results, is_set_operate=False)
+        return self._batch_postprocess(
+            get_results,
+            is_set_operate=False,
+            key_multiplier=key_multiplier,
+        )
 
     def batch_set_v1(
         self,
@@ -1083,8 +1246,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
-        key_multiplier = len(key_strs) // len(keys)
+        canonical_hashes = self._canonical_hashes(extra_info)
+        if self.is_mla_backend and canonical_hashes:
+            canonical_hashes = self._tag_keys(canonical_hashes)
+            key_strs, buffer_ptrs, buffer_sizes = (
+                self._get_canonical_mla_buffer_meta(canonical_hashes, host_indices)
+            )
+            key_multiplier = self.canonical_dcp_size
+        else:
+            key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+                keys, host_indices
+            )
+            key_multiplier = len(key_strs) // len(keys)
         group_ids = (
             self._expand_group_ids(keys, key_multiplier)
             if self._can_use_group_semantics()
@@ -1126,7 +1299,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]
 
-        return self._batch_postprocess(set_results, is_set_operate=True)
+        return self._batch_postprocess(
+            set_results,
+            is_set_operate=True,
+            key_multiplier=key_multiplier,
+        )
 
     def set(
         self,
@@ -1257,7 +1434,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
-        if self.is_mla_backend:
+        canonical_hashes = self._canonical_hashes(extra_info)
+        if self.is_mla_backend and canonical_hashes:
+            canonical_hashes = self._tag_keys(canonical_hashes)
+            query_keys = self._canonical_mla_keys(canonical_hashes)
+            key_multiplier = self.canonical_dcp_size
+        elif self.is_mla_backend:
             query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
             key_multiplier = 1
         else:

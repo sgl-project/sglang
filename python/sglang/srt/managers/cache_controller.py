@@ -180,12 +180,18 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        storage_hash_value: Optional[List[str]] = None,
+        storage_last_hash: Optional[str] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
+        self.storage_hash_value = (
+            storage_hash_value if storage_hash_value is not None else []
+        )
+        self.storage_last_hash = storage_last_hash
         self.prefix_keys = prefix_keys
 
         self.id = StorageOperation.counter
@@ -476,6 +482,66 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
+        extra_config = self.storage_config.extra_config or {}
+        has_canonical_page_size = "canonical_page_size" in extra_config
+        has_canonical_dcp_size = "canonical_dcp_size" in extra_config
+        if has_canonical_page_size != has_canonical_dcp_size:
+            raise ValueError(
+                "canonical_page_size and canonical_dcp_size must be configured "
+                "together."
+            )
+        canonical_page_size = int(
+            extra_config.get("canonical_page_size", self.page_size)
+        )
+        canonical_dcp_size = int(extra_config.get("canonical_dcp_size", 0))
+        if has_canonical_dcp_size and canonical_dcp_size <= 0:
+            raise ValueError(
+                "canonical_dcp_size must be a positive integer, got "
+                f"{canonical_dcp_size}."
+            )
+        if canonical_dcp_size and storage_backend != "mooncake":
+            raise ValueError(
+                "canonical_dcp_size is currently supported only by the Mooncake "
+                f"HiCache backend, got {storage_backend!r}."
+            )
+        if canonical_dcp_size and not self.storage_config.is_mla_model:
+            raise ValueError(
+                "canonical_dcp_size currently supports only MLA KV pools."
+            )
+        if canonical_page_size <= 0 or self.page_size % canonical_page_size != 0:
+            raise ValueError(
+                "canonical_page_size must be a positive divisor of the HiCache "
+                f"logical page size ({self.page_size}), got {canonical_page_size}."
+            )
+        if canonical_dcp_size and canonical_page_size % canonical_dcp_size != 0:
+            raise ValueError(
+                "canonical_page_size must be divisible by canonical_dcp_size: "
+                f"{canonical_page_size} % {canonical_dcp_size} != 0."
+            )
+        if canonical_dcp_size and self.storage_config.attn_cp_size != 1:
+            raise ValueError(
+                "Mooncake canonical DCP layout does not support context "
+                "parallelism yet; expected attn_cp_size=1, got "
+                f"{self.storage_config.attn_cp_size}."
+            )
+        if canonical_dcp_size and self.mem_pool_host.layout != "page_first":
+            raise ValueError(
+                "Mooncake canonical DCP layout requires "
+                "--hicache-mem-layout page_first, got "
+                f"{self.mem_pool_host.layout!r}."
+            )
+        if canonical_dcp_size and self.storage_config.attn_dcp_size not in (
+            1,
+            canonical_dcp_size,
+        ):
+            raise ValueError(
+                "Mooncake canonical DCP layout currently supports only DCP1 "
+                "or the canonical DCP size itself: "
+                f"local={self.storage_config.attn_dcp_size}, "
+                f"canonical={canonical_dcp_size}."
+            )
+        self.storage_page_size = canonical_page_size
+        self.storage_hashes_per_page = self.page_size // canonical_page_size
         # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = (
             self.storage_config.is_mla_model
@@ -1022,7 +1088,19 @@ class HiCacheController:
 
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            storage_start = i * self.storage_hashes_per_page
+            storage_end = (i + len(batch_hashes)) * self.storage_hashes_per_page
+            canonical_hashes = operation.storage_hash_value[
+                storage_start:storage_end
+            ]
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info=(
+                    {"canonical_hashes": canonical_hashes}
+                    if canonical_hashes
+                    else None
+                ),
+            )
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
             # Check termination
             if (
@@ -1235,7 +1313,19 @@ class HiCacheController:
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            storage_start = i * self.storage_hashes_per_page
+            storage_end = (i + len(batch_hashes)) * self.storage_hashes_per_page
+            canonical_hashes = operation.storage_hash_value[
+                storage_start:storage_end
+            ]
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info=(
+                    {"canonical_hashes": canonical_hashes}
+                    if canonical_hashes
+                    else None
+                ),
+            )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
                 logger.warning(

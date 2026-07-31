@@ -1146,13 +1146,48 @@ class SchedulerDisaggregationPrefillMixin:
             c128_seq_len = transfer_input_len
 
             def _mamba_payload():
-                return [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        req.req_pool_idx
-                    ]
-                    .cpu()
-                    .numpy()
+                indices = [
+                    int(
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            req.req_pool_idx
+                        ].item()
+                    )
                 ]
+                # Canonical Decode-origin L3 publication needs the historical
+                # KDA state at the widened DCP page boundary, in addition to
+                # the active post-prefill state used for normal decoding.
+                extra_config = (
+                    self.server_args.hicache_storage_backend_extra_config_dict
+                )
+                checkpoint_len = (
+                    seq_len // self.server_args.mamba_track_interval
+                ) * self.server_args.mamba_track_interval
+                if (
+                    int(extra_config.get("canonical_dcp_size", 0)) > 0
+                    and checkpoint_len > 0
+                ):
+                    # ``cache_unfinished_req`` runs before this final PD send.
+                    # It donates the tracked ping-pong slot to the newly inserted
+                    # radix node and clears ``mamba_last_track_seqlen``.  The
+                    # request lock keeps that node (and its Mamba component)
+                    # alive until the transfer poll succeeds and release_kv_cache
+                    # drops the lock.
+                    if req.cache_protected_len != checkpoint_len:
+                        raise RuntimeError(
+                            "Canonical Mooncake KDA checkpoint mismatch before "
+                            f"PD transfer: cached={req.cache_protected_len}, "
+                            f"expected={checkpoint_len}, rid={req.rid}."
+                        )
+                    checkpoint = self.tree_cache.get_mamba_device_value(
+                        req.last_node
+                    )
+                    if checkpoint is None or checkpoint.numel() != 1:
+                        raise RuntimeError(
+                            "Canonical Mooncake KDA checkpoint is not device "
+                            f"resident on the protected radix node for rid={req.rid}."
+                        )
+                    indices.append(int(checkpoint.item()))
+                return indices
 
             def _swa_payload():
                 window_size = self.sliding_window_size

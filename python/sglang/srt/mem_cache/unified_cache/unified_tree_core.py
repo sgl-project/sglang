@@ -91,6 +91,7 @@ class StorageBackupSpec(NamedTuple):
     host_value: torch.Tensor
     token_ids: array
     hash_value: list[str]
+    storage_hash_value: list[str]
     prefix_keys: Optional[list[str]]
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
@@ -112,6 +113,7 @@ class UnifiedTreeNode:
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
         self.hash_value = None
+        self.storage_hash_value = None
         self.hit_count = 0
         self.priority = priority
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
@@ -147,6 +149,11 @@ class UnifiedTreeNode:
         if self.hash_value is None or len(self.hash_value) == 0:
             return None
         return self.hash_value[-1]
+
+    def get_last_storage_hash_value(self) -> Optional[str]:
+        if not self.storage_hash_value:
+            return None
+        return self.storage_hash_value[-1]
 
     def get_prefix_hash_values(self, node: UnifiedTreeNode) -> list[str]:
         if node is None or node.hash_value is None:
@@ -380,6 +387,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         components: dict[ComponentType, TreeComponent],
     ):
         self.page_size = params.page_size
+        self.storage_page_size = self.page_size
         self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
         self.enable_hicache = False
         self.enable_storage = False
@@ -433,6 +441,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.root_node.key = RadixKey(array("q"), None)
         self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
         self.root_node.hash_value = []
+        self.root_node.storage_hash_value = []
         for ct in self.component_types:
             self.root_node.component_data[ct].lock_ref = 1
 
@@ -1029,6 +1038,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        new_node.storage_hash_value, child.storage_hash_value = split_node_hash_value(
+            child.storage_hash_value, split_len, self.storage_page_size
+        )
 
         for component in self.components:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
@@ -1073,6 +1085,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
         if self.enable_storage:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+            new_node.storage_hash_value = compute_node_hash_values(
+                new_node,
+                self.storage_page_size,
+                hash_attr="storage_hash_value",
+            )
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
@@ -1574,6 +1591,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         key: RadixKey,
         host_value: torch.Tensor,
         hash_value: list[str],
+        storage_hash_value: Optional[list[str]] = None,
     ) -> InsertResult:
         """Insert a host-side (backuped) tree path descending from the given node."""
         node = self.node_by_id(node_id)
@@ -1593,6 +1611,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
+            if storage_hash_value is not None:
+                storage_hash_value = storage_hash_value[
+                    prefix_len // self.storage_page_size :
+                ]
             matched_length += prefix_len
 
             if prefix_len < len(node.key):
@@ -1630,6 +1652,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.parent = node
         new_node.key = key
         new_node.hash_value = hash_value
+        new_node.storage_hash_value = storage_hash_value
         new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
         node.children[child_key] = new_node
         self._update_evictable_leaf_sets(new_node)
@@ -1676,6 +1699,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             host_value=node.component_data[BASE_COMPONENT_TYPE].host_value,
             token_ids=node.key.token_ids,
             hash_value=node.hash_value,
+            storage_hash_value=node.storage_hash_value or node.hash_value,
             prefix_keys=prefix_keys,
             comp_xfers=comp_xfers,
         )
