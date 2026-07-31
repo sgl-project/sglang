@@ -745,6 +745,7 @@ def invoke_fused_moe_kernel(
     add_output_mask: Optional[torch.Tensor] = None,
     mask_output: bool = False,
     lora_preserve_base: bool = False,
+    scale_ue8m0: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -775,7 +776,14 @@ def invoke_fused_moe_kernel(
                 # passed to the kernel below).
                 assert A_scale is not None
             elif _is_cuda:
-                A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
+                A, A_scale = sglang_per_token_group_quant_fp8(
+                    A, block_k, scale_ue8m0=scale_ue8m0
+                )
+            elif scale_ue8m0:
+                raise NotImplementedError(
+                    "UE8M0 activation scales for Triton MoE are only "
+                    "supported on CUDA"
+                )
             else:
                 A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]

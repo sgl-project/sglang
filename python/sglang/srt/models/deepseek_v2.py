@@ -1559,6 +1559,8 @@ class DeepseekV2MoE(nn.Module):
         quant_method = experts.quant_method
         if not isinstance(quant_method, Fp8MoEMethod):
             return False, "experts quant method not Fp8MoEMethod"
+        if quant_method.quant_config.use_scale_ue8m0:
+            return False, "UE8M0 activation scales unsupported by quant-once"
         if not quant_method.block_quant or quant_method.use_mxfp8:
             return False, "experts not block-quant fp8"
         if quant_method.quant_config.weight_block_size != [128, 128]:
