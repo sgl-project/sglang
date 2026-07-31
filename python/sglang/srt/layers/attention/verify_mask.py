@@ -41,19 +41,19 @@ class VerifyMask(msgspec.Struct):
 
     buffer: torch.Tensor
     mode: TreeMaskMode
+    max_context_len: int
     is_read: bool = True
 
     def fits(self, bs: int, num_draft_tokens: int) -> bool:
         """Whether this batch's writes stay inside the buffer.
 
-        Only the compact layout is checked. FULL_MASK keeps its pre-existing
-        unconditional reuse -- its bound needs a max_context_len that composite
-        backends do not carry -- so a batch past max_bs can still overflow it
-        when draft * sum(seq_len) exceeds the buffer, as it could before.
+        Sized with the formula the allocation used. Every sequence is capped by
+        ``max_context_len``, so that is an upper bound on the kernel's writes --
+        it holds while bs stays within the max_bs the buffer was sized for.
         """
-        if self.mode != TreeMaskMode.QLEN_ONLY:
-            return True
-        return self.buffer.numel() >= bs * num_draft_tokens * num_draft_tokens
+        return self.buffer.numel() >= tree_mask_numel(
+            self.mode, bs, num_draft_tokens, self.max_context_len
+        )
 
 
 def maybe_create_verify_mask(
@@ -78,5 +78,6 @@ def maybe_create_verify_mask(
             device=device,
         ),
         mode=mode,
+        max_context_len=max_context_len,
         is_read=is_read,
     )

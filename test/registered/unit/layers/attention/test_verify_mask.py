@@ -74,12 +74,22 @@ class TestVerifyMaskCapacity(CustomTestCase):
         mask = _create(is_read=False)
         self.assertFalse(mask.fits(_MAX_BS + 1, _DRAFT))
 
-    def test_full_mask_always_fits(self):
-        """FULL_MASK is exempt from the check -- see fits()."""
+    def test_full_mask_does_not_fit_beyond_max_bs(self):
+        """The context dimension is sized for max_bs sequences, so a bigger batch
+        overflows it: with the hybrid-attn CI shape (--cuda-graph-max-bs-decode 8,
+        draft 4, ctx 4096) a 48-request verify writes 4 * (48 * 4096) + 4**2 * 48
+        cells into a 8 * 4 * (4096 + 4) buffer."""
         mask = VerifyMask(
-            buffer=torch.zeros(8, dtype=torch.bool), mode=TreeMaskMode.FULL_MASK
+            buffer=torch.zeros(
+                tree_mask_numel(TreeMaskMode.FULL_MASK, 8, 4, 4096), dtype=torch.bool
+            ),
+            mode=TreeMaskMode.FULL_MASK,
+            max_context_len=4096,
         )
-        self.assertTrue(mask.fits(_MAX_BS * 1000, _DRAFT))
+
+        self.assertTrue(mask.fits(8, 4))
+        self.assertFalse(mask.fits(48, 4))
+        self.assertLess(mask.buffer.numel(), 4 * (48 * 4096) + 4 * 4 * 48)
 
 
 class TestVerifyMaskGate(CustomTestCase):
@@ -107,6 +117,7 @@ def _mask(numel, **kwargs):
     return VerifyMask(
         buffer=torch.zeros(numel, dtype=torch.bool),
         mode=TreeMaskMode.QLEN_ONLY,
+        max_context_len=_MAX_CONTEXT_LEN,
         **kwargs,
     )
 
@@ -119,6 +130,7 @@ def _make_hybrid_backend(speculative_attention_mode, prefill_mask, decode_mask):
         server_args=SimpleNamespace(
             speculative_attention_mode=speculative_attention_mode
         ),
+        model_config=SimpleNamespace(context_len=_MAX_CONTEXT_LEN),
     )
     return HybridAttnBackend(
         model_runner,
@@ -145,8 +157,8 @@ class TestHybridAttnBackendHandsOutSelectedChildMask(CustomTestCase):
         self.assertIs(backend.verify_mask, prefill_mask)
 
     def test_capacity_check_needs_nothing_from_the_backend(self):
-        """A composite backend carries no max_context_len of its own: fits()
-        reaching back through the backend would raise AttributeError here."""
+        """fits() reads the max_context_len recorded on the mask -- the one that
+        sized the buffer -- so it never reaches back through the backend."""
         backend = _make_hybrid_backend("prefill", _mask(64, is_read=False), None)
 
         self.assertTrue(backend.verify_mask.fits(_MAX_BS, _DRAFT))
