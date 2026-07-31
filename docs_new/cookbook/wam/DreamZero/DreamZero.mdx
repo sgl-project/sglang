@@ -22,7 +22,7 @@ Validated checkpoint layout:
 
 | Checkpoint | Status | Notes |
 | --- | --- | --- |
-| Local SGLang-format DreamZero WAN2.2 5B LIBERO SFT checkpoints | Validated | Requires `model_index.json` plus `tokenizer/`, `transformer/`, `text_encoder/`, `image_encoder/`, and `vae/` component directories |
+| [RLinf/RLinf-DreamZero-WAN2.2-5B-LIBERO-SFT-Diffusers](https://huggingface.co/RLinf/RLinf-DreamZero-WAN2.2-5B-LIBERO-SFT-Diffusers) | Validated | Diffusers component layout with `model_index.json` plus `tokenizer/`, `transformer/`, `text_encoder/`, `image_encoder/`, and `vae/` directories |
 
 References:
 
@@ -44,19 +44,19 @@ For general environment setup, see the [SGLang Diffusion installation guide](/do
 
 ## 3. Model Deployment
 
-Serve a DreamZero checkpoint in SGLang component layout:
+Serve the DreamZero LIBERO SFT Diffusers checkpoint:
 
 ```bash Command
-sglang serve /path/to/dreamzero-wan2.2-5b-libero-sft \
+sglang serve RLinf/RLinf-DreamZero-WAN2.2-5B-LIBERO-SFT-Diffusers \
   --model-type diffusion \
   --host 127.0.0.1 \
   --port 30000
 ```
 
-The local checkpoint directory must contain the SGLang-native component layout:
+You can also download the repository locally and serve that path. The checkpoint directory must contain:
 
 ```text File
-/path/to/dreamzero-wan2.2-5b-libero-sft/
+/path/to/RLinf-DreamZero-WAN2.2-5B-LIBERO-SFT-Diffusers/
   model_index.json
   tokenizer/
   transformer/
@@ -77,9 +77,7 @@ Example pipeline override:
   "cfg_scale": 5.0,
   "flow_shift": 5.0,
   "dreamzero_max_sessions": 64,
-  "dreamzero_compile_components": true,
-  "dreamzero_tensor_parallel_size": 1,
-  "dreamzero_sequence_parallel_size": 1
+  "dreamzero_compile_components": true
 }
 ```
 
@@ -234,7 +232,7 @@ The returned `actions` are DreamZero normalized action chunks. Convert them back
 - Use msgpack for batched rollout requests. JSON is primarily for schema inspection and tiny smoke tests because image/video tensors make JSON payloads large.
 - Configure `default_num_inference_steps`, `cfg_scale`, and `flow_shift` at server startup. DreamZero keeps these policy parameters stable inside one served model instance.
 - `cfg_parallel_degree=2` splits DreamZero conditional and unconditional branches across CFG ranks. The text encoder is kept replicated for this path so positive and negative prompts do not pass through tensor-parallel collectives as if they were one shared prompt.
-- `dreamzero_tensor_parallel_size` and `dreamzero_sequence_parallel_size` control DreamZero model parallelism inside the pipeline config. DreamZero SP shards the video/action/state sequence path and uses SGLang USP attention for the sharded attention compute.
+- TP and SP are controlled by the server `tp_size` and `sp_degree`. DreamZero SP uses SGLang USP attention for the sharded video/action/state sequence path.
 - `dreamzero_compile_components` compiles the DreamZero DiT hot path. Disable it when debugging numerical parity or distributed compile issues.
 
 ## 7. Validation Notes

@@ -77,8 +77,8 @@ def _is_sglang_dreamzero_checkpoint(model_path: str) -> bool:
 
 
 def _validate_dreamzero_parallel_config(server_args: ServerArgs) -> None:
-    configured_tp_size = int(server_args.pipeline_config.dreamzero_tensor_parallel_size)
-    configured_sp_size = int(server_args.pipeline_config.dreamzero_sequence_parallel_size)
+    configured_tp_size = int(getattr(server_args, "tp_size", 1) or 1)
+    configured_sp_size = int(getattr(server_args, "sp_degree", 1) or 1)
     if model_parallel_is_initialized():
         actual_tp_size = get_tp_world_size()
         if configured_tp_size != actual_tp_size:
@@ -89,7 +89,7 @@ def _validate_dreamzero_parallel_config(server_args: ServerArgs) -> None:
         actual_sp_size = get_sp_world_size()
         if configured_sp_size != actual_sp_size:
             raise ValueError(
-                "DreamZero sequence parallel size must match the initialized SP "
+                "DreamZero sp_degree must match the initialized SP "
                 f"group: configured={configured_sp_size}, actual={actual_sp_size}"
             )
     elif configured_tp_size > 1 or configured_sp_size > 1:
@@ -136,7 +136,7 @@ class DreamZeroPipeline(ComposedPipelineBase):
             )
 
         server_args.pipeline_config.dit_config.arch_config.use_tensor_parallel = (
-            server_args.pipeline_config.dreamzero_tensor_parallel_size > 1
+            (getattr(server_args, "tp_size", 1) or 1) > 1
         )
         modules["image_encoder"] = load_dreamzero_image_encoder(
             server_args,

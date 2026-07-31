@@ -308,8 +308,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
                     crossattn_cache=crossattn_caches[local_index],
                     current_start_frame=current_start_frame,
                     enable_sequence_parallel=(
-                        self.server_args.pipeline_config.dreamzero_sequence_parallel_size
-                        > 1
+                        (getattr(self.server_args, "sp_degree", 1) or 1) > 1
                     ),
                 )
             if update_kv_cache:

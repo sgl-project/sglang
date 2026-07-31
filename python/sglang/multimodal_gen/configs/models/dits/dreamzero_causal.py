@@ -6,7 +6,7 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTCon
 
 @dataclass
 class DreamZeroCausalWanArchConfig(DiTArchConfig):
-    """DROID DreamZero causal Wan DiT architecture defaults.
+    """DreamZero causal Wan DiT architecture defaults.
 
     Architecture values follow the official DreamZero implementation:
     https://github.com/dreamzero0/dreamzero/blob/main/groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py
