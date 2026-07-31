@@ -25,6 +25,9 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
+from sglang.srt.layers.attention.trtllm_mla_backend import (
+    make_persistent_multi_ctas_kv_counter_buffer,
+)
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -205,6 +208,35 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+
+        # Persistent scratch owned by this backend so that no per-layer,
+        # per-forward allocation lands inside a captured CUDA graph. Both
+        # buffers below otherwise cost one tiny fill kernel per attention
+        # layer per decode step (~3.5us/layer at bs=1 on B200).
+        #
+        # 1. trtllm-gen multi-CTA KV semaphores. FlashInfer allocates a fresh
+        #    zeroed buffer per call when the caller does not supply one; the
+        #    kernel self-resets the counters at the end of every launch, so one
+        #    zeroing at lease time is enough. Sized for the widest batch this
+        #    backend can ever see (over-sizing is explicitly allowed).
+        #    Owned per backend instance (not a shared lease) so a co-resident
+        #    draft backend with a smaller pool cannot size it down. Verify
+        #    batches run bs * num_draft_tokens rows through the same call.
+        self._multi_ctas_kv_counter_buffer = (
+            make_persistent_multi_ctas_kv_counter_buffer(
+                torch.device(self.device),
+                num_q_heads=config.num_attention_heads,
+                max_batch_size=(model_runner.max_running_requests + 1)
+                * max(1, self.speculative_num_draft_tokens or 1),
+            )
+        )
+        # 2. Fallback K/V dequant scales for the fused FP8 KV-cache write. The
+        #    op needs float32 [1] tensors; layers without checkpoint kv scales
+        #    would otherwise build them with torch.ones() on every call.
+        self._default_kv_scale = get_buffer(
+            "trtllm_mha_default_kv_scale",
+            lambda: torch.ones(1, dtype=torch.float32, device=self.device),
+        )
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
@@ -729,6 +761,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         cache_loc = self._get_layer_cache_loc(layer, forward_batch)
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        # Layers without checkpoint KV scales fall back to the backend-owned
+        # float32 ones tensor; letting the op synthesize one costs a fill
+        # kernel per layer per forward, baked into the captured graph.
         return fused_fp8_qkv_kv_cache(
             q=q,
             k=k,
@@ -736,8 +771,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k_cache=k_cache,
             v_cache=v_cache,
             cache_loc=cache_loc,
-            k_scale=layer.k_scale,
-            v_scale=layer.v_scale,
+            k_scale=(
+                layer.k_scale if layer.k_scale is not None else self._default_kv_scale
+            ),
+            v_scale=(
+                layer.v_scale if layer.v_scale is not None else self._default_kv_scale
+            ),
         )
 
     def init_forward_metadata_out_graph(
@@ -1081,6 +1120,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             out_dtype=self.q_data_type,  # model_runner.dtype
             kv_cache_sf=kv_cache_block_scales,
+            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
         )
         if self.is_nvfp4_kvcache and o.dtype != self.q_data_type:
             o = o.to(self.q_data_type)
@@ -1210,6 +1250,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                     out_dtype=self.q_data_type,
                     q_len_per_req=1,
+                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
             elif self.forward_metadata.is_ragged_verify:
                 o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -1228,6 +1269,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     q_len_per_req=None,
                     max_q_len=self.forward_metadata.max_seq_len_q,
                     cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
+                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
             else:
                 o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -1244,6 +1286,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                     out_dtype=self.q_data_type,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
+                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
         else:
 
