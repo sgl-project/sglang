@@ -1929,6 +1929,11 @@ class Scheduler(
             max_total_num_tokens=self.max_total_num_tokens * self.server_args.dcp_size,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_quarantined_reqs=lambda: (
+                self.disagg_decode_transfer_queue.get_quarantined_reqs()
+                if self.disagg_decode_transfer_queue is not None
+                else []
+            ),
         )
 
     def init_invariant_checker(self) -> None:
@@ -1947,6 +1952,11 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_quarantined_reqs=lambda: (
+                self.disagg_decode_transfer_queue.get_quarantined_reqs()
+                if self.disagg_decode_transfer_queue is not None
+                else []
+            ),
         )
 
     def init_kv_events_publisher(self) -> None:
@@ -3534,26 +3544,33 @@ class Scheduler(
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
+                        radix_hisparse_decode = self._is_radix_hisparse_decode(batch)
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(future_indices, batch_result)
-                            if _is_hip:
+                        if _is_hip:
+                            self._backup_radix_hisparse_decode(batch)
+                            if batch_result.delay_sample_func is None:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
                                 batch_result.copy_to_cpu(
                                     return_logprob=batch.return_logprob,
                                     return_hidden_states=batch.return_hidden_states,
                                 )
-                            else:
-                                # Result D2H on copy_stream overlaps the next forward
-                                # instead of serializing on forward_stream; it's a leaf
-                                # gated by copy_done, so nothing on forward_stream waits.
-                                self.copy_stream.wait_stream(self.forward_stream)
-                                with self.copy_stream_ctx:
+                        elif (
+                            batch_result.delay_sample_func is None
+                            or radix_hisparse_decode
+                        ):
+                            # KV write-back and result D2H share one ordered leaf
+                            # stream and one final copy_done publication fence.
+                            self.copy_stream.wait_stream(self.forward_stream)
+                            with self.copy_stream_ctx:
+                                self._backup_radix_hisparse_decode(batch)
+                                if batch_result.delay_sample_func is None:
                                     batch_result.copy_to_cpu(
                                         return_logprob=batch.return_logprob,
                                         return_hidden_states=batch.return_hidden_states,
                                     )
-                        else:
+                        if batch_result.delay_sample_func is not None:
                             batch_result.future_indices = future_indices
 
                 # Next-iter input_ids relayed via future_map.
@@ -3586,6 +3603,7 @@ class Scheduler(
                         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)
+                self._backup_radix_hisparse_decode(batch)
                 # Sync D2H so the result processor can read CPU tensors.
                 batch_result.copy_done = self.device_module.Event()
                 batch_result.copy_to_cpu(
@@ -3607,6 +3625,9 @@ class Scheduler(
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
                     batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
+                backup_done = self._backup_radix_hisparse_decode(batch)
+                if backup_done is not None:
+                    batch_result.copy_done = backup_done
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -3696,6 +3717,20 @@ class Scheduler(
             return
         self.future_map.stash(future_indices, payload)
 
+    def _is_radix_hisparse_decode(self, batch: ScheduleBatch) -> bool:
+        coordinator = self.hisparse_coordinator
+        return (
+            coordinator is not None
+            and coordinator.is_radix_hisparse
+            and batch.forward_mode.is_decode()
+        )
+
+    def _backup_radix_hisparse_decode(self, batch: ScheduleBatch):
+        if self._is_radix_hisparse_decode(batch):
+            coordinator = self.hisparse_coordinator
+            return coordinator.backup_radix_decode_batch(batch.out_cache_loc)
+        return None
+
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
     ) -> Union[GenerationBatchResult]:
@@ -3710,6 +3745,10 @@ class Scheduler(
             assert _batch_result is batch_result
             # Delay-sample is non-spec only; relays the sampled bonus tokens.
             self._relay_forward_payload(batch_result.future_indices, batch_result)
+            if self._is_radix_hisparse_decode(cur_batch):
+                # Let sampling overlap the KV D2H, then make copy_done cover
+                # both the KV write-back and the result copies.
+                self.hisparse_coordinator.wait_for_radix_decode_backup()
             batch_result.copy_to_cpu(
                 return_logprob=cur_batch.return_logprob,
                 return_hidden_states=cur_batch.return_hidden_states,
@@ -3910,6 +3949,9 @@ class Scheduler(
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+                idle &= (
+                    not self.disagg_decode_transfer_queue.has_quarantined_transfers()
+                )
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 

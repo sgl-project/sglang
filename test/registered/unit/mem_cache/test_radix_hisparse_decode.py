@@ -222,6 +222,136 @@ class TestRadixHiSparseDecodeAdmission(CustomTestCase):
         self.assertEqual(order, ["canonicalize", "admit_l0"])
 
 
+class _FakeEvent:
+    def __init__(self, order=None):
+        self.order = order if order is not None else []
+
+    def record(self):
+        self.order.append("record")
+
+    def wait(self, stream):
+        self.order.append(("wait", stream))
+
+    def synchronize(self):
+        self.order.append("synchronize")
+
+
+class TestRadixHiSparseDecodeWriteBack(CustomTestCase):
+    def test_current_decode_rows_are_backed_up_and_event_is_retained(self):
+        l1_locs = torch.tensor([7, 11], dtype=torch.int64)
+        host_locs = torch.tensor([107, 111], dtype=torch.int64)
+        l0_locs = torch.tensor([3, 5], dtype=torch.int64)
+        event = _FakeEvent()
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            full_kv_host_locs=MagicMock(return_value=host_locs)
+        )
+        coordinator.mem_pool_device = SimpleNamespace(
+            translate_loc_from_full_to_hisparse_device=MagicMock(return_value=l0_locs)
+        )
+        coordinator.mem_pool_host = SimpleNamespace(
+            backup_from_device_all_layer=MagicMock()
+        )
+
+        fake_device_module = SimpleNamespace(
+            Event=MagicMock(return_value=event),
+            current_stream=MagicMock(return_value="copy-stream"),
+        )
+        with patch(
+            "sglang.srt.managers.hisparse_coordinator.device_module",
+            fake_device_module,
+        ):
+            returned_event = coordinator.backup_radix_decode_batch(l1_locs)
+
+        self.assertIs(returned_event, event)
+        self.assertIs(coordinator._radix_decode_backup_event, event)
+        self.assertEqual(event.order, ["record"])
+        args = coordinator.mem_pool_host.backup_from_device_all_layer.call_args
+        self.assertIs(args.args[0], coordinator.mem_pool_device)
+        self.assertTrue(torch.equal(args.args[1], host_locs))
+        self.assertTrue(torch.equal(args.args[2], l0_locs))
+        self.assertEqual(args.kwargs, {"io_backend": "kernel"})
+
+    def test_next_l0_mapping_waits_for_previous_write_back(self):
+        order = []
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.is_radix_hisparse = True
+        coordinator.is_dsv4_hisparse = False
+        coordinator.device_buffer_size = 2
+        coordinator.wait_for_radix_decode_backup = MagicMock(
+            side_effect=lambda: order.append("wait")
+        )
+        coordinator._eager_backup_previous_token = MagicMock()
+        coordinator._grow_device_buffers = MagicMock(
+            side_effect=lambda *args: order.append("map")
+            or torch.tensor([3], dtype=torch.int64)
+        )
+        coordinator.req_device_buffer_token_locs = torch.zeros(
+            (1, 1, 3), dtype=torch.int32
+        )
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            get_last_loc_compressed=lambda locs: locs
+        )
+        coordinator.mem_pool_device = SimpleNamespace(
+            full_to_hisparse_device_index_mapping=torch.zeros(16, dtype=torch.int64)
+        )
+
+        coordinator.map_last_loc_to_buffer(
+            seq_lens=torch.tensor([5], dtype=torch.int64),
+            out_cache_loc=torch.tensor([7], dtype=torch.int64),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([5], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
+        )
+
+        self.assertEqual(order, ["wait", "map"])
+        coordinator._eager_backup_previous_token.assert_not_called()
+        self.assertEqual(
+            int(coordinator.mem_pool_device.full_to_hisparse_device_index_mapping[7]),
+            3,
+        )
+
+    def test_finish_fences_write_back_before_l0_release(self):
+        order = []
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.decode_producer_stream = None
+        coordinator.is_radix_hisparse = True
+        coordinator.synchronize_radix_decode_backup = MagicMock(
+            side_effect=lambda: order.append("fence")
+        )
+        coordinator.req_device_buffer_size = torch.tensor([1], dtype=torch.int64)
+        coordinator.req_to_device_buffer = torch.tensor([[3, 0]], dtype=torch.int64)
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            free_hisparse_indices=MagicMock(
+                side_effect=lambda locs: order.append("free-l0")
+            )
+        )
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor([[7, -1]], dtype=torch.int64)
+        )
+        coordinator.mem_pool_device = SimpleNamespace(
+            translate_loc_from_full_to_compressed=lambda locs: locs,
+            full_to_hisparse_device_index_mapping=torch.ones(16, dtype=torch.int64),
+        )
+        coordinator._clear_request_host_locs = MagicMock()
+        coordinator.req_device_buffer_tokens = torch.zeros((1, 1, 2), dtype=torch.int32)
+        coordinator.req_device_buffer_token_locs = torch.zeros(
+            (1, 1, 2), dtype=torch.int32
+        )
+        coordinator.lru_slots = torch.zeros((1, 1, 2), dtype=torch.int32)
+        coordinator._lru_init = torch.zeros((1, 2), dtype=torch.int32)
+        coordinator._skip_first_backup = [False]
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            kv=SimpleNamespace(kv_allocated_len=1),
+        )
+
+        coordinator.request_finished(req)
+
+        self.assertEqual(order[:2], ["fence", "free-l0"])
+
+
 class TestRadixHiSparseDSAStateRange(CustomTestCase):
     def test_state_pages_use_decode_suffix_and_allow_full_hit(self):
         page_size = 64

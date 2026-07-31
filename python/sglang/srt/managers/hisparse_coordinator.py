@@ -164,6 +164,7 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
+        self._radix_decode_backup_event = None
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -218,6 +219,7 @@ class HiSparseCoordinator:
         self.write_staging_stream.synchronize()
         self.decode_backup_stream.synchronize()
         if self.is_radix_hisparse:
+            self.synchronize_radix_decode_backup()
             self.token_to_kv_pool_allocator.destroy()
         else:
             self.mem_pool_host.destroy()
@@ -545,9 +547,14 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
-        self._eager_backup_previous_token(
-            seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
-        )
+        if self.is_radix_hisparse:
+            # The reserved L0 row is reused by the next decode forward. Order
+            # that write after the previous row has reached CPU L1.
+            self.wait_for_radix_decode_backup()
+        else:
+            self._eager_backup_previous_token(
+                seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
+            )
 
         if not self.is_dsv4_hisparse:
             # Grow device buffers if needed and resolve the latest-token slot.
@@ -697,6 +704,49 @@ class HiSparseCoordinator:
         self._backup_done_event.wait(device_module.current_stream())
         self._has_pending_backup = False
 
+    def backup_radix_decode_batch(self, l1_locs: torch.Tensor):
+        """Write the current decode rows through from L0 to CPU L1.
+
+        The caller submits this after the decode forward on a stream ordered
+        behind that forward. The returned event can be used as the result-copy
+        fence; the coordinator also retains it so L0 reuse and a one-batch-ahead
+        overlap finish can wait for the newest committed rows.
+        """
+        host_locs = self.token_to_kv_pool_allocator.full_kv_host_locs(l1_locs)
+        device_locs = self.mem_pool_device.translate_loc_from_full_to_hisparse_device(
+            l1_locs
+        )
+        self.mem_pool_host.backup_from_device_all_layer(
+            self.mem_pool_device,
+            host_locs,
+            device_locs,
+            io_backend="kernel",
+        )
+
+        done_event = device_module.Event()
+        done_event.record()
+        if host_locs.is_cuda:
+            host_locs.record_stream(device_module.current_stream())
+        if device_locs.is_cuda:
+            device_locs.record_stream(device_module.current_stream())
+        if l1_locs.is_cuda:
+            l1_locs.record_stream(device_module.current_stream())
+        self._radix_decode_backup_event = done_event
+        return done_event
+
+    def wait_for_radix_decode_backup(self) -> None:
+        """Order the current device stream after the latest Radix write-back."""
+        if self._radix_decode_backup_event is not None:
+            self._radix_decode_backup_event.wait(device_module.current_stream())
+
+    def synchronize_radix_decode_backup(self) -> None:
+        """Fence CPU publication on the latest Radix write-back."""
+        done_event = self._radix_decode_backup_event
+        if done_event is not None:
+            done_event.synchronize()
+            if self._radix_decode_backup_event is done_event:
+                self._radix_decode_backup_event = None
+
     def naive_load_topk(
         self,
         req_pool_indices: torch.Tensor,
@@ -823,7 +873,13 @@ class HiSparseCoordinator:
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
-        self.wait_for_pending_backup()
+        if self.is_radix_hisparse:
+            # Result processing can lag one forward under overlap scheduling.
+            # Host-synchronize the newest write-back before CPU Radix insertion
+            # makes any of this request's L1 rows matchable.
+            self.synchronize_radix_decode_backup()
+        else:
+            self.wait_for_pending_backup()
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
