@@ -536,6 +536,12 @@ def maybe_init_distributed_environment_and_model_parallel(
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
     device = get_local_torch_device()
+
+    # Bind the process before creating any process groups or communicators.
+    # CPU and MPS do not expose per-rank accelerator device selection.
+    if device.type not in ("cpu", "mps"):
+        torch.get_device_module(device).set_device(local_rank)
+
     logger.info(
         "Initializing distributed environment with world_size=%d, device=%s, timeout=%s",
         world_size,
@@ -561,14 +567,6 @@ def maybe_init_distributed_environment_and_model_parallel(
         ring_degree=ring_degree,
         sequence_parallel_degree=sp_size,
     )
-
-    # Only set CUDA device if we're on a CUDA platform
-    if current_platform.is_cuda_alike():
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
-    elif current_platform.is_npu():
-        device = torch.device(f"npu:{local_rank}")
-        torch.npu.set_device(device)
 
 
 def model_parallel_is_initialized() -> bool:
