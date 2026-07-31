@@ -32,15 +32,46 @@ __device__ __forceinline__ int hash_slot(int32_t key, int hash_size) {
 }
 
 #ifdef USE_ROCM
+// 128-bit vector type used by the wide copy path below.
+using TransferVec4 = __attribute__((__vector_size__(4 * sizeof(uint32_t)))) uint32_t;
+
 __device__ __forceinline__ void transfer_item_warp(
     int32_t lane_id, const void* __restrict__ src_addr, void* __restrict__ dst_addr, int64_t item_size_bytes) {
   const auto src = static_cast<const char*>(src_addr);
   auto dst = static_cast<char*>(dst_addr);
 
+  // Wide path: one 128-bit dwordx4 per lane instead of two 64-bit dwordx2.
+  // The source is usually pinned host DRAM, so every miss pays a round trip
+  // over the host interconnect; halving the load/store instruction count
+  // halves the serialized round trips per item and raises per-warp
+  // memory-level parallelism, which is what actually hides that latency.
+  // The CUDA branch below already issues 128-bit paired loads -- this brings
+  // ROCm to parity.
+  //
+  // The load is non-temporal because these items are streamed in once; there
+  // is no reuse to preserve and they should not evict resident lines from
+  // L2/MALL. The store is deliberately left cached: its destination is the
+  // device buffer that the attention kernel reads immediately afterwards.
+  int64_t byte_pos = 0;
+  const bool aligned_16b = ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 0xF) == 0;
+  if (aligned_16b) {
+    constexpr int64_t kVecBytes = static_cast<int64_t>(sizeof(TransferVec4));
+    const int64_t vec_count = item_size_bytes / kVecBytes;
+    const auto src_vec = reinterpret_cast<const TransferVec4*>(src);
+    auto dst_vec = reinterpret_cast<TransferVec4*>(dst);
+    for (int64_t i = lane_id; i < vec_count; i += WARP_SIZE) {
+      dst_vec[i] = __builtin_nontemporal_load(&src_vec[i]);
+    }
+    byte_pos = vec_count * kVecBytes;
+  }
+
+  // 64-bit path: covers the unaligned case in full, and the <= 8-byte
+  // remainder the wide path leaves behind.
   const int64_t word_count = item_size_bytes / static_cast<int64_t>(sizeof(uint64_t));
+  const int64_t word_start = byte_pos / static_cast<int64_t>(sizeof(uint64_t));
   const auto src_words = reinterpret_cast<const uint64_t*>(src);
   auto dst_words = reinterpret_cast<uint64_t*>(dst);
-  for (int64_t i = lane_id; i < word_count; i += WARP_SIZE) {
+  for (int64_t i = word_start + lane_id; i < word_count; i += WARP_SIZE) {
     dst_words[i] = src_words[i];
   }
 
