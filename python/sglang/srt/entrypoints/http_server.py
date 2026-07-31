@@ -273,7 +273,14 @@ async def lifespan(fast_api_app: FastAPI):
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
-        warmup_thread_target = fast_api_app.warmup_thread_target
+        # External hosts that embed the module-level app configure it by
+        # setting the three attributes above by hand, so they do not set the
+        # warmup target, which this module started reading only recently.
+        # Falling back to the standalone warmup keeps those hosts working
+        # exactly as they did before.
+        warmup_thread_target = getattr(
+            fast_api_app, "warmup_thread_target", _wait_and_warmup
+        )
         thread_label = "Tokenizer"
     else:
         # Initialize multi-tokenizer support for worker processes

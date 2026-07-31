@@ -489,6 +489,38 @@ class TestEngineBindingGuards(HttpServerAppFactoryTestBase):
             engine.tokenizer_manager,
         )
 
+    def test_lifespan_starts_app_configured_the_legacy_way(self):
+        """Bug regression: the lifespan read fast_api_app.warmup_thread_target
+        directly, so it required an attribute that did not exist before this
+        change. External hosts such as Ray Serve LLM set only the attributes
+        that already existed (is_single_tokenizer_mode, server_args and
+        warmup_thread_kwargs) on the module level app, so they crashed at
+        startup with AttributeError. Such an app must still start and must run
+        the standalone warmup, which is what it did before.
+        """
+        server_args = ServerArgs(model_path="dummy", skip_server_warmup=True)
+        legacy_app = FastAPI(lifespan=http_server.lifespan)
+        legacy_app.is_single_tokenizer_mode = True
+        legacy_app.server_args = server_args
+        legacy_app.warmup_thread_kwargs = dict(server_args=server_args)
+        # The attribute this change introduced is deliberately not set here.
+        self.assertFalse(hasattr(legacy_app, "warmup_thread_target"))
+
+        engine = _fake_engine(server_args)
+        set_global_state(
+            http_server._GlobalState(
+                tokenizer_manager=engine.tokenizer_manager,
+                template_manager=engine.template_manager,
+                scheduler_info={"max_req_input_len": 128},
+            )
+        )
+
+        with patch.object(http_server, "_wait_and_warmup") as warmup_stub:
+            with TestClient(legacy_app):
+                pass
+
+        warmup_stub.assert_called_once_with(server_args=server_args)
+
     def test_init_app_state_server_args_must_match_engine(self):
         """The optional server_args parameter of init_app_state must match the
         arguments the engine was built with; a mismatch would silently imply a
