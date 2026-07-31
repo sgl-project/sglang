@@ -6,7 +6,8 @@ all behind one signature. The public module-level functions are thin wrappers
 over module-level instances; auto-selection follows the production default for
 the live device: AOT ``sgl_kernel`` on CUDA, ``aiter`` (or rocm-triton for
 gemma) on ROCm, ``sgl_kernel_npu`` or ``torch_npu`` on Ascend depending on the
-operator, and the native reference otherwise.
+operator, and the native reference otherwise. Gemma normalization on Ascend
+always delegates its SoC-specific implementation to ``sgl_kernel_npu``.
 Pick a specific backend with e.g.
 ``_RMSNORM.forward(x, w, backend=KernelBackend.JIT)`` or globally via
 ``SGLANG_FORCE_FUSED_OP_BACKEND``.
@@ -14,7 +15,6 @@ Pick a specific backend with e.g.
 
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
@@ -31,21 +31,6 @@ _NORM_DTYPES = ("float16", "bfloat16")
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 _HIP = frozenset({CapabilityRequirement.HIP})
 _NPU = frozenset({CapabilityRequirement.NPU})
-
-
-@lru_cache(maxsize=1)
-def _load_sgl_kernel_npu_gemma_api():
-    """Load the Gemma API only when it is present in the target-specific wheel."""
-    try:
-        from sgl_kernel_npu.norm.gemma_rmsnorm import (
-            add_gemma_rms_norm,
-            gemma_rms_norm,
-        )
-    except ModuleNotFoundError as error:
-        if error.name == "sgl_kernel_npu.norm.gemma_rmsnorm":
-            return None
-        raise
-    return gemma_rms_norm, add_gemma_rms_norm
 
 
 # Unlike the gated-activation ops, sgl_kernel does *not* build the rmsnorm ops
@@ -301,7 +286,6 @@ class GemmaRMSNormOp(BaseFusedOp):
         KernelBackend.AOT: _CUDA,
         KernelBackend.JIT: _HIP,
         KernelBackend.SGL_KERNEL_NPU: _NPU,
-        KernelBackend.TORCH_NPU: _NPU,
     }
     format_signature = FormatSignature(
         supported_dtypes=_NORM_DTYPES,
@@ -315,18 +299,8 @@ class GemmaRMSNormOp(BaseFusedOp):
         KernelBackend.SGL_KERNEL_NPU: (
             "Gemma-style RMS normalization (sgl_kernel_npu, Ascend)."
         ),
-        KernelBackend.TORCH_NPU: (
-            "Gemma-style RMS normalization (native torch_npu, Ascend)."
-        ),
         KernelBackend.TORCH: "Gemma-style RMS normalization (pure-torch reference).",
     }
-
-    def backend_eligible(self, backend: KernelBackend, *args, **kwargs) -> bool:
-        if not super().backend_eligible(backend, *args, **kwargs):
-            return False
-        if backend is KernelBackend.SGL_KERNEL_NPU:
-            return _load_sgl_kernel_npu_gemma_api() is not None
-        return True
 
     def forward_native(
         self,
@@ -385,30 +359,16 @@ class GemmaRMSNormOp(BaseFusedOp):
         out: Optional[torch.Tensor] = None,
         enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
-        api = _load_sgl_kernel_npu_gemma_api()
-        if api is None:
+        try:
+            from sgl_kernel_npu.norm.gemma_rmsnorm import gemma_rms_norm
+        except ImportError as error:
             raise RuntimeError(
-                "sgl_kernel_npu was not built with Gemma RMSNorm support"
-            )
-        gemma_rms_norm, _ = api
+                "Gemma RMSNorm on Ascend requires a target-specific "
+                "sgl-kernel-npu wheel that provides "
+                "sgl_kernel_npu.norm.gemma_rmsnorm"
+            ) from error
 
         result = gemma_rms_norm(input, weight, eps)
-        if out is None:
-            return result
-        out.copy_(result)
-        return out
-
-    def forward_npu(
-        self,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        eps: float = 1e-6,
-        out: Optional[torch.Tensor] = None,
-        enable_pdl: Optional[bool] = None,
-    ) -> torch.Tensor:
-        import torch_npu
-
-        result = torch_npu.npu_gemma_rms_norm(input, weight, eps)[0]
         if out is None:
             return result
         out.copy_(result)
@@ -426,7 +386,6 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         KernelBackend.AOT: _CUDA,
         KernelBackend.JIT: _HIP,
         KernelBackend.SGL_KERNEL_NPU: _NPU,
-        KernelBackend.TORCH_NPU: _NPU,
     }
     format_signature = FormatSignature(
         supported_dtypes=_NORM_DTYPES,
@@ -443,21 +402,10 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
             "Gemma-style fused residual-add + RMS normalization "
             "(sgl_kernel_npu, Ascend)."
         ),
-        KernelBackend.TORCH_NPU: (
-            "Gemma-style fused residual-add + RMS normalization "
-            "(native torch_npu, Ascend)."
-        ),
         KernelBackend.TORCH: (
             "Gemma-style fused residual-add + RMS normalization (pure-torch reference)."
         ),
     }
-
-    def backend_eligible(self, backend: KernelBackend, *args, **kwargs) -> bool:
-        if not super().backend_eligible(backend, *args, **kwargs):
-            return False
-        if backend is KernelBackend.SGL_KERNEL_NPU:
-            return _load_sgl_kernel_npu_gemma_api() is not None
-        return True
 
     def forward_native(
         self,
@@ -516,30 +464,16 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         eps: float = 1e-6,
         enable_pdl: Optional[bool] = None,
     ) -> None:
-        api = _load_sgl_kernel_npu_gemma_api()
-        if api is None:
+        try:
+            from sgl_kernel_npu.norm.gemma_rmsnorm import add_gemma_rms_norm
+        except ImportError as error:
             raise RuntimeError(
-                "sgl_kernel_npu was not built with Gemma RMSNorm support"
-            )
-        _, add_gemma_rms_norm = api
+                "Gemma RMSNorm on Ascend requires a target-specific "
+                "sgl-kernel-npu wheel that provides "
+                "sgl_kernel_npu.norm.gemma_rmsnorm"
+            ) from error
 
         norm_output, residual_sum = add_gemma_rms_norm(input, weight, residual, eps)
-        input.copy_(norm_output)
-        residual.copy_(residual_sum)
-
-    def forward_npu(
-        self,
-        input: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        eps: float = 1e-6,
-        enable_pdl: Optional[bool] = None,
-    ) -> None:
-        import torch_npu
-
-        norm_output, _, residual_sum = torch_npu.npu_add_rms_norm(
-            residual, input, 1.0 + weight, eps
-        )
         input.copy_(norm_output)
         residual.copy_(residual_sum)
 
