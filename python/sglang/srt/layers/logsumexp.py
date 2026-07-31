@@ -7,19 +7,15 @@ shift-invariant way log-softmax does: folding them into one absolute
 normalizer would round the small log-sum term away whenever rows carry a
 large common offset.
 
-``row_logsumexp_topk`` additionally maintains a running top-k (k <= 32) in
-registers during the same pass, so callers that need both the normalizer and
-the top-k tokens pay for a single read of the input.
+``row_logsumexp_topk`` additionally maintains a running top-k
+(k <= FUSED_TOPK_MAX_K) in registers during the same pass, so callers that
+need both the normalizer and the top-k tokens pay for a single read of the
+input.
 """
 
 import torch
 import triton
 import triton.language as tl
-
-from sglang.srt.layers.moe.moe_runner.triton_utils.gate_topk import (
-    fpval_to_key,
-    key_to_fpval,
-)
 
 # Maximum k for the fused top-k kernel; larger k should fall back to
 # torch.topk. The per-block selection cost grows with k: measured on GB300
@@ -115,11 +111,26 @@ def row_logsumexp(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 @triton.jit
+def _fpval_to_key(x):
+    """fp32 bits (as uint32) -> unsigned key with float order.
+
+    The standard sign-flip transform, specialized to 32-bit from
+    kernels.ops.moe.gate_topk's generic helpers.
+    """
+    return x ^ tl.where((x & 0x80000000) != 0, 0xFFFFFFFF, 0x80000000)
+
+
+@triton.jit
+def _key_to_fpval(x):
+    return x ^ tl.where((x & 0x80000000) == 0, 0xFFFFFFFF, 0x80000000)
+
+
+@triton.jit
 def _pack_key(vals, idxs):
     """Pack fp32 value + int32 index into one order-encoding int64 key.
 
     Key order == candidate order: higher value wins, value ties go to the
-    LOWER index. The fp32 bits are mapped through gate_topk's sign-flip
+    LOWER index. The fp32 bits are mapped through the sign-flip
     transform so unsigned bit order matches float order, then placed above
     the complemented index; all keys land in [0, 2**63), so signed int64
     comparison is the candidate comparison. The 2147483647 (int32 max)
@@ -127,14 +138,14 @@ def _pack_key(vals, idxs):
     (-inf, sentinel) candidates lose against everything, including genuine
     -inf lanes.
     """
-    sortable = fpval_to_key(vals.to(tl.uint32, bitcast=True))
+    sortable = _fpval_to_key(vals.to(tl.uint32, bitcast=True))
     return (sortable.to(tl.int64) << 31) | (2147483647 - idxs).to(tl.int64)
 
 
 @triton.jit
 def _unpack_val(keys):
     sortable = ((keys >> 31) & 0xFFFFFFFF).to(tl.uint32)
-    return key_to_fpval(sortable).to(tl.float32, bitcast=True)
+    return _key_to_fpval(sortable).to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -262,10 +273,14 @@ def row_logsumexp_topk(
     if num_rows == 0:
         return out_max, out_log_sum, top_vals, top_idx
 
+    # Floor 2: K_PAD=1 would degenerate the kernel's [K_PAD, SEG] view
+    # (and flip/sort of single-lane tensors).
+    k_pad = max(2, triton.next_power_of_2(k))
     # next_power_of_2(num_cols) >= num_cols >= k when num_cols < 16384, and
     # 16384 > FUSED_TOPK_MAX_K otherwise: the kernel's first block always
-    # sees at least k in-row lanes.
-    BLOCK_N = triton.next_power_of_2(min(num_cols, 16384))
+    # sees at least k in-row lanes. The K_PAD floor keeps SEG =
+    # BLOCK_N // K_PAD >= 1 for tiny vocabularies.
+    BLOCK_N = max(triton.next_power_of_2(min(num_cols, 16384)), k_pad)
     _row_logsumexp_topk_kernel[(num_rows,)](
         x,
         out_max,
@@ -276,9 +291,7 @@ def row_logsumexp_topk(
         x.stride(1),
         num_cols,
         K=k,
-        # Floor 2: K_PAD=1 would degenerate the kernel's [BLOCK_N // K_PAD,
-        # K_PAD] view (and flip/sort of single-lane tensors).
-        K_PAD=max(2, triton.next_power_of_2(k)),
+        K_PAD=k_pad,
         BLOCK_N=BLOCK_N,
         num_warps=8,
     )

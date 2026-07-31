@@ -228,6 +228,28 @@ class TestFastInputLogprobs(CustomTestCase):
                 logprob.cpu(), expected.expand(4), rtol=1e-5, atol=1e-5
             )
 
+    def test_logsumexp_module_imports(self):
+        # Runs on CPU CI too: catches import rot in the CUDA-only kernel
+        # module, whose imports otherwise only execute on GPU machines.
+        import sglang.srt.layers.logsumexp  # noqa: F401
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_fused_tiny_shapes(self):
+        from sglang.srt.layers.logsumexp import row_logsumexp_topk
+
+        for rows, cols, k in ((1, 1, 1), (3, 2, 2), (2, 3, 1), (2, 5, 5)):
+            logits = torch.randn(rows, cols, device="cuda")
+            got_m, got_ls, got_v, got_i = row_logsumexp_topk(logits, k)
+            ref_v, ref_i = torch.topk(logits, k, dim=-1, sorted=True)
+            self.assertTrue(torch.equal(got_v, ref_v.float()), (rows, cols, k))
+            self.assertTrue(torch.equal(got_i, ref_i), (rows, cols, k))
+            torch.testing.assert_close(
+                got_m + got_ls,
+                torch.logsumexp(logits.double(), dim=-1).float(),
+                rtol=1e-5,
+                atol=1e-5,
+            )
+
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_fused_run_to_run_deterministic(self):
         from sglang.srt.layers.logsumexp import row_logsumexp_topk
