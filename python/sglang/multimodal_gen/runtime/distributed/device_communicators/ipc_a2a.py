@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 _SYNC_DECL = (
     "void spin_wait(torch::Tensor flag, torch::Tensor target, torch::Tensor timed_out,"
-    " int64_t budget_ns);\n"
+    " torch::Tensor peer_timed_out, int64_t budget_ns);\n"
     "void bump_signal(torch::Tensor seq, torch::Tensor peer_flag);"
 )
 _SYNC_SRC = """
@@ -41,15 +41,20 @@ __device__ __forceinline__ unsigned long long now_ns() {
     return t;
 }
 __global__ void spin_wait_kernel(volatile int* flag, const int* target,
-                                 int* timed_out, unsigned long long budget_ns) {
+                                 int* timed_out, int* peer_timed_out,
+                                 unsigned long long budget_ns) {
     int t = *target;
     unsigned long long start = now_ns();
     while (*flag < t) {
         if (now_ns() - start > budget_ns) {
             // Give up rather than hang the stream forever. The peer never
-            // published, so this exchange's data is incomplete; the host reads
-            // the flag outside capture and disables the transport.
+            // published, so this exchange's data is incomplete. Flag it on the
+            // peer as well as here: both ranks must retire the transport at the
+            // same request boundary, or the one that switched to NCCL would post
+            // a collective the other never posts.
             *timed_out = 1;
+            *peer_timed_out = 1;
+            __threadfence_system();
             return;
         }
     }
@@ -62,10 +67,11 @@ __global__ void bump_signal_kernel(int* seq, volatile int* peer_flag) {
     *peer_flag = v;
 }
 void spin_wait(torch::Tensor flag, torch::Tensor target, torch::Tensor timed_out,
-               int64_t budget_ns) {
+               torch::Tensor peer_timed_out, int64_t budget_ns) {
     spin_wait_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
         (volatile int*)flag.data_ptr<int>(), target.data_ptr<int>(),
-        timed_out.data_ptr<int>(), (unsigned long long)budget_ns);
+        timed_out.data_ptr<int>(), peer_timed_out.data_ptr<int>(),
+        (unsigned long long)budget_ns);
 }
 void bump_signal(torch::Tensor seq, torch::Tensor peer_flag) {
     bump_signal_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -88,6 +94,7 @@ class IpcA2AState:
         self.peer_flag = None
         self.my_seq = None
         self.timed_out = None
+        self.peer_timed_out = None
         self.budget_ns = 0
         self.max_buffers = 0
         self.calls = 0
@@ -153,6 +160,7 @@ class IpcA2AState:
         self.budget_ns = int(envs.SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS * 1e6)
         self.max_buffers = envs.SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS
         self.peer_flag = self._share(self.flag, group)
+        self.peer_timed_out = self._share(self.timed_out, group)
         self.inited = True
 
     def get_staging(self, n_local, n_peer, dtype, group):
@@ -208,21 +216,39 @@ class IpcA2AState:
         self.ops.bump_signal(self.my_seq, self.peer_flag)
 
     def wait(self):
-        self.ops.spin_wait(self.flag, self.my_seq, self.timed_out, self.budget_ns)
-
-    def check_timeout(self) -> bool:
-        """Read the timeout flag (a device sync, so call this between requests,
-        never inside a capture) and disable the transport if it fired."""
-        if self.failed or not self.inited or self.timed_out.item() == 0:
-            return False
-        logger.error(
-            "IPC all-to-all timed out waiting for the peer after %d ms; "
-            "falling back to NCCL. The exchange that timed out returned "
-            "incomplete data.",
-            envs.SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS,
+        self.ops.spin_wait(
+            self.flag,
+            self.my_seq,
+            self.timed_out,
+            self.peer_timed_out,
+            self.budget_ns,
         )
+
+    def check_timeout(self) -> None:
+        """Retire the transport on every rank if any rank's spin expired.
+
+        The flag is a device read, so this belongs at a request boundary, never
+        inside a capture. It reads as local, but the spin kernel sets the flag on
+        both sides, so a timeout retires the transport on both: a rank that
+        retired alone would post an all_to_all its peer -- still on IPC -- never
+        posts, and the NCCL watchdog would take the process down.
+
+        Expiry means the peer went silent for the whole budget, which is a hang,
+        not a slow step, and the exchange that gave up returned incomplete data.
+        So this raises rather than quietly serving a corrupted result.
+        """
+        if self.failed or not self.inited or self.timed_out.item() == 0:
+            return
         self.failed = True
-        return True
+        raise RuntimeError(
+            "IPC all-to-all gave up waiting for its peer after "
+            f"{envs.SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS:g} ms, so that exchange "
+            "returned incomplete data. The transport is now disabled on every "
+            "rank; retry the request over NCCL. Raise "
+            "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS if a rank can legitimately "
+            "stall this long (layerwise offload, expert-tower swaps), or set "
+            "SGLANG_DIFFUSION_IPC_A2A=0."
+        )
 
 
 IPC_A2A = IpcA2AState()

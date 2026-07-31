@@ -157,6 +157,24 @@ def _worker() -> int:
             f"staged={len(IPC_A2A.staging)})"
         )
 
+    # A timeout must retire the transport on BOTH ranks. When only the rank that
+    # timed out switched to NCCL, it posted an all_to_all its peer -- still on
+    # IPC -- never posted, and the NCCL watchdog took the process down (seen on
+    # wan2_2_t2v_a14b_2gpu in CI). Rank 0 waits for a signal rank 1 never sends,
+    # so rank 1 may only learn of it through the peer-side flag write.
+    IPC_A2A.budget_ns = 5 * 1000 * 1000
+    if rank == 0:
+        IPC_A2A.signal_and_wait()
+    torch.cuda.synchronize()
+    dist.barrier()
+    if IPC_A2A.timed_out.item() == 0:
+        failures.append(f"rank{rank} never saw the timeout flag")
+    try:
+        IPC_A2A.check_timeout()
+        failures.append(f"rank{rank} check_timeout did not raise after a timeout")
+    except RuntimeError:
+        pass
+
     verdict = torch.tensor([len(failures)], device="cuda")
     dist.all_reduce(verdict)
     if failures:
