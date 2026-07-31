@@ -9,13 +9,9 @@ verify->commit chain stays bitwise equal at every step (no accumulation channel
 on the state path -- the long-decode drift failure mode).
 """
 
-import sys
 import unittest
-from pathlib import Path
 
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
 from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
