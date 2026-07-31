@@ -104,6 +104,44 @@ class DVRDraftBackend:
         del recv_req
         return True, "Succeeded to update model weights."
 
+    def update_draft_runner_from_disk(self, runner, recv_req):
+        model_path, load_format = self.draft_weight_source(
+            recv_req.model_path, recv_req.load_format
+        )
+        return runner.weight_updater.update_weights_from_disk(
+            model_path,
+            load_format,
+            recapture_cuda_graph=False,
+        )
+
+    def update_draft_runner_from_ipc(self, runner, recv_req):
+        if self.draft_follows_target:
+            return runner.weight_updater.update_weights_from_ipc(recv_req)
+
+        model_path, load_format = self.draft_weight_source(None, None)
+        return runner.weight_updater.update_weights_from_disk(
+            model_path,
+            load_format,
+            recapture_cuda_graph=False,
+        )
+
+    @property
+    def draft_follows_target(self) -> bool:
+        server_args = self.owner.server_args
+        return (
+            server_args.speculative_draft_model_path is not None
+            and server_args.speculative_draft_model_path == server_args.model_path
+        )
+
+    def draft_weight_source(self, target_model_path, target_load_format):
+        server_args = self.owner.server_args
+        if self.draft_follows_target:
+            return target_model_path, target_load_format
+        return (
+            server_args.speculative_draft_model_path,
+            server_args.speculative_draft_load_format or server_args.load_format,
+        )
+
     def reset_cuda_graphs(self):
         pass
 
@@ -133,11 +171,6 @@ class DVRDraftBackend:
                 "DVR target verify must return hidden states required by the "
                 "draft backend."
             )
-
-    def publish_rollback_event(self, event):
-        if self.worker is None:
-            self.war_fastpath_runner.war_fastpath_read_done_event = event
-
 
 class SelfDraftBackend(DVRDraftBackend):
     """Target-model self-draft around the common DVR transaction."""

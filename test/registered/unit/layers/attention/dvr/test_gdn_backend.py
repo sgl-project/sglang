@@ -685,7 +685,7 @@ def test_gdn_self_draft_rebuild_reads_boundary_and_writes_workspace():
     )
 
 
-def test_gdn_commit_alternates_boundary_slots(monkeypatch):
+def test_gdn_commit_and_stage_boundary_state(monkeypatch):
     temporal_scatters = []
     conv_scatters = []
     monkeypatch.setattr(
@@ -727,21 +727,25 @@ def test_gdn_commit_alternates_boundary_slots(monkeypatch):
         transition_cache=(torch.empty(1, 3, 80, 1),) * 4,
     )
 
-    crossed = adapter.commit_accepted_state(
+    crossed, boundary_conv_steps = adapter.commit_accepted_state(
         request_rows=torch.tensor([1, 2]),
         target_cache_slots=torch.tensor([3, 4]),
-        radix_checkpoint_slots=torch.tensor([7, 8]),
         tail_lens_before=torch.tensor([63, 1]),
         accepted_token_counts=torch.tensor([2, 2]),
     )
 
     assert crossed.tolist() == [True, False]
-    assert temporal_scatters == [
-        ([3, 4], [0, -1], [1, 2]),
-        ([7, 8], [0, -1], [1, 2]),
-    ]
-    assert conv_scatters == [
-        ([3, 4], [1, 1], [1, 2]),
-        ([7, 8], [0, -1], [1, 2]),
-    ]
+    assert boundary_conv_steps.tolist() == [0, -1]
+    assert temporal_scatters == [([3, 4], [0, -1], [1, 2])]
+    assert conv_scatters == [([3, 4], [1, 1], [1, 2])]
     assert compacted_tails == [[1, 3]]
+
+    adapter.stage_boundary_state(
+        request_rows=torch.tensor([1, 2]),
+        source_slots=torch.tensor([3, 4]),
+        destination_slots=torch.tensor([7, 8]),
+        boundary_conv_steps=boundary_conv_steps,
+    )
+
+    assert temporal_scatters[-1] == ([7, 8], [0, -1], [3, 4])
+    assert conv_scatters[-1] == ([7, 8], [0, -1], [1, 2])

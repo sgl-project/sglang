@@ -127,6 +127,7 @@ def _make_model_runner(
     spec.is_standalone.return_value = False
     spec.is_dflash.return_value = False
     spec.is_dflash_family.return_value = False
+    spec.is_dvr_dflash.return_value = False
     spec.is_none.return_value = True
     mr.spec_algorithm = spec
 

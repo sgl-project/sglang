@@ -53,13 +53,27 @@ case "${SERVER_MODE}" in
       --speculative-num-draft-tokens "${DRAFT_TOKENS}"
     )
     ;;
+  dflash)
+    if [[ -z "${DRAFT_MODEL_PATH:-}" ]]; then
+      echo "DRAFT_MODEL_PATH is required for SERVER_MODE=dflash." >&2
+      exit 2
+    fi
+    SPECULATIVE_ALGORITHM="DECODE_VERIFY_ROLLBACK_DFLASH"
+    DRAFT_TOKENS="${DRAFT_TOKENS:-16}"
+    spec_args+=(
+      --enable-deterministic-inference
+      --speculative-algorithm "${SPECULATIVE_ALGORITHM}"
+      --speculative-draft-model-path "${DRAFT_MODEL_PATH}"
+      --speculative-num-draft-tokens "${DRAFT_TOKENS}"
+    )
+    ;;
   *)
-    echo "SERVER_MODE must be normal, deterministic, self, or eagle." >&2
+    echo "SERVER_MODE must be normal, deterministic, self, eagle, or dflash." >&2
     exit 2
     ;;
 esac
 
-if [[ "${SERVER_MODE}" =~ ^(self|eagle)$ ]]; then
+if [[ "${SERVER_MODE}" =~ ^(self|eagle|dflash)$ ]]; then
   if ((DRAFT_TOKENS < 2)); then
     echo "DRAFT_TOKENS must be at least 2." >&2
     exit 2

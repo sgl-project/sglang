@@ -200,6 +200,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         needs_full_hidden_states = (
             model_runner.server_args.enable_return_hidden_states
             or model_runner.spec_algorithm.is_dflash_family()
+            or model_runner.spec_algorithm.is_dvr_dflash()
         )
         if is_breakable_eagle and model_runner.is_draft_worker:
             self.capture_hidden_mode = CaptureHiddenMode.LAST

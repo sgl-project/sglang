@@ -133,14 +133,10 @@ class EagleDraftBackend(DVRDraftBackend):
             self.worker.init_cuda_graphs()
 
     def update_weights_from_disk(self, recv_req):
-        return self.worker.draft_runner.update_weights_from_disk(
-            recv_req.model_path,
-            recv_req.load_format,
-            recapture_cuda_graph=False,
-        )
+        return self.update_draft_runner_from_disk(self.worker.draft_runner, recv_req)
 
     def update_weights_from_ipc(self, recv_req):
-        return self.worker.draft_runner.update_weights_from_ipc(recv_req)
+        return self.update_draft_runner_from_ipc(self.worker.draft_runner, recv_req)
 
     @contextmanager
     def context(self):
@@ -180,5 +176,6 @@ class EagleDraftBackend(DVRDraftBackend):
         return self.worker.draft(batch)
 
     def commit_draft_state(self, batch, batch_result):
+        # Draft extend remains the final shared-pool reader for EAGLE.
         with self.context(), spec_stage_span("dvr_rollback_draft"):
             self.worker._draft_extend_for_decode(batch, batch_result)

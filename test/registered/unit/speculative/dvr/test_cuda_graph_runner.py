@@ -435,16 +435,23 @@ def test_dvr_graph_layouts_separate_draft_decode_from_target_verify():
 
 
 @pytest.mark.parametrize(
-    ("forward_mode", "dvr_self_draft", "dflash", "records_event"),
+    (
+        "forward_mode",
+        "dvr_self_draft",
+        "dvr_dflash",
+        "dflash",
+        "records_event",
+    ),
     [
-        (ForwardMode.DECODE, False, False, True),
-        (ForwardMode.DECODE, True, False, False),
-        (ForwardMode.TARGET_VERIFY, False, True, True),
-        (ForwardMode.TARGET_VERIFY, True, False, True),
+        (ForwardMode.DECODE, False, False, False, True),
+        (ForwardMode.DECODE, True, False, False, False),
+        (ForwardMode.TARGET_VERIFY, False, False, True, True),
+        (ForwardMode.TARGET_VERIFY, True, False, False, True),
+        (ForwardMode.TARGET_VERIFY, False, True, False, True),
     ],
 )
 def test_cuda_graph_war_event_skips_provisional_self_draft(
-    forward_mode, dvr_self_draft, dflash, records_event
+    forward_mode, dvr_self_draft, dvr_dflash, dflash, records_event
 ):
     events = []
 
@@ -465,6 +472,7 @@ def test_cuda_graph_war_event_skips_provisional_self_draft(
         device_timer=None,
         spec_algorithm=SimpleNamespace(
             is_dvr_self_draft=lambda: dvr_self_draft,
+            is_dvr_dflash=lambda: dvr_dflash,
             is_dflash_family=lambda: dflash,
         ),
         war_fastpath_read_done_event=None,

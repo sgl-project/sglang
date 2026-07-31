@@ -76,7 +76,7 @@ def dvr_gdn_workspace_state_slots(
         + num_layers * (FLA_CHUNK_SIZE + num_draft_tokens) * values_per_token
         # Cover request-local boundary metadata without coupling pool sizing to
         # the selected Radix strategy.
-        + 3 * torch.int64.itemsize
+        + 6 * torch.int64.itemsize
     )
     return max(1, math.ceil(workspace_bytes / cache_params.mamba_cache_per_req))
 
@@ -524,15 +524,43 @@ class DVRGDNStateAdapter:
             ),
         )
 
+    def stage_boundary_state(
+        self,
+        *,
+        request_rows: torch.Tensor,
+        source_slots: torch.Tensor,
+        destination_slots: torch.Tensor,
+        boundary_conv_steps: torch.Tensor,
+    ) -> None:
+        """Stage one exact live boundary in ordinary Radix tracking storage."""
+
+        dvr_scatter_state(
+            self.state_cache.temporal,
+            self.state_cache.temporal.unsqueeze(2),
+            source_rows=source_slots,
+            destination_rows=destination_slots,
+            source_steps=torch.where(
+                boundary_conv_steps >= 0,
+                torch.zeros_like(boundary_conv_steps),
+                torch.full_like(boundary_conv_steps, -1),
+            ),
+        )
+        dvr_scatter_conv_window(
+            self.state_cache.conv[0],
+            self.verify_conv_windows,
+            source_rows=request_rows,
+            destination_rows=destination_slots,
+            source_steps=boundary_conv_steps,
+        )
+
     def commit_accepted_state(
         self,
         *,
         request_rows: torch.Tensor,
         target_cache_slots: torch.Tensor,
-        radix_checkpoint_slots: Optional[torch.Tensor],
         tail_lens_before: torch.Tensor,
         accepted_token_counts: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         tail_lens_before = tail_lens_before.to(
             device=target_cache_slots.device, dtype=torch.long
         )
@@ -542,6 +570,11 @@ class DVRGDNStateAdapter:
         tail_lens_after = tail_lens_before + accepted_token_counts
         crosses_chunk_boundary = tail_lens_after >= self.chunk_size
         no_commit_step = torch.full_like(tail_lens_before, -1)
+        boundary_conv_steps = torch.where(
+            crosses_chunk_boundary,
+            self.chunk_size - 1 - tail_lens_before,
+            no_commit_step,
+        )
         # accept_lens includes the bonus token, so every non-idle request has a
         # valid accepted step. The fused scatter already handles the empty batch.
         dvr_scatter_conv_window(
@@ -562,9 +595,10 @@ class DVRGDNStateAdapter:
                 source_steps=accepted_token_counts - 1,
             )
 
-        # The target live slot owns the exact recurrent boundary. Radix tracking
-        # receives a copy only when accepted tokens cross that boundary.
-        with profile_range("boundary_publish"):
+        # The target live slot owns the newest computed boundary. Radix staging
+        # is delayed until the scheduler has either continued or finalized the
+        # request, because CPU stop handling may trim the accepted suffix.
+        with profile_range("target_boundary_commit"):
             dvr_scatter_state(
                 self.state_cache.temporal,
                 self.recurrent_workspace,
@@ -576,29 +610,6 @@ class DVRGDNStateAdapter:
                     no_commit_step,
                 ),
             )
-            if radix_checkpoint_slots is not None:
-                dvr_scatter_state(
-                    self.state_cache.temporal,
-                    self.recurrent_workspace,
-                    source_rows=request_rows,
-                    destination_rows=radix_checkpoint_slots,
-                    source_steps=torch.where(
-                        crosses_chunk_boundary,
-                        torch.zeros_like(tail_lens_before),
-                        no_commit_step,
-                    ),
-                )
-                dvr_scatter_conv_window(
-                    self.state_cache.conv[0],
-                    self.verify_conv_windows,
-                    source_rows=request_rows,
-                    destination_rows=radix_checkpoint_slots,
-                    source_steps=torch.where(
-                        crosses_chunk_boundary,
-                        self.chunk_size - 1 - tail_lens_before,
-                        no_commit_step,
-                    ),
-                )
         new_tail_lens = tail_lens_after - self.chunk_size
         tail_lens_after = torch.where(
             crosses_chunk_boundary, new_tail_lens, tail_lens_after
@@ -625,7 +636,7 @@ class DVRGDNStateAdapter:
                 )
         # EAGLE/MTP owns separate draft state and skips this reconstruction.
 
-        return crosses_chunk_boundary
+        return crosses_chunk_boundary, boundary_conv_steps
 
 
 class DVRGDNAttnBackend(GDNAttnBackend):

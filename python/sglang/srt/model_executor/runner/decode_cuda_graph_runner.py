@@ -1249,6 +1249,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and (
                 self.model_runner.spec_algorithm.is_dflash_family()
                 or self.model_runner.spec_algorithm.is_dvr_self_draft()
+                or self.model_runner.spec_algorithm.is_dvr_dflash()
             )
         )
         # Exception: breakable-graph verify replays (captured forward metadata)

@@ -106,7 +106,9 @@ def _resolve_dflash_aux_hidden_state(
     spec_algorithm: SpeculativeAlgorithm,
     is_draft_worker: bool,
 ) -> None:
-    if spec_algorithm.is_dflash_family() and not is_draft_worker:
+    if (
+        spec_algorithm.is_dflash_family() or spec_algorithm.is_dvr_dflash()
+    ) and not is_draft_worker:
         from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
         # Select target layers to capture for building draft context features.

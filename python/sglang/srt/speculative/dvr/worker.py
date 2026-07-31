@@ -585,6 +585,12 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
 
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 
+        if on_publish is not None:
+            # Acceptance fully determines the next logical lengths. Publish them
+            # before target-state maintenance so overlap preparation can proceed;
+            # request release remains fenced by rollback_done_event below.
+            on_publish(new_seq_lens)
+
         with spec_stage_span("dvr_rollback"):
             self.state_lifecycle.rollback(
                 batch=batch,
@@ -594,7 +600,6 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
         if rollback_plan is not None:
             self.rollback_done_event = device_module.Event()
             self.rollback_done_event.record()
-            self.draft_backend.publish_rollback_event(self.rollback_done_event)
         if rollback_plan is None:
             commit_mamba_states_after_verify(
                 self.target_worker,
@@ -603,11 +608,6 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
                 accept_index,
                 verify_tokens,
             )
-        if on_publish is not None:
-            # Publish only after the request-owned state commit is enqueued and
-            # fenced. EAGLE draft-extend later replaces this with its final
-            # shared-pool read event; self-draft uses the commit event itself.
-            on_publish(new_seq_lens)
         if has_verify_tokens and batch.return_logprob:
             with spec_stage_span("verify_logprob"):
                 compute_spec_v2_logprobs(

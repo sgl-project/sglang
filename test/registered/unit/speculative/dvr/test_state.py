@@ -35,6 +35,7 @@ class FakeAdapter:
         self.recurrent_workspace = torch.empty(1, 8, 1)
         self.zeroed = []
         self.published = []
+        self.staged = []
         self.initialized = []
         self.commits = []
         self.crosses_boundary = torch.tensor([False])
@@ -49,6 +50,13 @@ class FakeAdapter:
     def publish_boundary_state(self, **kwargs):
         self.published.append({name: value.tolist() for name, value in kwargs.items()})
 
+    def stage_boundary_state(self, **kwargs):
+        valid = kwargs["boundary_conv_steps"] >= 0
+        if valid.any():
+            self.staged.append(
+                {name: value[valid].tolist() for name, value in kwargs.items()}
+            )
+
     def initialize_self_draft_state(self, **kwargs):
         self.initialized.append(
             {name: value.tolist() for name, value in kwargs.items()}
@@ -56,7 +64,12 @@ class FakeAdapter:
 
     def commit_accepted_state(self, **kwargs):
         self.commits.append(kwargs)
-        return self.crosses_boundary
+        boundary_conv_steps = torch.where(
+            self.crosses_boundary,
+            self.chunk_size - 1 - kwargs["tail_lens_before"],
+            torch.full_like(kwargs["tail_lens_before"], -1),
+        )
+        return self.crosses_boundary, boundary_conv_steps
 
 
 def make_lifecycle(*, disable_radix=False, track_slots=(10, 11)):
@@ -77,6 +90,7 @@ def make_batch(*, seq_len, prefix_len=0, next_track=1, track_slots=(10, 11)):
     req = SimpleNamespace(
         rid="r0",
         req_pool_idx=1,
+        mamba_pool_idx=torch.tensor([20]),
         mamba_next_track_idx=next_track,
         mamba_ping_pong_track_buffer=torch.tensor(track_slots),
         skip_radix_cache_insert=False,
@@ -359,8 +373,8 @@ def test_new_prefill_boundary_is_copied_to_radix_tracking_slot():
         }
     ]
     assert lifecycle.radix_boundary_lens[1].tolist() == [64, -1]
-    assert plan.radix_checkpoint_slots.tolist() == [11]
-    assert plan.radix_checkpoint_lanes.tolist() == [1]
+    assert lifecycle.radix_boundary_slots[1].tolist() == [10, -1]
+    assert plan.target_cache_slots.tolist() == [20]
 
 
 def test_sync_single_lane_publishes_first_accepted_boundary():
@@ -374,10 +388,9 @@ def test_sync_single_lane_publishes_first_accepted_boundary():
     adapter.crosses_boundary = torch.tensor([True])
     lifecycle.rollback(batch=batch, plan=plan, accept_lens=torch.tensor([1]))
 
-    assert plan.radix_checkpoint_slots.tolist() == [10]
-    assert plan.radix_checkpoint_lanes.tolist() == [0]
     assert lifecycle.target_boundary_lens[1].item() == 64
-    assert lifecycle.radix_boundary_lens[1].tolist() == [64]
+    assert lifecycle.radix_boundary_lens[1].tolist() == [-1]
+    assert lifecycle.pending_boundary_conv_steps[1].item() == 0
 
     req.kv_committed_len = 64
     req.finished_reason = None
@@ -386,6 +399,14 @@ def test_sync_single_lane_publishes_first_accepted_boundary():
 
     assert req.mamba_last_track_seqlen == 64
     assert req.mamba_next_track_idx == 0
+    assert adapter.staged == [
+        {
+            "request_rows": [1],
+            "source_slots": [20],
+            "destination_slots": [10],
+            "boundary_conv_steps": [0],
+        }
+    ]
 
 
 def test_sync_single_lane_uses_replacement_slot_after_radix_donation():
@@ -402,13 +423,19 @@ def test_sync_single_lane_uses_replacement_slot_after_radix_donation():
     req.mamba_ping_pong_track_buffer[0] = 12
     pool.req_index_to_mamba_ping_pong_track_buffer_mapping[1, 0] = 12
     plan = lifecycle.prepare_rollback(batch)
+    assert lifecycle.radix_boundary_lens[1].tolist() == [-1]
     adapter.crosses_boundary = torch.tensor([True])
     lifecycle.rollback(batch=batch, plan=plan, accept_lens=torch.tensor([63]))
 
-    assert plan.radix_checkpoint_slots.tolist() == [12]
-    assert plan.radix_checkpoint_lanes.tolist() == [0]
     assert lifecycle.target_boundary_lens[1].item() == 128
+    assert lifecycle.radix_boundary_lens[1].tolist() == [-1]
+
+    batch.seq_lens = torch.tensor([128])
+    lifecycle.prepare_rollback(batch)
+
     assert lifecycle.radix_boundary_lens[1].tolist() == [128]
+    assert lifecycle.radix_boundary_slots[1].tolist() == [12]
+    assert adapter.staged[-1]["destination_slots"] == [12]
 
 
 def test_warm_partial_extend_needs_no_new_radix_checkpoint():
@@ -423,7 +450,7 @@ def test_warm_partial_extend_needs_no_new_radix_checkpoint():
     assert adapter.published[-1]["publish_mask"] == [False]
     assert lifecycle.radix_boundary_lens[1].tolist() == [-1, -1]
     assert plan.target_cache_slots.tolist() == [20]
-    assert plan.radix_checkpoint_slots.tolist() == [10]
+    assert adapter.staged == []
 
 
 def test_no_radix_boundary_crossing_updates_only_live_state():
@@ -437,8 +464,8 @@ def test_no_radix_boundary_crossing_updates_only_live_state():
 
     lifecycle.rollback(batch=batch, plan=plan, accept_lens=torch.tensor([2]))
 
-    assert adapter.commits[-1]["radix_checkpoint_slots"] is None
     assert lifecycle.target_boundary_lens[1].item() == 64
+    assert adapter.staged == []
 
     lifecycle.prepare_for_cache_release(req)
 
@@ -457,9 +484,14 @@ def test_radix_boundary_crossing_rotates_publication_lane():
     lifecycle.rollback(batch=batch, plan=plan, accept_lens=torch.tensor([63]))
 
     assert adapter.commits[-1]["target_cache_slots"].tolist() == [20]
-    assert adapter.commits[-1]["radix_checkpoint_slots"].tolist() == [11]
     assert lifecycle.target_boundary_lens[1].item() == 128
+    assert lifecycle.radix_boundary_lens[1].tolist() == [64, -1]
+
+    batch.seq_lens = torch.tensor([128])
+    lifecycle.prepare_rollback(batch)
+
     assert lifecycle.radix_boundary_lens[1].tolist() == [64, 128]
+    assert adapter.staged[-1]["destination_slots"] == [11]
 
 
 def test_release_selects_latest_visible_radix_boundary():
@@ -505,3 +537,63 @@ def test_generated_release_excludes_unprocessed_final_token():
 
     assert req.mamba_last_track_seqlen == 64
     assert req.mamba_next_track_idx == 1
+
+
+@pytest.mark.parametrize("track_slots", [(10,), (10, 11)])
+def test_aligned_generation_keeps_last_visible_boundary(track_slots):
+    lifecycle, adapter, pool = make_lifecycle(track_slots=track_slots)
+    next_track = 0 if len(track_slots) == 1 else 1
+    req, batch = make_batch(
+        seq_len=512,
+        next_track=next_track,
+        track_slots=track_slots,
+    )
+    attach_pool(batch, pool)
+    lifecycle.prepare_target_extend(batch)
+    lifecycle.finish_target_extend(batch)
+
+    for seq_len in (512, 528, 544, 560):
+        batch.seq_lens = torch.tensor([seq_len])
+        plan = lifecycle.prepare_rollback(batch)
+        adapter.crosses_boundary = torch.tensor([seq_len == 560])
+        lifecycle.rollback(
+            batch=batch,
+            plan=plan,
+            accept_lens=torch.tensor([16]),
+        )
+
+    assert lifecycle.target_boundary_lens[1].item() == 576
+    assert lifecycle.pending_boundary_conv_steps[1].item() == 15
+    assert 512 in lifecycle.radix_boundary_lens[1].tolist()
+
+    req.kv_committed_len = 576
+    req.finished_reason = object()
+    req.origin_input_ids = list(range(64))
+    req.output_ids_through_stop = list(range(512))
+    req.sampling_params = SimpleNamespace(max_new_tokens=512)
+    req.effective_kv_committed_len = lambda: req.kv_committed_len
+    lifecycle.prepare_for_cache_release(req)
+
+    assert req.mamba_last_track_seqlen == 512
+    assert adapter.staged == []
+
+
+def test_overlap_extra_round_preserves_last_visible_boundary():
+    lifecycle, adapter, pool = make_lifecycle(track_slots=(10, 11))
+    req, _ = make_batch(seq_len=640, next_track=0, track_slots=(10, 11))
+    lifecycle.target_boundary_lens[1] = 640
+    lifecycle.pending_boundary_conv_steps[1] = 15
+    lifecycle.radix_boundary_lens[1] = torch.tensor([512, 576])
+    lifecycle.radix_boundary_slots[1] = torch.tensor([10, 11])
+
+    req.kv_committed_len = 640
+    req.finished_reason = object()
+    req.origin_input_ids = list(range(64))
+    req.output_ids_through_stop = list(range(512))
+    req.sampling_params = SimpleNamespace(max_new_tokens=512)
+    req.effective_kv_committed_len = lambda: req.kv_committed_len
+    lifecycle.prepare_for_cache_release(req)
+
+    assert req.mamba_last_track_seqlen == 512
+    assert req.mamba_next_track_idx == 1
+    assert adapter.staged == []
