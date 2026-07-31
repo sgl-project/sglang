@@ -19,11 +19,21 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         device: the device where the backend runs.
     """
 
+    # Supporting backends implement init_prefill_cuda_graph_batch_info() and
+    # honor use_prefill_cuda_graph in prepare_lora_batch().
+    supports_prefill_cuda_graph: bool = False
+
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
         self.device = device
         self.init_lm_head_config()
         self._is_moe_lora = False
+        # Static metadata read by prefill-CUDA-graph kernels, refreshed in
+        # place every prefill batch.
+        self.prefill_cuda_graph_batch_info: LoRABatchInfo | None = None
+        # Request/token caps for serving a batch from the static metadata.
+        self.prefill_cuda_graph_max_bs: int | None = None
+        self.prefill_cuda_graph_max_tokens: int | None = None
 
     def run_lora_a_embedding(
         self,
@@ -160,6 +170,13 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             num_tokens_per_req: number of tokens per sequence (1 for decoding, >1 for target_verify)
         """
         pass
+
+    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
+        """Allocate static LoRA batch metadata for the prefill CUDA graph,
+        sized for the largest captured token bucket. Called before capture."""
+        raise NotImplementedError(
+            f"LoRA backend {type(self).__name__} does not support the prefill CUDA graph."
+        )
 
     @property
     def is_moe_lora(self) -> bool:
@@ -317,18 +334,12 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         lora_ranks: list[int],
         scalings: list[float],
         use_cuda_graph: bool,
+        use_prefill_cuda_graph: bool = False,
     ):
         """Prepare the lora weights and batch info for current forward batch.
 
-        This method provides a hook for each backend to conduct its own preparation
-        logic for each forward batch.
-
-        Args:
-            forward_batch: the ForwardBatch object for current forward pass
-            weight_indices: list of indices of lora weights to be applied for current batch
-            lora_ranks: list of lora ranks corresponding to weight_indices
-            scalings: list of scaling factors corresponding to weight_indices
-            use_cuda_graph: whether to use CUDA Graph for this batch
+        use_cuda_graph / use_prefill_cuda_graph select in-place updates of the
+        static decode / prefill CUDA graph batch info respectively.
         """
         pass
 

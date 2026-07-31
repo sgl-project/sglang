@@ -19,7 +19,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
@@ -40,6 +40,11 @@ if is_cuda():
     )
 
     causal_conv1d_fn = causal_conv1d_fn_cuda
+elif is_xpu():
+    from sgl_kernel import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
+
+    causal_conv1d_fn = causal_conv1d_fn_xpu
+    causal_conv1d_update = causal_conv1d_update_xpu
 elif is_npu():
     from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
     from sgl_kernel_npu.mamba.causal_conv1d import (
@@ -68,10 +73,6 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
         or not is_cuda()
         or torch.cuda.get_device_capability()[0] != 10
     ):
-        return
-
-    # Extra-buffer strategies need intermediate state checkpoints.
-    if args.uses_mamba_radix_cache and args.mamba_radix_cache_strategy != "no_buffer":
         return
 
     cuda_version = torch.version.cuda
@@ -198,6 +199,10 @@ class GDNKernelDispatcher:
             f"verify={self.verify_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )
+
+    @property
+    def extend_uses_state_checkpoints(self) -> bool:
+        return self.extend_kernel.uses_state_checkpoints
 
     def packed_decode(
         self,
@@ -357,6 +362,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+            if self.kernel_dispatcher.extend_uses_state_checkpoints:
+                from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+                    maybe_build_flashinfer_checkpoint_plan,
+                )
+
+                maybe_build_flashinfer_checkpoint_plan(
+                    forward_batch, self.forward_metadata, self.device
+                )
 
     def forward_decode(
         self,
@@ -488,11 +501,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # slot layout, so they silently drop the write to the strided envelope
         # pool. Run them on contiguous per-sequence copies (identity-indexed) and
         # scatter the result back. No-op for the default contiguous pool.
+        # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use
+        # proper indexed writes and handle non-contiguous pools directly via
+        # cache_indices, so the gather/scatter round-trip is unnecessary on CPU.
         # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
         # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
         # int64 indexing, like packed_decode / causal_conv1d_update already do.
-        needs_state_gather = (not is_target_verify) and (
-            not conv_states.is_contiguous() or not ssm_states.is_contiguous()
+        needs_state_gather = (
+            (not is_target_verify)
+            and (not is_cpu())
+            and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
         )
         if needs_state_gather:
             conv_states_contig = conv_states[cache_indices].contiguous()
@@ -639,6 +657,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                state_checkpoint_cu_starts=(
+                    forward_metadata.state_checkpoint_cu_starts
+                ),
+                num_state_checkpoints=forward_metadata.num_state_checkpoints,
+                state_checkpoint_every_n_tokens=(
+                    forward_metadata.state_checkpoint_every_n_tokens
+                ),
             )
 
             if is_npu() and last_recurrent_state is not None:
@@ -653,7 +678,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_states[cache_indices] = conv_states_contig
                 ssm_states[cache_indices] = ssm_states_contig
 
-            if h is not None:
+            if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
                 )
