@@ -2034,6 +2034,13 @@ class ServerArgs:
         "The number of tokens sampled from the draft model in Speculative Decoding.",
         NS("spec"),
     ] = None
+    speculative_echo_threshold: A[
+        Optional[float],
+        "Enable ECHO for EAGLE3. Must be a finite value in [0, 1]. "
+        "Requires --speculative-eagle-topk > 1, FA3, and "
+        "--disable-overlap-schedule.",
+        NS("spec"),
+    ] = None
     speculative_dflash_block_size: A[
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",

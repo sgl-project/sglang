@@ -183,6 +183,11 @@ To enable EAGLE speculative decoding the following parameters are relevant:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Auto (<code>8</code> for Llama/Grok; <code>4</code> for many other models). If <code>topk=1</code>, it is adjusted to <code>num_steps + 1</code>.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-echo-threshold</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable ECHO for EAGLE-3. The value must be a finite float in the range <code>[0, 1]</code>. See the supported configuration below.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code> (disabled)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-accept-threshold-single</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Acceptance threshold for single-token verification. Lower values accept more aggressively.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1.0</code></td>
@@ -388,6 +393,23 @@ response = client.chat.completions.create(
 
 print(response.choices[0].message.content)
 ```
+
+#### ECHO
+
+Add the following flags to an EAGLE-3 launch command:
+
+```bash
+--attention-backend fa3 \
+--disable-overlap-schedule \
+--speculative-echo-threshold 0.2
+```
+
+ECHO currently requires EAGLE-3 with `--speculative-eagle-topk > 1`, FA3, the
+non-overlap scheduler, and two-batch overlap to remain disabled (do not pass
+`--enable-two-batch-overlap`). It does not currently support sliding-window,
+MRoPE, or hybrid Mamba/GDN/linear-attention target models, DP attention, LoRA,
+or configurations that disable CUDA Graph padding or require gathered token
+buffers.
 
 ---
 

@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -8,6 +8,9 @@ from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_trit
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,9 @@ class EagleVerifyInput(SpecInput):
     capture_hidden_mode: CaptureHiddenMode
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
+    ragged_verify_layout: Optional["RaggedVerifyLayout"] = None
+    # Query geometry used by graph capture and replay.
+    ragged_query_layout: Optional["RaggedVerifyLayout"] = None
     # Stacked per-step draft proposal distribution q, shape (bs, num_steps,
     # vocab); only set under rejection sampling. Consumed by the verify kernel.
     draft_probs: torch.Tensor = None

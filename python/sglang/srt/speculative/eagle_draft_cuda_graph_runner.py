@@ -489,10 +489,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
-        parent_list, top_scores_index, draft_tokens, draft_probs = (
+        parent_list, top_scores_index, draft_tokens, draft_probs, verify_lens = (
             t[:raw_bs] if t is not None else None for t in out
         )
-        return parent_list, top_scores_index, draft_tokens, draft_probs
+        return (
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            draft_probs,
+            verify_lens,
+        )
 
     # -----------------------------------------------------------------
     # Replay

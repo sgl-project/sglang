@@ -247,6 +247,24 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
                 )
             ]
         )
+        ragged_layout = getattr(verify_input, "ragged_verify_layout", None)
+        if ragged_layout is not None:
+            candidates.extend(
+                (
+                    ragged_layout.verify_lens,
+                    ragged_layout.extend_start_loc,
+                    ragged_layout.qo_indptr_device,
+                )
+            )
+        query_layout = getattr(verify_input, "ragged_query_layout", None)
+        if query_layout is not None:
+            candidates.extend(
+                (
+                    query_layout.verify_lens,
+                    query_layout.extend_start_loc,
+                    query_layout.qo_indptr_device,
+                )
+            )
     record_stream_each(candidates, fwd_stream)
 
 

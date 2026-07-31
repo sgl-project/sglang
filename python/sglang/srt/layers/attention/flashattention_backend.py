@@ -31,7 +31,10 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_schedule, get_spec
-from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    build_ragged_target_verify_geometry,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import get_compiler_backend
@@ -474,14 +477,18 @@ class FlashAttentionBackend(AttentionBackend):
             if forward_mode.is_target_verify() and self.topk > 1:
                 # topk>1 target verify: replay needs spec_info.positions and .custom_mask
                 # which are not populated at capture time.
-                self.forward_metadata = self.target_verify_metadata_topk_normal[bs]
+                metadata_key = self._target_verify_topk_metadata_key(bs, spec_info)
+                self.forward_metadata = self.target_verify_metadata_topk_normal[
+                    metadata_key
+                ]
                 self.forward_metadata_spec_decode_expand = (
-                    self.target_verify_metadata_topk_expand[bs]
+                    self.target_verify_metadata_topk_expand[metadata_key]
                 )
                 return
 
             self._apply_cuda_graph_metadata(
                 bs=bs,
+                real_bs=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_sum=None,
@@ -521,6 +528,7 @@ class FlashAttentionBackend(AttentionBackend):
             # (stale page-table rows -> OOB); force None under sync-free.
             self._apply_cuda_graph_metadata(
                 bs=bs,
+                real_bs=bs - getattr(forward_batch, "num_padding", 0),
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_sum=forward_batch.seq_lens_sum,
@@ -628,6 +636,108 @@ class FlashAttentionBackend(AttentionBackend):
             m.max_seq_len_q = forward_batch.positions.numel()
             m.max_seq_len_k = self.max_context_len
         self.forward_metadata = m
+
+    @staticmethod
+    def _target_verify_topk_metadata_key(
+        bs: int, spec_info: Optional[SpecInput]
+    ) -> int | tuple[int, int]:
+        """Return the CUDA Graph metadata key for topk>1 target verification."""
+        ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+        if ragged_layout is None:
+            return bs
+        return (bs, ragged_layout.graph_num_tokens)
+
+    def _build_target_verify_topk_expand_inputs(
+        self,
+        *,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        spec_info: SpecInput,
+        query_layout: Optional[RaggedVerifyLayout],
+        real_bs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build FA3 metadata for topk>1 target verification."""
+        draft_tokens = self.speculative_num_draft_tokens
+        bs = seq_lens.numel()
+        device = seq_lens.device
+
+        if query_layout is None:
+            query_lens = torch.full(
+                (bs,), draft_tokens, dtype=torch.int32, device=device
+            )
+            query_starts = torch.arange(
+                0,
+                bs * draft_tokens,
+                draft_tokens,
+                dtype=torch.int32,
+                device=device,
+            )
+            num_query_tokens = bs * draft_tokens
+        else:
+            query_lens = query_layout.verify_lens.to(torch.int32)
+            query_starts = query_layout.qo_indptr_device[:-1].to(torch.int32)
+            num_query_tokens = query_layout.graph_num_tokens
+
+        request_ids = torch.repeat_interleave(
+            torch.arange(bs, dtype=torch.int64, device=device),
+            query_lens,
+            output_size=num_query_tokens,
+        )
+        repeated_starts = torch.repeat_interleave(
+            query_starts,
+            query_lens,
+            output_size=num_query_tokens,
+        ).to(torch.int64)
+        within_request = (
+            torch.arange(num_query_tokens, dtype=torch.int64, device=device)
+            - repeated_starts
+        )
+
+        # FULL_MASK only contains rows for real requests. Clamp padding request
+        # ids for safe indexing, then replace their gathered masks below.
+        is_real = request_ids < real_bs
+        safe_request_ids = request_ids.clamp(max=max(real_bs - 1, 0))
+        real_layout = getattr(spec_info, "ragged_verify_layout", None)
+        if real_layout is not None:
+            real_query_lens = real_layout.verify_lens.to(torch.int64)
+            is_real = is_real & (within_request < real_query_lens[safe_request_ids])
+        safe_within_request = within_request.clamp(min=0, max=draft_tokens - 1)
+        real_seq_lens = seq_lens[:real_bs].to(torch.int64)
+        row_widths = real_seq_lens + draft_tokens
+        block_starts = torch.nn.functional.pad(
+            torch.cumsum(row_widths * draft_tokens, dim=0), (1, 0)
+        )[:-1]
+        mask_row_starts = (
+            block_starts[safe_request_ids]
+            + safe_within_request * row_widths[safe_request_ids]
+            + real_seq_lens[safe_request_ids]
+        )
+        tree_columns = torch.arange(draft_tokens, dtype=torch.int64, device=device)
+        mask_indices = mask_row_starts[:, None] + tree_columns[None, :]
+        mask = spec_info.custom_mask[mask_indices]
+        # FA3's one-query expand sequences need at least one KV entry. Route
+        # graph-padding rows to the first allocated tree slot; their output is
+        # discarded after replay.
+        mask = torch.where(
+            is_real[:, None],
+            mask,
+            tree_columns[None, :] == 0,
+        )
+
+        # Each query in a request sees the same D candidate KV locations; the
+        # mask sort packs its ancestors to the front for FA3 varlen attention.
+        all_seq_lens = seq_lens.to(torch.int64)
+        candidate_columns = all_seq_lens[:, None] + tree_columns[None, :]
+        per_request_page_table = self.req_to_token[req_pool_indices, :].gather(
+            1, candidate_columns
+        )
+        non_masked_page_table = per_request_page_table[request_ids]
+        sort_keys = torch.where(
+            mask, tree_columns[None, :], tree_columns[None, :] + draft_tokens
+        )
+        sort_order = torch.argsort(sort_keys, dim=1)
+        page_table = non_masked_page_table.gather(1, sort_order)
+        return mask, page_table
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -824,15 +934,33 @@ class FlashAttentionBackend(AttentionBackend):
 
                 self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
             else:
+                ragged_layout = getattr(
+                    forward_batch.spec_info, "ragged_verify_layout", None
+                )
+                if ragged_layout is not None and self.has_swa:
+                    raise NotImplementedError(
+                        "FA3 EAGLE topk>1 ragged verify does not support sliding "
+                        "window attention"
+                    )
+                query_layout = getattr(
+                    forward_batch.spec_info, "ragged_query_layout", None
+                )
+                if query_layout is None and ragged_layout is not None:
+                    query_layout = ragged_layout
+
                 metadata.cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
                 metadata.max_seq_len_k = eager_max_k
-                metadata.cu_seqlens_q = torch.arange(
-                    0,
-                    batch_size * self.speculative_num_draft_tokens + 1,
-                    step=self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=device,
+                metadata.cu_seqlens_q = (
+                    query_layout.qo_indptr_device.to(torch.int32)
+                    if query_layout is not None
+                    else torch.arange(
+                        0,
+                        batch_size * self.speculative_num_draft_tokens + 1,
+                        step=self.speculative_num_draft_tokens,
+                        dtype=torch.int32,
+                        device=device,
+                    )
                 )
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(
@@ -847,67 +975,28 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata_expand = FlashAttentionMetadata()
 
                 metadata_expand.max_seq_len_q = 1
+                num_query_tokens = (
+                    query_layout.graph_num_tokens
+                    if query_layout is not None
+                    else forward_batch.seq_lens.numel()
+                    * self.speculative_num_draft_tokens
+                )
                 metadata_expand.cu_seqlens_q = torch.arange(
                     0,
-                    forward_batch.seq_lens.numel() * self.speculative_num_draft_tokens
-                    + 1,
+                    num_query_tokens + 1,
                     dtype=torch.int32,
                     device=device,
                 )
 
-                # create expand page table
-                offsets = torch.arange(
-                    self.speculative_num_draft_tokens, device=device
-                ).unsqueeze(
-                    0
-                )  # shape: (1, self.speculative_num_draft_tokens)
-                cols = offsets.expand(
-                    forward_batch.seq_lens.numel(), -1
-                ) + forward_batch.seq_lens.unsqueeze(1)
-                cum_len = torch.nn.functional.pad(
-                    torch.cumsum(
-                        (
-                            forward_batch.seq_lens + self.speculative_num_draft_tokens
-                        ).repeat_interleave(self.speculative_num_draft_tokens),
-                        dim=0,
-                    ),
-                    (1, 0),
-                )[:-1]
-                mask_extraction_indices = (
-                    cols.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                    + cum_len[:, None]
-                ).view(1, -1)
-                mask = forward_batch.spec_info.custom_mask[
-                    mask_extraction_indices
-                ].view(
-                    -1, self.speculative_num_draft_tokens
-                )  # (bsz * draft_num, draft_num)
-
-                # shift table indices to avoid padding
-                # non_masked_page_table [[8, 9, 10],   mask (display with int format) [[1, 0, 0],
-                #                        [8, 9, 10],                                   [1, 1, 0],
-                #                        [8, 9, 10]]                                   [1, 0, 1]]
-                # if masked with padding [[8, 0, 0],   our mask without padding       [[8, 9, 10],
-                #                        [8, 9, 0],                                    [8, 9, 10],
-                #                        [8, 0, 10]]                                   [8, 10, 9]]
-                # note here cache_seqlens_int32 is [1, 2, 2] so extra page indices will be ignored in each row
-                col_indices = offsets.expand(
-                    mask.shape[0], self.speculative_num_draft_tokens
+                mask, metadata_expand.page_table = (
+                    self._build_target_verify_topk_expand_inputs(
+                        seq_lens=forward_batch.seq_lens,
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        spec_info=forward_batch.spec_info,
+                        query_layout=query_layout,
+                        real_bs=batch_size,
+                    )
                 )
-                # Build keys: if an entry is valid (mask==True), keep its original index;
-                # if not, add self.speculative_num_draft_tokens so that it sorts after all valid entries.
-                keys = torch.where(
-                    mask, col_indices, col_indices + self.speculative_num_draft_tokens
-                )
-                _, sort_order = torch.sort(keys, dim=1)
-                non_masked_page_table = (
-                    self.req_to_token_pool.req_to_token[
-                        forward_batch.req_pool_indices, :
-                    ]
-                    .gather(1, cols)
-                    .repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                )  # (bsz, draft_num)
-                metadata_expand.page_table = non_masked_page_table.gather(1, sort_order)
                 metadata_expand.cache_seqlens_int32 = mask.sum(dim=1).to(torch.int32)
                 metadata_expand.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(
@@ -2490,6 +2579,18 @@ class FlashAttentionBackend(AttentionBackend):
                 self.target_verify_metadata[bs] = metadata
             else:
                 # Target Verify topk>1: two (or three with SWA) metadata objects
+                ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+                if ragged_layout is not None and self.has_swa:
+                    raise NotImplementedError(
+                        "FA3 EAGLE topk>1 ragged verify does not support sliding "
+                        "window attention"
+                    )
+                metadata_key = self._target_verify_topk_metadata_key(bs, spec_info)
+                num_query_tokens = (
+                    ragged_layout.graph_num_tokens
+                    if ragged_layout is not None
+                    else bs * self.speculative_num_draft_tokens
+                )
                 metadata.cache_seqlens_int32 = self.target_verify_metadata_topk_normal[
                     "cache_seqlens"
                 ][:bs]
@@ -2503,25 +2604,30 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = self.target_verify_metadata_topk_normal[
                     "page_table"
                 ][:bs, :]
+                if ragged_layout is not None:
+                    # Initialize replay metadata for this capture shape.
+                    metadata.cu_seqlens_q.copy_(
+                        ragged_layout.qo_indptr_device.to(torch.int32)
+                    )
 
                 metadata_expand.cache_seqlens_int32 = (
                     self.target_verify_metadata_topk_expand["cache_seqlens"][
-                        : bs * self.speculative_num_draft_tokens
+                        :num_query_tokens
                     ]
                 )
                 metadata_expand.max_seq_len_q = 1
                 metadata_expand.cu_seqlens_q = self.target_verify_metadata_topk_expand[
                     "cu_seqlens_q"
-                ][: bs * self.speculative_num_draft_tokens + 1]
+                ][: num_query_tokens + 1]
                 metadata_expand.cu_seqlens_k = self.target_verify_metadata_topk_expand[
                     "cu_seqlens_k"
-                ][: bs * self.speculative_num_draft_tokens + 1]
+                ][: num_query_tokens + 1]
                 metadata_expand.page_table = self.target_verify_metadata_topk_expand[
                     "page_table"
-                ][: bs * self.speculative_num_draft_tokens]
+                ][:num_query_tokens]
 
-                self.target_verify_metadata_topk_normal[bs] = metadata
-                self.target_verify_metadata_topk_expand[bs] = metadata_expand
+                self.target_verify_metadata_topk_normal[metadata_key] = metadata
+                self.target_verify_metadata_topk_expand[metadata_key] = metadata_expand
                 # topk>1 target-verify early-returns before _apply; bind the
                 # view here (buffer refilled at replay).
                 if self.use_sliding_window_kv_pool:
@@ -2531,20 +2637,20 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata_swa = FlashAttentionMetadata()
                     metadata_swa.cache_seqlens_int32 = (
                         self.target_verify_metadata_topk_swa["cache_seqlens"][
-                            : bs * self.speculative_num_draft_tokens
+                            :num_query_tokens
                         ]
                     )
                     metadata_swa.max_seq_len_q = 1
                     metadata_swa.cu_seqlens_q = self.target_verify_metadata_topk_swa[
                         "cu_seqlens_q"
-                    ][: bs * self.speculative_num_draft_tokens + 1]
+                    ][: num_query_tokens + 1]
                     metadata_swa.cu_seqlens_k = self.target_verify_metadata_topk_swa[
                         "cu_seqlens_k"
-                    ][: bs * self.speculative_num_draft_tokens + 1]
+                    ][: num_query_tokens + 1]
                     metadata_swa.page_table = self.target_verify_metadata_topk_swa[
                         "page_table"
-                    ][: bs * self.speculative_num_draft_tokens]
-                    self.target_verify_metadata_topk_swa[bs] = metadata_swa
+                    ][:num_query_tokens]
+                    self.target_verify_metadata_topk_swa[metadata_key] = metadata_swa
                     metadata.swa_spec_metadata = metadata_swa
 
         elif forward_mode.is_draft_extend_v2():
@@ -2596,6 +2702,7 @@ class FlashAttentionBackend(AttentionBackend):
     def _apply_cuda_graph_metadata(
         self,
         bs: int,
+        real_bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
@@ -2845,15 +2952,30 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
+                ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+                if ragged_layout is not None and self.has_swa:
+                    raise NotImplementedError(
+                        "FA3 EAGLE topk>1 ragged verify does not support sliding "
+                        "window attention"
+                    )
+                metadata_key = self._target_verify_topk_metadata_key(bs, spec_info)
+                padded_layout = getattr(spec_info, "ragged_query_layout", None)
+                if padded_layout is None and ragged_layout is not None:
+                    padded_layout = ragged_layout
+
                 # 1. The first half of metadata for prefix tokens
-                metadata = self.target_verify_metadata_topk_normal[bs]
+                metadata = self.target_verify_metadata_topk_normal[metadata_key]
                 metadata.cache_seqlens_int32.copy_(seq_lens)
                 # metadata.max_seq_len_q = self.speculative_num_draft_tokens, already set in capture
                 # Page table built on-device (self-guards on cache_seqlens).
                 # max_seq_len_k stays the static bound; its only replay reader
                 # is the SWA-merge capacity assert, capture-sized to match.
                 metadata.max_seq_len_k = self.max_context_len
-                # metadata.cu_seqlens_q already set in capture
+                if padded_layout is not None:
+                    metadata.cu_seqlens_q.copy_(
+                        padded_layout.qo_indptr_device.to(torch.int32)
+                    )
+                # Dense metadata.cu_seqlens_q is already set in capture.
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )
@@ -2865,59 +2987,19 @@ class FlashAttentionBackend(AttentionBackend):
                     page_size=self.page_size,
                 )
 
-                # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
-                metadata_expand = self.target_verify_metadata_topk_expand[bs]
+                # 2. Initialize tree-token metadata.
+                metadata_expand = self.target_verify_metadata_topk_expand[metadata_key]
 
                 # metadata_expand.max_seq_len_q = 1, already set in capture
                 # metadata_expand.cu_seqlens_q already set in capture
-                offsets = torch.arange(
-                    self.speculative_num_draft_tokens, device=device
-                ).unsqueeze(
-                    0
-                )  # shape: (1, self.speculative_num_draft_tokens)
-
-                cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
-                cum_len = torch.nn.functional.pad(
-                    torch.cumsum(
-                        (
-                            seq_lens + self.speculative_num_draft_tokens
-                        ).repeat_interleave(self.speculative_num_draft_tokens),
-                        dim=0,
-                    ),
-                    (1, 0),
-                )[:-1]
-                mask_extraction_indices = (
-                    cols.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                    + cum_len[:, None]
-                ).view(1, -1)
-                # avoid extracting padded seq indices which will be out of boundary
-                mask_extraction_indices[
-                    :,
-                    spec_info.positions.numel() * self.speculative_num_draft_tokens :,
-                ].fill_(0)
-                mask = spec_info.custom_mask[mask_extraction_indices].view(
-                    -1, self.speculative_num_draft_tokens
-                )  # (bsz * draft_num, draft_num)
-
-                col_indices = offsets.expand(
-                    mask.shape[0], self.speculative_num_draft_tokens
+                mask, page_table = self._build_target_verify_topk_expand_inputs(
+                    seq_lens=seq_lens,
+                    req_pool_indices=req_pool_indices,
+                    spec_info=spec_info,
+                    query_layout=padded_layout,
+                    real_bs=real_bs,
                 )
-                keys = torch.where(
-                    mask,
-                    col_indices,
-                    col_indices + self.speculative_num_draft_tokens,
-                )
-                _, sort_order = torch.sort(keys, dim=1)
-
-                non_masked_page_table = (
-                    self.req_to_token[req_pool_indices, :]
-                    .gather(1, cols)
-                    .repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                )  # (bsz, draft_num)
-
-                metadata_expand.page_table.copy_(
-                    non_masked_page_table.gather(1, sort_order)
-                )
+                metadata_expand.page_table.copy_(page_table)
                 metadata_expand.cache_seqlens_int32.copy_(mask.sum(dim=1))
                 metadata_expand.cu_seqlens_k[1:].copy_(
                     torch.cumsum(
@@ -2927,7 +3009,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 )
                 if self.has_swa:
-                    metadata_swa = self.target_verify_metadata_topk_swa[bs]
+                    metadata_swa = self.target_verify_metadata_topk_swa[metadata_key]
                     self._init_sliding_window_attn_spec_metadata(
                         metadata, metadata_expand, metadata_swa
                     )

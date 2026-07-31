@@ -50,6 +50,10 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        # StandaloneDraftWorker intentionally skips EagleDraftWorker.__init__.
+        # ECHO is EAGLE3-only, but draft_forward still reads this field on the
+        # shared topk > 1 path.
+        self.echo_threshold = None
 
         self._rebuild_topk1_chain_buffers()
 

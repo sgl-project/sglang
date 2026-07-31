@@ -129,6 +129,65 @@ def organize_draft_results(
     return parent_list, top_scores_index, draft_tokens
 
 
+def compute_echo_verify_lens(
+    score_list: List[torch.Tensor],
+    top_scores_index: torch.Tensor,
+    threshold: float,
+) -> torch.Tensor:
+    """Compute per-request ECHO verification lengths."""
+    if not score_list:
+        raise ValueError("ECHO requires at least one draft layer")
+    if top_scores_index.ndim != 2:
+        raise ValueError(
+            "top_scores_index must have shape [batch, num_draft_tokens - 1], "
+            f"got {tuple(top_scores_index.shape)}"
+        )
+
+    batch_size = top_scores_index.shape[0]
+    layer_widths = []
+    layer_passes = []
+    for scores in score_list:
+        if scores.shape[0] != batch_size:
+            raise ValueError(
+                "all EAGLE score layers must have the same batch size as "
+                f"top_scores_index ({batch_size}), got {scores.shape[0]}"
+            )
+        flattened = scores.flatten(start_dim=1)
+        layer_widths.append(flattened.shape[1])
+        layer_max = flattened.amax(dim=1)
+        layer_passes.append(torch.isnan(layer_max) | (layer_max >= threshold))
+
+    pass_prefix = torch.cumprod(torch.stack(layer_passes, dim=1).to(torch.int32), dim=1)
+    candidate_cutoff = torch.zeros(
+        batch_size,
+        dtype=top_scores_index.dtype,
+        device=top_scores_index.device,
+    )
+    for layer_index, width in enumerate(layer_widths):
+        candidate_cutoff.add_(
+            pass_prefix[:, layer_index].to(top_scores_index.dtype) * width
+        )
+    return 1 + (top_scores_index < candidate_cutoff.unsqueeze(1)).sum(dim=1).to(
+        torch.int32
+    )
+
+
+def eagle_ragged_graph_tier_eligible(
+    *,
+    graph_num_tokens: int,
+    batch_size: int,
+    graph_runner,
+) -> bool:
+    """Whether a captured ragged tier has both this token key and enough slots."""
+    return bool(
+        graph_runner is not None
+        and graph_runner.ragged_verify_mode
+        and graph_runner.capture_num_tokens
+        and graph_num_tokens in graph_runner.capture_num_tokens
+        and graph_runner._ragged_capture_slots(graph_num_tokens) >= batch_size
+    )
+
+
 class TreeMaskMode(IntEnum):
     FULL_MASK = 0
     QLEN_ONLY = 1
@@ -496,13 +555,19 @@ def eagle_prepare_for_verify(
     from sglang.kernels.ops.speculative.cache_locs import (
         assign_extend_cache_locs_uniform_func,
     )
+    from sglang.kernels.ops.speculative.eagle_echo import (
+        build_eagle_ragged_verify_window,
+    )
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
         ForwardBatch,
         ForwardMode,
     )
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
 
+    dense_out_cache_loc = None
+    dense_positions = None
     if not batch.forward_mode.is_idle():
         # Assign cache locations
         bs = len(batch.req_pool_indices)
@@ -525,12 +590,40 @@ def eagle_prepare_for_verify(
             draft_token_num=verify_input.draft_token_num,
             device=device,
         )
+        dense_out_cache_loc = batch.out_cache_loc
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
         )
 
         prepare_mamba_track_for_verify(batch)
+
+        ragged_layout = verify_input.ragged_verify_layout
+        if ragged_layout is not None:
+            dense_positions = verify_input.positions
+            graph_runner = target_worker.model_runner.decode_cuda_graph_runner
+            use_graph_tier = eagle_ragged_graph_tier_eligible(
+                graph_num_tokens=ragged_layout.graph_num_tokens,
+                batch_size=bs,
+                graph_runner=graph_runner,
+            )
+            padded_bs = (
+                graph_runner._ragged_capture_slots(ragged_layout.graph_num_tokens)
+                if use_graph_tier
+                else bs
+            )
+            verify_window = build_eagle_ragged_verify_window(
+                draft_tokens=verify_input.draft_token,
+                positions=verify_input.positions,
+                out_cache_loc=dense_out_cache_loc,
+                layout=ragged_layout,
+                draft_token_num=verify_input.draft_token_num,
+                padded_bs=padded_bs,
+            )
+            batch.input_ids = verify_window.input_ids
+            batch.out_cache_loc = verify_window.out_cache_loc
+            verify_input.positions = verify_window.positions
+            verify_input.ragged_query_layout = verify_window.query_layout
 
         # TBO's split_spec_info reads these; no-verify-sync leaves both None.
         verify_input.seq_lens_cpu = batch.seq_lens_cpu
@@ -553,6 +646,9 @@ def eagle_prepare_for_verify(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
     )
+    if dense_out_cache_loc is not None:
+        # Restore the batch-owned cache-location view after ForwardBatch setup.
+        batch.out_cache_loc = dense_out_cache_loc
 
     # Run attention backend plan and cuda graph preparation
     can_run_cuda_graph = bool(
@@ -561,6 +657,49 @@ def eagle_prepare_for_verify(
             verify_forward_batch
         )
     )
+    if (
+        not can_run_cuda_graph
+        and dense_out_cache_loc is not None
+        and dense_positions is not None
+        and verify_input.ragged_verify_layout is not None
+    ):
+        ragged_layout = verify_input.ragged_verify_layout
+        real_num_tokens = int(ragged_layout.verify_lens.sum().item())
+        query_layout = verify_input.ragged_query_layout
+        if (
+            ragged_layout.graph_num_tokens != real_num_tokens
+            or query_layout is None
+            or query_layout.bs != len(batch.req_pool_indices)
+        ):
+            # A non-shape eligibility check (for example a per-request embed
+            # override) can reject an otherwise captured token tier. Rebuild
+            # the eager input without graph-only padding so its request layout
+            # remains self-contained.
+            eager_layout = RaggedVerifyLayout.from_verify_lens_device(
+                verify_lens=ragged_layout.verify_lens,
+                graph_num_tokens=real_num_tokens,
+            )
+            verify_input.ragged_verify_layout = eager_layout
+            verify_window = build_eagle_ragged_verify_window(
+                draft_tokens=verify_input.draft_token,
+                positions=dense_positions,
+                out_cache_loc=dense_out_cache_loc,
+                layout=eager_layout,
+                draft_token_num=verify_input.draft_token_num,
+                padded_bs=len(batch.req_pool_indices),
+            )
+            batch.input_ids = verify_window.input_ids
+            batch.out_cache_loc = verify_window.out_cache_loc
+            verify_input.positions = verify_window.positions
+            verify_input.ragged_query_layout = verify_window.query_layout
+            verify_forward_batch = ForwardBatch.init_new(
+                batch,
+                target_worker.model_runner,
+                capture_hidden_mode=capture_mode,
+                return_hidden_states_before_norm=False,
+            )
+            batch.out_cache_loc = dense_out_cache_loc
+
     if can_run_cuda_graph:
         target_worker.model_runner.decode_cuda_graph_runner.load_batch(
             verify_forward_batch
