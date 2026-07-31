@@ -248,6 +248,26 @@ export const benchmarks = [
     accuracy: { gpqa_pct: 87.03, aime25_pct: 96.25, gsm8k_pct: 97.04 },
   },
   {
+    match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
+        ttft_ms: 1292.88, tpot_ms: 46.03, tokens_per_sec_per_gpu: 2678 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
+        ttft_ms: 5861.87, tpot_ms: 103.54, tokens_per_sec_per_gpu: 5030 },
+    ],
+  },
+  {
+    match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 156841.34, tpot_ms: 106.18, tokens_per_sec_per_gpu: 5520 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 410259.84, tpot_ms: 105.33, tokens_per_sec_per_gpu: 5461 },
+    ],
+  },
+  {
     match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",
     speed: [
