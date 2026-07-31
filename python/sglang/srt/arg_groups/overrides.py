@@ -408,9 +408,11 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             # CUDA-graph replay on ROCm (see sgl-project/sglang#32831); the a2a
             # exchange is the workaround for that wedge at dcp_size 8.
             #
-            # Prefill defaults to aiter (gluon absorb-prefill), but may be set to
-            # triton via --prefill-attention-backend triton, which is ~7x faster
-            # at long inputs. Triton dispatches extend two ways: a zero-prefix
+            # Prefill defaults to aiter (gluon absorb-prefill); it now pages the
+            # staging KV, so it is ~25% faster than triton at long input instead
+            # of the ~28x slower it was while gluon's tile was stuck at one
+            # token. --prefill-attention-backend triton remains available and is
+            # correct: triton dispatches extend two ways: a zero-prefix
             # batch takes the MHA path (per-head K/V up-projected in hand, plain
             # local causal attention -- DCP contributes nothing there), while ANY
             # non-zero prefix (chunked prefill, or a radix hit) sends the whole
@@ -446,13 +448,15 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 # gluon's MLA decode takes its KV tile straight from the paged
                 # block size (TILE_SIZE == block_size, and the kernel asserts
                 # NUM_BLOCKS_GATHER_PER_TILE == 1), so page_size 1 shrinks every
-                # tile to a single token: 27 vs 511 GB/s on gfx950, which at 128k
-                # context was 96% of the decode step (median ITL 1073 -> 87 ms,
-                # 12.3x, gsm8k unchanged at 0.980). Under DCP the allocator's
-                # page is page_size * dcp_size, so 16 leaves each rank 16
-                # contiguous physical slots per virtual page -- exactly the tile
-                # gluon wants. 64/128 measured slower than 16.
-                overrides["page_size"] = 16
+                # tile to a single token and cost 12x on the decode step at 128k
+                # context (median ITL 1073 -> 87 ms). Under DCP the allocator's
+                # page is page_size * dcp_size, so this leaves each rank
+                # page_size contiguous physical slots per virtual page -- exactly
+                # the tile gluon wants. 32 measured fastest across shapes
+                # (ms/layer at 128k/bs=55: 42.7 at 1, 1.80 at 16, 1.41 at 32,
+                # 4.40 at 64); the extend path stages its own copy and picks its
+                # own page size (_GLUON_PREFILL_PAGE_SIZE, where 64 wins).
+                overrides["page_size"] = 32
             return overrides
         if decode_backend == "cutedsl_mla" or decode_backend is None:
             _require_kimi_k3_cutedsl_dcp_support()

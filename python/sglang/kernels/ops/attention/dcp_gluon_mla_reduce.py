@@ -131,6 +131,85 @@ def build_dcp_page_table(
 
 
 @triton.jit
+def _pack_dcp_kv_pages_kernel(
+    src_ptr,  # [n_src, 1, D] assembled dcp_kv_buffer
+    dst_ptr,  # [n_pages * PAGE, 1, D] paged staging buffer
+    src_idx_ptr,  # [total] dcp_kv_indices: sequence position -> src row
+    dst_idx_ptr,  # [total] sequence position -> padded/paged dst row
+    D: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    src = tl.load(src_idx_ptr + row).to(tl.int64)
+    dst = tl.load(dst_idx_ptr + row).to(tl.int64)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < D
+    tl.store(
+        dst_ptr + dst * D + offs,
+        tl.load(src_ptr + src * D + offs, mask=mask),
+        mask=mask,
+    )
+
+
+def pack_dcp_kv_into_pages(
+    kv_buffer: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    bs: int,
+    page_size: int,
+):
+    """Repack the per-forward ``dcp_kv_buffer`` into a paged staging buffer for
+    aiter's gluon ``mla_prefill_fwd``.
+
+    The assembled buffer is laid out as [all requests' gathered prefixes | all
+    requests' extend tokens], so a request's sequence is split across two
+    regions and cannot be addressed by page (gluon requires every page but the
+    sequence's last to be full). Repacking into per-request page-aligned regions
+    lets the KV tile match the page: the kernel takes TILE_SIZE straight from
+    the block size, and at block size 1 a 16384x16384 chunk measured 5156 ms vs
+    39 ms at 64 on gfx950 (~131x).
+
+    The layout of ``dcp_kv_buffer`` itself is left alone -- flashinfer_mla reads
+    the same buffer. The copy is one pass over the batch's KV (a prefill batch
+    holds only the few requests of one chunk), which the attention saving dwarfs.
+
+    Returns (paged_kv [n_pages, page_size, 1, D], block_tables [bs, max_pages]).
+    """
+    total, _, dim = kv_buffer.shape[0], kv_buffer.shape[1], kv_buffer.shape[-1]
+    device = kv_buffer.device
+    lens = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int64)
+    pages = (lens + page_size - 1) // page_size
+    page_start = torch.cumsum(pages, dim=0) - pages
+    # sequence position -> row in the padded buffer
+    shift = page_start * page_size - kv_indptr[:bs].to(torch.int64)
+    n_tokens = int(kv_indptr[bs].item())
+    dst_idx = torch.repeat_interleave(shift, lens) + torch.arange(
+        n_tokens, device=device, dtype=torch.int64
+    )
+
+    n_pages = int(pages.sum().item())
+    # zeros, not empty: gluon reads the whole last page of a sequence and masks
+    # by seqused_k, so uninitialized tail rows could feed NaNs into the QK GEMM.
+    paged = torch.zeros(
+        (n_pages * page_size, 1, dim), dtype=kv_buffer.dtype, device=device
+    )
+    if n_tokens > 0:
+        _pack_dcp_kv_pages_kernel[(n_tokens,)](
+            kv_buffer,
+            paged,
+            kv_indices,
+            dst_idx,
+            D=dim,
+            BLOCK=triton.next_power_of_2(dim),
+        )
+    max_pages = int(pages.max().item()) if bs > 0 else 0
+    block_tables = page_start[:, None] + torch.arange(
+        max_pages, device=device, dtype=torch.int64
+    )
+    return paged.view(-1, page_size, 1, dim), block_tables.to(torch.int32)
+
+
+@triton.jit
 def _dcp_gluon_mla_reduce_kernel(
     out_ptr,  # [num_tokens, num_query_heads, KV_LORA_RANK]
     lse_ptr,  # [num_tokens, num_query_heads] (base-2)

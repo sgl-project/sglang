@@ -142,6 +142,12 @@ class ForwardMetadata:
 
 _AITER_PARTITION_SIZE_ROCM = 256
 
+# KV page size for the gluon DCP extend path. gluon sets TILE_SIZE == block_size
+# (the MLA kernel asserts NUM_BLOCKS_GATHER_PER_TILE == 1), and on gfx950 a
+# 16384x16384 chunk measured 5156 ms at 1, 55.8 ms at 16, 39.5 ms at 64. This is
+# a staging-buffer page size, independent of the KV pool's --page-size.
+_GLUON_PREFILL_PAGE_SIZE = 64
+
 
 class AiterAttnBackend(AttentionBackend):
     def __init__(
@@ -941,7 +947,7 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         from sglang.kernels.ops.attention.dcp_gluon_mla_reduce import (
-            build_dcp_block_table,
+            pack_dcp_kv_into_pages,
         )
 
         dcp_meta = forward_batch.attn_dcp_metadata
@@ -955,21 +961,20 @@ class AiterAttnBackend(AttentionBackend):
 
         seqused_k = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int32)
         max_kv = int(seqused_k.max().item())
-        block_tables = build_dcp_block_table(kv_indptr, kv_indices, bs, max_kv)
+        # gluon takes its KV tile straight from the paged block size, so feeding
+        # the assembled buffer as block_size 1 collapses each tile to a single
+        # token: a 16384x16384 chunk measured 5156 ms that way vs 39 ms at block
+        # size 64 on gfx950 (~131x). Repack into per-request page-aligned pages.
+        paged_kv, block_tables = pack_dcp_kv_into_pages(
+            kv_buffer, kv_indptr, kv_indices, bs, _GLUON_PREFILL_PAGE_SIZE
+        )
 
         out = q.new_empty(
             (q.shape[0], num_heads * kv_lora_rank), dtype=self.input_dtype
         )
-        # TODO(gluon, block_size): like the decode path used to, this feeds a
-        # block size of 1, so gluon's TILE_SIZE collapses to a single token
-        # (~19x off peak on gfx950). dcp_kv_buffer is assembled per forward and
-        # is contiguous within each request's prefix / extend region, so it can
-        # be addressed in multi-token blocks. This is why aiter gluon prefill is
-        # ~28x slower than triton at long input; the mixed backend
-        # (--prefill-attention-backend triton) sidesteps it for now.
         gluon_mla_prefill_fwd(
             q.view(-1, num_heads, layer.qk_head_dim),
-            kv_buffer.view(-1, 1, 1, layer.qk_head_dim),
+            paged_kv,
             out.view(-1, num_heads, kv_lora_rank),
             self.forward_metadata.qo_indptr,  # extend query-token boundaries
             seqused_k,
