@@ -406,11 +406,22 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             compile_kwargs = build_torch_compile_kwargs(mode=mode)
             logger.info(f"Compiling transformer with mode: {mode}")
 
-        # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        self._torch_compile_registry.compile_once(
-            module,
-            compile_kwargs=compile_kwargs,
-        )
+        if getattr(self.server_args, "regional_compile", False):
+            compiled_count = self._torch_compile_registry.compile_regions_once(
+                module,
+                compile_kwargs=compile_kwargs,
+            )
+            logger.info(
+                "Enabled regional torch.compile for %d submodules in %s",
+                compiled_count,
+                type(module).__name__,
+            )
+        else:
+            # TODO(triple-mu): support customized fullgraph and dynamic in the future
+            self._torch_compile_registry.compile_once(
+                module,
+                compile_kwargs=compile_kwargs,
+            )
 
     def _maybe_enable_cache_dit_and_torch_compile(
         self, num_inference_steps: int | tuple[int, int], batch: Req

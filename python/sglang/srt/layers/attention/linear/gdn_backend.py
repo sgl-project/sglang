@@ -75,10 +75,6 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
     ):
         return
 
-    # Extra-buffer strategies need intermediate state checkpoints.
-    if args.uses_mamba_radix_cache and args.mamba_radix_cache_strategy != "no_buffer":
-        return
-
     cuda_version = torch.version.cuda
     chunk_size = args.chunked_prefill_size
     config = hybrid_gdn_config(model_runner.model_config)
@@ -203,6 +199,10 @@ class GDNKernelDispatcher:
             f"verify={self.verify_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )
+
+    @property
+    def extend_uses_state_checkpoints(self) -> bool:
+        return self.extend_kernel.uses_state_checkpoints
 
     def packed_decode(
         self,
@@ -362,6 +362,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+            if self.kernel_dispatcher.extend_uses_state_checkpoints:
+                from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+                    maybe_build_flashinfer_checkpoint_plan,
+                )
+
+                maybe_build_flashinfer_checkpoint_plan(
+                    forward_batch, self.forward_metadata, self.device
+                )
 
     def forward_decode(
         self,
@@ -582,23 +590,35 @@ class GDNAttnBackend(MambaAttnBackendBase):
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
-            # ReplaySSM spec-verify (Part B of #28511): when the per-slot ring is
-            # allocated (--enable-gdn-replayssm-spec, GDN + linear-chain topk<=1),
-            # reconstruct the verify output for the whole draft window from the
-            # frozen checkpoint (`temporal`) + the per-slot circular (d, k, g) ring
-            # instead of the recurrent verify that snapshots a full state per draft
-            # token. The cursors are advanced once per decode step by the worker
-            # (commit_gdn_replayssm_spec in spec_utils). GDN-only: KDA (per-K gate)
-            # routes through kda_backend and never reaches here; we additionally
-            # guard on `not replayssm_is_kda` for safety. Falls back to the
-            # recurrent verify when the ring is absent.
+            # ReplaySSM verify protocols: fold-every-commit (ring-write during
+            # verify, fold on commit), circular ring, or the snapshotting
+            # fallback when neither ring is allocated.
             mamba_pool = self.req_to_token_pool.mamba_pool
+            use_replayssm_fold = (
+                mamba_cache_params.replayssm_rawv is not None
+                and getattr(mamba_pool, "replayssm_spec_fold", False)
+                and not getattr(mamba_pool, "replayssm_is_kda", False)
+            )
             use_replayssm_spec = (
                 mamba_cache_params.replayssm_d is not None
                 and getattr(mamba_pool, "replayssm_cache_base", None) is not None
                 and not getattr(mamba_pool, "replayssm_is_kda", False)
             )
-            if use_replayssm_spec:
+            if use_replayssm_fold:
+                core_attn_out = self._replayssm_fold_target_verify(
+                    layer=layer,
+                    query=query,
+                    key=key,
+                    value=value,
+                    a=a,
+                    b=b,
+                    layer_cache=mamba_cache_params,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
+            elif use_replayssm_spec:
                 core_attn_out = self._replayssm_target_verify(
                     layer=layer,
                     query=query,
@@ -649,6 +669,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                state_checkpoint_cu_starts=(
+                    forward_metadata.state_checkpoint_cu_starts
+                ),
+                num_state_checkpoints=forward_metadata.num_state_checkpoints,
+                state_checkpoint_every_n_tokens=(
+                    forward_metadata.state_checkpoint_every_n_tokens
+                ),
             )
 
             if is_npu() and last_recurrent_state is not None:
@@ -663,12 +690,61 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_states[cache_indices] = conv_states_contig
                 ssm_states[cache_indices] = ssm_states_contig
 
-            if h is not None:
+            if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
                 )
 
         return core_attn_out
+
+    def _replayssm_fold_target_verify(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        layer_cache: "MambaPool.SpeculativeState",
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        retrieve_parent_token: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Recurrent verify + fused ring-write; the commit fold replays the
+        accepted prefix into ``temporal``. Called directly, not via the kernel
+        dispatcher: the ring-write exists only in the Triton kernel."""
+        from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
+
+        assert retrieve_parent_token is None, (
+            "ReplaySSM fold-every-commit supports a linear draft chain only "
+            "(topk <= 1); EAGLE tree verify must use the recurrent verify."
+        )
+        return fused_sigmoid_gating_delta_rule_update(
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            q=query,
+            k=key,
+            v=value,
+            a=a,
+            b=b,
+            initial_state_source=ssm_states,
+            initial_state_indices=cache_indices,
+            cu_seqlens=query_start_loc,
+            use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            is_kda=False,
+            disable_state_update=True,
+            cache_ring=True,
+            replayssm_rawv=layer_cache.replayssm_rawv,
+            replayssm_rawk=layer_cache.replayssm_rawk,
+            replayssm_g=layer_cache.replayssm_g,
+            replayssm_beta=layer_cache.replayssm_beta,
+        )
 
     def _replayssm_target_verify(
         self,
