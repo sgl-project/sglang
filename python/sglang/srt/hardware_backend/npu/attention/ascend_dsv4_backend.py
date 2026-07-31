@@ -891,17 +891,14 @@ class C4IndexerAscendBackendMixin:
         stream_q = self._get_npu_indexer_q_stream()
         stream_w = get_indexer_weight_stream()
 
-        # q_lora / x are produced on cur; make them visible to the workers.
+        # q_lora/x are produced on cur; workers wait for them.
         stream_q.wait_stream(cur)
         stream_w.wait_stream(cur)
 
-        # C: route-KV write stays on cur (fused compressor -> c4_indexer_kv_pool).
-        # It must precede the topk read; that ordering is cur's own program order
-        # (C is queued before the joins below), so no explicit sync is needed.
+        # route-KV write on cur; ordered before the topk read by cur's program order.
         c4_indexer.compressor(x, forward_batch)
 
-        # B: weights_proj (small GEMM) + scale on stream_w. Hidden behind the
-        # heavier C (cur) and A (stream_q); finishes early, never gates them.
+        # weights_proj + scale on stream_w.
         with torch.npu.stream(stream_w):
             weights = c4_indexer.weights_proj(x)[0]
             weights = weights * (
@@ -909,7 +906,7 @@ class C4IndexerAscendBackendMixin:
             )
             weights.record_stream(stream_w)
 
-        # A: q (wq_b + rope + hadamard) on stream_q.
+        # q (wq_b + rope + hadamard) on stream_q.
         with torch.npu.stream(stream_q):
             if q_lora_ready is not None:
                 stream_q.wait_event(q_lora_ready)
