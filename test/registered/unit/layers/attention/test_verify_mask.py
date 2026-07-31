@@ -61,8 +61,7 @@ class TestVerifyMaskSizing(CustomTestCase):
 
 
 class TestVerifyMaskCapacity(CustomTestCase):
-    """A batch past the captured max_bs must not silently reuse the buffer --
-    every layout is sized per request, so none has slack for extra ones."""
+    """A batch past the captured max_bs must not silently reuse the buffer."""
 
     def test_compact_layout_fits_up_to_max_bs(self):
         # is_read=False pins QLEN_ONLY; the read layout is build-dependent.
@@ -75,9 +74,9 @@ class TestVerifyMaskCapacity(CustomTestCase):
         self.assertFalse(mask.fits(_MAX_BS + 1))
 
     def test_full_mask_does_not_fit_beyond_max_bs(self):
-        """The context dimension is per-request slack, not spare room for extra
-        requests: reusing FULL_MASK past max_bs runs off the end of the buffer.
-        Built explicitly because default_tree_mask_mode() is host-dependent."""
+        """FULL_MASK's context dimension is per-request slack, not spare room
+        for extra requests -- it must not be exempt from the check. Built
+        explicitly because default_tree_mask_mode() is host-dependent."""
         mask = VerifyMask(
             buffer=torch.zeros(
                 tree_mask_numel(

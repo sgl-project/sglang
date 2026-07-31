@@ -32,10 +32,9 @@ class VerifyMask(msgspec.Struct, frozen=True):
     ``build_tree_kernel_efficient`` writes the buffer in place after draft, which
     is what lets the worker skip the ``seq_lens_sum`` D2H sync. Keep them
     together: taking the buffer without its layout has the kernel write a shape
-    the reader does not expect, and without its ``max_bs`` there is nothing left
-    to bound reuse by. The kernel writes every cell even when unread, so the
-    buffer is always allocated. Frozen so the fields cannot drift apart -- swap
-    the whole struct to resize.
+    the reader does not expect. The kernel writes every cell even when unread, so
+    the buffer is always allocated. Frozen -- resize by swapping the whole struct,
+    never a field, so ``max_bs`` cannot go stale against ``buffer``.
 
     Temporary home -- a phase-level buffer with no owner today (``spec_info`` is a
     per-phase union the graph registry cannot slot).
@@ -49,8 +48,8 @@ class VerifyMask(msgspec.Struct, frozen=True):
     def fits(self, bs: int) -> bool:
         """Whether this batch's writes stay inside the buffer.
 
-        Every layout is sized per request off worst-case per-request bounds
-        (FULL_MASK's spans max_context_len), so max_bs bounds them all.
+        ``tree_mask_numel`` is ``bs * per_req`` and per_req is fixed at
+        allocation (FULL_MASK's spans max_context_len), so max_bs bounds it.
         """
         return bs <= self.max_bs
 
