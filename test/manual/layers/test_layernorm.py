@@ -1,5 +1,7 @@
 import itertools
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -323,6 +325,167 @@ class TestRMSNormFp8QuantFusion(CustomTestCase):
         self.assertEqual(out_off[0].dtype, torch.bfloat16)
         self.assertEqual(var_out[0].dtype, torch.bfloat16)
         self.assertEqual(cast_out[0].dtype, torch.bfloat16)
+
+
+class TestApplyFp8LinearScaleDispatch(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+        torch.set_default_device("cuda")
+
+    @staticmethod
+    def _make_inputs(dtype=torch.bfloat16):
+        M, K, N = 8, 16, 32
+        input = torch.randn(M, K, dtype=dtype)
+        qinput = input.to(torch.float8_e4m3fn)
+        weight = torch.randn(N, K).to(torch.float8_e4m3fn).t()
+        input_scale = torch.tensor([0.05], dtype=torch.float32)
+        weight_scale = torch.linspace(0.01, 0.03, N, dtype=torch.float32)
+        return input, qinput, weight, input_scale, weight_scale
+
+    def test_sm90_static_prequant_and_dynamic_scale_shapes(self):
+        import sglang.srt.layers.quantization.fp8_utils as fp8_utils
+
+        input, qinput, weight, input_scale, weight_scale = self._make_inputs()
+        seen_scales = []
+
+        def fake_fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
+            seen_scales.append(scales_a)
+            return torch.empty(
+                (mat_a.shape[0], mat_b.shape[1]), dtype=out_dtype, device=mat_a.device
+            )
+
+        server_args = SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(tc_compiler="none")
+            )
+        )
+        with patch.object(fp8_utils, "_is_sm90_supported", True), patch.object(
+            fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm
+        ), patch.object(fp8_utils, "get_server_args", return_value=server_args):
+            fp8_utils.apply_fp8_linear(
+                input,
+                weight,
+                weight_scale,
+                input_scale=input_scale,
+                cutlass_fp8_supported=True,
+            )
+            fp8_utils.apply_fp8_linear(
+                input,
+                weight,
+                weight_scale,
+                input_scale=input_scale,
+                cutlass_fp8_supported=True,
+                use_per_token_if_dynamic=True,
+                compressed_tensor_quant=True,
+            )
+            fp8_utils.apply_fp8_linear(
+                qinput,
+                weight,
+                weight_scale,
+                input_scale=input_scale,
+                cutlass_fp8_supported=True,
+                pre_quant_output_dtype=input.dtype,
+            )
+            fp8_utils.apply_fp8_linear(
+                input,
+                weight,
+                weight_scale,
+                input_scale=None,
+                cutlass_fp8_supported=True,
+                use_per_token_if_dynamic=True,
+                compressed_tensor_quant=True,
+            )
+
+        self.assertEqual(seen_scales[0].numel(), 1)
+        self.assertEqual(seen_scales[1].numel(), 1)
+        self.assertIs(seen_scales[2], input_scale)
+        self.assertEqual(tuple(seen_scales[3].shape), (input.shape[0], 1))
+
+    def test_non_sm90_static_scale_is_repeated(self):
+        import sglang.srt.layers.quantization.fp8_utils as fp8_utils
+
+        input, qinput, weight, input_scale, weight_scale = self._make_inputs()
+        seen_scales = []
+
+        def fake_fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
+            seen_scales.append(scales_a)
+            return torch.empty(
+                (mat_a.shape[0], mat_b.shape[1]), dtype=out_dtype, device=mat_a.device
+            )
+
+        with patch.object(fp8_utils, "_is_sm90_supported", False), patch.object(
+            fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm
+        ):
+            fp8_utils.apply_fp8_linear(
+                input,
+                weight,
+                weight_scale,
+                input_scale=input_scale,
+                cutlass_fp8_supported=True,
+            )
+            fp8_utils.apply_fp8_linear(
+                qinput,
+                weight,
+                weight_scale,
+                input_scale=input_scale,
+                cutlass_fp8_supported=True,
+                pre_quant_output_dtype=input.dtype,
+            )
+
+        self.assertEqual(tuple(seen_scales[0].shape), (input.shape[0], 1))
+        self.assertEqual(tuple(seen_scales[1].shape), (input.shape[0], 1))
+
+    def test_linear_methods_forward_fused_scalar_tuple(self):
+        import sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 as compressed_fp8
+        import sglang.srt.layers.quantization.fp8 as native_fp8
+
+        input, qinput, weight, input_scale, weight_scale = self._make_inputs(
+            torch.float16
+        )
+
+        class Layer:
+            pass
+
+        layer = Layer()
+        layer.weight = weight
+        layer.weight_scale = weight_scale
+        layer.input_scale = input_scale
+
+        native_method = native_fp8.Fp8LinearMethod.__new__(native_fp8.Fp8LinearMethod)
+        native_method.use_marlin = False
+        native_method.use_mxfp8 = False
+        native_method.block_quant = False
+        native_method.cutlass_fp8_supported = True
+        native_method.use_per_token_if_dynamic = False
+
+        compressed_method = compressed_fp8.CompressedTensorsW8A8Fp8.__new__(
+            compressed_fp8.CompressedTensorsW8A8Fp8
+        )
+        compressed_method.weight_block_size = None
+
+        fused_input = (qinput, input_scale, input.dtype)
+        with patch.object(native_fp8, "apply_fp8_linear") as native_apply:
+            native_apply.return_value = torch.empty(
+                (qinput.shape[0], weight.shape[1]), dtype=input.dtype
+            )
+            native_method.apply(layer, fused_input)
+            self.assertIs(native_apply.call_args.kwargs["input_scale"], input_scale)
+            self.assertEqual(
+                native_apply.call_args.kwargs["pre_quant_output_dtype"], input.dtype
+            )
+
+        with patch.object(compressed_fp8, "apply_fp8_linear") as compressed_apply:
+            compressed_apply.return_value = torch.empty(
+                (qinput.shape[0], weight.shape[1]), dtype=input.dtype
+            )
+            compressed_method.apply_weights(layer, fused_input)
+            self.assertIs(compressed_apply.call_args.kwargs["input_scale"], input_scale)
+            self.assertEqual(
+                compressed_apply.call_args.kwargs["pre_quant_output_dtype"],
+                input.dtype,
+            )
 
 
 class TestApplyFp8LinearPrequantOutputDtype(CustomTestCase):

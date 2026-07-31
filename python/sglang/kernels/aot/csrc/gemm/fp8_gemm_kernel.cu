@@ -1115,7 +1115,19 @@ torch::Tensor fp8_scaled_mm(
   TORCH_CHECK(mat_b.scalar_type() == torch::kFloat8_e4m3fn, "mat_b must be Float8_e4m3fn");
   TORCH_CHECK(out_dtype == torch::kHalf || out_dtype == torch::kBFloat16, "out_dtype must be Half or BFloat16");
 
-  TORCH_CHECK(scales_a.numel() == mat_a.size(0), "size of scales_a is not matched");
+  auto sm_version = getSMVersion();
+  TORCH_CHECK(
+      scales_a.numel() == 1 || scales_a.numel() == mat_a.size(0),
+      "scales_a must contain either one scalar scale or one scale per row; got ",
+      scales_a.numel(),
+      " elements for M=",
+      mat_a.size(0));
+  TORCH_CHECK(
+      scales_a.numel() != 1 || mat_a.size(0) == 1 || sm_version == 90,
+      "scalar scales_a with M > 1 is only supported on SM90; got M=",
+      mat_a.size(0),
+      " on SM",
+      sm_version);
   TORCH_CHECK(scales_b.numel() == mat_b.size(1), "size of scales_b is not matched");
   TORCH_CHECK(scales_a.is_contiguous(), "scales_a must be contiguous");
   TORCH_CHECK(scales_b.is_contiguous(), "scales_b msut be contiguous");
@@ -1130,8 +1142,6 @@ torch::Tensor fp8_scaled_mm(
 
   torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
   TORCH_CHECK((out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
-
-  auto sm_version = getSMVersion();
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12080
   if (sm_version >= 120) {

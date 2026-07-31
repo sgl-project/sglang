@@ -60,6 +60,7 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_sm90_supported = is_sm90_supported()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
@@ -1841,22 +1842,27 @@ def apply_fp8_linear(
     else:
         output_dtype = input.dtype
 
+    channelwise_cutlass = (
+        cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]
+    )
+    cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
+    use_cutlass_channelwise_gemm = (
+        channelwise_cutlass and cutlass_compatible_b and not use_triton_w8a8_fp8_kernel
+    )
+    native_scalar_a_scale = use_cutlass_channelwise_gemm and _is_sm90_supported
+
     if input_prequantized:
         assert input_scale is not None and input_scale.numel() == 1
         qinput = input_2d
-        if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
-            # Only the cutlass per-channel-weight GEMM consumes a per-token
-            # activation scale. For per-tensor weights, keep the scalar scale so
-            # `per_tensor_activations` stays True and the fused per-tensor
-            # `torch._scaled_mm` path is used instead of the slower unfused
-            # dequant+cast fallback.
+        if channelwise_cutlass and not native_scalar_a_scale:
+            # SM89, SM100, and SM120 CUTLASS epilogues require one A scale per row.
             x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
         else:
             x_scale = input_scale
     elif compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__
         num_token_padding = output_padding
-        if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
+        if channelwise_cutlass:
             num_token_padding = None
         # For static per-tensor activation scales when using inductor compiler,
         # use pure PyTorch ops instead of the opaque sgl_kernel quant kernel.
@@ -1885,13 +1891,19 @@ def apply_fp8_linear(
                 num_token_padding=num_token_padding,
                 use_per_token_if_dynamic=use_per_token_if_dynamic,
             )
+        if (
+            input_scale is not None
+            and channelwise_cutlass
+            and not native_scalar_a_scale
+        ):
+            x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
     else:
-        # cutlass w8a8 fp8 sgl-kernel only supports per-token scale
         if input_scale is not None:
             assert input_scale.numel() == 1
-            # broadcast per-tensor scale to per-token scale when supporting cutlass
             qinput, x_scale = static_quant_fp8(
-                input_2d, input_scale, repeat_scale=cutlass_fp8_supported
+                input_2d,
+                input_scale,
+                repeat_scale=channelwise_cutlass and not native_scalar_a_scale,
             )
         else:
             # default use per-token quantization if dynamic
@@ -1912,9 +1924,8 @@ def apply_fp8_linear(
                         input_2d, group_size=input_2d.shape[1]
                     )
 
-    if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
-        cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
-        if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
+    if channelwise_cutlass:
+        if not use_cutlass_channelwise_gemm:
             # Massage the input to be 2D
             qinput = qinput.view(-1, qinput.shape[-1])
             output = triton_scaled_mm(
