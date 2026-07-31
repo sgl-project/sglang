@@ -593,11 +593,9 @@ class ShouldEmitNormalTextTestCase(CustomTestCase):
 
 
 class EnginePassthroughTestCase(CustomTestCase):
-    """``require_reasoning`` and ``skip_special_tokens`` reach the engine through
-    multi-hop plumbing with no type contract binding the hops, so a refactor can
-    silently drop either one. Both failures are quiet: reasoning stops being
-    deferred past ``</think>``, or tool-call markers get detokenized away and
-    every tool parse fails. These pin the wire values."""
+    """Both flags reach the engine through hops with no type contract between
+    them, and dropping either fails silently -- reasoning stops deferring the
+    grammar, or tool-call markers get detokenized away and every parse fails."""
 
     def _capture(self, serving, request):
         # Let the real _process_messages run: it is the hop that turns
@@ -700,9 +698,8 @@ class CancelIdempotencyTestCase(CustomTestCase):
         self.assertEqual(out.status, "cancelled")
 
     def test_cancel_completed_response_returns_it_not_error(self):
-        """Pins the behavior change: cancelling an already-completed (never
-        background) response returns 200 with the response instead of the former
-        400 "Cannot cancel a synchronous response"."""
+        """A completed (never-background) response returns 200 with the response,
+        where it used to be a 400."""
         from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
 
         serving = make_serving()
@@ -827,9 +824,8 @@ class MultiToolCallStreamingOrderTestCase(CustomTestCase):
         self.assertEqual(names, ["get_time", "get_weather"])
 
     def test_prose_before_tool_call_keeps_message_first(self):
-        """A delta carrying both prose and the start of a tool call must emit the
-        message item first: the parser returns them as an unordered tuple, and the
-        prose textually preceded the call."""
+        """Prose and a tool-call start in one delta: the message item must come
+        first, since the prose preceded the call."""
         from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 
         serving = self.serving

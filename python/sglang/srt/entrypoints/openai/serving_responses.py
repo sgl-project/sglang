@@ -267,9 +267,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         # harmony output opens with <|channel|>analysis<|message|>, so a whole-output
         # json_schema forces "{" at the first token and the harmony parse then fails.
-        if self.use_harmony and ResponsesRequest._json_schema_from_text_format(
-            request.text
-        ):
+        if self.use_harmony and request.has_json_schema_constraint():
             return self.create_error_response(
                 "structured output (text.format) is not supported with gpt-oss models",
                 param="text",
@@ -2419,15 +2417,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
                         )
 
-                # A single delta can carry text and calls together, and the tuple
-                # loses their relative position. Recover it from what each call
-                # does: arguments continuing an open item textually precede this
-                # delta's text, and a call opening a new item follows it. Both
-                # kinds can appear in one delta, so emit in three phases rather
-                # than picking one global order -- draining continuations first
-                # keeps a closing "}" from being dropped when the text closes
-                # every open item, and deferring the openings keeps the message
-                # ahead of the tool item it preceded.
+                # The parser returns text and calls as an unordered tuple, but
+                # their positions are recoverable: arguments continuing an open
+                # item came before this delta's text, a call opening a new item
+                # after it. One delta can hold both, so no single order works --
+                # emitting text before draining continuations would close the
+                # open item and drop its trailing "}".
                 #
                 # Classify before emitting: emitting mutates tool_call_states.
                 def _is_continuing(call):

@@ -1635,6 +1635,10 @@ class ResponsesRequest(BaseModel):
         """Whether the caller asked for per-token output logprobs via include."""
         return bool(self.include and "message.output_text.logprobs" in self.include)
 
+    def has_json_schema_constraint(self) -> bool:
+        """Whether ``text.format`` constrains the output to JSON."""
+        return self._json_schema_from_text_format(self.text) is not None
+
     def to_sampling_params(
         self,
         default_max_tokens: int,
