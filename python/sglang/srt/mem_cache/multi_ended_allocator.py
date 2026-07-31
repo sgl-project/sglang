@@ -60,6 +60,10 @@ _LAZY_COMPACTION_STATS_INTERVAL_SEC = float(
 # Signal handler emits each instance's final counters (atexit misses signal exits).
 _STATS_INSTANCES: weakref.WeakSet[MultiEndedAllocator] = weakref.WeakSet()
 _SIGNAL_HANDLERS_INSTALLED = False
+# A GPU gather plus async invariant check is cheaper than one D2H `.item()` per
+# survivor only once the move batch is moderately large. Small batches retain
+# the lower-launch-overhead host path.
+_DEVICE_V_MOVED_GATHER_THRESHOLD = 16
 
 
 def _emit_all_final_stats(reason: str) -> None:
@@ -1416,8 +1420,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             `_commit_move_batch` routes such srcs to `_pending_reuse`; urgent's
             settle makes them immediately reusable.
 
-        `_topmost_survivor` excludes all p2v=-1 pages, so a `v_moved < 0` in the
-        loop is a corrupt-state bug and raises.
+        `_topmost_survivor` excludes all p2v=-1 pages. `_commit_move_batch`
+        validates that invariant while choosing an adaptive remap path: small
+        move batches retain the low-launch-overhead host lookup, while large
+        batches gather every moved virtual id in one GPU operation.
         """
         if not self.lazy_compaction:
             return 0
@@ -1453,7 +1459,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
             srcs: List[int] = []
             dsts: List[int] = []
-            v_moveds: List[int] = []
 
             # Flush-scoped accumulator for event-FIRED srcs. `_commit_move_batch`
             # appends here instead of catting onto `_free_phys_pages`; the merge is
@@ -1498,12 +1503,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                         # Commit accumulated moves, then wait the forward so the
                         # rest of the walk is race-free.
                         self._commit_move_batch(
-                            srcs, dsts, v_moveds, latest_event, released_fired
+                            srcs, dsts, latest_event, released_fired
                         )
                         n_moves += len(srcs)
                         srcs.clear()
                         dsts.clear()
-                        v_moveds.clear()
                         inflight = self._inflight_forward
                         if inflight is not None:
                             torch.cuda.current_stream().wait_event(inflight[0])
@@ -1534,22 +1538,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     dst_cursor -= 1
                 n_dst_consumed += 1
 
-                v_moved = int(self.physical_to_virtual[src].item())
-                if v_moved < 0:
-                    # `_topmost_survivor` excludes all p2v=-1 pages — corrupt state.
-                    raise AssertionError(
-                        f"MultiEndedAllocator({self.sub_pool_name!r})."
-                        f"_flush: topmost survivor p={src} has p2v=-1; "
-                        "this should be impossible (`_topmost_survivor` "
-                        "excludes `holes_cpu` and `_pending_reuse_pages_cpu`)."
-                        f" State: {self.allocator_state_str()}, "
-                        f"#holes={len(holes_cpu)}, "
-                        f"#pending_reuse={len(self._pending_reuse_pages_cpu)}"
-                    )
-
                 srcs.append(src)
                 dsts.append(dst)
-                v_moveds.append(v_moved)
 
                 # Advance cursor strictly past the picked src.
                 if self.grow_direction == "up":
@@ -1560,7 +1550,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 if move_cap is not None and len(srcs) >= move_cap:
                     break
 
-            self._commit_move_batch(srcs, dsts, v_moveds, latest_event, released_fired)
+            self._commit_move_batch(srcs, dsts, latest_event, released_fired)
             n_moves += len(srcs)
 
             if single_pass_absorb:
@@ -1601,21 +1591,48 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self,
         srcs: List[int],
         dsts: List[int],
-        v_moveds: List[int],
         latest_event: Optional[torch.cuda.Event],
         released_fired: List[torch.Tensor],
     ) -> None:
         """Issue ONE `move_kv_cache` + ONE bulk v2p/p2v remap for the accumulated
-        `(src, dst, v_moved)` triples. Fired srcs accumulate in `released_fired`
-        (merged by `_flush` AFTER its dst-slice, keeping the free list == holes_cpu);
-        event-pending srcs route to `_pending_reuse` (read-race gating).
+        `(src, dst)` pairs. Large batches gather every `v_moved` on-device from
+        p2v instead of synchronizing once per survivor; small batches retain the
+        lower-launch-overhead host path. Fired srcs accumulate in
+        `released_fired` (merged by `_flush` AFTER its dst-slice, keeping the
+        free list == holes_cpu); event-pending srcs route to `_pending_reuse`
+        (read-race gating).
         """
         if not srcs:
             return
         with record_function("MultiEndedAlloc._commit_move_batch"):
+            use_device_gather = (
+                torch.device(self.device).type != "cpu"
+                and len(srcs) >= _DEVICE_V_MOVED_GATHER_THRESHOLD
+            )
+            if not use_device_gather:
+                # Preserve the original small-batch ordering: read p2v before
+                # enqueueing the src/dst H2D tensors, so the first `.item()` does
+                # not synchronize behind those transfers.
+                v_moveds = [int(self.physical_to_virtual[src].item()) for src in srcs]
+                if any(v_moved < 0 for v_moved in v_moveds):
+                    raise AssertionError(
+                        "MultiEndedAllocator._commit_move_batch: selected a p2v=-1 "
+                        "source page"
+                    )
+
             src_pages_t = torch.tensor(srcs, dtype=torch.int64, device=self.device)
             dst_pages_t = torch.tensor(dsts, dtype=torch.int64, device=self.device)
-            v_moveds_t = torch.tensor(v_moveds, dtype=torch.int64, device=self.device)
+            if use_device_gather:
+                v_moveds_t = self.physical_to_virtual[src_pages_t].clone()
+                torch._assert_async(
+                    torch.all(v_moveds_t >= 0),
+                    "MultiEndedAllocator._commit_move_batch: selected a p2v=-1 "
+                    "source page",
+                )
+            else:
+                v_moveds_t = torch.tensor(
+                    v_moveds, dtype=torch.int64, device=self.device
+                )
             # Expand to token granularity (the move kernel is token-granular).
             if self.page_size == 1:
                 src_t, dst_t = src_pages_t, dst_pages_t
