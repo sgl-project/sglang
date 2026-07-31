@@ -153,6 +153,20 @@ class TestModelOptNvfp4(CustomTestCase):
         "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get",
         return_value=True,
     )
+    def test_serialized_config_honors_per_token_activation_env(self, env_get):
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+        )
+
+        self.assertTrue(config.use_per_token_activation)
+        env_get.assert_called_once_with()
+
+    @patch(
+        "sglang.srt.layers.quantization.modelopt_quant.envs."
+        "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get",
+        return_value=True,
+    )
     def test_online_modelopt_config_is_always_static_per_tensor(self, _):
         config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=False,

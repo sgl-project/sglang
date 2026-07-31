@@ -1208,13 +1208,16 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 class ModelOptFp4Config(ModelOptQuantConfig):
     """Config for serialized ModelOpt FP4 checkpoints.
 
-    ModelOpt FP4 ordinarily loads packed NVFP4 weights and checkpoint-provided
-    per-tensor FP32 activation scales. As a small extension, floating MoE expert
-    weights can also be quantized while loading. Missing activation scales use
-    a static 1.0 fallback; checkpoint tensors overwrite it. `nvfp4_online` has
-    a different activation contract: online per-token FP32 activation scales.
-    The existing per-token environment switch for serialized checkpoints is
-    retained for compatibility.
+    The standard path loads packed NVFP4 weights and checkpoint-provided
+    per-tensor FP32 activation scales. Serialized checkpoints also support
+    FlashInfer TRTLLM per-token activation scaling through
+    `SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION`.
+
+    As a small extension, floating MoE expert weights can also be quantized
+    while loading. This online-weight path uses per-tensor activation scaling;
+    missing scales default to 1.0, and checkpoint tensors overwrite the
+    fallback. Online weight quantization with per-token activation scaling
+    remains the separate `nvfp4_online` interface.
     """
 
     def __init__(
@@ -2197,10 +2200,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
 
-        # nvfp4_online uses 1.0 only as a neutral placeholder because the
-        # backend computes an FP32 scale per token. modelopt_fp4 uses 1.0 as
-        # the actual static per-tensor fallback for any module whose checkpoint
-        # omits activation-scale tensors. A loaded tensor overwrites it.
+        # Per-token activation modes use 1.0 as a neutral placeholder because
+        # the backend computes an FP32 scale per token. In the default
+        # modelopt_fp4 per-tensor mode, 1.0 is the static fallback for modules
+        # whose checkpoints omit activation-scale tensors; a loaded tensor
+        # overwrites it.
         w13_input_scale = _make_per_tensor_scale_parameter(
             (layer.num_experts, num_shards),
             weight_loader=weight_loader,
