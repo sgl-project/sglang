@@ -3,7 +3,8 @@
 更新时间：2026-07-31
 
 状态：实现与 CPU 语义门已完成；L40S 全量 1089 帧诊断已完成，但尚未达到
-数值对齐；同机原生 baseline 门已调度到 us-east-2b 的 8×H100 Spot。
+数值对齐；产品临时实例和同机原生 baseline 门正在 Phoenix Local Zone 的
+8×H200 Spot 上运行。
 
 ## 1. 本次对齐对象
 
@@ -165,6 +166,9 @@ request horizon 扩大 cache。这会静默覆盖 checkpoint 的 `local_attn_siz
 5. 参考产物只提供编码后的 MP4，没有 baseline latent、每步 flow 或 cache dump。
    因而页面产物最多建立“解码视频数值对齐”；严格的 latent/cache bitwise 结论
    需要算法侧额外提供 tensor dump，或在同一任务里运行 baseline。
+6. 部署 manifest 曾把短 SHA `fc9d1e7621` 手工补成错误的完整 SHA，导致第一次
+   checkout 失败。部署合同现在只接受直接复制的 `git rev-parse HEAD` 完整
+   输出；禁止凭短 SHA 手工补全。
 
 ## 5. 已完成的语义门
 
@@ -299,7 +303,7 @@ GPU，并在同一台 8×B200/B300 节点上串行执行：
 EC2 都返回 `UnfulfillableCapacity` / `InsufficientInstanceCapacity`。继续提高
 出价无法解决物理容量不足，因此按“尽快可测”的优先级转向 H100。
 
-最终在 `us-east-2b` 成功获得一台 `p5.48xlarge` Spot：
+随后在 `us-east-2b` 短暂获得一台 `p5.48xlarge` Spot：
 
 | 字段 | 值 |
 | --- | --- |
@@ -309,8 +313,60 @@ EC2 都返回 `UnfulfillableCapacity` / `InsufficientInstanceCapacity`。继续�
 | 任务申请 | 3 GPU |
 | 空闲 | 5 GPU |
 
-服务和两路 parity Pod 被调度到同一节点。失败的 us-east-1 Deployment、Job、
-NLB、PVC 和临时 NodePool/NodeClass 已删除；没有遗留第二台 GPU 主机。
+服务和两路 parity Pod 一度被调度到同一节点，但实例启动数分钟后收到
+Spot rebalance recommendation 和 interruption，Karpenter 正常驱逐 Pod，
+实例随后被回收。它不能作为产品测试入口。
+
+接着用单卡 `p5.4xlarge` 降低申请粒度，并让 Karpenter 在 Spot 失败后自动尝试
+On-Demand；`us-east-2a/b/c` 与 `us-east-1a/b` 的可用 offering 都返回
+`UnfulfillableCapacity` / `InsufficientInstanceCapacity`。这证明当时缺的是
+物理容量，不是一次申请 8 卡过大。
+
+最后复用 `us-west-2-phx-2a` Local Zone 中刚释放的 `p5e.48xlarge` Spot：
+
+| 字段 | 值 |
+| --- | --- |
+| 实例 | `i-0128c7ba0be106051` |
+| GPU | 8×NVIDIA H200 141 GB |
+| NodePool | `minwm-test-phx2-p5e-spot` |
+| Realtime Studio/API | 1 GPU |
+| 原生 MinWM + SGLang parity | 2 GPU |
+| 空闲 | 5 GPU |
+
+CUDA smoke 已确认 Torch 能识别 H200；服务的 MinWM 单测为 84/84 通过，
+checkpoint bytes 与 SHA-256 通过。节点有 EKS 报告的少量 PCIe replay 告警，
+所以最终可用性仍以真实 WebSocket 视频请求而不是 Node Ready 为准。
+
+首次 Phoenix 启动还暴露了两个与 GPU 无关的部署缺口：
+
+- 服务的 50 GiB ephemeral-storage limit 小于 20 GB checkpoint 加 donor
+  实际占用，Pod 被 kubelet 以明确的 `Pod ephemeral local storage usage
+  exceeds ... 50Gi` 驱逐；Phoenix overlay 已改为 request 100 GiB、limit
+  500 GiB。
+- baseline helper 虽已延迟导入 `msgspec`，仍通过 `run_sglang_api` 间接顶层
+  导入它；原生镜像因没有该 WebSocket 依赖而失败。现在
+  `decode_frames` 也只在真正发起 WebSocket 请求时导入，并新增无 WebSocket
+  依赖的 import 回归测试。
+
+部署 overlay：
+
+```bash
+kubectl kustomize --load-restrictor LoadRestrictionsNone \
+  benchmark/minwm_realtime_parity/k8s/tianpeng_gap12_h200_phx2 \
+  | kubectl --context codex-minwm-test-phx2 apply -f -
+```
+
+同机 parity overlay：
+
+```bash
+kubectl kustomize --load-restrictor LoadRestrictionsNone \
+  benchmark/minwm_realtime_parity/k8s/tianpeng_gap12_parity_h200_phx2 \
+  | kubectl --context codex-minwm-test-phx2 apply -f -
+```
+
+失败的 us-east-1/us-east-2 Deployment、NLB 和本次临时单卡 H100 NodePool 已删除；
+没有遗留第二台 GPU 主机。us-east-2 的旧 parity 工作盘暂时保留到本轮结果落盘，
+避免在输出确认前做不可恢复清理。
 
 ## 9. 交给克君部署前的检查
 

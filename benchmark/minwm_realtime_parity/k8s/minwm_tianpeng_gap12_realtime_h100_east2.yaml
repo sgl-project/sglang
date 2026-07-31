@@ -1,18 +1,40 @@
-apiVersion: v1
-kind: PersistentVolumeClaim
+apiVersion: karpenter.sh/v1
+kind: NodePool
 metadata:
-  name: minwm-tianpeng-realtime-work-20260731
-  namespace: default
-  labels:
-    app.kubernetes.io/name: minwm-tianpeng-realtime
-    seedleap.ai/owner: chenshengdong
+  name: minwm-tianpeng-h100-single-fast
 spec:
-  accessModes:
-    - ReadWriteOnce
-  storageClassName: gp2
-  resources:
-    requests:
-      storage: 200Gi
+  disruption:
+    budgets:
+      - nodes: 10%
+    consolidateAfter: 10m
+    consolidationPolicy: WhenEmpty
+  limits:
+    cpu: "64"
+    nvidia.com/gpu: "4"
+  template:
+    metadata:
+      labels:
+        seedleap.ai/capacity-pool: minwm-tianpeng-h100-single-fast
+    spec:
+      expireAfter: 6h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: minwm-test-h100-single-ec2
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values:
+            - spot
+            - on-demand
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            - p5.4xlarge
+      taints:
+        - effect: NoSchedule
+          key: seedleap.ai/task
+          value: minwm-tianpeng-h100-single
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -25,12 +47,12 @@ metadata:
     seedleap.ai/task: minwm-realtime-serving
   annotations:
     seedleap.ai/alignment-status: provisional-not-yet-numerically-aligned
-    seedleap.ai/capacity-type: spot
+    seedleap.ai/capacity-type: spot-preferred-on-demand-fallback
     seedleap.ai/checkpoint-sha256: 18a48a2709d74b93ce26f0b808f381d191553853aae81dd72d2438430251d379
     seedleap.ai/checkpoint-staged-version-id: yPbAthXMihZVEbfNFK4Ew2AVYs0FGDUq
     seedleap.ai/checkpoint-version-id: sL6CTylRv4QWY98mVTkuLoe5REbKHlvd
     seedleap.ai/minwm-git-ref: 4220c8a
-    seedleap.ai/sglang-git-ref: 238af753f52bfe858a20709fecb32136926df869
+    seedleap.ai/sglang-git-ref: 9604683ef03d137ed8917f48a3c6e5a762f02c3a
 spec:
   replicas: 1
   revisionHistoryLimit: 2
@@ -49,14 +71,18 @@ spec:
       annotations:
         seedleap.ai/alignment-status: provisional-not-yet-numerically-aligned
         seedleap.ai/checkpoint-version-id: sL6CTylRv4QWY98mVTkuLoe5REbKHlvd
-        seedleap.ai/sglang-git-ref: 238af753f52bfe858a20709fecb32136926df869
+        seedleap.ai/sglang-git-ref: 9604683ef03d137ed8917f48a3c6e5a762f02c3a
     spec:
       restartPolicy: Always
       terminationGracePeriodSeconds: 90
       nodeSelector:
-        karpenter.sh/capacity-type: spot
-        karpenter.sh/nodepool: minwm-test-h100-spot
-        seedleap.ai/capacity-pool: minwm-test-h100-karpenter
+        karpenter.sh/nodepool: minwm-tianpeng-h100-single-fast
+        seedleap.ai/capacity-pool: minwm-tianpeng-h100-single-fast
+      tolerations:
+        - effect: NoSchedule
+          key: seedleap.ai/task
+          operator: Equal
+          value: minwm-tianpeng-h100-single
       securityContext:
         seLinuxOptions:
           type: spc_t
@@ -74,7 +100,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: SGLANG_GIT_REF
-              value: 238af753f52bfe858a20709fecb32136926df869
+              value: 9604683ef03d137ed8917f48a3c6e5a762f02c3a
             - name: MINWM_GIT_REF
               value: 4220c8a
             - name: MINWM_CHECKPOINT
@@ -246,13 +272,13 @@ spec:
             failureThreshold: 6
           resources:
             requests:
-              cpu: "32"
-              memory: 160Gi
+              cpu: "8"
+              memory: 128Gi
               ephemeral-storage: 20Gi
               nvidia.com/gpu: "1"
             limits:
-              cpu: "64"
-              memory: 320Gi
+              cpu: "14"
+              memory: 230Gi
               ephemeral-storage: 50Gi
               nvidia.com/gpu: "1"
           volumeMounts:
@@ -269,8 +295,7 @@ spec:
             claimName: s3-claim
             readOnly: true
         - name: work
-          persistentVolumeClaim:
-            claimName: minwm-tianpeng-realtime-work-20260731
+          emptyDir: {}
         - name: shm
           emptyDir:
             medium: Memory
