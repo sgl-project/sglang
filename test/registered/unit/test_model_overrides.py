@@ -71,6 +71,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "ep_size",
                     "moe_dense_tp_size",
                     "attn_cp_size",
+                    "dcp_comm_backend",
+                    "dcp_replicate_q_proj",
                     "disable_overlap_schedule",
                     "uses_mamba_radix_cache",
                     "mamba_radix_cache_strategy",
@@ -346,24 +348,59 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # so the declaration is pinned directly for both provider inputs.
         from sglang.srt.arg_groups.overrides import _mimo_v2_overrides
 
-        self.assertEqual(
-            _mimo_v2_overrides(SimpleNamespace(speculative_algorithm="EAGLE"), None),
-            {"enable_multi_layer_eagle": True},
-        )
-        self.assertEqual(
-            _mimo_v2_overrides(SimpleNamespace(speculative_algorithm=None), None),
-            {},
-        )
+        def _args(**kw):
+            defaults = dict(speculative_algorithm=None, moe_runner_backend="auto")
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        # Non-SM100: the MoE pin must not fire, so hf_config is never inspected.
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            self.assertEqual(
+                _mimo_v2_overrides(_args(speculative_algorithm="EAGLE"), None),
+                {"enable_multi_layer_eagle": True},
+            )
+            self.assertEqual(_mimo_v2_overrides(_args(), None), {})
+
+    def test_mimo_v2_sm100_fp8_pins_flashinfer_trtllm_moe(self):
+        """Blackwell FP8 must not be left on the triton fused-MoE runner."""
+        from sglang.srt.arg_groups.overrides import _mimo_v2_overrides
+
+        def _args(**kw):
+            defaults = dict(speculative_algorithm=None, moe_runner_backend="auto")
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            with patch.object(
+                overrides_module, "get_quantization_config", return_value="fp8"
+            ):
+                self.assertEqual(
+                    _mimo_v2_overrides(_args(), None),
+                    {"moe_runner_backend": "flashinfer_trtllm"},
+                )
+                # An explicit user choice is never overwritten.
+                self.assertEqual(
+                    _mimo_v2_overrides(_args(moe_runner_backend="triton"), None), {}
+                )
+            # FP4 checkpoints run through flashinfer_mxfp4, so they must not be
+            # pinned to flashinfer_trtllm.
+            with patch.object(
+                overrides_module, "get_quantization_config", return_value="mxfp4"
+            ):
+                self.assertEqual(_mimo_v2_overrides(_args(), None), {})
 
     def test_mimo_v2_family_is_registered(self):
-        self.assertEqual(
-            collect_model_override_declarations(
-                "MiMoV2FlashForCausalLM",
-                SimpleNamespace(speculative_algorithm="EAGLE"),
-                None,
-            ),
-            [("_mimo_v2_overrides", {"enable_multi_layer_eagle": True})],
-        )
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            self.assertEqual(
+                collect_model_override_declarations(
+                    "MiMoV2FlashForCausalLM",
+                    SimpleNamespace(
+                        speculative_algorithm="EAGLE", moe_runner_backend="auto"
+                    ),
+                    None,
+                ),
+                [("_mimo_v2_overrides", {"enable_multi_layer_eagle": True})],
+            )
 
     def test_step3p_hierarchical_cache_golden(self):
         # SWA-hybrid arch: the mini config needs layer_types/sliding_window.

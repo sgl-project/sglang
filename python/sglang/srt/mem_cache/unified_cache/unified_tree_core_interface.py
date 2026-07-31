@@ -166,8 +166,11 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
-    def inc_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
-        """Bump the reference count on a node's component locks."""
+    def inc_lock_ref(
+        self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
+    ) -> IncLockRefResult:
+        """Bump the reference count on a node's component locks, leaving any
+        component in skip_lock_components evictable and recorded in the result."""
         ...
 
     @abstractmethod
@@ -182,7 +185,10 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
 
     @abstractmethod
     def dec_swa_lock_only(
-        self, node_id: NodeId, swa_uuid_for_lock: Optional[int]
+        self,
+        node_id: NodeId,
+        swa_uuid_for_lock: Optional[int],
+        skip_lock_node_ids: Optional[dict] = None,
     ) -> DecSwaLockOnlyResult:
         """Decrease only the SWA (and lower-priority co-located) reference
         counts; the result carries the freed slots."""
