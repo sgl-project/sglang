@@ -161,9 +161,9 @@ if _is_npu:
     import torch_npu
 
     from sglang.kernels.ops.layernorm import (
-        gemma_fused_add_rmsnorm as npu_gemma_fused_add_rmsnorm,
+        gemma_fused_add_rmsnorm,
+        gemma_rmsnorm,
     )
-    from sglang.kernels.ops.layernorm import gemma_rmsnorm as npu_gemma_rmsnorm
 
 
 @lru_cache(maxsize=1)
@@ -999,10 +999,10 @@ class GemmaRMSNorm(MultiPlatformOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            npu_gemma_fused_add_rmsnorm(x, residual, self.weight, self.variance_epsilon)
+            gemma_fused_add_rmsnorm(x, residual, self.weight, self.variance_epsilon)
             return x, residual
 
-        return npu_gemma_rmsnorm(x, self.weight, self.variance_epsilon)
+        return gemma_rmsnorm(x, self.weight, self.variance_epsilon)
 
     def forward_xpu(
         self,
@@ -1097,9 +1097,9 @@ class Gemma3RMSNorm(MultiPlatformOp):
         if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
             return self.forward_native(x, residual)
         if residual is not None:
-            npu_gemma_fused_add_rmsnorm(x, residual, self.weight, self.eps)
+            gemma_fused_add_rmsnorm(x, residual, self.weight, self.eps)
             return x, residual
-        return npu_gemma_rmsnorm(x, self.weight, self.eps)
+        return gemma_rmsnorm(x, self.weight, self.eps)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
