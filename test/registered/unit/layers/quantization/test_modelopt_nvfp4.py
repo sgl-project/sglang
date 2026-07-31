@@ -12,7 +12,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
 )
 from sglang.srt.layers.quantization.nvfp4_online import (
-    ModelOptNvFp4OnlineWeightFusedMoEMethod,
+    ModelOptNvFp4OnlineFusedMoEMethod,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -138,7 +138,7 @@ class TestModelOptNvfp4(CustomTestCase):
             patch("sglang.srt.layers.moe.fused_moe_triton.FusedMoE", FakeFusedMoE),
             patch(
                 "sglang.srt.layers.quantization.nvfp4_online."
-                "ModelOptNvFp4OnlineWeightFusedMoEMethod",
+                "ModelOptNvFp4OnlineFusedMoEMethod",
                 return_value=sentinel,
             ) as online_weight_method,
         ):
@@ -182,7 +182,7 @@ class TestModelOptNvfp4(CustomTestCase):
             )
 
     def test_non_gated_w1_is_quantized_without_pairing(self):
-        method = object.__new__(ModelOptNvFp4OnlineWeightFusedMoEMethod)
+        method = object.__new__(ModelOptNvFp4OnlineFusedMoEMethod)
         method.quant_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=False,
             group_size=16,

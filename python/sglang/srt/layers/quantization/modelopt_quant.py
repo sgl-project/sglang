@@ -1403,7 +1403,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.nvfp4_online import (
-            ModelOptNvFp4OnlineWeightFusedMoEMethod,
+            ModelOptNvFp4OnlineFusedMoEMethod,
         )
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
@@ -1415,7 +1415,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if isinstance(layer, FusedMoE):
                 if self.is_layer_excluded(prefix):
                     return None
-                return ModelOptNvFp4OnlineWeightFusedMoEMethod(self, prefix)
+                return ModelOptNvFp4OnlineFusedMoEMethod(self, prefix)
             return None
 
         return self._get_quant_method(

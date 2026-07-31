@@ -35,14 +35,10 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
     format. It reuses the ModelOpt NVFP4 MoE parameter layout and fills those
     parameters by converting BF16/FP16/FP8 expert tensors as they are loaded.
     Dense layers stay in the source checkpoint precision or quantization path.
-
-    The public contract is per-token activation quantization: FlashInfer derives
-    an FP32 scale for each activation row online. A backend that uses one static
-    per-tensor FP32 activation scale must use modelopt_fp4 instead, even if its
-    expert weights are converted while loading.
     """
 
-    # Serialized NVFP4 checkpoints use ModelOptFp4Config instead.
+    # Marker consumed by the ModelOpt FP4 layout and the model loader. Serialized
+    # NVFP4 checkpoints use ModelOptFp4Config instead.
     is_nvfp4_online = True
     is_checkpoint_nvfp4_serialized = False
     group_size = 16
@@ -84,8 +80,8 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping or {},
         )
         self.fp4_ignored_layers = fp4_ignored_layers
-        # Weight scales are static, while FlashInfer computes activation FP32
-        # scales dynamically per token at runtime.
+        # Weights use static NVFP4 scales, while FlashInfer computes activation
+        # FP32 scales dynamically per token at runtime.
         self.use_per_token_activation = True
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         self.is_fp4_experts = False
@@ -153,17 +149,12 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
                 if self.is_checkpoint_fp8_serialized:
                     return Fp8MoEMethod(self)
                 return None
-            return ModelOptNvFp4OnlineWeightFusedMoEMethod(self, prefix)
+            return ModelOptNvFp4OnlineFusedMoEMethod(self, prefix)
         return None
 
 
-class ModelOptNvFp4OnlineWeightFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
-    """Convert source expert weights to NVFP4 during loading.
-
-    Online weight conversion does not select an activation-scale contract. The
-    owning config chooses either nvfp4_online per-token scales or modelopt_fp4
-    static per-tensor scales.
-    """
+class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
+    """MoE method that converts source expert weights to NVFP4 during loading."""
 
     def __init__(self, quant_config: ModelOptQuantConfig, layer_prefix: str):
         super().__init__(quant_config)
@@ -282,7 +273,7 @@ class ModelOptNvFp4OnlineWeightFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     ) -> torch.Tensor:
         if getattr(self.quant_config, "use_mxfp8", False):
             raise ValueError(
-                "Online NVFP4 weight conversion does not support "
+                "--quantization nvfp4_online does not support online "
                 "requantization from MXFP8 expert checkpoints."
             )
 
@@ -567,7 +558,7 @@ class ModelOptNvFp4OnlineWeightFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 pending_eid,
             )
 
-        def nvfp4_weight_loader(
+        def nvfp4_online_weight_loader(
             param: torch.nn.Parameter,
             loaded_weight: torch.Tensor,
             weight_name: str,
@@ -604,4 +595,4 @@ class ModelOptNvFp4OnlineWeightFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 expert_id=expert_id,
             )
 
-        return nvfp4_weight_loader
+        return nvfp4_online_weight_loader
