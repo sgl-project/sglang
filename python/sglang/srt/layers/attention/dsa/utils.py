@@ -170,6 +170,13 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
     from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+    from sglang.srt.layers.cp.utils import is_cp_v2_active
+
+    # CP-v2 already pads each rank-local shard to its physical size
+    if is_cp_v2_active(forward_batch):
+        return forward_batch.attn_cp_metadata.per_rank_actual_token[
+            get_parallel().attn_cp_rank
+        ]
 
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
