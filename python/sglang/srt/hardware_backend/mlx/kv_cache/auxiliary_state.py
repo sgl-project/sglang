@@ -351,7 +351,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                 source_value
             )
             if forked_value is None:
-                self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
                 forked_value = (
                     self.cache.req_to_token_pool.auxiliary_state_pool.fork_from(
                         source_value
