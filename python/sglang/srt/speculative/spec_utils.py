@@ -121,22 +121,73 @@ def resolve_num_tokens_per_req(
     raise ValueError(f"Unknown speculative phase: {phase}")
 
 
-def fast_sample(probs: torch.Tensor, num_samples: int = 1):
-    """Draw from `probs` via the Gumbel-max trick: argmax(probs / Exp(1)).
+# Domain-separate draft proposal draws from target sampling and verify coins.
+# The per-step offset also separates successive draft draws if their absolute
+# position inputs overlap.
+_DRAFT_GUMBEL_SEED_SALT = 0x44524146545F0000
 
-    Distributionally equivalent to torch.multinomial, but avoids multinomial's
-    device-side distribution-validity assert, which the draft CUDA graph would
-    otherwise capture and replay every step. q is clamped off zero so a zero
-    draw can't yield inf/NaN scores that argmax would wrongly select; fp32
-    avoids bf16 argmax ties biasing the draw. Set SGLANG_OPT_USE_GUMBEL_SAMPLE=0
-    to fall back to torch.multinomial.
+
+def fast_sample(
+    probs: torch.Tensor,
+    num_samples: int = 1,
+    *,
+    sampling_seed: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
+    draft_step: int = 0,
+):
+    """Draw from ``probs`` with the exponential-race form of Gumbel-max.
+
+    When ``sampling_seed`` is provided, derive one exponential variate per
+    request, position, draft step, and vocabulary entry with ``murmur_hash32``.
+    This makes draft proposals reproducible under batch reordering and CUDA
+    graph replay. The midpoint uint32 mapping stays strictly inside ``(0, 1)``,
+    avoiding infinite exponential/Gumbel values at either hash endpoint.
+
+    The unseeded path keeps using PyTorch's fast RNG-backed implementation.
+    Set ``SGLANG_OPT_USE_GUMBEL_SAMPLE=0`` to make that path fall back to
+    ``torch.multinomial``.
     """
-    if not envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
-        sample_index = torch.multinomial(probs, num_samples=num_samples)
-        return probs.gather(1, sample_index), sample_index
-    q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
-    q.clamp_min_(torch.finfo(torch.float32).tiny)
-    scores = probs.float() / q
+    if sampling_seed is not None:
+        if positions is None:
+            raise ValueError("positions are required for deterministic fast_sample")
+        if sampling_seed.shape != positions.shape:
+            raise ValueError(
+                "sampling_seed and positions must have matching shapes, got "
+                f"{sampling_seed.shape} and {positions.shape}"
+            )
+        if sampling_seed.numel() != probs.shape[0]:
+            raise ValueError(
+                "sampling_seed must have one value per probability row, got "
+                f"{sampling_seed.numel()} seeds for {probs.shape[0]} rows"
+            )
+
+        from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
+
+        # Addition is intentionally performed in signed int64 before the hash
+        # helper converts to uint64. It provides a separate random stream from
+        # target sampling and verify-side coins without changing their baselines.
+        salted_seed = sampling_seed + _DRAFT_GUMBEL_SEED_SALT + draft_step
+        col_indices = torch.arange(probs.shape[1], device=probs.device)
+        hashed = murmur_hash32(
+            salted_seed.to(torch.uint64), positions.to(torch.uint64), col_indices
+        )
+
+        # If U ~ Uniform(0, 1), then -log(U) ~ Exp(1), and
+        # argmax_i probs[i] / Exp_i samples from the categorical distribution.
+        # Keep float64 for this first implementation, matching the established
+        # deterministic sampler's numerical-conservatism policy.
+        scores = hashed.to(torch.float64)
+        del hashed
+        scores.add_(0.5).div_(2.0**32).log_().neg_().reciprocal_()
+        scores.mul_(probs)
+    else:
+        if not envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
+            sample_index = torch.multinomial(probs, num_samples=num_samples)
+            return probs.gather(1, sample_index), sample_index
+        q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
+        q.clamp_min_(torch.finfo(torch.float32).tiny)
+        scores = probs.float() / q
+
     if num_samples == 1:
         sample_index = scores.argmax(dim=-1, keepdim=True)
     else:
@@ -161,7 +212,14 @@ def renorm_draft_probs(
     return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
 
 
-def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):
+def sample_draft_proposal(
+    next_token_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    *,
+    sampling_seed: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
+    draft_step: int = 0,
+):
     """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
 
     Returns (q, q(X), X). The verify's accept test coin*q(X) < p(X) is unbiased
@@ -169,7 +227,13 @@ def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.T
     the returned q (not a recomputed one) to the verify.
     """
     probs = torch.softmax(next_token_logits / temperatures, dim=-1)
-    topk_p, topk_index = fast_sample(probs, num_samples=1)
+    topk_p, topk_index = fast_sample(
+        probs,
+        num_samples=1,
+        sampling_seed=sampling_seed,
+        positions=positions,
+        draft_step=draft_step,
+    )
     return probs, topk_p, topk_index
 
 

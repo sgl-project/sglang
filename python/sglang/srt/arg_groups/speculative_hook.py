@@ -623,6 +623,15 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "--speculative-use-rejection-sampling requires --speculative-eagle-topk=1."
             )
         if (
+            server_args.enable_deterministic_inference
+            and not server_args.device.startswith("cuda")
+        ):
+            raise ValueError(
+                "Deterministic rejection sampling is currently supported only on "
+                "CUDA-compatible devices because draft proposal sampling uses a "
+                "Triton hash kernel."
+            )
+        if (
             server_args.speculative_accept_threshold_single != 1.0
             or server_args.speculative_accept_threshold_acc != 1.0
         ):
@@ -632,13 +641,6 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "--speculative-accept-threshold-acc; rejection sampling ignores "
                 "the accept thresholds."
             )
-        if server_args.enable_deterministic_inference:
-            raise ValueError(
-                "--speculative-use-rejection-sampling is incompatible with "
-                "--enable-deterministic-inference; the sampling kernel draws "
-                "coins from the global RNG and is not batch-invariant."
-            )
-
         from sglang.srt.arg_groups.overrides import resolved_view
 
         if (
