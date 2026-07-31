@@ -4098,9 +4098,8 @@ def get_model_loader(
         logger.info("Using IncModelLoader due to AutoRound quantization config.")
         return IncModelLoader(load_config)
 
-    # ModelOptModelLoader's local-copy quantize-and-export workflow doesn't apply
-    # to non-local loaders. These loaders own their weight transport path and still
-    # initialize the model with ModelOpt quantization config where applicable.
+    # Online modelopt_fp4 converts weights through DefaultModelLoader. Non-local
+    # loaders also bypass ModelOptModelLoader because they own weight transport.
     modelopt_fp4_online = (
         model_config
         and model_config.quantization == "modelopt_fp4"

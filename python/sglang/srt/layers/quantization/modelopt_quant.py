@@ -1206,18 +1206,17 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 
 
 class ModelOptFp4Config(ModelOptQuantConfig):
-    """Config for serialized ModelOpt FP4 checkpoints.
+    """Supported ModelOpt FP4 paths:
 
-    The standard path loads packed NVFP4 weights and checkpoint-provided
-    per-tensor FP32 activation scales. Serialized checkpoints also support
-    FlashInfer TRTLLM per-token activation scaling through
-    `SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION`.
-
-    As a small extension, floating MoE expert weights can also be quantized
-    while loading. This online-weight path uses per-tensor activation scaling;
-    missing scales default to 1.0, and checkpoint tensors overwrite the
-    fallback. Online weight quantization with per-token activation scaling
-    remains the separate `nvfp4_online` interface.
+    - Serialized + per-tensor FP32 activation scales: load packed NVFP4 weights
+      and checkpoint-provided scales.
+    - Serialized + per-token FP32 activation scales: set
+      `SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=1`; use
+      `flashinfer_trtllm` or `flashinfer_trtllm_routed`.
+    - BF16/FP16 MoE + per-tensor FP32 activation scales: quantize expert weights
+      on load, keep dense weights in source precision, and default missing
+      scales to 1.0; checkpoint scales override the default.
+    - BF16/FP16/FP8 MoE + per-token FP32 activation scales: use `nvfp4_online`.
     """
 
     def __init__(
@@ -1242,7 +1241,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         if not is_checkpoint_nvfp4_serialized:
             if use_per_token_activation:
                 raise ValueError(
-                    "Non-serialized modelopt_fp4 uses static per-tensor FP32 "
+                    "Non-serialized modelopt_fp4 uses per-tensor FP32 "
                     "activation scales. Use nvfp4_online for online per-token "
                     "FP32 activation scales."
                 )
@@ -1268,7 +1267,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         cls,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ) -> ModelOptFp4Config:
-        """Build the static-activation config for floating MoE weights."""
+        """Use per-tensor FP32 activation scales for load-time MoE quantization."""
         return cls(
             is_checkpoint_nvfp4_serialized=False,
             group_size=16,
@@ -1420,8 +1419,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
 
         if not self.is_checkpoint_nvfp4_serialized:
             if isinstance(layer, (LinearBase, ParallelLMHead)):
-                # Online conversion is MoE-only; dense layers stay in their
-                # source precision.
+                # Load-time quantization applies only to MoE weights.
                 return UnquantizedLinearMethod()
             if isinstance(layer, FusedMoE):
                 if self.is_layer_excluded(prefix):
@@ -2075,8 +2073,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
     def _uses_serialized_fp8_source(self) -> bool:
-        # ModelOptFp4Config intentionally has no FP8-source state. The online
-        # subclass overrides this hook only when it wraps NvFp4OnlineConfig.
+        # nvfp4_online overrides this for serialized FP8 source weights.
         return False
 
     def create_weights(
@@ -2218,8 +2215,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         is_nvfp4_online = self.quant_config.get_name() == "nvfp4_online"
-        # Leave nvfp4_online scales uninitialized so an unexpected static-scale
-        # path does not silently use a neutral value.
+        # Keep nvfp4_online input scales uninitialized to expose unintended
+        # per-tensor scaling.
         input_scale_fill = 1.0 if not is_nvfp4_online else None
         w13_input_scale = _make_per_tensor_scale_parameter(
             (layer.num_experts, num_shards),
@@ -2238,7 +2235,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Prepare packed FP4 MoE weights and scales for the selected backend."""
+        """Transform packed FP4 MoE weights and scales for the selected backend."""
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):

@@ -166,7 +166,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Yes (Blackwell/SM100 or SM103)</td>
       <td>No</td>
       <td>No</td>
-      <td>Online MoE-only NVFP4 weight quantization with online per-token FP32 activation scales for BF16/FP16/FP8 checkpoints; never use this name for static per-tensor activation scales; requires <code>flashinfer_trtllm</code> or <code>flashinfer_trtllm_routed</code></td>
+      <td>Online MoE-only NVFP4 weight quantization with per-token FP32 activation scales for BF16/FP16/FP8 checkpoints; use <code>modelopt_fp4</code> for per-tensor FP32 activation scales; requires <code>flashinfer_trtllm</code> or <code>flashinfer_trtllm_routed</code></td>
     </tr>
     <tr>
       <td><code>petit_nvfp4</code></td>
@@ -851,12 +851,12 @@ python3 -m sglang.launch_server \
 
 ### `nvfp4_online` online quantization method
 
-Use `--quantization nvfp4_online` when you have a BF16, FP16, or FP8 MoE checkpoint and want SGLang to convert eligible MoE expert weights to NVFP4 while loading the model. This mode is for online conversion from higher-precision or FP8 checkpoints. It always requires online per-token FP32 activation scales. It is not an alias for static per-tensor NVFP4 and is not the serving path for already serialized NVFP4 checkpoints; use `modelopt_fp4` for those cases.
+Use `--quantization nvfp4_online` to convert eligible BF16, FP16, or FP8 MoE expert weights to NVFP4 at load time with per-token FP32 activation scales. Use `modelopt_fp4` for serialized NVFP4 checkpoints or load-time BF16/FP16 conversion with per-tensor FP32 activation scales.
 
 The design separates weight quantization from activation scaling:
 
 - **Weights:** SGLang quantizes each eligible MoE expert weight tensor as it is loaded, using standard 2D NVFP4 weight quantization. The generated NVFP4 weights use static E4M3 block scales plus static per-tensor FP32 scales derived from the weight amax. For gated MoE experts, the w1/w3 pair shares one per-tensor FP32 scale.
-- **Activations:** FlashInfer computes and propagates one FP32 activation scale per token at runtime. A backend implementation that accepts only one static per-tensor FP32 activation scale does not satisfy the `nvfp4_online` contract and must use `modelopt_fp4` instead.
+- **Activations:** FlashInfer computes and propagates one FP32 scale per token at runtime. Backends that accept one per-tensor FP32 activation scale must use `modelopt_fp4`.
 - **FP8 checkpoints:** If an eligible expert weight is stored as FP8, SGLang first dequantizes that tensor with the checkpoint scale and then requantizes it to NVFP4 during loading.
 - **Other layers:** Dense linear layers stay in their source checkpoint precision or checkpoint quantization path.
 

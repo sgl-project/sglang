@@ -29,12 +29,13 @@ logger = logging.getLogger(__name__)
 
 
 class NvFp4OnlineConfig(ModelOptQuantConfig):
-    """Config for `--quantization nvfp4_online`.
+    """Load-time NVFP4 with online per-token FP32 activation scales.
 
-    This mode is a load-time conversion path, not a serialized NVFP4 checkpoint
-    format. It reuses the ModelOpt NVFP4 MoE parameter layout and fills those
-    parameters by converting BF16/FP16/FP8 expert tensors as they are loaded.
-    Dense layers stay in the source checkpoint precision or quantization path.
+    `--quantization nvfp4_online` exclusively means online per-token FP32
+    activation scaling. Use `modelopt_fp4` for per-tensor FP32 activation scales
+    or serialized NVFP4 checkpoints. This path converts BF16/FP16/FP8 MoE expert
+    weights as they load; dense layers retain their source precision or
+    quantization.
     """
 
     # Marker consumed by the ModelOpt FP4 layout and the model loader. Serialized
@@ -80,8 +81,8 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping or {},
         )
         self.fp4_ignored_layers = fp4_ignored_layers
-        # Weights use static NVFP4 scales, while FlashInfer computes activation
-        # FP32 scales dynamically per token at runtime.
+        # NVFP4 weight scales are fixed at load time; FlashInfer computes one
+        # FP32 activation scale per token at runtime.
         self.use_per_token_activation = True
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         self.is_fp4_experts = False
@@ -172,12 +173,12 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             raise ValueError(
                 "--quantization nvfp4_online requires online per-token FP32 "
                 "activation scales and supports only flashinfer_trtllm or "
-                "flashinfer_trtllm_routed. Use modelopt_fp4 for static "
-                "per-tensor FP32 activation scales."
+                "flashinfer_trtllm_routed. Use modelopt_fp4 for per-tensor "
+                "FP32 activation scales."
             )
 
     def prepare_weight_loader(self, layer, weight_loader):
-        """Wrap floating expert tensors with load-time NVFP4 conversion."""
+        """Wrap the MoE weight loader with load-time NVFP4 conversion."""
         fp8_dequantizer = (
             self._dequantize_fp8_weight
             if self.quant_config.is_checkpoint_fp8_serialized
@@ -628,7 +629,7 @@ def make_nvfp4_online_weight_loader(
     layer: torch.nn.Module,
     original_weight_loader: Callable,
 ) -> Callable:
-    """Build the shared load-time NVFP4 expert-weight loader."""
+    """Wrap a MoE weight loader with load-time NVFP4 conversion."""
     return ModelOptNvFp4OnlineFusedMoEMethod.get_online_weight_loader(
         layer,
         original_weight_loader,

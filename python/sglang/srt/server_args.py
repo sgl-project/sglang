@@ -2131,13 +2131,7 @@ class ServerArgs:
     speculative_draft_model_quantization: A[
         Optional[str],
         Arg(
-            help=(
-                "The quantization method for the speculative draft model. "
-                "nvfp4_online is reserved for NVFP4 with online per-token "
-                "FP32 activation scales. Use modelopt_fp4 for online-capable "
-                "NVFP4 with static per-tensor FP32 activation scales; missing "
-                "activation scales default to 1.0."
-            ),
+            help="The quantization method for speculative model.",
             choices=QUANTIZATION_CHOICES,
         ),
         NS("spec"),

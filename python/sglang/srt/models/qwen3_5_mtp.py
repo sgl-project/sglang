@@ -61,9 +61,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
 
-        # Qwen3.5 checkpoints keep embedded MTP weights in BF16. Retain the
-        # unquantized default for serialized ModelOpt configs, while allowing
-        # the non-serialized modelopt_fp4 online-weight path.
+        # Serialized Qwen3.5 ModelOpt checkpoints keep embedded MTP weights in
+        # BF16. Disable quantization for those checkpoints; non-serialized
+        # modelopt_fp4 still converts MoE expert weights on load.
         if quant_config and (
             quant_config.get_name() == "modelopt_mixed"
             or (

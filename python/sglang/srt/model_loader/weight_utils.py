@@ -341,8 +341,8 @@ def get_quant_config(
     ]
     if len(quant_config_files) == 0:
         if model_config.quantization == "modelopt_fp4":
-            # modelopt_fp4 can quantize floating MoE expert weights online;
-            # dense layers stay in their source precision on this path.
+            # Without serialized metadata, quantize MoE expert weights online;
+            # leave dense layers in source precision.
             return ModelOptFp4Config.for_online_weight_quantization(
                 packed_modules_mapping
             )
