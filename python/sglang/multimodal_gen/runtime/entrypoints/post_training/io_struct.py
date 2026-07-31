@@ -111,3 +111,34 @@ class RolloutResponse(BaseModel):
 
     inference_time_s: Optional[float] = None
     peak_memory_mb: Optional[float] = None
+
+
+class EncodeRequest(BaseModel):
+    prompt: str
+    negative_prompt: Optional[str] = None
+    seed: Optional[int] = None
+    generator_device: str = "cuda"
+
+    width: Optional[int] = None
+    height: Optional[int] = None
+    num_frames: Optional[int] = None
+    fps: Optional[int] = None
+
+    image_path: Optional[list[str]] = None
+    # ground-truth video to VAE-encode into latents (e.g. SFT targets)
+    video_path: Optional[str] = None
+
+    suppress_logs: bool = False
+
+    extra_sampling_params: Optional[dict[str, Any]] = None
+
+
+class EncodeResponse(BaseModel):
+    request_id: str
+    prompt: str
+
+    # serialized tensors: prompt_embeds, negative_prompt_embeds, attention
+    # masks, pooled embeds, image_latent, video_latents
+    encoder_output: dict[str, Any]
+
+    inference_time_s: Optional[float] = None

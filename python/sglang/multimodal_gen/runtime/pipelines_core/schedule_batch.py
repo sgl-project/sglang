@@ -230,6 +230,8 @@ class Req:
     output: torch.Tensor | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+    # encoder tensors collected by EncoderOutputStage (encode-only serving)
+    encoder_output: dict[str, Any] | None = None
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields
@@ -455,6 +457,7 @@ class OutputBatch:
     trajectory_latents: torch.Tensor | None = None
     rollout_trajectory_data: RolloutTrajectoryData | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
+    encoder_output: dict[str, Any] | None = None
     error: str | None = None
     output_file_paths: list[str] | None = None
 
@@ -472,6 +475,7 @@ class OutputBatch:
         self.trajectory_timesteps = None
         self.trajectory_latents = None
         self.rollout_trajectory_data = None
+        self.encoder_output = None
         self.trajectory_decoded = None
         self.output_file_paths = None
         self.raw_frame_batches = None

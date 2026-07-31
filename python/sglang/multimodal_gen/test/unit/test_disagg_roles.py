@@ -222,7 +222,7 @@ def _make_pipeline(role: RoleType) -> _FakePipeline:
     pipeline.modules = {}
     pipeline._stages = []
     pipeline._stage_name_mapping = {}
-    pipeline._disagg_role = role
+    pipeline._role = role
     return pipeline
 
 
@@ -504,7 +504,7 @@ class TestStageAffinityAndValidation(_GlobalStageArgsMixin, unittest.TestCase):
         pipeline.server_args = self._install_stage_server_args(
             pipeline_config=Hunyuan3D2PipelineConfig(paint_enable=paint_enable)
         )
-        pipeline._disagg_role = role
+        pipeline._role = role
         pipeline.modules = {
             "hy3dshape_image_processor": object(),
             "hy3dshape_conditioner": object(),

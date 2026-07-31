@@ -36,6 +36,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
+    _kwargs_to_cpu,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
@@ -46,6 +49,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     temporary_module_dtype,
 )
 from sglang.multimodal_gen.runtime.utils.vision import (
+    load_video,
     normalize,
     numpy_to_pt,
     pil_to_numpy,
@@ -1092,3 +1096,92 @@ class ImageVAEEncodingStage(PipelineStage):
         #     "image_latent", batch.image_latent, [V.is_tensor, V.with_dims(5)]
         # )
         return result
+
+
+class EncoderOutputStage(ImageVAEEncodingStage):
+    """Terminal stage for encode-only serving: collects encoder tensors on CPU."""
+
+    def __init__(self, vae: ParallelTiledVAE | None = None) -> None:
+        super().__init__(vae=vae)
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        video_latents = None
+        if batch.video_path is not None:
+            if self.vae is None:
+                raise ValueError("video_path requires a VAE, but none is loaded")
+            video_latents = self._encode_video(batch, server_args)
+        batch.encoder_output = _kwargs_to_cpu(
+            {
+                "prompt_embeds": batch.prompt_embeds,
+                "negative_prompt_embeds": batch.negative_prompt_embeds,
+                "prompt_attention_mask": batch.prompt_attention_mask,
+                "negative_attention_mask": batch.negative_attention_mask,
+                "pooled_embeds": batch.pooled_embeds,
+                "neg_pooled_embeds": batch.neg_pooled_embeds,
+                "image_latent": batch.image_latent,
+                "video_latents": video_latents,
+            }
+        )
+        return batch
+
+    def _encode_video(self, batch: Req, server_args: ServerArgs) -> torch.Tensor:
+        frames = load_video(batch.video_path)
+        if batch.num_frames is not None:
+            frames = frames[: batch.num_frames]
+        frames = [
+            frame.resize((batch.width, batch.height), PIL.Image.LANCZOS)
+            for frame in frames
+        ]
+        # T frames of (1, C, H, W) stacked to (1, C, T, H, W)
+        video = torch.stack([self.preprocess(frame) for frame in frames], dim=2)
+        video = video.to(get_local_torch_device(), dtype=torch.float32)
+
+        vae_dtype = resolve_precision(
+            server_args, self.component_name, precision_attr="vae_precision"
+        )
+        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
+        with self.use_declared_component(
+            component_name=self.component_name,
+            module=self.vae,
+        ) as vae:
+            assert vae is not None
+            self.vae = vae
+            with autocast_context(vae_dtype, server_args.disable_autocast):
+                if server_args.pipeline_config.vae_tiling:
+                    self.vae.enable_tiling()
+                if not vae_autocast_enabled:
+                    video = video.to(vae_dtype)
+                video = server_args.pipeline_config.preprocess_vae_encode(
+                    video, self.vae
+                )
+                with temporary_module_dtype(
+                    self.vae, vae_dtype, enabled=not vae_autocast_enabled
+                ) as vae:
+                    latent_dist = vae.encode(video)
+                if isinstance(latent_dist, AutoencoderKLOutput):
+                    latent_dist = latent_dist.latent_dist
+
+            sample_mode = server_args.pipeline_config.vae_config.encode_sample_mode()
+            latents = self.retrieve_latents(
+                latent_dist, batch.generator, sample_mode=sample_mode
+            )
+            latents = server_args.pipeline_config.postprocess_vae_encode(
+                latents, self.vae
+            )
+            normalized = server_args.pipeline_config.normalize_vae_encode(
+                latents, self.vae
+            )
+            if normalized is not None:
+                return normalized
+            scaling_factor, shift_factor = (
+                server_args.pipeline_config.get_decode_scale_and_shift(
+                    device=latents.device, dtype=latents.dtype, vae=self.vae
+                )
+            )
+            return self.scale_and_shift_encode_latents(
+                latents, scaling_factor, shift_factor
+            )
+
+    def build_dedup_fingerprint(self, batch: Req, server_args: ServerArgs) -> int:
+        # Output depends on the prompt as well, so never share across requests.
+        return id(batch)
