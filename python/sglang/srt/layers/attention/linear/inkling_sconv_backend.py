@@ -69,9 +69,8 @@ if TYPE_CHECKING:
 
 
 class InklingShortConvMetadata(msgspec.Struct):
-    """The step's conv-state metadata, resolved during metadata prep and shared by
-    every conv module in the step. On the graph path each tensor is a static buffer
-    refilled in place.
+    """The step's conv-state metadata, filled during metadata prep. On the graph
+    path every tensor here is a static buffer refilled in place.
     """
 
     cache_indices: Optional[torch.Tensor] = None  # per-request slot ids, int32
@@ -81,9 +80,9 @@ class InklingShortConvMetadata(msgspec.Struct):
     # [B, conv_kernel - 1] input positions whose conv window feeds the prefix
     # cache. Extend only, and only when tracking is on.
     track_conv_indices: Optional[torch.Tensor] = None
-    # layer id -> that layer's pool views, indexed by ``SconvType``. Filled on
-    # first ask, not up front: ``mamba2_layer_cache`` carries the HiCache
-    # layer-transfer wait, which has to stay just ahead of that layer's forward.
+    # layer id -> that layer's pool views. Filled on first ask, not up front:
+    # ``mamba2_layer_cache`` waits on that layer's HiCache transfer, which has to
+    # stay just ahead of the layer's forward.
     layer_caches: dict = {}
 
     def layer_cache(self, layer_id: int):
@@ -497,14 +496,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
     def conv_state_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> InklingShortConvMetadata:
-        """The step's metadata, with ``layer_id``'s pool views resolved into it.
-
-        Everything else was resolved during metadata prep, so every conv layer
-        shares one gather, one fused launch and one track-index build. The pool
-        views are resolved once per LAYER: all four of a layer's convs ask for the
-        same handle, and ``mamba2_layer_cache`` rebuilds a ``State`` over the pool's
-        conv streams per call (plus a HiCache layer-transfer wait).
-        """
+        """The step's metadata, with ``layer_id``'s pool views resolved into it."""
         del forward_batch
         md = self.sconv_metadata
         if layer_id not in md.layer_caches:

@@ -181,8 +181,7 @@ class TestInklingSconvMetadataOnce(CustomTestCase):
         self.assertEqual(counts["decode"], 1)
         self.assertEqual(pool.gather_calls, 1)
         self.assertEqual(len(handles), NUM_LAYERS * NUM_MODULES_PER_LAYER)
-        # One pool view per LAYER, not per module: mamba2_layer_cache rebuilds a
-        # State over every conv stream and waits on the HiCache layer transfer.
+        # One pool view per LAYER, not per conv module.
         self.assertEqual(pool.layer_cache_calls, NUM_LAYERS)
         first = handles[0]
         for h in handles[1:]:

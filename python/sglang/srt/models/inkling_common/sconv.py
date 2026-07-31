@@ -123,12 +123,7 @@ class ShortConvolution(nn.Module):
         param_data.copy_(loaded_weight)
 
     def _conv_state(self, forward_batch: ForwardBatch):
-        """This layer's conv-state handle for the current step.
-
-        ``InklingShortConvAttnBackend`` resolved the whole step-global metadata set
-        once during metadata prep, so this is a pure read shared by every conv
-        module in the step.
-        """
+        """The step's conv-state metadata, resolved once by the attention backend."""
         return get_attn_backend().conv_state_metadata(self.layer_id, forward_batch)
 
     def _layer_cache(self, meta):
