@@ -987,9 +987,9 @@ class SchedulerBatchResultProcessor:
         req: Req,
         next_token_id: Union[int, List[int]],
     ):
-        think_end_id = self.model_config.think_end_id
-        if req.require_reasoning and think_end_id is not None:
-            req.update_reasoning_tokens(next_token_id, think_end_id)
+        think_end_ids = self.model_config.think_end_ids
+        if req.require_reasoning and think_end_ids:
+            req.update_reasoning_tokens(next_token_id, think_end_ids)
 
     def _mamba_prefix_cache_update(
         self,
