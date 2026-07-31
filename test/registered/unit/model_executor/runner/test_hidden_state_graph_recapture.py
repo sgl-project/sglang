@@ -88,6 +88,7 @@ class TestHiddenStateGraphRecapture(CustomTestCase):
             spec_info=SimpleNamespace(capture_hidden_mode=spec_capture_hidden_mode),
             global_num_tokens_cpu=None,
             return_logprob=False,
+            extend_prefix_lens_cpu=None,
             input_ids=list(range(4)),
         )
 

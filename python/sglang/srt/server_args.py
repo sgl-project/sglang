@@ -3599,6 +3599,10 @@ class ServerArgs:
         materialize_declarations(self)
 
     def _handle_return_hidden_states_mode(self):
+        if self.return_hidden_states_mode not in (None, "last", "full"):
+            raise ValueError(
+                "return_hidden_states_mode must be one of: None, 'last', or 'full'."
+            )
         if self.return_hidden_states_mode is None:
             if self.enable_return_hidden_states:
                 self.return_hidden_states_mode = "full"

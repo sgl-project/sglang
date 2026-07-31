@@ -72,6 +72,15 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertTrue(parsed_last.enable_return_hidden_states)
         self.assertEqual(parsed_last.return_hidden_states_mode, "last")
 
+        with self.assertRaisesRegex(
+            ValueError,
+            "return_hidden_states_mode must be one of",
+        ):
+            ServerArgs(
+                model_path="dummy",
+                return_hidden_states_mode="lst",
+            )
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")
