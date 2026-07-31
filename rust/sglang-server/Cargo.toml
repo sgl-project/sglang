@@ -32,6 +32,7 @@ tracing-appender = { workspace = true }
 uuid = { workspace = true }
 
 axum = { version = "0.8.9", features = ["json", "tokio"] }
+libc = "0.2"
 core_affinity = "0.8"
 # the dynamo-tokenizers is deps on hf-hub, should bump version together.
 dynamo-tokenizers = "1.7.0"

@@ -2565,6 +2565,7 @@ dependencies = [
  "futures",
  "hf-hub",
  "itertools",
+ "libc",
  "pyo3",
  "regex-syntax",
  "rmp-serde",

@@ -96,6 +96,27 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // port (EADDRINUSE) is a hard startup error.
     let listener = std::net::TcpListener::bind(cfg.rust_server_args.http_addr)
         .map_err(|e| format!("bind {} failed: {e}", cfg.rust_server_args.http_addr))?;
+    // Accepted sockets inherit this rcvbuf. The kernel default (87 KB) is
+    // smaller than one large /generate body; a request burst that overflows
+    // it costs the client a ~200 ms RTO retransmit. 16 MiB covers a
+    // 1M-token body; allocation is lazy, so idle connections pay nothing.
+    // Requests above net.core.rmem_max are silently clamped by the kernel.
+    {
+        use std::os::fd::AsRawFd;
+        let sz: libc::c_int = 1 << 24; // 16 MiB
+        let r = unsafe {
+            libc::setsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &sz as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&sz) as libc::socklen_t,
+            )
+        };
+        if r != 0 {
+            eprintln!("warning: SO_RCVBUF setsockopt on listener failed");
+        }
+    }
     listener
         .set_nonblocking(true)
         .map_err(|e| format!("listener set_nonblocking failed: {e}"))?;
