@@ -249,11 +249,23 @@ class PipelineConfig:
     preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
         default_factory=lambda: (None,)
     )
+    # None falls back to the positive-branch preprocessors, which is what every
+    # model expected before this field existed.
+    negative_preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] | None = (
+        None
+    )
 
     # get prompt_embeds from encoder output
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.tensor], ...] = (
         field(default_factory=lambda: (postprocess_text,))
     )
+
+    def get_preprocess_text_funcs(
+        self, *, is_negative: bool
+    ) -> tuple[Callable[[str], str] | None, ...]:
+        if is_negative and self.negative_preprocess_text_funcs is not None:
+            return self.negative_preprocess_text_funcs
+        return self.preprocess_text_funcs
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
@@ -1099,6 +1111,13 @@ class PipelineConfig:
         if len(self.text_encoder_configs) != len(self.preprocess_text_funcs):
             raise ValueError(
                 f"Length of text encoder configs ({len(self.text_encoder_configs)}) must be equal to length of text preprocessing functions ({len(self.preprocess_text_funcs)})"
+            )
+
+        if self.negative_preprocess_text_funcs is not None and len(
+            self.text_encoder_configs
+        ) != len(self.negative_preprocess_text_funcs):
+            raise ValueError(
+                f"Length of text encoder configs ({len(self.text_encoder_configs)}) must be equal to length of negative text preprocessing functions ({len(self.negative_preprocess_text_funcs)})"
             )
 
         if len(self.preprocess_text_funcs) != len(self.postprocess_text_funcs):

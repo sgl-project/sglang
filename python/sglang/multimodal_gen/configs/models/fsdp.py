@@ -48,6 +48,10 @@ def is_blocks_or_transformer_blocks(name: str, module: object) -> bool:
     return is_module_list_entry_in(name, ("blocks", "transformer_blocks"))
 
 
+def is_lumina2_layer(name: str, module: object) -> bool:
+    return is_module_list_entry_in(name, ("layers", "noise_refiner", "context_refiner"))
+
+
 def is_zimage_layer(name: str, module: object) -> bool:
     last_part = name.split(".")[-1]
     # Preserve Z-Image's finer historical FSDP granularity for perf.

@@ -75,6 +75,45 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 _VARLEN_FA_ENABLED = os.environ.get("SGLANG_VARLEN_FA", "1") != "0"
 
 
+def _same_head_count(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    """True when Q/K/V share a head count (MHA), for ``[B, S, H, D]`` inputs.
+
+    The varlen FA fast path calls ``fused_pack_qkv``, which asserts Q/K/V share
+    a full shape, so GQA/MQA must not reach it. The surrounding gates compare
+    ``shape[:2]`` -- (batch, sequence) -- which is equal for GQA too, stopping
+    one index short of the dimension that actually differs.
+    """
+    return q.shape[2] == k.shape[2] == v.shape[2]
+
+
+def _expand_kv_for_gqa(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dim: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Repeat K/V heads up to Q's head count for kernels without native GQA.
+
+    ``scaled_dot_product_attention`` does not broadcast heads, so a GQA model
+    reaches it with mismatched head counts and raises. ``LocalAttention`` has
+    carried this expansion since it was written; ``USPAttention`` did not.
+
+    ``dim`` is the head axis: 1 for the ``[B, H, S, D]`` layout SDPA wants.
+    Returns ``k, v`` unchanged -- the same objects -- when the counts already
+    match, so MHA models (e.g. Z-Image) are bit-for-bit unaffected.
+    """
+    q_heads, kv_heads = q.shape[dim], k.shape[dim]
+    if q_heads == kv_heads:
+        return k, v
+    if kv_heads <= 0 or q_heads % kv_heads != 0:
+        raise ValueError(
+            f"query heads ({q_heads}) must be a positive multiple of "
+            f"kv heads ({kv_heads})"
+        )
+    repeat_factor = q_heads // kv_heads
+    return (
+        k.repeat_interleave(repeat_factor, dim=dim),
+        v.repeat_interleave(repeat_factor, dim=dim),
+    )
+
+
 def build_varlen_mask_meta(
     key_mask: torch.Tensor,
 ) -> dict:
@@ -505,10 +544,7 @@ class LocalAttention(nn.Module):
                     mask = mask[:, None, :, :]
                 mask = (mask - 1.0) * torch.finfo(q_.dtype).max
 
-            if q_.shape[1] != k_.shape[1]:
-                repeat_factor = q_.shape[1] // k_.shape[1]
-                k_ = k_.repeat_interleave(repeat_factor, dim=1)
-                v_ = v_.repeat_interleave(repeat_factor, dim=1)
+            k_, v_ = _expand_kv_for_gqa(q_, k_, v_)
 
             sdpa_context = (
                 sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
@@ -719,6 +755,8 @@ class USPAttention(nn.Module):
                     and attn_mask.device == q.device
                     and q.dtype in (torch.float16, torch.bfloat16)
                     and q.shape[:2] == attn_mask.shape == k.shape[:2] == v.shape[:2]
+                    # shape[:2] stops before the head dimension.
+                    and _same_head_count(q, k, v)
                 ):
                     bs, seq = q.shape[0], q.shape[1]
                     indices = attn_mask_meta["indices"]
@@ -753,6 +791,7 @@ class USPAttention(nn.Module):
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
+                k_, v_ = _expand_kv_for_gqa(q_, k_, v_)
                 mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
                 sdpa_context = (
                     sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
@@ -888,6 +927,8 @@ class USPAttention(nn.Module):
                 and gathered_mask.device == q.device
                 and q.dtype in (torch.float16, torch.bfloat16)
                 and q.shape[:2] == gathered_mask.shape == k.shape[:2] == v.shape[:2]
+                # shape[:2] stops before the head dimension.
+                and _same_head_count(q, k, v)
             ):
                 bs, seq = q.shape[0], q.shape[1]
                 gathered_mask_meta = build_varlen_mask_meta(gathered_mask)
@@ -918,6 +959,7 @@ class USPAttention(nn.Module):
             q_ = q.transpose(1, 2)
             k_ = k.transpose(1, 2)
             v_ = v.transpose(1, 2)
+            k_, v_ = _expand_kv_for_gqa(q_, k_, v_)
             mask = _prepare_sdpa_mask(gathered_mask, dtype=q_.dtype, device=q_.device)
             sdpa_context = (
                 sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
