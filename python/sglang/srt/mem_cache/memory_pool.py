@@ -1111,6 +1111,9 @@ class MambaPool:
             subdims_per_tensor += [subdims] * self.num_mamba_layers
         return subdims_per_tensor
 
+    def get_kv_size_bytes(self):
+        return self.mamba_cache.mem_usage_bytes()
+
 
 class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
