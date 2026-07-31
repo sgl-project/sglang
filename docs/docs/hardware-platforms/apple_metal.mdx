@@ -6,7 +6,7 @@ metatags:
 
 This document describes how to run the SGLang serving runtime on Apple Silicon
 using [MLX](https://opensource.apple.com/projects/mlx/). SGLang Diffusion uses
-PyTorch MPS instead; see its [installation guide](../sglang-diffusion/installation#platform-specific-apple-mps).
+PyTorch MPS instead; see its [installation guide](/docs/sglang-diffusion/installation#platform-specific-apple-mps).
 If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
 ## Prerequisites
@@ -14,6 +14,10 @@ If you encounter issues or have questions, please [open an issue](https://github
 The MLX runtime requires MLX 0.32 or newer and PyTorch 2.13 or newer on
 Apple Silicon with macOS 14 or newer. The `srt_mps` extra installs compatible
 versions automatically.
+
+With `SGLANG_USE_MLX=1`, SGLang validates both framework versions and Metal
+availability during argument initialization and stops before resolving or
+downloading a model when the runtime is incompatible.
 
 Building the optional native Metal kernels in `sgl-kernel` requires the Metal
 shader compiler from the full Xcode application. The standalone Xcode Command
@@ -44,9 +48,9 @@ source sglang-metal/bin/activate
 uv pip install --upgrade pip
 uv run python/sglang/kernels/aot/setup_metal.py install
 
-# Install the SRT MLX backend
+# Install sglang python package along with diffusion support
 rm -f python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-uv pip install -e "python[srt_mps]"
+uv pip install -e "python[all_mps]"
 ```
 
 ## Launch of the Serving Engine
