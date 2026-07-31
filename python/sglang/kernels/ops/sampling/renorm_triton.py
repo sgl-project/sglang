@@ -1,4 +1,4 @@
-"""ROCm-compatible top-p probability renormalization fallback."""
+"""ROCm-compatible top-k / top-p probability renormalization fallbacks."""
 
 from __future__ import annotations
 
@@ -51,6 +51,44 @@ def _normalize_kernel(
     tl.store(out_ptr + offsets, values / denominator, mask=mask)
 
 
+def _prepare_probs(probs: torch.Tensor) -> torch.Tensor:
+    if probs.ndim != 2:
+        raise ValueError(f"probs must be 2D, got shape={tuple(probs.shape)}")
+    if not probs.is_cuda:
+        raise ValueError("renorm kernels require a CUDA/HIP tensor")
+    return probs.float().contiguous()
+
+
+def _renorm_from_pivots(probs_fp32: torch.Tensor, pivots: torch.Tensor) -> torch.Tensor:
+    batch_size, vocab_size = probs_fp32.shape
+    num_chunks = triton.cdiv(vocab_size, _BLOCK_SIZE)
+    out = torch.empty_like(probs_fp32)
+    partial_sums = torch.empty(
+        (batch_size, num_chunks), device=probs_fp32.device, dtype=torch.float32
+    )
+    _mask_and_partial_sum_kernel[(batch_size, num_chunks)](
+        probs_fp32,
+        pivots,
+        out,
+        partial_sums,
+        vocab_size=vocab_size,
+        num_chunks=num_chunks,
+        BLOCK_SIZE=_BLOCK_SIZE,
+        num_warps=8,
+    )
+
+    row_sums = partial_sums.sum(dim=1)
+    _normalize_kernel[(triton.cdiv(out.numel(), _BLOCK_SIZE),)](
+        out,
+        row_sums,
+        out.numel(),
+        vocab_size=vocab_size,
+        BLOCK_SIZE=_BLOCK_SIZE,
+        num_warps=8,
+    )
+    return out
+
+
 def top_p_renorm_probs_triton(
     probs: torch.Tensor, top_p: Union[torch.Tensor, float]
 ) -> torch.Tensor:
@@ -60,12 +98,7 @@ def top_p_renorm_probs_triton(
     in-register Triton sort does not scale to 100K+ vocabularies. Triton performs
     the bandwidth-heavy masking, partial reduction, and normalization.
     """
-    if probs.ndim != 2:
-        raise ValueError(f"probs must be 2D, got shape={tuple(probs.shape)}")
-    if not probs.is_cuda:
-        raise ValueError("top_p_renorm_probs_triton requires a CUDA/HIP tensor")
-
-    probs_fp32 = probs.float().contiguous()
+    probs_fp32 = _prepare_probs(probs)
     batch_size, vocab_size = probs_fp32.shape
     if batch_size == 0 or vocab_size == 0:
         return probs_fp32
@@ -96,32 +129,44 @@ def top_p_renorm_probs_triton(
     cutoff.clamp_(max=vocab_size - 1)
     pivots = sorted_probs.gather(1, cutoff.unsqueeze(1)).squeeze(1).contiguous()
 
-    num_chunks = triton.cdiv(vocab_size, _BLOCK_SIZE)
-    out = torch.empty_like(probs_fp32)
-    partial_sums = torch.empty(
-        (batch_size, num_chunks), device=probs.device, dtype=torch.float32
-    )
-    _mask_and_partial_sum_kernel[(batch_size, num_chunks)](
-        probs_fp32,
-        pivots,
-        out,
-        partial_sums,
-        vocab_size=vocab_size,
-        num_chunks=num_chunks,
-        BLOCK_SIZE=_BLOCK_SIZE,
-        num_warps=8,
-    )
-
-    row_sums = partial_sums.sum(dim=1)
-    _normalize_kernel[(triton.cdiv(out.numel(), _BLOCK_SIZE),)](
-        out,
-        row_sums,
-        out.numel(),
-        vocab_size=vocab_size,
-        BLOCK_SIZE=_BLOCK_SIZE,
-        num_warps=8,
-    )
-    return out
+    return _renorm_from_pivots(probs_fp32, pivots)
 
 
-__all__ = ["top_p_renorm_probs_triton"]
+def top_k_renorm_probs_triton(
+    probs: torch.Tensor, top_k: Union[torch.Tensor, int]
+) -> torch.Tensor:
+    """Apply exact top-k thresholding and renormalize each probability row.
+
+    Sorting uses PyTorch's device kernels because a vocabulary-sized in-register
+    Triton sort does not scale to 100K+ vocabularies. Triton performs the
+    bandwidth-heavy masking, partial reduction, and normalization.
+    """
+    probs_fp32 = _prepare_probs(probs)
+    batch_size, vocab_size = probs_fp32.shape
+    if batch_size == 0 or vocab_size == 0:
+        return probs_fp32
+
+    if isinstance(top_k, torch.Tensor):
+        top_ks = top_k.to(device=probs.device, dtype=torch.int64).reshape(-1)
+        if top_ks.numel() == 1:
+            top_ks = top_ks.expand(batch_size)
+        elif top_ks.numel() != batch_size:
+            raise ValueError(
+                f"top_k must be scalar or have one value per row, got "
+                f"{top_ks.numel()} values for {batch_size} rows"
+            )
+    else:
+        top_ks = torch.full(
+            (batch_size,), int(top_k), device=probs.device, dtype=torch.int64
+        )
+
+    # Match FlashInfer's threshold semantics: sort descending, keep the k highest
+    # probabilities, and retain all ties at the pivot.
+    sorted_probs = torch.sort(probs_fp32, dim=-1, descending=True).values
+    cutoff = (top_ks - 1).clamp_(min=0, max=vocab_size - 1)
+    pivots = sorted_probs.gather(1, cutoff.unsqueeze(1)).squeeze(1).contiguous()
+
+    return _renorm_from_pivots(probs_fp32, pivots)
+
+
+__all__ = ["top_k_renorm_probs_triton", "top_p_renorm_probs_triton"]
