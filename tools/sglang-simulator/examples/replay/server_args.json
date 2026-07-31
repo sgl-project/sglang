@@ -1,0 +1,15 @@
+{
+  "model_path": "/absolute/path/to/model",
+  "skip_tokenizer_init": true,
+  "max_total_tokens": 8192,
+  "max_running_requests": 8,
+  "max_prefill_tokens": 4096,
+  "chunked_prefill_size": 4096,
+  "page_size": 1,
+  "disable_overlap_schedule": true,
+  "enable_hierarchical_cache": false,
+  "tp_size": 1,
+  "ep_size": 1,
+  "dp_size": 1,
+  "pp_size": 1
+}

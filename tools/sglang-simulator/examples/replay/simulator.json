@@ -1,0 +1,24 @@
+{
+  "platform": {
+    "accelerator": {"name": "h20_sxm"},
+    "disk_read_bandwidth_gb": 8,
+    "disk_write_bandwidth_gb": 8,
+    "memory_read_bandwidth_gb": 64,
+    "memory_write_bandwidth_gb": 64,
+    "num_device_per_node": 1
+  },
+  "predictor": {
+    "name": "replay",
+    "database_path": "replay_table.json",
+    "miss_strategy": "knn",
+    "miss_knn_k": 1
+  },
+  "scheduler": {
+    "tp_size": 1,
+    "ep_size": 1,
+    "dp_size": 1,
+    "data_type": "FP16",
+    "kv_cache_data_type": "FP16",
+    "backend_name": "sglang"
+  }
+}
