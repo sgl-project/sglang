@@ -1,76 +1,8 @@
-import torch
 import triton
 import triton.language as tl
 
 _FLASHMLA_CREATE_KV_BLOCK_SIZE = 4096
 FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SIZE)
-
-
-@triton.jit(do_not_specialize=["num_locs", "mapping_size"])
-def _translate_full_to_swa_int32_kernel(
-    full_to_swa_ptr,
-    full_locs_ptr,
-    swa_locs_ptr,
-    full_to_swa_stride,
-    full_locs_stride,
-    num_locs,
-    mapping_size,
-    BLOCK: tl.constexpr,
-):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < num_locs
-    full_loc = tl.load(
-        full_locs_ptr + offsets * full_locs_stride,
-        mask=mask,
-        other=0,
-    ).to(tl.int64)
-
-    # The full-to-SWA mapping appends a sentinel for the production -1 location.
-    is_sentinel = full_loc == -1
-    mapping_idx = tl.where(is_sentinel, mapping_size - 1, full_loc)
-    valid = mask & (mapping_idx >= 0) & (mapping_idx < mapping_size)
-    swa_loc = tl.load(
-        full_to_swa_ptr + mapping_idx * full_to_swa_stride,
-        mask=valid,
-        other=-1,
-    )
-    tl.store(swa_locs_ptr + offsets, swa_loc.to(tl.int32), mask=mask)
-
-
-def translate_full_to_swa_int32(
-    full_to_swa_mapping: torch.Tensor,
-    full_locs: torch.Tensor,
-) -> torch.Tensor:
-    """Gather valid full-cache locations (or ``-1``) as int32 in one CUDA launch."""
-    assert full_to_swa_mapping.dim() == full_locs.dim() == 1
-    assert full_to_swa_mapping.device == full_locs.device
-    assert full_to_swa_mapping.dtype in (torch.int32, torch.int64)
-    assert full_locs.dtype in (torch.int32, torch.int64)
-    assert full_to_swa_mapping.numel() > 0
-
-    if not full_locs.is_cuda:
-        return full_to_swa_mapping[full_locs].to(torch.int32)
-
-    swa_locs = torch.empty(
-        full_locs.shape,
-        dtype=torch.int32,
-        device=full_locs.device,
-    )
-    if full_locs.numel() == 0:
-        return swa_locs
-
-    block = 256
-    _translate_full_to_swa_int32_kernel[(triton.cdiv(full_locs.numel(), block),)](
-        full_to_swa_mapping,
-        full_locs,
-        swa_locs,
-        full_to_swa_mapping.stride(0),
-        full_locs.stride(0),
-        full_locs.numel(),
-        full_to_swa_mapping.numel(),
-        BLOCK=block,
-    )
-    return swa_locs
 
 
 @triton.jit

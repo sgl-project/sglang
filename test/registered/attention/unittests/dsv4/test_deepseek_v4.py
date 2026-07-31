@@ -623,39 +623,59 @@ class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
         self.assertEqual(out.tolist(), [0, 0])
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
 class TestDSV4InGraphMetadata(CustomTestCase):
-    def test_draft_extend_uses_fused_int32_translation(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
-            DSV4Metadata,
+    def test_draft_extend_caches_int32_translation(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend as dsv4_backend
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            model_capture_mode,
         )
 
-        translated = torch.tensor([6, 8], dtype=torch.int32)
-        translate_int32 = mock.Mock(return_value=translated)
-        backend = object.__new__(DeepseekV4AttnBackend)
-        backend.forward_metadata = DSV4Metadata(
+        backend = object.__new__(dsv4_backend.DeepseekV4AttnBackend)
+        backend.forward_metadata = dsv4_backend.DSV4Metadata(
             core_attn_metadata=SimpleNamespace(swa_out_cache_loc=None),
             indexer_metadata=None,
         )
         backend.token_to_kv_pool = SimpleNamespace(
-            translate_loc_from_full_to_swa_int32=translate_int32,
+            full_to_swa_index_mapping=torch.tensor(
+                [0, 2, 4, 6, 8, -1], dtype=torch.int64, device="cuda"
+            ),
         )
         backend.topk = 0
         backend.speculative_num_steps = 0
         backend.is_dspark_draft = False
-        out_cache_loc = torch.tensor([3, 4], dtype=torch.int64)
+        out_cache_loc = torch.tensor([3, 4, -1], dtype=torch.int64, device="cuda")
         forward_batch = SimpleNamespace(
             out_cache_loc=out_cache_loc,
             forward_mode=ForwardMode.DRAFT_EXTEND_V2,
             batch_size=2,
         )
 
-        backend.init_forward_metadata_in_graph(forward_batch)
+        with model_capture_mode():
+            # Match the production backend: compile during warmup, then capture
+            # the generated kernel in the outer CUDA graph.
+            backend.init_forward_metadata_in_graph(forward_batch)
+            torch.cuda.synchronize()
 
-        translate_int32.assert_called_once_with(out_cache_loc)
-        self.assertIs(
-            backend.forward_metadata.core_attn_metadata.swa_out_cache_loc,
-            translated,
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                backend.init_forward_metadata_in_graph(forward_batch)
+
+        translated = backend.forward_metadata.core_attn_metadata.swa_out_cache_loc
+        output_ptr = translated.data_ptr()
+        backend.token_to_kv_pool.full_to_swa_index_mapping.copy_(
+            torch.tensor([10, 12, 14, 16, 18, -1], dtype=torch.int64, device="cuda")
+        )
+        out_cache_loc.copy_(torch.tensor([4, 3, -1], dtype=torch.int64, device="cuda"))
+        graph.replay()
+
+        self.assertEqual(translated.dtype, torch.int32)
+        self.assertEqual(translated.data_ptr(), output_ptr)
+        self.assertTrue(
+            torch.equal(
+                translated,
+                torch.tensor([18, 16, -1], dtype=torch.int32, device="cuda"),
+            )
         )
 
 
