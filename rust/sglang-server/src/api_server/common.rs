@@ -161,6 +161,7 @@ fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>
         "tokenizer_path": server_args.tokenizer_path,
         "max_context_length": server_args.model_config.context_len,
         "max_total_num_tokens": server_args.max_total_num_tokens,
+        "max_total_num_tokens_per_dcp_rank": server_args.max_total_num_tokens_per_dcp_rank,
         "version": server_args.version,
         "internal_states": [serde_json::Value::Object(state_out)],
     });
@@ -201,8 +202,15 @@ mod tests {
         let mut msgpack = Vec::new();
         rmpv::encode::write_value(&mut msgpack, &outer).unwrap();
 
-        let sa =
-            ServerArgs::from_json(r#"{"model_path": "/m", "api_key": "secret-token"}"#).unwrap();
+        let sa = ServerArgs::from_json(
+            r#"{
+                "model_path": "/m",
+                "api_key": "secret-token",
+                "max_total_num_tokens": 4096,
+                "max_total_num_tokens_per_dcp_rank": 1024
+            }"#,
+        )
+        .unwrap();
         let out = shape_server_info(&msgpack, &sa).unwrap();
         let text = String::from_utf8(out.clone()).unwrap();
         // No secret leaks anywhere in the serialized response.
@@ -224,5 +232,7 @@ mod tests {
         assert!(state0.get("api_key").is_none());
         // Curated top-level config comes from typed accessors, not the dump.
         assert_eq!(v["model_path"], "/m");
+        assert_eq!(v["max_total_num_tokens"], 4096);
+        assert_eq!(v["max_total_num_tokens_per_dcp_rank"], 1024);
     }
 }

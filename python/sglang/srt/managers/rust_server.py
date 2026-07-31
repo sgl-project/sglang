@@ -369,7 +369,10 @@ class RustServer:
         server_args["num_reserved_tokens"] = compute_num_reserved_tokens(
             scheduler.server_args
         )
-        server_args["max_total_num_tokens"] = scheduler.max_total_num_tokens
+        server_args["max_total_num_tokens"] = scheduler.logical_max_total_num_tokens
+        server_args["max_total_num_tokens_per_dcp_rank"] = (
+            scheduler.max_total_num_tokens_per_dcp_rank
+        )
 
         return msgspec.json.encode(server_args, enc_hook=str).decode("utf-8")
 

@@ -1628,6 +1628,7 @@ class Scheduler(
         result_dict = {
             "status": "ready",
             "max_total_num_tokens": self.logical_max_total_num_tokens,
+            "max_total_num_tokens_per_dcp_rank": self.max_total_num_tokens_per_dcp_rank,
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
         }
@@ -4192,6 +4193,7 @@ class Scheduler(
             kv_cache_gb=self.token_to_kv_pool_allocator.get_kvcache().mem_usage,
             startup_available_gb=self.startup_available_gpu_memory_gb,
             token_capacity=self.logical_max_total_num_tokens,
+            token_capacity_per_dcp_rank=self.max_total_num_tokens_per_dcp_rank,
             token_capacity_swa=self.swa_tokens_per_layer,
             target_graph_memory_usage=self.tp_worker.graph_memory_usage,
             draft_graph_memory_usage=draft_graph_memory_usage,

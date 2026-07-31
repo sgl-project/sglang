@@ -151,10 +151,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             paged_input_len = -(-input_len // page_size) * page_size
             self.assertEqual(
                 self._init_and_check(scheduler, req),
-                max_total_num_tokens * dcp_size
-                - paged_input_len
-                - page_size
-                - 1,
+                max_total_num_tokens * dcp_size - paged_input_len - page_size - 1,
             )
 
     def test_min_new_tokens_clamped_to_limit(self):
