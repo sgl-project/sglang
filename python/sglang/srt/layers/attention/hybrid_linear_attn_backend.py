@@ -927,7 +927,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     @property
     def verify_mask(self) -> Optional[VerifyMask]:
-        # The scratch lives on the full-attn child; the linear side reads no mask.
+        # The mask lives on the full-attn child; the linear side reads none.
         return self.full_attn_backend.verify_mask
 
     def update_verify_buffers_to_fill_after_draft(

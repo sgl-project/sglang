@@ -1510,8 +1510,7 @@ class DeepseekV4AttnBackend(
         self.draft_extend_num_tokens_per_req = (
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
-        # Verify metadata never extracts the mask, but the tree kernel still
-        # writes it. No skip_prefill notion here.
+        # Verify metadata never extracts the mask. No skip_prefill notion here.
         self._verify_mask = maybe_create_verify_mask(
             is_draft_runner=self.is_draft_runner,
             skip_prefill=False,

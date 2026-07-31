@@ -75,9 +75,7 @@ class TestVerifyMaskCapacity(CustomTestCase):
         self.assertFalse(mask.fits(_MAX_BS + 1, _DRAFT))
 
     def test_full_mask_always_fits(self):
-        """FULL_MASK is exempt: its bound needs a max_context_len that composite
-        backends do not carry, so it keeps its pre-existing unconditional reuse
-        -- including the overflow that reuse can still hit past max_bs."""
+        """FULL_MASK is exempt from the check -- see fits()."""
         mask = VerifyMask(
             buffer=torch.zeros(8, dtype=torch.bool), mode=TreeMaskMode.FULL_MASK
         )
@@ -156,8 +154,7 @@ class TestHybridAttnBackendHandsOutSelectedChildMask(CustomTestCase):
 
 class TestTreeMaskNumel(CustomTestCase):
     def test_rejects_layouts_it_cannot_size(self):
-        """Falling through to FULL_MASK would over-allocate a packed layout by
-        orders of magnitude instead of failing."""
+        """A packed layout must raise, not silently take FULL_MASK's size."""
         with self.assertRaises(NotImplementedError):
             tree_mask_numel(
                 TreeMaskMode.QLEN_ONLY_BITPACKING, 1, _DRAFT, _MAX_CONTEXT_LEN

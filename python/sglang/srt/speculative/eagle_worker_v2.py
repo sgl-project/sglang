@@ -1239,8 +1239,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         attn_backend = self._target_worker.model_runner.attn_backend
         verify_mask = attn_backend.verify_mask
-        # This 1-node tree is one token per request, and every position is
-        # visible, so an all-True fill is correct under either layout.
+        # Every position in a 1-node tree is visible, so an all-True fill is
+        # correct under either layout.
         if verify_mask is not None and verify_mask.fits(bs, 1):
             custom_mask = verify_mask.buffer
             custom_mask.fill_(True)

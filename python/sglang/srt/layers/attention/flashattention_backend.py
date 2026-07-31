@@ -180,7 +180,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.max_context_len + self.page_size - 1
         ) // self.page_size
         # Page table is built on-device (build_trtllm_mha_page_table) and the
-        # tree-mask scratch is preallocated (see VerifyMask), so no
+        # tree mask is preallocated (see VerifyMask), so no
         # seq_lens_cpu / seq_lens_sum D2H sync is ever needed.
         self.needs_cpu_seq_lens = False
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
