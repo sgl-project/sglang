@@ -1228,6 +1228,23 @@ class TritonAttnBackend(AttentionBackend):
         # dcp_size) through the masked path so each rank only stores the tokens
         # it owns. Non-DCP keeps the original write loc and plain set_kv_buffer.
         if self.dcp_size > 1:
+            if self.use_mla:
+                # The MLA pool's set_kv_buffer owner-filters by `loc % dcp_size`
+                # but never divides, and the hybrid pool drops `dcp_kv_mask` on
+                # its MLA branch -- so the pre-divided loc below would be
+                # filtered a SECOND time, leaving each rank holding ~1/dcp_size
+                # of the wrong tokens (damage grows with dcp_size). The
+                # set_mla_kv_buffer kernel is DCP-aware end to end (owner filter
+                # AND `loc // dcp_size`), so hand it the RAW virtual loc and the
+                # latent split into nope/rope.
+                kv_lora_rank = v.shape[-1]
+                self.token_to_kv_pool.set_mla_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k[..., :kv_lora_rank],
+                    k[..., kv_lora_rank:],
+                )
+                return
             loc = forward_batch.out_cache_loc // self.dcp_size
             if (
                 forward_batch.positions is not None

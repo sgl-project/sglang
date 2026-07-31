@@ -396,31 +396,52 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
         prefill_backend, decode_backend = attention_backends_of(server_args)
         if decode_backend == "aiter":
             # aiter DCP decode uses the gluon MLA kernel (tiles query heads, so it
-            # serves K3's non-pow2 gathered head count) and merges partials with
-            # the aiter-native AllGather+ReduceScatter reduction
-            # (cp_lse_ag_out_rs_mla), NOT the CUDA a2a/fi_a2a exchange. The head-dim
-            # Q all-gather is required, so replicated Q projection stays off.
+            # serves K3's non-pow2 gathered head count) and merges partials across
+            # ranks. The default merge is the AllGather+ReduceScatter reduction
+            # (cp_lse_ag_out_rs_mla, dcp_comm_backend='ag_rs'), which needs the
+            # head-dim Q all-gather so replicated Q projection stays off.
+            #
+            # dcp_comm_backend may be set to 'a2a' via --dcp-comm-backend a2a: the
+            # MLA decode path then merges via dcp_a2a_lse_reduce (all_to_all_single)
+            # instead of ag_rs. This avoids the ag_rs reduce_scatter's grouped
+            # self-send/self-recv RCCL path, which deadlocks under high-concurrency
+            # CUDA-graph replay on ROCm (see sgl-project/sglang#32831); the a2a
+            # exchange is the workaround for that wedge at dcp_size 8.
             #
             # Prefill defaults to aiter (gluon absorb-prefill), but may be set to
-            # triton via --prefill-attention-backend triton: triton has an
-            # efficient native DCP MLA extend (_forward_extend_dcp via the MHA
-            # path, K3's proven-correct path) that avoids the slow gluon absorb
-            # prefill at long inputs. Both write the same latent KV that the aiter
-            # gluon DCP decode reads (K3 MLA is NoPE, so no rope mismatch), so the
-            # mixed backend is KV-compatible.
+            # triton via --prefill-attention-backend triton, which is ~7x faster
+            # at long inputs. Triton dispatches extend two ways: a zero-prefix
+            # batch takes the MHA path (per-head K/V up-projected in hand, plain
+            # local causal attention -- DCP contributes nothing there), while ANY
+            # non-zero prefix (chunked prefill, or a radix hit) sends the whole
+            # batch down the absorbed MLA path into _forward_extend_dcp, which
+            # attends this rank's KV shard over the gathered query heads and
+            # merges the partials with cp_lse_ag_out_rs_mha. Both paths write the
+            # same latent KV that the aiter gluon DCP decode reads (K3 MLA is
+            # NoPE, so no rope mismatch), so the mixed backend is KV-compatible.
             prefill_ab = "triton" if prefill_backend == "triton" else "aiter"
+            dcp_comm = (
+                server_args.dcp_comm_backend
+                if server_args.dcp_comm_backend in ("a2a", "fi_a2a")
+                else "ag_rs"
+            )
             logger.info(
                 "Kimi-K3 DCP uses aiter gluon MLA decode: "
                 f"prefill={prefill_backend!r} -> {prefill_ab!r}, "
-                f"decode={decode_backend!r} -> 'aiter' (dcp_comm_backend -> 'ag_rs')."
+                f"decode={decode_backend!r} -> 'aiter' (dcp_comm_backend -> {dcp_comm!r})."
             )
             overrides.update(
                 prefill_attention_backend=prefill_ab,
                 decode_attention_backend="aiter",
-                dcp_comm_backend="ag_rs",
+                dcp_comm_backend=dcp_comm,
             )
+            # ag_rs needs the head-dim Q all-gather, so replicated Q stays off.
+            # a2a/fi_a2a instead project the full-head Q locally (replicated Q on):
+            # this removes the decode-path Q all-gather entirely, leaving only the
+            # a2a output exchange — another grouped-collective site that can wedge
+            # under high-concurrency CUDA-graph replay on ROCm.
             if server_args.dcp_replicate_q_proj is None:
-                overrides["dcp_replicate_q_proj"] = False
+                overrides["dcp_replicate_q_proj"] = dcp_comm in ("a2a", "fi_a2a")
             return overrides
         if decode_backend == "cutedsl_mla" or decode_backend is None:
             _require_kimi_k3_cutedsl_dcp_support()
