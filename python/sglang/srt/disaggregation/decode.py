@@ -1789,7 +1789,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and self._radix_full_available() < required_alloc_tokens
         ):
             num_to_evict = required_alloc_tokens - self._radix_full_available()
-            result = self.tree_cache.evict(EvictParams(num_tokens=num_to_evict))
+            result = self.tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=num_to_evict)
+            )
             if self._radix_full_available() < required_alloc_tokens:
                 logger.warning(
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
