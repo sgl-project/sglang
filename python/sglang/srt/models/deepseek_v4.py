@@ -1751,7 +1751,7 @@ class MQALayer(MqaAttentionBase):
                 bias=None,
                 group_sizes=(0, 0, 32),
                 x1_scale=o_scale.view(torch.float8_e8m0fnu),
-                x2_scale=self.wo_a.weight_scale.view(torch.float8_e8m0fnu),
+                x2_scale=self.wo_a.weight_scale_inv.view(torch.float8_e8m0fnu),
                 perm_x1=(1, 0, 2),
                 perm_x2=(0, 1, 2),
                 perm_y=(1, 0, 2),
@@ -3633,7 +3633,13 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if not _FP8_WO_A_GEMM:
+        # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
+        # while the layer allocated an FP8 parameter (or vice versa) fails the
+        # weight loader's dtype check.
+        if not (
+            _FP8_WO_A_GEMM
+            or _use_npu_a5_mxfp8_wo_a(self.quant_config)
+        ):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
