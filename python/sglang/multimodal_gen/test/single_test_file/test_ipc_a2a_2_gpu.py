@@ -90,6 +90,44 @@ def _worker() -> int:
         if not torch.equal(nccl_out, ipc_out):
             failures.append(f"output a2a {(b, s_local, h_global, d)}")
 
+    # AllToAll4D is a second entry point (stacked-qkv UlyssesAttention: zimage's
+    # secondary attention, wan-VSA, hunyuanvideo) and routes through the same
+    # exchange, so it needs its own parity check.
+    from sglang.multimodal_gen.runtime.distributed.communication_op import (
+        sequence_model_parallel_all_to_all_4D as all_to_all_4D,
+    )
+
+    for b, s_local, h_global, d in shapes:
+        torch.manual_seed(4321)
+        for scatter_dim in (1, 2):
+            if scatter_dim == 2:
+                x = torch.randn(
+                    b, s_local, h_global, d, dtype=torch.bfloat16, device="cuda"
+                )
+            else:
+                x = torch.randn(
+                    b,
+                    s_local * _WORLD,
+                    h_global // _WORLD,
+                    d,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+            envs.SGLANG_DIFFUSION_IPC_A2A = False
+            nccl = all_to_all_4D(x, scatter_dim=scatter_dim, gather_dim=3 - scatter_dim)
+            envs.SGLANG_DIFFUSION_IPC_A2A = True
+            ipc = all_to_all_4D(x, scatter_dim=scatter_dim, gather_dim=3 - scatter_dim)
+            envs.SGLANG_DIFFUSION_IPC_A2A = False
+            if nccl.shape != ipc.shape:
+                failures.append(
+                    f"a2a4d scatter={scatter_dim} shape {tuple(nccl.shape)} != "
+                    f"{tuple(ipc.shape)} for {(b, s_local, h_global, d)}"
+                )
+            elif not torch.equal(nccl, ipc):
+                failures.append(
+                    f"a2a4d scatter={scatter_dim} {(b, s_local, h_global, d)}"
+                )
+
     # the transport must survive a shape it has never staged before, and the
     # eviction that a capped cache performs
     envs.SGLANG_DIFFUSION_IPC_A2A = True
