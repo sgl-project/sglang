@@ -84,7 +84,9 @@ class SparseKVCacheManager:
             enable=enable_memory_saver
         )
 
-        self.size = req_to_token_pool.size
+        # Include the padding row because real request IDs can equal the
+        # configured capacity when row 0 is reserved for graph padding.
+        self.size = int(req_to_token_pool.req_to_token.shape[0])
         self.max_context_len = req_to_token_pool.max_context_len
         self.sparse_context_len = 2048
         self.device = req_to_token_pool.device
