@@ -187,6 +187,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_ATTENTION_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_ATTENTION_BACKEND"
     ),
+    # Opt-in to MXFP8 Flash Attention quantization on top of an MXFP8 linear
+    # weight quant config. Applies to both online ``MXFP8Config`` and offline
+    # ``ModelSlimConfig`` (W8A8_MXFP8): without the flag only the linear weights
+    # are quantized (W8A8 scenario); with it Q/K/V also get online QR rotation
+    # + dynamic MX quant before FA (W8A8 + FA FP8 scenario).
+    "SGLANG_DIFFUSION_FA_MXFP8": _lazy_bool("SGLANG_DIFFUSION_FA_MXFP8"),
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work
     "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(

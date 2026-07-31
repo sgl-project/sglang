@@ -731,7 +731,8 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
 
 For online MXFP8 quantization, load the original FP16/BF16 model and add `--quantization mxfp8`.
 Weights are quantized at load time via `npu_dynamic_mx_quant`, and activations are quantized per-token
-during inference with `npu_quant_matmul` (block_size=32).
+during inference with `npu_quant_matmul` (block_size=32). This is **W8A8** (linear-only): attention
+still runs on standard FA.
 
 ```bash
 sglang generate \
@@ -743,11 +744,29 @@ sglang generate \
 
 > **Hardware requirement:** Ascend A5 series or newer. `npu_dynamic_mx_quant` is not available on A2/A3.
 
+### MXFP8 Flash Attention (opt-in)
+
+To additionally quantize self-attention Q/K/V and run FA v2 on top of the MXFP8 linear weights
+(W8A8 + FA FP8), set `SGLANG_DIFFUSION_FA_MXFP8=1`. Without it, only the linear layers are quantized
+and attention stays on standard FA.
+
+```bash
+SGLANG_DIFFUSION_FA_MXFP8=1 sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --quantization mxfp8 \
+  --prompt "a fox walking through neon rain" \
+  --save-output
+```
+
+- The same flag works for offline msmodelslim (`W8A8_MXFP8`) checkpoints — no `--quantization` flag needed there.
+- Only self-attention uses the MXFP8 FA path; cross-attention always uses standard FA.
+- Tune sub-head splitting with `USE_SUB_HEAD` (default `5`) when the head count is large.
+
 ## MXFP8 Offline Quantization (msmodelslim)
 
 Pre-quantized MXFP8 weights exported by msmodelslim are auto-detected via `quant_model_description.json`
 (`W8A8_MXFP8` scheme). Use `wan_repack.py` to convert the quantized weights to Diffusers format,
-then load the converted model with `--model-path`:
+then load the converted model with `--model-path`. This is **W8A8** (linear-only).
 
 ```bash
 sglang generate \
@@ -755,6 +774,10 @@ sglang generate \
   --prompt "a beautiful sunset" \
   --save-output
 ```
+
+> To additionally run MXFP8 Q/K/V attention quant (FA v2) on this offline checkpoint, opt in with
+> `SGLANG_DIFFUSION_FA_MXFP8=1` — see [MXFP8 Flash Attention (opt-in)](#mxfp8-flash-attention-opt-in)
+> above.
 
 ## MXFP4 Online Quantization
 

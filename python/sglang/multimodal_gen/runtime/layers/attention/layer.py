@@ -73,6 +73,29 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 _VARLEN_FA_ENABLED = os.environ.get("SGLANG_VARLEN_FA", "1") != "0"
 
 
+def _resolve_quant_attn_backend(
+    extra_impl_args: dict,
+) -> AttentionBackendEnum | None:
+    """Return ``FA`` if *extra_impl_args* carries a quant config that needs it.
+
+    Delegates to :func:`ascend_fa.resolve_mx_fa_scheme` (single source of truth)
+    so online ``MXFP8Config`` and offline ``ModelSlimConfig`` route to the
+    Ascend FA backend when ``SGLANG_DIFFUSION_FA_MXFP8`` opts into FA MXFP8
+    quant. Imported lazily to avoid pulling the NPU backend (and ``torch_npu``)
+    into the attention layer module eagerly.
+    """
+    quant_config = extra_impl_args.get("quant_config")
+    if quant_config is None:
+        return None
+    from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+        resolve_mx_fa_scheme,
+    )
+
+    if resolve_mx_fa_scheme(quant_config) is not None:
+        return AttentionBackendEnum.FA
+    return None
+
+
 def build_varlen_mask_meta(
     key_mask: torch.Tensor,
 ) -> dict:
@@ -236,7 +259,10 @@ class UlyssesAttention(nn.Module):
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            selected_attention_backend=_resolve_quant_attn_backend(extra_impl_args),
         )
         impl_cls = attn_backend.get_impl_cls()
 
@@ -433,7 +459,10 @@ class LocalAttention(nn.Module):
 
         dtype = compute_dtype or get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            selected_attention_backend=_resolve_quant_attn_backend(extra_impl_args),
         )
         impl_cls = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
@@ -567,7 +596,10 @@ class USPAttention(nn.Module):
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            selected_attention_backend=_resolve_quant_attn_backend(extra_impl_args),
         )
         if get_ring_parallel_world_size() > 1:
             backend_enum = attn_backend.get_enum()

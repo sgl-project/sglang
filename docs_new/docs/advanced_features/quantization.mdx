@@ -926,7 +926,7 @@ SGLang-Diffusion supports MXFP8 quantization for diffusion models (such as Wan2.
 
 ### Online MXFP8
 
-Pass `--quantization mxfp8` to dynamically quantize FP16/BF16 transformer weights to MXFP8 at load time:
+Pass `--quantization mxfp8` to dynamically quantize FP16/BF16 transformer weights to MXFP8 at load time. This is **W8A8** (linear-only); attention stays on standard FA:
 
 ```bash
 sglang serve \
@@ -945,6 +945,12 @@ sglang generate \
   --prompt "a beautiful sunset" \
   --save-output
 ```
+
+> **MXFP8 Flash Attention (opt-in):** both paths above are W8A8 (linear-only). To additionally quantize
+> self-attention Q/K/V and run FA v2 (W8A8 + FA FP8) — for either online or offline checkpoints — prepend
+> `SGLANG_DIFFUSION_FA_MXFP8=1` (e.g. `SGLANG_DIFFUSION_FA_MXFP8=1 sglang serve ... --quantization mxfp8`).
+> Only self-attention uses the MXFP8 FA path; cross-attention always uses standard FA. See the
+> [Diffusion environment variables](../sglang-diffusion/environment_variables) page for details.
 
 For the full quantization + format conversion workflow and a complete list of supported schemes, see [Diffusion Quantization on Ascend NPU](../hardware-platforms/ascend-npus/ascend_npu_quantization#diffusion-model-quantization-on-ascend-npu) and [SGLang-Diffusion Quantization](../sglang-diffusion/quantization#modelslim).
 
