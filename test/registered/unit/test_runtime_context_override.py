@@ -164,6 +164,34 @@ class TestContextOverride(CustomTestCase):
         self.assertIs(rc.get_context().server_args, target)
         self.assertEqual(rc.get_schedule().page_size, 16)
 
+    def test_publish_records_role(self):
+        rc.publish(ServerArgs(model_path="dummy"), role="scheduler")
+        self.assertEqual(rc.publish_role(), "scheduler")
+
+    def test_legacy_shims_record_roles(self):
+        # Unit 2a: the legacy setters publish with their process role.
+        from sglang.srt.server_args import (
+            set_global_server_args_for_scheduler,
+            set_global_server_args_for_tokenizer,
+        )
+
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        self.assertEqual(rc.publish_role(), "scheduler")
+        set_global_server_args_for_tokenizer(ServerArgs(model_path="dummy"))
+        self.assertEqual(rc.publish_role(), "tokenizer")
+
+    def test_reset_clears_role(self):
+        rc.publish(ServerArgs(model_path="dummy"), role="test")
+        rc.reset_context()
+        self.assertIsNone(rc.publish_role())
+
+    def test_direct_install_clears_role(self):
+        # A role-less set_server_args (test overrides, draft-worker builds)
+        # must not inherit the previous lifecycle's role.
+        rc.publish(ServerArgs(model_path="dummy"), role="scheduler")
+        rc.get_context().set_server_args(ServerArgs(model_path="dummy"))
+        self.assertIsNone(rc.publish_role())
+
 
 if __name__ == "__main__":
     unittest.main()
