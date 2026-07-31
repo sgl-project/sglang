@@ -155,6 +155,38 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
 
 
+def validate_deepseek_v4_index_cache(server_args: ServerArgs, hf_config) -> None:
+    """Fail-fast on unsupported DeepSeek V4 IndexCache combinations."""
+    from sglang.srt.models.deepseek_common.utils import dsv4_index_cache_enabled
+
+    compress_ratios = getattr(hf_config, "compress_ratios", None)
+    if not compress_ratios:
+        return
+    index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+    index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
+
+    if not dsv4_index_cache_enabled(
+        compress_ratios, index_topk_freq, index_topk_pattern
+    ):
+        return
+
+    if server_args.enable_two_batch_overlap:
+        raise ValueError(
+            "--enable-two-batch-overlap is not supported with DeepSeek V4 "
+            "IndexCache (index_topk_freq > 1 or an index_topk_pattern with "
+            "shared layers): the TBO op path does not propagate raw top-k "
+            "across layer ops, so shared layers would run sparse attention "
+            "without indices. Disable one of them."
+        )
+
+    if server_args.pp_size > 1:
+        raise ValueError(
+            "Pipeline parallelism (pp_size > 1) is not supported with "
+            "DeepSeek V4 IndexCache: raw top-k is not passed across pipeline "
+            "stages. Disable one of them."
+        )
+
+
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
     if not server_args.enable_prefill_cp:

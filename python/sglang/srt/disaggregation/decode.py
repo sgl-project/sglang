@@ -479,6 +479,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
+
+        kv_args.dsv4_index_cache_layout_signature = None
+        kv_args.dsv4_index_cache_producer_layer_ids = None
+        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            from sglang.srt.models.deepseek_common.utils import (
+                compute_dsv4_index_cache_descriptor,
+            )
+
+            (
+                kv_args.dsv4_index_cache_layout_signature,
+                kv_args.dsv4_index_cache_producer_layer_ids,
+            ) = compute_dsv4_index_cache_descriptor(
+                self.scheduler.model_config.hf_config,
+                fp4_indexer_enabled=(
+                    self.scheduler.server_args.enable_deepseek_v4_fp4_indexer
+                ),
+                page_size=self.token_to_kv_pool.page_size,
+            )
+
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,

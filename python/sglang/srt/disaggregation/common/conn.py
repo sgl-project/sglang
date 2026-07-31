@@ -113,6 +113,10 @@ class PrefillServerInfo:
     required_dst_info_num: Optional[int] = None
     required_prefill_response_num: Optional[int] = None
 
+    # DeepSeek V4 IndexCache PD compatibility descriptor (agreed across all P ranks)
+    dsv4_index_cache_layout_signature: Optional[str] = None
+    dsv4_index_cache_producer_layer_ids: Optional[List[int]] = None
+
     def __post_init__(self):
         self.attn_tp_size = int(self.attn_tp_size)
         self.attn_cp_size = int(self.attn_cp_size)
@@ -469,7 +473,11 @@ class CommonKVManager(BaseKVManager):
 
         info: PrefillServerInfo = None
         try:
-            url = f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
+            url = (
+                f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}"
+                f"&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
+                f"&dsv4_indexcache_desc=1"
+            )
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
@@ -499,6 +507,26 @@ class CommonKVManager(BaseKVManager):
                 f"KV cache dtype mismatch: prefill server has kv_cache_dtype={info.kv_cache_dtype}, "
                 f"but decode server has kv_cache_dtype={get_model().kv_cache_dtype}. "
                 f"Both servers must use the same --kv-cache-dtype value."
+            )
+
+        decode_sig = self.kv_args.dsv4_index_cache_layout_signature
+        if (
+            info.dsv4_index_cache_layout_signature is not None
+            and decode_sig is not None
+        ):
+            from sglang.srt.models.deepseek_common.utils import (
+                validate_dsv4_index_cache_pd_compatibility,
+            )
+
+            validate_dsv4_index_cache_pd_compatibility(
+                prefill_layout_signature=info.dsv4_index_cache_layout_signature,
+                prefill_producer_layer_ids=(
+                    info.dsv4_index_cache_producer_layer_ids or []
+                ),
+                decode_layout_signature=decode_sig,
+                decode_producer_layer_ids=(
+                    self.kv_args.dsv4_index_cache_producer_layer_ids or []
+                ),
             )
 
         self._resolve_rank_mapping(info)
@@ -659,6 +687,12 @@ class CommonKVManager(BaseKVManager):
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
             "prefill_http_port": self.server_args.port,
+            "dsv4_index_cache_layout_signature": (
+                self.kv_args.dsv4_index_cache_layout_signature
+            ),
+            "dsv4_index_cache_producer_layer_ids": (
+                self.kv_args.dsv4_index_cache_producer_layer_ids
+            ),
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
@@ -668,10 +702,18 @@ class CommonKVManager(BaseKVManager):
                 if response.status_code == 200:
                     logger.debug("Prefill successfully registered to bootstrap server.")
                     return
+                # A 4xx is a permanent config error (e.g. a DSV4 IndexCache
+                # descriptor mismatch across prefill ranks); retrying cannot
+                # help and would degrade to a silent never-ready hang.
+                if 400 <= response.status_code < 500:
+                    raise RuntimeError(
+                        "Prefill failed to register to bootstrap server "
+                        f"(status {response.status_code}): {response.text}"
+                    )
                 logger.warning(
                     f"Prefill register attempt {attempt + 1}/{max_retries} failed: status {response.status_code}"
                 )
-            except Exception as e:
+            except requests.RequestException as e:
                 # Walk to root cause to skip misleading urllib3 wrapper messages
                 cause = e
                 while cause.__cause__ is not None:
@@ -1479,6 +1521,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
+        self.dsv4_index_cache_layout_signature: Optional[str] = None
+        self.dsv4_index_cache_producer_layer_ids: Optional[List[int]] = None
+        self._dsv4_descriptor_seen: bool = False
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
@@ -1548,6 +1593,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
+        dsv4_sig = data.get("dsv4_index_cache_layout_signature")
+        dsv4_producers = data.get("dsv4_index_cache_producer_layer_ids")
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1569,6 +1616,49 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
+
+        if self._dsv4_descriptor_seen and dsv4_sig is None:
+            return web.Response(
+                text=(
+                    "DSV4 IndexCache descriptor missing on a prefill rank while "
+                    "other ranks reported one; all prefill ranks must run the "
+                    "same code/config."
+                ),
+                status=400,
+            )
+        if dsv4_sig is not None:
+            if not self._dsv4_descriptor_seen:
+                if self._registered_count > 0:
+                    return web.Response(
+                        text=(
+                            "DSV4 IndexCache descriptor reported by a prefill "
+                            "rank after other ranks registered without one; all "
+                            "prefill ranks must run the same code/config."
+                        ),
+                        status=400,
+                    )
+                self._dsv4_descriptor_seen = True
+                self.dsv4_index_cache_layout_signature = dsv4_sig
+                self.dsv4_index_cache_producer_layer_ids = dsv4_producers
+            elif dsv4_sig != self.dsv4_index_cache_layout_signature:
+                return web.Response(
+                    text=(
+                        "DSV4 IndexCache layout_signature mismatch across "
+                        f"prefill ranks: stored="
+                        f"{self.dsv4_index_cache_layout_signature}, got={dsv4_sig}"
+                    ),
+                    status=400,
+                )
+            elif dsv4_producers != self.dsv4_index_cache_producer_layer_ids:
+                return web.Response(
+                    text=(
+                        "DSV4 IndexCache producer_layer_ids mismatch across "
+                        f"prefill ranks: stored="
+                        f"{self.dsv4_index_cache_producer_layer_ids}, "
+                        f"got={dsv4_producers}"
+                    ),
+                    status=400,
+                )
 
         if self.follow_bootstrap_room is None:
             load_balance_method = data.get(
@@ -1612,6 +1702,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         prefill_cp_rank = request.query.get("prefill_cp_rank")
         target_tp_rank = request.query.get("target_tp_rank")
         target_pp_rank = request.query.get("target_pp_rank")
+        wants_dsv4_descriptor = request.query.get("dsv4_indexcache_desc") == "1"
         if (
             not prefill_dp_rank
             or not prefill_cp_rank
@@ -1646,8 +1737,18 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
+                dsv4_index_cache_layout_signature=(
+                    self.dsv4_index_cache_layout_signature
+                ),
+                dsv4_index_cache_producer_layer_ids=(
+                    self.dsv4_index_cache_producer_layer_ids
+                ),
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            payload = dataclasses.asdict(info)
+            if not wants_dsv4_descriptor:
+                payload.pop("dsv4_index_cache_layout_signature", None)
+                payload.pop("dsv4_index_cache_producer_layer_ids", None)
+            return web.json_response(payload, status=200)
 
         if not self._is_ready():
             return web.Response(

@@ -251,11 +251,27 @@ class PrefillBootstrapQueue:
             req_to_token_pool=req_to_token_pool,
         )
 
+        kv_args.dsv4_index_cache_layout_signature = None
+        kv_args.dsv4_index_cache_producer_layer_ids = None
         if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
             # V4's KVCache is organized by compression-ratio
             # buckets rather than by layer.
             kv_args.mla_compression_ratios = list(
                 self.token_to_kv_pool.compression_ratios
+            )
+            from sglang.srt.models.deepseek_common.utils import (
+                compute_dsv4_index_cache_descriptor,
+            )
+
+            (
+                kv_args.dsv4_index_cache_layout_signature,
+                kv_args.dsv4_index_cache_producer_layer_ids,
+            ) = compute_dsv4_index_cache_descriptor(
+                self.scheduler.model_config.hf_config,
+                fp4_indexer_enabled=(
+                    self.scheduler.server_args.enable_deepseek_v4_fp4_indexer
+                ),
+                page_size=self.token_to_kv_pool.page_size,
             )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)

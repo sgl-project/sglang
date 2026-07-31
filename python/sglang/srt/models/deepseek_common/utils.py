@@ -13,7 +13,7 @@
 # ==============================================================================
 import logging
 import math
-from typing import Optional
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -70,6 +70,169 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "ascend",
     "intel_xpu",
 ]
+
+
+def get_dsv4_c4_layer_ids(compress_ratios: Iterable[int]) -> List[int]:
+    return [idx for idx, ratio in enumerate(compress_ratios) if ratio == 4]
+
+
+def compute_dsv4_index_topk_flags(
+    compress_ratios: List[int],
+    layer_id: int,
+    index_topk_freq: int = 1,
+    index_topk_pattern: Optional[Union[str, List[str]]] = None,
+) -> Tuple[bool, bool]:
+    if index_topk_freq is None:
+        index_topk_freq = 1
+    if (
+        isinstance(index_topk_freq, bool)
+        or not isinstance(index_topk_freq, int)
+        or index_topk_freq <= 0
+    ):
+        raise ValueError(
+            f"index_topk_freq must be a positive integer, got {index_topk_freq}"
+        )
+    c4_layer_ids = get_dsv4_c4_layer_ids(compress_ratios)
+    c4_layer_rank = c4_layer_ids.index(layer_id)
+
+    if index_topk_pattern is None:
+        skip_topk = c4_layer_rank % index_topk_freq != 0
+        next_skip_topk = (
+            c4_layer_rank + 1 < len(c4_layer_ids)
+            and (c4_layer_rank + 1) % index_topk_freq != 0
+        )
+        return skip_topk, next_skip_topk
+
+    if isinstance(index_topk_pattern, str):
+        index_topk_pattern = list(index_topk_pattern)
+    invalid_pattern_values = set(index_topk_pattern) - {"F", "S"}
+    if invalid_pattern_values:
+        raise ValueError(
+            "index_topk_pattern only supports 'F' for full indexer "
+            f"layers and 'S' for shared layers, got "
+            f"{sorted(invalid_pattern_values)}"
+        )
+    if len(index_topk_pattern) == len(compress_ratios):
+        pattern_idx = layer_id
+        has_next_pattern = c4_layer_rank < len(c4_layer_ids) - 1
+        next_pattern_idx = c4_layer_ids[c4_layer_rank + 1] if has_next_pattern else None
+    elif len(index_topk_pattern) == len(c4_layer_ids):
+        pattern_idx = c4_layer_rank
+        has_next_pattern = c4_layer_rank < len(c4_layer_ids) - 1
+        next_pattern_idx = c4_layer_rank + 1 if has_next_pattern else None
+    else:
+        raise ValueError(
+            "index_topk_pattern length must either match "
+            f"num_hidden_layers ({len(compress_ratios)}) or "
+            f"the number of C4 layers ({len(c4_layer_ids)}), got "
+            f"{len(index_topk_pattern)}"
+        )
+
+    skip_topk = index_topk_pattern[pattern_idx] == "S"
+    if c4_layer_rank == 0 and skip_topk:
+        raise ValueError(
+            "index_topk_pattern marks the first C4 layer as 'S' (shared), but "
+            "the first C4 layer must be 'F' (a full producer): there is no "
+            "prior producer whose raw top-k it could reuse. Set the first C4 "
+            f"layer to 'F'. (pattern={index_topk_pattern})"
+        )
+    next_skip_topk = (
+        index_topk_pattern[next_pattern_idx] == "S"
+        if next_pattern_idx is not None
+        else False
+    )
+    return skip_topk, next_skip_topk
+
+
+def compute_dsv4_index_topk_flags_for_all_c4_layers(
+    compress_ratios: List[int],
+    index_topk_freq: int = 1,
+    index_topk_pattern: Optional[Union[str, List[str]]] = None,
+) -> "dict[int, Tuple[bool, bool]]":
+    """Map each C4 layer id -> (skip_topk, next_skip_topk)."""
+    return {
+        layer_id: compute_dsv4_index_topk_flags(
+            compress_ratios, layer_id, index_topk_freq, index_topk_pattern
+        )
+        for layer_id in get_dsv4_c4_layer_ids(compress_ratios)
+    }
+
+
+def dsv4_index_cache_enabled(
+    compress_ratios: List[int],
+    index_topk_freq: int = 1,
+    index_topk_pattern: Optional[Union[str, List[str]]] = None,
+) -> bool:
+    flags = compute_dsv4_index_topk_flags_for_all_c4_layers(
+        compress_ratios, index_topk_freq, index_topk_pattern
+    )
+    return any(skip_topk for skip_topk, _ in flags.values())
+
+
+def dsv4_index_cache_producer_layer_ids(
+    compress_ratios: List[int],
+    index_topk_freq: int = 1,
+    index_topk_pattern: Optional[Union[str, List[str]]] = None,
+) -> List[int]:
+    flags = compute_dsv4_index_topk_flags_for_all_c4_layers(
+        compress_ratios, index_topk_freq, index_topk_pattern
+    )
+    return sorted(
+        layer_id for layer_id, (skip_topk, _) in flags.items() if not skip_topk
+    )
+
+
+def compute_dsv4_index_cache_descriptor(
+    hf_config,
+    *,
+    fp4_indexer_enabled: bool,
+    page_size: int,
+) -> "Tuple[str, List[int]]":
+    import hashlib
+    import json
+
+    compress_ratios = list(getattr(hf_config, "compress_ratios", None) or [])
+    index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+    index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
+
+    layout = {
+        "schema_version": 1,
+        "num_hidden_layers": hf_config.num_hidden_layers,
+        "compress_ratios": compress_ratios,
+        "index_topk": getattr(hf_config, "index_topk", 512),
+        "index_head_dim": getattr(hf_config, "index_head_dim", 128),
+        "index_n_heads": getattr(hf_config, "index_n_heads", 64),
+        "fp4_indexer_enabled": bool(fp4_indexer_enabled),
+        "page_size": page_size,
+    }
+    layout_signature = hashlib.sha256(
+        json.dumps(layout, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    producer_layer_ids = dsv4_index_cache_producer_layer_ids(
+        compress_ratios, index_topk_freq, index_topk_pattern
+    )
+    return layout_signature, producer_layer_ids
+
+
+def validate_dsv4_index_cache_pd_compatibility(
+    *,
+    prefill_layout_signature: str,
+    prefill_producer_layer_ids: List[int],
+    decode_layout_signature: str,
+    decode_producer_layer_ids: List[int],
+) -> None:
+    if prefill_layout_signature != decode_layout_signature:
+        raise RuntimeError(
+            "DSV4 IndexCache layout mismatch between prefill and decode: "
+            f"prefill={prefill_layout_signature} decode={decode_layout_signature}"
+        )
+    missing = set(decode_producer_layer_ids) - set(prefill_producer_layer_ids)
+    if missing:
+        raise RuntimeError(
+            "DSV4 IndexCache producer coverage violation: prefill does not "
+            f"provide required indexer cache for layers {sorted(missing)}. "
+            "A decode engine's producer set must be a subset of prefill's."
+        )
 
 
 def awq_dequantize_func():
