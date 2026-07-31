@@ -19,6 +19,7 @@ import unittest
 
 import torch
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.test.test_utils import CustomTestCase
 
 _WORLD = 2
@@ -192,6 +193,12 @@ def _worker() -> int:
 
 class TestIpcA2ATwoGpu(CustomTestCase):
     def test_ipc_matches_nccl_bitwise(self):
+        # CUDA only: the transport opens torch IPC handles through libcudart and
+        # cudaDeviceEnablePeerAccess. On ROCm/NPU it correctly refuses and both
+        # arms run over NCCL, which the evidence assertion below reads -- rightly
+        # -- as "the transport never engaged". That is unsupported, not broken.
+        if not current_platform.is_cuda():
+            self.skipTest("CUDA-IPC transport is unavailable on this platform")
         if torch.cuda.device_count() < _WORLD:
             self.skipTest(f"needs {_WORLD} GPUs")
         proc = subprocess.run(
