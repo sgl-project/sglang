@@ -125,7 +125,6 @@ def _time_kernel(batch_size: int, hot_buffer_size: int, miss_rate: float) -> flo
     def run_once():
         state["device_buffer_tokens"].copy_(state["initial_device_buffer_tokens"])
         state["lru_slots"].copy_(state["initial_lru_slots"])
-        state["top_k_device_locs"].fill_(-1)
         load_cache_to_device_buffer_mla(
             top_k_tokens=state["top_k_tokens"],
             device_buffer_tokens=state["device_buffer_tokens"],

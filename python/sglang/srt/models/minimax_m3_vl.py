@@ -42,6 +42,7 @@ from sglang.srt.models.minimax_vl_common import (
     load_vision_weight,
     merge_vit_qkv_weights,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -54,6 +55,15 @@ _device_sm = get_device_sm()
 
 
 class MiniMaxM3SparseForConditionalGeneration(nn.Module):
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={".block_sparse_moe.": ".mlp."}
+    )
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "index_qkv_proj": ["index_q_proj", "index_k_proj", "index_v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(
         self,
         config,
@@ -131,6 +141,14 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         disable_reason = None
         if not getattr(text_config, "n_shared_experts", None):
             disable_reason = "No shared experts are defined in the config."
+        elif (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "modelopt_mixed"
+        ):
+            disable_reason = (
+                "Shared and routed experts may use different quantization formats "
+                "in ModelOpt mixed-precision checkpoints."
+            )
         elif not _is_cuda:
             disable_reason = "Shared experts fusion currently requires CUDA devices."
         elif (_device_sm is not None) and (_device_sm < 80):
