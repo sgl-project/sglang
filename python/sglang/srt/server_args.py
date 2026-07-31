@@ -4203,8 +4203,32 @@ class ServerArgs:
         ):
             self.cuda_graph_backend_prefill = Backend.FULL
 
+    def _apply_kimi_hybrid_symm_mem_guard(self):
+        """Kimi hybrid models drop --enable-symm-mem unless capture is off
+        everywhere. Called from _handle_cuda_graph_config once the per-phase
+        backends are resolved; see disable_kimi_k3_symm_mem for why."""
+        if (
+            not self.enable_symm_mem
+            or parse_connector_type(self.model_path) == ConnectorType.INSTANCE
+        ):
+            return
+        arch = self.get_model_config().hf_config.architectures[0]
+        if arch in (
+            "KimiLinearForCausalLM",
+            "KimiK3ForConditionalGeneration",
+        ):
+            from sglang.srt.arg_groups.kimi_k3_hook import disable_kimi_k3_symm_mem
+
+            disable_kimi_k3_symm_mem(self)
+
     def _handle_cuda_graph_config(self):
         self._parse_cuda_graph_config()
+        # Between parse and the compat cascade: the resolved per-phase backends
+        # are readable here, and enable_symm_mem is still the raw request. Both
+        # the tc_piecewise compat rules below and the symm-pool prealloc default
+        # in _handle_gpu_memory_settings key off enable_symm_mem, so a model hook
+        # that reverses it must land before them.
+        self._apply_kimi_hybrid_symm_mem_guard()
         self._apply_cuda_graph_compatibility()
         self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()
