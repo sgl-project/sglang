@@ -599,7 +599,7 @@ export const Playground = ({ config }) => {
         };
       },
 
-      apply: ({ flags, env, value, fc, sel, h, derived }) => {
+      apply: ({ flags, env, value, fc, h, derived }) => {
         if (value.backend !== null) {
           flags = h.stripFlagsByFirstToken(flags, [
             "--moe-a2a-backend", "--moe-runner-backend",
@@ -804,7 +804,7 @@ export const Playground = ({ config }) => {
         return "current";
       },
 
-      apply: ({ flags, env, value, fc, h, derived }) => {
+      apply: ({ flags, env, value, fc, sel, h, derived }) => {
         if (value === "current") return { flags, env };
         // No-op when the pick already matches base (preserves flag position).
         if (derived && value === derived) return { flags, env };
