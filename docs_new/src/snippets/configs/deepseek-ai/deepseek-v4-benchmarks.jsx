@@ -245,7 +245,7 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
         ttft_ms: 726.81, tpot_ms: 8.84, tokens_per_sec_per_gpu: 2711 },
     ],
-    accuracy: { gsm8k_pct: 97.04 },
+    accuracy: { aime25_pct: 96.25, gsm8k_pct: 97.04 },
   },
   {
     match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
