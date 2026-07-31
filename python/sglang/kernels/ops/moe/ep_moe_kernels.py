@@ -1575,7 +1575,13 @@ def moe_ep_deepgemm_preprocess(
     assert len(block_shape) == 2
     block_n, block_k = block_shape[0], block_shape[1]
     is_fp8 = output_dtype == torch.float8_e4m3fn
-    if is_fp8 and use_mxfp8:
+    # Blackwell DeepGEMM consumes UE8M0 activation scales. Quantize the FP8
+    # values with that rounded scale directly; quantizing with an exact FP32
+    # scale and only rounding the scale afterward changes the represented
+    # activation by as much as 2x.
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    if is_fp8 and (use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0):
         from sglang.kernels.ops.quantization.minimax_quant_ue8m0 import (
             per_token_quant_fp8_ue8m0_scatter,
         )

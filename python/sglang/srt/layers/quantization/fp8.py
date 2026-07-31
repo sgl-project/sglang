@@ -1606,7 +1606,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
             from sglang.srt.layers import deep_gemm_wrapper
-            from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 
             # Check if MoE will actually use DeepGEMM runner
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
@@ -1680,21 +1679,35 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if not self.is_fp4_expert:
                 weight_block_size = self.quant_config.weight_block_size
-                if requant_block_scale_ue8m0_for_deepgemm(
-                    layer.w13_weight,
-                    layer.w13_weight_scale_inv,
-                    weight_block_size,
-                    use_deepgemm_runner=will_use_deepgemm,
+                for weight_name, weight, weight_scale in (
+                    (
+                        "w13_weight",
+                        layer.w13_weight,
+                        layer.w13_weight_scale_inv,
+                    ),
+                    ("w2_weight", layer.w2_weight, layer.w2_weight_scale_inv),
                 ):
-                    assert isinstance(
-                        layer, DeepEPMoE
-                    ), "DeepGemm MoE is only supported with DeepEPMoE"
                     requant_block_scale_ue8m0_for_deepgemm(
-                        layer.w2_weight,
-                        layer.w2_weight_scale_inv,
+                        weight,
+                        weight_scale,
                         weight_block_size,
-                        use_deepgemm_runner=True,
+                        use_deepgemm_runner=will_use_deepgemm,
+                        output_dtype=torch.bfloat16,
+                        weight_shape=weight.shape[-2:],
                     )
+                    if (
+                        will_use_deepgemm
+                        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                        and not getattr(weight_scale, "format_ue8m0", False)
+                    ):
+                        raise ValueError(
+                            "DeepGEMM MoE on Blackwell requires a supported "
+                            "128x128 block-FP8 weight shape and UE8M0 scales, "
+                            f"but {weight_name} has shape "
+                            f"{tuple(weight.shape[-2:])}, block size "
+                            f"{weight_block_size}. Choose another MoE runner "
+                            "backend for this tensor-parallel layout."
+                        )
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.mxfp8_block_convert import (
