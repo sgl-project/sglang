@@ -13,12 +13,13 @@ from sglang.test.kits.spec_server_kits import (
     SpecCorrectnessKit,
     SpecFeatureKit,
     SpecLogprobKit,
+    SpecMTBenchKit,
     SpecPenaltyKit,
     SpecPerfKit,
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=900, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestEagle3Fa3(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogprobKit):
@@ -26,6 +27,24 @@ class TestEagle3Fa3(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogprob
 
     attention_backend = "fa3"
     disable_overlap = False
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
+
+
+class TestEagle3Fa3Echo(SpecMTBenchKit, Eagle3Base):
+    """ECHO graph/eager parity on a two-turn MT-Bench smoke set."""
+
+    enable_deterministic_inference = True
+    spec_steps = 3
+    spec_topk = 3
+    spec_tokens = 6
+    mtbench_accept_len_thres = 1.1
+    attention_backend = "fa3"
+    disable_overlap = True
+    cuda_graph_max_bs_decode = 4
+    extra_args = (
+        "--speculative-echo-threshold",
+        "0.2",
+    )
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
