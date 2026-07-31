@@ -408,6 +408,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.stage.server_args = SimpleNamespace(
             enable_breakable_cuda_graph=False,
             enable_torch_compile=False,
+            dit_cuda_graph="off",
         )
         self.stage._bcg_runners = {}
         self.stage._cache_dit_enabled = False
