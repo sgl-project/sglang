@@ -34,6 +34,28 @@ def _make_kernel_without_flashinfer() -> FlashInferGDNKernel:
 
 
 class TestFlashInferGDNAlignment(unittest.TestCase):
+    def test_oakhaven_bs1_split_view_reproduces_under_alignment(self):
+        # Oakhaven TP16's generic projection packs [b_local(8) | a_local(8)]
+        # in BF16. The a view begins 16 bytes after the storage base. At BS=1
+        # PyTorch considers the strided view contiguous, so contiguous() is a
+        # no-op and cannot satisfy FlashInfer's stricter 32-byte ABI.
+        projected_ba = torch.empty((2, 16), dtype=torch.bfloat16)
+        _, a = projected_ba.split((8, 8), dim=-1)
+
+        a_bs1 = a[:1]
+        self.assertEqual(a_bs1.stride(), (16, 1))
+        self.assertTrue(a_bs1.is_contiguous())
+        self.assertEqual(a_bs1.data_ptr() % 32, 16)
+        self.assertEqual(a_bs1.contiguous().data_ptr(), a_bs1.data_ptr())
+
+        # BS>1 exposes the row gap, so contiguous() does allocate a rebased,
+        # allocator-aligned tensor. This explains why only BS=1 failed.
+        a_bs2 = a[:2]
+        self.assertFalse(a_bs2.is_contiguous())
+        repaired = a_bs2.contiguous()
+        self.assertNotEqual(repaired.data_ptr(), a_bs2.data_ptr())
+        self.assertEqual(repaired.data_ptr() % 32, 0)
+
     def test_dynamic_repair_buffer_is_reused_without_allocator_churn(self):
         kernel = _make_kernel_without_flashinfer()
         source = _view_with_pointer_mod((1, 1, 8), torch.bfloat16, 16)

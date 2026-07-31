@@ -641,7 +641,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and isinstance(projected_states_ba, torch.Tensor)
         )
         value_to_key_head_ratio = self.num_v_heads // self.num_k_heads
-        use_fused_contiguous_unpack = value_to_key_head_ratio in [1, 2, 4]
+        use_fused_contiguous_unpack = value_to_key_head_ratio in [1, 2, 4, 8]
         if use_fused_decode_proj_conv:
             # The GDN backend owns the indexed Conv1D state and therefore owns
             # the safe unpack+Conv fusion boundary. B/A are passed as temporary
@@ -671,17 +671,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             b = b.contiguous()
             a = a.contiguous()
-            if _is_cuda and forward_batch.forward_mode.is_decode():
-                # FlashInfer GDN requires each gate tensor to start at a
-                # 32-byte-aligned address. For TP-local configurations with
-                # eight value heads, ``a`` can be a view at a 16-byte offset,
-                # so contiguous() is a no-op despite the invalid address.
-                # Preserve the original generic split path and materialize
-                # only a view that actually violates the backend contract.
-                if b.data_ptr() % 32 != 0:
-                    b = b.clone(memory_format=torch.contiguous_format)
-                if a.data_ptr() % 32 != 0:
-                    a = a.clone(memory_format=torch.contiguous_format)
 
             query, key, value = map(
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
