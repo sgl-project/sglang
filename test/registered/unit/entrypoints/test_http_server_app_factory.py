@@ -26,6 +26,7 @@ from sglang.srt.entrypoints.http_server import (
     set_global_state,
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus
+from sglang.srt.observability import func_timer
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -78,6 +79,21 @@ class HttpServerAppFactoryTestBase(CustomTestCase):
         saved_global_state = get_global_state()
         self.addCleanup(set_global_state, saved_global_state)
         set_global_state(None)
+
+    def _use_temp_prometheus_multiproc_dir(self):
+        """Point prometheus at a throwaway directory for the current test."""
+        prometheus_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(prometheus_dir.cleanup)
+        saved_env = os.environ.get("PROMETHEUS_MULTIPROC_DIR")
+
+        def _restore_env():
+            if saved_env is None:
+                os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
+            else:
+                os.environ["PROMETHEUS_MULTIPROC_DIR"] = saved_env
+
+        self.addCleanup(_restore_env)
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_dir.name
 
 
 class TestBuildApp(HttpServerAppFactoryTestBase):
@@ -286,12 +302,58 @@ class TestFactoryAppWarmup(HttpServerAppFactoryTestBase):
 
 
 class TestFactoryAppMetrics(HttpServerAppFactoryTestBase):
+    def _reset_func_timer_registration(self):
+        """Run the test as if no function latency histogram existed yet.
+
+        The histogram is created once per process, so a test that ran earlier
+        may already have created it. This drops it for the duration of the
+        test and puts the original one back afterwards.
+        """
+        from prometheus_client import REGISTRY
+
+        saved_latency = func_timer.FUNC_LATENCY
+        saved_enable_metrics = func_timer.enable_metrics
+
+        def _restore():
+            if func_timer.FUNC_LATENCY is not None:
+                REGISTRY.unregister(func_timer.FUNC_LATENCY)
+            if saved_latency is not None:
+                REGISTRY.register(saved_latency)
+            func_timer.FUNC_LATENCY = saved_latency
+            func_timer.enable_metrics = saved_enable_metrics
+
+        self.addCleanup(_restore)
+        if saved_latency is not None:
+            REGISTRY.unregister(saved_latency)
+        func_timer.FUNC_LATENCY = None
+        func_timer.enable_metrics = False
+
     def test_build_app_twice_with_metrics_enabled(self):
         """Bug regression: the second build_app call with metrics enabled used
         to crash, because the HTTP tracking collectors were registered in the
         process wide prometheus registry once per call under fixed names."""
         build_app(_fake_server_args(enable_metrics=True))
         build_app(_fake_server_args(enable_metrics=True))
+
+    def test_enable_func_timer_twice_reuses_histogram(self):
+        """Bug regression: enabling metrics a second time in one process used
+        to crash. Every app started with metrics enabled calls
+        enable_func_timer, which created the sglang:func_latency_seconds
+        histogram again under a name prometheus already knew, and prometheus
+        rejects a second collector with the same name. The second call must
+        keep the histogram the first call created.
+        """
+        self._use_temp_prometheus_multiproc_dir()
+        self._reset_func_timer_registration()
+
+        func_timer.enable_func_timer()
+        first_histogram = func_timer.FUNC_LATENCY
+        self.assertIsNotNone(first_histogram)
+
+        func_timer.enable_func_timer()
+
+        self.assertIs(func_timer.FUNC_LATENCY, first_histogram)
+        self.assertTrue(func_timer.enable_metrics)
 
     def test_metrics_endpoint_served_by_built_app_not_module_app(self):
         """The lifespan must add the /metrics route to the app it is starting.
@@ -301,18 +363,7 @@ class TestFactoryAppMetrics(HttpServerAppFactoryTestBase):
         app returned 404 for /metrics and the module level app grew a stray
         route.
         """
-        prometheus_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(prometheus_dir.cleanup)
-        saved_env = os.environ.get("PROMETHEUS_MULTIPROC_DIR")
-
-        def _restore_env():
-            if saved_env is None:
-                os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
-            else:
-                os.environ["PROMETHEUS_MULTIPROC_DIR"] = saved_env
-
-        self.addCleanup(_restore_env)
-        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_dir.name
+        self._use_temp_prometheus_multiproc_dir()
 
         server_args = ServerArgs(
             model_path="dummy", skip_server_warmup=True, enable_metrics=True
