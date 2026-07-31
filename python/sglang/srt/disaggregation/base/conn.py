@@ -85,6 +85,16 @@ class KVArgs:
     total_kv_layers: int
 
 
+class KVTransferBarrierEscalation(RuntimeError):
+    """Raised when KV pages cannot be proven idle and must not be reused.
+
+    Deliberately distinct from a backend fault: the poll path contains ordinary
+    exceptions and releases the request, but this one has to reach the scheduler.
+    Restarting is the only way to reclaim these pages safely, and the scheduler's
+    top-level handler already turns an exception into engine teardown.
+    """
+
+
 class KVPoll:
     Failed = 0
     Bootstrapping = 1
@@ -178,6 +188,37 @@ class BaseKVSender(ABC):
         """
         pass
 
+    def advance_failure_quiescence(self) -> bool:
+        """
+        Drive this request's transfer ownership barrier and report progress.
+
+        Mooncake-style backends hand raw KV pointers to native code (RDMA, a
+        transfer executor, CUDA staging copies) that outlives the Python call
+        which started it. A request that becomes terminal while that work runs
+        would let the allocator hand the same pages to another request.
+
+        Called on every poll of a request that has failed, before the scheduler
+        is allowed to observe ``KVPoll.Failed``. The first call closes the
+        barrier -- no new transfer work may be admitted for this request -- and
+        each call returns ``True`` once no native work can still touch its KV
+        pages. Backends without out-of-band transfer work keep the default.
+
+        Implementations must be idempotent, must not block the scheduler loop,
+        and must be *bounded*: a transport or peer that never confirms
+        quiescence has to eventually return ``True`` rather than pinning the
+        request, and its pages, forever.
+        """
+        return True
+
+    def is_failure_quiescing(self) -> bool:
+        """
+        Whether this request's ownership barrier has been closed.
+
+        Once it has, the request is logically failed on every rank, so all of
+        them converge on releasing it together.
+        """
+        return False
+
 
 class BaseKVReceiver(ABC):
     @abstractmethod
@@ -236,6 +277,19 @@ class BaseKVReceiver(ABC):
         Abort the current transfer.
         """
         pass
+
+    def advance_failure_quiescence(self) -> bool:
+        """See ``BaseKVSender.advance_failure_quiescence``.
+
+        On the decode side the KV pages are the *destination* of the prefill's
+        writes, so quiescence additionally requires confirmation from every
+        prefill rank that was handed this request's page indices.
+        """
+        return True
+
+    def is_failure_quiescing(self) -> bool:
+        """See ``BaseKVSender.is_failure_quiescing``."""
+        return False
 
 
 class BaseKVBootstrapServer(ABC):

@@ -2705,19 +2705,26 @@ class Scheduler(
         prepare_abort(req, "Aborted")
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
-            req.pending_bootstrap = False
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Earlier chunks may already be in flight to the decode instance,
+            # which reads this request's KV pages directly. Park the request in
+            # the inflight queue instead of releasing here: that queue polls the
+            # sender and releases the pages once the transfer has quiesced.
+            req.disagg_kv_sender.abort()
+            # Its partial prefix must not enter the radix cache, matching the
+            # is_insert=False release this path used to do inline.
+            req.skip_radix_cache_insert = True
+            if req not in self.disagg_prefill_inflight_queue:
+                self.disagg_prefill_inflight_queue.append(req)
+        else:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
