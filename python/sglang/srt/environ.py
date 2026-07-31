@@ -697,6 +697,12 @@ class Envs:
     # SWA pool) instead of its full-attention slots. Needs draft window <= the
     # target's sliding window; ignored (with the reason logged) where it does not apply.
     SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV = EnvBool(True)
+    # Minimum denoise rows at which dLLM logits stay in lm_head dtype instead of
+    # being copied into the fp32 logits buffer. The copy is what caps the batch
+    # size; the reduction replacing it is launch-bound, so it only pays off once
+    # the rows amortize it. Unset takes the backend's measured crossover (512 on
+    # Ascend, never elsewhere); -1 keeps the fp32 path everywhere.
+    SGLANG_DLLM_KEEP_LOGITS_DTYPE_MIN_ROWS = EnvInt(None)
 
     # ===================================================================
     # Scheduler token budgeting and admission
