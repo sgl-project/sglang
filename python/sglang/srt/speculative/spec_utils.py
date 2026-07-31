@@ -869,7 +869,20 @@ def commit_mamba_states_after_verify(
         from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
             commit_gdn_replayssm_fold_after_verify,
         )
+        from sglang.srt.speculative.replayssm_commit_cuda_graph import (
+            commit_via_cuda_graph,
+        )
 
+        if commit_via_cuda_graph(
+            req_pool=req_pool,
+            batch=batch,
+            accept_lens=accept_lens,
+            accept_index=accept_index,
+            draft_token_num=draft_token_num,
+            track_interval=get_server_args().mamba_track_interval,
+            max_bs=req_pool.size,
+        ):
+            return
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
