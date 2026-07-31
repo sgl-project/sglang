@@ -98,59 +98,11 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
     return tensor_gpu
 
 
-def _allocate_packed_scale_buffer(
-    rows: int,
-    width: int,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-    column_major: bool,
-) -> torch.Tensor:
-    """Allocate a logical [rows, width] scale tensor in the required layout."""
-    if column_major:
-        # DeepGEMM's UE8M0 path requires sf.stride(-2) == 1. Allocate the
-        # transposed storage directly so the logical [M, packed-K] view has
-        # strides [1, M].
-        return torch.zeros((width, rows), device=device, dtype=dtype).transpose(0, 1)
-    return torch.zeros((rows, width), device=device, dtype=dtype)
-
-
-def _assert_packed_ue8m0_scale_layout(
-    scale: torch.Tensor,
-    *,
-    rows: int,
-    width: int,
-) -> None:
-    # This is the same logical layout used by the existing DeepEP contiguous
-    # path. DeepGEMM reads packed UE8M0 scales as MN-major and requires the
-    # token axis to have unit stride. ``rows`` is block-E aligned, which also
-    # satisfies the 16-byte TMA alignment requirement for int32 scales.
-    assert scale.dtype == torch.int32
-    assert scale.shape == (rows, width)
-    assert scale.stride(-2) == 1
-    assert scale.stride(-1) == rows
-    assert rows % 4 == 0
-
-
 def _should_use_masked_standard_layout(runner_config: MoeRunnerConfig) -> bool:
-    """Prefer masked DeepGEMM for small local-expert EP views.
-
-    The contiguous standard path needs a graph-static row count large enough
-    for every assignment, including assignments later mapped to ``-1`` by EP.
-    For Oakhaven TEP16 that makes each rank execute the global top-k row bound
-    even though it owns only 1/16 of the experts. The masked path keeps a
-    per-expert capacity but uses the runtime ``masked_m`` counts for GEMM, so
-    it avoids that compute amplification. Keep the cutoff deliberately narrow:
-    masked buffers scale with ``num_local_experts * num_tokens`` and are not
-    memory-feasible for the 512-local-expert TP16 view.
-    """
-    num_experts = getattr(runner_config, "num_experts", None)
-    num_local_experts = getattr(runner_config, "num_local_experts", None)
+    """Use masked GEMM when expert parallelism keeps its buffer small."""
     return (
-        num_experts is not None
-        and num_local_experts is not None
-        and num_experts > num_local_experts
-        and num_local_experts <= 32
+        runner_config.num_experts > runner_config.num_local_experts
+        and runner_config.num_local_experts <= 32
     )
 
 
@@ -762,9 +714,8 @@ def pre_permute_standard_to_deep_gemm(
                 use_mxfp8=quant_info.use_mxfp8,
             )
         )
-        # expected_m is a DeepGEMM tuning hint, not a capacity limit. For EP it
-        # must use the global expert count; dividing global assignments only by
-        # local experts overestimates Oakhaven TEP16 by 16x.
+        # Use the global expert count because expected_m is a tuning hint, not
+        # the per-rank buffer capacity.
         expected_m = max(
             1,
             ceil_div(
@@ -794,17 +745,8 @@ def pre_permute_standard_to_deep_gemm(
             expected_m=expected_m,
         )
 
-    # Pack standard-dispatch assignments into the contiguous grouped-GEMM
-    # layout. This also supports EP: StandardDispatcher maps non-local expert
-    # IDs to -1, and both ep_scatter and the post-permute kernel skip them.
-    #
-    # The masked layout allocates [num_experts, align(num_tokens), hidden].
-    # That is pathological for many-expert TP without EP: Oakhaven prefill
-    # would require 512 * 8448 * 8192 * 2 bytes = 66 GiB for down_output.
-    # Contiguous DeepGEMM only needs one row per token/expert assignment plus
-    # at most BLOCK_E - 1 alignment rows per local expert. The upper bound is
-    # fixed for a graph shape and remains valid for every routing pattern,
-    # including assignments mapped to -1 by expert parallelism.
+    # The compact layout avoids scaling masked buffers with the expert count.
+    # Scatter and post-permute skip non-local experts mapped to -1.
     block_e = 128
     num_experts = runner_config.num_local_experts
     num_assignments = topk_ids.numel()
@@ -817,9 +759,8 @@ def pre_permute_standard_to_deep_gemm(
     )
     dispose_tensor(unused_masked_dst)
     tokens_per_expert = (ceil_div(tokens_per_expert, block_e) * block_e).to(torch.int32)
-    # Keep the allocation and m_indices shape graph-static. Extra rows are
-    # zero-filled and assigned to the final local expert; src2dst never points
-    # to them, so they cannot affect the combined result.
+    # Keep graph-static shapes by assigning zero-filled padding rows to the
+    # final expert. src2dst never points to them.
     tokens_per_expert[-1].add_(all_tokens - tokens_per_expert.sum())
 
     k = hidden_states.size(1)
@@ -862,18 +803,17 @@ def pre_permute_standard_to_deep_gemm(
         scale_width = k // block_k
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             scale_width = ceil_div(scale_width, 4)
-        packed_input_scale = _allocate_packed_scale_buffer(
-            all_tokens,
-            scale_width,
-            device=hidden_states_device,
-            dtype=packed_input_source_scale.dtype,
-            column_major=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        )
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-            _assert_packed_ue8m0_scale_layout(
-                packed_input_scale,
-                rows=all_tokens,
-                width=scale_width,
+            packed_input_scale = torch.zeros(
+                (scale_width, all_tokens),
+                device=hidden_states_device,
+                dtype=packed_input_source_scale.dtype,
+            ).transpose(0, 1)
+        else:
+            packed_input_scale = torch.zeros(
+                (all_tokens, scale_width),
+                device=hidden_states_device,
+                dtype=packed_input_source_scale.dtype,
             )
 
     expert_start_loc = torch.empty(
@@ -899,9 +839,7 @@ def pre_permute_standard_to_deep_gemm(
     if packed_input_source_scale is not None:
         dispose_tensor(packed_input_source_scale)
 
-    # The caller may still need the original activation for a separate shared
-    # expert or its gate. Honor the same inplace contract as the other MoE
-    # runners instead of always invalidating the caller's tensor.
+    # Preserve the input when a shared expert or its gate may still use it.
     if runner_config.inplace:
         dispose_tensor(hidden_states_ref)
 

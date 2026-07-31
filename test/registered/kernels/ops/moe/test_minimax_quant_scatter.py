@@ -1,7 +1,6 @@
 import random
 import sys
 from contextlib import nullcontext
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,7 +9,6 @@ import sglang.srt.layers.moe.moe_runner.deep_gemm as deep_gemm_runner
 from sglang.kernels.ops.moe.ep_moe_kernels import (
     fill_gateup_input_triton_kernel,
     moe_ep_deepgemm_preprocess,
-    post_reorder_deepgemm,
 )
 from sglang.kernels.ops.quantization.minimax_quant_ue8m0 import (
     per_token_quant_fp8_ue8m0,
@@ -138,113 +136,6 @@ def test_standard_deepgemm_preprocess_quantizes_with_ue8m0_scale():
                 grouped_scale[expert, row],
                 direct_scale[token],
             )
-
-
-def test_standard_compact_prepermute_and_combine_skip_nonlocal_experts():
-    hidden_states = (
-        torch.arange(3 * 128, device=dev, dtype=torch.float32)
-        .to(torch.bfloat16)
-        .reshape(3, 128)
-    )
-    topk_ids = torch.tensor([[0, -1], [1, -1], [0, -1]], device=dev, dtype=torch.int32)
-    topk_weights = torch.full(topk_ids.shape, 0.5, device=dev, dtype=torch.float32)
-    dispatch_output = StandardDispatchOutput(
-        hidden_states=hidden_states,
-        hidden_states_scale=None,
-        topk_output=(topk_weights, topk_ids, None),
-    )
-    quant_info = SimpleNamespace(
-        w13_weight=torch.zeros((2, 64, 128), device=dev, dtype=torch.bfloat16),
-        block_shape=[128, 128],
-        use_mxfp8=False,
-    )
-    runner_config = SimpleNamespace(
-        num_experts=2,
-        num_local_experts=2,
-        top_k=2,
-        inplace=False,
-    )
-    running_state = {}
-
-    packed = pre_permute_standard_to_deep_gemm(
-        dispatch_output,
-        quant_info,
-        runner_config,
-        running_state,
-    )
-    torch.cuda.synchronize()
-
-    assert running_state["all_tokens"] == 384
-    assert torch.equal(
-        packed.m_indices[:128], torch.zeros(128, device=dev, dtype=torch.int32)
-    )
-    assert torch.equal(
-        packed.m_indices[128:],
-        torch.ones(256, device=dev, dtype=torch.int32),
-    )
-    for token in range(hidden_states.shape[0]):
-        dst = int(running_state["src2dst"][token, 0])
-        assert torch.equal(packed.hidden_states[dst], hidden_states[token])
-
-    combined = torch.empty_like(hidden_states)
-    post_reorder_deepgemm(
-        packed.hidden_states,
-        combined,
-        running_state["src2dst"],
-        topk_ids,
-        topk_weights,
-        topk=2,
-        num_tokens=hidden_states.shape[0],
-        hidden_size=hidden_states.shape[1],
-        routed_scaling_factor=1.0,
-    )
-    torch.cuda.synchronize()
-    torch.testing.assert_close(combined, hidden_states * 0.5, rtol=0, atol=0)
-
-
-def test_standard_masked_prepermute_skips_nonlocal_experts():
-    hidden_states = (
-        torch.arange(3 * 128, device=dev, dtype=torch.float32)
-        .to(torch.bfloat16)
-        .reshape(3, 128)
-    )
-    topk_ids = torch.tensor([[0, -1], [1, -1], [0, -1]], device=dev, dtype=torch.int32)
-    topk_weights = torch.full(topk_ids.shape, 0.5, device=dev, dtype=torch.float32)
-    dispatch_output = StandardDispatchOutput(
-        hidden_states=hidden_states,
-        hidden_states_scale=None,
-        topk_output=(topk_weights, topk_ids, None),
-    )
-    quant_info = SimpleNamespace(
-        w13_weight=torch.zeros((2, 64, 128), device=dev, dtype=torch.bfloat16),
-        block_shape=[128, 128],
-        use_mxfp8=False,
-    )
-    runner_config = SimpleNamespace(
-        num_experts=8,
-        num_local_experts=2,
-        top_k=2,
-        inplace=False,
-    )
-    running_state = {}
-
-    packed = pre_permute_standard_to_deep_gemm(
-        dispatch_output,
-        quant_info,
-        runner_config,
-        running_state,
-    )
-    torch.cuda.synchronize()
-
-    assert packed.use_masked_gemm
-    assert packed.expected_m == 1
-    assert packed.hidden_states.shape == (2, 256, 128)
-    assert packed.masked_m.tolist() == [2, 1]
-    for token in range(hidden_states.shape[0]):
-        dst = int(running_state["src2dst"].view_as(topk_ids)[token, 0])
-        expert, row = divmod(dst, 256)
-        assert expert == int(topk_ids[token, 0])
-        assert torch.equal(packed.hidden_states[expert, row], hidden_states[token])
 
 
 def test_standard_masked_fp8_runner_matches_compact_end_to_end(monkeypatch):

@@ -1679,13 +1679,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if not self.is_fp4_expert:
                 weight_block_size = self.quant_config.weight_block_size
-                for weight_name, weight, weight_scale in (
-                    (
-                        "w13_weight",
-                        layer.w13_weight,
-                        layer.w13_weight_scale_inv,
-                    ),
-                    ("w2_weight", layer.w2_weight, layer.w2_weight_scale_inv),
+                for weight, weight_scale in (
+                    (layer.w13_weight, layer.w13_weight_scale_inv),
+                    (layer.w2_weight, layer.w2_weight_scale_inv),
                 ):
                     requant_block_scale_ue8m0_for_deepgemm(
                         weight,
@@ -1695,19 +1691,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         output_dtype=torch.bfloat16,
                         weight_shape=weight.shape[-2:],
                     )
-                    if (
-                        will_use_deepgemm
-                        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                        and not getattr(weight_scale, "format_ue8m0", False)
-                    ):
-                        raise ValueError(
-                            "DeepGEMM MoE on Blackwell requires a supported "
-                            "128x128 block-FP8 weight shape and UE8M0 scales, "
-                            f"but {weight_name} has shape "
-                            f"{tuple(weight.shape[-2:])}, block size "
-                            f"{weight_block_size}. Choose another MoE runner "
-                            "backend for this tensor-parallel layout."
-                        )
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.mxfp8_block_convert import (

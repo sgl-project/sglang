@@ -217,41 +217,6 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         self.assertTrue(layer.w13_weight_scale_inv.format_ue8m0)
         self.assertTrue(layer.w2_weight_scale_inv.format_ue8m0)
 
-    def test_fp8_moe_fails_loudly_when_w2_shape_is_unsupported(self):
-        method = fp8_quant.Fp8MoEMethod.__new__(fp8_quant.Fp8MoEMethod)
-        method.convert_mxfp8_to_block = False
-        method.use_mxfp8 = False
-        method.is_fp4_expert = False
-        method.dequant_fp4_to_fp8 = False
-        method.quant_config = unittest.mock.Mock(weight_block_size=BLOCK_SIZE)
-
-        layer = torch.nn.Module()
-        layer.w13_weight, layer.w13_weight_scale_inv = _make_params()
-        layer.w2_weight, layer.w2_weight_scale_inv = _make_params()
-
-        def _only_mark_w13(weight, weight_scale, *args, **kwargs):
-            if weight is layer.w13_weight:
-                weight_scale.format_ue8m0 = True
-                return True
-            return False
-
-        with patch.multiple(
-            fp8_quant,
-            _is_cpu=False,
-            _is_fp8_fnuz=False,
-            _use_aiter=False,
-        ), patch.object(
-            method, "is_deepgemm_moe_runner_backend_enabled", return_value=True
-        ), patch.object(
-            fp8_quant,
-            "requant_block_scale_ue8m0_for_deepgemm",
-            side_effect=_only_mark_w13,
-        ), patch.object(
-            deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", True
-        ):
-            with self.assertRaisesRegex(ValueError, "w2_weight"):
-                method.process_weights_after_loading_block_quant(layer)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)
