@@ -61,6 +61,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -717,6 +718,13 @@ async def model_info():
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
         # "hf_config": model_config.hf_config.to_dict(),
     }
+    embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
+    if embedding_model_spec is not None:
+        result["embedding"] = resolved_embedding_plan(
+            embedding_model_spec,
+            server_args=_global_state.tokenizer_manager.server_args,
+            model_config=model_config,
+        )
     return result
 
 
