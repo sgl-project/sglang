@@ -32,7 +32,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
