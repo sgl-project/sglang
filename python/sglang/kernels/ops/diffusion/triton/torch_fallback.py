@@ -77,6 +77,9 @@ def norm_infer_native(
             result = result + bias
     else:
         result = F.layer_norm(x, normalized_shape, weight, bias, eps)
+    # Match the original fallback and Triton kernel contract even when a
+    # higher-precision weight or bias promotes PyTorch's intermediate result.
+    result = result.to(x.dtype)
     if out is not None:
         out.copy_(result)
         return out
