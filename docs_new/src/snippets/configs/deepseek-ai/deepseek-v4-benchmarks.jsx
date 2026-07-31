@@ -1,6 +1,6 @@
 // DeepSeek-V4 per-cell benchmark numbers, keyed by the same `match` tuple as
 // deepseek-v4.jsx cells. See _deployment.jsx for the speed/accuracy schema.
-// Measured on sglang v0.5.15 / v0.5.15.post1 (per-cell sglang_version).
+// Measured on sglang v0.5.15 / v0.5.15.post1 / v0.5.16 (per-cell sglang_version).
 // tokens_per_sec_per_gpu is total (input+output) tok/s/GPU = output/GPU × (isl+osl)/osl.
 export const benchmarks = [
   // ====================================================================
@@ -236,6 +236,17 @@ export const benchmarks = [
   // ====================================================================
   // GB300 + FP4
   // ====================================================================
+  {
+    match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 468.93, tpot_ms: 1.31, tokens_per_sec_per_gpu: 930 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 726.81, tpot_ms: 8.84, tokens_per_sec_per_gpu: 2711 },
+    ],
+    accuracy: { gsm8k_pct: 97.04 },
+  },
   {
     match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",

@@ -22,6 +22,7 @@ export const config = {
 
   variants: [
     { id: "flash", label: "Flash", subtitle: "284B" },
+    { id: "flash-official", label: "Flash Official", subtitle: "284B · 0731" },
     { id: "pro",   label: "Pro",   subtitle: "1.6T" },
   ],
   quantizations: [
@@ -44,6 +45,7 @@ export const config = {
     "flash|fp4": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|nvfp4": "nvidia/DeepSeek-V4-Flash-NVFP4",
+    "flash-official|fp4": "deepseek-ai/DeepSeek-V4-Flash-0731",
     "pro|fp4":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|fp8":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|nvfp4": "nvidia/DeepSeek-V4-Pro-NVFP4",
@@ -96,6 +98,14 @@ sgl-eval run gpqa \\
   --temperature 1.0 --top-p 1.0 --thinking \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
+        "flash-official":
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run gpqa \\
+  --model {{MODEL_NAME}} --api-key <api-key> \\
+  --n-repeats 16 --max-tokens 200000 \\
+  --temperature 1.0 --top-p 1.0 --thinking \\
+  --out-dir /sgl-workspace/logs \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
         pro:
 `# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
 sgl-eval run gpqa \\
@@ -106,6 +116,14 @@ sgl-eval run gpqa \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
       },
       aime25_pct: {
+        "flash-official":
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run aime25 \\
+  --model {{MODEL_NAME}} --api-key <api-key> \\
+  --n-repeats 16 --max-tokens 200000 \\
+  --temperature 1.0 --top-p 1.0 --thinking \\
+  --out-dir /sgl-workspace/logs \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
         flash:
 `# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
 sgl-eval run aime25 \\
@@ -268,10 +286,15 @@ sgl-eval run aime25 \\
         { id: "off",        label: "Off (greedy)" },
         { id: "mtp-314",    label: "EAGLE / MTP 3-1-4",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
-                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"] },
+                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"],
+          hide: { variant: ["flash-official"] } },
         { id: "mtp-112",    label: "EAGLE / MTP 1-1-2",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
-                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"] },
+                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
+          hide: { variant: ["flash-official"] } },
+        { id: "dspark",     label: "DSpark",
+          flags: ["--speculative-algorithm DSPARK"],
+          hide: { variant: ["flash", "pro"] } },
         { id: "ngram",      label: "NGRAM",
           flags: ["--speculative-algorithm NGRAM",
                   "--speculative-num-draft-tokens 16",
@@ -383,6 +406,24 @@ sgl-eval run aime25 \\
       ],
       defaultHostRatio: 10,
     },
+
+    flagSelects: [
+      {
+        id: "dsparkDraftTokens",
+        title: "DSpark Proposed Draft Tokens",
+        showWhen: (base) => base.variant === "flash-official",
+        control: "slider",
+        stripPrefixes: ["--speculative-dspark-block-size"],
+        options: [
+          { id: "auto", label: "Checkpoint default" },
+          { id: "1", label: "1", flags: ["--speculative-dspark-block-size 1"] },
+          { id: "2", label: "2", flags: ["--speculative-dspark-block-size 2"] },
+          { id: "3", label: "3", flags: ["--speculative-dspark-block-size 3"] },
+          { id: "4", label: "4", flags: ["--speculative-dspark-block-size 4"] },
+          { id: "5", label: "5", flags: ["--speculative-dspark-block-size 5"] },
+        ],
+      },
+    ],
   },
 
   cells: [
@@ -914,6 +955,23 @@ sgl-eval run aime25 \\
     // ====================================================================
     // GB300 + FP4
     // ====================================================================
+    {
+      match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.90",
+        "--chunked-prefill-size 4096",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     {
       match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,
