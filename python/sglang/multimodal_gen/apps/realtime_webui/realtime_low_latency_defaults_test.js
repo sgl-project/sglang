@@ -38,8 +38,13 @@ assert.match(
 
 assert.match(
   appJs,
-  /const DEFAULT_TARGET_FPS\s*=\s*16;/,
-  "8-GPU webui profile should request a smoother target FPS",
+  /const DEFAULT_TARGET_FPS\s*=\s*configuredNumber\("targetFps", 16\);/,
+  "webui should preserve its fallback while accepting a deployment target FPS",
+);
+assert.match(
+  indexHtml,
+  /<script src="\.\/runtime-config\.js"><\/script>/,
+  "webui should load the deployment profile before app.js",
 );
 assert.match(
   appJs,

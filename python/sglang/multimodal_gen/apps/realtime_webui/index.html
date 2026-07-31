@@ -11,7 +11,7 @@
       <section class="panel controls" aria-label="Session controls">
         <div class="brand">
           <span>sglang-diffusion</span>
-          <strong>Realtime Studio</strong>
+          <strong id="studioTitle">Realtime Studio</strong>
         </div>
         <label>Server<input id="serverUrl" value="ws://127.0.0.1:30000/v1/realtime_video/generate" /></label>
         <label>Model<input id="model" value="" placeholder="auto from /v1/models" /></label>
@@ -155,9 +155,9 @@
         </section>
 
         <section class="panel presets" aria-label="Presets and camera">
-          <div class="section-title">LingBot</div>
+          <div id="modelSectionTitle" class="section-title">LingBot</div>
           <div class="spec-grid">
-            <span><b>16 fps</b> target</span>
+            <span><b id="targetFpsSummary">16 fps</b> target</span>
             <span><b>chunked</b> stream</span>
             <span><b>480p/720p</b></span>
             <span><b>Cam + Act</b></span>
@@ -169,6 +169,7 @@
         </section>
       </section>
     </main>
+  <script src="./runtime-config.js"></script>
   <script src="./playback_controller.js?v=realtime-playback-v21"></script>
   <script src="./app.js?v=realtime-record-v94"></script>
 </body>

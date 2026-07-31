@@ -5,13 +5,20 @@ const RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip";
 const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
 const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v10";
+const UI_CONFIG = Object.freeze(globalThis.SGLANG_REALTIME_UI_CONFIG || {});
+
+function configuredNumber(name, fallback) {
+  const value = Number(UI_CONFIG[name]);
+  return Number.isFinite(value) ? value : fallback;
+}
+
 const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";
 const DEFAULT_PREVIEW_OUTPUT_QUALITY = 55;
 const MAX_WEBP_PREVIEW_OUTPUT_QUALITY = 80;
 const SMOOTH_PREVIEW_OUTPUT_QUALITY = 70;
 const SR_PREVIEW_OUTPUT_QUALITY = 70;
 const HEAVY_PREVIEW_OUTPUT_QUALITY = 60;
-const DEFAULT_TARGET_FPS = 16;
+const DEFAULT_TARGET_FPS = configuredNumber("targetFps", 16);
 const DEFAULT_PREVIEW_MAX_WIDTH = 560;
 const DEFAULT_FRAME_INTERPOLATION_EXP = 1;
 const DEFAULT_FRAME_INTERPOLATION_SCALE = 1.0;
@@ -57,6 +64,33 @@ const CONTROL_ACTION_META = {
   k: { label: "Pitch -", type: "rotation", axis: "-pitch", amount: "4deg/frame" },
   l: { label: "Yaw +", type: "rotation", axis: "+yaw", amount: "6deg/frame" },
 };
+
+function applyRuntimeUiConfig() {
+  $("fps").value = String(DEFAULT_TARGET_FPS);
+  $("guidance").value = String(
+    configuredNumber("guidanceScale", Number($("guidance").value)),
+  );
+  $("sinkSize").value = String(
+    configuredNumber("sinkSize", Number($("sinkSize").value)),
+  );
+  $("windowFrames").value = String(
+    configuredNumber("windowFrames", Number($("windowFrames").value)),
+  );
+  $("targetFpsSummary").textContent = `${DEFAULT_TARGET_FPS} fps`;
+  if (UI_CONFIG.modelLabel) {
+    $("modelSectionTitle").textContent = String(UI_CONFIG.modelLabel);
+  }
+  if (UI_CONFIG.titleSuffix) {
+    const suffix = String(UI_CONFIG.titleSuffix);
+    $("studioTitle").textContent = `Realtime Studio · ${suffix}`;
+    document.title = `Realtime Studio · ${suffix}`;
+  }
+  if (UI_CONFIG.actionAmountLabel) {
+    Object.values(CONTROL_ACTION_META).forEach((meta) => {
+      meta.amount = String(UI_CONFIG.actionAmountLabel);
+    });
+  }
+}
 
 const REACTOR_PRESET_BASE_URL = "https://www.reactor.inc/lingbot-world-fast-v1";
 
@@ -1748,7 +1782,7 @@ async function applyPreset(preset, options = {}) {
   selectedPreset = preset;
   $("prompt").value = preset.prompt;
   $("size").value = preset.size;
-  $("fps").value = preset.fps;
+  $("fps").value = UI_CONFIG.targetFps == null ? preset.fps : DEFAULT_TARGET_FPS;
   updateOutputSizeText();
   syncPlaybackTargetFps();
   await setPresetReference(preset);
@@ -2170,6 +2204,7 @@ function unpack(buf) {
   return read();
 }
 
+applyRuntimeUiConfig();
 renderPresets();
 drawIdle();
 setPreviewScale(DEFAULT_PREVIEW_SCALE);

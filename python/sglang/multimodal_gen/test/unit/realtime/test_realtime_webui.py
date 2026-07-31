@@ -19,6 +19,25 @@ def test_realtime_webui_uses_same_origin_server_by_default():
     assert 'app.router.add_route("*", "/v1/{path:.*}"' in proxy_server
 
 
+def test_realtime_webui_supports_deployment_runtime_config():
+    repo_root = Path(__file__).resolve().parents[6]
+    app_js = (
+        repo_root / "python/sglang/multimodal_gen/apps/realtime_webui/app.js"
+    ).read_text()
+    index_html = (
+        repo_root / "python/sglang/multimodal_gen/apps/realtime_webui/index.html"
+    ).read_text()
+    proxy_server = (
+        repo_root / "python/sglang/multimodal_gen/apps/realtime_webui/server.py"
+    ).read_text()
+
+    assert 'os.environ.get("REALTIME_UI_CONFIG_JSON", "{}")' in proxy_server
+    assert 'app.router.add_get("/runtime-config.js", _runtime_config)' in proxy_server
+    assert '<script src="./runtime-config.js"></script>' in index_html
+    assert 'configuredNumber("targetFps", 16)' in app_js
+    assert "UI_CONFIG.targetFps == null ? preset.fps : DEFAULT_TARGET_FPS" in app_js
+
+
 def test_realtime_webui_presets_do_not_emit_camera_scripts():
     repo_root = Path(__file__).resolve().parents[6]
     app_js = (

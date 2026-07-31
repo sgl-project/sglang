@@ -3,6 +3,7 @@
 """Serve the realtime UI and proxy its HTTP/WebSocket API on one port."""
 
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -35,6 +36,25 @@ def _forward_headers(headers):
 
 async def _index(_request):
     return web.FileResponse(ROOT / "index.html")
+
+
+async def _runtime_config(_request):
+    raw_config = os.environ.get("REALTIME_UI_CONFIG_JSON", "{}")
+    try:
+        config = json.loads(raw_config)
+    except json.JSONDecodeError as error:
+        raise web.HTTPInternalServerError(
+            text=f"invalid REALTIME_UI_CONFIG_JSON: {error.msg}"
+        ) from error
+    if not isinstance(config, dict):
+        raise web.HTTPInternalServerError(
+            text="REALTIME_UI_CONFIG_JSON must contain a JSON object"
+        )
+    return web.Response(
+        text=f"globalThis.SGLANG_REALTIME_UI_CONFIG = {json.dumps(config)};\n",
+        content_type="application/javascript",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 async def _proxy_http(request):
@@ -106,6 +126,7 @@ def create_app():
     app = web.Application(client_max_size=1024**3)
     app.cleanup_ctx.append(_session_context)
     app.router.add_get("/", _index)
+    app.router.add_get("/runtime-config.js", _runtime_config)
     app.router.add_get("/v1/realtime_video/generate", _proxy_websocket)
     app.router.add_route("*", "/v1/{path:.*}", _proxy_http)
     app.router.add_static("/", ROOT)
