@@ -10,7 +10,8 @@ and the sigmoid-gated output RMSNorm.
 Kernel body vendored from the NVIDIA x Moonshot Kimi K3 optimization package
 (see csrc/attention/kda_fused_decode.cuh for provenance and the list of
 integration patches). Specialized for the K3 KDA decode regime:
-H = HV = 12, K = V = 128, kernel width 4, no lower bound, T = 1 per request.
+H = HV = 12 (TP8) or 24 (TP4), K = V = 128, kernel width 4,
+T = 1 per request.
 
 The model must hand off the output-norm gate (attempt-and-verify stash on the
 attention layer, see kimi_k3.py), and a covered() check gates supported inputs.
@@ -33,8 +34,9 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-_H = 12  # q/k/v heads per rank (TP8) — the compiled static layout
-_SEG = _H * 128  # 1536: per-segment width of q, k and v
+_H = 12  # Backward-compatible TP8 constant used by focused CPU tests.
+_SUPPORTED_HEADS = (12, 24)
+_SEG = _H * 128
 _CONV_DIM = 3 * _SEG
 _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
 
@@ -46,7 +48,10 @@ def _jit_kda_fused_decode_module() -> Module:
         "kda_fused_decode",
         *args,
         cuda_files=["attention/kda_fused_decode.cuh"],
-        cuda_wrappers=[("run", f"KdaFusedDecodeKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("run_12", f"KdaFusedDecodeKernel<12, {args}>::run"),
+            ("run_24", f"KdaFusedDecodeKernel<24, {args}>::run"),
+        ],
         extra_cuda_cflags=["-O3", "--use_fast_math"],
     )
 
@@ -60,25 +65,32 @@ def covered(
     cache_indices: torch.Tensor,
     onorm_g: torch.Tensor,
 ) -> bool:
-    """The kernel is compiled for the K3 KDA decode regime: 12 heads of 128,
-    packed [T, 4608] qkv rows, transposed [slots, 3, 4608] conv pool, fp32
-    [slots, 12, 128, 128] ssm pool (inner-contiguous, any slot pitch — the
-    kernel reads the real slot stride), one token per request."""
-    if mixed_qkv.ndim != 2 or mixed_qkv.shape[-1] != _CONV_DIM:
+    """Check the TP8/TP4 K3 fused-decode layouts.
+
+    The compiled variants cover 12 or 24 heads of 128, a packed
+    ``[T, 3*H*128]`` qkv row, transposed ``[slots, 3, 3*H*128]`` conv pool,
+    and fp32 ``[slots, H, 128, 128]`` SSM pool. The inner SSM dimensions must
+    be contiguous; its slot pitch may be an allocator envelope stride.
+    """
+    if mixed_qkv.ndim != 2 or ssm_states.ndim < 4:
         return False
     HV, V, K = ssm_states.shape[-3:]
+    if HV not in _SUPPORTED_HEADS:
+        return False
+    seg = HV * K
+    conv_dim = 3 * seg
     return (
-        HV == _H
-        and V == 128
+        V == 128
         and K == 128
+        and mixed_qkv.shape[-1] == conv_dim
         and a.ndim == 2
-        and a.shape[-1] == _SEG
+        and a.shape[-1] == seg
         and b.ndim == 2
-        and b.shape[-1] == _H
+        and b.shape[-1] == HV
         and onorm_g.ndim == 2
-        and onorm_g.shape[-1] == _SEG
+        and onorm_g.shape[-1] == seg
         and conv_states.ndim == 3
-        and conv_states.shape[-2:] == (_CONV_STATE_W, _CONV_DIM)
+        and conv_states.shape[-2:] == (_CONV_STATE_W, conv_dim)
         and mixed_qkv.dtype == torch.bfloat16
         and a.dtype == torch.bfloat16
         and b.dtype == torch.bfloat16
@@ -129,8 +141,11 @@ def kda_fused_decode(
     attention output [1, B, HV, V] (the packed-decode output layout).
     Caller must have checked covered()."""
     B = mixed_qkv.shape[0]
-    out = torch.empty((B, _SEG), dtype=torch.bfloat16, device=mixed_qkv.device)
-    _jit_kda_fused_decode_module().run(
+    H = ssm_states.shape[-3]
+    seg = H * 128
+    out = torch.empty((B, seg), dtype=torch.bfloat16, device=mixed_qkv.device)
+    run = getattr(_jit_kda_fused_decode_module(), f"run_{H}")
+    run(
         mixed_qkv,
         a,
         b,
@@ -156,4 +171,4 @@ def kda_fused_decode(
         float(lower_bound) if lower_bound is not None else 0.0,
         lower_bound is not None,
     )
-    return out.view(1, B, _H, 128)
+    return out.view(1, B, H, 128)
