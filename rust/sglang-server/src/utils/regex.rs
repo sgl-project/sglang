@@ -5,6 +5,9 @@
 //! and afford. See [`validate`] for the two rejection classes and why the
 //! invariant is one-directional.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 use crate::error::Error;
 
 /// `MAX_LEN` from Python's `get_max_seq_length`: the bound for an *unbounded* stop
@@ -209,6 +212,49 @@ fn check_escape(b: &[u8], i: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Entries kept in [`ADMISSION_CACHE`], mirroring CPython's `re._MAXCACHE`.
+const ADMISSION_CACHE_CAP: usize = 512;
+
+/// Memo of admitted patterns → their bound.
+///
+/// Admission is a pure function of the pattern text, and an expensive one: ~87% of
+/// it is HIR translation, which expands `\w`/`\W` into large Unicode class unions.
+/// A 256-byte `\W`-heavy pattern (exactly [`MAX_STOP_REGEX_LEN`]) measures 574 µs,
+/// and a request may carry [`MAX_STOP_REGEX_COUNT`] of them — 18 ms of admission on
+/// the single ingress thread, re-derived from scratch on every request. It
+/// multiplies through a batch, because one `sampling_params` object broadcasts to
+/// every item: a 13.6 KB body measured **1.01 s**, during which that thread serves
+/// no other request, no abort and no health probe.
+///
+/// Only successes are memoized. A rejected pattern fails inside [`validate`], which
+/// is the cheap 8% — the expensive translate runs only after it passes — so the
+/// hazard is entirely on the admitted side, and this keeps the entry a plain
+/// `usize` rather than something that has to reconstruct an `Error` faithfully.
+///
+/// Cleared wholesale when full rather than evicted one at a time: that is what
+/// CPython's `re` does, and it keeps the hot path one lookup with no LRU
+/// bookkeeping. The lock is held across a hash lookup and nothing else, and is
+/// taken almost exclusively by the one ingress thread.
+static ADMISSION_CACHE: LazyLock<Mutex<HashMap<Box<str>, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cached_bound(pattern: &str) -> Option<usize> {
+    ADMISSION_CACHE
+        .lock()
+        .ok()
+        .and_then(|c| c.get(pattern).copied())
+}
+
+fn cache_bound(pattern: &str, max_len: usize) {
+    let Ok(mut c) = ADMISSION_CACHE.lock() else {
+        return;
+    };
+    if c.len() >= ADMISSION_CACHE_CAP {
+        c.clear();
+    }
+    c.insert(pattern.into(), max_len);
+}
+
 /// A `stop_regex` that has been admitted, together with the bound derived while
 /// admitting it.
 ///
@@ -239,6 +285,11 @@ impl<'a> RegexPattern<'a> {
     /// `Err` for anything CPython's `re` cannot compile, or cannot match cheaply
     /// enough to run on every decode step — see [`validate`].
     fn build(pattern: &'a str) -> Result<Self, Error> {
+        // Same pattern text ⇒ same verdict and same bound, so a repeat costs a hash
+        // lookup instead of a parse + translate. See [`ADMISSION_CACHE`].
+        if let Some(max_len) = cached_bound(pattern) {
+            return Ok(Self { pattern, max_len });
+        }
         let ast = validate(pattern)?;
         // Translate the AST `validate` already produced instead of re-parsing. The full
         // `regex_syntax::Parser` parses AND translates, so calling it here would parse a
@@ -255,6 +306,7 @@ impl<'a> RegexPattern<'a> {
                 ))
             })?;
         let max_len = hir_max_len(&hir);
+        cache_bound(pattern, max_len);
         Ok(Self { pattern, max_len })
     }
 
@@ -578,14 +630,53 @@ fn ast_len(ast: &regex_syntax::ast::Ast) -> (u64, Option<u64>) {
 mod tests {
     use super::*;
 
-    /// Bound-only view of [`RegexPattern::new`], so the corpus rows read as
+    /// Bound-only view of [`RegexPattern`], so the corpus rows read as
     /// `pattern -> bound` without naming the type at every call.
     fn stop_regex_bound(pattern: &str) -> Result<usize, Error> {
         RegexPattern::try_from(pattern).map(|r| r.max_len())
     }
 
-    /// The newtype's contract: an admitted pattern keeps its own text alongside
-    /// its own bound, so the two cannot be paired up wrongly.
+    /// The admission memo must be indistinguishable from admitting afresh.
+    ///
+    /// It short-circuits the validator, so a wrong entry would admit a pattern
+    /// nobody checked or hand back another pattern's bound — and the bound sizes
+    /// the scheduler's match window, which is the under-estimate class of bug this
+    /// module exists to prevent. Three properties, one per way that could break:
+    /// a repeat agrees with a cold run, a rejection is never memoized, and the
+    /// wholesale clear at [`ADMISSION_CACHE_CAP`] loses nothing but the entries.
+    #[test]
+    fn admission_memo_agrees_with_admitting_afresh() {
+        // Distinct from any other test's patterns: the cache is process-wide, so a
+        // shared pattern would make this pass for the wrong reason.
+        let admitted = r"memo\d{3}[a-f]+";
+        let cold = RegexPattern::try_from(admitted).expect("valid").max_len();
+        let warm = RegexPattern::try_from(admitted).expect("valid").max_len();
+        assert_eq!(
+            cold, warm,
+            "a memoized bound must equal a freshly derived one"
+        );
+
+        // Rejections are re-validated every time, so the memo can never turn one
+        // into an admission.
+        let rejected = r"memo(?:.|.)*Z";
+        assert!(RegexPattern::try_from(rejected).is_err());
+        assert!(
+            RegexPattern::try_from(rejected).is_err(),
+            "a rejected pattern must stay rejected on the second try"
+        );
+
+        // Overflow the cache, then re-check: clearing must not corrupt or stale a
+        // subsequent lookup.
+        for i in 0..=ADMISSION_CACHE_CAP {
+            let _ = RegexPattern::try_from(format!("memofill{i}").as_str());
+        }
+        assert_eq!(
+            RegexPattern::try_from(admitted).expect("valid").max_len(),
+            cold,
+            "the bound must survive a cache clear"
+        );
+    }
+
     #[test]
     fn admitted_pattern_carries_its_own_text_and_bound() {
         let p = RegexPattern::try_from(r"\d{6}").expect("valid");
