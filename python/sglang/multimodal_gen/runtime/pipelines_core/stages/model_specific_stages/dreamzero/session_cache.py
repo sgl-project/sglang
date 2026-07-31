@@ -25,20 +25,20 @@ class DreamZeroCachePool:
     capacity: int
     local_attn_size: int = -1
 
-    session_ids: list[str | None] = field(init=False)
-    current_start_frames: list[int] = field(init=False)
-    visual_valid: list[bool] = field(init=False)
-    prompt_hashes: dict[int, list[str | None]] = field(init=False)
-    prompt_valid: dict[int, list[bool]] = field(init=False)
-    kv_valid: dict[int, list[bool]] = field(init=False)
-    kv_lengths: dict[int, list[int]] = field(init=False)
-    crossattn_valid: dict[int, list[bool]] = field(init=False)
+    session_ids: list[str | None] = field(default_factory=list)
+    current_start_frames: list[int] = field(default_factory=list)
+    visual_valid: list[bool] = field(default_factory=list)
+    prompt_hashes: dict[int, list[str | None]] = field(default_factory=dict)
+    prompt_valid: dict[int, list[bool]] = field(default_factory=dict)
+    kv_valid: dict[int, list[bool]] = field(default_factory=dict)
+    kv_lengths: dict[int, list[int]] = field(default_factory=dict)
+    crossattn_valid: dict[int, list[bool]] = field(default_factory=dict)
 
     kv_cache_pos: list[torch.Tensor] = field(default_factory=list)
     kv_cache_neg: list[torch.Tensor] = field(default_factory=list)
     crossattn_cache: list[dict[str, Any]] = field(default_factory=list)
     crossattn_cache_neg: list[dict[str, Any]] = field(default_factory=list)
-    cached_prompt_embs: dict[int, torch.Tensor | None] = field(init=False)
+    cached_prompt_embs: dict[int, torch.Tensor | None] = field(default_factory=dict)
 
     clip_feas: torch.Tensor | None = None
     ys: torch.Tensor | None = None
@@ -55,21 +55,21 @@ class DreamZeroCachePool:
         self.crossattn_valid = {branch: [False] * self.capacity for branch in BRANCHES}
         self.cached_prompt_embs = {branch: None for branch in BRANCHES}
 
-    def branch_kv_cache(self, branch: int) -> list[torch.Tensor]:
+    def _branch_kv_cache(self, branch: int) -> list[torch.Tensor]:
         return self.kv_cache_pos if branch == BRANCH_COND else self.kv_cache_neg
 
-    def set_branch_kv_cache(self, branch: int, value: list[torch.Tensor]) -> None:
+    def _set_branch_kv_cache(self, branch: int, value: list[torch.Tensor]) -> None:
         if branch == BRANCH_COND:
             self.kv_cache_pos = value
         else:
             self.kv_cache_neg = value
 
-    def branch_crossattn_cache(self, branch: int) -> list[dict[str, Any]]:
+    def _branch_crossattn_cache(self, branch: int) -> list[dict[str, Any]]:
         return (
             self.crossattn_cache if branch == BRANCH_COND else self.crossattn_cache_neg
         )
 
-    def set_branch_crossattn_cache(
+    def _set_branch_crossattn_cache(
         self, branch: int, value: list[dict[str, Any]]
     ) -> None:
         if branch == BRANCH_COND:
@@ -88,9 +88,9 @@ class DreamZeroCachePool:
                 self.prompt_valid[branch][slot] = False
                 self.prompt_hashes[branch][slot] = None
             if not any(self.kv_valid[branch]):
-                self.set_branch_kv_cache(branch, [])
+                self._set_branch_kv_cache(branch, [])
             if not any(self.crossattn_valid[branch]):
-                self.set_branch_crossattn_cache(branch, [])
+                self._set_branch_crossattn_cache(branch, [])
         if not any(self.visual_valid):
             self.clip_feas = None
             self.ys = None
@@ -215,7 +215,7 @@ class DreamZeroCachePool:
         length = lengths[0]
         index = None
         gathered = []
-        for tensor in self.branch_kv_cache(branch):
+        for tensor in self._branch_kv_cache(branch):
             if index is None:
                 index = _slot_tensor(slots, tensor.device)
             gathered.append(tensor[:, index, :length].contiguous())
@@ -224,7 +224,7 @@ class DreamZeroCachePool:
     def scatter_kv(
         self, branch: int, slots: list[int], values: list[torch.Tensor]
     ) -> None:
-        pool = self.branch_kv_cache(branch)
+        pool = self._branch_kv_cache(branch)
         if not pool:
             pool = [None] * len(values)
         new_pool: list[torch.Tensor] = []
@@ -238,14 +238,14 @@ class DreamZeroCachePool:
                     seq_capacity=self.local_attn_size,
                 )
             )
-        self.set_branch_kv_cache(branch, new_pool)
+        self._set_branch_kv_cache(branch, new_pool)
         kv_length = int(values[0].shape[2]) if values else 0
         for slot in slots:
             self.kv_valid[branch][slot] = True
             self.kv_lengths[branch][slot] = kv_length
 
     def gather_crossattn(self, branch: int, slots: list[int]) -> list[dict[str, Any]]:
-        cache = self.branch_crossattn_cache(branch)
+        cache = self._branch_crossattn_cache(branch)
         if not cache:
             raise RuntimeError("DreamZero cross-attention cache pool is empty")
         if not all(self.crossattn_valid[branch][slot] for slot in slots):
@@ -274,7 +274,7 @@ class DreamZeroCachePool:
     def scatter_crossattn(
         self, branch: int, slots: list[int], values: list[dict[str, Any]]
     ) -> None:
-        existing = self.branch_crossattn_cache(branch)
+        existing = self._branch_crossattn_cache(branch)
         if not existing:
             existing = [{"is_init": False} for _ in values]
         new_cache: list[dict[str, Any]] = []
@@ -296,7 +296,7 @@ class DreamZeroCachePool:
                 else:
                     layer[key] = value
             new_cache.append(layer)
-        self.set_branch_crossattn_cache(branch, new_cache)
+        self._set_branch_crossattn_cache(branch, new_cache)
         for slot in slots:
             self.crossattn_valid[branch][slot] = True
 
@@ -470,18 +470,13 @@ def normalize_batched_prompt_fields(value: Any, batch_size: int) -> list[str | N
 
 
 def _logical_session_fields(batch, batch_size: int) -> tuple[list[str], list[bool]]:
-    extra = getattr(batch, "extra", {})
-    session_ids = getattr(batch, "dreamzero_session_ids", None)
-    if session_ids is None:
-        session_ids = extra.get("dreamzero_session_ids")
+    extra = batch.extra
+    session_ids = extra.get("dreamzero_session_ids")
     if session_ids is None:
         raise ValueError("DreamZero session cache requires dreamzero_session_ids")
-    reset_mask = getattr(batch, "dreamzero_reset_mask", None)
-    if reset_mask is None:
-        reset_mask = extra.get("dreamzero_reset_mask")
     return normalize_batched_session_fields(
         session_ids=session_ids,
-        reset_mask=reset_mask,
+        reset_mask=extra.get("dreamzero_reset_mask"),
         batch_size=batch_size,
     )
 
@@ -550,14 +545,14 @@ def _normalize_optional_hashes(
 def _batch_prompt_hashes(
     batch, batch_size: int
 ) -> tuple[list[str | None], list[str | None]]:
-    extra = getattr(batch, "extra", {})
+    extra = batch.extra
     prompts = normalize_batched_prompt_fields(
         extra.get("dreamzero_prompts"), batch_size
     )
     neg_prompts = normalize_batched_prompt_fields(
         extra.get("dreamzero_negative_prompts"), batch_size
     )
-    inputs = getattr(batch, "dreamzero_inputs", {})
+    inputs = batch.dreamzero_inputs
     explicit_prompt_hashes = _normalize_optional_hashes(
         extra.get("dreamzero_prompt_hashes", inputs.get("prompt_hashes")),
         batch_size,

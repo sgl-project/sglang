@@ -43,9 +43,9 @@ from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.utils import (
-    gather_sequence_parallel_global_tensor,
-    shard_sequence_parallel_global_sequence,
-    shard_sequence_parallel_global_tensor,
+    sp_gather_tensor,
+    sp_shard_sequence,
+    sp_shard_tensor,
 )
 
 _DREAMZERO_SUPPORTED_ATTENTION_BACKENDS = {
@@ -525,12 +525,12 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
                 torch.cat([kv_cache[1], v], dim=1),
             )
         else:
-            current_video_k = gather_sequence_parallel_global_tensor(
-                roped_key, seq_lens
-            )[:, :video_sequence_length]
-            current_video_v = gather_sequence_parallel_global_tensor(
-                v, seq_lens
-            )[:, :video_sequence_length]
+            current_video_k = sp_gather_tensor(roped_key, seq_lens)[
+                :, :video_sequence_length
+            ]
+            current_video_v = sp_gather_tensor(v, seq_lens)[
+                :, :video_sequence_length
+            ]
             out = self._sequence_parallel_attention_with_replicated_prefix(
                 roped_query,
                 roped_key,
@@ -965,7 +965,7 @@ class DreamZeroCausalWanModel(CachableDiT):
 
         seq_lens = None
         if enable_sequence_parallel:
-            x, freqs, seq_lens = shard_sequence_parallel_global_sequence(x, freqs)
+            x, freqs, seq_lens = sp_shard_sequence(x, freqs)
 
         if num_timestep_frames <= seq_len:
             repeat = (seq_len + num_timestep_frames - 1) // num_timestep_frames
@@ -997,7 +997,7 @@ class DreamZeroCausalWanModel(CachableDiT):
         e0 = self.time_projection(e).unflatten(dim=2, sizes=(6, self.dim))
         if enable_sequence_parallel:
             assert seq_lens is not None
-            e0 = shard_sequence_parallel_global_tensor(e0, seq_lens)
+            e0 = sp_shard_tensor(e0, seq_lens)
 
         context = self.text_embedding(context)
         if clip_feature is not None:
@@ -1026,7 +1026,7 @@ class DreamZeroCausalWanModel(CachableDiT):
 
         if enable_sequence_parallel:
             assert seq_lens is not None
-            x = gather_sequence_parallel_global_tensor(x, seq_lens)
+            x = sp_gather_tensor(x, seq_lens)
 
         if action is not None:
             action_noise_pred = x[:, seq_len : seq_len + action_length]

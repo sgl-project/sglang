@@ -317,14 +317,10 @@ def test_dreamzero_global_sequence_shard_includes_action_state(monkeypatch):
 
     monkeypatch.setattr(dreamzero_utils, "get_ulysses_parallel_world_size", lambda: 2)
     monkeypatch.setattr(dreamzero_utils, "get_ulysses_parallel_rank", lambda: 0)
-    local0, freqs0, seq_lens = dreamzero_utils.shard_sequence_parallel_global_sequence(
-        seqs, freqs
-    )
+    local0, freqs0, seq_lens = dreamzero_utils.sp_shard_sequence(seqs, freqs)
 
     monkeypatch.setattr(dreamzero_utils, "get_ulysses_parallel_rank", lambda: 1)
-    local1, freqs1, _ = dreamzero_utils.shard_sequence_parallel_global_sequence(
-        seqs, freqs
-    )
+    local1, freqs1, _ = dreamzero_utils.sp_shard_sequence(seqs, freqs)
 
     assert seq_lens == [3, 2]
     assert torch.equal(local0, seqs[:, :3])

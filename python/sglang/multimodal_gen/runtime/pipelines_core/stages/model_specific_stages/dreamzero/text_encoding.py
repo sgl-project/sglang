@@ -216,7 +216,7 @@ class DreamZeroTextEncodingStage(TextEncodingStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         inputs: dict[str, Any] = batch.dreamzero_inputs
-        batch_size = infer_dreamzero_batch_size(inputs)
+        batch_size = infer_dreamzero_batch_size(inputs.values())
         self._ensure_prompt_extra(batch, batch_size)
         request_cache = resolve_request_cache(
             batch,

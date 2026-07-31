@@ -241,8 +241,7 @@ class DreamZeroObsPrepStage(PipelineStage):
 
         batch.dreamzero_inputs = model_inputs
         batch_size = infer_dreamzero_batch_size(
-            model_inputs,
-            keys=("images", "videos", "state"),
+            model_inputs.get(k) for k in ("images", "videos", "state")
         )
         session_ids, reset_mask = normalize_batched_session_fields(
             session_ids=batch.extra.get("dreamzero_session_ids"),
