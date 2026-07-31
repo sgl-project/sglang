@@ -458,10 +458,10 @@ template <
     typename DType,
     typename PosT,
     bool kUsePDL,
-    bool kRopeFirst,
-    bool kHadamard,
-    uint32_t kNumWarps,
-    uint32_t kMinBlocksPerSM>
+    bool kRopeFirst = false,
+    bool kHadamard = true,
+    uint32_t kNumWarps = kFusedQNumWarps,
+    uint32_t kMinBlocksPerSM = 16>
 __global__ __launch_bounds__(kNumWarps* device::kWarpThreads, kMinBlocksPerSM) void fused_q_indexer_rope_hadamard_quant(
     const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
   using namespace device;
@@ -480,132 +480,127 @@ __global__ __launch_bounds__(kNumWarps* device::kWarpThreads, kMinBlocksPerSM) v
 
   const auto warp_id = threadIdx.x / kWarpThreads;
   const auto lane_id = threadIdx.x % kWarpThreads;
+  const auto work_id = blockIdx.x * kNumWarps + warp_id;
   // V4 ropes the trailing kRopeDim dims (kRopeFirst=false); V3.2 ropes the
   // leading kRopeDim dims (kRopeFirst=true). Select the owning lanes per layout.
   const bool is_rope_lane = kRopeFirst ? (lane_id < kRopeSize) : (lane_id >= kWarpThreads - kRopeSize);
 
   const uint32_t total_works = params.batch_size * params.num_heads;
+  if (work_id >= total_works) return;
 
-  // One (token, head) row = one warp's work. Fully self-contained (no cross-row
-  // state), so which SM / warp / order runs it does not change its 128 output
-  // bits -> bitwise identical to the upstream one-row-per-warp baseline. All the
-  // upstream math (rope_cache layout, kRopeFirst/kHadamard branches, weight
-  // stride) is used verbatim; only the scheduling around it is changed.
-  auto process_row = [&](uint32_t work_id) {
-    const uint32_t batch_id = work_id / params.num_heads;
-    const auto input_ptr = static_cast<const DType*>(params.q_input) + work_id * kHeadDim;
-    const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[batch_id]);
-    const auto rope_cache = params.rope_cache + position * kRopeDim;
-    const uint32_t head_id = work_id - batch_id * params.num_heads;
-    const auto weight_val =
-        cast<float>(static_cast<const DType*>(params.weight)[batch_id * params.weight_stride_batch + head_id]);
+  const uint32_t batch_id = work_id / params.num_heads;
+  const auto input_ptr = static_cast<const DType*>(params.q_input) + work_id * kHeadDim;
+  const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[batch_id]);
+  const auto rope_cache = params.rope_cache + position * kRopeDim;
 
-    // part 1: load (no norm). Each lane owns a 4-elem pack.
-    Float4 data, freq;
-    {
-      Storage input_vec;
-      input_vec.load(input_ptr, lane_id);
-      if (is_rope_lane) {
-        if constexpr (kRopeFirst) {
-          freq = load_rope_first_cos_sin<kRopeDim>(rope_cache, lane_id);
-        } else {
-          freq.load(rope_cache, lane_id - (kWarpThreads - kRopeSize));
-        }
+  // Lane 0 prefetches the weight scalar for this (token, head) work item.
+  // Weight is (B, num_heads) DType; we need one scalar per warp -- offload
+  // the load to lane 0 only. The multiply + store happens once the q_scale
+  // is known (part 4).
+
+  PDLWaitPrimary<kUsePDL>();
+  Float4 data, freq;
+  const uint32_t head_id = work_id - batch_id * params.num_heads;
+  const auto weight_val =
+      cast<float>(static_cast<const DType*>(params.weight)[batch_id * params.weight_stride_batch + head_id]);
+
+  // part 1: load (no norm). Each lane owns a 4-elem pack.
+  {
+    Storage input_vec;
+    input_vec.load(input_ptr, lane_id);
+    if (is_rope_lane) {
+      if constexpr (kRopeFirst) {
+        freq = load_rope_first_cos_sin<kRopeDim>(rope_cache, lane_id);
+      } else {
+        freq.load(rope_cache, lane_id - (kWarpThreads - kRopeSize));
       }
+    }
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      data[i] = cast<float>(input_vec[i]);
+    }
+  }
+
+  // part 2: rope on rope lanes only (4 elems / lane = 2 (real, imag) pairs).
+  if (is_rope_lane) {
+    const auto x_real = data[0];
+    const auto x_imag = data[1];
+    const auto y_real = data[2];
+    const auto y_imag = data[3];
+    const auto fxr = freq[0];
+    const auto fxi = freq[1];
+    const auto fyr = freq[2];
+    const auto fyi = freq[3];
+    data[0] = x_real * fxr - x_imag * fxi;
+    data[1] = x_real * fxi + x_imag * fxr;
+    data[2] = y_real * fyr - y_imag * fyi;
+    data[3] = y_real * fyi + y_imag * fyr;
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+
+  // part 3: 128-point Hadamard (2 local stages + 5 cross-lane shfl_xor stages).
+  // Same recipe as `fused_norm_rope_indexer`; see comments there for the
+  // butterfly invariants and the early-return safety argument. V3.2 omits the
+  // rotation (kHadamard=false): it is logit-preserving (H orthonormal, applied
+  // to both q and k), so dropping it only trades fp8 quant accuracy.
+  if constexpr (kHadamard) {
+    {
+      const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
+      data[0] = a0 + a1;
+      data[1] = a0 - a1;
+      data[2] = a2 + a3;
+      data[3] = a2 - a3;
+    }
+    {
+      const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
+      data[0] = a0 + a2;
+      data[1] = a1 + a3;
+      data[2] = a0 - a2;
+      data[3] = a1 - a3;
+    }
+#pragma unroll
+    for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
 #pragma unroll
       for (int i = 0; i < kVecSize; ++i) {
-        data[i] = cast<float>(input_vec[i]);
+        const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
+        data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
       }
     }
-
-    // part 2: rope on rope lanes only (4 elems / lane = 2 (real, imag) pairs).
-    if (is_rope_lane) {
-      const auto x_real = data[0];
-      const auto x_imag = data[1];
-      const auto y_real = data[2];
-      const auto y_imag = data[3];
-      const auto fxr = freq[0];
-      const auto fxi = freq[1];
-      const auto fyr = freq[2];
-      const auto fyi = freq[3];
-      data[0] = x_real * fxr - x_imag * fxi;
-      data[1] = x_real * fxi + x_imag * fxr;
-      data[2] = y_real * fyr - y_imag * fyi;
-      data[3] = y_real * fyi + y_imag * fyr;
-    }
-
-    // part 3: 128-point Hadamard (2 local stages + 5 cross-lane shfl_xor). V3.2
-    // omits the rotation (kHadamard=false): H is orthonormal and applied to both
-    // q and k, so dropping it only trades fp8 quant accuracy.
-    if constexpr (kHadamard) {
-      {
-        const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
-        data[0] = a0 + a1;
-        data[1] = a0 - a1;
-        data[2] = a2 + a3;
-        data[3] = a2 - a3;
-      }
-      {
-        const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
-        data[0] = a0 + a2;
-        data[1] = a1 + a3;
-        data[2] = a0 - a2;
-        data[3] = a1 - a3;
-      }
+    const float kHadamardScale = math::rsqrt(static_cast<float>(kHeadDim));
 #pragma unroll
-      for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
-#pragma unroll
-        for (int i = 0; i < kVecSize; ++i) {
-          const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
-          data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
-        }
-      }
-      const float kHadamardScale = math::rsqrt(static_cast<float>(kHeadDim));
-#pragma unroll
-      for (int i = 0; i < kVecSize; ++i)
-        data[i] *= kHadamardScale;
-    }
-
-    // part 4: dynamic fp8-e4m3 quant: warp abs_max -> scale -> pack -> store.
-    {
-      float local_max = math::abs(data[0]);
-#pragma unroll
-      for (int i = 1; i < kVecSize; ++i) {
-        local_max = math::max(local_max, math::abs(data[i]));
-      }
-      const auto abs_max = warp::reduce_max(local_max);
-      const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
-      const auto inv_scale = 1.0f / scale;
-      OutStorage result;
-      result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
-      result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
-
-      // q_fp8 row pointer: 128 fp8 / row = 32 OutStorage / row, one per lane.
-      auto out_row = static_cast<uint8_t*>(params.q_fp8) + work_id * kHeadDim;
-      result.store(out_row, lane_id);
-      // scale/weight are uniform across lanes; one lane writes the scalar, the
-      // other 31 same-address stores were waste. Bitwise identical.
-      if (lane_id == 0) params.weights_out[work_id] = weight_val * params.weight_scale * scale;
-    }
-  };
-
-  // Persistent grid-stride: the launcher caps the grid at one wave, so each
-  // warp loops over the remaining rows. When the grid already covers all rows
-  // the loop runs exactly once, so small/medium batch pays no extra cost.
-  const uint32_t warp_stride = gridDim.x * kNumWarps;
-  uint32_t work_id = blockIdx.x * kNumWarps + warp_id;
-  if (work_id >= total_works) return;
-  PDLWaitPrimary<kUsePDL>();
-  for (; work_id < total_works; work_id += warp_stride) {
-    process_row(work_id);
+    for (int i = 0; i < kVecSize; ++i)
+      data[i] *= kHadamardScale;
   }
-  PDLTriggerSecondary<kUsePDL>();
+
+  {
+    float local_max = math::abs(data[0]);
+#pragma unroll
+    for (int i = 1; i < kVecSize; ++i) {
+      local_max = math::max(local_max, math::abs(data[i]));
+    }
+    const auto abs_max = warp::reduce_max(local_max);
+    const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+    const auto inv_scale = 1.0f / scale;
+    OutStorage result;
+    result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
+    result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
+
+    // q_fp8 row pointer: 128 fp8 / row = 32 OutStorage / row, one per lane.
+    auto out_row = static_cast<uint8_t*>(params.q_fp8) + work_id * kHeadDim;
+    result.store(out_row, lane_id);
+    // scale/weight are uniform across lanes; one lane writes the scalar, the
+    // other 31 same-address stores were waste. Bitwise identical.
+    if (lane_id == 0) params.weights_out[work_id] = weight_val * params.weight_scale * scale;
+  }
 }
 
 template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
 struct FusedQIndexerRopeHadamardQuantKernel {
-  // 8 warps/block + resident-block cap 16: raises occupancy on small/medium
-  // batch and keeps the large-batch grid a clean 2-wave shape. Math unchanged.
+  // 8 warps/block (256 threads) + resident-block cap 16: the upstream 4-warp
+  // (128-thread) block ran the schedulers at ~38% occupancy on the top
+  // long_scoreboard stall; doubling warps/block lifts occupancy to ~86% and is
+  // where the win comes from. Overridable at compile time; math unchanged.
   static constexpr uint32_t kNumWarps =
 #ifdef Q_BLOCK_SIZE
       Q_BLOCK_SIZE / device::kWarpThreads;
@@ -702,22 +697,10 @@ struct FusedQIndexerRopeHadamardQuantKernel {
         .num_heads = num_heads,
     };
     const auto total_works = batch_size * num_heads;
-    // Cap the grid at one wave; the kernel's grid-stride loop mops up the rest.
-    // Blocks/SM comes from the driver (cudaOccupancyMaxActiveBlocksPerMultiprocessor),
-    // not hard-coded, so it tracks the real per-arch hardware limit. Single
-    // persistent instance, so one query suffices; when the grid already covers
-    // all rows the launch is just min(rows, wave) and the loop runs once.
-    const bool is_i32 = pos_dtype.is_type<int32_t>();
-    const auto k = is_i32 ? kernel<int32_t> : kernel<int64_t>;
-    int num_sm = 0;
-    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device_.unwrap().device_id);
-    int blocks_per_sm = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, k, kBlockSize, 0);
-    if (blocks_per_sm <= 0) blocks_per_sm = static_cast<int>(kBlocksPerSM);  // query-failed fallback
-    const uint32_t sm = static_cast<uint32_t>(num_sm > 0 ? num_sm : 1);
-    const uint32_t rows_blocks = div_ceil(total_works, kNumWarps);
-    const uint32_t wave_blocks = sm * static_cast<uint32_t>(blocks_per_sm);
-    const auto num_blocks = min(rows_blocks, wave_blocks);
+    const auto num_blocks = div_ceil(total_works, kNumWarps);
+    const auto k_int32 = kernel<int32_t>;
+    const auto k_int64 = kernel<int64_t>;
+    const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
     LaunchKernel(num_blocks, kBlockSize, device_.unwrap())  //
         .enable_pdl(kUsePDL)(k, params);
   }
