@@ -2,11 +2,12 @@ import logging
 from typing import Optional, Union
 
 import torch
-from sgl_kernel_npu.mamba.mamba_state_update_triton import (
-    conv_state_rollback,
-    move_intermediate_cache,
-)
 
+from sgl_kernel_npu.mamba.mamba_state_update_triton import conv_state_rollback
+
+from sglang.srt.hardware_backend.npu.kernels.speculative_state_scatter import (
+    speculative_state_scatter_npu,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -259,15 +260,15 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
-        dst_indices_tensor = state_indices_tensor.to(torch.int64)  # [N]
+        dst_indices_tensor = state_indices_tensor.to(torch.int32)
         src_indices_tensor = torch.arange(
             dst_indices_tensor.shape[0],
             device=dst_indices_tensor.device,
-            dtype=torch.int64,
+            dtype=torch.int32,
         )
-        last_steps = last_correct_step_indices.to(torch.int64)  # [N]
+        last_steps = last_correct_step_indices.to(torch.int32)
 
-        move_intermediate_cache(
+        speculative_state_scatter_npu(
             ssm_states,
             intermediate_state_cache,
             dst_indices_tensor,
@@ -276,12 +277,29 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         )
 
         draft_token_num = intermediate_state_cache.shape[2]
+        has_conv_snapshots = getattr(
+            self.linear_attn_backend,
+            "supports_speculative_conv_state_snapshots",
+            False,
+        )
+        if has_conv_snapshots:
+            intermediate_conv_window_cache = (
+                mamba_caches.intermediate_conv_window[0]
+            )
+            speculative_state_scatter_npu(
+                conv_states,
+                intermediate_conv_window_cache,
+                dst_indices_tensor,
+                src_indices_tensor,
+                last_steps,
+            )
+
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
-            mamba_track_indices = mamba_track_indices.to(torch.int64)
-            mamba_steps_to_track = mamba_steps_to_track.to(torch.int64)
+            mamba_track_indices = mamba_track_indices.to(torch.int32)
+            mamba_steps_to_track = mamba_steps_to_track.to(torch.int32)
 
-            move_intermediate_cache(
+            speculative_state_scatter_npu(
                 ssm_states,
                 intermediate_state_cache,
                 mamba_track_indices,
@@ -289,30 +307,41 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
                 mamba_steps_to_track,
             )
 
-            track_mask = mamba_steps_to_track >= 0
-            # Track conv state from the verify-time window before rolling back
-            # the working slot; NPU does not keep per-step conv intermediates.
-            track_indices = mamba_track_indices[track_mask]
-            if track_indices.numel() > 0:
-                conv_states[:, track_indices] = conv_states[
-                    :, dst_indices_tensor[track_mask]
-                ]
+            if has_conv_snapshots:
+                speculative_state_scatter_npu(
+                    conv_states,
+                    intermediate_conv_window_cache,
+                    mamba_track_indices,
+                    src_indices_tensor,
+                    mamba_steps_to_track,
+                )
+            else:
+                track_mask = mamba_steps_to_track >= 0
+                # Legacy NPU backends do not keep per-step conv intermediates.
+                # Preserve their verify-time window before rolling back the
+                # working slot.
+                track_indices = mamba_track_indices[track_mask]
+                if track_indices.numel() > 0:
+                    conv_states[:, track_indices] = conv_states[
+                        :, dst_indices_tensor[track_mask]
+                    ]
 
-        if dst_indices_tensor.numel() > 0:
-            conv_state_rollback(
-                conv_states,
-                dst_indices_tensor,
-                last_steps,
-                draft_token_num,
-            )
+        if not has_conv_snapshots:
+            if dst_indices_tensor.numel() > 0:
+                conv_state_rollback(
+                    conv_states,
+                    dst_indices_tensor,
+                    last_steps,
+                    draft_token_num,
+                )
 
-        if mamba_track_indices is not None and mamba_track_indices.numel() > 0:
-            conv_state_rollback(
-                conv_states,
-                mamba_track_indices,
-                mamba_steps_to_track,
-                draft_token_num,
-            )
+            if mamba_track_indices is not None and mamba_track_indices.numel() > 0:
+                conv_state_rollback(
+                    conv_states,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                    draft_token_num,
+                )
 
         return
 

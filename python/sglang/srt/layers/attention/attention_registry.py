@@ -460,7 +460,14 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             else:
                 linear_attn_backend = Mamba2AttnBackend(runner)
         elif kimi_linear_config(runner.model_config) is not None:
-            linear_attn_backend = KDAAttnBackend(runner)
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.attention.ascend_kda_backend import (
+                    AscendKDAAttnBackend,
+                )
+
+                linear_attn_backend = AscendKDAAttnBackend(runner)
+            else:
+                linear_attn_backend = KDAAttnBackend(runner)
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:
