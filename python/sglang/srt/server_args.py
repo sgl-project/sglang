@@ -1099,6 +1099,17 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = None
+    dcp_direct_q_gather: A[
+        bool,
+        Arg(
+            help="For MLA decode context parallelism, keep Query projection "
+            "weights and computation head-sharded, then publish each local BF16 "
+            "Query shard through NVLS multicast directly into the final complete "
+            "consumer-local Query buffer. This is an opt-in single-node NVIDIA "
+            "path and is mutually exclusive with replicated Q projection.",
+        ),
+        NS("parallel"),
+    ] = False
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -3819,6 +3830,24 @@ class ServerArgs:
                     "--dcp-replicate-q-proj only applies to the a2a/fi_a2a DCP "
                     "communication backend (it removes the head-dim Q all-gather); "
                     f"got --dcp-comm-backend={self.dcp_comm_backend}."
+                )
+        if self.dcp_direct_q_gather:
+            if self.dcp_size <= 1:
+                raise ValueError("--dcp-direct-q-gather requires --dcp-size > 1.")
+            if self.nnodes != 1:
+                raise ValueError(
+                    "--dcp-direct-q-gather currently requires a single-node "
+                    "DCP group."
+                )
+            if not is_cuda():
+                raise ValueError(
+                    "--dcp-direct-q-gather requires an NVIDIA CUDA platform "
+                    "with NVLS multicast support."
+                )
+            if self.dcp_replicate_q_proj is True:
+                raise ValueError(
+                    "--dcp-direct-q-gather and --dcp-replicate-q-proj are "
+                    "mutually exclusive."
                 )
 
     def _handle_load_balance_method(self):

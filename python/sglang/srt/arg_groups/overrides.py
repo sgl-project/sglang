@@ -398,7 +398,13 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'tokenspeed_mla', got {decode_backend!r}."
             )
 
-        if server_args.dcp_replicate_q_proj is None:
+        if server_args.dcp_direct_q_gather:
+            logger.info(
+                "Kimi-K3 DCP enables direct-final NVLS Query publication and "
+                "disables replicated Q projection."
+            )
+            overrides["dcp_replicate_q_proj"] = False
+        elif server_args.dcp_replicate_q_proj is None:
             logger.info("Kimi-K3 DCP enables replicated Q projection by default.")
             overrides["dcp_replicate_q_proj"] = True
 

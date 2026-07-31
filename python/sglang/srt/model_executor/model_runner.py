@@ -874,8 +874,71 @@ class ModelRunner:
         self.prefill_attention_backend_str = backends.prefill_attention_backend_str
         self.decode_attention_backend_str = backends.decode_attention_backend_str
 
-        if self.server_args.dcp_size > 1 and self.server_args.dcp_replicate_q_proj:
-            self._prepare_replicated_q_proj()
+        if self.server_args.dcp_size > 1 and self.use_mla_backend:
+            if self.server_args.dcp_direct_q_gather:
+                self._prepare_direct_q_gather()
+            elif self.server_args.dcp_replicate_q_proj:
+                self._prepare_replicated_q_proj()
+
+    def _prepare_direct_q_gather(self) -> None:
+        """Allocate persistent direct-final Query storage before graph capture."""
+        from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+            recommended_max_tokens,
+        )
+        from sglang.srt.layers.dcp.query import DCPDirectFinalQueryGatherer
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+        dcp_group = get_parallel().dcp_group
+        if dcp_group.world_size <= 1:
+            return
+
+        max_tokens = recommended_max_tokens(include_prefill=False, floor=1)
+        gatherers = {}
+        n_prepared = 0
+        for module in self.model.modules():
+            if not isinstance(module, DeepseekV2AttentionMLA):
+                continue
+            if module.w_kc is None:
+                continue
+
+            key = (
+                module.num_local_heads,
+                module.kv_lora_rank,
+                module.qk_rope_head_dim,
+                module.w_kc.device,
+            )
+            gatherer = gatherers.get(key)
+            if gatherer is None:
+                gatherer = DCPDirectFinalQueryGatherer(
+                    group=dcp_group,
+                    max_tokens=max_tokens,
+                    local_heads=module.num_local_heads,
+                    nope_dim=module.kv_lora_rank,
+                    rope_dim=module.qk_rope_head_dim,
+                    device=module.w_kc.device,
+                )
+                gatherers[key] = gatherer
+            module.dcp_direct_q_gatherer = gatherer
+            n_prepared += 1
+
+        if n_prepared == 0:
+            if self.ps.pp_size > 1:
+                logger.info(
+                    "dcp_direct_q_gather: this pipeline stage has no eligible "
+                    "MLA layers."
+                )
+                return
+            raise RuntimeError(
+                "--dcp-direct-q-gather was requested, but no eligible MLA layers "
+                "were found."
+            )
+        logger.info(
+            "dcp_direct_q_gather: prepared %d MLA layers with %d persistent "
+            "workspace layout(s), max_tokens=%d",
+            n_prepared,
+            len(gatherers),
+            max_tokens,
+        )
 
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of

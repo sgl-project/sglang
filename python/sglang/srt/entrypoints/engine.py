@@ -1499,23 +1499,24 @@ class Engine(EngineScoreMixin, EngineBase):
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
+    requires_nvls = server_args.enable_symm_mem or server_args.dcp_direct_q_gather
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
     # cuMem-based buffers and MNNVL transport. Default them on (user-set
     # values win; the symm-mem override below only fires when unset).
     if server_args.nnodes > 1 and is_mnnvl_fabric_device():
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         os.environ.setdefault("NCCL_MNNVL_ENABLE", "1")
-    if "NCCL_CUMEM_ENABLE" not in os.environ or server_args.enable_symm_mem:
-        os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
+    if "NCCL_CUMEM_ENABLE" not in os.environ or requires_nvls:
+        os.environ["NCCL_CUMEM_ENABLE"] = str(int(requires_nvls))
     if (
         "NCCL_NVLS_ENABLE" not in os.environ
         or server_args.enable_nccl_nvls
-        or server_args.enable_symm_mem
+        or requires_nvls
     ):
         os.environ["NCCL_NVLS_ENABLE"] = str(
-            int(server_args.enable_nccl_nvls or server_args.enable_symm_mem)
+            int(server_args.enable_nccl_nvls or requires_nvls)
         )
-    if "NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or server_args.enable_symm_mem:
+    if "NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or requires_nvls:
         # Note(wh): NCCL_GRAPH_MIXING_SUPPORT=0 can help improve performance for symmetric kernels.
         # details in https://github.com/NVIDIA/nccl-tests/issues/333#issuecomment-3103636985
         if server_args.dcp_size > 1:

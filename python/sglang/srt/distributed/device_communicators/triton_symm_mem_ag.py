@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Symmetric-memory ``multimem.st`` all-gather along the hidden (last) dim.
+"""Symmetric-memory ``multimem.st`` all-gather into a final hidden layout.
 
 Each rank stores its ``[T, H/TP]`` shard into a multicast buffer in one NVLink
 pass instead of an NCCL ring; ``create_state`` rendezvous once so launches are
-CUDA-graph capturable.
+CUDA-graph capturable. The split-input variant writes strided ``q_nope`` and
+``q_rope`` tensors directly into a packed per-head Query layout.
 """
 
 import logging
@@ -287,6 +288,84 @@ def _all_gather_kernel_inner(
     _blockwise_barrier(signal_pad_ptr, RANK, WORLD_SIZE, sem="acq_rel")
 
 
+@triton.jit
+def _all_gather_split_kernel_inner(
+    nope_ptr,
+    rope_ptr,
+    multicast_ptr,
+    signal_pad_ptr,
+    total_tokens,
+    nope_stride_t,
+    nope_stride_h,
+    rope_stride_t,
+    rope_stride_h,
+    LOCAL_HEADS: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    TOTAL_HIDDEN: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUMEL_PER_THREAD: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+) -> None:
+    """Publish split per-head Query inputs into one rank-major final row."""
+    _blockwise_barrier(signal_pad_ptr, RANK, WORLD_SIZE, sem="relaxed")
+    _sync_threads()
+
+    nope_chunks: tl.constexpr = NOPE_DIM // NUMEL_PER_THREAD
+    rope_chunks: tl.constexpr = ROPE_DIM // NUMEL_PER_THREAD
+    head_chunks: tl.constexpr = nope_chunks + rope_chunks
+    local_chunks: tl.constexpr = LOCAL_HEADS * head_chunks
+    total_hidden_chunks: tl.constexpr = TOTAL_HIDDEN // NUMEL_PER_THREAD
+    rank_offset_chunks: tl.constexpr = RANK * local_chunks
+    total_chunks = total_tokens * local_chunks
+
+    pid = tl.program_id(axis=0)
+    tid = _get_flat_tid()
+    block_start = pid * BLOCK_SIZE
+
+    while block_start < total_chunks:
+        chunk = block_start + tid
+        mask = chunk < total_chunks
+        token = chunk // local_chunks
+        local_col = chunk % local_chunks
+        head = local_col // head_chunks
+        head_col = local_col % head_chunks
+        is_nope = head_col < nope_chunks
+
+        nope_col = head_col * NUMEL_PER_THREAD
+        rope_col = (head_col - nope_chunks) * NUMEL_PER_THREAD
+        nope_addr = (
+            nope_ptr
+            + token * nope_stride_t
+            + head * nope_stride_h
+            + nope_col
+        )
+        rope_addr = (
+            rope_ptr
+            + token * rope_stride_t
+            + head * rope_stride_h
+            + rope_col
+        )
+        in_ptr = tl.where(is_nope, nope_addr, rope_addr).to(
+            tl.pointer_type(tl.uint64)
+        )
+
+        out_chunk = (
+            token * total_hidden_chunks + rank_offset_chunks + local_col
+        )
+        out_ptr = (
+            multicast_ptr.to(tl.int64).to(tl.pointer_type(tl.uint64))
+            + out_chunk * 2
+        )
+        x, y, z, w = _local_ld_128(in_ptr, mask)
+        _multimem_st_128(out_ptr, x, y, z, w, mask)
+        block_start += tl.num_programs(axis=0) * BLOCK_SIZE
+
+    _sync_threads()
+    _blockwise_barrier(signal_pad_ptr, RANK, WORLD_SIZE, sem="acq_rel")
+
+
 # ------------------------------------------------------------------------------
 # Public API
 # ------------------------------------------------------------------------------
@@ -411,6 +490,91 @@ def all_gather_inner(
     )
     output = state.comm_buff[:total_tokens, :tp_hidden_dim]
     return output.clone() if safe else output
+
+
+def all_gather_split_inner(
+    state: MultimemAllGatherState,
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+) -> torch.Tensor:
+    """Gather split ``[T,H,D]`` Query tensors directly into ``[T,H*P,Dn+Dr]``.
+
+    Unlike :func:`all_gather_inner`, this path accepts token/head-strided
+    inputs. It avoids first materializing a contiguous local Query concat.
+    """
+    assert q_nope.dtype == q_rope.dtype == torch.bfloat16, (
+        "Only bfloat16 is supported"
+    )
+    assert q_nope.ndim == q_rope.ndim == 3, (
+        "q_nope and q_rope must have shape [T,H,D]"
+    )
+    assert q_nope.shape[:2] == q_rope.shape[:2], (
+        "q_nope and q_rope must have matching token/head dimensions"
+    )
+    assert q_nope.device == q_rope.device == state.device, (
+        "q_nope, q_rope, and the symmetric workspace must share a device"
+    )
+    assert q_nope.stride(-1) == q_rope.stride(-1) == 1, (
+        "q_nope and q_rope must be contiguous in the last dimension"
+    )
+    assert q_nope.data_ptr() % 16 == q_rope.data_ptr() % 16 == 0, (
+        "q_nope and q_rope must have 16-byte-aligned base pointers"
+    )
+    assert all(
+        stride % _NUMEL_PER_THREAD == 0
+        for stride in (
+            q_nope.stride(0),
+            q_nope.stride(1),
+            q_rope.stride(0),
+            q_rope.stride(1),
+        )
+    ), "q_nope and q_rope token/head strides must preserve 16-byte alignment"
+
+    total_tokens, local_heads, nope_dim = q_nope.shape
+    rope_dim = q_rope.shape[-1]
+    head_dim = nope_dim + rope_dim
+    local_hidden = local_heads * head_dim
+    total_hidden = local_hidden * state.world_size
+    assert nope_dim % _NUMEL_PER_THREAD == 0, (
+        f"q_nope dim ({nope_dim}) must be a multiple of {_NUMEL_PER_THREAD}"
+    )
+    assert rope_dim % _NUMEL_PER_THREAD == 0, (
+        f"q_rope dim ({rope_dim}) must be a multiple of {_NUMEL_PER_THREAD}"
+    )
+    assert total_hidden <= state.hidden_dim, (
+        f"comm buffer too narrow: required={total_hidden} > "
+        f"state.hidden_dim={state.hidden_dim}"
+    )
+    assert 0 < total_tokens <= state.max_token_num, (
+        f"total_tokens={total_tokens} exceeds max_token_num={state.max_token_num}"
+    )
+
+    num_blocks, block_size, num_warps, numel_per_thread = _launch_config(
+        total_tokens * local_hidden
+    )
+    _all_gather_split_kernel_inner[(num_blocks, 1, 1)](
+        nope_ptr=q_nope,
+        rope_ptr=q_rope,
+        multicast_ptr=state.symm_mem_hdl.multicast_ptr,
+        signal_pad_ptr=state.symm_mem_hdl.signal_pad_ptrs_dev,
+        total_tokens=total_tokens,
+        nope_stride_t=q_nope.stride(0),
+        nope_stride_h=q_nope.stride(1),
+        rope_stride_t=q_rope.stride(0),
+        rope_stride_h=q_rope.stride(1),
+        LOCAL_HEADS=local_heads,
+        NOPE_DIM=nope_dim,
+        ROPE_DIM=rope_dim,
+        TOTAL_HIDDEN=state.hidden_dim,
+        BLOCK_SIZE=block_size,
+        NUMEL_PER_THREAD=numel_per_thread,
+        RANK=state.rank_in_group,
+        WORLD_SIZE=state.world_size,
+        num_warps=num_warps,
+    )
+    return state.comm_buff[:total_tokens, :total_hidden].view(
+        total_tokens, local_heads * state.world_size, head_dim
+    )
 
 
 # ------------------------------------------------------------------------------

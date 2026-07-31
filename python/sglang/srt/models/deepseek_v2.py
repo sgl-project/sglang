@@ -1770,6 +1770,9 @@ class DeepseekV2AttentionMLA(
         # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
         self.w_kc_qrep = None
         self.q_b_proj_qrep_weight = None
+        # Shared persistent direct-final Query workspace. The model runner
+        # installs it before CUDA-graph capture when explicitly requested.
+        self.dcp_direct_q_gatherer = None
 
         self.w_scale_k = None
         self.w_scale_v = None

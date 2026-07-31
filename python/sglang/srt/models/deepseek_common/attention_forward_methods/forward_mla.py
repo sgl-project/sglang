@@ -615,6 +615,7 @@ class DeepseekMLAForwardMixin:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
                         q_pe=q_pe,
+                        direct_gatherer=self.dcp_direct_q_gatherer,
                     )
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv

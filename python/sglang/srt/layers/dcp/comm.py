@@ -21,7 +21,7 @@ PR #25090 vs #14194):
 """
 
 import warnings
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -36,6 +36,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.runtime_context import get_parallel
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.dcp.query import DCPDirectFinalQueryGatherer
 
 
 def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
@@ -239,7 +242,11 @@ def all_gather_kv_cache_for_mha_extend(
 def all_gather_q_for_mla_decode(
     q_nope_out: torch.Tensor,
     q_pe: torch.Tensor,
+    direct_gatherer: Optional["DCPDirectFinalQueryGatherer"] = None,
 ):
+    if direct_gatherer is not None:
+        return direct_gatherer(q_nope_out, q_pe)
+
     group = get_parallel().dcp_group
     with use_symmetric_memory(group):
         # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
