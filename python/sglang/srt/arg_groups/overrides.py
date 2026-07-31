@@ -261,19 +261,14 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
 
 def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
     """Declare a load-time resolved field (model-file config overrides,
-    weight-resolved dtypes) on the published ``server_args``: resolution has
-    already materialized, so the declaration writes through, joining the
-    declaration stash for provenance and republish consistency."""
+    weight-resolved dtypes): validated against the resolvable whitelist, then
+    written to the config bags via ``get_context().override``; ``server_args``
+    stays the pristine startup record."""
     from sglang.srt.runtime_context import get_context
 
-    server_args = get_context().server_args
-    validate_declarations(server_args, [(source, dict(declared))])
-    override = getattr(server_args, "override", None)
-    if override is not None:
-        override(source, **declared)
-    else:
-        # Config-shaped fixtures without the mutation entry point.
-        _apply_fields(server_args, declared)
+    context = get_context()
+    validate_declarations(context.server_args, [(source, dict(declared))])
+    context.override(source, **declared)
 
 
 def collect_model_override_declarations(

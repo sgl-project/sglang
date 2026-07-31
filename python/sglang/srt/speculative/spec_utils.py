@@ -46,7 +46,7 @@ from sglang.srt.mem_cache.allocation import (
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_server_args
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -805,7 +805,7 @@ def _verify_commit_step_indices(
         return last_correct_step_indices, None
     seq_lens_pre_verify = batch.seq_lens
     seq_lens_post_verify = batch.seq_lens + accept_lens
-    mamba_track_interval = get_server_args().mamba_track_interval
+    mamba_track_interval = get_exec().mamba.mamba_track_interval
     to_track_mask = (
         seq_lens_pre_verify // mamba_track_interval
         != seq_lens_post_verify // mamba_track_interval
@@ -969,7 +969,7 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     if server_args.enable_mamba_extra_buffer_lazy():
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
-            server_args.mamba_track_interval,
+            get_exec().mamba.mamba_track_interval,
             server_args.max_speculative_num_draft_tokens,
         )
     if batch.spec_algorithm.is_dflash_family():

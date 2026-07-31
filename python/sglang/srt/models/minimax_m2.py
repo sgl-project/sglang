@@ -80,7 +80,13 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
     narrow_padded_param_and_loaded_weight,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_schedule,
+    get_server_args,
+)
 
 # get_bool_env_var is defined in sglang.srt.utils.common, not sglang.srt.distributed.
 # Importing from the wrong module causes this file to fail import, which prevents the
@@ -426,10 +432,10 @@ class MiniMaxM2QKRMSNorm:
         props = torch.cuda.get_device_properties(device)
         # probe the maximum tokens for one prefill
         server_args = get_server_args()
-        max_tokens = server_args.chunked_prefill_size
+        max_tokens = get_schedule().chunked_prefill_size
         if max_tokens is None:
             max_tokens = server_args.model_config.context_len
-        max_tokens = max(max_tokens, server_args.max_prefill_tokens)
+        max_tokens = max(max_tokens, get_schedule().max_prefill_tokens)
         logger.info(f"[AR] Using CustomAllReduceV2 for MiniMaxM2 with {max_tokens = }")
         ALIGN = 512
         # typically, this should not exceed 1M, since max_tokens is usually less than 16384
@@ -513,7 +519,7 @@ class MiniMaxM2MoE(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_local_experts
-            + get_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
