@@ -315,12 +315,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         input_ids: torch.Tensor,
         mask_dtype: torch.dtype,
     ):
-        """Prepare bidirectional attention masks for image tokens.
+        """Prepare compact bidirectional-attention metadata for image tokens.
 
         Gemma 4 uses bidirectional attention for image soft tokens
-        during prefill. Following the HF implementation, bidirectional attention
-        is only enabled within each individual image group (same-item
-        tokens), not across items.
+        in sliding-attention layers during prefill. Following the HF
+        implementation, bidirectional attention is only enabled within each
+        individual image group (same-item tokens), not across items.
         Currently only the TritonAttnBackend supports this.
 
         TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
@@ -333,25 +333,20 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             return
         assert forward_batch.forward_mode == ForwardMode.EXTEND
 
-        bidirectional_attn_masks_list = []
-        bidirectional_attn_mask_indptr = torch.zeros(
-            forward_batch.batch_size + 1, dtype=torch.int64, device=input_ids.device
-        )
-
+        image_span_indptr = [0]
+        image_span_begin = []
+        image_span_end = []
         split_images = []
+        extend_seq_lens = forward_batch.extend_seq_lens_cpu
+        if extend_seq_lens is None:
+            extend_seq_lens = forward_batch.extend_seq_lens.tolist()
+        extend_prefix_lens = forward_batch.extend_prefix_lens_cpu
+        if extend_prefix_lens is None:
+            extend_prefix_lens = forward_batch.extend_prefix_lens.tolist()
 
         for i in range(forward_batch.batch_size):
-            extend_seq_len = forward_batch.extend_seq_lens[i]
-            prefix_len = forward_batch.extend_prefix_lens[i]
-            bidirectional_attn_mask = torch.zeros(
-                extend_seq_len,
-                extend_seq_len + prefix_len,
-                dtype=mask_dtype,
-                device=input_ids.device,
-            )
-            # Start with causal mask
-            bidirectional_attn_mask.fill_(1)
-            bidirectional_attn_mask = bidirectional_attn_mask.tril(diagonal=prefix_len)
+            extend_seq_len = extend_seq_lens[i]
+            prefix_len = extend_prefix_lens[i]
 
             # HF only enables bidirectional attention for image tokens,
             # not video or audio (see create_causal_mask_mapping).
@@ -370,20 +365,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                                 im_begin >= prefix_len
                                 and im_end < prefix_len + extend_seq_len
                             ):
-                                bidirectional_attn_mask[
-                                    im_begin - prefix_len : im_end + 1 - prefix_len,
-                                    im_begin : im_end + 1,
-                                ] = 1
+                                image_span_begin.append(im_begin)
+                                image_span_end.append(im_end + 1)
                             elif (
                                 im_end >= prefix_len
                                 and im_begin < prefix_len + extend_seq_len
                             ):
                                 split_images.append((i, im_begin, im_end))
-
-            bidirectional_attn_masks_list.append(bidirectional_attn_mask.flatten())
-            bidirectional_attn_mask_indptr[i + 1] = (
-                bidirectional_attn_mask_indptr[i] + bidirectional_attn_mask.nelement()
-            )
+            image_span_indptr.append(len(image_span_begin))
         if split_images:
             num_split_images = len(split_images)
             logger.warning_once(
@@ -397,12 +386,17 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             logger.warning_once(
                 "Those images will receive causal attention. Disable chunked prefill (--chunked-prefill-size=-1) for full bidirectional attention.",
             )
-        if bidirectional_attn_masks_list:
-            bidirectional_attn_masks = torch.cat(bidirectional_attn_masks_list, dim=0)
-            get_attn_backend().forward_metadata.mask_indptr = (
-                bidirectional_attn_mask_indptr
+        if image_span_begin:
+            metadata = get_attn_backend().forward_metadata
+            metadata.image_span_indptr = torch.tensor(
+                image_span_indptr, dtype=torch.int64, device=input_ids.device
             )
-            get_attn_backend().forward_metadata.custom_mask = bidirectional_attn_masks
+            metadata.image_span_begin = torch.tensor(
+                image_span_begin, dtype=torch.int64, device=input_ids.device
+            )
+            metadata.image_span_end = torch.tensor(
+                image_span_end, dtype=torch.int64, device=input_ids.device
+            )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vt = self.vision_tower

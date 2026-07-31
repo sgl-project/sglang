@@ -111,6 +111,10 @@ class ForwardMetadata:
     # PHYSICAL full-attn write target for the unified pool (eager: translated tensor;
     # cuda-graph: capture-stable buffer view). None for non-unified pools.
     out_cache_loc_full_physical: Optional[torch.Tensor] = None
+    # Compact image-token spans for multimodal decoder attention. Ends are exclusive.
+    image_span_indptr: Optional[torch.Tensor] = None
+    image_span_begin: Optional[torch.Tensor] = None
+    image_span_end: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -312,9 +316,9 @@ class TritonAttnBackend(AttentionBackend):
         # And the real_num_token is num_seq in decoding phase.
         num_group = num_token // num_seq
 
-        assert (
-            num_group * num_seq == num_token
-        ), f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
+        assert num_group * num_seq == num_token, (
+            f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
+        )
 
         if (
             self.static_kv_splits or self.device_core_count <= 0
@@ -1411,6 +1415,7 @@ class TritonAttnBackend(AttentionBackend):
             page_size=self.page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            **self._get_image_spans_for_layer(layer),
         )
         return o
 
@@ -1546,6 +1551,19 @@ class TritonAttnBackend(AttentionBackend):
         current_scale = torch.nan_to_num(current_scale, nan=0.0, posinf=0.0, neginf=0.0)
         out = prefix_out * prefix_scale + current_out * current_scale
         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
+
+    def _get_image_spans_for_layer(self, layer: RadixAttention):
+        if layer.sliding_window_size is not None and layer.sliding_window_size >= 0:
+            return {
+                "image_span_indptr": self.forward_metadata.image_span_indptr,
+                "image_span_begin": self.forward_metadata.image_span_begin,
+                "image_span_end": self.forward_metadata.image_span_end,
+            }
+        return {
+            "image_span_indptr": None,
+            "image_span_begin": None,
+            "image_span_end": None,
+        }
 
     def _forward_extend_unified(
         self,
@@ -1685,6 +1703,7 @@ class TritonAttnBackend(AttentionBackend):
             page_size=self.page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            **self._get_image_spans_for_layer(layer),
         )
 
         return o
