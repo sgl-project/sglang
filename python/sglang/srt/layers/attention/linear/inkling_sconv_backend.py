@@ -80,13 +80,6 @@ class InklingShortConvMetadata(msgspec.Struct):
     # [B, conv_kernel - 1] input positions whose conv window feeds the prefix
     # cache. Extend only, and only when tracking is on.
     track_conv_indices: Optional[torch.Tensor] = None
-    # layer id -> that layer's pool views. Filled on first ask, not up front:
-    # ``mamba2_layer_cache`` waits on that layer's HiCache transfer, which has to
-    # stay just ahead of the layer's forward.
-    layer_caches: dict = {}
-
-    def layer_cache(self, layer_id: int):
-        return self.layer_caches[layer_id]
 
 
 class InklingShortConvAttnBackend(ShortConvAttnBackend):
@@ -101,7 +94,9 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        # conv[i] is [n_layers, n_slots, conv_kernel - 1, conv_dim].
+        # Pool-wide, bound at pool construction: conv[stream] is
+        # [n_layers, n_slots, conv_kernel - 1, conv_dim].
+        self._mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
         self.conv_state_len: int = self.conv_states_shape[2]
         self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
         # A plain table lookup is recordable; the unified pool's translate is an
@@ -496,14 +491,24 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
     def conv_state_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> InklingShortConvMetadata:
-        """The step's metadata, with ``layer_id``'s pool views resolved into it."""
-        del forward_batch
-        md = self.sconv_metadata
-        if layer_id not in md.layer_caches:
-            md.layer_caches[layer_id] = self.req_to_token_pool.mamba2_layer_cache(
-                layer_id
-            )
-        return md
+        """The step's metadata: resolved once during prep, so this is a pure read."""
+        del layer_id, forward_batch
+        return self.sconv_metadata
+
+    def sconv_state(self, *, layer_id: int, stream: int) -> torch.Tensor:
+        """``layer_id``'s conv state for one ``SconvType`` stream.
+
+        Indexed straight out of the pool tensor: a ``State`` would slice all six
+        streams (plus the spec windows) to hand back one of them, and the caller
+        always wants exactly one.
+        """
+        pool_layer = self.req_to_token_pool.mamba2_layer_index(layer_id)
+        return self._mamba_cache.conv[stream][pool_layer]
+
+    def sconv_intermediate_window(self, *, layer_id: int, stream: int) -> torch.Tensor:
+        """One stream's per-draft-token conv windows. TARGET_VERIFY only."""
+        pool_layer = self.req_to_token_pool.mamba2_layer_index(layer_id)
+        return self._mamba_cache.intermediate_conv_window[stream][pool_layer]
 
 
 class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):

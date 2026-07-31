@@ -1164,3 +1164,11 @@ class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
 
     def conv_state_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         return self.short_conv_backend.conv_state_metadata(layer_id, forward_batch)
+
+    def sconv_state(self, *, layer_id: int, stream: int) -> torch.Tensor:
+        return self.short_conv_backend.sconv_state(layer_id=layer_id, stream=stream)
+
+    def sconv_intermediate_window(self, *, layer_id: int, stream: int) -> torch.Tensor:
+        return self.short_conv_backend.sconv_intermediate_window(
+            layer_id=layer_id, stream=stream
+        )

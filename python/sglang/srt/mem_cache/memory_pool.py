@@ -1324,11 +1324,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
         / get_cpu_copy / load_cpu_copy)."""
         return mamba_indices
 
-    def mamba2_layer_cache(self, layer_id: int):
+    def mamba2_layer_index(self, layer_id: int) -> int:
+        """Pool-side index of ``layer_id``'s state, gated on its HiCache transfer.
+
+        For a caller that wants one specific state tensor: it indexes the pool
+        tensor itself instead of taking a ``State`` sliced over every field.
+        """
         assert layer_id in self.mamba_map
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
+        return self.mamba_map[layer_id]
+
+    def mamba2_layer_cache(self, layer_id: int):
+        return self.mamba_pool.mamba2_layer_cache(self.mamba2_layer_index(layer_id))
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
