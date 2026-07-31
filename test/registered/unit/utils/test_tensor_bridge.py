@@ -11,7 +11,7 @@ from unittest import mock
 import torch
 from packaging.version import Version
 
-from sglang.srt.utils.tensor_bridge import mlx_to_torch, torch_to_mlx
+from sglang.srt.utils.tensor_bridge import mlx_call, mlx_to_torch, torch_to_mlx
 from sglang.test.ci.ci_register import register_mlx_ci
 
 register_mlx_ci(est_time=2, suite="stage-a-unit-test-mlx")
@@ -71,20 +71,23 @@ class TestTensorBridgeMetalSharing(unittest.TestCase):
                 self.assertEqual(round_tripped.device.type, "mps")
                 self.assertTrue(torch.equal(round_tripped.cpu(), source.cpu()))
 
-    def test_torch_mps_to_mlx_shares_strided_bfloat16_storage(self):
+    def test_torch_mps_to_mlx_is_an_explicit_copy(self):
         import mlx.core as mx
 
         tensor = torch.arange(24, device="mps", dtype=torch.float32)
         tensor = tensor.to(torch.bfloat16).reshape(4, 6).T
+        expected = tensor.cpu().clone()
         array = torch_to_mlx(tensor)
 
         tensor.zero_()
         torch.mps.synchronize()
-        self.assertTrue(mx.all(array == 0).item())
+        mx.eval(array)
+        round_tripped = mlx_to_torch(array, device="cpu")
+        self.assertTrue(torch.equal(round_tripped, expected))
 
         del tensor
         gc.collect()
-        self.assertTrue(mx.all(array == 0).item())
+        self.assertTrue(torch.equal(round_tripped, expected))
 
     def test_mlx_to_torch_mps_shares_storage_and_lifetime(self):
         import mlx.core as mx
@@ -101,12 +104,44 @@ class TestTensorBridgeMetalSharing(unittest.TestCase):
         gc.collect()
         self.assertEqual(torch.count_nonzero(tensor).item(), 0)
 
-    def test_mps_round_trip_reuses_the_same_allocation(self):
+    def test_mps_round_trip_uses_independent_input_storage(self):
         tensor = torch.arange(16, device="mps", dtype=torch.float32)
 
         round_tripped = mlx_to_torch(torch_to_mlx(tensor))
 
-        self.assertEqual(round_tripped.data_ptr(), tensor.data_ptr())
+        self.assertNotEqual(round_tripped.data_ptr(), tensor.data_ptr())
+
+    def test_mlx_call_keeps_zero_copy_borrows_alive(self):
+        import mlx.core as mx
+
+        tensor = torch.randn(2, 8, device="mps", dtype=torch.float32)
+        weight = torch.randn(8, device="mps", dtype=torch.float32)
+        before = tensor.cpu().clone()
+        result = mlx_call(lambda x, w: mx.fast.rms_norm(x, w, 1e-6), tensor, weight)
+
+        torch.mps.synchronize()
+        self.assertTrue(torch.equal(tensor.cpu(), before))
+        self.assertNotEqual(result.data_ptr(), tensor.data_ptr())
+        reference = torch.nn.functional.rms_norm(before, (8,), weight.cpu(), 1e-6)
+        torch.testing.assert_close(result.cpu(), reference)
+
+    def test_mlx_call_borrows_noncontiguous_view_for_call_scope(self):
+        import mlx.core as mx
+
+        base = torch.randn(4, 6, device="mps", dtype=torch.bfloat16)
+        tensor = base.T
+        weight = torch.randn(4, device="mps", dtype=torch.bfloat16)
+        base_before = base.cpu().clone()
+        tensor_before = tensor.cpu().clone()
+
+        result = mlx_call(lambda x, w: mx.fast.rms_norm(x, w, 1e-6), tensor, weight)
+
+        torch.mps.synchronize()
+        self.assertTrue(torch.equal(base.cpu(), base_before))
+        reference = torch.nn.functional.rms_norm(
+            tensor_before, (4,), weight.cpu(), 1e-6
+        )
+        torch.testing.assert_close(result.cpu(), reference)
 
     def test_bridge_detaches_autograd_and_synchronizes_producers(self):
         import mlx.core as mx
