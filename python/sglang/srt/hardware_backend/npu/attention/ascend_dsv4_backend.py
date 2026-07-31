@@ -6,13 +6,14 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch_npu
 import torch.nn.functional as F
 
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
-from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
-from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -64,7 +65,25 @@ def _overlap_transform(
     return out
 
 
-class CompressorAscendBackendMixin(CompressorBackendMixin):
+def _get_kv_indices(
+    forward_batch: ForwardBatch,
+    kv_len: int,
+    page_table: torch.Tensor,
+    req_idx: int,
+    seqlen: int,
+) -> torch.Tensor:
+    logic_start = max(0, seqlen - kv_len)
+    logic_end = seqlen
+    page_size = get_attn_backend().page_size
+    if page_size == 1:
+        return page_table[req_idx, logic_start:logic_end]
+    logic_pos = torch.arange(logic_start, logic_end, device=page_table.device)
+    block_id = logic_pos // page_size
+    offset_in_block = logic_pos % page_size
+    return page_table[req_idx, block_id] * page_size + offset_in_block
+
+
+class CompressorAscendBackendMixin:
 
     @staticmethod
     def _to_cpu_int_list(values) -> Optional[list[int]]:
@@ -372,7 +391,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         x: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
-        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
         ratio = compressor.ratio
         coff = 1 + int(compressor.overlap)
@@ -469,7 +487,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
           completes a ratio-aligned chunk, gather the chunk (overlap: 2*ratio, else
           ratio), ape-weighted softmax + sum, and write via ``set_compress_buffer``.
         """
-        import torch_npu  # local: NPU-only, used for npu_rotary_mul below
 
         positions = forward_batch.positions
         ratio, overlap, d = compressor.ratio, compressor.overlap, compressor.head_dim
@@ -723,7 +740,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             pos_out = torch.cat(kv_out_positions, dim=0)
             kv_out = compressor.norm(kv_out)
             rope_dim = compressor.rope_head_dim
-            from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
             cos, sin = Dsv4NpuRoPE.for_freqs(
                 compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
@@ -789,8 +805,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         kv_scale: Optional[torch.Tensor] = None
         li_kv_dtype = getattr(compressor, "li_kv_dtype", "bf16")
         if li_kv_dtype == "int8" and compressor.is_in_indexer:
-            import torch_npu
-
             kv, kv_scale = torch_npu.npu_dynamic_quant(kv)
             kv_scale = kv_scale.to(torch.float16)
 
@@ -832,40 +846,95 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         )
 
 
-class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
+class C4IndexerAscendBackendMixin:
 
     def init_forward_metadata_indexer(self, core_attn_metadata):
         # li_quant_metadata is built in _compute_kernel_metadata; None satisfies the mixin contract
         return None
 
-    def forward_c4_indexer_npu(
+    def _forward_prepare(
         self,
         c4_indexer,
         x: torch.Tensor,
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
-        skip_compressor: bool = False,
-    ) -> torch.Tensor:
-        assert (
-            not skip_compressor
-        ), "skip_compressor=True is not supported by forward_c4_indexer_npu"
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q = self._compute_q_npu(c4_indexer, q_lora, forward_batch.positions)
+        weights, _ = c4_indexer.weights_proj(x)
+        weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
+        c4_indexer.compressor(x, forward_batch)
+        return q, weights
 
+    def _can_use_indexer_multi_stream(self) -> bool:
+        return envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+
+    def _get_npu_indexer_q_stream(self):
+        s = getattr(self, "_npu_indexer_q_stream_obj", None)
+        if s is None:
+            s = torch.npu.Stream()
+            self._npu_indexer_q_stream_obj = s
+        return s
+
+    def _forward_prepare_multi_stream(
+        self,
+        c4_indexer,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        forward_batch: ForwardBatch,
+        q_lora_ready,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from sglang.srt.hardware_backend.npu.utils import (
+            get_indexer_weight_stream,
+        )
+
+        cur = torch.npu.current_stream()
+        stream_q = self._get_npu_indexer_q_stream()
+        stream_w = get_indexer_weight_stream()
+
+        # q_lora / x are produced on cur; make them visible to the workers.
+        stream_q.wait_stream(cur)
+        stream_w.wait_stream(cur)
+
+        # C: route-KV write stays on cur (fused compressor -> c4_indexer_kv_pool).
+        # It must precede the topk read; that ordering is cur's own program order
+        # (C is queued before the joins below), so no explicit sync is needed.
+        c4_indexer.compressor(x, forward_batch)
+
+        # B: weights_proj (small GEMM) + scale on stream_w. Hidden behind the
+        # heavier C (cur) and A (stream_q); finishes early, never gates them.
+        with torch.npu.stream(stream_w):
+            weights = c4_indexer.weights_proj(x)[0]
+            weights = weights * (
+                c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5
+            )
+            weights.record_stream(stream_w)
+
+        # A: q (wq_b + rope + hadamard) on stream_q.
+        with torch.npu.stream(stream_q):
+            if q_lora_ready is not None:
+                stream_q.wait_event(q_lora_ready)
+            q = self._compute_q_npu(c4_indexer, q_lora, forward_batch.positions)
+            q.record_stream(stream_q)
+
+        cur.wait_stream(stream_w)
+        cur.wait_stream(stream_q)
+        return q, weights
+
+    def _forward_indexer(
+        self,
+        c4_indexer,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
         ratio = c4_indexer.compressor.ratio
         device = x.device
-        self._ensure_npu_c4_indexer(c4_indexer, device)
         bs = x.shape[0]
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
         )
-
-        q = self._compute_q_npu(c4_indexer, q_lora, forward_batch.positions)
-
-        weights, _ = c4_indexer.weights_proj(x)
-        weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
-
-        if not skip_compressor:
-            c4_indexer.compressor(x, forward_batch)
 
         li_kv_dtype = getattr(c4_indexer.compressor, "li_kv_dtype", "bf16")
         if li_kv_dtype == "int8":
@@ -958,7 +1027,6 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
     def _compute_q_npu(
         self, c4_indexer, q_lora: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
         bs = q_lora.shape[0]
         q, _ = c4_indexer.wq_b(q_lora)
@@ -994,8 +1062,6 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         weights: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        import torch_npu
-
         q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
         fm = self.forward_metadata
         li_quant_metadata = fm.kernel_metadata["li_quant_metadata"]
@@ -1034,8 +1100,20 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        topk_idxs = self.forward_c4_indexer_npu(
-            c4_indexer, x, q_lora, forward_batch, skip_compressor=skip_compressor
+        assert (
+            not skip_compressor
+        ), "skip_compressor=True is not supported on the NPU indexer path"
+        self._ensure_npu_c4_indexer(c4_indexer, x.device)
+        if self._can_use_indexer_multi_stream():
+            q, weights = self._forward_prepare_multi_stream(
+                c4_indexer, x, q_lora, forward_batch, q_lora_ready
+            )
+        else:
+            q, weights = self._forward_prepare(
+                c4_indexer, x, q_lora, forward_batch
+            )
+        topk_idxs = self._forward_indexer(
+            c4_indexer, x, q, weights, forward_batch
         )
         self.forward_metadata.c4_topk_indices = topk_idxs
 
@@ -1504,15 +1582,6 @@ class DeepseekV4AscendAttnBackend(
                 [torch.zeros(1, dtype=torch.int32, device=device), actual_q],
                 dim=0,
             )
-        elif forward_batch.forward_mode.is_idle():
-            B = forward_batch.batch_size
-            fm.actual_seq_lengths_q = torch.arange(
-                1, B + 1, dtype=torch.int32, device=device
-            )
-            fm.actual_seq_lengths_q_pa = torch.arange(
-                0, B + 1, dtype=torch.int32, device=device
-            )
-            fm.actual_seq_lengths_kv = torch.ones(B, dtype=torch.int32, device=device)
         else:
             fm.actual_seq_lengths_q = None
             fm.actual_seq_lengths_q_pa = None
@@ -1658,12 +1727,12 @@ class DeepseekV4AscendAttnBackend(
                 layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
             )
         if compress_ratio == 0:
-            return self._forward_dense(q, layer, forward_batch, attn_sink)
+            return self._forward_swa(q, layer, forward_batch, attn_sink)
         return self._forward_compressed(
             q, layer, forward_batch, attn_sink, compress_ratio
         )
 
-    def _forward_dense(
+    def _forward_swa(
         self,
         q: torch.Tensor,
         layer: RadixAttention,
@@ -1940,24 +2009,6 @@ class DeepseekV4AscendAttnBackend(
         self._fill_verify_positions_cmp_padding_one(
             positions, c128_positions, 128, seq_lens_cpu, n_draft=n_draft
         )
-
-
-def _get_kv_indices(
-    forward_batch: ForwardBatch,
-    kv_len: int,
-    page_table: torch.Tensor,
-    req_idx: int,
-    seqlen: int,
-) -> torch.Tensor:
-    logic_start = max(0, seqlen - kv_len)
-    logic_end = seqlen
-    page_size = get_attn_backend().page_size
-    if page_size == 1:
-        return page_table[req_idx, logic_start:logic_end]
-    logic_pos = torch.arange(logic_start, logic_end, device=page_table.device)
-    block_id = logic_pos // page_size
-    offset_in_block = logic_pos % page_size
-    return page_table[req_idx, block_id] * page_size + offset_in_block
 
 
 class DeepseekV4AscendMultiStepDraftBackend:
