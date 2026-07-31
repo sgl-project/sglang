@@ -2120,6 +2120,8 @@ class ConfigureLoggingReq(BaseReq, kw_only=True):
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
     dump_requests_exclude_meta_keys: Optional[List[str]] = None
+    # Fraction of requests to dump, in (0, 1]. 1.0 dumps every request.
+    dump_requests_sample_fraction: Optional[float] = None
 
 
 class OpenSessionReqInput(BaseReq, kw_only=True):

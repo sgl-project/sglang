@@ -41,6 +41,17 @@ if __name__ == "__main__":
     )
     parser.add_argument("--dump-requests-threshold", type=int, default=1000)
     parser.add_argument(
+        "--dump-requests-sample-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Fraction of requests to dump, in (0, 1]. Sampling is a "
+            "deterministic hash of the request id, so a given request is kept "
+            "or dropped consistently. If not set, the server default (1.0, "
+            "dump every request) is used."
+        ),
+    )
+    parser.add_argument(
         "--dump-requests-exclude-meta-keys",
         type=str,
         default=None,
@@ -59,6 +70,8 @@ if __name__ == "__main__":
         "dump_requests_threshold": args.dump_requests_threshold,
         "log_level": args.log_level,
     }
+    if args.dump_requests_sample_fraction is not None:
+        payload["dump_requests_sample_fraction"] = args.dump_requests_sample_fraction
     if args.dump_requests_exclude_meta_keys is not None:
         payload["dump_requests_exclude_meta_keys"] = [
             k.strip()

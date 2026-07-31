@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -358,6 +359,20 @@ def _build_flat_input_top_logprobs_fields_from_arrays(
     return fields
 
 
+def _request_in_dump_sample(rid: str, sample_fraction: float) -> bool:
+    """Decide whether a request falls inside the dump sample.
+
+    Hashes the rid into [0, 1) instead of drawing randomness so the decision
+    is deterministic: the same rid is kept or dropped consistently across
+    retries and across workers sharing a dump folder.
+    """
+    if sample_fraction >= 1.0:
+        return True
+    digest = hashlib.sha256(str(rid).encode("utf-8")).digest()
+    bucket = int.from_bytes(digest[:8], "big") / 2**64
+    return bucket < sample_fraction
+
+
 class InputFormat(Enum):
     """Input format types for tokenization handling."""
 
@@ -594,6 +609,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Dumping
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
+        self.dump_requests_sample_fraction = 1.0  # By default dump every request
         self.dump_requests_exclude_meta_keys: List[str] = [
             "routed_experts",
             "hidden_states",
@@ -2142,6 +2158,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.dump_requests_exclude_meta_keys = list(
                 obj.dump_requests_exclude_meta_keys
             )
+        if obj.dump_requests_sample_fraction is not None:
+            # Like the log_level check below, let the exception propagate to
+            # the caller; only valid values are applied.
+            if not 0.0 < obj.dump_requests_sample_fraction <= 1.0:
+                raise ValueError(
+                    "dump_requests_sample_fraction must be in (0, 1], got "
+                    f"{obj.dump_requests_sample_fraction}"
+                )
+            self.dump_requests_sample_fraction = obj.dump_requests_sample_fraction
         if obj.crash_dump_folder is not None:
             self.crash_dump_folder = obj.crash_dump_folder
         if obj.log_level is not None:
@@ -2919,6 +2944,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
+        if not _request_in_dump_sample(
+            state.obj.rid, self.dump_requests_sample_fraction
+        ):
+            return
         if self.dump_requests_exclude_meta_keys and isinstance(
             out_dict.get("meta_info"), dict
         ):
