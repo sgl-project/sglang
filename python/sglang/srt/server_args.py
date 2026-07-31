@@ -7712,12 +7712,14 @@ class ServerArgs:
         # are the RESOLVED ids from _resolved_attention_backends: "flashinfer" is
         # FlashInferMLAAttnBackend for an MLA model, "trtllm_mla" the trtllm
         # decode kernel; "cutedsl_mla" and "tokenspeed_mla" subclass
-        # TRTLLMMLABackend and inherit its dense read/write path.
+        # TRTLLMMLABackend and inherit its dense read/write path; "fa3" remaps its
+        # page_table (in-kernel for captured decode, one funnel for eager).
         # flashmla / cutlass_mla share the create_flashmla block-table path and
         # can be added the same way once exercised.
         if self.enable_unified_memory and self.use_mla_backend():
             allowed_full = {
                 "triton",
+                "fa3",
                 "trtllm_mla",
                 "flashinfer",
                 "cutedsl_mla",
