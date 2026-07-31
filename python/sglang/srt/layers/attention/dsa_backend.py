@@ -362,6 +362,12 @@ class DeepseekSparseAttnBackend(
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
+        # Bumped once per forward batch. The aiter extend path plans its work
+        # buffers lazily on the first attention layer of a batch and reuses the
+        # plan for the rest, so it needs a cheap "is this still the same batch"
+        # test that does not depend on tensor identity.
+        self.dsa_forward_serial = 0
+
         if _is_hip:
             max_bs = model_runner.req_to_token_pool.size
 
@@ -389,6 +395,13 @@ class DeepseekSparseAttnBackend(
             self.aiter_dsa_kv_last_page_lens = None
             self.aiter_dsa_work_metadata = None
             self.aiter_sparse_mla_metadata = None
+            # Extend uses its own work buffers: they are sized by the token
+            # count of a prefill chunk, which is far larger than a decode batch
+            # and is not known until the first prefill arrives.
+            self.aiter_sparse_mla_extend_metadata = None
+            self.aiter_sparse_mla_extend_kv_indices = None
+            self.aiter_sparse_mla_extend_plan_serial = -1
+            self.aiter_sparse_mla_identity_scale = None
 
             if (
                 self.dsa_prefill_impl == "aiter" or self.dsa_decode_impl == "aiter"
@@ -398,6 +411,17 @@ class DeepseekSparseAttnBackend(
                     batch_size=max_bs,
                     q_dtype=torch.bfloat16,
                     kv_dtype=fp8_dtype,
+                )
+                # asm_mla.cu rejects fp8 Q unless BOTH scales are given, and the
+                # fused rope/cache path quantizes Q and KV against a unit scale,
+                # so the value is a constant 1.0. Allocating it per layer costs
+                # 2 fill launches x every layer x every forward, which measured
+                # +0.62 ms per decode iteration -- more than the aiter kernel
+                # itself saves. One tensor, allocated once, is shared by every
+                # layer and by both the decode and extend paths; nothing ever
+                # writes to it.
+                self.aiter_sparse_mla_identity_scale = torch.ones(
+                    (), dtype=torch.float32, device=self.device
                 )
 
             if (
@@ -415,16 +439,6 @@ class DeepseekSparseAttnBackend(
                     q_dtype=fp8_dtype,
                     kv_dtype=fp8_dtype,
                     device=self.device,
-                )
-                # asm_mla.cu rejects fp8 Q unless BOTH scales are given, and the
-                # fused rope/cache path quantizes Q and KV against a unit scale,
-                # so the value is a constant 1.0. Allocating it per layer costs
-                # 2 fill launches x every layer x every forward, which measured
-                # +0.62 ms per decode iteration -- more than the aiter kernel
-                # itself saves. One tensor, allocated once, is shared by all
-                # layers; nothing ever writes to it.
-                self.aiter_sparse_mla_identity_scale = torch.ones(
-                    (), dtype=torch.float32, device=self.device
                 )
 
         # Speculative decoding
@@ -664,6 +678,76 @@ class DeepseekSparseAttnBackend(
         )
         return self.aiter_sparse_mla_metadata
 
+    def _ensure_aiter_sparse_mla_extend_plan(
+        self,
+        cu_seqlens_q: torch.Tensor,
+        sparse_kv_indptr: torch.Tensor,
+        num_tokens: int,
+        q_dtype: torch.dtype,
+    ) -> AiterSparseMLADecodeMetadata:
+        """Plan aiter's persistent sparse work for one *prefill* batch.
+
+        Sparse prefill runs the same kernel pair as decode, with every query
+        token presented as its own length-1 sequence, so the only difference
+        from :py:meth:`_build_aiter_sparse_mla_metadata` is capacity: the batch
+        dimension here is the chunk's token count, not the request count.
+
+        Planning happens on the first attention layer of a batch rather than in
+        ``init_forward_metadata`` because the plan is dtype-specific and Q's
+        dtype is decided by the rope/cache path, not by the backend. Every
+        later layer of the same batch reuses it -- the whole point, since
+        planning per layer is what made the aiter path slower than TileLang.
+        Prefill is never CUDA-graph captured, so allocating here is safe.
+        """
+        metadata = self.aiter_sparse_mla_extend_metadata
+        if metadata is None or not metadata.matches(
+            batch_size=num_tokens,
+            max_seqlen_q=1,
+            num_heads_padded=self.num_head_padded,
+            q_dtype=q_dtype,
+            kv_dtype=fp8_dtype,
+        ):
+            # Round up so a slightly larger chunk does not trigger a realloc.
+            capacity = max(1 << (num_tokens - 1).bit_length(), 1024)
+            metadata = alloc_sparse_mla_decode_metadata(
+                batch_size=capacity,
+                max_seqlen_q=1,
+                num_heads_padded=self.num_head_padded,
+                q_dtype=q_dtype,
+                kv_dtype=fp8_dtype,
+                device=self.device,
+            )
+            self.aiter_sparse_mla_extend_metadata = metadata
+            self.aiter_sparse_mla_extend_plan_serial = -1
+
+        if self.aiter_sparse_mla_extend_plan_serial != self.dsa_forward_serial:
+            build_sparse_mla_decode_metadata(
+                metadata,
+                cu_seqlens_q,
+                sparse_kv_indptr,
+                bs=num_tokens,
+                max_seqlen_q=1,
+            )
+            self.aiter_sparse_mla_extend_plan_serial = self.dsa_forward_serial
+
+        return metadata
+
+    def _aiter_sparse_mla_extend_kv_indices(self, num_tokens: int) -> torch.Tensor:
+        """Scratch for this layer's flattened top-k slot list.
+
+        ``self.kv_indices`` is sized for a decode batch (one row per request);
+        a prefill chunk needs one row per token, which is a different order of
+        magnitude.
+        """
+        needed = num_tokens * self.dsa_index_topk
+        buffer = self.aiter_sparse_mla_extend_kv_indices
+        if buffer is None or buffer.numel() < needed:
+            self.aiter_sparse_mla_extend_kv_indices = torch.empty(
+                needed, dtype=torch.int32, device=self.device
+            )
+            buffer = self.aiter_sparse_mla_extend_kv_indices
+        return buffer[:needed]
+
     def _prepare_aiter_dsa_decode_metadata(
         self,
         qo_indptr: torch.Tensor,
@@ -841,6 +925,9 @@ class DeepseekSparseAttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        # Invalidates the aiter extend work plan: whatever the previous batch
+        # planned no longer describes this one.
+        self.dsa_forward_serial += 1
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
@@ -2261,6 +2348,7 @@ class DeepseekSparseAttnBackend(
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 layer=layer,
+                metadata=metadata,
             )
         else:
             raise ValueError(
@@ -3106,88 +3194,105 @@ class DeepseekSparseAttnBackend(
         kv_cache: torch.Tensor,
         page_table_1: torch.Tensor,
         layer: RadixAttention,
+        metadata: DSAMetadata,
     ) -> torch.Tensor:
+        """Sparse MLA prefill through aiter's persistent kernel pair.
+
+        Sparse attention gives every query token its own top-k KV list, so a
+        prefill chunk is handed to the kernel as ``num_tokens`` independent
+        length-1 sequences -- the same shape decode already runs, just wider.
+        That is why this shares the decode entry point rather than calling
+        ``mla_prefill_fwd``, which has no fp8 scale or persistent-work
+        parameters at all.
+
+        Only the top-k gather is per layer; the work plan and every index
+        buffer are shared across the batch.
+        """
         num_tokens = q_all.shape[0]
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
-
-        if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
 
         if self.need_pad_heads:
             q_kernel = q.view(
                 -1, layer.tp_q_head_num, layer.head_dim
             ).repeat_interleave(self.head_repeat_factor, dim=1)
-            o_kernel = q.new_empty(
-                (
-                    num_tokens,
-                    layer.tp_q_head_num * self.head_repeat_factor,
-                    layer.v_head_dim,
-                )
-            )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-            o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        q_scale = None
-        kv_scale = None
-        aiter_persistent_kwargs = {}
-        if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
-
-        non_minus1_mask = page_table_1 != -1
-        non_minus1_counts = non_minus1_mask.sum(dim=1)
-
-        kv_indptr = torch.zeros(num_tokens + 1, dtype=torch.int32, device=self.device)
-        kv_indptr[1:] = torch.cumsum(non_minus1_counts, dim=0)
-
-        # Allocate kv_indices with upper-bound size (num_tokens * topk)
-        topk = page_table_1.shape[1]
-        kv_indices = torch.zeros(
-            num_tokens * topk, dtype=torch.int32, device=self.device
+        # dsa_cu_seqlens_k is the per-token context length clamped to
+        # index_topk, cumulatively summed -- exactly the sparse indptr this
+        # kernel wants, and already built for the batch. dsa_cu_seqlens_q is the
+        # matching arange, one query per row.
+        sparse_kv_indptr = metadata.dsa_cu_seqlens_k[: num_tokens + 1]
+        cu_seqlens_q = metadata.dsa_cu_seqlens_q[: num_tokens + 1]
+        sparse_kv_indices = self._aiter_sparse_mla_extend_kv_indices(num_tokens)
+        get_valid_kv_indices(
+            page_table_1, sparse_kv_indptr, sparse_kv_indices, num_tokens
         )
 
-        # Use get_valid_kv_indices kernel to extract valid indices
-        get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, num_tokens)
-
-        # Build cu_seqlens_q for extend: each token is treated as seq_len_q=1
-        cu_seqlens_q = torch.arange(
-            0, num_tokens + 1, dtype=torch.int32, device=self.device
-        )
-        kv_last_page_lens = cu_seqlens_q
-        if kv_cache.dtype == fp8_dtype:
-            aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
-                cu_seqlens_q,
-                kv_indptr,
-                num_tokens,
-                1,
-                q_kernel.dtype,
-                kv_cache.dtype,
+        if kv_cache.dtype != fp8_dtype:
+            # The persistent path is fp8-only; fall back to aiter's plain
+            # prefill kernel, which takes neither scales nor a work plan.
+            o = torch.empty(
+                (num_tokens, self.num_head_padded, layer.v_head_dim),
+                dtype=q_kernel.dtype,
+                device=q.device,
             )
-            kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
+            mla_prefill_fwd(
+                q_kernel,
+                kv_cache.view(-1, 1, 1, layer.head_dim),
+                o,
+                cu_seqlens_q,
+                sparse_kv_indptr,
+                sparse_kv_indices,
+                torch.ones(num_tokens, dtype=torch.int32, device=self.device),
+                1,
+                layer.scaling,
+                layer.logit_cap,
+                None,
+            )
+            return (
+                o[:, :: self.head_repeat_factor, :]
+                if self.need_pad_heads
+                else o.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
+            )
 
-        # TODO support more forward_mode
-        mla_decode_fwd(
+        out_dtype = aiter_sparse_mla_out_dtype(q_kernel.dtype)
+        o_kernel = torch.empty(
+            (num_tokens, self.num_head_padded, layer.v_head_dim),
+            dtype=out_dtype,
+            device=q.device,
+        )
+
+        # asm_mla.cu rejects fp8 Q unless BOTH scales are given. Both point at
+        # the same preallocated unit scalar -- see __init__ for why it is not
+        # built here.
+        identity_scale = self.aiter_sparse_mla_identity_scale
+        q_scale = identity_scale if q_kernel.dtype.itemsize == 1 else None
+
+        sparse_mla_decode(
             q_kernel,
-            kv_cache.view(-1, 1, 1, layer.head_dim),
+            kv_cache,
             o_kernel,
             cu_seqlens_q,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            1,  # max_seq_len_q = 1 for per-token attention
+            sparse_kv_indptr,
+            sparse_kv_indices,
+            self._ensure_aiter_sparse_mla_extend_plan(
+                cu_seqlens_q,
+                sparse_kv_indptr,
+                num_tokens=num_tokens,
+                q_dtype=q_kernel.dtype,
+            ),
+            bs=num_tokens,
+            max_seqlen_q=1,
             sm_scale=layer.scaling,
-            logit_cap=layer.logit_cap,
             q_scale=q_scale,
-            kv_scale=kv_scale,
-            **aiter_persistent_kwargs,
+            kv_scale=identity_scale,
         )
 
         if self.need_pad_heads:
-            o = o_kernel[:, :: self.head_repeat_factor, :]
+            return o_kernel[:, :: self.head_repeat_factor, :]
 
-        return o
+        return o_kernel.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
     def _forward_trtllm(
         self,
