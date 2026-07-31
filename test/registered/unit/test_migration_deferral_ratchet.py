@@ -23,7 +23,7 @@ _TEST_ROOT = Path(__file__).resolve().parents[2]
 
 _MARKER = "config-namespace migration"
 
-_BASELINE = 15
+_BASELINE = 1
 
 
 class TestMigrationDeferralRatchet(CustomTestCase):
