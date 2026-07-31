@@ -4,6 +4,7 @@ import importlib.util
 import os
 import subprocess
 import sys
+import types
 import unittest
 from unittest import mock
 
@@ -51,6 +52,46 @@ assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
         self.assertTrue(runtime._version_at_least("0.32.0", minimum))
         self.assertTrue(runtime._version_at_least("0.33.0.dev1", minimum))
         self.assertFalse(runtime._version_at_least("unknown", minimum))
+
+    def test_missing_mlx_has_an_actionable_error(self):
+        runtime._validate_runtime.cache_clear()
+        try:
+            with mock.patch.dict(sys.modules, {"mlx": None, "mlx.core": None}):
+                with self.assertRaisesRegex(RuntimeError, "MLX is not installed"):
+                    runtime._validate_runtime()
+        finally:
+            runtime._validate_runtime.cache_clear()
+
+    def test_unavailable_metal_devices_have_actionable_errors(self):
+        fake_mlx = types.ModuleType("mlx")
+        fake_core = types.ModuleType("mlx.core")
+        fake_core.__version__ = "0.32.0"
+        fake_mlx.core = fake_core
+
+        cases = (
+            (False, True, "PyTorch MPS device"),
+            (True, False, "MLX Metal device"),
+        )
+        for torch_mps_available, mlx_metal_available, message in cases:
+            with self.subTest(message=message):
+                fake_core.metal = types.SimpleNamespace(
+                    is_available=lambda: mlx_metal_available
+                )
+                runtime._validate_runtime.cache_clear()
+                try:
+                    with mock.patch.dict(
+                        sys.modules, {"mlx": fake_mlx, "mlx.core": fake_core}
+                    ):
+                        with mock.patch.object(torch, "__version__", "2.13.0"):
+                            with mock.patch.object(
+                                torch.backends.mps,
+                                "is_available",
+                                return_value=torch_mps_available,
+                            ):
+                                with self.assertRaisesRegex(RuntimeError, message):
+                                    runtime._validate_runtime()
+                finally:
+                    runtime._validate_runtime.cache_clear()
 
     @unittest.skipUnless(
         importlib.util.find_spec("mlx") is not None
