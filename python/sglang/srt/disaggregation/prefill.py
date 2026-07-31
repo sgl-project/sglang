@@ -432,7 +432,9 @@ class PrefillBootstrapQueue:
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
                     # Snapshot the prefill-token counter for HRRN aging.
-                    req.arrival_processed_tokens = self.scheduler.processed_tokens_counter
+                    req.arrival_processed_tokens = (
+                        self.scheduler.processed_tokens_counter
+                    )
             elif poll == KVPoll.WaitingForInput:
                 if should_force_retry(req):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):

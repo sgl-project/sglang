@@ -362,6 +362,7 @@ class SchedulePolicy:
           - Snapshot `req.arrival_processed_tokens = counter` when the req enters waiting_queue
             (pop_bootstrapped for disagg prefill, _add_request_to_queue for unified).
         """
+
         def _key(r: Req):
             rid = getattr(r, "rid", "")
             if r.rid in temporary_deprioritized:
