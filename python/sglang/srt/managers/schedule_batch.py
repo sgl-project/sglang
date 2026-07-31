@@ -2473,6 +2473,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ) -> _MambaRadixCacheV2TrackEntry:
         server_args = get_server_args()
         mamba_cache_chunk_size = server_args.mamba_cache_chunk_size
+        mamba_checkpoint_interval = getattr(
+            server_args,
+            "mamba_radix_checkpoint_interval",
+            mamba_cache_chunk_size,
+        )
+        assert mamba_checkpoint_interval % mamba_cache_chunk_size == 0, (
+            "mamba radix checkpoint interval must be a multiple of the kernel "
+            f"state stride, got {mamba_checkpoint_interval=} and "
+            f"{mamba_cache_chunk_size=}"
+        )
 
         def _force_track_h(i: int) -> int:
             assert i % mamba_cache_chunk_size == 0
@@ -2485,7 +2495,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        mask = req.extend_range.length >= mamba_cache_chunk_size
+        mask = req.extend_range.length >= mamba_checkpoint_interval
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
         if mask:
@@ -2502,22 +2512,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # mamba radix cache to track which seqlen this mamba state should store at.
             mamba_track_seqlen_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_range.length // mamba_cache_chunk_size)
-                * mamba_cache_chunk_size
+                + (req.extend_range.length // mamba_checkpoint_interval)
+                * mamba_checkpoint_interval
             )
 
-            # mamba_track_fla_chunk_aligned is the aligned seqlen based on mamba_cache_chunk_size
-            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
-            # page_size > mamba_cache_chunk_size, we need to force the math calculation to retrieve the correct mamba state from h
-            # by _force_track_h()
-            mamba_track_fla_chunk_aligned = (
-                len(req.prefix_indices)
-                + (req.extend_range.length // mamba_cache_chunk_size)
-                * mamba_cache_chunk_size
-            )
-            if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
-                # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
+            # An aligned checkpoint can use ``last_recurrent_state`` only when
+            # it is also the final position of this extend.  For an interior
+            # boundary, encode boundary + 1 so the attention backend selects
+            # the corresponding intermediate ``h`` state while
+            # ``mamba_last_track_seqlen`` retains the true cache position.
+            if mamba_track_seqlen_aligned != mamba_track_seqlen:
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
             # In lazy mode, skip the swap — the second ping-pong slot is not
@@ -2534,7 +2538,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
                     req.mamba_branching_seqlen - len(req.prefix_indices)
-                ) % mamba_cache_chunk_size == 0
+                ) % mamba_checkpoint_interval == 0
                 if (
                     req.mamba_branching_seqlen > len(req.prefix_indices)
                     and req.mamba_branching_seqlen < mamba_track_seqlen

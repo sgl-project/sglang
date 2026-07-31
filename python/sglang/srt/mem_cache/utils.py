@@ -123,12 +123,15 @@ def hash_str_to_int64(hash_str: str) -> int:
     return uint64_val
 
 
-def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
+def compute_node_hash_values(
+    node: Any, page_size: int, hash_attr: str = "hash_value"
+) -> List[str]:
     """Compute SHA256-based hash values for position-aware KV block IDs."""
     parent_hash = None
-    if node.parent is not None and node.parent.hash_value is not None:
-        if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
-            parent_hash = node.parent.hash_value[-1]
+    if node.parent is not None:
+        parent_hash_values = getattr(node.parent, hash_attr, None)
+        if len(node.parent.key) > 0 and parent_hash_values:
+            parent_hash = parent_hash_values[-1]
 
     hash_values = get_hash_str(node.key, parent_hash, page_size=page_size)
     assert isinstance(hash_values, list)

@@ -111,9 +111,19 @@ class StorageOperation(BaseStorageOperation):
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        storage_hash_value: Optional[List[str]] = None,
+        storage_last_hash: Optional[str] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
     ):
-        super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
+        super().__init__(
+            host_indices,
+            token_ids,
+            last_hash,
+            hash_value,
+            prefix_keys,
+            storage_hash_value,
+            storage_last_hash,
+        )
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
 
@@ -125,6 +135,7 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        storage_last_hash: Optional[str] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
     ):
         self.request_id = request_id
@@ -136,6 +147,7 @@ class PrefetchOperation(StorageOperation):
             None,
             token_ids,
             last_hash,
+            storage_last_hash=storage_last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=pool_transfers,
         )
@@ -562,12 +574,14 @@ class HybridCacheController(BaseHiCacheController):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        storage_last_hash: Optional[str] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             request_id,
             new_input_tokens,
             last_hash,
+            storage_last_hash=storage_last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
@@ -580,12 +594,14 @@ class HybridCacheController(BaseHiCacheController):
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        storage_hash_value: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> int:
         operation = StorageOperation(
             host_indices,
             token_ids,
             hash_value=hash_value,
+            storage_hash_value=storage_hash_value,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
@@ -596,9 +612,15 @@ class HybridCacheController(BaseHiCacheController):
         hash_value = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
+        storage_hash_value = self.get_hash_str(
+            operation.token_ids,
+            operation.storage_last_hash,
+            page_size=self.storage_page_size,
+        )
 
         extra_info = HiCacheStorageExtraInfo(
-            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
+            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
+            extra_info={"canonical_hashes": storage_hash_value},
         )
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
@@ -612,6 +634,9 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        operation.storage_hash_value = storage_hash_value[
+            : kv_hit_pages * self.storage_hashes_per_page
+        ]
 
         return (
             hash_value[:kv_hit_pages],
@@ -659,8 +684,18 @@ class HybridCacheController(BaseHiCacheController):
             and not operation.is_terminated()
             and kv_completed_pages == len(operation.hash_value)
         ):
+            storage_hashes = operation.storage_hash_value or operation.hash_value
+            hashes_per_page = (
+                self.storage_hashes_per_page
+                if operation.storage_hash_value
+                else 1
+            )
+            storage_page_hashes = [
+                storage_hashes[(page + 1) * hashes_per_page - 1]
+                for page in range(kv_completed_pages)
+            ]
             self._sync_trailing_keys(
-                operation.pool_transfers, operation.hash_value, kv_completed_pages
+                operation.pool_transfers, storage_page_hashes, kv_completed_pages
             )
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
@@ -681,6 +716,19 @@ class HybridCacheController(BaseHiCacheController):
             ]
 
         if backup_transfers:
+            storage_hashes = operation.storage_hash_value or operation.hash_value
+            hashes_per_page = (
+                self.storage_hashes_per_page
+                if operation.storage_hash_value
+                else 1
+            )
+            storage_page_hashes = [
+                storage_hashes[(page + 1) * hashes_per_page - 1]
+                for page in range(len(operation.hash_value))
+            ]
+            self._sync_trailing_keys(
+                backup_transfers, storage_page_hashes, len(operation.hash_value)
+            )
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_set_v2(backup_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)

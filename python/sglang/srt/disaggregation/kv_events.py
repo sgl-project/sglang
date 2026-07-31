@@ -92,15 +92,22 @@ class OffloadedState:
 
     - prefill_len (int): The length of the prefill part of the KV cache block.
     - inc_len (int): The length of the incremental part of the KV cache block.
-    - last_hash (Optional[str]): The hash of the last token in the KV cache block.
+    - last_hash (Optional[str]): The runtime-page hash at the end of the block.
+    - storage_last_hash (Optional[str]): The storage-page hash at the end of the
+      block. This can differ from last_hash when L3 uses a canonical layout.
     """
 
     def __init__(
-        self, prefill_len: int, inc_len: int = 0, last_hash: Optional[str] = None
+        self,
+        prefill_len: int,
+        inc_len: int = 0,
+        last_hash: Optional[str] = None,
+        storage_last_hash: Optional[str] = None,
     ):
         self.prefill_len = prefill_len
         self.inc_len = inc_len
         self.last_hash = last_hash
+        self.storage_last_hash = storage_last_hash
 
 
 class BlockStored(KVCacheEvent):

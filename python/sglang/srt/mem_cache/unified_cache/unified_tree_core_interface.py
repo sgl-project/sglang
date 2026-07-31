@@ -120,6 +120,7 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
 
     # ==== Tree-owned state the Controller reads (or, via its facade setters, writes) ====
     page_size: int
+    storage_page_size: int
     is_eagle: bool
     device: torch.device
     enable_hicache: bool
@@ -359,6 +360,7 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         key: RadixKey,
         host_value: torch.Tensor,
         hash_value: list[str],
+        storage_hash_value: Optional[list[str]] = None,
     ) -> InsertResult:
         """Insert a host-side (backuped) tree path descending from the given node."""
         ...

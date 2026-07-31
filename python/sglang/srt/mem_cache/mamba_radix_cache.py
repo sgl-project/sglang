@@ -102,6 +102,8 @@ class TreeNode:
         self.host_value = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
+        # L3 may use a canonical page geometry independent of the DCP layout.
+        self.storage_hash_value: Optional[List[str]] = None
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -479,11 +481,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def supports_mamba(self) -> bool:
         return True
 
+    def get_mamba_device_value(self, node: TreeNode) -> Optional[torch.Tensor]:
+        return node.mamba_value
+
     def reset(self) -> None:
         self.root_node = TreeNode()
         self.root_node.key = RadixKey(array("q"), None)
         self.root_node.value = []
         self.root_node.hash_value = []
+        self.root_node.storage_hash_value = []
         self.root_node.full_lock_ref = 1
         self.root_node.mamba_lock_ref = 1
         self.full_evictable_size_ = 0

@@ -7065,6 +7065,61 @@ class ServerArgs:
         # pool boundary; only the validated MLA-hybrid (Kimi) path is wired.
         self._resolve_hicache_dcp_compatibility()
 
+        # Step 4: A Decode-origin hybrid checkpoint must describe the exact
+        # token boundary used by the canonical DCP storage page.  Prefill keeps
+        # that historical KDA state in an extra buffer; Decode receives it and
+        # continues tracking the same boundaries even though its request cache
+        # remains ChunkCache.
+        self._resolve_canonical_hybrid_checkpointing()
+
+    def _resolve_canonical_hybrid_checkpointing(self):
+        if self.hicache_storage_backend != "mooncake":
+            return
+        try:
+            extra_config = json.loads(
+                self.hicache_storage_backend_extra_config or "{}"
+            )
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Invalid hicache storage backend extra config JSON: {e}"
+            ) from e
+        canonical_dcp_size = int(extra_config.get("canonical_dcp_size", 0))
+        if canonical_dcp_size <= 0:
+            return
+        canonical_page_size = int(extra_config.get("canonical_page_size", 0))
+        if canonical_page_size <= 0:
+            # HiCacheController emits the full paired-option diagnostic. Avoid
+            # deriving a bogus checkpoint interval here first.
+            return
+
+        model_arches = self.get_model_config().hf_config.architectures
+        supported = {"KimiLinearForCausalLM", "KimiK3ForConditionalGeneration"}
+        if not supported.intersection(model_arches):
+            return
+
+        checkpoint_interval = canonical_page_size * canonical_dcp_size
+        # Keep this separate from ``mamba_cache_chunk_size``.  KDA kernels
+        # materialize intermediate recurrent states at their native chunk
+        # stride (64 for Kimi KDA), while a canonical DCP object may only be
+        # publishable at a wider boundary (for example 64 * DCP8 = 512).
+        self._canonical_hybrid_checkpoint_interval = checkpoint_interval
+        if self.mamba_track_interval != checkpoint_interval:
+            logger.warning(
+                "Canonical Mooncake DCP hybrid checkpoints require "
+                "mamba_track_interval=%d; overriding %d.",
+                checkpoint_interval,
+                self.mamba_track_interval,
+            )
+            self.mamba_track_interval = checkpoint_interval
+
+        if (
+            self.disaggregation_mode == "decode"
+            and self.disaggregation_decode_enable_offload_kvcache
+        ):
+            # ChunkCache still needs a historical KDA checkpoint slot for L3
+            # publication. This does not enable Decode RadixCache.
+            self.mamba_radix_cache_strategy = "extra_buffer"
+
     def _resolve_hicache_dcp_compatibility(self):
         if self.dcp_size <= 1:
             return
@@ -8565,8 +8620,12 @@ class ServerArgs:
         )
 
     def enable_mamba_extra_buffer(self) -> bool:
+        checkpoint_only_decode = (
+            self.disaggregation_mode == "decode"
+            and self.disaggregation_decode_enable_offload_kvcache
+        )
         return (
-            self.disable_radix_cache is False
+            (self.disable_radix_cache is False or checkpoint_only_decode)
             and self.mamba_radix_cache_strategy in ("extra_buffer", "extra_buffer_lazy")
         )
 
@@ -8611,6 +8670,21 @@ class ServerArgs:
             ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
             self._mamba_cache_chunk_size = max(chunk_size, page_size)
         return self._mamba_cache_chunk_size
+
+    @property
+    def mamba_radix_checkpoint_interval(self) -> int:
+        """Token interval represented by a tracked Radix Mamba checkpoint.
+
+        Normally this is the native cache chunk stride. Canonical Mooncake DCP
+        objects use a wider interval without changing the kernel's intermediate
+        state stride.
+        """
+        canonical_interval = getattr(
+            self, "_canonical_hybrid_checkpoint_interval", None
+        )
+        if canonical_interval is not None:
+            return canonical_interval
+        return self.mamba_cache_chunk_size
 
     def _check_two_batch_overlap(self):
         # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
