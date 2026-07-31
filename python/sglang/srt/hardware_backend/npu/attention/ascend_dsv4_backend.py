@@ -2041,7 +2041,6 @@ class DeepseekV4AscendAttnBackend(
             sinks=attn_sink,
             metadata=fm.kernel_metadata["c1a_metadata"],
             softmax_scale=layer.scaling,
-            cmp_ratio=1,
         )
         out, _ = attn_op(**attn_kwargs)
         return out
