@@ -111,6 +111,8 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.communicator import ScatterMode
+from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -630,13 +632,20 @@ class Indexer(MultiPlatformOp):
             self.alt_stream.wait_stream(current_stream)
             query = self._maybe_rotate(query)
 
+            # Gather the full key on alt_stream so the CP all-gather overlaps
+            # with the query rotate above on the current stream.
             with torch.cuda.stream(self.alt_stream):
-                key = cp_all_gather_rerange_output(
-                    key.contiguous(),
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
+                if is_cp_v2_active(forward_batch):
+                    key = get_cp_strategy().materialize_full_indexer_k_cache(
+                        key, forward_batch
+                    )
+                else:
+                    key = cp_all_gather_rerange_output(
+                        key.contiguous(),
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
             current_stream.wait_stream(self.alt_stream)
             return query, key, weights_raw
         else:
@@ -644,7 +653,9 @@ class Indexer(MultiPlatformOp):
             key = self._maybe_rotate(key)
 
         # allgather+rerrange
-        if forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
+        if is_cp_v2_active(forward_batch):
+            key = get_cp_strategy().materialize_full_indexer_k_cache(key, forward_batch)
+        elif forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
             key = cp_all_gather_rerange_output(
                 key.contiguous(),
                 self.cp_size,
@@ -1870,7 +1881,11 @@ class Indexer(MultiPlatformOp):
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
         else:
             query, key, weights_raw = self._get_q_k_bf16(
-                q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
+                q_lora,
+                x,
+                positions,
+                enable_dual_stream,
+                forward_batch=forward_batch,
             )
 
             if enable_dual_stream:

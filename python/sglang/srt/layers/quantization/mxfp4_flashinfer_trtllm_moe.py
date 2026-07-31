@@ -25,7 +25,7 @@ from sglang.srt.utils.common import is_sm100_supported, next_power_of_2
 _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if is_sm100_supported() else "cuda"
 
 if is_flashinfer_available():
-    from flashinfer import mxfp8_quantize, shuffle_matrix_a, shuffle_matrix_sf_a
+    from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
     from flashinfer.fp4_quantization import block_scale_interleave
     from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.fused_moe.core import (
@@ -303,7 +303,11 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                     value=0.0,
                 )
         elif precision == "default":
-            x_quant, x_scale = mxfp8_quantize(
+            from sglang.srt.layers.quantization.fp8_utils import (
+                flashinfer_mxfp8_quantize,
+            )
+
+            x_quant, x_scale = flashinfer_mxfp8_quantize(
                 hidden_states,
                 False,
                 alignment=hidden_size,

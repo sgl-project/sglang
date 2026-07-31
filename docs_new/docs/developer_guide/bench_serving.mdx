@@ -16,6 +16,7 @@ This guide explains how to benchmark online serving throughput and latency using
 - `sglang` / `sglang-native`: `POST /generate`
 - `sglang-oai`, `vllm`, `lmdeploy`: `POST /v1/completions`
 - `sglang-oai-chat`, `vllm-chat`, `lmdeploy-chat`: `POST /v1/chat/completions`
+- `sglang-embedding`, `vllm-embedding`: `POST /v1/embeddings`
 - `trt` (TensorRT-LLM): `POST /v2/models/ensemble/generate_stream`
 - `gserver`: Custom server (Not Implemented yet in this script)
 - `truss`: `POST /v1/models/model:predict`
@@ -54,6 +55,38 @@ python3 -m sglang.bench_serving \
   --num-prompts 1000 \
   --model meta-llama/Llama-3.1-8B-Instruct
 ```
+
+### Fair embedding comparison
+
+Use the two embedding backends with the same model, tokenizer, input length, prompt count, and concurrency. The benchmark reports input-token throughput and end-to-end latency; embeddings have no decode-side TTFT or TPOT.
+
+```bash Command
+# Start either server on the same hardware and precision, then run one at a time.
+python3 -m sglang.bench_serving \
+  --backend sglang-embedding \
+  --model google/embeddinggemma-300m \
+  --dataset-name random \
+  --random-input-len 2048 \
+  --num-prompts 300 \
+  --max-concurrency 64 \
+  --warmup-requests 3 \
+  --flush-cache
+```
+
+```bash Command
+# vLLM's cache reset endpoint requires VLLM_SERVER_DEV_MODE=1 at server startup.
+python3 -m sglang.bench_serving \
+  --backend vllm-embedding \
+  --model google/embeddinggemma-300m \
+  --dataset-name random \
+  --random-input-len 2048 \
+  --num-prompts 300 \
+  --max-concurrency 64 \
+  --warmup-requests 3 \
+  --flush-cache
+```
+
+`--flush-cache` calls `/flush_cache` for SGLang and `/reset_prefix_cache` for vLLM after warmup. For vLLM, start the server with `VLLM_SERVER_DEV_MODE=1`; without it the benchmark fails loudly rather than accidentally measuring warm-cache performance.
 
 ### Datasets
 
