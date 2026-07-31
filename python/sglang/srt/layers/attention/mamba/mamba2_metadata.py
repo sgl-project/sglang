@@ -240,7 +240,19 @@ class Mamba2Metadata(ForwardMetadata):
         batch_size = getattr(forward_batch, "_original_batch_size", None)
         if batch_size is None:
             batch_size = len(forward_batch.seq_lens)
-        num_decodes = max(0, batch_size - num_prefills)
+        original_forward_mode = getattr(forward_batch, "_original_forward_mode", None)
+        if original_forward_mode is not None and original_forward_mode.is_idle():
+            # DP attention fabricates one prefill request on an otherwise idle
+            # hybrid-Mamba rank so it can participate in the padded MLP
+            # collectives. The semantic batch size remains zero, but this
+            # metadata describes the fabricated request.
+            assert batch_size == 0
+            batch_size = forward_batch.batch_size
+        num_decodes = batch_size - num_prefills
+        assert num_decodes >= 0, (
+            "Mamba mixed metadata has more prefills than requests: "
+            f"{batch_size=}, {num_prefills=}"
+        )
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
         has_initial_states = context_lens_tensor > 0
