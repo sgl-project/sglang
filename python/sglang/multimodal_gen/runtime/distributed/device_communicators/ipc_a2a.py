@@ -66,6 +66,10 @@ void bump_signal(torch::Tensor seq, torch::Tensor peer_flag) {
 """
 
 
+class _Unsupported(RuntimeError):
+    """This topology cannot run the transport -- an expected outcome, not a bug."""
+
+
 class IpcA2AState:
     def __init__(self):
         self.ops = None
@@ -119,7 +123,7 @@ class IpcA2AState:
         self.rank = dist.get_rank(group=group)
         dev = torch.cuda.current_device()
         if not torch.cuda.can_device_access_peer(dev, 1 - dev):
-            raise RuntimeError("no P2P access between the two devices")
+            raise _Unsupported("no peer-to-peer access between the two devices")
         # kernel-level dereference of peer mappings needs explicit peer access
         ctypes.CDLL("libcudart.so").cudaDeviceEnablePeerAccess(1 - dev, 0)
         build_dir = os.path.join(
@@ -234,6 +238,10 @@ def ipc_a2a_ready(group) -> bool:
     try:
         IPC_A2A.init(group)
         return True
+    except _Unsupported as e:
+        logger.info("IPC all-to-all unavailable (%s); using NCCL", e)
+        IPC_A2A.failed = True
+        return False
     except Exception:
         logger.exception("IPC all-to-all init failed; falling back to NCCL")
         IPC_A2A.failed = True
