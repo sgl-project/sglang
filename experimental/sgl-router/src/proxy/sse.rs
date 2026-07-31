@@ -102,6 +102,13 @@ pub struct StreamCapture {
     pub max_bytes: usize,
     /// Consumer of the cleanly-completed stream's raw bytes.
     pub on_done: Box<dyn FnOnce(Vec<u8>) + Send + 'static>,
+    /// RAII permit from the router-global capture semaphore. Held for the pump's
+    /// lifetime and released on drop (clean end, discard, or teardown), so the
+    /// TOTAL number of concurrent captures — and hence aggregate capture memory
+    /// (≤ N × `max_bytes`) — is bounded no matter the traffic. `None` only in
+    /// unit tests that don't exercise the budget; production arming acquires one
+    /// and skips the capture entirely when the budget is exhausted.
+    pub _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// Carryover cap for the in-band error scanner (mirrors the gateway's
@@ -824,6 +831,7 @@ mod tests {
         (
             StreamCapture {
                 max_bytes: 1024,
+                _permit: None,
                 on_done: Box::new(move |buf| {
                     *slot_c.lock().unwrap() = Some(buf);
                 }),

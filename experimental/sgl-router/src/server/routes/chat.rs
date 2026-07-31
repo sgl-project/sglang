@@ -607,6 +607,22 @@ async fn chat_completions_inner(
             if !armed {
                 return None;
             }
+            // Reserve a global capture slot so total concurrent captures — and
+            // thus aggregate capture memory (≤ N × MAX_EXTEND_CAPTURE_BYTES) —
+            // stay bounded under any load. Budget exhausted ⇒ don't capture this
+            // stream (skip its extend tee, counted as `capture_capped`); the
+            // capture is observational, so shedding it never affects serving.
+            let permit = match ctx
+                .cache_sim_tee
+                .as_ref()
+                .and_then(|t| t.try_acquire_capture_permit())
+            {
+                Some(p) => p,
+                None => {
+                    ctx.metrics.record_cache_sim_tee("capture_capped");
+                    return None;
+                }
+            };
             let ctx = Arc::clone(&ctx);
             let model = model.clone();
             let request_body = request_body.clone();
@@ -614,6 +630,7 @@ async fn chat_completions_inner(
             let request_id = request_id.clone();
             Some(StreamCapture {
                 max_bytes: cache_sim_extend::MAX_EXTEND_CAPTURE_BYTES,
+                _permit: Some(permit),
                 on_done: Box::new(move |buf| {
                     cache_sim_extend::spawn_extend_tee(
                         ctx,

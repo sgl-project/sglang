@@ -10,7 +10,8 @@ use clap::Parser;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use crate::config::{
-    default_cb_cool_down, default_proxy_request_timeout_secs, default_shutdown_drain_secs,
+    default_cache_sim_max_concurrent_captures, default_cb_cool_down,
+    default_proxy_request_timeout_secs, default_shutdown_drain_secs,
     default_stale_request_timeout_secs, default_stream_idle_timeout_secs,
     default_stream_send_stall_secs, default_tokenizer_shards, resolve_mode, ActiveLoadConfig,
     AdmissionConfig, CacheAwareConfig, CircuitBreakerConfig, Config, DiscoveryBackend,
@@ -258,6 +259,12 @@ pub struct Cli {
     /// flag) simply ignores, rather than crash-looping on an unknown CLI flag.
     #[arg(long, env = "RADIXARK_CACHE_SIM_URL")]
     pub cache_sim_url: Option<String>,
+    /// Max concurrent streaming captures the cache-sim extend tee holds. Each
+    /// buffers up to 16 MiB, so this hard-caps aggregate capture memory at
+    /// `N × 16 MiB` (default 256 ⇒ ~4 GiB ceiling); excess streams skip the
+    /// capture. Only meaningful with `--cache-sim-url`.
+    #[arg(long, default_value_t = default_cache_sim_max_concurrent_captures())]
+    pub cache_sim_max_concurrent_captures: usize,
 }
 
 impl Cli {
@@ -428,6 +435,7 @@ impl Cli {
                 log_level: self.log_level,
                 log_format: self.log_format,
                 cache_sim_url: self.cache_sim_url,
+                cache_sim_max_concurrent_captures: self.cache_sim_max_concurrent_captures,
             },
             model: ModelConfig {
                 // Default the tokenizer source to the model id (treated as a

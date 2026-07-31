@@ -270,6 +270,21 @@ pub struct ObservabilityConfig {
     /// ingress-computed `input_ids` are teed to `<url>/ingest_ids`
     /// (best-effort, fire-and-forget). `None` disables the tee.
     pub cache_sim_url: Option<String>,
+    /// Maximum number of concurrent streaming response captures the cache-sim
+    /// extend tee holds. Each capture buffers up to
+    /// `cache_sim_extend::MAX_EXTEND_CAPTURE_BYTES` (16 MiB), so this caps
+    /// aggregate capture memory at `N × 16 MiB` — a hard bound so the
+    /// (observational) tee can never OOM the router under a traffic flood.
+    /// Excess streams simply aren't captured. Only meaningful with
+    /// `cache_sim_url`.
+    pub cache_sim_max_concurrent_captures: usize,
+}
+
+/// Default concurrent-capture budget: 256 × 16 MiB = 4 GiB ceiling on aggregate
+/// cache-sim capture memory. Comfortable for normal streaming concurrency,
+/// small next to any sane router memory limit.
+pub fn default_cache_sim_max_concurrent_captures() -> usize {
+    256
 }
 
 /// `text` for human-readable dev output, `json` for one-line-per-record
@@ -293,6 +308,7 @@ impl Default for ObservabilityConfig {
             log_level: default_log_level(),
             log_format: LogFormat::default(),
             cache_sim_url: None,
+            cache_sim_max_concurrent_captures: default_cache_sim_max_concurrent_captures(),
         }
     }
 }

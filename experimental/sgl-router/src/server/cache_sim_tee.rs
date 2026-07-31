@@ -118,6 +118,13 @@ struct IngestIdsBody<'a> {
 pub struct CacheSimTee {
     tx: mpsc::Sender<TeeMsg>,
     metrics: Arc<MetricsRegistry>,
+    /// Router-global budget on concurrent streaming response captures. Each
+    /// armed [`crate::proxy::sse::StreamCapture`] holds one permit for its
+    /// stream's lifetime, so aggregate capture memory is hard-bounded at
+    /// `permits × MAX_EXTEND_CAPTURE_BYTES` regardless of traffic. When the
+    /// budget is exhausted the request simply isn't captured (its extend tee is
+    /// skipped) — the capture is observational, so shedding it is always safe.
+    capture_sem: Arc<tokio::sync::Semaphore>,
 }
 
 // Manual (MetricsRegistry isn't Debug) so AppContext's derive(Debug) holds.
@@ -132,7 +139,9 @@ impl std::fmt::Debug for CacheSimTee {
 impl CacheSimTee {
     /// Spawn the background sender and return a handle. `url` is the cache-sim
     /// base (e.g. `http://radixark-cache-sim:9095`); `/ingest_ids` is appended.
-    pub fn spawn(url: String, metrics: Arc<MetricsRegistry>) -> Arc<Self> {
+    /// `max_captures` caps concurrent streaming captures (see `capture_sem`);
+    /// `0` is clamped to `1` so the semaphore is always constructible.
+    pub fn spawn(url: String, metrics: Arc<MetricsRegistry>, max_captures: usize) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         // .expect, not a fallback: reqwest::Client::new() would panic on the
         // same (near-impossible, TLS-backend-init) failure, and a fallback
@@ -154,7 +163,19 @@ impl CacheSimTee {
             extend_url,
             Arc::clone(&metrics),
         ));
-        Arc::new(Self { tx, metrics })
+        Arc::new(Self {
+            tx,
+            metrics,
+            capture_sem: Arc::new(tokio::sync::Semaphore::new(max_captures.max(1))),
+        })
+    }
+
+    /// Try to reserve one concurrent-capture slot. `Some(permit)` — the caller
+    /// owns a slot until the permit drops (RAII, on the pump's end); `None` —
+    /// the budget is exhausted, so the caller must NOT capture this stream
+    /// (skip it, counted as `capture_capped`). Never blocks.
+    pub fn try_acquire_capture_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.capture_sem).try_acquire_owned().ok()
     }
 
     /// Offer one request's tokens to the tee. Never blocks: a full queue is
@@ -338,7 +359,14 @@ mod tests {
         metrics: Arc<MetricsRegistry>,
     ) -> (CacheSimTee, mpsc::Receiver<TeeMsg>) {
         let (tx, rx) = mpsc::channel(capacity);
-        (CacheSimTee { tx, metrics }, rx)
+        (
+            CacheSimTee {
+                tx,
+                metrics,
+                capture_sem: Arc::new(tokio::sync::Semaphore::new(64)),
+            },
+            rx,
+        )
     }
 
     #[tokio::test]
@@ -363,7 +391,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let metrics = MetricsRegistry::new();
-        let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics));
+        let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics), 64);
         tee.offer("m", &[10, 11, 12], "rid-1");
 
         // The sender POSTs asynchronously; poll until the body lands.
@@ -490,7 +518,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let metrics = MetricsRegistry::new();
-        let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics));
+        let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics), 64);
         tee.offer_extend(
             "m",
             &[10, 11, 12, 13],
@@ -584,7 +612,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let metrics = MetricsRegistry::new();
-        let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics));
+        let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics), 64);
         tee.offer("m", &[1, 2, 3], "rid-1");
 
         let mut rendered = String::new();
@@ -618,6 +646,35 @@ mod tests {
                 .render()
                 .contains(r#"sgl_router_cache_sim_tee_total{result="closed"}"#),
             "offer on a closed channel must count as closed"
+        );
+    }
+
+    /// The capture budget is a hard bound: the first `N` permits are granted,
+    /// the `N+1`th is refused (the request skips its capture), and dropping a
+    /// permit frees a slot. This is what caps aggregate capture memory at
+    /// `N × 16 MiB` under a streaming flood.
+    #[tokio::test]
+    async fn capture_permits_are_bounded_and_released_on_drop() {
+        let metrics = MetricsRegistry::new();
+        let (tee, _rx) = unstarted(4, Arc::clone(&metrics));
+        // unstarted() gives a 64-permit budget; drain it to prove the bound and
+        // the release both hold without depending on the exact N.
+        let mut held = Vec::new();
+        while let Some(p) = tee.try_acquire_capture_permit() {
+            held.push(p);
+            if held.len() > 1000 {
+                panic!("capture budget is not bounded");
+            }
+        }
+        assert_eq!(held.len(), 64, "exactly the budget many permits are granted");
+        assert!(
+            tee.try_acquire_capture_permit().is_none(),
+            "an exhausted budget must refuse further captures",
+        );
+        held.pop(); // release one
+        assert!(
+            tee.try_acquire_capture_permit().is_some(),
+            "a released permit must free a slot for the next capture",
         );
     }
 }

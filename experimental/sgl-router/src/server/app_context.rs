@@ -136,13 +136,14 @@ impl AppContext {
         let admission = Arc::new(AdmissionQueue::new(config.admission, Arc::clone(&metrics)));
         // Spawn the cache-sim tee when configured. Read before `config` is
         // moved into `Self`; an empty/whitespace URL is treated as unset.
+        let max_captures = config.observability.cache_sim_max_concurrent_captures;
         let cache_sim_tee = config
             .observability
             .cache_sim_url
             .as_ref()
             .map(|u| u.trim())
             .filter(|u| !u.is_empty())
-            .map(|url| CacheSimTee::spawn(url.to_owned(), Arc::clone(&metrics)));
+            .map(|url| CacheSimTee::spawn(url.to_owned(), Arc::clone(&metrics), max_captures));
         Self {
             config,
             tokenizers,
