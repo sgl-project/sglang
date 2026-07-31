@@ -149,21 +149,26 @@ def _set_kv_buffer_impl(
     device_module: Any,
     size_limit: int,
     alt_stream: Optional[torch.cuda.Stream] = None,
-    same_kv_dim: bool = True,
+    v_row_dim: Optional[int] = None,  # head_num * v_head_dim; defaults to row_dim
 ) -> None:
+    v_row_dim = row_dim if v_row_dim is None else v_row_dim
     row_bytes = row_dim * store_dtype.itemsize
-    if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):
+    v_row_bytes = v_row_dim * store_dtype.itemsize
+    if (_is_cuda or _is_hip) and can_use_store_cache(row_bytes, v_row_bytes):
         return store_cache(
             k.view(-1, row_dim),
-            v.view(-1, row_dim),
+            v.view(-1, v_row_dim),
             k_cache.view(-1, row_dim),
-            v_cache.view(-1, row_dim),
+            v_cache.view(-1, v_row_dim),
             indices,
             row_bytes=row_bytes,
+            v_row_bytes=v_row_bytes,
             size_limit=size_limit,
         )
 
-    if _is_cpu and _cpu_has_amx_support:
+    # store_cache_cpu takes a single row_dim for both K and V, so it only serves
+    # equal-width rows; asymmetric KV falls through to the naive path below.
+    if _is_cpu and _cpu_has_amx_support and v_row_dim == row_dim:
         return torch.ops.sgl_kernel.store_cache_cpu(
             k,
             v,
@@ -473,6 +478,7 @@ class MambaPool:
             enable=enable_memory_saver
         )
         num_mamba_layers = len(mamba_layer_ids)
+        self.mamba_layer_ids = list(mamba_layer_ids)
 
         self.size = size
         self.device = device
@@ -874,6 +880,7 @@ class MambaPool:
         return (
             not _is_npu
             and len(convs) > 0
+            and convs[0].shape[0] > 0
             and convs[0].is_cuda
             and all(c.dtype == torch.bfloat16 and c.is_contiguous() for c in convs)
         )
@@ -1069,6 +1076,16 @@ class MambaPool:
             # Repeat for each layer since we have per-layer data_ptrs
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
+
+    def get_state_layer_ids(self):
+        """Global model-layer id for each RDMA state entry.
+
+        Aligned element-wise with get_contiguous_buf_infos(), which flattens
+        the state list tensor-major x layer. Lets PD transfer match entries
+        by layer id when prefill (PP stage) holds a subset of the mamba layers.
+        """
+        state_tensor_count = sum(1 for _ in self._iter_transfer_state_tensors())
+        return list(self.mamba_layer_ids) * state_tensor_count
 
     def get_state_slice_outer_counts(self):
         """Get the number of rows preceding each tensor's TP slice axis."""
@@ -1710,6 +1727,8 @@ class MHATokenToKVPool(KVCache):
         quant_method=None,
         post_capture_active: bool = False,
     ):
+        self.k_buffer = None
+        self.v_buffer = None
         if post_capture_active:
             # Reserved upper bound only (unbacked VA): page-align UP so
             # (size + page_size) % page_size == 0 holds for paged layouts.
@@ -1805,7 +1824,7 @@ class MHATokenToKVPool(KVCache):
 
         # for store_cache JIT kernel
         self.row_dim = self.head_num * self.head_dim
-        self.same_kv_dim = self.head_dim == self.v_head_dim
+        self.v_row_dim = self.head_num * self.v_head_dim
 
     def _init_kv_copy_and_warmup(self):
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
@@ -2049,7 +2068,7 @@ class MHATokenToKVPool(KVCache):
         # Derive from the real buffers when they exist (covers arbitrary layouts,
         # e.g. vectorized_5d); fall back to _kv_buffer_shapes for the pre-allocation
         # post-capture call, which only runs for NHD/HND.
-        if getattr(self, "k_buffer", None) and getattr(self, "v_buffer", None):
+        if self.k_buffer and self.v_buffer:
             k_shape = tuple(self.k_buffer[0].shape)
             v_shape = tuple(self.v_buffer[0].shape)
         else:
@@ -2372,7 +2391,7 @@ class MHATokenToKVPool(KVCache):
             # dummy tokens write there); valid index range is [0, size + page_size).
             size_limit=self.size + self.page_size,
             alt_stream=self.alt_stream,
-            same_kv_dim=self.same_kv_dim,
+            v_row_dim=self.v_row_dim,
         )
 
     def _quantized_scales(self, global_layer_id: int, k_scale, v_scale):
@@ -2697,6 +2716,15 @@ class MHATokenToKVPool(KVCache):
                 layer_id_override=layer_id,
             )
             return
+
+        # The tiled kernel takes one ROW_BYTES for both tensors, so an asymmetric V
+        # row would be written at K's width and bleed into the next slot. Only this
+        # path needs the gate; the non-CUDA branch above handles both widths.
+        if self.v_row_dim != self.row_dim:
+            raise NotImplementedError(
+                "prefix-valid commit requires equal-width K/V rows, got "
+                f"head_dim={self.head_dim} v_head_dim={self.v_head_dim}."
+            )
 
         _set_kv_buffer_prefix_valid_impl(
             cache_k,
@@ -3608,11 +3636,11 @@ class HybridLinearKVPool(KVCache):
 
     @property
     def post_capture_active(self) -> bool:
-        return getattr(self.full_kv_pool, "post_capture_active", False)
+        return self.full_kv_pool.post_capture_active
 
     @property
     def post_capture_backed_bytes(self) -> int:
-        return getattr(self.full_kv_pool, "post_capture_backed_bytes", 0)
+        return self.full_kv_pool.post_capture_backed_bytes
 
     def finalize_backing(self, config) -> None:
         # Only the attention KV is resized; the mamba state cache is fixed pre-capture.
@@ -3622,8 +3650,19 @@ class HybridLinearKVPool(KVCache):
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
 
+    def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
+        # Hybrid layer ids are global model-layer ids, while the backing pool
+        # is dense over only full-attention layers. Shape discovery does not
+        # need a global layer lookup, so delegate it to that backing pool.
+        return self.full_kv_pool.get_kv_buffer_shape()
+
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
+
+    def get_kv_layer_ids(self):
+        """Global layer ids aligned with the full-attention KV buffers."""
+        layer_ids = list(self.full_attention_layer_id_mapping)
+        return layer_ids if self.use_mla else layer_ids * 2
 
     def get_state_buf_infos(self):
         mamba_data_ptrs, mamba_data_lens, mamba_item_lens = (
@@ -3634,6 +3673,10 @@ class HybridLinearKVPool(KVCache):
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each mamba state tensor."""
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_layer_ids(self):
+        """Global layer id per mamba state entry, aligned with get_state_buf_infos()."""
+        return self.mamba_pool.get_state_layer_ids()
 
     def get_state_slice_outer_counts(self):
         """Get the row count preceding each mamba state slice axis."""

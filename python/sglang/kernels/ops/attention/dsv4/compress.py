@@ -10,6 +10,10 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.layers.attention.dsa.utils import (
+    INDEXER_K_CACHE_PRESHUFFLE_TILE,
+    aiter_can_use_preshuffle_paged_mqa,
+)
 from sglang.srt.utils import is_hip, is_xpu
 
 from .utils import make_name
@@ -47,7 +51,13 @@ def _jit_compress_norm_rope_module(
     bf16_store: bool = False,
 ) -> Module:
     args = make_cpp_args(
-        dtype, head_dim, rope_dim, page_size, is_arch_support_pdl(), bf16_store
+        dtype,
+        head_dim,
+        rope_dim,
+        page_size,
+        is_arch_support_pdl(),
+        INDEXER_K_CACHE_PRESHUFFLE_TILE if aiter_can_use_preshuffle_paged_mqa() else 0,
+        bf16_store,
     )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
     if head_dim == 128:

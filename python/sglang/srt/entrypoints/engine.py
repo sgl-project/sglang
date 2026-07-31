@@ -1308,15 +1308,9 @@ class Engine(EngineScoreMixin, EngineBase):
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
-        if load_format == "flattened_bucket":
-            serialized_named_tensors = normalize_serialized_named_tensor_payloads(
-                cast(List[SerializedTensorPayload], named_tensors)
-            )
-        else:
-            serialized_named_tensors = [
-                MultiprocessingSerializer.serialize(named_tensors)
-                for _ in range(self.server_args.tp_size)
-            ]
+        serialized_named_tensors = self._serialize_tensors_per_rank(
+            named_tensors, load_format
+        )
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
@@ -1367,23 +1361,38 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
+    def _serialize_tensors_per_rank(
+        self,
+        tensors,
+        load_format: Optional[str],
+    ) -> List[bytes]:
+        """One serialized payload per TP rank: each rank deserializes only its
+        own copy, so producer-side CUDA-IPC refcounts drop cleanly after every
+        load. flattened_bucket callers pass pre-serialized per-rank payloads."""
+        if load_format == "flattened_bucket":
+            return normalize_serialized_named_tensor_payloads(
+                cast(List[SerializedTensorPayload], tensors)
+            )
+        else:
+            return [
+                MultiprocessingSerializer.serialize(tensors)
+                for _ in range(self.server_args.tp_size)
+            ]
+
     def load_lora_adapter_from_tensors(
         self,
         lora_name: str,
-        tensors,
+        tensors: Union[Dict[str, torch.Tensor], List[SerializedTensorPayload]],
         config_dict: Dict,
         load_format: Optional[str] = None,
     ):
-        if load_format == "flattened_bucket":
-            serialized_tensors = tensors
-        else:
-            serialized_tensors = MultiprocessingSerializer.serialize(
-                tensors, output_str=True
-            )
+        serialized_named_tensors = self._serialize_tensors_per_rank(
+            tensors, load_format
+        )
         lora_req = LoadLoRAAdapterFromTensorsReqInput(
             lora_name=lora_name,
             config_dict=config_dict,
-            serialized_tensors=serialized_tensors,
+            serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
         )
         return self.loop.run_until_complete(

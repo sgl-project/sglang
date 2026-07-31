@@ -5,6 +5,10 @@ metatags:
     description: "Deploy and use JoyAI-Echo long-form audio–video generation with SGLang Diffusion, including single-shot and multi-shot memory-bank workflows."
 ---
 
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["video", "audio-video", "multi-shot", "memory bank"]} />
+
 ## 1. Model Introduction
 
 [JoyAI-Echo](https://huggingface.co/jdopensource/JoyAI-Echo) (JoyEcho) is a long-form audio–video generation model built on the LTX-2 backbone. Its core idea is a **paired audio–video memory bank**: each shot commits decoded frames and audio latents into a rolling bank, and subsequent shots condition on that memory prefix. This enables **multi-shot, minute-scale generation** with visual and audio continuity across prompts.
