@@ -32,7 +32,7 @@ checkpoint 的开关。
 
 ## 文件和端口
 
-- `run_server.sh`：安装当前 SGLang、校验模型、跑 137 个 realtime 单测、启动
+- `run_server.sh`：安装当前 SGLang、校验模型、跑 138 个 realtime 单测、启动
   WebUI 和 API。
 - `minwm-tianpeng.service`：systemd 单元，GPU 3、API 30060、WebUI 18060。
 - `nginx-minwm.conf`：80 → API 30060 / WebUI 18060，支持 WebSocket。
@@ -59,6 +59,6 @@ curl http://127.0.0.1:18060/
 curl http://127.0.0.1/health
 ```
 
-不要只看编码 FPS。当前同一 5 秒 case 的 server scheduler 为 13.72 FPS，
-window=32 饱和后为 11.90 FPS；WebUI 写 24 FPS 是播放合同，不代表模型能以
+不要只看编码 FPS。当前同一 5 秒 case 的 server scheduler 为 13.21 FPS，
+window=32 饱和后为 11.50 FPS；WebUI 写 24 FPS 是播放合同，不代表模型能以
 24 FPS 生产。

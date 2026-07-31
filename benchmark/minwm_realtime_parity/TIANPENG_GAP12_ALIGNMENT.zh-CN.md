@@ -493,7 +493,7 @@ kubectl kustomize --load-restrictor LoadRestrictionsNone \
 | --- | ---: | ---: | --- |
 | dense + whole-DiT compile | 1.87 | 1.22 | KV 变长后严重退化，禁用 |
 | packed FA4 + whole-DiT compile，FA4 graph break | 未跑完 | 约 1.8～2.9 | 正确但仍为负优化，禁用 |
-| packed FA4 非确定性 + segment compile | 13.72 | 11.90 | 当前最终性能档 |
+| packed FA4 非确定性 + segment compile | 13.21 | 11.50 | 当前最终性能档 |
 
 whole-DiT compile 直接包住 packed FA4 时，PyTorch 2.11 Inductor 会在 varlen
 `cumsum` 元数据上报 `FakeTensor * Node`。SGLang 因此把融合 FA4 边界显式留在
@@ -513,14 +513,15 @@ attention backend                 fa（B200 实际选择 FA4）
 SP / CFG parallel                 1 / false
 ```
 
-公网 WebSocket 的同一 5 秒 case 复核为：TTFF 2.21 秒，wall time 11.81 秒，
-完整 chunk scheduler 13.70 FPS。WebP 解码并写视频的客户端测量为 121 帧 / 12.89
-秒；浏览器传输仍使用 WebP quality 55、560px preview、3 帧/消息、pacing=false。
+公网 WebSocket 的同一 5 秒 case 复核为：TTFF 2.43 秒，wall time 12.55 秒，
+完整 chunk scheduler 13.21 FPS。另一次边接收边做 WebP 解码和 MP4 写盘的客户端
+测量为 121 帧 / 18.52 秒；它包含同步解码/写盘背压，不代表纯传输吞吐。浏览器
+传输仍使用 WebP quality 55、560px preview、3 帧/消息、pacing=false。
 
 这次不能把 13.7 FPS 与 7 月 27 日的约 38 FPS 直接归因于加速开关变化：旧结果是
 另一 checkpoint/I2V/window 20 合同，本次是 gap12 T2V/window 32；本次在固定新
 checkpoint 和请求下的可比结论是，最终档显著快于 dense compile，但单卡仍未达到
-24 FPS。
+24 FPS。上述最终数字取远端运行文件 SHA 与提交 `9ef0696d1c` 对齐后的重跑。
 
 最终服务由 systemd 管理，使用单张 B200（物理 GPU 3），API/UI 分别监听
 30060/18060，再由 Nginx 暴露 80 端口。其余 7 张 GPU 已释放。验证产物在：
