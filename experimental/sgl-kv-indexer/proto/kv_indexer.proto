@@ -1,0 +1,100 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package kv_indexer.v1;
+
+// Storage tier for externally managed KV cache blocks.
+enum TierType {
+  TIER_UNKNOWN = 0;
+  TIER_HBM = 1;
+  TIER_DRAM = 2;
+  TIER_SSD = 3;
+}
+
+message MatchExternalKvRequest {
+  // MVP semantics: these are block-level hashes to match against placement
+  // metadata. The indexer returns block placement matches and does not compute
+  // the longest reusable prefix.
+  repeated string hashes = 1;
+
+  // When true, only hashes that are actually matched should increase hit
+  // counters. Diagnostic callers should leave this false.
+  bool count_as_hit = 2;
+}
+
+// The kind of mutation a single ExternalKvAction carries. A whole SGLang
+// KVEventBatch is applied in one call while preserving exact action order.
+enum ExternalKvActionType {
+  ACTION_UNKNOWN = 0;
+  ACTION_REPORT = 1;
+  ACTION_REVOKE = 2;
+  ACTION_CLEAR_ALL_AT_TIER = 3;
+}
+
+message ExternalKvAction {
+  ExternalKvActionType type = 1;
+  TierType tier = 2;
+  // Non-empty for REPORT/REVOKE; ignored for CLEAR_ALL_AT_TIER.
+  repeated string hashes = 3;
+}
+
+message ApplyExternalKvBatchRequest {
+  string worker_id = 1;
+  // The SGLang batch sequence number, monotonic per worker. Carried for
+  // observability only: this build applies every batch it receives and does not
+  // deduplicate, fence, or checkpoint on it.
+  uint64 seq = 2;
+  repeated ExternalKvAction actions = 3;
+  // The worker's KV-transfer address, used to populate MatchExternalKvResponse.
+  // Supplied by the bridge; may be empty, in which case matches for this worker
+  // carry an empty address.
+  string worker_address = 4;
+
+  // Field 5 held the worker incarnation token used for restart fencing.
+  reserved 5;
+}
+
+// Deliberately empty: applies are unconditional, so there is nothing to report
+// back. Kept as a message so the RPC signature stays stable.
+message ApplyExternalKvBatchResponse {
+  // Fields 1-3 held the durable seq checkpoint and duplicate flag.
+  reserved 1, 2, 3;
+}
+
+message TierHashes {
+  TierType tier = 1;
+  repeated string hashes = 2;
+}
+
+message ExternalKvNodeMatch {
+  string worker_id = 1;
+  string address = 2;
+  repeated TierHashes hashes_by_tier = 3;
+}
+
+message MatchExternalKvResponse {
+  repeated ExternalKvNodeMatch matches = 1;
+}
+
+message HitCountEntry {
+  string hash = 1;
+  uint64 hit_count_total = 2;
+}
+
+message GetExternalKvHitCountsRequest {
+  repeated string hashes = 1;
+}
+
+message GetExternalKvHitCountsResponse {
+  repeated HitCountEntry entries = 1;
+}
+
+service KVIndexer {
+  // The sole mutation API: applies an ordered SGLang KVEventBatch.
+  rpc ApplyExternalKvBatch(ApplyExternalKvBatchRequest) returns (ApplyExternalKvBatchResponse);
+
+  rpc MatchExternalKv(MatchExternalKvRequest) returns (MatchExternalKvResponse);
+  rpc GetExternalKvHitCounts(GetExternalKvHitCountsRequest) returns (GetExternalKvHitCountsResponse);
+}
