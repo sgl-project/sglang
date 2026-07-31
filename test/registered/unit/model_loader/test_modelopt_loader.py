@@ -5,6 +5,8 @@ This test module verifies the functionality of ModelOptModelLoader, which
 applies NVIDIA Model Optimizer quantization to models during loading.
 """
 
+import json
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -525,65 +527,20 @@ class TestParseQuantHfConfig(CustomTestCase):
         self.assertEqual(result["quant_method"], "gptq")
         self.assertNotIn("quant_algo", result)
 
-    def test_mixed_target_preserves_explicit_modelopt_fp4_draft(self):
-        self.model_config.quantization = "modelopt_fp4"
-        self.model_config.is_draft_model = True
-        self.model_config.is_embedded_draft_model = True
-        self.model_config.is_draft_quantization_explicit = True
-        with (
-            patch.object(
-                self.model_config,
-                "_parse_quant_hf_config",
-                return_value={
-                    "quant_method": "modelopt_mixed",
-                    "quant_algo": "MIXED_PRECISION",
-                },
-            ),
-            patch.object(
-                self.model_config,
-                "_find_quant_modelslim_config",
-                return_value=None,
-            ),
-        ):
-            self.model_config._verify_quantization()
 
-        self.assertEqual(self.model_config.quantization, "modelopt_fp4")
-
-    def test_mixed_target_overrides_inherited_modelopt_fp4_draft(self):
-        self.model_config.quantization = "modelopt_fp4"
-        self.model_config.is_draft_model = True
-        self.model_config.is_embedded_draft_model = True
-        self.model_config.is_draft_quantization_explicit = False
-        with (
-            patch.object(
-                self.model_config,
-                "_parse_quant_hf_config",
-                return_value={
-                    "quant_method": "modelopt_mixed",
-                    "quant_algo": "MIXED_PRECISION",
-                },
-            ),
-            patch.object(
-                self.model_config,
-                "_find_quant_modelslim_config",
-                return_value=None,
-            ),
-        ):
-            self.model_config._verify_quantization()
-
-        self.assertEqual(self.model_config.quantization, "modelopt_mixed")
-
-
-class TestModelOptMixedPrecisionConfig(CustomTestCase):
-    def test_draft_modelopt_fp4_ignores_target_mixed_config(self):
+class TestModelOptFp4LoaderSelection(CustomTestCase):
+    def test_explicit_excluded_draft_uses_online_modelopt_fp4(self):
         model_config = SimpleNamespace(
             model_path="target-model",
             quantization="modelopt_fp4",
             is_draft_model=True,
-            is_embedded_draft_model=True,
             is_draft_quantization_explicit=True,
             hf_config=SimpleNamespace(
-                quantization_config={"quant_algo": "MIXED_PRECISION"}
+                quantization_config={
+                    "quant_algo": "NVFP4",
+                    "group_size": 16,
+                    "ignore": ["mtp.layers.0*"],
+                }
             ),
         )
 
@@ -594,12 +551,11 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         self.assertFalse(config.use_per_token_activation)
         self.assertEqual(config.group_size, 16)
 
-    def test_external_serialized_modelopt_fp4_draft_uses_checkpoint_config(self):
+    def test_explicit_nonexcluded_draft_keeps_serialized_config(self):
         model_config = SimpleNamespace(
             model_path="draft-model",
             quantization="modelopt_fp4",
             is_draft_model=True,
-            is_embedded_draft_model=False,
             is_draft_quantization_explicit=True,
             hf_config=SimpleNamespace(
                 quantization_config={
@@ -615,18 +571,44 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         self.assertIsInstance(config, ModelOptFp4Config)
         self.assertTrue(config.is_checkpoint_nvfp4_serialized)
 
+    def test_legacy_excluded_draft_uses_online_modelopt_fp4(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            with open(f"{model_path}/hf_quant_config.json", "w") as f:
+                json.dump(
+                    {
+                        "producer": {"name": "modelopt"},
+                        "quantization": {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                            "exclude_modules": ["mtp.layers.0*"],
+                        },
+                    },
+                    f,
+                )
+
+            model_config = SimpleNamespace(
+                model_path=model_path,
+                revision=None,
+                quantization="modelopt_fp4",
+                is_draft_quantization_explicit=True,
+                hf_config=SimpleNamespace(quantization_config=None),
+            )
+            config = get_quant_config(model_config, LoadConfig(), {})
+
+        self.assertIsInstance(config, ModelOptFp4Config)
+        self.assertFalse(config.is_checkpoint_nvfp4_serialized)
+
     def test_inherited_modelopt_fp4_draft_uses_checkpoint_config(self):
         model_config = SimpleNamespace(
             model_path="target-model",
             quantization="modelopt_fp4",
             is_draft_model=True,
-            is_embedded_draft_model=True,
             is_draft_quantization_explicit=False,
             hf_config=SimpleNamespace(
                 quantization_config={
                     "quant_algo": "NVFP4",
                     "group_size": 16,
-                    "ignore": [],
+                    "ignore": ["mtp.layers.0*"],
                 }
             ),
         )
@@ -647,6 +629,8 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         self.assertIsInstance(loader, DefaultModelLoader)
         self.assertNotIsInstance(loader, ModelOptModelLoader)
 
+
+class TestModelOptMixedPrecisionConfig(CustomTestCase):
     def test_minimax_mixed_precision_resolves_runtime_names_and_mxfp8(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(
             {

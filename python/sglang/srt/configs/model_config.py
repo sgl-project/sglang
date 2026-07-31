@@ -263,7 +263,6 @@ class ModelConfig:
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
-        is_embedded_draft_model: bool = False,
         is_draft_quantization_explicit: bool = False,
     ) -> None:
         # Parse args
@@ -271,7 +270,6 @@ class ModelConfig:
         self.revision = revision
         self.quantization = quantization
         self.is_draft_model = is_draft_model
-        self.is_embedded_draft_model = is_embedded_draft_model
         self.is_draft_quantization_explicit = is_draft_quantization_explicit
         self.speculative_algorithm = speculative_algorithm
         self.model_impl = model_impl
@@ -543,12 +541,10 @@ class ModelConfig:
             if is_draft_model
             else server_args.decrypted_config_file
         )
-        resolved_model_path = model_path or server_args.model_path
-        resolved_model_revision = model_revision or server_args.revision
         return ModelConfig(
-            model_path=resolved_model_path,
+            model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
-            revision=resolved_model_revision,
+            revision=model_revision or server_args.revision,
             context_length=(
                 context_length
                 if context_length is not None
@@ -567,11 +563,6 @@ class ModelConfig:
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
-            is_embedded_draft_model=(
-                is_draft_model
-                and resolved_model_path == server_args.model_path
-                and resolved_model_revision == server_args.revision
-            ),
             is_draft_quantization_explicit=(
                 is_draft_model
                 and getattr(
@@ -1463,22 +1454,18 @@ class ModelConfig:
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()
 
-            # Target metadata may not describe embedded floating-point draft
-            # experts. Preserve an explicit modelopt_fp4 draft opt-in rather
-            # than replacing it with the target's detected method. Keep the
-            # existing nvfp4_online draft behavior separately.
-            preserve_draft_quantization = (
-                self.is_embedded_draft_model
-                and self.is_draft_quantization_explicit
-                and self.quantization == "modelopt_fp4"
-            ) or (
+            # ModelOpt FP4 checkpoints quantize only the target model; an
+            # embedded MTP draft may stay unquantized, so an explicit
+            # nvfp4_online opt-in for the draft wins over checkpoint detection.
+            # The online loader rejects already-packed weights at load time.
+            preserve_online_draft_quantization = (
                 self.is_draft_model
                 and self.quantization == "nvfp4_online"
                 and quant_method == "modelopt_fp4"
             )
 
             # Detect which checkpoint is it
-            if not preserve_draft_quantization:
+            if not preserve_online_draft_quantization:
                 for _, method in QUANTIZATION_METHODS.items():
                     quantization_override = method.override_quantization_method(
                         quant_cfg, self.quantization
@@ -1493,7 +1480,7 @@ class ModelConfig:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
                 # Check if the CLI-specified quantization is compatible with HF config's quant_method
-                is_compatible = preserve_draft_quantization or (
+                is_compatible = preserve_online_draft_quantization or (
                     self.quantization in compatible_quantization_methods
                     and quant_method
                     in compatible_quantization_methods[self.quantization]
