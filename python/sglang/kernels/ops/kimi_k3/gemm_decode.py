@@ -106,7 +106,10 @@ def gemm_decode(
     """Compute x @ weight.T using the MFMA decode kernel.
 
     Returns None if the kernel is unavailable or x does not satisfy the
-    decode-shape contract (2-D, bf16, M <= 512, contiguous).
+    decode-shape contract (2-D, bf16, M <= 512, N <= 4096, contiguous).
+    The N <= 4096 guard prevents routing large-N draft-model layers (e.g.
+    N=7168 in DSpark) through a tile-fixed kernel that produces wrong output
+    at untested output widths.
     """
     if (
         not _AVAILABLE
@@ -116,6 +119,7 @@ def gemm_decode(
         or weight.dtype != torch.bfloat16
         or not x.is_contiguous()
         or x.shape[0] > 512
+        or weight.shape[0] > 4096
     ):
         return None
 
