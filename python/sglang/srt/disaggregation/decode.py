@@ -209,6 +209,9 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         mamba_size: int = None,
         start_layer: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        linear_replayssm_cache_len: int = 16,
+        mamba_envelope_layout: bool = False,
+        enable_gdn_replayssm_spec: bool = False,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -253,6 +256,9 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            linear_replayssm_cache_len=linear_replayssm_cache_len,
+            mamba_envelope_layout=mamba_envelope_layout,
+            enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
         )
 
     def clear(self):
@@ -898,7 +904,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
         if is_pp_mode:
-            rids_to_check = pp_good_rids + pp_bad_rids
+            rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
 
         failed_reqs = []
         preallocated_reqs = []

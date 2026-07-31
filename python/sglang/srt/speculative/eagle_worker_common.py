@@ -342,22 +342,28 @@ def build_eagle_verify_input(
             device,
         )
 
-    # Build tree mask
-    # Directly write to cuda graph buffers for verify attn
-    tree_mask_buf, position_buf = (
-        target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
-    )
+    # Write straight into the backend's buffer when it owns one and this batch
+    # fits; an eager batch past the captured max_bs falls back to allocating.
+    bs = batch.seq_lens.shape[0]
+    target_attn_backend = target_worker.model_runner.attn_backend
+    verify_mask = target_attn_backend.verify_mask
+    if verify_mask is None:
+        tree_mask_buf, mask_mode, fill_mask = None, tree_mask_mode, True
+    else:
+        mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
+        tree_mask_buf = (
+            verify_mask.buffer if verify_mask.fits(bs, num_draft_tokens) else None
+        )
 
     # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
-    # tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
+    # FULL_MASK tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
     seq_lens_sum = batch.seq_lens_sum
     if seq_lens_sum is None:
-        if tree_mask_buf is None:
-            max_context_len = target_worker.model_runner.attn_backend.max_context_len
-            seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
-        else:
-            # tree_mask_buf preallocated -> kernel ignores seq_lens_sum.
+        if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
+            # Preallocated, or a QLEN_ONLY allocation sized off bs alone.
             seq_lens_sum = 0
+        else:
+            seq_lens_sum = bs * target_attn_backend.max_context_len
 
     (
         tree_mask,
@@ -376,9 +382,9 @@ def build_eagle_verify_input(
         topk,
         num_steps,
         num_draft_tokens,
-        tree_mask_mode,
+        mask_mode,
         tree_mask_buf,
-        position_buf,
+        fill_prefix_mask=fill_mask,
     )
 
     return EagleVerifyInput(
