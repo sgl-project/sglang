@@ -454,6 +454,210 @@ def fused_conv_window_scatter_with_mask(
     )
 
 
+_CONV_MULTI_MAX_TYPES = 8
+_CONV_MULTI_META_COLS = 12
+_conv_multi_meta_cache: dict = {}
+
+
+@triton.jit
+def _fused_conv_window_scatter_multi_kernel(
+    meta_ptr,  # int64 [num_types, 12]: src_ptr, dst_ptr, elem, s_l, s_r, s_s, s_d, s_w, d_l, d_r, block_start, last_axis
+    idx1_ptr,
+    step1_ptr,
+    idx2_ptr,
+    step2_ptr,
+    n1,
+    src_req_size,
+    src_step_size,
+    dst_req_size,
+    NUM_TYPES: tl.constexpr,
+    META_COLS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_req = tl.program_id(0)
+    pid_layer = tl.program_id(1).to(tl.int64)
+    pid_block = tl.program_id(2).to(tl.int64)
+
+    is1 = pid_req < n1
+    is2 = pid_req >= n1
+    off1 = pid_req
+    off2 = pid_req - n1
+    s1 = tl.load(step1_ptr + off1, mask=is1, other=-1).to(tl.int64)
+    s2 = tl.load(step2_ptr + off2, mask=is2, other=-1).to(tl.int64)
+    step_idx = tl.where(is2, s2, s1)
+    if step_idx < 0:
+        return
+    d1 = tl.load(idx1_ptr + off1, mask=is1, other=-1).to(tl.int64)
+    d2 = tl.load(idx2_ptr + off2, mask=is2, other=-1).to(tl.int64)
+    dst_idx = tl.where(is2, d2, d1)
+    src_idx = tl.where(is2, off2, off1).to(tl.int64)
+
+    if not (
+        (dst_idx >= 0)
+        & (dst_idx < dst_req_size)
+        & (src_idx < src_req_size)
+        & (step_idx < src_step_size)
+    ):
+        return
+
+    for t in tl.static_range(NUM_TYPES):
+        block_start = tl.load(meta_ptr + t * META_COLS + 10)
+        block_end = tl.load(
+            meta_ptr + (t + 1) * META_COLS + 10,
+            mask=t + 1 < NUM_TYPES,
+            other=2147483647,
+        )
+        if (pid_block >= block_start) & (pid_block < block_end):
+            src_ptr = tl.load(meta_ptr + t * META_COLS + 0).to(
+                tl.pointer_type(tl.bfloat16)
+            )
+            dst_ptr = tl.load(meta_ptr + t * META_COLS + 1).to(
+                tl.pointer_type(tl.bfloat16)
+            )
+            elem_per_entry = tl.load(meta_ptr + t * META_COLS + 2)
+            src_layer_stride = tl.load(meta_ptr + t * META_COLS + 3)
+            src_req_stride = tl.load(meta_ptr + t * META_COLS + 4)
+            src_step_stride = tl.load(meta_ptr + t * META_COLS + 5)
+            src_dim_stride = tl.load(meta_ptr + t * META_COLS + 6)
+            src_win_stride = tl.load(meta_ptr + t * META_COLS + 7)
+            dst_layer_stride = tl.load(meta_ptr + t * META_COLS + 8)
+            dst_req_stride = tl.load(meta_ptr + t * META_COLS + 9)
+            last_axis = tl.load(meta_ptr + t * META_COLS + 11)
+
+            start = (pid_block - block_start) * BLOCK_SIZE
+            e = start + tl.arange(0, BLOCK_SIZE)
+            mask = e < elem_per_entry
+            d = e // last_axis
+            w = e % last_axis
+            src_off = (
+                pid_layer * src_layer_stride
+                + src_idx * src_req_stride
+                + step_idx * src_step_stride
+                + d * src_dim_stride
+                + w * src_win_stride
+            )
+            dst_off = pid_layer * dst_layer_stride + dst_idx * dst_req_stride + e
+            data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
+            tl.store(dst_ptr + dst_off, data, mask=mask)
+
+
+def _conv_multi_build_meta(pairs, block_size: int):
+    rows = []
+    block_start = 0
+    for dst, src in pairs:
+        elem = dst.shape[2] * dst.shape[3]
+        rows.append(
+            [
+                src.data_ptr(),
+                dst.data_ptr(),
+                elem,
+                src.stride(0),
+                src.stride(1),
+                src.stride(2),
+                src.stride(3),
+                src.stride(4),
+                dst.stride(0),
+                dst.stride(1),
+                block_start,
+                dst.shape[3],
+            ]
+        )
+        block_start += triton.cdiv(elem, block_size)
+    meta = torch.tensor(rows, dtype=torch.int64, device=pairs[0][0].device)
+    return meta, block_start
+
+
+def _conv_multi_eligible(pairs) -> bool:
+    if not (0 < len(pairs) <= _CONV_MULTI_MAX_TYPES):
+        return False
+    layers = pairs[0][0].shape[0]
+    for dst, src in pairs:
+        if dst.dtype != torch.bfloat16 or src.dtype != torch.bfloat16:
+            return False
+        if dst.ndim != 4 or src.ndim != 5:
+            return False
+        if dst.shape[0] != layers:
+            return False
+        if src.shape[0] != layers or src.shape[3:] != dst.shape[2:]:
+            return False
+        if not dst.is_contiguous():
+            return False
+        if src.shape[1:3] != pairs[0][1].shape[1:3]:
+            return False
+        if dst.shape[1] != pairs[0][0].shape[1]:
+            return False
+    return True
+
+
+def fused_conv_window_scatter_multi(
+    pairs,
+    dst_indices_raw: torch.Tensor,
+    step_indices_raw: torch.Tensor,
+    dst_indices2_raw: torch.Tensor | None = None,
+    step_indices2_raw: torch.Tensor | None = None,
+) -> None:
+    """Single-launch variant of ``fused_conv_window_scatter_with_mask`` over
+    multiple (dst, src) conv-type pairs and up to two request-index sets (the
+    accept commit plus the optional interval-crossing track set)."""
+    n1 = step_indices_raw.shape[0]
+    n2 = 0 if step_indices2_raw is None else step_indices2_raw.shape[0]
+    if n1 + n2 == 0:
+        return
+
+    BLOCK_SIZE = 1024
+    key = tuple(
+        (dst.data_ptr(), src.data_ptr()) + tuple(src.stride()) + tuple(dst.shape)
+        for dst, src in pairs
+    )
+    cached = _conv_multi_meta_cache.get(key)
+    if cached is None:
+        cached = _conv_multi_build_meta(pairs, BLOCK_SIZE)
+        _conv_multi_meta_cache.clear()
+        _conv_multi_meta_cache[key] = cached
+    meta, total_blocks = cached
+
+    idx1 = (
+        dst_indices_raw
+        if dst_indices_raw.is_contiguous()
+        else dst_indices_raw.contiguous()
+    )
+    st1 = (
+        step_indices_raw
+        if step_indices_raw.is_contiguous()
+        else step_indices_raw.contiguous()
+    )
+    if n2 > 0:
+        idx2 = (
+            dst_indices2_raw
+            if dst_indices2_raw.is_contiguous()
+            else dst_indices2_raw.contiguous()
+        )
+        st2 = (
+            step_indices2_raw
+            if step_indices2_raw.is_contiguous()
+            else step_indices2_raw.contiguous()
+        )
+    else:
+        idx2, st2 = idx1, st1
+
+    dst0, src0 = pairs[0]
+    grid = (n1 + n2, dst0.shape[0], total_blocks)
+    _fused_conv_window_scatter_multi_kernel[grid](
+        meta,
+        idx1,
+        st1,
+        idx2,
+        st2,
+        n1,
+        src0.shape[1],
+        src0.shape[2],
+        dst0.shape[1],
+        NUM_TYPES=len(pairs),
+        META_COLS=_CONV_MULTI_META_COLS,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+
 def scatter_mamba_states_after_mtp_verify(
     mamba_caches,
     state_indices_tensor: torch.Tensor,
@@ -473,31 +677,100 @@ def scatter_mamba_states_after_mtp_verify(
             state_indices_tensor,
             last_correct_step_indices,
         )
-    for conv_states, intermediate_conv_window_cache in zip(
-        mamba_caches.conv, mamba_caches.intermediate_conv_window
-    ):
-        fused_conv_window_scatter_with_mask(
-            conv_states,
-            intermediate_conv_window_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
-        )
-
-    if mamba_track_indices is not None:
-        assert mamba_steps_to_track is not None
-        if ssm_states.numel() > 0:
+        if mamba_track_indices is not None:
+            assert mamba_steps_to_track is not None
             fused_mamba_state_scatter_with_mask(
                 ssm_states,
                 intermediate_state_cache,
                 mamba_track_indices,
                 mamba_steps_to_track,
             )
-        for conv_states, intermediate_conv_window_cache in zip(
-            mamba_caches.conv, mamba_caches.intermediate_conv_window
-        ):
+
+    pairs = list(zip(mamba_caches.conv, mamba_caches.intermediate_conv_window))
+    if not pairs:
+        return
+    if mamba_track_indices is not None:
+        assert mamba_steps_to_track is not None
+    if _conv_multi_eligible(pairs):
+        fused_conv_window_scatter_multi(
+            pairs,
+            state_indices_tensor,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+        )
+        return
+    for conv_states, intermediate_conv_window_cache in pairs:
+        fused_conv_window_scatter_with_mask(
+            conv_states,
+            intermediate_conv_window_cache,
+            state_indices_tensor,
+            last_correct_step_indices,
+        )
+    if mamba_track_indices is not None:
+        for conv_states, intermediate_conv_window_cache in pairs:
             fused_conv_window_scatter_with_mask(
                 conv_states,
                 intermediate_conv_window_cache,
                 mamba_track_indices,
                 mamba_steps_to_track,
             )
+
+
+@triton.jit
+def _fused_commit_track_indices_kernel(
+    accept_index_ptr,
+    accept_lens_ptr,
+    seq_lens_ptr,
+    last_correct_out_ptr,
+    track_steps_out_ptr,
+    dtn,
+    interval,
+    HAS_TRACK: tl.constexpr,
+):
+    b = tl.program_id(0).to(tl.int64)
+    al = tl.load(accept_lens_ptr + b).to(tl.int64)
+    base = b * dtn
+    last = tl.load(accept_index_ptr + base + al - 1).to(tl.int64) - base
+    tl.store(last_correct_out_ptr + b, last)
+    if HAS_TRACK:
+        pre = tl.load(seq_lens_ptr + b).to(tl.int64)
+        post = pre + al
+        cross = (pre // interval) != (post // interval)
+        tp = (post // interval) * interval
+        ti = tp - pre - 1
+        ti = tl.where(ti < 0, 0, ti)
+        cand = tl.load(accept_index_ptr + base + ti).to(tl.int64) - base
+        tl.store(track_steps_out_ptr + b, tl.where(cross, cand, -1))
+
+
+def fused_commit_track_indices(
+    accept_index: torch.Tensor,
+    accept_lens: torch.Tensor,
+    seq_lens: torch.Tensor | None,
+    draft_token_num: int,
+    mamba_track_interval: int,
+):
+    """Single-launch replacement for the eager index math in
+    ``commit_mamba_states_after_verify`` (index ranges, gathers, floordiv chain)."""
+    bs = accept_lens.shape[0]
+    last_correct_step_indices = torch.empty(
+        bs, dtype=torch.int64, device=accept_lens.device
+    )
+    has_track = seq_lens is not None
+    mamba_steps_to_track = (
+        torch.empty(bs, dtype=torch.int64, device=accept_lens.device)
+        if has_track
+        else last_correct_step_indices
+    )
+    _fused_commit_track_indices_kernel[(bs,)](
+        accept_index,
+        accept_lens,
+        seq_lens if has_track else accept_lens,
+        last_correct_step_indices,
+        mamba_steps_to_track,
+        draft_token_num,
+        mamba_track_interval,
+        HAS_TRACK=has_track,
+    )
+    return last_correct_step_indices, (mamba_steps_to_track if has_track else None)
