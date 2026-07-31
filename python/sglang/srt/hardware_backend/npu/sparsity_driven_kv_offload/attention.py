@@ -131,7 +131,11 @@ def forward_sparsity_driven_kv_offload(
             f"num_query_heads={num_query_heads}"
         )
 
-        selected_kv = torch.zeros(
+        # Materialize the compact top-k KV for the current attention step:
+        # device-cache hits and host misses are copied into this buffer, the
+        # device cache is refilled from it, and sparse attention consumes it
+        # directly.
+        selected_kv_buffer = torch.zeros(
             (
                 batch_size,
                 selected_kv_length,
@@ -141,10 +145,10 @@ def forward_sparsity_driven_kv_offload(
             dtype=k.dtype,
             device=backend.device,
         )
-        sparse_kv_manager.prefetch(
-            layer, forward_batch, topk_indices, selected_kv, stream
+        sparse_kv_manager.materialize_selected_kv(
+            layer, forward_batch, topk_indices, selected_kv_buffer, stream
         )
-        selected_k_nope, selected_k_rope = selected_kv.split(
+        selected_k_nope, selected_k_rope = selected_kv_buffer.split(
             [nope_head_dim, rope_head_dim], dim=-1
         )
 

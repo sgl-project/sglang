@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, AnyStr, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 from sgl_kernel_npu.sparsity_driven_kv_offload import (
@@ -28,27 +28,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
-
-GB = 1024 * 1024 * 1024
-ACL_MEMCPY_HOST_TO_DEVICE = 1
-ACL_MEMCPY_DEVICE_TO_HOST = 2
-ACL_MEMCPY_DEVICE_TO_DEVICE = 3
-_LAYER_TO_LOG = [0, 1]
-
-
-def _log_debug(device: torch.device, layer: RadixAttention, msg: AnyStr):
-    if device == torch.device("npu:0") and layer.layer_id in _LAYER_TO_LOG:
-        logger.info(msg)
-
-
-def _profile_push(name: str):
-    profiler_range = torch.profiler.record_function(name)
-    profiler_range.__enter__()
-    return profiler_range
-
-
-def _profile_pop(profiler_range):
-    profiler_range.__exit__(None, None, None)
 
 
 def _record_stream_event(stream, event) -> None:
@@ -76,8 +55,6 @@ class SparseKVCacheManager:
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        # tp_group: torch.distributed.ProcessGroup,
-        # server_args: ServerArgs,
     ) -> None:
         enable_memory_saver = False
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -100,7 +77,6 @@ class SparseKVCacheManager:
         self.start_layer = paged_kv_cache.start_layer
         # MLA params
         self.head_num = 1
-        # Maybe useful?
         self.kv_lora_rank = self.paged_kv_cache.kv_lora_rank
         self.qk_rope_head_dim = self.paged_kv_cache.qk_rope_head_dim
         # kv_cache_dim = kv_lora_rank + qk_rope_head_dim
@@ -109,23 +85,22 @@ class SparseKVCacheManager:
         )
         self.store_dtype = self.paged_kv_cache.store_dtype
         self.layer_num = self.paged_kv_cache.layer_num
-        self._prefetch_d2d_hit_stream = torch.npu.Stream()
-        self._prefetch_h2d_miss_stream = torch.npu.Stream()
-        self._prefetch_refill_stream = torch.npu.Stream()
+        self._materialize_d2d_hit_stream = torch.npu.Stream()
+        self._materialize_h2d_miss_stream = torch.npu.Stream()
+        self._materialize_refill_stream = torch.npu.Stream()
         # device KV buffer
         try:
             with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
                 # [bs, ctx_len, head_num, head_dim] for each layer
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
                 self.device_kv_buffer: list[torch.Tensor] = [
-                    torch.full(
+                    torch.empty(
                         (
                             self.size,
                             self.sparse_context_len,
                             self.head_num,
                             self.head_dim,
                         ),
-                        1111.11,
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -157,17 +132,6 @@ class SparseKVCacheManager:
         # Host KV buffer
         # [bs, ctx_len, head_num, head_dim] for each layer
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        # self.host_kv_buffer = [
-        #     torch.full(
-        #         (self.size, self.max_context_len, self.head_num, self.head_dim),
-        #         2222.22,
-        #         dtype=self.store_dtype,
-        #         device="cpu",
-        #         pin_memory=True
-        #     )
-        #     for _ in range(self.layer_num)
-        # ]
-
         self.host_kv_buffer: list[torch.Tensor] = []
         self.host_ptr_list: list[int] = []
         self.dev_ptr_list: list[int] = []
@@ -189,14 +153,11 @@ class SparseKVCacheManager:
                     device_id=device_id,
                     name=f"host_kv_layer_{layer_idx}_rank_{device_id}",
                 )
-                shm_cpu_tensor.fill_(2222.22)
-
                 self.host_kv_buffer.append(shm_cpu_tensor)
                 self.host_ptr_list.append(host_ptr)
                 self.dev_ptr_list.append(dev_ptr)
         except Exception as e:
             self._raise_buffer_allocation_error("host_kv_buffer", e)
-        # Maybe useless
         self.host_kv_ctx_len = torch.zeros(
             (self.size, self.max_context_len), dtype=torch.int32, device="cpu"
         )
@@ -204,7 +165,6 @@ class SparseKVCacheManager:
         self.token_on_device_cpu = None
         self.device_token_pos_cpu = None
         self.current_req_indices_cpu = None
-        self._debug_log_cnt = 10
 
         self._device_cache_slot_ids = torch.arange(
             self.sparse_context_len, dtype=torch.long, device=self.device
@@ -688,15 +648,15 @@ class SparseKVCacheManager:
         k_nope, k_pe = kv_cat.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         return k_nope.contiguous(), k_pe.contiguous()
 
-    def prefetch(
+    def materialize_selected_kv(
         self,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         topk_indices: torch.Tensor,
-        current_kv_buffer: torch.Tensor,
+        selected_kv_buffer: torch.Tensor,
         stream: torch.npu.Stream,
-    ):
-        prefetch_profile_range = _profile_push("sparse_kv_prefetch")
+    ) -> None:
+        """Materialize top-k KV entries and refresh the device cache metadata."""
         layer_idx = layer.layer_id - self.start_layer
         stream = stream if stream is not None else torch.npu.current_stream()
 
@@ -728,7 +688,6 @@ class SparseKVCacheManager:
             )
 
             # Query the slot map for device-cache hits and their slot positions.
-            profile_range = _profile_push("sparse_kv_prefetch.slot_lookup")
             slot_lookup_req_indices = slot_map_row_indices.to(
                 dtype=torch.int32
             ).contiguous()
@@ -739,7 +698,6 @@ class SparseKVCacheManager:
                 slot_lookup_topk_indices,
             )
             token_on_device = token_on_device.to(torch.bool) & valid_topk_mask
-            _profile_pop(profile_range)
 
             # Build copy indices on the main stream, then protect their use on
             # the hit and miss streams with copy_ready.
@@ -778,13 +736,12 @@ class SparseKVCacheManager:
             refill_done = torch.npu.Event()
             _record_stream_event(stream, copy_ready)
 
-        # Copy device-cache hits into the current KV buffer.
-        profile_range = _profile_push("sparse_kv_prefetch.d2d_hit_copy")
-        with torch.npu.stream(self._prefetch_d2d_hit_stream):
-            _wait_stream_event(self._prefetch_d2d_hit_stream, copy_ready)
+        # Copy device-cache hits into the selected KV buffer.
+        with torch.npu.stream(self._materialize_d2d_hit_stream):
+            _wait_stream_event(self._materialize_d2d_hit_stream, copy_ready)
             unidex_copy_inplace(
                 self.device_kv_buffer[layer_idx],
-                current_kv_buffer,
+                selected_kv_buffer,
                 hit_src_index,
                 hit_dst_index,
                 hit_valid_mask,
@@ -792,16 +749,14 @@ class SparseKVCacheManager:
                 2,  #
                 block_dim=24,
             )
-            _record_stream_event(self._prefetch_d2d_hit_stream, hit_done)
-        _profile_pop(profile_range)
+            _record_stream_event(self._materialize_d2d_hit_stream, hit_done)
 
-        # Copy host shared-memory misses into the current KV buffer.
-        profile_range = _profile_push("sparse_kv_prefetch.h2d_miss_copy")
-        with torch.npu.stream(self._prefetch_h2d_miss_stream):
-            _wait_stream_event(self._prefetch_h2d_miss_stream, copy_ready)
+        # Copy host shared-memory misses into the selected KV buffer.
+        with torch.npu.stream(self._materialize_h2d_miss_stream):
+            _wait_stream_event(self._materialize_h2d_miss_stream, copy_ready)
             unidex_copy_inplace(
                 self.host_kv_buffer[layer_idx],
-                current_kv_buffer,
+                selected_kv_buffer,
                 miss_src_index,
                 miss_dst_index,
                 miss_valid_mask,
@@ -810,17 +765,15 @@ class SparseKVCacheManager:
                 block_dim=24,
                 src_ptr=self.dev_ptr_list[layer_idx],
             )
-            _record_stream_event(self._prefetch_h2d_miss_stream, miss_done)
-        _profile_pop(profile_range)
+            _record_stream_event(self._materialize_h2d_miss_stream, miss_done)
 
         # Refill the device cache with the current top-k after hit and miss
         # copies complete, so the next step can reuse these entries.
-        profile_range = _profile_push("sparse_kv_prefetch.device_refill")
-        with torch.npu.stream(self._prefetch_refill_stream):
-            _wait_stream_event(self._prefetch_refill_stream, hit_done)
-            _wait_stream_event(self._prefetch_refill_stream, miss_done)
+        with torch.npu.stream(self._materialize_refill_stream):
+            _wait_stream_event(self._materialize_refill_stream, hit_done)
+            _wait_stream_event(self._materialize_refill_stream, miss_done)
             unidex_copy_inplace(
-                current_kv_buffer,
+                selected_kv_buffer,
                 self.device_kv_buffer[layer_idx],
                 refill_src_index,
                 refill_dst_index,
@@ -829,14 +782,12 @@ class SparseKVCacheManager:
                 2,
                 block_dim=48,
             )
-            _record_stream_event(self._prefetch_refill_stream, refill_done)
-        _profile_pop(profile_range)
+            _record_stream_event(self._materialize_refill_stream, refill_done)
 
         _wait_stream_event(stream, refill_done)
 
         # Replace the slot-map row with the current top-k mapping. Invalid
         # entries use the max_context_len sentinel column to preserve shape.
-        profile_range = _profile_push("sparse_kv_prefetch.metadata_update")
         with torch.npu.stream(stream):
             self.device_slot_map[layer_idx].index_fill_(0, slot_map_row_indices, -1)
 
@@ -857,8 +808,6 @@ class SparseKVCacheManager:
             self.device_slot_map[layer_idx].view(-1).scatter_(
                 0, slot_map_flat_indices, slot_map_slot_values.reshape(-1)
             )
-        _profile_pop(profile_range)
-        _profile_pop(prefetch_profile_range)
 
 
 _global_sparse_kv_manager: Optional[SparseKVCacheManager] = None
