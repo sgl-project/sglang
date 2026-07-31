@@ -8,11 +8,12 @@ end to end attention solution with aiter kernels
 
 import logging
 from dataclasses import dataclass
-from enum import auto, Enum
-from typing import Optional, TYPE_CHECKING
+from enum import Enum, auto
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
+
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
@@ -24,7 +25,9 @@ from sglang.kernels.ops.kvcache.aiter_unified_attention import (
     scatter_req_to_token_to_page_table_kernel,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -133,7 +136,9 @@ class AiterAttnBackend(AttentionBackend):
     ):
         super().__init__()
         # Lazy import to avoid the initialization of cuda context
-        from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
+        from sglang.kernels.ops.attention.extend_attention import (
+            extend_attention_fwd,
+        )
 
         self.input_dtype = model_runner.model_config.dtype
 
