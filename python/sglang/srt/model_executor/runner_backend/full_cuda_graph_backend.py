@@ -85,11 +85,14 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
-        # When --enable-profile-cuda-graph is set, the runner created a torch
-        # profiler (schedule wait=2, active=1) and exposed it as _profiler. We
-        # step() past the two warmup runs so only the capture run is recorded,
-        # so each batch size produces its own trace via the profiler's
-        # on_trace_ready.
+        # When per-bs capture traces are enabled (--enable-profile-cuda-graph +
+        # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE), the runner created a *scheduled*
+        # torch profiler (wait=2, active=1) and exposed it as _profiler. We step()
+        # past the two warmup runs so only the capture run is recorded, and each
+        # batch size produces its own trace via the profiler's on_trace_ready.
+        # With --enable-profile-cuda-graph alone the runner leaves _profiler None
+        # (its unscheduled profiler records the whole capture in one pass), so no
+        # stepping happens here.
         runner = self._cuda_graph_runner
         profiler = (
             getattr(runner, "_profiler", None)
