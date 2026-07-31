@@ -1,0 +1,9 @@
+{
+  "data-root": "/opt/dlami/nvme/docker",
+  "runtimes": {
+    "nvidia": {
+      "args": [],
+      "path": "nvidia-container-runtime"
+    }
+  }
+}

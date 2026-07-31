@@ -372,12 +372,19 @@ def _minwm_apply_qk_op(
     return _MinWMSegmentCompile.get(qk_op, use_compile)(*qk_args)
 
 
+@torch.compiler.disable
 def _minwm_packed_varlen_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
 ) -> torch.Tensor:
-    """Call the same device-selected packed-varlen backend as minWM main."""
+    """Call the same device-selected packed-varlen backend as minWM main.
+
+    Keep the packed FlashAttention boundary eager when the enclosing DiT is
+    compiled.  Inductor cannot lower the symbolic ``cumsum``-built varlen
+    metadata on current PyTorch/FA4 (``FakeTensor * Node``), while FA4 already
+    supplies the fused kernel we want here.
+    """
     if query.device.type != "cuda":
         raise RuntimeError("MinWM packed-varlen attention requires CUDA")
     batch_size, query_length, num_heads, head_dim = query.shape

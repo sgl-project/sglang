@@ -483,6 +483,56 @@ kubectl kustomize --load-restrictor LoadRestrictionsNone \
 没有遗留第二台 GPU 主机。us-east-2 的旧 parity 工作盘暂时保留到本轮结果落盘，
 避免在输出确认前做不可恢复清理。
 
+## 8.1 B200 性能优先部署复核（2026-07-31）
+
+在 `us-east-2b` 的单张 B200 上，使用同一个 gap12 checkpoint、832×480、
+24 FPS、4 DMD steps、window 32、sink 8 做了三种执行档复核。结果表明旧模型上
+有效的 `dense + whole-DiT compile` 不能直接套到本次 T2V checkpoint：
+
+| 执行档 | 完整 chunk scheduler FPS | window=32 饱和 FPS | 结论 |
+| --- | ---: | ---: | --- |
+| dense + whole-DiT compile | 1.87 | 1.22 | KV 变长后严重退化，禁用 |
+| packed FA4 + whole-DiT compile，FA4 graph break | 未跑完 | 约 1.8～2.9 | 正确但仍为负优化，禁用 |
+| packed FA4 非确定性 + segment compile | 13.72 | 11.90 | 当前最终性能档 |
+
+whole-DiT compile 直接包住 packed FA4 时，PyTorch 2.11 Inductor 会在 varlen
+`cumsum` 元数据上报 `FakeTensor * Node`。SGLang 因此把融合 FA4 边界显式留在
+eager，避免请求崩溃；但 69 个 block 上的 graph break 会让整图 compile 比
+eager/segment compile 更慢，所以产品部署仍关闭 whole-DiT compile。
+
+最终部署开关如下：
+
+```text
+performance_mode                  speed
+MINWM_ATTENTION_IMPL              packed
+MINWM_PACKED_ATTENTION_DETERMINISTIC false
+MINWM_NATIVE_COMPONENTS           <empty; use SGLang components>
+MINWM_SEGMENT_COMPILE             true
+enable_torch_compile              false
+attention backend                 fa（B200 实际选择 FA4）
+SP / CFG parallel                 1 / false
+```
+
+公网 WebSocket 的同一 5 秒 case 复核为：TTFF 2.21 秒，wall time 11.81 秒，
+完整 chunk scheduler 13.70 FPS。WebP 解码并写视频的客户端测量为 121 帧 / 12.89
+秒；浏览器传输仍使用 WebP quality 55、560px preview、3 帧/消息、pacing=false。
+
+这次不能把 13.7 FPS 与 7 月 27 日的约 38 FPS 直接归因于加速开关变化：旧结果是
+另一 checkpoint/I2V/window 20 合同，本次是 gap12 T2V/window 32；本次在固定新
+checkpoint 和请求下的可比结论是，最终档显著快于 dense compile，但单卡仍未达到
+24 FPS。
+
+最终服务由 systemd 管理，使用单张 B200（物理 GPU 3），API/UI 分别监听
+30060/18060，再由 Nginx 暴露 80 端口。其余 7 张 GPU 已释放。验证产物在：
+
+```text
+benchmark/minwm_realtime_parity/results/
+  tianpeng-gap12-b200-public-5s-performance-final/
+    request.json
+    summary.json
+    sglang-performance.mp4
+```
+
 ## 9. 交给克君部署前的检查
 
 - 必须使用本次提交后的 SGLang commit，而不是复制工作区文件；
@@ -495,6 +545,8 @@ kubectl kustomize --load-restrictor LoadRestrictionsNone \
   realtime adapter；
 - 产品 profile 若打开 torch.compile 或非确定 attention，应明确它是性能模式，
   不承诺跨进程 bitwise。
+- 本次 gap12 T2V 性能档只能开启非确定 packed FA4 和 segment compile；不要按旧
+  checkpoint 经验开启 whole-DiT compile，除非重新证明饱和 window 吞吐更高。
 
 ## 10. 必须通过的测验
 

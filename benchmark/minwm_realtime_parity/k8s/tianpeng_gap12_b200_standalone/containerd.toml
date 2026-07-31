@@ -1,0 +1,10 @@
+# Docker 29 uses containerd's image store on the DLAMI. Keep large diffusion
+# image layers off the 36 GiB root disk and on the local NVMe volume.
+disabled_plugins = ["cri"]
+root = "/opt/dlami/nvme/containerd"
+state = "/run/containerd"
+
+[proxy_plugins]
+  [proxy_plugins.soci]
+    type = "snapshot"
+    address = "/run/soci-snapshotter-grpc/soci-snapshotter-grpc.sock"
