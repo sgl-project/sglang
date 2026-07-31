@@ -296,6 +296,47 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "trtllm",
 ]
 
+# DSA backends that exist only on CUDA. Each one imports a CUDA-only extension
+# (flashmla_ops, trtllm, flashinfer) at first use, so reaching any of them on
+# ROCm is a hard ImportError rather than a slow path.
+_CUDA_ONLY_DSA_IMPLS = frozenset(
+    {
+        "flashmla_sparse",
+        "flashmla_sparse_q8",
+        "flashmla_kv",
+        "flashmla_auto",
+        "flashinfer_sparse_mla",
+        "trtllm",
+    }
+)
+
+
+def _resolve_hip_dsa_impl(impl: _DSA_IMPL_T, role: str) -> _DSA_IMPL_T:
+    """Substitute tilelang for a CUDA-only DSA backend on ROCm.
+
+    This exists to repair a gap in default resolution, not to override a real
+    choice. ``arg_groups/overrides.py`` only applies its ROCm default -- tilelang
+    for both roles -- when *neither* backend was set on the command line. Set
+    just one (say ``--dsa-decode-backend aiter``) and the other is left to the
+    generic fp8 branch below it, which picks ``flashmla_kv`` on anything that is
+    not Blackwell. gfx950 reports device capability major 9, so ROCm lands there
+    and the server dies at the first prefill with ``ImportError: flashmla_ops``.
+
+    Nothing in that path can ever select a backend that runs on ROCm, so a
+    CUDA-only value arriving here is always the result of that fall-through and
+    never something the user could have meant. Coercing it to tilelang, loudly,
+    turns a crash into the documented default.
+    """
+    if impl not in _CUDA_ONLY_DSA_IMPLS:
+        return impl
+    logger.warning(
+        f"DSA {role} backend {impl!r} is CUDA-only and cannot run on ROCm; "
+        "using 'tilelang' instead. This usually means only one of "
+        "--dsa-prefill-backend / --dsa-decode-backend was passed, which skips "
+        "the ROCm default. Pass both to choose explicitly."
+    )
+    return "tilelang"
+
 
 class DeepseekSparseAttnBackend(
     DeepseekSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
@@ -348,6 +389,11 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.dsa_prefill_backend
         )
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
+        if _is_hip:
+            self.dsa_prefill_impl = _resolve_hip_dsa_impl(
+                self.dsa_prefill_impl, "prefill"
+            )
+            self.dsa_decode_impl = _resolve_hip_dsa_impl(self.dsa_decode_impl, "decode")
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
