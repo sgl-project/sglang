@@ -20,6 +20,10 @@ debug = false
 name = "sglang_mm_core"
 crate-type = ["cdylib"]
 
+[features]
+default = ["turbojpeg-decode"]
+turbojpeg-decode = ["dep:turbojpeg"]
+
 [dependencies]
 pyo3 = { workspace = true }
 
@@ -28,4 +32,6 @@ blake3 = "1"
 half = "2.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 numpy = "0.29"
+png = "0.17"
 rayon = "1.10"
+turbojpeg = { version = "1", optional = true }

@@ -23,6 +23,12 @@ jobs:
           python -m pip install pre-commit
           pre-commit install
 
+      # sglang-mm's default turbojpeg-decode feature builds libjpeg-turbo from
+      # source, whose SIMD path needs the NASM assembler (cmake/gcc are already
+      # on the runner). The clippy-rust-workspace hook compiles this workspace.
+      - name: Install NASM (turbojpeg SIMD build)
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
       # The clippy-rust-workspace pre-commit hook compiles the rust/ workspace
       # (debug profile); cache cargo registry + target across runs.
       - name: Rust cache (rust/ workspace)
