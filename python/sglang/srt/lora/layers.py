@@ -45,9 +45,23 @@ class BaseLayerWithLoRA(nn.Module):
             self.weight = self.base_layer.weight
         if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
             self.bias = self.base_layer.bias
+        # Forward reduce_results so model code that inspects it on the module
+        # (e.g. DeepseekV2AttentionMLA's `assert not self.o_proj.reduce_results`
+        # on DP-attention idle forwards) keeps working when the layer is
+        # LoRA-wrapped.
+        if hasattr(self.base_layer, "reduce_results"):
+            self.reduce_results = self.base_layer.reduce_results
 
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
+
+    @property
+    def lora_active(self) -> bool:
+        """True when this layer has LoRA buffers set AND the current forward
+        has LoRA batch metadata. batch_info is None on DP-attention idle
+        forwards (see LoRAManager.prepare_lora_batch), so idle forwards take
+        the base path."""
+        return self.set_lora and self.lora_backend.batch_info is not None
 
     def set_lora_info(self, *args):
         pass
@@ -211,8 +225,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         ):
             base_output = self.extra_token_embedding(input_, base_output)
 
-        # Apply LoRA if configured
-        if self.set_lora:
+        # Apply LoRA if configured; DP-attention idle forwards take the base
+        # path (see lora_active).
+        if self.lora_active:
             # The backend's run_lora_a_embedding now handles both regular
             # and extra tokens efficiently with CUDA graph support
             base_output = self.apply_lora(base_output, input_, batch_info)
@@ -377,8 +392,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
             hidden_states, self.weight, bias=getattr(self.base_layer, "bias", None)
         )
 
-        # Apply LoRA if set
-        if self.set_lora:
+        if self.lora_active:
             base_output = self.apply_lora(base_output, hidden_states)
 
         return base_output
@@ -467,7 +481,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.base_layer, input_, bias
         )
 
-        if self.set_lora:
+        if self.lora_active:
             output_parallel = self.apply_lora(output_parallel, input_)
 
         if self.base_layer.gather_output:
@@ -773,7 +787,8 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             and not should_skip_mlp_all_reduce()
         )
 
-        if self.set_lora and should_reduce:
+        lora_active = self.lora_active
+        if lora_active and should_reduce:
             lora_a_output = self.lora_backend.run_lora_a_sgemm(
                 input_parallel, self.A_buffer
             )
@@ -787,7 +802,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                 base_output=output_,
             )
         else:
-            if self.set_lora:
+            if lora_active:
                 output_parallel = self.apply_lora(output_parallel, input_parallel)
             if should_reduce:
                 output_ = tensor_model_parallel_all_reduce(output_parallel)
@@ -886,7 +901,7 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
     def forward(self, x: torch.Tensor):
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
         output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
-        if self.set_lora:
+        if self.lora_active:
             output = self.apply_lora(output, x)
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output, output_bias
@@ -1090,6 +1105,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         1. After gate_up projection, before activation
         2. After down projection, before final reduction
         """
+        # DP-attention idle forward: no batch_info, run the base MoE path.
+        if self.lora_backend.batch_info is None:
+            return self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
         # Build LoRA info for this batch
         lora_info = self._get_lora_info()

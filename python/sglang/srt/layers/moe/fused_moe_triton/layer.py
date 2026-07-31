@@ -71,6 +71,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.runtime_context import (
+    get_exec,
     get_global_dwdp_manager,
     get_parallel,
     get_server_args,
@@ -260,7 +261,7 @@ class FusedMoE(torch.nn.Module):
 
         self._num_global_routed = num_experts - num_shared_slots
         server_args = get_server_args()
-        if server_args.ep_join_mode == "scale":
+        if get_exec().moe.ep_join_mode == "scale":
             storage_ep_size = server_args.elastic_ep_initial_size
             assert storage_ep_size is not None
             self._expert_storage_rank = (
@@ -359,7 +360,7 @@ class FusedMoE(torch.nn.Module):
         print_info_once(
             "FlashInfer TRTLLM MoE deferred finalize is "
             f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
-            f"(moe_runner_backend={server_args.moe_runner_backend}, "
+            f"(moe_runner_backend={get_exec().moe.moe_runner_backend}, "
             f"quant_method={type(self.quant_method).__name__})."
         )
 

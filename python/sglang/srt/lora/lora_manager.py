@@ -414,6 +414,13 @@ class LoRAManager:
                 if callable(notify):
                     notify(slot_ids)
 
+    def reset_lora_batch(self):
+        """Clear per-batch LoRA state. Called instead of prepare_lora_batch()
+        on DP-attention idle forwards (zero local tokens), so the LoRA layers
+        take the base path instead of reading the previous batch's stale
+        metadata."""
+        self.lora_backend.reset_batch_state()
+
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size

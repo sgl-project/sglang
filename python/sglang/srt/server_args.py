@@ -7377,7 +7377,7 @@ class ServerArgs:
                 "Please choose one tokenizer batching approach."
             )
 
-        if self.skip_tokenizer_init:
+        if self.skip_tokenizer_init and not envs.SGLANG_RUST_SERVER.get():
             # Tokenizer workers still serve HTTP / state / output work, so
             # their fanout is preserved; detokenizer workers only decode.
             if self.detokenizer_worker_num != 1:
@@ -7712,12 +7712,14 @@ class ServerArgs:
         # are the RESOLVED ids from _resolved_attention_backends: "flashinfer" is
         # FlashInferMLAAttnBackend for an MLA model, "trtllm_mla" the trtllm
         # decode kernel; "cutedsl_mla" and "tokenspeed_mla" subclass
-        # TRTLLMMLABackend and inherit its dense read/write path.
+        # TRTLLMMLABackend and inherit its dense read/write path; "fa3" remaps its
+        # page_table (in-kernel for captured decode, one funnel for eager).
         # flashmla / cutlass_mla share the create_flashmla block-table path and
         # can be added the same way once exercised.
         if self.enable_unified_memory and self.use_mla_backend():
             allowed_full = {
                 "triton",
+                "fa3",
                 "trtllm_mla",
                 "flashinfer",
                 "cutedsl_mla",
@@ -9005,14 +9007,19 @@ class ServerArgs:
 # (decrease-only) by test/registered/unit/test_legacy_global_ratchet.py.
 # Imports are in-function so the two modules stay cycle-free at import time.
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
-    """Legacy publish shim — prefer ``get_context().set_server_args()`` from
-    ``sglang.srt.runtime_context`` in new code."""
-    from sglang.srt.runtime_context import get_context
+    """Legacy publish shim (role=scheduler) — prefer
+    ``runtime_context.publish(server_args, role=...)`` in new code."""
+    from sglang.srt.runtime_context import publish
 
-    get_context().set_server_args(server_args)
+    publish(server_args, role="scheduler")
 
 
-set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler
+def set_global_server_args_for_tokenizer(server_args: ServerArgs):
+    """Legacy publish shim (role=tokenizer). Not aliased to the scheduler shim:
+    the process role differs."""
+    from sglang.srt.runtime_context import publish
+
+    publish(server_args, role="tokenizer")
 
 
 def get_global_server_args() -> ServerArgs:
@@ -9188,14 +9195,13 @@ class PortArgs:
             dist_init_host = na.host
             dist_init_port = na.port
 
-            # We need 5 consecutive ports from port_base for:
-            # port_base, detokenizer, rpc, metrics, scheduler.
-            # In multi-node, all nodes derive ports independently from
-            # dist_init_port, so the derivation must be deterministic
-            # (no availability-based search). If incrementing would
-            # overflow the valid TCP range, decrement instead.
-            NUM_DERIVED_PORTS = 5
-            if server_args.is_ep_joiner:
+            # Reserve port_base+0..NUM_DERIVED_PORTS-1 (6 fixed ports + dp_size
+            # rust-path slots); derive from server_args only (never dp_rank) so
+            # every init_new call agrees, decrementing below dist_init_port on
+            # overflow.
+            is_rust_server = envs.SGLANG_RUST_SERVER.get()
+            NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + server_args.dp_size
+            if server_args.is_ep_scale_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
