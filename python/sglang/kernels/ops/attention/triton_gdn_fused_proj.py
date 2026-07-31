@@ -254,6 +254,48 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
 
 
+def qkvzba_split_is_pure_view(mixed_qkvz, mixed_ba) -> bool:
+    """Whether the contiguous split can be served by views instead of a kernel.
+
+    For the contiguous (Qwen3.5) input layout every load/store offset in
+    ``fused_qkvzba_split_reshape_cat_contiguous_kernel`` is an identity map: the
+    kernel copies ``[all_q | all_k | all_v]`` and ``all_z`` out of ``mixed_qkvz``
+    and ``all_b`` / ``all_a`` out of ``mixed_ba`` without reordering anything.
+    So the outputs are exactly column slices of the inputs.
+
+    Slicing columns only stays contiguous for a single row, which is the shape
+    that matters here: one decode token per sequence. Multi-row callers keep the
+    kernel, whose outputs downstream consumers may assume are contiguous.
+    """
+    return (
+        mixed_qkvz.shape[0] == 1
+        and mixed_ba.shape[0] == 1
+        and mixed_qkvz.is_contiguous()
+        and mixed_ba.is_contiguous()
+    )
+
+
+def qkvzba_split_reshape_cat_contiguous_views(
+    mixed_qkvz,
+    mixed_ba,
+    num_heads_qk,
+    num_heads_v,
+    head_qk,
+    head_v,
+):
+    """Zero-kernel equivalent of ``fused_qkvzba_split_reshape_cat_contiguous``.
+
+    Only valid when :func:`qkvzba_split_is_pure_view` holds. Saves one launch
+    plus a full round trip of the projection output per linear-attention layer.
+    """
+    qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
+    mixed_qkv = mixed_qkvz[:, :qkv_dim]
+    z = mixed_qkvz[:, qkv_dim:].view(-1, num_heads_v, head_v)
+    b = mixed_ba[:, :num_heads_v]
+    a = mixed_ba[:, num_heads_v:]
+    return mixed_qkv, z, b, a
+
+
 def fused_qkvzba_split_reshape_cat_contiguous(
     mixed_qkvz,
     mixed_ba,
