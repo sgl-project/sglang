@@ -66,6 +66,51 @@ if is_flashinfer_available():
     )
 
 
+@dataclass(frozen=True)
+class UnifiedMLAHooks:
+    """Allocator hooks the paged MLA backends need under the unified memory pool.
+
+    All-``None``/1/``False`` for the statically-partitioned pool, where
+    ``req_to_token`` already holds physical ids.
+    """
+
+    # Page-level virtual->physical table, gathered through by the block-table kernel.
+    v2p_page_table: Optional[torch.Tensor]
+    # Virtual token id -> DENSE kernel-facing id.
+    translate_kv_loc_dense: Optional[Callable[..., torch.Tensor]]
+    # Dense page stride scale (= number of full-attention MLA layers).
+    kernel_page_multiplier: int
+    enabled: bool
+
+
+def unified_mla_hooks(allocator) -> UnifiedMLAHooks:
+    """Probe ``allocator`` for the unified-pool dense-view hooks.
+
+    Detection keys on the page-level v2p table, NOT on
+    ``kernel_page_multiplier > 1``: a configuration with exactly ONE
+    full-attention layer (e.g. a pipeline-parallel rank that owns a single MLA
+    layer) has multiplier 1 while its ``req_to_token`` still holds VIRTUAL ids.
+    With multiplier 1 the dense id collapses onto the physical id, so the v2p
+    gather alone is the whole translation -- skipping it would leave the block
+    table and the KV write loc in virtual space and silently address the wrong
+    pages once virtual and physical diverge (e.g. after compaction).
+    """
+    v2p = getattr(allocator, "full_v2p_page_table", None)
+    if v2p is None:
+        return UnifiedMLAHooks(
+            v2p_page_table=None,
+            translate_kv_loc_dense=None,
+            kernel_page_multiplier=1,
+            enabled=False,
+        )
+    return UnifiedMLAHooks(
+        v2p_page_table=v2p,
+        translate_kv_loc_dense=getattr(allocator, "translate_kv_loc_dense", None),
+        kernel_page_multiplier=getattr(allocator, "kernel_page_multiplier", 1),
+        enabled=True,
+    )
+
+
 @dataclass
 class DecodeMetadata:
     decode_wrapper: BatchMLAPagedAttentionWrapper
@@ -675,6 +720,10 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.kv_indptr = attn_backend.kv_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.q_indptr = attn_backend.q_indptr_decode
+        # Unified dense MLA pool: VIRTUAL -> DENSE kv_indices (see prefill updater).
+        self._translate_kv_loc_dense = unified_mla_hooks(
+            model_runner.token_to_kv_pool_allocator
+        ).translate_kv_loc_dense
 
     def update(
         self,
@@ -732,6 +781,21 @@ class FlashInferMLAIndicesUpdaterDecode:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+            # Unified pool: VIRTUAL -> DENSE, written back IN PLACE.
+            #
+            # On the cuda-graph replay path `kv_indices` IS the capture-stable
+            # buffer (fast_decode_kwargs["kv_indices"] == cuda_graph_kv_indices)
+            # that the captured wrapper reads, and `fast_mla_decode_plan` ignores
+            # the kv_indices argument entirely -- rebinding the local name to a
+            # fresh tensor would leave the graph reading VIRTUAL ids. Only the
+            # [:paged_kernel_lens_sum] prefix the index kernel just filled is
+            # translated; the stale tail is left alone so it can never index the
+            # v2p table out of bounds. The int64 translate result narrows back to
+            # the buffer's int32 on copy_ (flashinfer requires int32; dense ids
+            # fit comfortably).
+            if self._translate_kv_loc_dense is not None:
+                valid = kv_indices[:paged_kernel_lens_sum]
+                valid.copy_(self._translate_kv_loc_dense(valid))
 
             if get_parallel().dcp_enabled:
                 plan_dcp_decode_metadata(
@@ -797,6 +861,12 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+        # Unified dense MLA pool: kv_indices built from req_to_token are VIRTUAL;
+        # the paged wrapper reads the dense per-layer view, so remap them to DENSE
+        # token ids. None (identity) unless the unified MLA pool is active.
+        self._translate_kv_loc_dense = unified_mla_hooks(
+            model_runner.token_to_kv_pool_allocator
+        ).translate_kv_loc_dense
 
     def update(
         self,
@@ -867,6 +937,12 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+            # Unified pool: VIRTUAL -> DENSE token ids for the paged wrapper.
+            # Prefill is not cuda-graph captured under unified memory, so an eager
+            # gather is safe. Dense ids fit int32 (max = full_slots*num_layers ~
+            # 1e7 << 2^31); the flashinfer wrapper requires int32.
+            if self._translate_kv_loc_dense is not None:
+                kv_indices = self._translate_kv_loc_dense(kv_indices).to(torch.int32)
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None

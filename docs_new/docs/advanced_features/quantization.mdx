@@ -53,8 +53,8 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td><code>mxfp8</code></td>
       <td>No</td>
       <td>No</td>
-      <td>Yes (A5 for Diffusion and LLM Dense Linear)</td>
-      <td>Ascend NPU only; online MXFP8 quantization for Diffusion models (e.g., Wan2.2) and LLM Dense Linear on A5 series; uses CANN <code>npu_dynamic_mx_quant</code> / <code>npu_quant_matmul</code> kernels</td>
+      <td>Yes (A5 for Diffusion, LLM Dense Linear and LLM MoE)</td>
+      <td>Ascend NPU only; online + offline MXFP8 for Diffusion models (e.g., Wan2.2), LLM Dense Linear, and LLM MoE (FusedMoE, e.g. Qwen3-30B-A3B) on A5 series; uses CANN <code>npu_dynamic_mx_quant</code> / <code>npu_quant_matmul</code> (dense) and <code>npu_grouped_matmul_swiglu_quant_v2</code> / <code>npu_grouped_matmul</code> (MoE) kernels</td>
     </tr>
     <tr>
       <td><code>mxfp_w4a8</code></td>
@@ -202,7 +202,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
 
 On AMD, several of these methods use [Aiter](https://github.com/ROCm/aiter) for acceleration -- set `SGLANG_USE_AITER=1` where noted. See [AMD GPU setup](../hardware-platforms/amd_gpu) for installation and configuration details.
 
-On Ascend, various layers quantization configurations are supported, see [Ascend NPU quantization](../hardware-platforms/ascend-npus/ascend_npu_quantization) for details.
+On Ascend, various layers quantization configurations are supported, see [Ascend NPU quantization](../hardware-platforms/ascend-npus/optimization/quantization) for details.
 
 ## GEMM Backends for FP4/FP8 Quantization
 
@@ -946,7 +946,7 @@ sglang generate \
   --save-output
 ```
 
-For the full quantization + format conversion workflow and a complete list of supported schemes, see [Diffusion Quantization on Ascend NPU](../hardware-platforms/ascend-npus/ascend_npu_quantization#diffusion-model-quantization-on-ascend-npu) and [SGLang-Diffusion Quantization](../sglang-diffusion/quantization#modelslim).
+For the full quantization + format conversion workflow and a complete list of supported schemes, see [Diffusion Quantization on Ascend NPU](../hardware-platforms/ascend-npus/optimization/quantization#diffusion-model-quantization-on-ascend-npu) and [SGLang-Diffusion Quantization](../sglang-diffusion/quantization#modelslim).
 
 ## Reference
 
