@@ -4,10 +4,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 import torch
-
 from sglang.srt.layers.attention.linear.kernels.kda_nvidia import (
     NvidiaKDAKernel,
     _from_nvidia_kda_state_layout,
+    _nvidia_kda_wins_staging_gate,
     _to_nvidia_kda_state_layout,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -51,6 +51,16 @@ class TestNvidiaKDAAllPrefillWrapper(CustomTestCase):
                 head_k_dim=7,
                 head_v_dim=5,
             )
+
+    def test_measured_staging_crossover_gate(self):
+        self.assertFalse(_nvidia_kda_wins_staging_gate([128, 128]))
+        self.assertFalse(_nvidia_kda_wins_staging_gate([512] * 8))
+        self.assertFalse(_nvidia_kda_wins_staging_gate([1024, 1024]))
+        self.assertTrue(_nvidia_kda_wins_staging_gate([1024] * 4))
+        self.assertTrue(_nvidia_kda_wins_staging_gate([2048, 2048]))
+        self.assertTrue(_nvidia_kda_wins_staging_gate([1024] * 8))
+        self.assertTrue(_nvidia_kda_wins_staging_gate([4096, 1]))
+        self.assertFalse(_nvidia_kda_wins_staging_gate([2048, 2048] + [512] * 8))
 
     def _make_kernel(self):
         calls = []
@@ -125,18 +135,23 @@ class TestNvidiaKDAAllPrefillWrapper(CustomTestCase):
         states_before = states.clone()
         slots = torch.tensor([2, 0, 4], dtype=torch.int32)
 
-        output = kernel.extend(
-            x["q"],
-            x["k"],
-            x["v"],
-            x["g"],
-            x["beta"],
-            ssm_states=states,
-            cache_indices=slots,
-            query_start_loc=x["query_start_loc"],
-            extend_seq_lens_cpu=seq_lens,
-            A_log=torch.zeros(128, dtype=torch.float32),
-        )
+        with patch(
+            "sglang.srt.layers.attention.linear.kernels.kda_nvidia."
+            "_nvidia_kda_wins_staging_gate",
+            return_value=True,
+        ):
+            output = kernel.extend(
+                x["q"],
+                x["k"],
+                x["v"],
+                x["g"],
+                x["beta"],
+                ssm_states=states,
+                cache_indices=slots,
+                query_start_loc=x["query_start_loc"],
+                extend_seq_lens_cpu=seq_lens,
+                A_log=torch.zeros(128, dtype=torch.float32),
+            )
 
         self.assertEqual(len(calls), 1)
         call = calls[0]
@@ -183,6 +198,77 @@ class TestNvidiaKDAAllPrefillWrapper(CustomTestCase):
                 A_log=torch.zeros(128, dtype=torch.float32),
             )
         self.assertEqual(calls, [])
+
+    def test_single_group_failure_does_not_mutate_state_before_fallback(self):
+        kernel, _ = self._make_kernel()
+        kernel._fwd = Mock(side_effect=RuntimeError("injected"))
+        kernel._triton = Mock()
+        kernel._triton.extend.return_value = "triton"
+        seq_lens = [2, 3]
+        x = self._inputs(seq_lens)
+        states = torch.randn(4, 1, 128, 128, dtype=torch.bfloat16)
+        states_before = states.clone()
+
+        with patch(
+            "sglang.srt.layers.attention.linear.kernels.kda_nvidia."
+            "_nvidia_kda_wins_staging_gate",
+            return_value=True,
+        ):
+            output = kernel.extend(
+                x["q"],
+                x["k"],
+                x["v"],
+                x["g"],
+                x["beta"],
+                ssm_states=states,
+                cache_indices=torch.tensor([1, 3], dtype=torch.int32),
+                query_start_loc=x["query_start_loc"],
+                extend_seq_lens_cpu=seq_lens,
+                A_log=torch.zeros(128, dtype=torch.float32),
+            )
+
+        self.assertEqual(output, "triton")
+        self.assertTrue(torch.equal(states, states_before))
+        kernel._triton.extend.assert_called_once()
+
+    def test_multi_group_failure_rolls_back_committed_state(self):
+        kernel, calls = self._make_kernel()
+        original_fwd = kernel._fwd
+
+        def fail_second_group(*args, **kwargs):
+            if calls:
+                raise RuntimeError("injected")
+            return original_fwd(*args, **kwargs)
+
+        kernel._fwd = fail_second_group
+        kernel._triton = Mock()
+        kernel._triton.extend.return_value = "triton"
+        seq_lens = [1] * 9
+        x = self._inputs(seq_lens)
+        states = torch.randn(12, 1, 128, 128, dtype=torch.bfloat16)
+        states_before = states.clone()
+
+        with patch(
+            "sglang.srt.layers.attention.linear.kernels.kda_nvidia."
+            "_nvidia_kda_wins_staging_gate",
+            return_value=True,
+        ):
+            output = kernel.extend(
+                x["q"],
+                x["k"],
+                x["v"],
+                x["g"],
+                x["beta"],
+                ssm_states=states,
+                cache_indices=torch.arange(1, 10, dtype=torch.int32),
+                query_start_loc=x["query_start_loc"],
+                extend_seq_lens_cpu=seq_lens,
+                A_log=torch.zeros(128, dtype=torch.float32),
+            )
+
+        self.assertEqual(output, "triton")
+        self.assertTrue(torch.equal(states, states_before))
+        kernel._triton.extend.assert_called_once()
 
     def test_supports_only_datacenter_blackwell(self):
         with (

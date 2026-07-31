@@ -6,11 +6,11 @@ Wraps the vendored ``kda_nvidia_prefill`` package through its FLA-compatible
 V-major ``[B,H,V,K]`` cache to the vendor's K-major ``[B,H,K,V]`` state and
 back; the vendored split kernels keep their original internal layouts.
 
-The serving wrapper repacks ordinary packed prefill batches into bounded
+The serving wrapper repacks sufficiently large ordinary prefills into bounded
 equal-length groups (B <= 8) and pads every sequence to one of
-2k/4k/8k/16k. This makes short multi-sequence prefill use the same NVIDIA KDA
-pipeline while bounding compile variants and transient workspaces. Everything
-that is not an ordinary state-committing prefill stays on its dedicated path:
+2k/4k/8k/16k. A measured crossover gate retains Triton for short groups where
+padding and staging outweigh the faster persistent kernel. Everything that is
+not an ordinary state-committing prefill stays on its dedicated path:
 
 - single-sequence prefill, including chunks of one long request, where Triton
   retains the neutral BS=1 performance;
@@ -30,10 +30,14 @@ loud log (attempt-and-verify, same stance as the fused decode kernel).
 """
 
 import logging
-from typing import Optional
 
 import torch
-
+from sglang.srt.layers.attention.linear.kernels.kda_nvidia_staging import (
+    gather_nvidia_kda_state,
+    pack_nvidia_kda_inputs,
+    scatter_nvidia_kda_state,
+    unpack_nvidia_kda_output,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
@@ -43,6 +47,23 @@ logger = logging.getLogger(__name__)
 
 _BUCKETS = (2048, 4096, 8192, 16384)
 _MAX_NVIDIA_KDA_BATCH = 8
+_MIN_NVIDIA_KDA_SEQ_LEN = 1024
+_MIN_NVIDIA_KDA_GROUP_TOKENS = 4096
+
+
+def _nvidia_kda_wins_staging_gate(seq_lens: list[int]) -> bool:
+    """Conservative GB200 crossover after charging the complete wrapper."""
+    for start in range(0, len(seq_lens), _MAX_NVIDIA_KDA_BATCH):
+        group = seq_lens[start : start + _MAX_NVIDIA_KDA_BATCH]
+        max_length = max(group)
+        # At least four real 1K tokens, or the equivalent ragged payload in a
+        # larger bucket, repays the complete staging boundary on GB200.
+        if (
+            max_length < _MIN_NVIDIA_KDA_SEQ_LEN
+            or sum(group) < _MIN_NVIDIA_KDA_GROUP_TOKENS
+        ):
+            return False
+    return True
 
 
 def _to_nvidia_kda_state_layout(
@@ -147,7 +168,7 @@ class NvidiaKDAKernel(LinearAttnKernelBase):
             **kwargs,
         )
 
-    def _flat_param(self, t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    def _flat_param(self, t: torch.Tensor | None) -> torch.Tensor | None:
         if t is None:
             return None
         key = (t.data_ptr(), t.dtype, tuple(t.shape))
@@ -229,9 +250,9 @@ class NvidiaKDAKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
-        A_log: Optional[torch.Tensor] = None,
-        dt_bias: Optional[torch.Tensor] = None,
-        lower_bound: Optional[float] = None,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        lower_bound: float | None = None,
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -316,8 +337,6 @@ class NvidiaKDAKernel(LinearAttnKernelBase):
                 kwargs,
             )
 
-        self._ensure_loaded()
-
         seq_lens = [int(length) for length in seq_lens_cpu]
         if (
             any(length <= 0 or length > _BUCKETS[-1] for length in seq_lens)
@@ -346,6 +365,25 @@ class NvidiaKDAKernel(LinearAttnKernelBase):
                 kwargs,
             )
 
+        if not _nvidia_kda_wins_staging_gate(seq_lens):
+            return self._triton_extend(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states,
+                cache_indices,
+                query_start_loc,
+                A_log,
+                dt_bias,
+                lower_bound,
+                return_intermediate_states,
+                kwargs,
+            )
+
+        self._ensure_loaded()
+
         num_heads = q.shape[2]
         head_k_dim = q.shape[-1]
         head_v_dim = v.shape[-1]
@@ -356,8 +394,19 @@ class NvidiaKDAKernel(LinearAttnKernelBase):
         all_slot_indices = torch.where(
             cache_indices >= 0, cache_indices, ssm_states.shape[0] - 1
         ).to(torch.int64)
-        state_backup = ssm_states.index_select(0, all_slot_indices).clone()
+        # A single group does not mutate the pool until its final scatter, so
+        # there is nothing to restore if staging or the vendor kernel fails.
+        # Multi-group batches can commit earlier groups before a later failure;
+        # retain the rollback copy only for that uncommon case.
+        state_backup = (
+            ssm_states.index_select(0, all_slot_indices).clone()
+            if len(seq_lens) > _MAX_NVIDIA_KDA_BATCH
+            else None
+        )
         packed_output = torch.empty_like(v)
+        use_fused_staging = (
+            q.is_cuda and num_heads > 0 and head_k_dim == 128 and head_v_dim == 128
+        )
 
         try:
             seq_start = 0
@@ -387,39 +436,59 @@ class NvidiaKDAKernel(LinearAttnKernelBase):
                     head_v_dim,
                     q.device,
                 )
-                st["q"].zero_()
-                st["k"].zero_()
-                st["v"].zero_()
-                st["g"].fill_(-1000.0)
-                st["beta"].zero_()
+                if use_fused_staging:
+                    pack_nvidia_kda_inputs(
+                        q=q,
+                        k=k,
+                        v=v,
+                        g=g,
+                        beta=beta,
+                        cu_seqlens=query_start_loc,
+                        seq_start=seq_start,
+                        group_size=group_size,
+                        staging=st,
+                    )
+                else:
+                    st["q"].zero_()
+                    st["k"].zero_()
+                    st["v"].zero_()
+                    st["g"].fill_(-1000.0)
+                    st["beta"].zero_()
 
-                row_token_start = token_start
-                for row, length in enumerate(group_lens):
-                    row_token_end = row_token_start + length
-                    st["q"][row, :length].copy_(
-                        self._l2norm(q[0, row_token_start:row_token_end].contiguous())
-                    )
-                    st["k"][row, :length].copy_(
-                        self._l2norm(k[0, row_token_start:row_token_end].contiguous())
-                    )
-                    st["v"][row, :length].copy_(v[0, row_token_start:row_token_end])
-                    g_in = g[0, row_token_start:row_token_end]
-                    if g_in.dim() == 2:
-                        g_in = g_in.view(length, num_heads, head_k_dim)
-                    st["g"][row, :length].copy_(g_in)
-                    st["beta"][row, :length].copy_(
-                        beta[0, row_token_start:row_token_end]
-                    )
-                    row_token_start = row_token_end
+                    row_token_start = token_start
+                    for row, length in enumerate(group_lens):
+                        row_token_end = row_token_start + length
+                        st["q"][row, :length].copy_(
+                            self._l2norm(
+                                q[0, row_token_start:row_token_end].contiguous()
+                            )
+                        )
+                        st["k"][row, :length].copy_(
+                            self._l2norm(
+                                k[0, row_token_start:row_token_end].contiguous()
+                            )
+                        )
+                        st["v"][row, :length].copy_(v[0, row_token_start:row_token_end])
+                        g_in = g[0, row_token_start:row_token_end]
+                        if g_in.dim() == 2:
+                            g_in = g_in.view(length, num_heads, head_k_dim)
+                        st["g"][row, :length].copy_(g_in)
+                        st["beta"][row, :length].copy_(
+                            beta[0, row_token_start:row_token_end]
+                        )
+                        row_token_start = row_token_end
 
                 group_slots = all_slot_indices[seq_start : seq_start + group_size]
-                st["s0"].copy_(
-                    _to_nvidia_kda_state_layout(
-                        ssm_states.index_select(0, group_slots),
-                        head_k_dim=head_k_dim,
-                        head_v_dim=head_v_dim,
+                if use_fused_staging:
+                    gather_nvidia_kda_state(ssm_states, group_slots, st["s0"])
+                else:
+                    st["s0"].copy_(
+                        _to_nvidia_kda_state_layout(
+                            ssm_states.index_select(0, group_slots),
+                            head_k_dim=head_k_dim,
+                            head_v_dim=head_v_dim,
+                        )
                     )
-                )
                 res = self._fwd(
                     st["q"],
                     st["k"],
@@ -438,28 +507,42 @@ class NvidiaKDAKernel(LinearAttnKernelBase):
                 )
                 group_output, final_state = res[0], res[1]
 
-                row_token_start = token_start
-                for row, length in enumerate(group_lens):
-                    row_token_end = row_token_start + length
-                    packed_output[0, row_token_start:row_token_end].copy_(
-                        group_output[row, :length]
+                if use_fused_staging:
+                    unpack_nvidia_kda_output(
+                        group_output,
+                        packed_output,
+                        query_start_loc,
+                        seq_start=seq_start,
                     )
-                    row_token_start = row_token_end
-
-                ssm_states.index_copy_(
-                    0,
-                    group_slots,
-                    _from_nvidia_kda_state_layout(
+                    scatter_nvidia_kda_state(
                         final_state,
-                        head_k_dim=head_k_dim,
-                        head_v_dim=head_v_dim,
-                        dtype=ssm_states.dtype,
-                    ),
-                )
+                        group_slots,
+                        ssm_states,
+                    )
+                else:
+                    row_token_start = token_start
+                    for row, length in enumerate(group_lens):
+                        row_token_end = row_token_start + length
+                        packed_output[0, row_token_start:row_token_end].copy_(
+                            group_output[row, :length]
+                        )
+                        row_token_start = row_token_end
+
+                    ssm_states.index_copy_(
+                        0,
+                        group_slots,
+                        _from_nvidia_kda_state_layout(
+                            final_state,
+                            head_k_dim=head_k_dim,
+                            head_v_dim=head_v_dim,
+                            dtype=ssm_states.dtype,
+                        ),
+                    )
                 seq_start += group_size
                 token_start += group_tokens
         except Exception:
-            ssm_states.index_copy_(0, all_slot_indices, state_backup)
+            if state_backup is not None:
+                ssm_states.index_copy_(0, all_slot_indices, state_backup)
             logger.warning(
                 "NVIDIA KDA prefill failed (T=%d sequences=%d); restored states "
                 "and fell back to Triton for this batch",
