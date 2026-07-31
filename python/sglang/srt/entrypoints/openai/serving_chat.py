@@ -9,6 +9,7 @@ import uuid
 from enum import Enum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
+from urllib.parse import urlsplit
 
 
 class ThinkingMode(str, Enum):
@@ -24,6 +25,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -66,7 +68,7 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
 )
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import GenerateReqInput, P2PKVTransferReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -76,6 +78,121 @@ if TYPE_CHECKING:
     from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
+
+REMOTE_KV_SOURCE_HEADER = "x-sgl-remote-kv-source"
+REMOTE_KV_SOURCE_BOOTSTRAP_ADDR_HEADER = "x-sgl-remote-kv-source-bootstrap-addr"
+REMOTE_KV_TARGET_HEADER = "x-sgl-remote-kv-target"
+REMOTE_KV_MATCHED_TOKENS_HEADER = "x-sgl-remote-kv-matched-tokens"
+REMOTE_KV_REASON_HEADER = "x-sgl-remote-kv-reason"
+
+
+def _request_base_url(raw_request: Optional[Request]) -> Optional[str]:
+    if raw_request is None:
+        return None
+    host = raw_request.headers.get("host")
+    if not host:
+        return None
+    return f"{raw_request.url.scheme}://{host}"
+
+
+def _extract_remote_kv_headers(
+    raw_request: Optional[Request],
+) -> tuple[Optional[str], Optional[int], Optional[str], Optional[str], Optional[str]]:
+    """Extract explicit experimental Prefill->Prefill remote-KV hints.
+
+    The feature is opt-in by header. Missing or malformed headers leave all
+    fields empty so default production request handling is unchanged.
+    """
+    if raw_request is None:
+        return None, None, None, None, None
+
+    source_url = raw_request.headers.get(REMOTE_KV_SOURCE_HEADER)
+    if not source_url:
+        return None, None, None, None, None
+
+    matched_tokens = None
+    raw_matched_tokens = raw_request.headers.get(REMOTE_KV_MATCHED_TOKENS_HEADER)
+    if raw_matched_tokens is not None:
+        try:
+            matched_tokens = int(raw_matched_tokens)
+        except ValueError:
+            logger.warning(
+                "Ignoring malformed %s header: %r",
+                REMOTE_KV_MATCHED_TOKENS_HEADER,
+                raw_matched_tokens,
+            )
+            return None, None, None, None, None
+
+    return (
+        source_url,
+        matched_tokens,
+        raw_request.headers.get(REMOTE_KV_REASON_HEADER),
+        raw_request.headers.get(REMOTE_KV_TARGET_HEADER)
+        or _request_base_url(raw_request),
+        raw_request.headers.get(REMOTE_KV_SOURCE_BOOTSTRAP_ADDR_HEADER),
+    )
+
+
+def _select_remote_kv_metadata(raw_request: Optional[Request], request: Any):
+    """Choose one coherent remote-KV control bundle.
+
+    Router headers are authoritative when present. JSON token IDs may augment
+    them, but duplicated JSON control fields must agree; a conflict disables
+    the best-effort P2P path instead of mixing metadata field by field.
+    """
+    header_present = bool(
+        raw_request and raw_request.headers.get(REMOTE_KV_SOURCE_HEADER)
+    )
+    header_bundle = _extract_remote_kv_headers(raw_request)
+    body_bundle = (
+        getattr(request, "remote_kv_source_url", None),
+        getattr(request, "remote_kv_matched_tokens", None),
+        getattr(request, "remote_kv_reason", None),
+        getattr(request, "remote_kv_target_url", None),
+        getattr(request, "remote_kv_source_bootstrap_addr", None),
+    )
+    token_ids = getattr(request, "remote_kv_token_ids", None)
+
+    if header_present:
+        if header_bundle[0] is None:
+            return None, None, None, None, None, None
+        if any(
+            body_value is not None and body_value != header_value
+            for header_value, body_value in zip(header_bundle, body_bundle)
+        ):
+            logger.warning(
+                "Disabling remote KV transfer: conflicting router header/body metadata"
+            )
+            return None, None, None, None, None, None
+        return (*header_bundle, token_ids)
+
+    return (*body_bundle, token_ids)
+
+
+def _validated_source_bootstrap_addr(
+    source_url: str, source_bootstrap_addr: Optional[str]
+) -> Optional[str]:
+    """Accept a router bootstrap address only for the source URL's host."""
+    if not source_bootstrap_addr:
+        return None
+    try:
+        source_host = urlsplit(source_url).hostname
+        parsed_addr = urlsplit(f"//{source_bootstrap_addr}")
+        addr_host = parsed_addr.hostname
+        addr_port = parsed_addr.port
+    except ValueError:
+        return None
+    if not source_host or not addr_host or not addr_port:
+        return None
+    if source_host.rstrip(".").casefold() != addr_host.rstrip(".").casefold():
+        return None
+    return source_bootstrap_addr
+
+
+def _remote_kv_request_id(rid: Any) -> str:
+    if rid:
+        return str(rid)
+    return f"p2p-{uuid.uuid4().hex}"
 
 
 def normalize_tool_content(role: str, content):
@@ -742,6 +859,14 @@ class OpenAIServingChat(OpenAIServingBase):
             request
         )
         require_reasoning = self._get_reasoning_from_request(request)
+        (
+            remote_kv_source_url,
+            remote_kv_matched_tokens,
+            remote_kv_reason,
+            remote_kv_target_url,
+            remote_kv_source_bootstrap_addr,
+            remote_kv_token_ids,
+        ) = _select_remote_kv_metadata(raw_request, request)
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
@@ -779,6 +904,12 @@ class OpenAIServingChat(OpenAIServingBase):
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
             return_prompt_token_ids=request.return_prompt_token_ids
             or request.return_token_ids,
+            remote_kv_source_url=remote_kv_source_url,
+            remote_kv_source_bootstrap_addr=remote_kv_source_bootstrap_addr,
+            remote_kv_target_url=remote_kv_target_url,
+            remote_kv_matched_tokens=remote_kv_matched_tokens,
+            remote_kv_reason=remote_kv_reason,
+            remote_kv_token_ids=remote_kv_token_ids,
         )
 
         return adapted_request, request
@@ -1181,6 +1312,7 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> Union[StreamingResponse, ErrorResponse]:
         """Handle streaming chat completion request"""
+        await self._maybe_run_remote_kv_transfer_poc(adapted_request)
         generator = self._generate_chat_stream(adapted_request, request, raw_request)
 
         # Kick-start the generator to trigger validation before HTTP 200 is sent.
@@ -1448,6 +1580,7 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> Union[ChatCompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming chat completion request"""
+        await self._maybe_run_remote_kv_transfer_poc(adapted_request)
         try:
             ret = await self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -1465,6 +1598,84 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         return response
+
+    async def _maybe_run_remote_kv_transfer_poc(
+        self, adapted_request: GenerateReqInput
+    ) -> None:
+        """Best-effort experimental P->P remote KV transfer hook.
+
+        This PoC intentionally never changes the default path: it only runs when
+        the router supplies x-sgl-remote-kv-* headers, and any failure falls back
+        to normal local recompute.
+        """
+        if self.tokenizer_manager.disaggregation_mode != DisaggregationMode.PREFILL:
+            return
+
+        source_url = adapted_request.remote_kv_source_url
+        if not source_url:
+            return
+
+        target_url = adapted_request.remote_kv_target_url
+        if not target_url:
+            target_url = self.tokenizer_manager.server_args.url()
+            adapted_request.remote_kv_target_url = target_url
+        if source_url == target_url:
+            return
+
+        input_ids = adapted_request.input_ids
+        if not input_ids or not isinstance(input_ids, list):
+            input_ids = adapted_request.remote_kv_token_ids
+            if input_ids:
+                logger.info(
+                    "remote KV transfer using router-provided token ids: tokens=%s",
+                    len(input_ids),
+                )
+        if not input_ids or not isinstance(input_ids, list):
+            logger.info(
+                "remote KV transfer skipped: no token ids available for experimental PoC"
+            )
+            return
+        if input_ids and isinstance(input_ids[0], list):
+            logger.info(
+                "remote KV transfer skipped: batched requests are unsupported by experimental PoC"
+            )
+            return
+
+        matched_tokens = adapted_request.remote_kv_matched_tokens or 0
+        if matched_tokens <= 0:
+            logger.info(
+                "remote KV transfer skipped: matched_tokens=%s",
+                matched_tokens,
+            )
+            return
+
+        req = P2PKVTransferReqInput(
+            source_url=source_url,
+            target_url=target_url,
+            token_ids=input_ids,
+            matched_tokens=min(matched_tokens, len(input_ids)),
+            request_id=_remote_kv_request_id(adapted_request.rid),
+            reason=adapted_request.remote_kv_reason or "",
+            source_bootstrap_addr=_validated_source_bootstrap_addr(
+                source_url, adapted_request.remote_kv_source_bootstrap_addr
+            ),
+        )
+        try:
+            ret = await self.tokenizer_manager.p2p_kv_transfer(req)
+        except Exception as e:
+            logger.warning(
+                "remote KV transfer control path failed; falling back to recompute: %s",
+                e,
+            )
+            return
+
+        if not ret.success or ret.fallback_recompute:
+            logger.info(
+                "remote KV transfer fell back to recompute: success=%s fallback=%s message=%s",
+                ret.success,
+                ret.fallback_recompute,
+                ret.message,
+            )
 
     def _build_chat_response(
         self,

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import logging
+import threading
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import fastapi
+import requests
 
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
@@ -48,6 +52,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    P2PKVTransferReqInput,
+    P2PKVTransferReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -87,6 +93,57 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+P2P_PAIR_GATE_ACQUIRE_REASON = "__p2p_pair_gate_acquire__"
+P2P_PAIR_GATE_RELEASE_REASON = "__p2p_pair_gate_release__"
+_P2P_PAIR_GATE_TTL_S = 365.0
+_P2P_PAIR_GATE_HTTP_TIMEOUT_S = 10.0
+
+
+def _p2p_req_to_builtins(obj: P2PKVTransferReqInput) -> Dict[str, Any]:
+    if dataclasses.is_dataclass(obj):
+        return dataclasses.asdict(obj)
+    return msgspec_to_builtins(obj)
+
+
+def _p2p_endpoint_sort_key(url: str):
+    endpoint = url.rstrip("/")
+    host_port = endpoint.split("://", 1)[-1].split("/", 1)[0]
+    host, _, port = host_port.partition(":")
+    host_key = tuple(
+        (0, int(part)) if part.isdigit() else (1, part) for part in host.split(".")
+    )
+    return (host_key, int(port) if port.isdigit() else 0, endpoint)
+
+
+def _p2p_pair_key(obj: P2PKVTransferReqInput):
+    return tuple(
+        sorted(
+            (obj.source_url.rstrip("/"), obj.target_url.rstrip("/")),
+            key=_p2p_endpoint_sort_key,
+        )
+    )
+
+
+def _p2p_pair_gate_owner(obj: P2PKVTransferReqInput) -> str:
+    return (
+        f"{obj.request_id}:{obj.p2p_bootstrap_room}:"
+        f"{obj.source_url.rstrip('/')}>{obj.target_url.rstrip('/')}"
+    )
+
+
+def _p2p_bootstrap_addr_matches_source(source_url: str, bootstrap_addr: str) -> bool:
+    try:
+        source_host = urlparse(source_url).hostname
+        parsed_addr = urlparse(f"//{bootstrap_addr}")
+        addr_host = parsed_addr.hostname
+        addr_port = parsed_addr.port
+    except ValueError:
+        return False
+    if not source_host or not addr_host or not addr_port:
+        return False
+    return source_host.rstrip(".").casefold() == addr_host.rstrip(".").casefold()
+
+
 # Declarative spec: (attr_name_prefix, response_type[, mode])
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
@@ -114,6 +171,7 @@ _COMMUNICATOR_SPECS = [
     ("attach_hicache_storage", AttachHiCacheStorageReqOutput),
     ("detach_hicache_storage", DetachHiCacheStorageReqOutput),
     ("profile", ProfileReqOutput),
+    ("p2p_kv_transfer", P2PKVTransferReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
@@ -279,6 +337,263 @@ class TokenizerControlMixin:
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+
+    async def p2p_kv_transfer(
+        self: TokenizerManager, obj: P2PKVTransferReqInput
+    ) -> P2PKVTransferReqOutput:
+        self.auto_create_handle_loop()
+        server_args = getattr(self, "server_args", None)
+        if server_args is not None and not getattr(
+            server_args, "enable_prefill_p2p_kv_transfer", False
+        ):
+            return P2PKVTransferReqOutput(
+                success=False,
+                message=(
+                    "Prefill-to-Prefill KV transfer is disabled. Start the "
+                    "prefill server with --enable-prefill-p2p-kv-transfer."
+                ),
+                source_url=obj.source_url,
+                target_url=obj.target_url,
+                matched_tokens=obj.matched_tokens,
+                transferred_tokens=0,
+                fallback_recompute=True,
+                experimental_limitations=["experimental_prefill_to_prefill_mooncake"],
+            )
+        if obj.p2p_bootstrap_room is None:
+            obj.p2p_bootstrap_room = uuid.uuid4().int & ((1 << 63) - 1)
+        if obj.dry_run and obj.reason == P2P_PAIR_GATE_ACQUIRE_REASON:
+            return self._p2p_pair_gate_control(obj, acquire=True)
+        if obj.dry_run and obj.reason == P2P_PAIR_GATE_RELEASE_REASON:
+            return self._p2p_pair_gate_control(obj, acquire=False)
+
+        is_target_transfer = (
+            not obj.p2p_source_send
+            and not obj.dry_run
+            and obj.source_url.rstrip("/") != obj.target_url.rstrip("/")
+        )
+        gate_acquired = False
+        if is_target_transfer:
+            gate_acquired, gate_message = await self._p2p_pair_gate_for_target(
+                obj, acquire=True
+            )
+            if not gate_acquired:
+                return self._p2p_pair_gate_failure(obj, gate_message)
+
+        try:
+            if (
+                obj.source_bootstrap_addr is not None
+                and not _p2p_bootstrap_addr_matches_source(
+                    obj.source_url, obj.source_bootstrap_addr
+                )
+            ):
+                logger.warning(
+                    "Discarding remote KV source bootstrap address that does not match source URL: source=%s bootstrap=%s",
+                    obj.source_url,
+                    obj.source_bootstrap_addr,
+                )
+                obj.source_bootstrap_addr = None
+            if (
+                obj.source_bootstrap_addr is None
+                and not obj.p2p_source_send
+                and not obj.dry_run
+                and obj.source_url != obj.target_url
+            ):
+                try:
+                    obj.source_bootstrap_addr = await asyncio.to_thread(
+                        self._resolve_p2p_source_bootstrap_addr, obj.source_url
+                    )
+                except Exception as exc:
+                    return P2PKVTransferReqOutput(
+                        success=False,
+                        message=f"source bootstrap discovery failed: {exc}",
+                        source_url=obj.source_url,
+                        target_url=obj.target_url,
+                        matched_tokens=obj.matched_tokens,
+                        transferred_tokens=0,
+                        fallback_recompute=True,
+                        experimental_limitations=[
+                            "experimental_prefill_to_prefill_mooncake"
+                        ],
+                    )
+            return (await self.p2p_kv_transfer_communicator(obj))[0]
+        finally:
+            if gate_acquired:
+                released, release_message = await self._p2p_pair_gate_for_target(
+                    obj, acquire=False
+                )
+                if not released:
+                    logger.error(
+                        "p2p_control_pair_gate_release_failed: request_id=%s "
+                        "source=%s target=%s message=%s",
+                        obj.request_id,
+                        obj.source_url,
+                        obj.target_url,
+                        release_message,
+                    )
+
+    def _p2p_pair_gate_state(self):
+        lock = getattr(self, "_p2p_pair_gate_lock", None)
+        if lock is None:
+            lock = self._p2p_pair_gate_lock = threading.Lock()
+            self._p2p_pair_gate_leases = {}
+        return lock, self._p2p_pair_gate_leases
+
+    def _p2p_pair_gate_control(
+        self: TokenizerManager, obj: P2PKVTransferReqInput, acquire: bool
+    ) -> P2PKVTransferReqOutput:
+        pair_key = _p2p_pair_key(obj)
+        owner = _p2p_pair_gate_owner(obj)
+        lock, leases = self._p2p_pair_gate_state()
+        now = time.monotonic()
+        success = False
+        message = ""
+        with lock:
+            current = leases.get(pair_key)
+            if current is not None and current[1] <= now:
+                leases.pop(pair_key, None)
+                current = None
+            if acquire:
+                if current is None or current[0] == owner:
+                    leases[pair_key] = (owner, now + _P2P_PAIR_GATE_TTL_S)
+                    success = True
+                    message = "p2p pair gate acquired"
+                else:
+                    message = "p2p pair gate busy"
+            elif current is None:
+                success = True
+                message = "p2p pair gate already released"
+            elif current[0] == owner:
+                leases.pop(pair_key, None)
+                success = True
+                message = "p2p pair gate released"
+            else:
+                message = "p2p pair gate owned by another transfer"
+        logger.info(
+            "p2p_control_pair_gate_%s: request_id=%s pair=%s owner=%s success=%s "
+            "message=%s",
+            "acquire" if acquire else "release",
+            obj.request_id,
+            pair_key,
+            owner,
+            success,
+            message,
+        )
+        return P2PKVTransferReqOutput(
+            success=success,
+            message=message,
+            source_url=obj.source_url,
+            target_url=obj.target_url,
+            matched_tokens=obj.matched_tokens,
+            transferred_tokens=0,
+            fallback_recompute=not success,
+            experimental_limitations=["experimental_prefill_to_prefill_mooncake"],
+        )
+
+    def _p2p_pair_gate_failure(
+        self: TokenizerManager, obj: P2PKVTransferReqInput, message: str
+    ) -> P2PKVTransferReqOutput:
+        logger.warning(
+            "p2p_control_pair_gate_fallback: request_id=%s source=%s target=%s "
+            "message=%s",
+            obj.request_id,
+            obj.source_url,
+            obj.target_url,
+            message,
+        )
+        return P2PKVTransferReqOutput(
+            success=False,
+            message=message,
+            source_url=obj.source_url,
+            target_url=obj.target_url,
+            matched_tokens=obj.matched_tokens,
+            transferred_tokens=0,
+            fallback_recompute=True,
+            experimental_limitations=["experimental_prefill_to_prefill_mooncake"],
+        )
+
+    async def _p2p_pair_gate_for_target(
+        self: TokenizerManager, obj: P2PKVTransferReqInput, acquire: bool
+    ):
+        coordinator_url = _p2p_pair_key(obj)[0]
+        if coordinator_url == obj.target_url.rstrip("/"):
+            result = self._p2p_pair_gate_control(obj, acquire=acquire)
+            return result.success, result.message
+        return await asyncio.to_thread(
+            self._p2p_remote_pair_gate_control,
+            obj,
+            coordinator_url,
+            acquire,
+        )
+
+    def _p2p_remote_pair_gate_control(
+        self: TokenizerManager,
+        obj: P2PKVTransferReqInput,
+        coordinator_url: str,
+        acquire: bool,
+    ):
+        control = P2PKVTransferReqInput(
+            source_url=obj.source_url,
+            target_url=obj.target_url,
+            token_ids=[],
+            matched_tokens=0,
+            request_id=obj.request_id,
+            dry_run=True,
+            reason=(
+                P2P_PAIR_GATE_ACQUIRE_REASON
+                if acquire
+                else P2P_PAIR_GATE_RELEASE_REASON
+            ),
+            p2p_bootstrap_room=obj.p2p_bootstrap_room,
+        )
+        try:
+            response = requests.post(
+                f"{coordinator_url}/experimental/p2p_kv_transfer",
+                json=_p2p_req_to_builtins(control),
+                timeout=_P2P_PAIR_GATE_HTTP_TIMEOUT_S,
+            )
+            payload = response.json()
+            success = response.status_code == 200 and bool(payload.get("success"))
+            message = str(
+                payload.get("message")
+                or f"coordinator returned HTTP {response.status_code}"
+            )
+        except Exception as exc:
+            success = False
+            message = f"pair gate coordinator request failed: {exc}"
+        logger.info(
+            "p2p_control_pair_gate_remote_%s: request_id=%s coordinator=%s "
+            "success=%s message=%s",
+            "acquire" if acquire else "release",
+            obj.request_id,
+            coordinator_url,
+            success,
+            message,
+        )
+        return success, message
+
+    def _resolve_p2p_source_bootstrap_addr(self, source_url: str) -> str:
+        source_url = source_url.rstrip("/")
+        cache = getattr(self, "_p2p_source_bootstrap_addrs", None)
+        if cache is None:
+            cache = self._p2p_source_bootstrap_addrs = {}
+        cached = cache.get(source_url)
+        if cached is not None:
+            return cached
+
+        response = requests.get(f"{source_url}/server_info", timeout=5)
+        if response.status_code != 200:
+            raise RuntimeError(f"HTTP {response.status_code}")
+        port = int(response.json().get("disaggregation_bootstrap_port"))
+        if not 0 < port < 65536:
+            raise ValueError(f"invalid bootstrap port {port}")
+        host = urlparse(source_url).hostname
+        if not host:
+            raise ValueError(f"invalid source URL {source_url}")
+        if ":" in host:
+            host = f"[{host}]"
+        addr = f"{host}:{port}"
+        cache[source_url] = addr
+        return addr
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

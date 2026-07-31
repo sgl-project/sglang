@@ -219,6 +219,33 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = self._load_balance_args(disaggregation_mode="decode")
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
+    def test_prefill_p2p_accepts_mooncake_prefill(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="prefill",
+            disaggregation_transfer_backend="mooncake",
+            enable_prefill_p2p_kv_transfer=True,
+        )
+        self.assertTrue(server_args.enable_prefill_p2p_kv_transfer)
+
+    def test_prefill_p2p_rejects_decode_mode(self):
+        with self.assertRaisesRegex(
+            ValueError, "--enable-prefill-p2p-kv-transfer requires"
+        ):
+            self._load_balance_args(
+                disaggregation_mode="decode",
+                enable_prefill_p2p_kv_transfer=True,
+            )
+
+    def test_prefill_p2p_rejects_non_mooncake_backend(self):
+        with self.assertRaisesRegex(
+            ValueError, "--enable-prefill-p2p-kv-transfer requires"
+        ):
+            self._load_balance_args(
+                disaggregation_mode="prefill",
+                disaggregation_transfer_backend="nixl",
+                enable_prefill_p2p_kv_transfer=True,
+            )
+
     def test_pd_decode_radix_cache_rejects_hisparse(self):
         server_args = ServerArgs(
             model_path="dummy",

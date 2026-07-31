@@ -23,6 +23,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.io_struct import P2PKVTransferReqInput
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -64,6 +65,28 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    def _pp_stage_p2p_control_reqs(self, recv_reqs):
+        """Stage ordered P2P controls without reordering PP message streams.
+
+        A non-last stage forwards the complete receive batch through the normal
+        request stream, but delays local handling until its next PP iteration.
+        The last stage handles the batch immediately.  This lets downstream PP
+        stages enter the same asynchronous P2P state transitions without
+        injecting an out-of-order send into the tagless PD bootstrap/release
+        streams.
+        """
+        pending_reqs = getattr(self, "_pending_p2p_control_reqs", [])
+        if self.pp_group.is_last_rank:
+            return pending_reqs + recv_reqs, recv_reqs
+
+        contains_p2p = any(isinstance(req, P2PKVTransferReqInput) for req in recv_reqs)
+        if contains_p2p:
+            self._pending_p2p_control_reqs = list(recv_reqs)
+            return pending_reqs, recv_reqs
+
+        self._pending_p2p_control_reqs = []
+        return pending_reqs + recv_reqs, recv_reqs
+
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
         """
@@ -99,12 +122,16 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
-                    self.process_input_requests(recv_reqs)
+                    process_reqs, forward_reqs = self._pp_stage_p2p_control_reqs(
+                        recv_reqs
+                    )
+                    self.process_input_requests(process_reqs)
+                    self.progress_p2p_kv_transfers()
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
+                            forward_reqs,
                             async_send=True,
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
@@ -239,7 +266,9 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.request_receiver.recv_requests()
-                self.process_input_requests(recv_reqs)
+                process_reqs, forward_reqs = self._pp_stage_p2p_control_reqs(recv_reqs)
+                self.process_input_requests(process_reqs)
+                self.progress_p2p_kv_transfers()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -329,7 +358,7 @@ class SchedulerPPMixin:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
+                        forward_reqs, async_send=True
                     )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                         bootstrapped_rids, async_send=True
@@ -392,6 +421,7 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
+                self.progress_p2p_kv_transfers()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)

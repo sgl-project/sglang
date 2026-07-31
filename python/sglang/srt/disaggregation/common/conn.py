@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import dataclasses
+import hashlib
+import json
 import logging
 import threading
 import time
@@ -97,6 +99,7 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+    p2p_layout_fingerprint: Optional[str] = None
     enable_dsa_cache_layer_split: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
@@ -121,6 +124,11 @@ class PrefillServerInfo:
         self.page_size = int(self.page_size) if self.page_size is not None else None
         self.kv_cache_dtype = (
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
+        )
+        self.p2p_layout_fingerprint = (
+            str(self.p2p_layout_fingerprint)
+            if self.p2p_layout_fingerprint is not None
+            else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
         self.enable_dsa_cache_layer_split = bool(self.enable_dsa_cache_layer_split)
@@ -177,6 +185,7 @@ class CommonKVManager(BaseKVManager):
         )
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
+        self.p2p_layout_fingerprint = self._compute_p2p_layout_fingerprint()
         self.local_ip = get_local_ip_auto()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
             self.is_hybrid_mla_backend or server_args.enable_dsa_cache_layer_split
@@ -267,6 +276,31 @@ class CommonKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def _compute_p2p_layout_fingerprint(self) -> str:
+        payload = {
+            "model_path": str(self.server_args.model_path),
+            "page_size": int(self.kv_args.page_size),
+            "kv_cache_dtype": str(get_model().kv_cache_dtype),
+            "kv_item_lens": [int(x) for x in self.kv_args.kv_item_lens],
+            "kv_components": len(self.kv_args.kv_data_ptrs),
+            "state_types": [
+                str(getattr(state_type, "value", state_type))
+                for state_type in self.kv_args.state_types
+            ],
+            "state_item_lens": [
+                [int(x) for x in component]
+                for component in self.kv_args.state_item_lens
+            ],
+            "state_components": [
+                len(component) for component in self.kv_args.state_data_ptrs
+            ],
+            "attn_tp_size": int(self.attn_tp_size),
+            "attn_cp_size": int(self.attn_cp_size),
+            "pp_size": int(self.pp_size),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
@@ -461,15 +495,30 @@ class CommonKVManager(BaseKVManager):
                 f"PD retract rebootstrap /generate request errored for rid={rid}.",
             )
 
-    def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
+    def try_ensure_parallel_info(
+        self, bootstrap_addr: str, *, p2p_identical_layout: bool = False
+    ) -> bool:
         """Single non-blocking attempt to fetch and cache prefill parallel info.
         Returns True if info is available (cached or freshly fetched)."""
         if bootstrap_addr in self.prefill_info_table:
-            return True
+            cached_info = self.prefill_info_table[bootstrap_addr]
+            if p2p_identical_layout and cached_info.p2p_layout_fingerprint is None:
+                # Legacy Prefill->Decode discovery intentionally omits P2P-only
+                # metadata. Refresh it before reusing this entry for P2P.
+                del self.prefill_info_table[bootstrap_addr]
+            else:
+                if p2p_identical_layout:
+                    self._resolve_rank_mapping(
+                        cached_info,
+                        p2p_identical_layout=True,
+                    )
+                return True
 
         info: PrefillServerInfo = None
         try:
             url = f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
+            if p2p_identical_layout:
+                url += "&include_p2p_metadata=1"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
@@ -501,14 +550,48 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
-        self._resolve_rank_mapping(info)
+        self._resolve_rank_mapping(info, p2p_identical_layout=p2p_identical_layout)
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
 
-    def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
+    def _resolve_rank_mapping(
+        self,
+        info: PrefillServerInfo,
+        *,
+        p2p_identical_layout: bool = False,
+    ) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
+        if p2p_identical_layout:
+            assert (
+                info.p2p_layout_fingerprint is not None
+                and info.p2p_layout_fingerprint == self.p2p_layout_fingerprint
+            ), (
+                "P2P requires identical model and KV layouts: "
+                f"target={self.p2p_layout_fingerprint} "
+                f"source={info.p2p_layout_fingerprint}"
+            )
+            assert self.attn_tp_size == info.attn_tp_size, (
+                "P2P requires identical attention TP sizes: "
+                f"target={self.attn_tp_size} source={info.attn_tp_size}"
+            )
+            assert self.attn_cp_size == info.attn_cp_size, (
+                "P2P requires identical attention CP sizes: "
+                f"target={self.attn_cp_size} source={info.attn_cp_size}"
+            )
+            assert self.pp_size == info.pp_size, (
+                "P2P requires identical PP sizes: "
+                f"target={self.pp_size} source={info.pp_size}"
+            )
+            info.target_tp_rank = self.attn_tp_rank
+            info.target_tp_ranks = [self.attn_tp_rank]
+            info.target_cp_ranks = [self.attn_cp_rank]
+            info.target_pp_ranks = [self.pp_rank]
+            info.required_dst_info_num = 1
+            info.required_prefill_response_num = 1
+            return
+
         # TP rank mapping
         if self.attn_tp_size == info.attn_tp_size:
             target_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
@@ -651,6 +734,7 @@ class CommonKVManager(BaseKVManager):
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": get_model().kv_cache_dtype,
+            "p2p_layout_fingerprint": self.p2p_layout_fingerprint,
             "load_balance_method": self.server_args.load_balance_method,
             "enable_dsa_cache_layer_split": getattr(
                 self.server_args, "enable_dsa_cache_layer_split", False
@@ -1008,6 +1092,7 @@ class CommonKVSender(BaseKVSender):
         dest_tp_ranks: List[int],
         pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        force_cp_rank_transfer: bool = False,
     ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
@@ -1020,7 +1105,8 @@ class CommonKVSender(BaseKVSender):
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
-        if self.kv_mgr.is_dummy_cp_rank:
+        self.force_cp_rank_transfer = force_cp_rank_transfer
+        if self.kv_mgr.is_dummy_cp_rank and not self.force_cp_rank_transfer:
             # Non-authoritative CP ranks are dummy participants.
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
             return
@@ -1114,7 +1200,9 @@ class CommonKVSender(BaseKVSender):
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        if (
+        if self.force_cp_rank_transfer:
+            pass
+        elif (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
             and not self.kv_mgr.server_args.enable_dsa_cache_layer_split
         ):
@@ -1478,6 +1566,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
+        self.p2p_layout_fingerprint: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
@@ -1547,6 +1636,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        p2p_layout_fingerprint = data.get("p2p_layout_fingerprint")
         prefill_http_port = data.get("prefill_http_port")
 
         if self.attn_tp_size is None:
@@ -1566,6 +1656,17 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
+
+        if self.p2p_layout_fingerprint is None and p2p_layout_fingerprint is not None:
+            self.p2p_layout_fingerprint = str(p2p_layout_fingerprint)
+        elif (
+            p2p_layout_fingerprint is not None
+            and str(p2p_layout_fingerprint) != self.p2p_layout_fingerprint
+        ):
+            return web.Response(
+                text="P2P KV layout fingerprint differs across Prefill ranks.",
+                status=400,
+            )
 
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
@@ -1607,6 +1708,28 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         return web.Response(text="OK", status=200)
 
+    def _parallel_info_payload(self, *, include_p2p_metadata: bool) -> Dict:
+        info = PrefillServerInfo(
+            attn_tp_size=self.attn_tp_size,
+            attn_cp_size=self.attn_cp_size,
+            dp_size=self.dp_size,
+            pp_size=self.pp_size,
+            page_size=self.page_size,
+            kv_cache_dtype=self.kv_cache_dtype,
+            p2p_layout_fingerprint=self.p2p_layout_fingerprint,
+            follow_bootstrap_room=(
+                self.follow_bootstrap_room
+                if self.follow_bootstrap_room is not None
+                else True
+            ),
+            enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+            prefill_http_port=self.prefill_http_port,
+        )
+        payload = dataclasses.asdict(info)
+        if not include_p2p_metadata:
+            payload.pop("p2p_layout_fingerprint", None)
+        return payload
+
     async def _handle_route_get(self, request: web.Request):
         prefill_dp_rank = request.query.get("prefill_dp_rank")
         prefill_cp_rank = request.query.get("prefill_cp_rank")
@@ -1632,22 +1755,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     f" ({self._registered_count} workers registered).",
                     status=503,
                 )
-            info = PrefillServerInfo(
-                attn_tp_size=self.attn_tp_size,
-                attn_cp_size=self.attn_cp_size,
-                dp_size=self.dp_size,
-                pp_size=self.pp_size,
-                page_size=self.page_size,
-                kv_cache_dtype=self.kv_cache_dtype,
-                follow_bootstrap_room=(
-                    self.follow_bootstrap_room
-                    if self.follow_bootstrap_room is not None
-                    else True
+            return web.json_response(
+                self._parallel_info_payload(
+                    include_p2p_metadata=(
+                        request.query.get("include_p2p_metadata") == "1"
+                    )
                 ),
-                enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
-                prefill_http_port=self.prefill_http_port,
+                status=200,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
 
         if not self._is_ready():
             return web.Response(

@@ -555,6 +555,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.progress_p2p_kv_transfers()
             if self._engine_paused:
                 continue
             self.waiting_queue.extend(
@@ -594,6 +595,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.progress_p2p_kv_transfers()
             if self._engine_paused:
                 continue
             self.waiting_queue.extend(

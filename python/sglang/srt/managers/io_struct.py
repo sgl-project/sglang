@@ -275,6 +275,16 @@ class GenerateReqInput:
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
+    # Experimental Prefill->Prefill remote KV transfer hint. This is only
+    # populated from explicit x-sgl-remote-kv-* headers and is ignored by
+    # default production traffic.
+    remote_kv_source_url: Optional[str] = None
+    remote_kv_source_bootstrap_addr: Optional[str] = None
+    remote_kv_target_url: Optional[str] = None
+    remote_kv_matched_tokens: Optional[int] = None
+    remote_kv_reason: Optional[str] = None
+    remote_kv_token_ids: Optional[List[int]] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
     # For custom metric labels
@@ -791,6 +801,12 @@ class GenerateReqInput:
             http_worker_ipc=self.http_worker_ipc,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
+            remote_kv_source_url=self.remote_kv_source_url,
+            remote_kv_source_bootstrap_addr=self.remote_kv_source_bootstrap_addr,
+            remote_kv_target_url=self.remote_kv_target_url,
+            remote_kv_matched_tokens=self.remote_kv_matched_tokens,
+            remote_kv_reason=self.remote_kv_reason,
+            remote_kv_token_ids=self.remote_kv_token_ids,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -877,6 +893,15 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
+
+    # Experimental Prefill->Prefill remote KV transfer hint. The scheduler
+    # treats this as best-effort and must fall back to local recompute.
+    remote_kv_source_url: Optional[str] = None
+    remote_kv_source_bootstrap_addr: Optional[str] = None
+    remote_kv_target_url: Optional[str] = None
+    remote_kv_matched_tokens: Optional[int] = None
+    remote_kv_reason: Optional[str] = None
+    remote_kv_token_ids: Optional[List[int]] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
@@ -1445,6 +1470,30 @@ class FlushCacheReqInput(BaseReq, kw_only=True):
 class FlushCacheReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
+
+
+class P2PKVTransferReqInput(BaseReq, kw_only=True):
+    source_url: str
+    target_url: str
+    token_ids: List[int]
+    matched_tokens: int
+    request_id: str = ""
+    dry_run: bool = False
+    reason: str = ""
+    p2p_bootstrap_room: Optional[int] = None
+    source_bootstrap_addr: Optional[str] = None
+    p2p_source_send: bool = False
+
+
+class P2PKVTransferReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+    source_url: str = ""
+    target_url: str = ""
+    matched_tokens: int = 0
+    transferred_tokens: int = 0
+    fallback_recompute: bool = True
+    experimental_limitations: List[str] = msgspec.field(default_factory=list)
 
 
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):

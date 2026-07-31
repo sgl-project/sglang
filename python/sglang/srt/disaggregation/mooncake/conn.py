@@ -1614,6 +1614,42 @@ class MooncakeKVManager(CommonKVManager):
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
                 room = waiting_req_bytes[0].decode("ascii")
+                # P2P Prefill->Prefill receiver reuse: target Prefill reuses
+                # MooncakeKVReceiver, so source sender reports completion to
+                # this manager's socket with the Decode-style status frame
+                # [room, status, prefill_rank]. Prefill mode normally expects
+                # metadata frames here; handle the short status frame before
+                # reading waiting_req_bytes[3].
+                if len(waiting_req_bytes) == 3 and room not in (
+                    "WATERMARK",
+                    "STAGING_RSP",
+                    "ABORT",
+                ):
+                    bootstrap_room = int(room)
+                    status = int(waiting_req_bytes[1].decode("ascii"))
+                    prefill_rank = int(waiting_req_bytes[2].decode("ascii"))
+                    if status == KVPoll.Success:
+                        if hasattr(self, "prefill_response_tracker"):
+                            self.prefill_response_tracker[bootstrap_room].add(
+                                prefill_rank
+                            )
+                            expected = getattr(
+                                self, "required_prefill_response_num_table", {}
+                            ).get(bootstrap_room, 1)
+                            if (
+                                len(self.prefill_response_tracker[bootstrap_room])
+                                >= expected
+                            ):
+                                self.update_status(bootstrap_room, KVPoll.Success)
+                        else:
+                            self.update_status(bootstrap_room, KVPoll.Success)
+                    elif status == KVPoll.Failed:
+                        self.record_failure(
+                            bootstrap_room,
+                            "Failed to get kvcache from P2P source prefill instance",
+                        )
+                        self.update_status(bootstrap_room, KVPoll.Failed)
+                    continue
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
                     from sglang.srt.disaggregation.common.staging_handler import (
@@ -1886,6 +1922,7 @@ class MooncakeKVSender(CommonKVSender):
         dest_tp_ranks: List[int],
         pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        force_cp_rank_transfer: bool = False,
     ):
         super().__init__(
             mgr,
@@ -1894,6 +1931,7 @@ class MooncakeKVSender(CommonKVSender):
             dest_tp_ranks,
             pp_rank,
             req_has_disagg_prefill_dp_rank,
+            force_cp_rank_transfer=force_cp_rank_transfer,
         )
         self.conclude_state = None
         self.init_time = time.time()

@@ -180,6 +180,8 @@ def gen_payload_openai(messages, output_len, model):
         "model": model,
         "messages": messages,
         "max_tokens": output_len,
+        "min_tokens": output_len,
+        "ignore_eos": True,
         "temperature": 0.0,
         "stream": True,
         "stream_options": {"include_usage": True},

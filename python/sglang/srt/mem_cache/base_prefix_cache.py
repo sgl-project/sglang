@@ -88,6 +88,7 @@ class InsertResult:
     cache_actions: list[CacheAction | ComponentAction] = dataclasses.field(
         default_factory=list
     )
+    duplicate_kv_handled_by_cache: bool = False
 
 
 @dataclasses.dataclass

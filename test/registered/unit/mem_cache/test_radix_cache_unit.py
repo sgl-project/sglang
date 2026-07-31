@@ -332,6 +332,8 @@ class TestRadixCache(unittest.TestCase):
                 result = cache.insert(InsertParams(key=key, value=value))
                 prefix_len = result.prefix_len
 
+                self.assertFalse(result.duplicate_kv_handled_by_cache)
+
                 if disable_cache:
                     self.assertEqual(prefix_len, 0)
                     self.assertEqual(cache.total_size(), 0)

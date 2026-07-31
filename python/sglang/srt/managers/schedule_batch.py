@@ -749,6 +749,12 @@ class Req(ReqDllmMixin):
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
+        remote_kv_source_url: Optional[str] = None,
+        remote_kv_source_bootstrap_addr: Optional[str] = None,
+        remote_kv_target_url: Optional[str] = None,
+        remote_kv_matched_tokens: Optional[int] = None,
+        remote_kv_reason: Optional[str] = None,
+        remote_kv_token_ids: Optional[List[int]] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
@@ -828,6 +834,12 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.lora_id = lora_id
         self.routing_key = routing_key
+        self.remote_kv_source_url = remote_kv_source_url
+        self.remote_kv_source_bootstrap_addr = remote_kv_source_bootstrap_addr
+        self.remote_kv_target_url = remote_kv_target_url
+        self.remote_kv_matched_tokens = remote_kv_matched_tokens
+        self.remote_kv_reason = remote_kv_reason
+        self.remote_kv_token_ids = remote_kv_token_ids
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
