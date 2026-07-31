@@ -11,8 +11,9 @@ from sglang.kernels.ops.diffusion.common.fallback_torch import (
     rms_norm_fn_native,
     triton_one_pass_rms_norm_native,
 )
-from sglang.test.ci.ci_register import register_mlx_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
 
@@ -25,7 +26,7 @@ class TestDiffusionTorchFallback(unittest.TestCase):
         dtypes = (
             (torch.float32, torch.float16, torch.bfloat16)
             if self.device.type == "mps"
-            else (torch.float32,)
+            else (torch.float32, torch.bfloat16)
         )
         for dtype in dtypes:
             with self.subTest(dtype=dtype):
@@ -33,12 +34,13 @@ class TestDiffusionTorchFallback(unittest.TestCase):
                 weight = torch.randn(32, device=self.device, dtype=dtype)
                 bias = torch.randn(32, device=self.device, dtype=dtype)
 
-                rms = norm_infer_native(x, weight, None, 1e-5, is_rms_norm=True)
+                rms = norm_infer_native(x, weight, bias, 1e-5, is_rms_norm=True)
                 x_fp32 = x.float()
                 rms_ref = (
                     x_fp32
                     * torch.rsqrt(x_fp32.square().mean(-1, keepdim=True) + 1e-5)
                     * weight.float()
+                    + bias.float()
                 ).to(dtype)
 
                 layer = norm_infer_native(x, weight, bias, 1e-5)
