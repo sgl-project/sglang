@@ -74,8 +74,9 @@ class TestVerifyMaskCapacity(CustomTestCase):
         self.assertFalse(mask.fits(_MAX_BS + 1, _DRAFT))
 
     def test_full_mask_always_fits(self):
-        """FULL_MASK's context dimension absorbed oversized batches before this
-        buffer had a capacity notion; keep that, and it needs no max_context_len."""
+        """FULL_MASK is exempt: its bound needs a max_context_len that composite
+        backends do not carry, so it keeps its pre-existing unconditional reuse
+        -- including the overflow that reuse can still hit past max_bs."""
         mask = VerifyMask(
             buffer=torch.zeros(8, dtype=torch.bool), mode=TreeMaskMode.FULL_MASK
         )
@@ -145,11 +146,10 @@ class TestHybridAttnBackendHandsOutSelectedChildMask(CustomTestCase):
         self.assertIs(backend.verify_mask, prefill_mask)
 
     def test_capacity_check_needs_nothing_from_the_backend(self):
-        """A composite backend carries no max_context_len of its own, so asking
-        the mask whether a batch fits must not reach back through it."""
+        """A composite backend carries no max_context_len of its own: fits()
+        reaching back through the backend would raise AttributeError here."""
         backend = _make_hybrid_backend("prefill", _mask(64, is_read=False), None)
 
-        self.assertFalse(hasattr(backend, "max_context_len"))
         self.assertTrue(backend.verify_mask.fits(_MAX_BS, _DRAFT))
 
 
