@@ -7,6 +7,7 @@ from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
+    tree_mask_numel,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, default_tree_mask_mode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -151,6 +152,16 @@ class TestHybridAttnBackendHandsOutSelectedChildMask(CustomTestCase):
         backend = _make_hybrid_backend("prefill", _mask(64, is_read=False), None)
 
         self.assertTrue(backend.verify_mask.fits(_MAX_BS, _DRAFT))
+
+
+class TestTreeMaskNumel(CustomTestCase):
+    def test_rejects_layouts_it_cannot_size(self):
+        """Falling through to FULL_MASK would over-allocate a packed layout by
+        orders of magnitude instead of failing."""
+        with self.assertRaises(NotImplementedError):
+            tree_mask_numel(
+                TreeMaskMode.QLEN_ONLY_BITPACKING, 1, _DRAFT, _MAX_CONTEXT_LEN
+            )
 
 
 if __name__ == "__main__":

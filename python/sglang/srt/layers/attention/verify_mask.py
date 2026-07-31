@@ -14,12 +14,15 @@ def tree_mask_numel(
     """Cells the tree kernel writes for ``bs`` requests under ``mode``.
 
     FULL_MASK reaches 100s of MB at long context; QLEN_ONLY stays in the KBs.
+    Bit-packed layouts are not sized here -- falling through to FULL_MASK would
+    over-allocate them by orders of magnitude.
     """
-    per_req = (
-        num_draft_tokens * num_draft_tokens
-        if mode == TreeMaskMode.QLEN_ONLY
-        else num_draft_tokens * (max_context_len + num_draft_tokens)
-    )
+    if mode == TreeMaskMode.QLEN_ONLY:
+        per_req = num_draft_tokens * num_draft_tokens
+    elif mode == TreeMaskMode.FULL_MASK:
+        per_req = num_draft_tokens * (max_context_len + num_draft_tokens)
+    else:
+        raise NotImplementedError(f"Invalid tree mask: {mode=}")
     return bs * per_req
 
 
