@@ -824,7 +824,8 @@ class Engine(EngineScoreMixin, EngineBase):
         if not use_dp_controller:
             # Launch tensor parallel scheduler processes
             memory_saver_adapter = TorchMemorySaverAdapter.create(
-                enable=server_args.enable_memory_saver
+                enable=server_args.enable_memory_saver,
+                hook_mode=server_args.memory_saver_hook_mode,
             )
             scheduler_pipe_readers = []
 
