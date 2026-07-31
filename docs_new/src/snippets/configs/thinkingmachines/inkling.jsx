@@ -72,19 +72,18 @@ export const config = {
 -H 'Content-Type: application/json' \\
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
-  // NVIDIA: two multi-arch CUDA builds (inkling-cu12 / inkling-cu13) — pick by your
-  // CUDA version, not by GPU. AMD: inkling-rocm700-mi35x. Panel defaults to cu13.
-  // The DSpark tier needs its own preview build (DSpark isn't in the inkling-cu1x
-  // images yet), so it takes a `hw|quant|strategy` key.
+  // NVIDIA: two multi-arch CUDA builds (dev-inkling-dspark for CUDA 13,
+  // dev-cu12-inkling-dspark for CUDA 12) — pick by your CUDA version, not by GPU.
+  // Panel defaults to cu13. AMD: dev-rocm720-mi35x-inkling-dspark (sglang-rocm repo).
+  // All tiers ship from the same images, DSpark included.
   dockerImages: {
-    "b200|nvfp4|dspark": "lmsysorg/sglang:dev-cu13-inkling-dspark",
-    h200:  "lmsysorg/sglang:inkling-cu13",
-    b200:  "lmsysorg/sglang:inkling-cu13",
-    b300:  "lmsysorg/sglang:inkling-cu13",
-    gb200: "lmsysorg/sglang:inkling-cu13",
-    gb300: "lmsysorg/sglang:inkling-cu13",
-    mi350x: "lmsysorg/sglang:inkling-rocm700-mi35x",
-    mi355x: "lmsysorg/sglang:inkling-rocm700-mi35x",
+    h200:  "lmsysorg/sglang:dev-inkling-dspark",
+    b200:  "lmsysorg/sglang:dev-inkling-dspark",
+    b300:  "lmsysorg/sglang:dev-inkling-dspark",
+    gb200: "lmsysorg/sglang:dev-inkling-dspark",
+    gb300: "lmsysorg/sglang:dev-inkling-dspark",
+    mi350x: "lmsysorg/sglang-rocm:dev-rocm720-mi35x-inkling-dspark",
+    mi355x: "lmsysorg/sglang-rocm:dev-rocm720-mi35x-inkling-dspark",
   },
 
   github: {
@@ -689,9 +688,8 @@ export const config = {
     // ====================================================================
     // DSpark (speculative decoding) — separate draft checkpoint
     // (RadixArk/Inkling-DSpark-Preview, served unquantized) instead of Inkling's
-    // own MTP head, so it needs a build carrying DSpark support: the
-    // `dev-cu13-inkling-dspark` image (see the dockerImages key above).
-    // The draft weights sit outside the FP4 target, hence mem-fraction 0.68.
+    // own MTP head. The draft weights sit outside the FP4 target, hence
+    // mem-fraction 0.68.
     // B200 verified end-to-end.
     // ====================================================================
     {
@@ -714,6 +712,7 @@ export const config = {
         "--mem-fraction-static 0.68",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
+        "--enable-multimodal",
         "--max-running-requests 68",
         "--reasoning-parser inkling",
         "--tool-call-parser inkling",
