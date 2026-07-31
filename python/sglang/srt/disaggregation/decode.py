@@ -1822,6 +1822,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             return
 
         self._commit_hicache_local_restore_to_req(decode_req)
+        if (
+            not _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+            and StateType.MAMBA in decode_req.kv_receiver.kv_mgr.kv_args.state_types
+        ):
+            # The transfer initialized the slot; clearing it would discard the state.
+            decode_req.req.mamba_needs_clear = False
 
         # Case 3: Success - commit the transfer
         # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
