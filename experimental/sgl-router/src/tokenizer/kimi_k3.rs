@@ -281,37 +281,22 @@ pub fn resolve_render_opts(request: &serde_json::Value) -> RenderOpts {
 /// Whether the request declares any tools, deciding what an absent `tool_choice`
 /// defaults to.
 ///
-/// Mirrors the engine's `set_tool_choice_default` predicate, which is
-/// `values.get("tools") is None and not _has_message_level_tools(...)`. Two
-/// details of that are load-bearing and easy to get wrong:
+/// Mirrors the engine's `set_tool_choice_default` predicate, which is exactly
+/// `values.get("tools") is None`; the field it reads is the TOP-LEVEL `tools`,
+/// never anything on a message. Two details of that are load-bearing and easy to
+/// get wrong:
 ///
-/// - The top-level test is `is None`, NOT truthiness. An explicit `tools: []` is
-///   not `None` in Python, so it yields `auto` (no preamble) even though it
-///   declares nothing renderable. Testing emptiness here would emit a
-///   `tool_choice=none` block the engine never emits.
-/// - Message-level `tools` count, but only on a `system` / `developer` message,
-///   and there by TRUTHINESS (`bool(msg.get("tools"))`), so an empty list on such
-///   a message does not count. Missing this half leaves the router short exactly
-///   on tool-carrying agent traffic, where the prompt divergence costs the most.
+/// - The test is `is None`, NOT truthiness. An explicit `tools: []` is not `None`
+///   in Python, so it yields `auto` (no preamble) even though it declares nothing
+///   renderable. Testing emptiness here would emit a `tool_choice=none` block the
+///   engine never emits.
+/// - There is no message-level half. A `system`/`developer` (or any) message
+///   carrying `tools` is invisible to `set_tool_choice_default`: with the
+///   top-level key absent the engine still resolves to `none`, so counting it
+///   would render the prompt shorn of the `tool_choice=none` preamble exactly
+///   like the bug this mirrors fixes.
 fn declares_tools(request: &serde_json::Value) -> bool {
-    if !matches!(request.get("tools"), None | Some(serde_json::Value::Null)) {
-        return true;
-    }
-    request
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .is_some_and(|messages| {
-            messages.iter().any(|message| {
-                message
-                    .get("role")
-                    .and_then(|r| r.as_str())
-                    .is_some_and(|role| {
-                        role.eq_ignore_ascii_case("system")
-                            || role.eq_ignore_ascii_case("developer")
-                    })
-                    && message.get("tools").is_some_and(json_truthy)
-            })
-        })
+    !matches!(request.get("tools"), None | Some(serde_json::Value::Null))
 }
 
 /// Python-truthiness of a JSON value, matching [`super::dsv4`]'s treatment of
@@ -1902,24 +1887,26 @@ mod tests {
             "an explicit empty `tools` is still not None"
         );
 
-        // Message-level tools count, but only on system/developer, and only when
-        // truthy.
+        // Message-level `tools` do NOT affect the protocol's default. The engine's
+        // predicate is `values.get("tools") is None` — top-level only — so a
+        // request with no top-level `tools` gets `none` no matter what individual
+        // messages carry.
         let sys_tools = json!({"messages": [
             {"role": "system", "content": "s", "tools": [{"name": "f"}]},
             {"role": "user", "content": "hi"},
         ]});
         assert_eq!(
             resolve_render_opts(&sys_tools).tool_choice,
-            ToolChoice::Unset,
-            "message-level tools on a system message declare tools"
+            ToolChoice::None,
+            "message-level tools do not count; only top-level `tools` does"
         );
         let dev_tools = json!({"messages": [
             {"role": "Developer", "content": "d", "tools": [{"name": "f"}]},
         ]});
         assert_eq!(
             resolve_render_opts(&dev_tools).tool_choice,
-            ToolChoice::Unset,
-            "the role match is case-insensitive, like Python's .lower()"
+            ToolChoice::None,
+            "the role is irrelevant to the top-level-only predicate"
         );
         let user_tools = json!({"messages": [
             {"role": "user", "content": "hi", "tools": [{"name": "f"}]},
@@ -1927,7 +1914,7 @@ mod tests {
         assert_eq!(
             resolve_render_opts(&user_tools).tool_choice,
             ToolChoice::None,
-            "tools on a USER message do not count for the engine's predicate"
+            "no top-level `tools` => `none`, whatever a message carries"
         );
         let empty_sys_tools = json!({"messages": [
             {"role": "system", "content": "s", "tools": []},
@@ -1935,7 +1922,7 @@ mod tests {
         assert_eq!(
             resolve_render_opts(&empty_sys_tools).tool_choice,
             ToolChoice::None,
-            "message-level tools are tested by truthiness, so [] does not count"
+            "still no top-level `tools` => `none`, empty or not"
         );
 
         // An explicit choice still wins over the default in both directions.
