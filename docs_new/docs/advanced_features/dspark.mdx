@@ -1,0 +1,254 @@
+---
+title: "DSpark speculative decoding"
+description: "Deploy, validate, tune, and troubleshoot DSpark speculative decoding in SGLang."
+---
+
+DSpark uses a semi-autoregressive draft model to propose a block of tokens, then verifies the block with the target model. A confidence head can assign a different verification window to each request, reducing wasted target-model work at higher concurrency while preserving the target model's output distribution.
+
+DSpark is a model-specific speculative decoding method. You need a draft checkpoint trained for the exact target model, unless the target checkpoint bundles its DSpark draft weights. For other speculative decoding methods, see [Speculative decoding](/docs/advanced_features/speculative_decoding).
+
+<Note>
+The core DSpark runtime is in SGLang `main`, but support is still expanding. The [DSpark roadmap](https://github.com/sgl-project/sglang/issues/30344) tracks ongoing work on cost modeling, model coverage, parallelism, observability, and robustness.
+</Note>
+
+## Current support
+
+The registered Qwen3-14B DSpark test covers the basic API, greedy decoding, scheduler stress, CUDA graph occupancy, GSM8K accuracy, JSON-constrained decoding, and grammar-constrained decoding. Model-specific cookbooks provide additional deployment recipes:
+
+- [Kimi-K3](/cookbook/autoregressive/Moonshotai/Kimi-K3)
+- [Inkling](/cookbook/autoregressive/ThinkingMachines/Inkling)
+- [Inkling-Small](/cookbook/autoregressive/ThinkingMachines/Inkling-Small)
+
+Use those recipes when they exist. They include model-specific attention backends, quantization, memory-pool sizing, and parallelism constraints that a generic command cannot infer.
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| Separate draft checkpoint | Supported | The draft must match the target model and DSpark architecture. |
+| Bundled draft weights | Supported | If the target config contains DSpark-prefixed fields, SGLang uses the target path as the draft path automatically. |
+| Greedy and temperature sampling | Supported | The greedy path is covered end to end; sampling kernels have parity coverage. Structured outputs and grammar-constrained decoding are also supported. |
+| `return_logprob` | Not supported | DSpark rejects requests that set `return_logprob`. |
+| Overlap scheduler | Supported | DSpark uses the speculative-decoding V2 worker. |
+| Tensor parallelism | Supported | Select the topology and attention backends from a model cookbook when available. |
+| DP attention | Conditional | Requires `--enable-dp-lm-head`, `--moe-a2a-backend none`, and `--attn-cp-size 1`. DeepSeek-V4 DSpark also requires `--dp-size` to equal `--tp-size`. |
+| Decode context parallelism | Model-specific | The current CUDA path is limited to Kimi Linear, DSpark decode attention, `tokenspeed_mla` or experimental `cutedsl_mla`, and `static` verification. |
+| Pipeline parallelism | Not supported | DSpark currently requires `--pp-size 1`. |
+| PD disaggregation | Not supported on `main` | The decode node cannot bootstrap the DSpark draft state from the target-model hidden states. Model-specific development branches or images may contain an experimental implementation. |
+| Mixed chunked prefill | Disabled automatically | SGLang turns it off when DSpark is enabled. |
+| ROCm | Model-specific | Follow the model cookbook or platform-specific support PR; the generic Qwen3 example below is for NVIDIA GPUs. |
+
+## Before you start
+
+You need:
+
+- A current SGLang installation. See [Install SGLang](/docs/get-started/install).
+- A supported GPU with enough memory for the target, draft, KV caches, and CUDA graphs.
+- A matching target and DSpark draft checkpoint, or a target checkpoint with bundled DSpark weights.
+- `--pp-size 1`.
+- A colocated deployment. Do not combine DSpark with PD disaggregation on the current `main` branch.
+
+Do not assume every checkpoint published by [DeepSpec](https://github.com/deepseek-ai/DeepSpec) is immediately supported by SGLang. Confirm that the target architecture exposes the hidden states DSpark needs and that the draft architecture is registered in the current SGLang version.
+
+## Launch a CI-covered model pair
+
+The following target and draft pair is used by SGLang's registered DSpark test. This command targets NVIDIA Hopper GPUs such as H100 or H200:
+
+```bash
+SGLANG_RAGGED_VERIFY_MODE=compact \
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-14B \
+    --trust-remote-code \
+    --attention-backend fa3 \
+    --speculative-draft-attention-backend fa3 \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path deepseek-ai/dspark_qwen3_14b_block7 \
+    --cuda-graph-max-bs-decode 4 \
+    --mem-fraction-static 0.7 \
+    --page-size 1 \
+    --enable-metrics \
+    --disable-piecewise-cuda-graph \
+    --host 0.0.0.0 \
+    --port 30000
+```
+
+On Blackwell GPUs, use the attention backends from the registered test instead:
+
+```text
+--attention-backend trtllm_mha
+--speculative-draft-attention-backend fa4
+```
+
+Send a smoke-test request after the health endpoint is ready:
+
+```bash
+curl -s http://127.0.0.1:30000/health
+
+curl -s http://127.0.0.1:30000/generate \
+    -H 'Content-Type: application/json' \
+    -d '{
+        "text": "The capital of France is",
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 32
+        }
+    }'
+```
+
+The example uses `compact` mode to exercise the ragged-verification path. Without an SPS cost table, `compact` uses the full verification window, so it does not yet gain throughput from confidence-based trimming.
+
+## Use bundled DSpark weights
+
+Some target checkpoints contain the DSpark config and weights in the same repository. For those checkpoints, omit `--speculative-draft-model-path`:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path TARGET_WITH_BUNDLED_DSPARK_WEIGHTS \
+    --speculative-algorithm DSPARK
+```
+
+SGLang detects the DSpark-prefixed checkpoint fields and reuses `--model-path` for the draft. If startup asks for `--speculative-draft-model-path`, the checkpoint does not follow the bundled-weight contract in its current config.
+
+## Choose a verification mode
+
+Set the mode with `SGLANG_RAGGED_VERIFY_MODE` before launching the server.
+
+| Mode | Behavior | When to use it |
+| --- | --- | --- |
+| `static` | Verifies the complete `gamma + 1` window for every request. This is the default. | Start here for compatibility, baseline measurements, and SPS profiling. It does not require a confidence head. |
+| `compact` | Packs the scheduled per-request windows into a token-count CUDA graph tier. | Use for production experiments after profiling an SPS cost table. It requires a trained confidence head. |
+| `cap-accept` | Verifies the full block but commits only through the scheduled window. | Use for diagnostics to measure the full-block acceptance ceiling. It does not save target verification work. |
+
+Non-static modes require `SGLANG_PREP_IN_CUDA_GRAPH=1`, which is enabled by default. If the draft checkpoint has no confidence head, use `static` mode.
+
+## Profile an SPS cost table
+
+The compact scheduler needs a steps-per-second (SPS) cost table to choose a useful token budget. The table is specific to the target and draft checkpoints, hardware, precision, attention backends, parallelism, and CUDA graph configuration.
+
+First, launch the same DSpark configuration in static mode with SPS recording enabled:
+
+```bash
+export SGLANG_RAGGED_VERIFY_MODE=static
+export SGLANG_DSPARK_ENABLE_SPS_RECORD=1
+```
+
+Run the profiler against the ready server:
+
+```bash
+python3 -m sglang.benchmark.dspark_sps_profiler all \
+    --base-url http://127.0.0.1:30000 \
+    --max-batch-size 48 \
+    --out /path/to/dspark_sps.json \
+    --no-plot
+```
+
+The profiler creates the fitted table, raw records, and a run manifest. Omit `--no-plot` to render a plot when Plotly and Kaleido are installed. Restart the server in compact mode with the fitted table:
+
+```bash
+SGLANG_RAGGED_VERIFY_MODE=compact \
+python3 -m sglang.launch_server \
+    --model-path TARGET_MODEL \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path DSPARK_DRAFT_MODEL \
+    --speculative-dspark-sps-table-path /path/to/dspark_sps.json
+```
+
+Re-profile after a material deployment change. The current cost model is an approximation and does not fully model every context-length effect.
+
+You can optionally calibrate confidence values with a sequential temperature scaling (STS) file and `--speculative-dspark-confidence-sts-path`. Run `python3 -m sglang.benchmark.dspark_sts_fit --help` for the calibration input format. STS changes scheduling estimates, not speculative decoding correctness.
+
+## Understand DSpark arguments
+
+| Argument or environment variable | Default | Meaning |
+| --- | --- | --- |
+| `--speculative-algorithm DSPARK` | None | Enables the DSpark worker. |
+| `--speculative-draft-model-path` | None | Loads a separate matching draft checkpoint. Omit only for bundled checkpoints. |
+| `--speculative-dspark-block-size` | Checkpoint value, then `7` | Sets `gamma`, the number of proposed draft tokens. Prefer checkpoint auto-detection. |
+| `--speculative-num-draft-tokens` | `gamma + 1` | Sets the target verification window. If set manually, it must equal `gamma + 1`. |
+| `--speculative-num-steps` | `1` | DSpark supports one semi-autoregressive block step; other values are overridden. |
+| `--speculative-eagle-topk` | `1` | DSpark uses one linear block; other values are overridden. |
+| `--speculative-dspark-sps-table-path` | None | Loads the cost table used by `compact` or `cap-accept` scheduling. It is a no-op in `static` mode. |
+| `--speculative-dspark-confidence-sts-path` | None | Loads optional confidence calibration. |
+| `--speculative-dspark-align-verify-tokens-to-graph-tier` | Off | In `compact` mode, spends CUDA graph padding on additional high-confidence verification tokens. |
+| `SGLANG_RAGGED_VERIFY_MODE` | `static` | Selects `static`, `compact`, or `cap-accept`. |
+| `--max-running-requests` | `48` when omitted | DSpark resets an unspecified value to 48. Set it explicitly after measuring memory and throughput. |
+
+## Validate quality and performance
+
+Do not judge DSpark only by acceptance length. Validate these four signals against the same target model without speculation:
+
+1. Accuracy on a representative workload.
+2. Stop rate and `finish_reason`, so runaway generations cannot hide behind an answer extractor.
+3. Output throughput and latency at the concurrency you expect in production.
+4. Speculative acceptance length and rate.
+
+After sending requests, inspect the server state:
+
+```bash
+curl -s http://127.0.0.1:30000/server_info \
+    | jq '[.internal_states[] | {avg_spec_accept_length, last_gen_throughput}]'
+```
+
+If metrics are enabled, inspect the Prometheus gauges:
+
+```bash
+curl -s http://127.0.0.1:30000/metrics \
+    | grep -E 'sglang:spec_accept_(length|rate)'
+```
+
+For a fixed-shape throughput sweep, use the built-in benchmark:
+
+```bash
+python3 -m sglang.benchmark.one_batch_server \
+    --model None \
+    --base-url http://127.0.0.1:30000 \
+    --batch-size 1 8 16 32 \
+    --input-len 512 \
+    --output-len 512 \
+    --temperature 0 \
+    --show-report
+```
+
+Restart the target without `--speculative-*` arguments and repeat the same workload. Keep model precision, attention backends, cache settings, prompt distribution, and concurrency identical.
+
+## Troubleshooting
+
+### Startup requires a draft model path
+
+The target checkpoint does not expose bundled DSpark config fields. Supply a matching `--speculative-draft-model-path`; do not substitute a draft trained for another target.
+
+### Block size or draft-token validation fails
+
+Remove manual block-size arguments and let SGLang read `block_size` from the draft config. If you must override it, set `--speculative-num-draft-tokens` to `--speculative-dspark-block-size + 1`.
+
+### Compact mode reports a missing confidence head
+
+The checkpoint cannot schedule variable verification windows. Switch to `SGLANG_RAGGED_VERIFY_MODE=static` or use a draft checkpoint with trained confidence-head weights.
+
+### CUDA graph capture runs out of memory
+
+Lower `--mem-fraction-static` to leave more headroom for draft weights, activations, and CUDA graphs. You can also reduce `--cuda-graph-max-bs-decode` and `--max-running-requests`. These changes reduce capacity, so benchmark again.
+
+### DP attention validation fails
+
+Add `--enable-dp-lm-head`, set `--moe-a2a-backend none`, and keep `--attn-cp-size 1`. For a DeepSeek-V4 MoE draft, also set `--dp-size` equal to `--tp-size`. Dense-draft `compact` verification with DP attention requires `--disable-cuda-graph`; use `static` mode if you need CUDA graphs.
+
+### PD disaggregation fails or acceptance degrades across runs
+
+PD disaggregation is not supported with DSpark on the current `main` branch. The decode path does not transfer the target-model hidden states needed to bootstrap the DSpark draft KV state. A partial integration can avoid an immediate crash while still producing progressively lower acceptance and throughput across repeated runs. Remove `--disaggregation-mode` and use a colocated deployment.
+
+Follow the [DSpark PD implementation](https://github.com/sgl-project/sglang/pull/31466) and its split [hidden-state transfer stack](https://github.com/sgl-project/sglang/pull/32422) for progress. Treat commands from model-specific development images as branch-specific until the required changes merge into `main`.
+
+### DSpark starts but does not improve throughput
+
+Check the acceptance metrics and compare at the intended batch size. `compact` mode without an SPS table verifies the full window, and an SPS table profiled for a different deployment can choose poor budgets. Low-concurrency workloads may also have too little target-verification cost to benefit from trimming.
+
+### Requests fail with `return_logprob`
+
+Remove `return_logprob`. DSpark does not currently return token log probabilities.
+
+## References
+
+- [DSpark in SGLang: Speculative Decoding with Confidence-Driven, Variable-Length Verification](https://www.lmsys.org/blog/2026-07-06-dspark-sglang)
+- [DSpark roadmap issue](https://github.com/sgl-project/sglang/issues/30344)
+- [Core DSpark implementation PR](https://github.com/sgl-project/sglang/pull/30261)
+- [DSpark PD disaggregation implementation PR](https://github.com/sgl-project/sglang/pull/31466)
+- [DeepSpec training and evaluation repository](https://github.com/deepseek-ai/DeepSpec)
