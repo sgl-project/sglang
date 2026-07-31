@@ -217,10 +217,18 @@ __global__ void load_cache_to_device_buffer_kernel(
   constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
 
   const int bid = blockIdx.x;
-  // Early exit for padded blocks (CUDA graph pads batch to a captured size)
-  if (bid >= num_real_reqs[0]) return;
-
   const int tid = threadIdx.x;
+  int32_t* req_top_k_device_locs = top_k_device_locs + bid * top_k_device_locs_stride;
+
+  // CUDA graph pads the batch to a captured size. Keep padded output rows
+  // invalid without a separate fill kernel.
+  if (bid >= num_real_reqs[0]) {
+    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+      req_top_k_device_locs[i] = -1;
+    }
+    return;
+  }
+
   const int warp_id = tid / WARP_SIZE;
   const int lane_id = tid % WARP_SIZE;
   const BallotMask lanes_before = (BallotMask(1) << lane_id) - BallotMask(1);
@@ -230,7 +238,6 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   // Calculate offsets for this request
   const int32_t* req_top_k_tokens = top_k_tokens + bid * top_k_tokens_stride;
-  int32_t* req_top_k_device_locs = top_k_device_locs + bid * top_k_device_locs_stride;
 
   const int64_t buffer_offset = rid * buffer_stride_0;
   int32_t* req_device_buffer_tokens = device_buffer_tokens + buffer_offset;
@@ -241,11 +248,15 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Fast path: short sequences have all tokens in the device buffer in order.
   if (seq_len <= HOT_BUFFER_SIZE) {
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
-    for (int i = tid; i < count; i += BLOCK_SIZE) {
-      int32_t token_pos = req_top_k_tokens[i];
-      if (token_pos >= 0) {
-        req_top_k_device_locs[i] = req_device_buffer_locs[token_pos];
+    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+      int32_t device_loc = -1;
+      if (i < count) {
+        int32_t token_pos = req_top_k_tokens[i];
+        if (token_pos >= 0) {
+          device_loc = req_device_buffer_locs[token_pos];
+        }
       }
+      req_top_k_device_locs[i] = device_loc;
     }
     return;
   }
