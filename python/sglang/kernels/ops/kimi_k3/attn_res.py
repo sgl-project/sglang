@@ -102,6 +102,15 @@ _PULL_SEM_MC_MAP: dict[int, int] = {}
 
 
 def register_comm(comm: Communicator, *, pull_sem_mc_ptr: int) -> None:
+    # One communicator per world_size per process -- see the note in
+    # kimi_k3/all_reduce.py::register_comm. The ops key only on world_size, so an
+    # overwrite here would hand the old group's callers the new group's peer
+    # pointers.
+    prev = _COMM_MAP.get(comm.world_size)
+    assert prev is None or prev is comm, (
+        f"a different communicator is already registered for world_size="
+        f"{comm.world_size}"
+    )
     _COMM_MAP[comm.world_size] = comm
     _PULL_SEM_MC_MAP[comm.world_size] = pull_sem_mc_ptr
 
