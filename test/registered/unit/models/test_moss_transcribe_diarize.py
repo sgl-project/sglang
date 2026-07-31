@@ -1,3 +1,4 @@
+import unittest
 from types import SimpleNamespace
 
 import torch
@@ -90,3 +91,7 @@ class TestMossTranscribeDiarizeModel(CustomTestCase):
 
         self.assertEqual(model.whisper_encoder.last_batch_shape, (2, 4, 5))
         self.assertEqual(tuple(output.shape), (2, 4))
+
+
+if __name__ == "__main__":
+    unittest.main()
