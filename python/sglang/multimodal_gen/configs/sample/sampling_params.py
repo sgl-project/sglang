@@ -76,12 +76,15 @@ class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()
     MESH = auto()
+    ACTION = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
             return "png"
         if self == DataType.VIDEO:
             return "mp4"
+        if self == DataType.ACTION:
+            return "json"
         return "glb"
 
 
@@ -246,10 +249,8 @@ class SamplingParams:
 
     def _set_output_file_ext(self):
         # add extension if needed
-        if not any(
-            self.output_file_name.endswith(ext)
-            for ext in [".mp4", ".jpg", ".png", ".webp", ".obj", ".glb"]
-        ):
+        output_extensions = (".mp4", ".jpg", ".png", ".webp", ".obj", ".glb", ".json")
+        if not any(self.output_file_name.endswith(ext) for ext in output_extensions):
             self.output_file_name = (
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
             )
@@ -329,6 +330,8 @@ class SamplingParams:
 
     def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
         """Convert output_quality string to compression level."""
+        if data_type == DataType.ACTION:
+            return 0
         output_quality_mapper = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
         if output_quality == "default":
             return 50 if data_type == DataType.VIDEO else 75
@@ -469,18 +472,22 @@ class SamplingParams:
         """
         check if the sampling params is compatible and valid with server_args
         """
-        if pipeline_config.task_type.requires_image_input():
+        task_type = pipeline_config.task_type
+        if task_type.is_action_gen():
+            return
+
+        if task_type.requires_image_input():
             # requires image input
             if self.image_path is None:
                 raise ValueError(
-                    f"Served model with task type '{pipeline_config.task_type.name}' requires an 'image_path' input, but none was provided"
+                    f"Served model with task type '{task_type.name}' requires an 'image_path' input, but none was provided"
                 )
 
-        if not pipeline_config.task_type.accepts_image_input():
+        if not task_type.accepts_image_input():
             # does not support image input
             if self.image_path is not None:
                 raise ValueError(
-                    f"input_reference is not supported for {pipeline_config.task_type.name} models."
+                    f"input_reference is not supported for {task_type.name} models."
                 )
 
     def _adjust(
@@ -494,7 +501,39 @@ class SamplingParams:
 
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
+        task_type = pipeline_config.task_type
+        self.data_type = task_type.data_type()
 
+        self._adjust_output_path(server_args)
+        if task_type.is_action_gen():
+            self._adjust_action_fields(server_args)
+            return
+
+        if task_type.is_mesh_gen():
+            self._adjust_mesh_fields(server_args, pipeline_config)
+            return
+
+        if task_type.is_visual_gen():
+            self._adjust_visual_fields(server_args, pipeline_config)
+
+    def _adjust_output_path(self, server_args):
+        if self.output_path is None:
+            if server_args.output_path is not None:
+                self.output_path = server_args.output_path
+                logger.debug(
+                    f"Overriding output_path with server configuration: {self.output_path}"
+                )
+            else:
+                self.save_output = False
+
+    def _adjust_action_fields(self, server_args):
+        self.return_file_paths_only = False
+        self.num_frames = 1
+        self.adjust_frames = False
+        if self.save_output and not server_args.comfyui_mode:
+            self._set_output_file_name()
+
+    def _adjust_mesh_fields(self, server_args, pipeline_config):
         if self.guidance_scale is None:
             try:
                 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
@@ -507,17 +546,16 @@ class SamplingParams:
                     self.guidance_scale = 1.0
             except ImportError:
                 self.guidance_scale = 1.0
+        self.return_frames = False
+        self.return_video = False
+        self.num_frames = 1
+        self.adjust_frames = False
+        if self.save_output and not server_args.comfyui_mode:
+            self._set_output_file_name()
 
-        self.data_type = server_args.pipeline_config.task_type.data_type()
-
-        if self.output_path is None:
-            if server_args.output_path is not None:
-                self.output_path = server_args.output_path
-                logger.debug(
-                    f"Overriding output_path with server configuration: {self.output_path}"
-                )
-            else:
-                self.save_output = False
+    def _adjust_visual_fields(self, server_args, pipeline_config):
+        if self.guidance_scale is None:
+            self.guidance_scale = 1.0
 
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():
@@ -576,7 +614,6 @@ class SamplingParams:
             if not server_args.pipeline_config.allow_set_num_frames():
                 logger.debug("Setting `num_frames` to 1 for image generation model")
                 self.num_frames = 1
-
         else:
             # mandatory frame adjusting logic, mod
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.

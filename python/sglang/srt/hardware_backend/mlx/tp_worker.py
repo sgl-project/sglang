@@ -26,7 +26,11 @@ from sglang.srt.hardware_backend.mlx.model_runner import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    PPProxyTensors,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,14 +67,8 @@ class MlxTpModelWorker(TpModelWorker):
             model_config=self.model_config,
             mem_fraction_static=self.server_args.mem_fraction_static,
             gpu_id=self.gpu_id,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            moe_ep_rank=self.moe_ep_rank,
-            moe_ep_size=self.ep_size,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
+            ps=self.ps,
             nccl_port=self.nccl_port,
-            dp_rank=self.dp_rank,
             server_args=self.server_args,
             is_draft_worker=self.is_draft_worker,
             req_to_token_pool=self.req_to_token_pool,
@@ -99,6 +97,8 @@ class MlxTpModelWorker(TpModelWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
         """Override to route through MLX model runner."""
         if batch is not None:
@@ -112,6 +112,7 @@ class MlxTpModelWorker(TpModelWorker):
             pp_proxy_tensors,
             is_verify,
             skip_attn_backend_init,
+            capture_hidden_mode=capture_hidden_mode,
         )
 
     def _cleanup_stale_rids(self, forward_mode, current_rids: set[str]) -> None:

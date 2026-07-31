@@ -192,6 +192,72 @@ This method is convenient for testing / experimenting. For production or multi-p
 
 Also note that the flat inline config form is interpreted as plugin-specific parameters for the selected plugin.
 
+### 4. Validated Hybrid-Model Example
+
+The following setup was validated against a hybrid Mamba model with HiCache enabled:
+
+- model: `Qwen/Qwen3.5-9B`
+- storage backend: `nixl`
+- NIXL plugin: `POSIX`
+- HiCache layout: `page_first_direct`
+- model type: hybrid attention + Mamba sidecar cache (`KV + MAMBA`)
+
+Important details from this validation:
+
+- Use a real `.toml` file path with `--hicache-storage-backend-extra-config`.
+- For this validated path, the storage directory was provided through `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`.
+- Use `--mamba-scheduler-strategy extra_buffer` to support page sizes larger than 1.
+
+Example TOML file:
+
+```toml
+[plugin.posix]
+active = true
+```
+
+Example serve command for a hybrid model:
+
+```bash
+export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/tmp/sglang_nixl_e2e_storage
+
+~/ve_sgl_dev/bin/sglang serve \
+  --model-path /workspace/LLM_models/Qwen3.5-9B \
+  --served-model-name Qwen/Qwen3.5-9B \
+  --host 127.0.0.1 \
+  --tp 2 \
+  --reasoning-parser qwen3 \
+  --attention-backend triton \
+  --enable-hierarchical-cache \
+  --hicache-ratio 2 \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct \
+  --hicache-storage-prefetch-policy wait_complete \
+  --page-size 256 \
+  --log-level info \
+  --disable-cuda-graph \
+  --hicache-storage-backend nixl \
+  --hicache-storage-backend-extra-config @/tmp/nixl.config.toml \
+  --mamba-scheduler-strategy extra_buffer
+```
+
+Expected behavior for this validated setup:
+
+- the server starts with `Attached hybrid Mamba pool stack to HiMambaRadixCache: pools=KV + MAMBA`
+- NIXL logs show `Backend POSIX was instantiated`
+- the server logs `HiCacheNixl: registered hybrid host pool mamba zero_copy=...`
+- the storage directory contains KV files plus Mamba sidecar files such as `..._0_2_mamba_temporal` and `..._0_2_mamba_conv_0`
+- after restarting the server against the same storage directory, a repeated long prompt shows large `cached_tokens` in the response metadata
+
+Minimal end-to-end validation flow:
+
+1. Start the server with the TOML file shown above.
+2. Send a long prompt once to populate storage.
+3. Restart the server against the same `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`.
+4. Send the same long prompt again and confirm that `meta_info.cached_tokens` is high.
+
+A reusable local validation script is available at `~/TestEnv/nixl_hicache_hybrid_e2e.py`; it starts this server, sends a long request, and checks both NIXL backend selection and Mamba sidecar storage files.
+
+
 
 ## Running Unit Tests
 

@@ -508,8 +508,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else True
             ),
             stop=request.stop,
-            chat_template_kwargs=request.chat_template_kwargs,
             reasoning_effort=(request.reasoning.effort if request.reasoning else None),
+            chat_template_kwargs=request.chat_template_kwargs,
         )
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal

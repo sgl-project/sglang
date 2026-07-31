@@ -37,7 +37,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 if _is_cuda or _is_hip or _is_xpu:
-    from sglang.jit_kernel.moe_lora_align import moe_lora_align_block_size
+    from sglang.kernels.ops.moe.moe_lora_align import moe_lora_align_block_size
 
 
 def _get_moe_lora_block_config(max_lora_rank: int) -> dict:
@@ -316,10 +316,8 @@ def _add_lora_gate_up_delta(
     routing_cache: dict | None = None,
 ) -> None:
     """Add LoRA gate_up delta to intermediate_cache in-place."""
-    from sglang.srt.lora.triton_ops import (
-        fused_moe_lora,
-        merged_experts_fused_moe_lora_add,
-    )
+    from sglang.kernels.ops.moe.fused_moe_lora_kernel import fused_moe_lora
+    from sglang.kernels.ops.moe.virtual_experts import merged_experts_fused_moe_lora_add
 
     if lora_info is None or lora_info.max_lora_rank == 0:
         return
@@ -409,10 +407,8 @@ def _add_lora_down_delta(
     routing_cache: dict | None = None,
 ) -> None:
     """Add LoRA down delta to intermediate_cache in-place."""
-    from sglang.srt.lora.triton_ops import (
-        fused_moe_lora,
-        merged_experts_fused_moe_lora_add,
-    )
+    from sglang.kernels.ops.moe.fused_moe_lora_kernel import fused_moe_lora
+    from sglang.kernels.ops.moe.virtual_experts import merged_experts_fused_moe_lora_add
 
     if lora_info.max_lora_rank == 0:
         return
