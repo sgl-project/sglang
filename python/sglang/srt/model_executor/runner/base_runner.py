@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import functools
 import inspect
 import logging
 from abc import ABC, abstractmethod
@@ -43,6 +42,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
@@ -245,7 +245,7 @@ class BaseRunner(ABC):
                 buffers is not None
             ), "_autotune_buffers() must return a reusable buffer set for autotune"
             self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
-            self._maybe_flashinfer_autotune_extend(decode_num_tokens=batch_size)
+            maybe_flashinfer_autotune_extend(self, decode_num_tokens=batch_size)
 
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
@@ -313,68 +313,6 @@ class BaseRunner(ABC):
             )
 
         run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
-
-    def _maybe_flashinfer_autotune_extend(self, *, decode_num_tokens: int) -> None:
-        """Also autotune one EXTEND-shaped dummy forward.
-
-        The decode-shaped autotune above only covers token counts up to the
-        decode batch size, so larger prefill/extend batches fall outside the
-        tuned buckets and run flashinfer's default heuristic — which can be
-        far slower than the tuned tactic (e.g. trtllm-gen fp4 MoE is ~30%
-        slower untuned at >=8k tokens on sm100). One extra forward at the
-        largest per-rank extend token count tunes all buckets up to it.
-        """
-        mr = self.model_runner
-        # max_prefill_tokens bounds total extend tokens per forward batch, so
-        # tuning there covers every real extend shape (chunked_prefill_size
-        # only caps per-request chunks). Unbounded on purpose: serving runs
-        # this exact shape anyway; the cost is startup tuning time.
-        num_tokens = mr.server_args.max_prefill_tokens
-        if require_mlp_tp_gather(mr.server_args):
-            # dp-attention splits an extend batch across dp ranks; tune the
-            # per-rank share so the dummy's gathered buffers stay at serving
-            # scale.
-            num_tokens //= mr.server_args.dp_size
-        if num_tokens <= (decode_num_tokens or 0):
-            return  # decode-shaped autotune already covered these buckets
-        if not mr.is_generation or mr.spec_algorithm.is_speculative():
-            # _dummy_run forces TARGET_VERIFY shapes for speculative runners;
-            # extend-bucket autotune for spec configs is a follow-up.
-            return
-
-        num_tokens_per_req = -(-num_tokens // mr.req_to_token_pool.size)
-        batch_size = -(-num_tokens // num_tokens_per_req)
-        num_tokens = batch_size * num_tokens_per_req
-
-        buffers = self._alloc_dummy_decode_buffers(
-            batch_size,
-            num_tokens_per_req=num_tokens_per_req,
-            allocate_logits_buffer=False,
-        )
-        canary_run_ctx = (
-            c.with_active_single_forward_manager(0)
-            if (c := mr.canary_manager) is not None
-            else empty_context()
-        )
-
-        forward_fn = functools.partial(
-            self._dummy_run,
-            batch_size=batch_size,
-            buffers=buffers,
-            run_ctx=canary_run_ctx,
-            forward_mode_override=ForwardMode.EXTEND,
-            extend_num_tokens_per_req=num_tokens_per_req,
-        )
-
-        log_info_on_rank0(
-            logger,
-            f"FlashInfer autotune: extra EXTEND pass at {num_tokens} tokens "
-            f"({batch_size} seqs x {num_tokens_per_req} tokens).",
-        )
-        run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
-        # release dummy buffers before capture measures free memory
-        del forward_fn, buffers
-        torch.cuda.empty_cache()
 
     def _alloc_dummy_decode_buffers(
         self,
