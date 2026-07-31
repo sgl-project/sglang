@@ -1436,22 +1436,33 @@ class ModelConfig:
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()
 
+            # ModelOpt FP4 checkpoints quantize only the target model; an
+            # embedded MTP draft may stay unquantized, so an explicit
+            # nvfp4_online opt-in for the draft wins over checkpoint detection.
+            # The online loader rejects already-packed weights at load time.
+            preserve_online_draft_quantization = (
+                self.is_draft_model
+                and self.quantization == "nvfp4_online"
+                and quant_method == "modelopt_fp4"
+            )
+
             # Detect which checkpoint is it
-            for _, method in QUANTIZATION_METHODS.items():
-                quantization_override = method.override_quantization_method(
-                    quant_cfg, self.quantization
-                )
-                if quantization_override:
-                    quant_method = quantization_override
-                    self.quantization = quantization_override
-                    break
+            if not preserve_online_draft_quantization:
+                for _, method in QUANTIZATION_METHODS.items():
+                    quantization_override = method.override_quantization_method(
+                        quant_cfg, self.quantization
+                    )
+                    if quantization_override:
+                        quant_method = quantization_override
+                        self.quantization = quantization_override
+                        break
 
             # Verify quantization configurations.
             if self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
                 # Check if the CLI-specified quantization is compatible with HF config's quant_method
-                is_compatible = (
+                is_compatible = preserve_online_draft_quantization or (
                     self.quantization in compatible_quantization_methods
                     and quant_method
                     in compatible_quantization_methods[self.quantization]

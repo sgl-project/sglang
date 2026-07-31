@@ -51,6 +51,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    replayssm_rawv=None,
+    replayssm_rawk=None,
+    replayssm_g=None,
+    replayssm_beta=None,
+    stride_rawv_slot: tl.constexpr = 0,
+    stride_rawk_slot: tl.constexpr = 0,
+    stride_g_slot: tl.constexpr = 0,
+    stride_beta_slot: tl.constexpr = 0,
+    MAX_CACHE_LEN: tl.constexpr = 0,
+    CACHE_RING: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -173,6 +183,47 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Compute beta = sigmoid(b)
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
+        # Stored here, pre-l2norm k / pre-delta v, so the commit fold's replay
+        # is bit-identical to the update below; steps >= MAX_CACHE_LEN would
+        # smash the next slot's ring.
+        if CACHE_RING:
+            ring_slot = tl.load(h0_indices + i_n).to(tl.int64)
+            if ring_slot >= 0 and step_idx < MAX_CACHE_LEN:
+                tl.store(
+                    replayssm_rawv
+                    + ring_slot * stride_rawv_slot
+                    + i_hv * MAX_CACHE_LEN * V
+                    + step_idx * V
+                    + o_v,
+                    b_v.to(replayssm_rawv.dtype.element_ty),
+                    mask=mask_v,
+                )
+                if i_v == 0:
+                    tl.store(
+                        replayssm_rawk
+                        + ring_slot * stride_rawk_slot
+                        + i_h * MAX_CACHE_LEN * K
+                        + step_idx * K
+                        + o_k,
+                        b_k.to(replayssm_rawk.dtype.element_ty),
+                        mask=mask_k,
+                    )
+                    tl.store(
+                        replayssm_g
+                        + ring_slot * stride_g_slot
+                        + i_hv * MAX_CACHE_LEN
+                        + step_idx,
+                        b_g,
+                    )
+                    if i_k == 0:
+                        tl.store(
+                            replayssm_beta
+                            + ring_slot * stride_beta_slot
+                            + i_hv * MAX_CACHE_LEN
+                            + step_idx,
+                            b_beta,
+                        )
+
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
@@ -262,6 +313,11 @@ def fused_sigmoid_gating_delta_rule_update(
         int
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    cache_ring: bool = False,
+    replayssm_rawv: Optional[torch.Tensor] = None,
+    replayssm_rawk: Optional[torch.Tensor] = None,
+    replayssm_g: Optional[torch.Tensor] = None,
+    replayssm_beta: Optional[torch.Tensor] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -319,6 +375,25 @@ def fused_sigmoid_gating_delta_rule_update(
         else 0
     )
 
+    if cache_ring:
+        assert not is_kda, "cache_ring supports GDN only (scalar gate layout)"
+        # stride(0) is used as the slot pitch, so a tensor still carrying the
+        # layer dim would scribble outside its slot.
+        assert (
+            replayssm_rawv.dim() == 4
+            and replayssm_rawk.dim() == 4
+            and replayssm_g.dim() == 3
+            and replayssm_beta.dim() == 3
+        ), "cache_ring expects per-layer ring views"
+        max_cache_len = replayssm_rawv.shape[-2]
+        stride_rawv_slot = replayssm_rawv.stride(0)
+        stride_rawk_slot = replayssm_rawk.stride(0)
+        stride_g_slot = replayssm_g.stride(0)
+        stride_beta_slot = replayssm_beta.stride(0)
+    else:
+        max_cache_len = 0
+        stride_rawv_slot = stride_rawk_slot = stride_g_slot = stride_beta_slot = 0
+
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
@@ -361,6 +436,16 @@ def fused_sigmoid_gating_delta_rule_update(
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        replayssm_rawv=replayssm_rawv,
+        replayssm_rawk=replayssm_rawk,
+        replayssm_g=replayssm_g,
+        replayssm_beta=replayssm_beta,
+        stride_rawv_slot=stride_rawv_slot,
+        stride_rawk_slot=stride_rawk_slot,
+        stride_g_slot=stride_g_slot,
+        stride_beta_slot=stride_beta_slot,
+        MAX_CACHE_LEN=max_cache_len,
+        CACHE_RING=cache_ring,
         num_warps=num_warps,
         num_stages=num_stages,
     )
