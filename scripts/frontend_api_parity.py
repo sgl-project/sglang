@@ -269,8 +269,7 @@ def _pointer_tokens(pointer: str) -> list[str]:
     if not pointer.startswith("/"):
         raise HarnessError(f"normalization path must be a JSON pointer: {pointer!r}")
     return [
-        token.replace("~1", "/").replace("~0", "~")
-        for token in pointer[1:].split("/")
+        token.replace("~1", "/").replace("~0", "~") for token in pointer[1:].split("/")
     ]
 
 
@@ -331,9 +330,7 @@ def parse_cli_headers(values: Iterable[str]) -> dict[str, str]:
     for value in values:
         name, separator, header_value = value.partition("=")
         if not separator or not name:
-            raise HarnessError(
-                f"header must use NAME=VALUE syntax, got {value!r}"
-            )
+            raise HarnessError(f"header must use NAME=VALUE syntax, got {value!r}")
         headers[name] = header_value
     return headers
 
@@ -530,9 +527,7 @@ def compare_values(
     return differences
 
 
-def compare_snapshots(
-    reference: dict[str, Any], actual: dict[str, Any]
-) -> list[str]:
+def compare_snapshots(reference: dict[str, Any], actual: dict[str, Any]) -> list[str]:
     validate_snapshot(reference, "reference")
     validate_snapshot(actual, "actual")
     differences: list[str] = []
