@@ -124,8 +124,8 @@ source sglang-diffusion/bin/activate
 uv pip install --upgrade pip
 mv python/pyproject.toml python/pyproject.toml.bak
 cp python/pyproject_other.toml python/pyproject.toml
-uv pip install -e "python[diffusion_mps]"
+uv pip install -e "python[all_mps]"
 ```
 
-This installs the PyTorch MPS diffusion runtime without MLX. The
-`SGLANG_USE_MLX` switch applies only to the SRT serving backend.
+SGLang Diffusion uses PyTorch MPS. The `all_mps` extra also installs the SRT
+MLX backend dependencies; `SGLANG_USE_MLX` applies only to SRT serving.
