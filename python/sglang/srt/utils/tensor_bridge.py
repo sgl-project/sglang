@@ -79,7 +79,12 @@ def torch_to_mlx(tensor: torch.Tensor) -> mx.array:
     Returns:
         MLX array with the same data
     """
-    return _torch_to_mlx(tensor, copy=True)
+    array = _torch_to_mlx(tensor, copy=True)
+    if tensor.device.type == "mps":
+        # Complete the ownership transfer before the caller may mutate or
+        # release the Torch source.
+        _mlx_core().eval(array)
+    return array
 
 
 def mlx_call(
