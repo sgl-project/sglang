@@ -52,7 +52,12 @@ class BatchedPenalizerOrchestrator:
         for penalizer in self.penalizers.values():
             penalizer.cumulate_output_tokens(output_ids=output_ids)
 
-    def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
+    def apply(
+        self,
+        logits: torch.Tensor,
+        repeat: Optional[int] = None,
+        output_token_ids: Optional[torch.Tensor] = None,
+    ):
         """
         Apply all penalizers to the logits in-place.
 
@@ -63,25 +68,34 @@ class BatchedPenalizerOrchestrator:
                 Additive penalties are captured into a zeros tensor, expanded,
                 then added; scaling penalties are accumulated, expanded, then
                 applied directly.
+            output_token_ids: If set, project full-vocabulary penalties onto
+                the compact output vocabulary before applying them.
         """
-        if repeat is None:
+        if repeat is None and output_token_ids is None:
             for penalizer in self.penalizers.values():
                 penalizer.apply(logits)
         else:
-            # Additive: capture into zeros, expand, add
+            repeat = repeat or 1
             bs = logits.shape[0] // repeat
             additive = torch.zeros(
-                (bs, logits.shape[1]), dtype=torch.float32, device=logits.device
+                (bs, self.vocab_size), dtype=torch.float32, device=logits.device
             )
             self.accumulate_additive_penalties(additive)
+            if output_token_ids is not None:
+                additive = additive.index_select(
+                    -1, output_token_ids.to(additive.device)
+                )
             logits.add_(torch.repeat_interleave(additive, repeat, dim=0))
-            # Scaling: accumulate, expand, apply
             accumulated = self.accumulate_scaling_penalties()
             if accumulated is not None:
                 from sglang.srt.sampling.penaltylib.repetition_penalty import (
                     apply_scaling_penalties,
                 )
 
+                if output_token_ids is not None:
+                    accumulated = accumulated.index_select(
+                        -1, output_token_ids.to(accumulated.device)
+                    )
                 expanded = torch.repeat_interleave(accumulated, repeat, dim=0)
                 apply_scaling_penalties(logits, expanded)
 
