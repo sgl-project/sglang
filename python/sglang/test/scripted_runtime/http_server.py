@@ -12,7 +12,7 @@ import zmq
 
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import sock_recv, sock_send
+from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import get_free_port, get_zmq_socket_on_host
 from sglang.test.scripted_runtime.io_struct import (
@@ -90,7 +90,7 @@ class ScriptedHttpServer:
             raise RuntimeError(f"ScriptedHttpServer is dirty: {self._dirty}")
 
         fn_path = f"{script_fn.__module__}:{script_fn.__qualname__}"
-        sock_send(self._socket, RunScript(fn_path=fn_path, args=args))
+        sock_send(self._socket, wrap_as_pickle(RunScript(fn_path=fn_path, args=args)))
 
         if not self._socket.poll(int(timeout_s * 1000)):
             if not self._server_process.is_alive():
@@ -117,7 +117,7 @@ class ScriptedHttpServer:
         fatal_error: Optional[OutOfBandError] = None
         try:
             try:
-                sock_send(self._socket, Shutdown())
+                sock_send(self._socket, wrap_as_pickle(Shutdown()))
             except zmq.ZMQError:
                 pass
 

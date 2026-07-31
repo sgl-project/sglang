@@ -77,7 +77,7 @@ export const InternS2PreviewDeployment = () => {
     if (reasoning === 'enabled') flags.push('  --reasoning-parser qwen3');
     if (toolcall === 'enabled') flags.push('  --tool-call-parser qwen3_coder');
     if (mtp === 'enabled') {
-      flags.push('  --mamba-scheduler-strategy extra_buffer');
+      flags.push('  --mamba-radix-cache-strategy extra_buffer');
       flags.push("  --speculative-algo 'NEXTN'");
       flags.push('  --speculative-eagle-topk 1');
       flags.push('  --speculative-num-steps 3');
@@ -87,8 +87,7 @@ export const InternS2PreviewDeployment = () => {
     flags.push('  --host 0.0.0.0');
     flags.push('  --port 30000');
 
-    const envPrefix = mtp === 'enabled' ? 'SGLANG_ENABLE_SPEC_V2=1 \\\n' : '';
-    return `${envPrefix}sglang serve \\\n${flags.join(' \\\n')}`;
+    return `sglang serve \\\n${flags.join(' \\\n')}`;
   };
 
   const containerStyle = { maxWidth: '900px', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: '4px' };

@@ -70,7 +70,7 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             **kwargs,
         )
 
-        if not getattr(self.server_args, "keep_mm_feature_on_device", False):
+        if not self.keep_mm_feature_on_device and not self.use_cuda_ipc:
             for feature_name in ["input_values"]:
                 if feature_name in result:
                     result[feature_name] = result[feature_name].cpu()

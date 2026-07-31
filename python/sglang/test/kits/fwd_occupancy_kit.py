@@ -212,15 +212,18 @@ class FwdOccupancyMixin:
         ]
         if avg_accept is not None:
             perf_rows.append(["avg spec accept", f"{avg_accept:.3f}"])
+        # Lead each table with a text title line so the two tables stay
+        # visually separated even when CI prefixes every line with a timestamp
+        # (which turns blank separator lines into non-empty lines).
         print(
-            "\n"
+            "\n[perf metrics]\n"
             + tabulate.tabulate(
                 perf_rows, headers=["perf metric", "value"], tablefmt="github"
             )
         )
 
         print(
-            "\n\n"
+            "\n[fwd_occupancy stats]\n"
             + tabulate.tabulate(
                 [
                     ["samples (n)", len(samples)],

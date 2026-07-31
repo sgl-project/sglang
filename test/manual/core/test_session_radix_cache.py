@@ -46,6 +46,7 @@ class TestSessionRadixCache(unittest.TestCase):
                 page_size=1,
                 eviction_policy="lru",
                 enable_kv_cache_events=False,
+                enable_session_radix_cache=True,
             )
         )
 
@@ -94,13 +95,19 @@ class TestSessionRadixCache(unittest.TestCase):
         self.assertEqual(getattr(leaf, "session_ids", None), {"S"})
         self.assertIn(leaf, self.cache._session_leaves["S"])
 
+    def test_disabled_cache_does_not_tag_session_kv(self):
+        self.cache.enable_session_radix_cache = False
+        self._insert([1, 2, 3, 4])
+        self._tag([1, 2, 3, 4], "S")
+        self.assertIsNone(getattr(self._leaf([1, 2, 3, 4]), "session_ids", None))
+
     def test_shared_prefix_frees_only_unique_tail(self):
         # A/B share prefix [1,2]; close(A) frees only A's tail, B + shared stay.
         self._insert([1, 2, 3, 4])
         self._tag([1, 2, 3, 4], "A")
         self._insert([1, 2, 5, 6])
         self._tag([1, 2, 5, 6], "B")
-        self.assertGreater(self.cache.release_session("A"), 0)
+        self.assertGreater(self.cache.release_radix_session("A"), 0)
         self.assertEqual(self._cached([1, 2, 3, 4]), 2)  # only shared [1,2] left
         self.assertEqual(self._cached([1, 2, 5, 6]), 4)  # B intact
 
@@ -113,10 +120,17 @@ class TestSessionRadixCache(unittest.TestCase):
         self.assertEqual(
             getattr(self._leaf([1, 2, 3, 4]), "session_ids", None), {"A", "B"}
         )
-        self.assertEqual(self.cache.release_session("A"), 0)  # B still holds
+        self.assertEqual(self.cache.release_radix_session("A"), 0)  # B still holds
         self.assertEqual(self._cached([1, 2, 3, 4]), 4)
-        self.assertEqual(self.cache.release_session("B"), 1)  # last holder frees
+        self.assertEqual(self.cache.release_radix_session("B"), 1)  # last holder frees
         self.assertEqual(self._cached([1, 2, 3, 4]), 0)
+
+    def test_legacy_release_does_not_release_radix_session(self):
+        self._insert([1, 2, 3, 4])
+        self._tag([1, 2, 3, 4], "S")
+        self.cache.release_session("S")
+        self.assertEqual(self._cached([1, 2, 3, 4]), 4)
+        self.assertEqual(self.cache.release_radix_session("S"), 1)
 
     def test_tag_is_lru_neutral_not_pinned(self):
         # The tag must add no lock/pin: a tagged, never-closed node is evictable.
@@ -129,29 +143,27 @@ class TestSessionRadixCache(unittest.TestCase):
         self.cache.evict(EvictParams(num_tokens=4))  # LRU reclaims it while open
         self.assertEqual(self._cached([1, 2, 3, 4]), 0)
         self.assertNotIn("S", self.cache._session_leaves)
-        self.assertEqual(self.cache.release_session("S"), 0)  # late close is a no-op
+        self.assertEqual(
+            self.cache.release_radix_session("S"), 0
+        )  # late close is a no-op
 
-    def test_close_tombstone_blocks_late_finish_until_reopen(self):
+    def test_close_tombstone_blocks_late_finish(self):
         self._insert([1, 2, 3, 4])
         self._tag([1, 2, 3, 4], "S")
-        self.assertEqual(self.cache.release_session("S"), 1)
+        self.assertEqual(self.cache.release_radix_session("S"), 1)
 
         self._insert([5, 6, 7, 8])
         self._tag([5, 6, 7, 8], "S")  # simulates a finish racing after close
         self.assertIsNone(getattr(self._leaf([5, 6, 7, 8]), "session_ids", None))
-
-        self.cache.register_session("S")
-        self._tag([5, 6, 7, 8], "S")
-        self.assertEqual(getattr(self._leaf([5, 6, 7, 8]), "session_ids", None), {"S"})
 
     def test_tombstoned_shared_holder_cannot_retag_after_last_holder_close(self):
         self._insert([1, 2, 3, 4])
         self._tag([1, 2, 3, 4], "A")
         self._tag([1, 2, 3, 4], "B")
 
-        self.assertEqual(self.cache.release_session("B"), 0)
+        self.assertEqual(self.cache.release_radix_session("B"), 0)
         self.assertEqual(getattr(self._leaf([1, 2, 3, 4]), "session_ids", None), {"A"})
-        self.assertEqual(self.cache.release_session("A"), 1)
+        self.assertEqual(self.cache.release_radix_session("A"), 1)
 
         self._insert([5, 6, 7, 8])
         self._tag([5, 6, 7, 8], "B")

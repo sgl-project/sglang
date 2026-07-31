@@ -8,6 +8,9 @@ python -m sglang.benchmark.offline_throughput --model-path meta-llama/Meta-Llama
 
 ## Random dataset with default args
 python -m sglang.benchmark.offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dataset-name random --random-input 1024 --random-output 1024
+
+## Random dataset with profiling args
+SGLANG_TORCH_PROFILER_DIR=/tmp python -m sglang.benchmark.offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dataset-name random --random-input 128 --random-output 128 --num-prompts 4 --max-running-requests 4 --profile-steps 3 --profile --profile-activities "CPU" "XPU"
 """
 
 import argparse
@@ -19,7 +22,7 @@ import logging
 import os
 import random
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -53,6 +56,8 @@ class BenchArgs:
     extra_request_body: Optional[str] = None
     apply_chat_template: bool = False
     profile: bool = False
+    profile_activities: Tuple[str] = ("CPU", "GPU")
+    profile_steps: Optional[int] = None
     skip_warmup: bool = False
     do_not_exit: bool = False
     prompt_suffix: str = ""
@@ -170,6 +175,20 @@ class BenchArgs:
             "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
+            "--profile-activities",
+            type=str,
+            nargs="+",
+            default=["CPU", "GPU"],
+            choices=["CPU", "GPU", "CUDA_PROFILER", "XPU"],
+            help="Profiler activities: CPU, GPU, XPU, CUDA_PROFILER. If CPU/GPU/XPU, use torch profiler. If CUDA_PROFILER, use CUDA profiler.",
+        )
+        parser.add_argument(
+            "--profile-steps",
+            type=int,
+            default=None,
+            help="Number of steps to profile. If not specified, profiles all steps.",
+        )
+        parser.add_argument(
             "--skip-warmup",
             action="store_true",
             help="Skip the warmup batches.",
@@ -210,6 +229,8 @@ def throughput_test_once(
     ignore_eos: bool,
     extra_request_body: Dict,
     profile: bool,
+    profile_activities=None,
+    profile_steps=None,
     return_logprob: bool = False,
     logprob_start_len: int = -1,
 ):
@@ -241,7 +262,14 @@ def throughput_test_once(
             "SGLANG_TORCH_PROFILER_DIR" in os.environ
         ), "Please set SGLANG_TORCH_PROFILER_DIR."
         os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
-        backend.start_profile()
+        known_files = None
+        backend.start_profile(
+            num_steps=profile_steps,
+            activities=profile_activities,
+        )
+        if profile_steps:
+            dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
+            known_files = set(os.listdir(dir))
 
     st = time.perf_counter()
     gen_out = backend.generate(
@@ -254,8 +282,17 @@ def throughput_test_once(
 
     if profile:
         dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
-        known_files = set(os.listdir(dir))
-        backend.stop_profile()
+        if not profile_steps:
+            known_files = set(os.listdir(dir))
+        # With --profile-steps the scheduler auto-stops mid-run after N steps, so
+        # a second stop here raises "not in progress"; a run shorter than N steps
+        # never hit the target and still needs this explicit stop. Either way we
+        # must stop before monitor_trace_file, which loops forever waiting for a
+        # trace that would otherwise never be finalized.
+        try:
+            backend.stop_profile()
+        except RuntimeError:
+            pass
         monitor_trace_file(known_files, dir)
 
     if backend_name == "runtime":
@@ -455,6 +492,8 @@ def throughput_test(
         ignore_eos=not bench_args.disable_ignore_eos,
         extra_request_body=extra_request_body,
         profile=bench_args.profile,
+        profile_activities=bench_args.profile_activities,
+        profile_steps=bench_args.profile_steps,
         return_logprob=bench_args.return_logprob,
         logprob_start_len=bench_args.logprob_start_len,
     )

@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.speculative.spec_utils import _sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -145,7 +146,7 @@ def apply_dflash_verify_logits_adjustments(
 
     acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
-    vocab_mask = getattr(sampling_info, "vocab_mask", None)
+    grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
     logits_3d: Optional[torch.Tensor] = None
@@ -161,7 +162,7 @@ def apply_dflash_verify_logits_adjustments(
     # broadcast over the verify block without materializing a repeated buffer.
     if (
         penalizer is not None and penalizer.is_required and acc_linear_penalties is None
-    ) or vocab_mask is not None:
+    ) or grammar_mask is not None:
         linear_penalty = torch.zeros(
             (bs, next_token_logits.shape[1]),
             dtype=torch.float32,
@@ -585,6 +586,43 @@ def compute_dflash_correct_drafts_and_bonus(
     return correct_len, bonus.to(torch.int64)
 
 
+def apply_dflash_simulated_acceptance(
+    *,
+    candidates: torch.Tensor,
+    target_predict: Optional[torch.Tensor],
+    accept_len: torch.Tensor,
+    commit_lens: torch.Tensor,
+    bonus: torch.Tensor,
+    out_tokens: torch.Tensor,
+    simulate_acc_len: float,
+    simulate_acc_method: str,
+    simulate_acc_token_mode: str,
+    fixed_token_id: int = 100,
+) -> None:
+    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob)."""
+    block_size = candidates.shape[1]
+
+    # _sample_simulated_acc_len clamps to [1, block_size].
+    forced_commit_len = _sample_simulated_acc_len(
+        simulate_acc_len, simulate_acc_method, block_size
+    )
+    forced_accept_len = forced_commit_len - 1
+
+    accept_len.fill_(forced_accept_len)
+    commit_lens.fill_(forced_commit_len)
+
+    if simulate_acc_token_mode != "real-draft-token":
+        bonus.fill_(fixed_token_id)
+        out_tokens.fill_(fixed_token_id)
+        return
+
+    out_tokens.zero_()
+    if forced_accept_len > 0:
+        out_tokens[:, :forced_accept_len].copy_(candidates[:, 1:forced_commit_len])
+    bonus.copy_(target_predict[:, forced_accept_len].to(dtype=bonus.dtype))
+    out_tokens[:, forced_accept_len].copy_(bonus.to(dtype=out_tokens.dtype))
+
+
 def compute_dflash_sampling_correct_drafts_and_bonus(
     *,
     candidates: torch.Tensor,
@@ -634,13 +672,13 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         )
 
     if threshold_single is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_spec
 
-        threshold_single = get_global_server_args().speculative_accept_threshold_single
+        threshold_single = get_spec().speculative_accept_threshold_single
     if threshold_acc is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_spec
 
-        threshold_acc = get_global_server_args().speculative_accept_threshold_acc
+        threshold_acc = get_spec().speculative_accept_threshold_acc
     threshold_single = float(threshold_single)
     threshold_acc = max(float(threshold_acc), 1e-9)
 
@@ -673,9 +711,69 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             dtype=torch.float32,
         )
 
+    target_probs = build_dflash_verify_target_probs(
+        next_token_logits=next_token_logits,
+        sampling_info=sampling_info,
+        draft_token_num=draft_token_num,
+        bs=bs,
+        max_top_k=max_top_k,
+        uniform_top_k_value=uniform_top_k_value,
+        use_sparse_topk=use_sparse_topk,
+    )
+    draft_probs = torch.zeros_like(target_probs)
+
+    (
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        predicts,
+        accept_index,
+        accept_token_num,
+    ) = _get_or_create_chain_verify_buffers(
+        bs=bs,
+        draft_token_num=draft_token_num,
+        device=device,
+    )
+    candidates_i64 = (
+        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
+    )
+    tree_speculative_sampling_target_only(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates_i64,
+        retrive_index=retrieve_index,
+        retrive_next_token=retrieve_next_token,
+        retrive_next_sibling=retrieve_next_sibling,
+        uniform_samples=uniform_samples,
+        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=threshold_single,
+        threshold_acc=threshold_acc,
+        deterministic=True,
+    )
+
+    correct_len = accept_token_num
+    row_ids = torch.arange(bs, dtype=torch.long, device=device)
+    accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
+    bonus = predicts[accept_pos].to(torch.int64)
+    return correct_len, bonus
+
+
+def build_dflash_verify_target_probs(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    draft_token_num: int,
+    bs: int,
+    max_top_k: Optional[int] = None,
+    uniform_top_k_value: Optional[int] = None,
+    use_sparse_topk: bool = True,
+) -> torch.Tensor:
+    device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
-    # Build target distribution once over all verify rows.
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     )
@@ -730,47 +828,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
             )
-    target_probs = target_probs.view(bs, draft_token_num, -1).contiguous()
-    draft_probs = torch.zeros_like(target_probs)
-
-    (
-        retrieve_index,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        predicts,
-        accept_index,
-        accept_token_num,
-    ) = _get_or_create_chain_verify_buffers(
-        bs=bs,
-        draft_token_num=draft_token_num,
-        device=device,
-    )
-    candidates_i64 = (
-        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
-    )
-    tree_speculative_sampling_target_only(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates_i64,
-        # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=threshold_single,
-        threshold_acc=threshold_acc,
-        deterministic=True,
-    )
-
-    correct_len = accept_token_num
-    row_ids = torch.arange(bs, dtype=torch.long, device=device)
-    accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
-    bonus = predicts[accept_pos].to(torch.int64)
-    return correct_len, bonus
+    return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
@@ -779,16 +837,5 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
 
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
-
-    if (
-        req.sampling_params.json_schema is not None
-        or req.sampling_params.regex is not None
-        or req.sampling_params.ebnf is not None
-        or req.sampling_params.structural_tag is not None
-    ):
-        return (
-            "DFLASH speculative decoding does not support "
-            "grammar-constrained decoding yet."
-        )
 
     return None

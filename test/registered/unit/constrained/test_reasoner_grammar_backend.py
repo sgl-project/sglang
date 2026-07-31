@@ -451,5 +451,65 @@ class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
         self.assertTrue(torch.all(mask == 0))
 
 
+class TestReasonerGrammarObjectCurrentToken(unittest.TestCase):
+    """`current_token` must be tracked on the wrapper so that disaggregation's
+    process_prebuilt dedup guard (`grammar.current_token is None`) works for
+    reasoning requests. Without it the guard never fires and a retracted/
+    re-prebuilt request re-accepts an already-accepted token -> grammar raises
+    "Tokens not accepted" -> FINISH_ABORT (the disagg tool_choice abort)."""
+
+    def _make_object_with_mock_grammar(self):
+        inner_grammar = MagicMock()
+        inner_grammar.is_terminated.return_value = False
+        obj = ReasonerGrammarObject(
+            grammar=inner_grammar,
+            think_end_id=7,
+            think_excluded_token_ids=None,
+            max_think_tokens=-1,
+            enable_token_filter=False,
+            token_filter_fn=None,
+        )
+        return obj, inner_grammar
+
+    def test_current_token_none_before_any_accept(self):
+        obj, _ = self._make_object_with_mock_grammar()
+        # Fresh grammar: the dedup guard must treat it as "not yet accepted".
+        self.assertIsNone(obj.current_token)
+
+    def test_current_token_tracked_in_generation_phase(self):
+        obj, inner_grammar = self._make_object_with_mock_grammar()
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(10)  # thinking token
+        obj.accept_token(7)  # think_end_id -> GENERATION
+        obj.accept_token(58)  # generation token "["
+        self.assertEqual(obj.current_token, 58)
+
+    def test_current_token_tracked_in_thinking_phase(self):
+        obj, _ = self._make_object_with_mock_grammar()
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(10)  # thinking token (inner grammar untouched)
+        # Even in the thinking phase the wrapper records progress, so a
+        # re-prebuilt request is not mistaken for a fresh one.
+        self.assertEqual(obj.current_token, 10)
+
+    def test_dedup_guard_skips_reaccept_after_generation(self):
+        """Reproduces the disagg double-accept: a generation token accepted once
+        must not be re-accepted; with current_token tracked, the guard skips."""
+        obj, inner_grammar = self._make_object_with_mock_grammar()
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(7)  # think_end_id -> GENERATION
+        obj.accept_token(58)  # "[" accepted into inner grammar
+        obj.accept_token(4913)  # '{"' accepted into inner grammar
+        inner_grammar.accept_token.reset_mock()
+
+        # Mirror disaggregation/decode_schedule_batch_mixin.py:process_prebuilt
+        last_token = 4913
+        if obj.current_token is None:  # guard
+            obj.accept_token(last_token)
+
+        # Guard must have fired -> no second accept of 4913 into the inner grammar.
+        inner_grammar.accept_token.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

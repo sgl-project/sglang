@@ -34,13 +34,6 @@ class SessionRadixCacheMixin:
         if not hasattr(self, "_session_leaves"):
             self._reset_session_radix_state()
 
-    def register_session(self, session_id: str) -> None:
-        self._ensure_session_radix_state()
-        if session_id is None:
-            return
-        self._closed_session_ids.pop(session_id, None)
-        self._session_leaves.setdefault(session_id, set())
-
     def _remember_closed_session(self, session_id: str) -> None:
         self._closed_session_ids[session_id] = None
         self._closed_session_ids.move_to_end(session_id)
@@ -62,6 +55,8 @@ class SessionRadixCacheMixin:
 
     def _tag_session_leaf(self, req: Req, radix_key, node=None) -> None:
         """Add this request's session id to its leaf's holder set; no-op for non-session reqs."""
+        if not self.enable_session_radix_cache:
+            return
         self._ensure_session_radix_state()
         sid = getattr(req, "session_id", None)
         if sid is None or sid in self._closed_session_ids:
@@ -86,7 +81,7 @@ class SessionRadixCacheMixin:
                 len(self._session_leaves[sid]),
             )
 
-    def release_session(self, session_id: str) -> int:
+    def release_radix_session(self, session_id: str) -> int:
         """Close: drop this session from each of its tagged leaves, freeing a node
         only once no other session still holds it (last holder). Shared
         prefixes/leaves kept."""
