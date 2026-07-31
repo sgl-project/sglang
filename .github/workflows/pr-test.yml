@@ -342,6 +342,15 @@ jobs:
           cd test/
           python3 run_suite.py --hw cpu --suite base-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].size }} $CONTINUE_ON_ERROR_FLAG
 
+      - name: Run SGLang Simulator compatibility tests
+        if: matrix.partition == 0
+        timeout-minutes: 10
+        env:
+          UV_SYSTEM_PYTHON: "1"
+        run: |
+          uv pip install -e tools/sglang-simulator
+          python3 -m pytest -q tools/sglang-simulator/test/unit
+
   # Runs on 5090 (32GB, SM120)
   base-b-test-1-gpu-small:
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
