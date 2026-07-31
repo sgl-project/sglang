@@ -73,6 +73,8 @@ def norm_infer_native(
     normalized_shape = (x.shape[-1],)
     if is_rms_norm:
         result = F.rms_norm(x, normalized_shape, weight, eps)
+        if bias is not None:
+            result = result + bias
     else:
         result = F.layer_norm(x, normalized_shape, weight, bias, eps)
     if out is not None:
