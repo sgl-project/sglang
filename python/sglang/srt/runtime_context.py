@@ -671,6 +671,34 @@ def _build_config_bags(server_args: Any) -> dict:
     return tops
 
 
+def _snapshot_bag_values(bags: dict | None) -> dict | None:
+    """Per-leaf value snapshot of a config-bag tree (bags are mutated in
+    place by ``override``, so reference snapshots alias live state)."""
+    if bags is None:
+        return None
+    snap: dict = {}
+
+    def walk(prefix: str, bag) -> None:
+        snap[prefix] = dict(object.__getattribute__(bag, "_fields"))
+        for name, sub in object.__getattribute__(bag, "_subs").items():
+            walk(f"{prefix}.{name}", sub)
+
+    for name, bag in bags.items():
+        walk(name, bag)
+    return snap
+
+
+def _restore_bag_values(bags: dict, snap: dict) -> None:
+    def walk(prefix: str, bag) -> None:
+        for key, value in snap[prefix].items():
+            bag._set(key, value)
+        for name, sub in object.__getattribute__(bag, "_subs").items():
+            walk(f"{prefix}.{name}", sub)
+
+    for name, bag in bags.items():
+        walk(name, bag)
+
+
 class RuntimeContext:
     """Container for the structured runtime accessors; exposes ``parallel``,
     ``server_args``, the resolved config namespace bags, ``flags``,
@@ -857,6 +885,31 @@ class RuntimeContext:
         override loses its clients and goes away.
         """
         return _ServerArgsOverride(self, fields)
+
+    @contextmanager
+    def preserve_config(self):
+        """Snapshot the full config lifecycle and reinstate it verbatim on exit.
+
+        For nested construction steps that publish a private ``ServerArgs``
+        copy (e.g. a draft-worker build) and must leave the enclosing
+        lifecycle — including its post-publish overrides — untouched.
+        """
+        prev_server_args = self._server_args
+        prev_bags = self._config_bags
+        prev_bag_values = _snapshot_bag_values(prev_bags)
+        prev_overrides_log = list(self._overrides_log)
+        prev_parallel_config = self.parallel._config
+        prev_capture = self.flags.capture.enable_torch_compile
+        try:
+            yield
+        finally:
+            self._server_args = prev_server_args
+            self._config_bags = prev_bags
+            if prev_bags is not None:
+                _restore_bag_values(prev_bags, prev_bag_values)
+            self._overrides_log = prev_overrides_log
+            self.parallel._config = prev_parallel_config
+            self.flags.capture.enable_torch_compile = prev_capture
 
 
 class _ServerArgsOverride:
