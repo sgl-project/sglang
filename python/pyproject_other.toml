@@ -98,12 +98,6 @@ diffusion_common = [
   "xatlas",
 ]
 
-mps_common = [
-  "torch==2.13.0",
-  "torchaudio==2.11.0",
-  "torchvision==0.28.0",
-]
-
 tracing = [
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
@@ -177,9 +171,11 @@ diffusion_musa = [
 srt_mps = [
     "mlx>=0.32.0",
     "mlx-lm",
-    "sglang[mps_common]",
     "sglang[runtime_common]",
+    "torch==2.13.0",
+    "torchaudio==2.11.0",
     "torchcodec==0.15.0",
+    "torchvision==0.28.0",
 ]
 
 diffusion_mps = [
@@ -190,7 +186,6 @@ diffusion_mps = [
   "remote-pdb==2.1.0",
   "scikit-image==0.25.2",
   "sglang[diffusion_common]",
-  "sglang[mps_common]",
   "trimesh>=4.0.0",
   "xatlas",
 ]
