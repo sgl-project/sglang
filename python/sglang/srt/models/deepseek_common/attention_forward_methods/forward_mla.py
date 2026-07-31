@@ -172,6 +172,12 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
 
 
+# DSA backends on gfx95 whose kernels select on Q's dtype and want it fp8.
+# Membership here decides whether rope is folded into
+# fused_qk_rope_cat_and_cache_mla, which is what produces fp8 Q.
+_DSA_BACKENDS_WANTING_FP8_Q = frozenset({"tilelang", "aiter"})
+
+
 def _should_defer_dsa_cp_kv_gather(
     *,
     dsa_prefill_cp: bool,
@@ -300,7 +306,7 @@ class DeepseekMLAForwardMixin:
             return None
         if self._fuse_rope_for_trtllm_mla(forward_batch):
             return None
-        if self._skip_rope_for_dsa_tilelang_fused():
+        if self._skip_rope_for_dsa_fp8_q_fused():
             return None
         if self._skip_rope_for_aiter_fused_mla():
             return None
@@ -726,12 +732,12 @@ class DeepseekMLAForwardMixin:
                 q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
-        skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused()
+        skip_rope_for_dsa_fp8_q_fused = self._skip_rope_for_dsa_fp8_q_fused()
         skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
         if (
             self.rotary_emb is not None
             and (not fuse_rope_for_trtllm_mla)
-            and (not skip_rope_for_dsa_tilelang_fused)
+            and (not skip_rope_for_dsa_fp8_q_fused)
             and (not skip_rope_for_aiter_fused_mla)
             and (
                 not _use_aiter
@@ -855,7 +861,7 @@ class DeepseekMLAForwardMixin:
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-            if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
+            if self._skip_rope_for_dsa_fp8_q_fused() and self.rotary_emb is not None:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
                 kv_cache_dtype = (
@@ -1263,17 +1269,28 @@ class DeepseekMLAForwardMixin:
             and get_attn_backend().data_type == torch.float8_e4m3fn
         )
 
-    def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
+    def _skip_rope_for_dsa_fp8_q_fused(self: DeepseekV2AttentionMLA) -> bool:
+        """Should rope be folded into fused_qk_rope_cat_and_cache_mla on gfx95?
+
+        Doing so is what makes Q come out as fp8 (the fused kernel writes Q in
+        the KV cache dtype), which in turn is what lets the DSA backend pick its
+        fp8 assembly kernel. Skipping it leaves Q in bf16 and the backend falls
+        back to a mixed-precision variant.
+
+        This gate is therefore a list of backends whose kernels *want* fp8 Q, and
+        aiter belongs on it: it selects mla_a8w8_* with fp8 Q and the much slower
+        mla_a16w8_* without. Measured on GLM-5.2 / MI355X with both DSA backends
+        set to aiter, i.e. exactly the case this list used to miss: decode
+        attention 1.83 -> 4.20 ms per iteration, prefill attention 320 -> 605 ms
+        per window, and the fused kernel's other savings (one CatArrayBatchedCopy
+        and one indirect cache write per layer) lost on top.
         """
-        Check if we should skip rope and use fused rope+cache path for TileLang DSA on gfx95.
-        """
-        server_args = get_server_args()
         return (
             _use_aiter_gfx95
             and self.current_attention_backend in ("dsa", "nsa")
             and (
-                get_exec().kernel.dsa_decode_backend == "tilelang"
-                or get_exec().kernel.dsa_prefill_backend == "tilelang"
+                get_exec().kernel.dsa_decode_backend in _DSA_BACKENDS_WANTING_FP8_Q
+                or get_exec().kernel.dsa_prefill_backend in _DSA_BACKENDS_WANTING_FP8_Q
             )
         )
 
