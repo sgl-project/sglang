@@ -12,6 +12,41 @@ from torch import Tensor
 from torch.distributed import ProcessGroup, ReduceOp
 
 
+def _ipc_all_to_all_4d(group, input_, scatter_dim):
+    """2-rank IPC path for AllToAll4D; None when the transport is unavailable."""
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        IPC_A2A,
+        ipc_a2a_ready,
+    )
+
+    if not ipc_a2a_ready(group):
+        return None
+    r = IPC_A2A.rank
+    if scatter_dim == 2:
+        # [bs, s_local, h, d] -> [bs, 2*s_local, h/2, d]
+        bs, shard_seqlen, hn, hd = input_.shape
+        half = hn // 2
+        send = input_[:, :, (1 - r) * half : (2 - r) * half].contiguous()
+        out = input_.new_empty(bs, 2 * shard_seqlen, half, hd)
+        out.narrow(1, r * shard_seqlen, shard_seqlen).copy_(
+            input_[:, :, r * half : (r + 1) * half]
+        )
+        theirs = IPC_A2A.exchange(group, send, (bs, shard_seqlen, half, hd))
+        out.narrow(1, (1 - r) * shard_seqlen, shard_seqlen).copy_(theirs)
+        return out
+    # scatter_dim == 1: [bs, s, h_local, d] -> [bs, s/2, 2*h_local, d]
+    bs, seqlen, shard_hn, hd = input_.shape
+    shard_seqlen = seqlen // 2
+    send = input_.narrow(1, (1 - r) * shard_seqlen, shard_seqlen).contiguous()
+    out = input_.new_empty(bs, shard_seqlen, 2 * shard_hn, hd)
+    out[:, :, r * shard_hn : (r + 1) * shard_hn].copy_(
+        input_.narrow(1, r * shard_seqlen, shard_seqlen)
+    )
+    theirs = IPC_A2A.exchange(group, send, (bs, shard_seqlen, shard_hn, hd))
+    out[:, :, (1 - r) * shard_hn : (2 - r) * shard_hn].copy_(theirs)
+    return out
+
+
 class DistributedAutograd:
     """Collection of autograd functions for distributed operations.
 
@@ -131,6 +166,11 @@ class DistributedAutograd:
             assert (
                 input_.dim() == 4
             ), f"input must be 4D tensor, got {input_.dim()} and shape {input_.shape}"
+
+            if world_size == 2 and scatter_dim in (1, 2):
+                fast = _ipc_all_to_all_4d(group, input_, scatter_dim)
+                if fast is not None:
+                    return fast
 
             if scatter_dim == 2 and gather_dim == 1:
                 bs, shard_seqlen, hn, hd = input_.shape
