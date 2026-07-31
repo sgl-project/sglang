@@ -7,12 +7,14 @@ import torch.nn as nn
 
 from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 from sglang.srt.layers.parameter import PerTensorScaleParameter
+from sglang.srt.layers.quantization import modelopt_quant
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
 )
 from sglang.srt.layers.quantization.nvfp4_online import (
     ModelOptNvFp4OnlineFusedMoEMethod,
+    NvFp4OnlineConfig,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -180,6 +182,43 @@ class TestModelOptNvfp4(CustomTestCase):
                 group_size=16,
                 use_per_token_activation=True,
             )
+
+    @patch.object(
+        modelopt_quant,
+        "_make_per_tensor_scale_parameter",
+        wraps=modelopt_quant._make_per_tensor_scale_parameter,
+    )
+    def test_moe_input_scale_fill_matches_quantization_interface(self, make_scale):
+        configs_and_fills = (
+            (ModelOptFp4Config(group_size=16), 1.0),
+            (NvFp4OnlineConfig(), None),
+        )
+        method = object.__new__(ModelOptNvFp4OnlineFusedMoEMethod)
+        method.enable_flashinfer_trtllm_moe = True
+        method.layer_log_name = "model.layers.0.mlp.experts"
+
+        for config, expected_fill in configs_and_fills:
+            with self.subTest(config=config.get_name()):
+                make_scale.reset_mock()
+                method.quant_config = config
+                layer = nn.Module()
+                layer.num_experts = 1
+                layer.num_local_experts = 1
+                layer.moe_runner_config = SimpleNamespace(is_gated=True)
+
+                method.create_weights(
+                    layer,
+                    num_experts=1,
+                    hidden_size=16,
+                    intermediate_size_per_partition=16,
+                    params_dtype=torch.bfloat16,
+                    weight_loader=MagicMock(),
+                )
+
+                self.assertEqual(
+                    [call.kwargs["fill_value"] for call in make_scale.call_args_list],
+                    [expected_fill, expected_fill],
+                )
 
     def test_non_gated_w1_is_quantized_without_pairing(self):
         method = object.__new__(ModelOptNvFp4OnlineFusedMoEMethod)

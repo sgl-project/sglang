@@ -2061,6 +2061,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         return weight_loader
 
     def _uses_serialized_fp8_source(self) -> bool:
+        # ModelOptFp4Config intentionally has no FP8-source state. The online
+        # subclass overrides this hook only when it wraps NvFp4OnlineConfig.
         return False
 
     def create_weights(
@@ -2201,15 +2203,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
 
-        # Per-token activation modes use 1.0 as a neutral placeholder because
-        # the backend computes an FP32 scale per token. In the default
-        # modelopt_fp4 per-tensor mode, 1.0 is the static fallback for modules
-        # whose checkpoints omit activation-scale tensors; a loaded tensor
-        # overwrites it.
+        is_nvfp4_online = self.quant_config.get_name() == "nvfp4_online"
+        # Leave nvfp4_online scales uninitialized so an unexpected static-scale
+        # path does not silently use a neutral value.
+        input_scale_fill = 1.0 if not is_nvfp4_online else None
         w13_input_scale = _make_per_tensor_scale_parameter(
             (layer.num_experts, num_shards),
             weight_loader=weight_loader,
-            fill_value=1.0,
+            fill_value=input_scale_fill,
         )
         w13_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w13_input_scale", w13_input_scale)
@@ -2217,7 +2218,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale = _make_per_tensor_scale_parameter(
             (layer.num_experts,),
             weight_loader=weight_loader,
-            fill_value=1.0,
+            fill_value=input_scale_fill,
         )
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
