@@ -50,15 +50,18 @@ from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
     CacheConfig,
+    build_daemon_model_specs,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
     compute_env_stamp,
     compute_global_rank,
     compute_local_gpu_id,
+    format_daemon_role,
     get_quant_method_name,
     get_ready_path,
     get_socket_path,
     hash_quant_config,
+    normalize_draft_model_idx,
     recv_msg,
     send_msg,
 )
@@ -96,6 +99,9 @@ class WeightCacheDaemon:
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
         dist_init_method: Optional[str] = None,
+        is_draft_model: bool = False,
+        draft_model_idx: Optional[int] = None,
+        speculative_algorithm: Optional[str] = None,
     ):
         self.model_path = model_path
         self.gpu_id = gpu_id
@@ -112,11 +118,37 @@ class WeightCacheDaemon:
         self.trust_remote_code = trust_remote_code
         self.revision = revision
         self.dist_init_method = dist_init_method
+        # Draft/MTP daemon: loads the speculative draft model (arch rewritten by
+        # ModelConfig._config_draft_model, e.g. Qwen3_5ForCausalLMMTP) instead
+        # of the target model, and serves it on a "_draft{idx}" socket.
+        self.is_draft_model = is_draft_model
+        self.draft_model_idx = draft_model_idx
+        # Normalize CLI spellings (NEXTN -> EAGLE, Gemma4-draft promotion) the
+        # same way the engine's ServerArgs resolution does. Model code compares
+        # against SpeculativeAlgorithm members (e.g. LayerCommunicator calls
+        # from_string), which rejects raw aliases like "NEXTN".
+        if speculative_algorithm is not None:
+            from sglang.srt.arg_groups.speculative_hook import (
+                _resolve_speculative_algorithm_alias,
+            )
+
+            speculative_algorithm = _resolve_speculative_algorithm_alias(
+                speculative_algorithm.upper(),
+                model_path if is_draft_model else None,
+                trust_remote_code,
+            )
+        self.speculative_algorithm = speculative_algorithm
 
         self.socket_path = get_socket_path(
-            compute_global_rank(tp_size, pp_rank, tp_rank)
+            compute_global_rank(tp_size, pp_rank, tp_rank),
+            is_draft_model=is_draft_model,
+            draft_model_idx=draft_model_idx,
         )
-        self.ready_path = get_ready_path(compute_global_rank(tp_size, pp_rank, tp_rank))
+        self.ready_path = get_ready_path(
+            compute_global_rank(tp_size, pp_rank, tp_rank),
+            is_draft_model=is_draft_model,
+            draft_model_idx=draft_model_idx,
+        )
 
         self.model = None
         self.config: Optional[CacheConfig] = None
@@ -223,6 +255,20 @@ class WeightCacheDaemon:
             load_format=self.load_format,
             model_loader_extra_config=self.model_loader_extra_config,
         )
+        if self.is_draft_model:
+            # Stamp the speculative fields through the sanctioned post-resolution
+            # mutation point (bare assignment raises: resolved ServerArgs is
+            # read-only). Constructing with them instead would run the full
+            # speculative resolution (draft-path defaults, num-steps auto-choice,
+            # backend checks), which is neither needed nor safe in this
+            # load-only process — but model code may read these via
+            # get_server_args() (e.g. the MTP head's draft-quant branch).
+            server_args.override(
+                "weight_cache_draft_daemon",
+                speculative_algorithm=self.speculative_algorithm,
+                speculative_draft_model_path=self.model_path,
+                speculative_draft_model_quantization=self.quantization,
+            )
         get_context().set_server_args(server_args)
 
         # Initialize distributed backend for model loading
@@ -234,6 +280,8 @@ class WeightCacheDaemon:
             revision=self.revision,
             dtype=self.dtype,
             quantization=self.quantization,
+            is_draft_model=self.is_draft_model,
+            speculative_algorithm=self.speculative_algorithm,
         )
 
         # Build cache config fingerprint BEFORE loading the model.
@@ -266,6 +314,8 @@ class WeightCacheDaemon:
             quant_config_hash=hash_quant_config(quant_config),
             dtype=str(model_config.dtype),
             revision=self.revision or "",
+            is_draft_model=self.is_draft_model,
+            draft_model_idx=normalize_draft_model_idx(self.draft_model_idx),
             **compute_env_stamp(),
         )
 
@@ -277,16 +327,20 @@ class WeightCacheDaemon:
         # Initialize distributed backend (requires server_args + model_config)
         self._init_distributed(server_args, model_config)
 
-        # Build load config
+        # Build load config. draft_model_idx drives the loader's per-MTP-head
+        # weight filtering (multi-layer MTP checkpoints).
         load_config = LoadConfig(
             load_format=self.load_format,
             model_loader_extra_config=self.model_loader_extra_config,
             tp_rank=self.tp_rank,
+            draft_model_idx=self.draft_model_idx,
         )
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
-            f"Loading model from disk: {self.model_path}"
+            f"Loading {'draft/MTP' if self.is_draft_model else 'target'} model "
+            f"from disk: {self.model_path} "
+            f"(arch={self.config.model_arch})"
         )
         tic = time.perf_counter()
 
@@ -552,11 +606,15 @@ def run_weight_cache_daemon(
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
     dist_init_method: Optional[str] = None,
+    is_draft_model: bool = False,
+    draft_model_idx: Optional[int] = None,
+    speculative_algorithm: Optional[str] = None,
 ):
     """Entry point for running a weight cache daemon process."""
+    role = format_daemon_role(is_draft_model, draft_model_idx)
     logging.basicConfig(
         level=logging.INFO,
-        format=f"%(asctime)s [Daemon gpu={gpu_id} tp_rank={tp_rank}] %(levelname)s %(message)s",
+        format=f"%(asctime)s [Daemon gpu={gpu_id} tp_rank={tp_rank}{role}] %(levelname)s %(message)s",
     )
 
     # Die if our parent (the engine or the standalone launcher that spawned us)
@@ -583,6 +641,9 @@ def run_weight_cache_daemon(
         trust_remote_code=trust_remote_code,
         revision=revision,
         dist_init_method=dist_init_method,
+        is_draft_model=is_draft_model,
+        draft_model_idx=draft_model_idx,
+        speculative_algorithm=speculative_algorithm,
     )
 
     daemon.load()
@@ -608,12 +669,21 @@ def launch_weight_cache_daemons(
     dist_init_method: Optional[str] = None,
     timeout: int = 1800,
     force: bool = False,
+    speculative_algorithm: Optional[str] = None,
+    speculative_draft_model_path: Optional[str] = None,
+    speculative_draft_model_quantization: Optional[str] = None,
+    speculative_draft_model_revision: Optional[str] = None,
 ):
     """Launch weight cache daemon processes for this node's PP×TP ranks.
 
     For single-node (nnodes=1): spawns pp_size * tp_size daemons.
     For multi-node (nnodes>1): spawns this node's share of PP×TP daemons,
     mapping local gpu_id to the correct global (pp_rank, tp_rank).
+
+    When ``speculative_algorithm`` is set, each rank gets a second daemon for
+    the draft/MTP model (its own socket and its own process group), so an engine
+    started with ``--weight-cache-mode client --speculative-algorithm ...`` can
+    IPC-load both its target and its draft worker.
 
     Uses subprocess.Popen instead of multiprocessing.Process to avoid
     initializing CUDA in the parent process, which can degrade CUDA IPC
@@ -622,6 +692,11 @@ def launch_weight_cache_daemons(
     Usage (single-node):
         python -m sglang.srt.weight_cache.daemon \\
             --model-path /path/to/model --tp-size 4
+
+    Usage (single-node, MTP/NEXTN speculative decoding):
+        python -m sglang.srt.weight_cache.daemon \\
+            --model-path /path/to/model --tp-size 4 \\
+            --speculative-algorithm NEXTN
 
     Usage (multi-node, run on each node):
         # Node 0:
@@ -661,115 +736,164 @@ def launch_weight_cache_daemons(
             "rendezvous address accessible from all nodes."
         )
 
-    # Auto-allocate a free port for the distributed init method
-    if dist_init_method is None:
+    def _free_local_rendezvous() -> str:
         with sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM) as s:
             s.bind(("127.0.0.1", 0))
-            free_port = s.getsockname()[1]
-        dist_init_method = f"tcp://127.0.0.1:{free_port}"
+            return f"tcp://127.0.0.1:{s.getsockname()[1]}"
+
+    # Auto-allocate a free port for the distributed init method
+    if dist_init_method is None:
+        dist_init_method = _free_local_rendezvous()
+
+    draft_dist_init_method = None
+    if speculative_algorithm is not None:
+        if nnodes > 1:
+            # A second cross-node rendezvous endpoint cannot be derived safely
+            # from the single user-provided address without risking a port
+            # collision, so require single-node here rather than guess.
+            raise ValueError(
+                "Multi-node weight cache daemons (nnodes > 1) do not support "
+                "speculative decoding yet: the draft daemons need a second "
+                "cross-node rendezvous endpoint. Launch with nnodes=1 or "
+                "disable speculative decoding for the daemon."
+            )
+        draft_dist_init_method = _free_local_rendezvous()
+
+    specs = build_daemon_model_specs(
+        model_path=model_path,
+        quantization=quantization,
+        revision=revision,
+        target_dist_init_method=dist_init_method,
+        speculative_algorithm=speculative_algorithm,
+        speculative_draft_model_path=speculative_draft_model_path,
+        speculative_draft_model_quantization=speculative_draft_model_quantization,
+        speculative_draft_model_revision=speculative_draft_model_revision,
+        draft_dist_init_method=draft_dist_init_method,
+    )
 
     python_path = sys.executable
     daemon_module = "sglang.srt.weight_cache.daemon"
 
     # Validate and clean up stale .ready/.sock files from prior runs.
-    for pp_rank in pp_rank_range:
-        for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-            cleanup_stale_daemon_files(global_rank, force=force)
+    for spec in specs:
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
+                cleanup_stale_daemon_files(
+                    global_rank,
+                    force=force,
+                    is_draft_model=spec.is_draft_model,
+                    draft_model_idx=spec.draft_model_idx,
+                )
 
     procs = []
-    for pp_rank in pp_rank_range:
-        for tp_rank in tp_rank_range:
-            gpu_id = compute_local_gpu_id(
-                pp_rank,
-                tp_rank,
-                pp_size_per_node,
-                tp_size_per_node,
-                base_gpu_id=base_gpu_id,
-                gpu_id_step=gpu_id_step,
-            )
-            cmd = [
-                python_path,
-                "-m",
-                daemon_module,
-                "--model-path",
-                model_path,
-                "--gpu-id",
-                str(gpu_id),
-                "--tp-size",
-                str(tp_size),
-                "--tp-rank",
-                str(tp_rank),
-                "--dp-size",
-                str(dp_size),
-                "--ep-size",
-                str(ep_size),
-                "--pp-size",
-                str(pp_size),
-                "--pp-rank",
-                str(pp_rank),
-                "--load-format",
-                load_format,
-                "--dtype",
-                dtype,
-                "--dist-init-method",
-                dist_init_method,
-            ]
-            if quantization:
-                cmd += ["--quantization", quantization]
-            if model_loader_extra_config and model_loader_extra_config != "{}":
-                cmd += ["--model-loader-extra-config", model_loader_extra_config]
-            if trust_remote_code:
-                cmd += ["--trust-remote-code"]
-            if revision:
-                cmd += ["--revision", revision]
+    for spec in specs:
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                gpu_id = compute_local_gpu_id(
+                    pp_rank,
+                    tp_rank,
+                    pp_size_per_node,
+                    tp_size_per_node,
+                    base_gpu_id=base_gpu_id,
+                    gpu_id_step=gpu_id_step,
+                )
+                cmd = [
+                    python_path,
+                    "-m",
+                    daemon_module,
+                    "--model-path",
+                    spec.model_path,
+                    "--gpu-id",
+                    str(gpu_id),
+                    "--tp-size",
+                    str(tp_size),
+                    "--tp-rank",
+                    str(tp_rank),
+                    "--dp-size",
+                    str(dp_size),
+                    "--ep-size",
+                    str(ep_size),
+                    "--pp-size",
+                    str(pp_size),
+                    "--pp-rank",
+                    str(pp_rank),
+                    "--load-format",
+                    load_format,
+                    "--dtype",
+                    dtype,
+                    "--dist-init-method",
+                    spec.dist_init_method,
+                ]
+                if spec.quantization:
+                    cmd += ["--quantization", spec.quantization]
+                if model_loader_extra_config and model_loader_extra_config != "{}":
+                    cmd += ["--model-loader-extra-config", model_loader_extra_config]
+                if trust_remote_code:
+                    cmd += ["--trust-remote-code"]
+                if spec.revision:
+                    cmd += ["--revision", spec.revision]
+                if spec.is_draft_model:
+                    cmd += ["--is-draft-model"]
+                    cmd += ["--speculative-algorithm", spec.speculative_algorithm]
+                    if spec.draft_model_idx is not None:
+                        cmd += ["--draft-model-idx", str(spec.draft_model_idx)]
 
-            proc = subprocess.Popen(cmd)
-            procs.append(proc)
-            logger.info(
-                f"Launched weight cache daemon gpu={gpu_id} "
-                f"pp_rank={pp_rank} tp_rank={tp_rank} pid={proc.pid}"
-            )
+                proc = subprocess.Popen(cmd)
+                procs.append(proc)
+                logger.info(
+                    f"Launched weight cache daemon gpu={gpu_id} "
+                    f"pp_rank={pp_rank} tp_rank={tp_rank} "
+                    f"role={spec.role or 'target'} pid={proc.pid}"
+                )
 
     # Wait for all daemons on this node to become ready
     num_daemons = len(procs)
     check_interval = 2
     start_time = time.time()
-    for pp_rank in pp_rank_range:
-        for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-            ready_path = get_ready_path(global_rank)
-            while not os.path.exists(ready_path):
-                time.sleep(check_interval)
-                if time.time() - start_time > timeout:
-                    logger.error(
-                        f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
-                        f"did not become ready within {timeout}s"
-                    )
-                    for p in procs:
-                        p.terminate()
-                    raise TimeoutError(
-                        f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
-                        f"did not become ready within {timeout}s"
-                    )
-                # Check if any daemon exited prematurely
-                for p in procs:
-                    retcode = p.poll()
-                    if retcode is not None:
+    for spec in specs:
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
+                ready_path = get_ready_path(
+                    global_rank,
+                    is_draft_model=spec.is_draft_model,
+                    draft_model_idx=spec.draft_model_idx,
+                )
+                while not os.path.exists(ready_path):
+                    time.sleep(check_interval)
+                    if time.time() - start_time > timeout:
                         logger.error(
-                            f"Weight cache daemon exited prematurely "
-                            f"with code {retcode}"
+                            f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
+                            f"role={spec.role or 'target'} "
+                            f"did not become ready within {timeout}s"
                         )
-                        for other in procs:
-                            if other.poll() is None:
-                                other.terminate()
-                        raise RuntimeError(
-                            f"Weight cache daemon exited prematurely "
-                            f"with code {retcode}"
+                        for p in procs:
+                            p.terminate()
+                        raise TimeoutError(
+                            f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
+                            f"role={spec.role or 'target'} "
+                            f"did not become ready within {timeout}s"
                         )
-            logger.info(
-                f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} is ready"
-            )
+                    # Check if any daemon exited prematurely
+                    for p in procs:
+                        retcode = p.poll()
+                        if retcode is not None:
+                            logger.error(
+                                f"Weight cache daemon exited prematurely "
+                                f"with code {retcode}"
+                            )
+                            for other in procs:
+                                if other.poll() is None:
+                                    other.terminate()
+                            raise RuntimeError(
+                                f"Weight cache daemon exited prematurely "
+                                f"with code {retcode}"
+                            )
+                logger.info(
+                    f"Weight cache daemon pp_rank={pp_rank} tp_rank={tp_rank} "
+                    f"role={spec.role or 'target'} is ready"
+                )
 
     logger.info(
         f"All {num_daemons} weight cache daemons on node {node_rank} are ready "
@@ -889,6 +1013,45 @@ if __name__ == "__main__":
         help="Take over a rank whose .ready file still points at a live PID by "
         "killing that daemon (use to reclaim a wedged/orphaned daemon).",
     )
+    parser.add_argument(
+        "--speculative-algorithm",
+        default=None,
+        help="Speculative algorithm the engine will run (e.g. EAGLE, NEXTN). "
+        "In multi-rank mode this additionally launches one draft/MTP daemon "
+        "per rank; in single-rank mode it is forwarded to the draft model "
+        "config (requires --is-draft-model).",
+    )
+    parser.add_argument(
+        "--speculative-draft-model-path",
+        default=None,
+        help="Draft model checkpoint path. Defaults to --model-path (MTP/NEXTN "
+        "checkpoints bundle the draft weights in the target checkpoint).",
+    )
+    parser.add_argument(
+        "--speculative-draft-model-quantization",
+        default=None,
+        help="Quantization method of the draft model (defaults to the target's "
+        "--quantization when the engine also leaves it unset).",
+    )
+    parser.add_argument(
+        "--speculative-draft-model-revision",
+        default=None,
+        help="Draft model revision. Defaults to --revision.",
+    )
+    parser.add_argument(
+        "--is-draft-model",
+        action="store_true",
+        help="Single-rank mode only: this daemon holds the speculative "
+        "draft/MTP model instead of the target model (serves on the "
+        "'_draft{idx}' socket).",
+    )
+    parser.add_argument(
+        "--draft-model-idx",
+        type=int,
+        default=None,
+        help="Multi-layer-MTP head index this draft daemon holds "
+        "(LoadConfig.draft_model_idx). Leave unset for the single-draft path.",
+    )
 
     args = parser.parse_args()
 
@@ -896,12 +1059,16 @@ if __name__ == "__main__":
         # Single-rank mode: launch one daemon for the specified rank
         gpu_id = args.gpu_id if args.gpu_id is not None else args.tp_rank
         tp_rank = args.tp_rank if args.tp_rank is not None else args.gpu_id
+        if args.is_draft_model and args.speculative_algorithm is None:
+            parser.error("--is-draft-model requires --speculative-algorithm")
         # Refuse to clobber a live daemon already holding this rank (mirrors the
         # multi-rank launcher and the engine path, which the multi-rank spawns
         # of this same entrypoint rely on). --force kills and takes over.
         cleanup_stale_daemon_files(
             compute_global_rank(args.tp_size, args.pp_rank, tp_rank),
             force=args.force,
+            is_draft_model=args.is_draft_model,
+            draft_model_idx=args.draft_model_idx,
         )
         run_weight_cache_daemon(
             model_path=args.model_path,
@@ -919,6 +1086,9 @@ if __name__ == "__main__":
             trust_remote_code=args.trust_remote_code,
             revision=args.revision,
             dist_init_method=args.dist_init_method,
+            is_draft_model=args.is_draft_model,
+            draft_model_idx=args.draft_model_idx,
+            speculative_algorithm=args.speculative_algorithm,
         )
     else:
         # Multi-rank mode: launch daemons for this node's TP ranks
@@ -941,4 +1111,8 @@ if __name__ == "__main__":
             dist_init_method=args.dist_init_method,
             timeout=args.timeout,
             force=args.force,
+            speculative_algorithm=args.speculative_algorithm,
+            speculative_draft_model_path=args.speculative_draft_model_path,
+            speculative_draft_model_quantization=args.speculative_draft_model_quantization,
+            speculative_draft_model_revision=args.speculative_draft_model_revision,
         )

@@ -655,11 +655,43 @@ class Engine(EngineScoreMixin, EngineBase):
             # engine's own NCCL TCPStore.
             dist_init_method = NetworkAddress("127.0.0.1", get_free_port()).to_tcp()
 
-        num_daemons = len(pp_rank_range) * len(tp_rank_range)
+        from sglang.srt.weight_cache.protocol import (
+            build_daemon_model_specs,
+            cleanup_stale_daemon_files,
+            compute_global_rank,
+            compute_local_gpu_id,
+            get_ready_path,
+        )
+
+        # Speculative decoding: the draft/MTP model is a separate nn.Module, so
+        # each rank gets a second daemon on its own "_draft" socket. The draft
+        # daemons form their own process group and need their own rendezvous
+        # port (single-node only; check_server_args rejects the multi-node
+        # combination).
+        draft_dist_init_method = None
+        if server_args.speculative_algorithm is not None:
+            draft_dist_init_method = NetworkAddress(
+                "127.0.0.1", get_free_port()
+            ).to_tcp()
+
+        daemon_specs = build_daemon_model_specs(
+            model_path=server_args.model_path,
+            quantization=server_args.quantization,
+            revision=server_args.revision,
+            target_dist_init_method=dist_init_method,
+            speculative_algorithm=server_args.speculative_algorithm,
+            speculative_draft_model_path=server_args.speculative_draft_model_path,
+            speculative_draft_model_quantization=server_args.speculative_draft_model_quantization,
+            speculative_draft_model_revision=server_args.speculative_draft_model_revision,
+            draft_dist_init_method=draft_dist_init_method,
+        )
+
+        num_daemons = len(daemon_specs) * len(pp_rank_range) * len(tp_rank_range)
         daemon_procs = []
         logger.info(
             f"Launching {num_daemons} weight cache daemon(s) on node "
             f"{server_args.node_rank} for model={server_args.model_path}, "
+            f"roles={[spec.role or 'target' for spec in daemon_specs]}, "
             f"pp_ranks={pp_rank_range.start}..{pp_rank_range.stop - 1}, "
             f"tp_ranks={tp_rank_range.start}..{tp_rank_range.stop - 1}, "
             f"dist_init_method={dist_init_method}"
@@ -667,72 +699,79 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Validate and clean up stale .ready/.sock files from prior runs.
         # If a daemon is still alive at this rank, raise instead of clobbering.
-        from sglang.srt.weight_cache.protocol import (
-            cleanup_stale_daemon_files,
-            compute_global_rank,
-            compute_local_gpu_id,
-            get_ready_path,
-        )
+        for spec in daemon_specs:
+            for pp_rank in pp_rank_range:
+                for tp_rank in tp_rank_range:
+                    global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
+                    cleanup_stale_daemon_files(
+                        global_rank,
+                        is_draft_model=spec.is_draft_model,
+                        draft_model_idx=spec.draft_model_idx,
+                    )
 
-        for pp_rank in pp_rank_range:
-            for tp_rank in tp_rank_range:
-                global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-                cleanup_stale_daemon_files(global_rank)
-
-        for pp_rank in pp_rank_range:
-            for tp_rank in tp_rank_range:
-                gpu_id = compute_local_gpu_id(
-                    pp_rank,
-                    tp_rank,
-                    pp_size_per_node,
-                    tp_size_per_node,
-                    base_gpu_id=server_args.base_gpu_id,
-                    gpu_id_step=server_args.gpu_id_step,
-                )
-                cmd = [
-                    sys.executable,
-                    "-m",
-                    "sglang.srt.weight_cache.daemon",
-                    "--model-path",
-                    server_args.model_path,
-                    "--gpu-id",
-                    str(gpu_id),
-                    "--tp-size",
-                    str(tp_size),
-                    "--tp-rank",
-                    str(tp_rank),
-                    "--pp-size",
-                    str(server_args.pp_size),
-                    "--pp-rank",
-                    str(pp_rank),
-                    "--dp-size",
-                    "1",
-                    "--ep-size",
-                    str(server_args.ep_size),
-                    "--load-format",
-                    server_args.load_format,
-                    "--dtype",
-                    server_args.dtype,
-                    "--dist-init-method",
-                    dist_init_method,
-                ]
-                if server_args.quantization:
-                    cmd += ["--quantization", server_args.quantization]
-                if (
-                    server_args.model_loader_extra_config
-                    and server_args.model_loader_extra_config != "{}"
-                ):
-                    cmd += [
-                        "--model-loader-extra-config",
-                        server_args.model_loader_extra_config,
+        for spec in daemon_specs:
+            for pp_rank in pp_rank_range:
+                for tp_rank in tp_rank_range:
+                    gpu_id = compute_local_gpu_id(
+                        pp_rank,
+                        tp_rank,
+                        pp_size_per_node,
+                        tp_size_per_node,
+                        base_gpu_id=server_args.base_gpu_id,
+                        gpu_id_step=server_args.gpu_id_step,
+                    )
+                    cmd = [
+                        sys.executable,
+                        "-m",
+                        "sglang.srt.weight_cache.daemon",
+                        "--model-path",
+                        spec.model_path,
+                        "--gpu-id",
+                        str(gpu_id),
+                        "--tp-size",
+                        str(tp_size),
+                        "--tp-rank",
+                        str(tp_rank),
+                        "--pp-size",
+                        str(server_args.pp_size),
+                        "--pp-rank",
+                        str(pp_rank),
+                        "--dp-size",
+                        "1",
+                        "--ep-size",
+                        str(server_args.ep_size),
+                        "--load-format",
+                        server_args.load_format,
+                        "--dtype",
+                        server_args.dtype,
+                        "--dist-init-method",
+                        spec.dist_init_method,
                     ]
-                if server_args.trust_remote_code:
-                    cmd += ["--trust-remote-code"]
-                if server_args.revision:
-                    cmd += ["--revision", server_args.revision]
+                    if spec.quantization:
+                        cmd += ["--quantization", spec.quantization]
+                    if (
+                        server_args.model_loader_extra_config
+                        and server_args.model_loader_extra_config != "{}"
+                    ):
+                        cmd += [
+                            "--model-loader-extra-config",
+                            server_args.model_loader_extra_config,
+                        ]
+                    if server_args.trust_remote_code:
+                        cmd += ["--trust-remote-code"]
+                    if spec.revision:
+                        cmd += ["--revision", spec.revision]
+                    if spec.is_draft_model:
+                        cmd += ["--is-draft-model"]
+                        cmd += [
+                            "--speculative-algorithm",
+                            spec.speculative_algorithm,
+                        ]
+                        if spec.draft_model_idx is not None:
+                            cmd += ["--draft-model-idx", str(spec.draft_model_idx)]
 
-                proc = subprocess.Popen(cmd)
-                daemon_procs.append(proc)
+                    proc = subprocess.Popen(cmd)
+                    daemon_procs.append(proc)
 
         # Wait for all daemons to be ready (ready file exists). On any failure
         # (readiness timeout or a daemon exiting early) terminate the siblings
@@ -742,29 +781,35 @@ class Engine(EngineScoreMixin, EngineBase):
         check_interval = 2
         start_time = time.time()
         try:
-            for pp_rank in pp_rank_range:
-                for tp_rank in tp_rank_range:
-                    global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-                    ready_path = get_ready_path(global_rank)
-                    while not os.path.exists(ready_path):
-                        time.sleep(check_interval)
-                        if time.time() - start_time > timeout:
-                            raise TimeoutError(
-                                f"Weight cache daemon for pp_rank={pp_rank} "
-                                f"tp_rank={tp_rank} did not become ready "
-                                f"within {timeout}s"
-                            )
-                        # Check if daemon process is still alive
-                        for p in daemon_procs:
-                            if p.poll() is not None:
-                                raise RuntimeError(
-                                    f"Weight cache daemon (pid={p.pid}) exited prematurely "
-                                    f"with code {p.returncode}"
+            for spec in daemon_specs:
+                for pp_rank in pp_rank_range:
+                    for tp_rank in tp_rank_range:
+                        global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
+                        ready_path = get_ready_path(
+                            global_rank,
+                            is_draft_model=spec.is_draft_model,
+                            draft_model_idx=spec.draft_model_idx,
+                        )
+                        while not os.path.exists(ready_path):
+                            time.sleep(check_interval)
+                            if time.time() - start_time > timeout:
+                                raise TimeoutError(
+                                    f"Weight cache daemon for pp_rank={pp_rank} "
+                                    f"tp_rank={tp_rank} "
+                                    f"role={spec.role or 'target'} "
+                                    f"did not become ready within {timeout}s"
                                 )
-                    logger.info(
-                        f"Weight cache daemon for pp_rank={pp_rank} "
-                        f"tp_rank={tp_rank} is ready"
-                    )
+                            # Check if daemon process is still alive
+                            for p in daemon_procs:
+                                if p.poll() is not None:
+                                    raise RuntimeError(
+                                        f"Weight cache daemon (pid={p.pid}) exited prematurely "
+                                        f"with code {p.returncode}"
+                                    )
+                        logger.info(
+                            f"Weight cache daemon for pp_rank={pp_rank} "
+                            f"tp_rank={tp_rank} role={spec.role or 'target'} is ready"
+                        )
         except BaseException:
             cls._terminate_weight_cache_daemons(daemon_procs)
             raise
