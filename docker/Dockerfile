@@ -610,6 +610,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7
+
 # Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
 # it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
