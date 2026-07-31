@@ -159,14 +159,14 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Yes (SM80-SM90 via Marlin; SM100+ native FP4)</td>
       <td>No</td>
       <td>No</td>
-      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a>; use Marlin W4A16 fallback on Ampere/Hopper and native FP4 backends on Blackwell</td>
+      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a> serialized NVFP4 plus online BF16/FP16 MoE weight conversion; static per-tensor FP32 activation scales by default; use Marlin W4A16 fallback on Ampere/Hopper and native FP4 backends on Blackwell</td>
     </tr>
     <tr>
       <td><code>nvfp4_online</code></td>
       <td>Yes (Blackwell/SM100 or SM103)</td>
       <td>No</td>
       <td>No</td>
-      <td>Online MoE-only NVFP4 weight quantization with runtime per-token activation scaling for BF16/FP16/FP8 checkpoints; requires <code>flashinfer_trtllm</code> or <code>flashinfer_trtllm_routed</code></td>
+      <td>Online MoE-only NVFP4 weight quantization with online per-token FP32 activation scales for BF16/FP16/FP8 checkpoints; never use this name for static per-tensor activation scales; requires <code>flashinfer_trtllm</code> or <code>flashinfer_trtllm_routed</code></td>
     </tr>
     <tr>
       <td><code>petit_nvfp4</code></td>
@@ -849,14 +849,26 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
+### `modelopt_fp4` online weight quantization with static activation scales
+
+`modelopt_fp4` remains the serving path for already serialized ModelOpt FP4 weights with checkpoint-provided per-tensor FP32 activation scales. As a small extension, it can also quantize eligible BF16 or FP16 MoE expert weights while loading. Online conversion produces the same packed weight and scale layout as a serialized checkpoint. Dense layers without serialized ModelOpt FP4 tensors stay in their source precision.
+
+For the ordinary/default path and this online-weight extension, the activation contract is static per-tensor FP32 scaling. If a ModelOpt FP4 module does not have activation-scale tensors in the checkpoint, SGLang initializes the corresponding scales to `1.0`. Checkpoint-provided tensors overwrite that fallback. This behavior is the same for target and draft modules; `1.0` is a static per-tensor scale, not an online per-token scale.
+
+For compatibility, `SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=1` can still make an already serialized `modelopt_fp4` checkpoint use FlashInfer TRT-LLM per-token activation scaling. This legacy serialized-checkpoint switch does not apply to the new online-weight extension. New online-weight integrations that require per-token FP32 activation scales must use `nvfp4_online`.
+
+For an embedded floating-point draft, explicitly select the same behavior with `--speculative-draft-model-quantization modelopt_fp4`. Omitting this flag preserves the checkpoint's existing draft behavior; setting it changes only the draft's quantization selection.
+
+Do not use `nvfp4_online` for static scaling. `nvfp4_online` is reserved for backends that compute and propagate an FP32 activation scale for every token at runtime. A path that quantizes activations with one static per-tensor FP32 scale belongs to `modelopt_fp4`, including when SGLang quantizes expert weights while loading.
+
 ### `nvfp4_online` online quantization method
 
-Use `--quantization nvfp4_online` when you have a BF16, FP16, or FP8 MoE checkpoint and want SGLang to convert eligible MoE expert weights to NVFP4 while loading the model. This mode is for online conversion from higher-precision or FP8 checkpoints. It is not the serving path for already serialized NVFP4 checkpoints; use the existing ModelOpt FP4 path for those checkpoints.
+Use `--quantization nvfp4_online` when you have a BF16, FP16, or FP8 MoE checkpoint and want SGLang to convert eligible MoE expert weights to NVFP4 while loading the model. This mode is for online conversion from higher-precision or FP8 checkpoints. It always requires online per-token FP32 activation scales. It is not an alias for static per-tensor NVFP4 and is not the serving path for already serialized NVFP4 checkpoints; use `modelopt_fp4` for those cases.
 
 The design separates weight quantization from activation scaling:
 
 - **Weights:** SGLang quantizes each eligible MoE expert weight tensor as it is loaded, using standard 2D NVFP4 weight quantization. The generated NVFP4 weights use static E4M3 block scales plus static per-tensor FP32 scales derived from the weight amax. For gated MoE experts, the w1/w3 pair shares one per-tensor FP32 scale.
-- **Activations:** FlashInfer computes activation FP32 scales dynamically per token at runtime. Because activations are scaled per token, this mode does not need calibrated static activation FP32 scales from the checkpoint.
+- **Activations:** FlashInfer computes and propagates one FP32 activation scale per token at runtime. A backend implementation that accepts only one static per-tensor FP32 activation scale does not satisfy the `nvfp4_online` contract and must use `modelopt_fp4` instead.
 - **FP8 checkpoints:** If an eligible expert weight is stored as FP8, SGLang first dequantizes that tensor with the checkpoint scale and then requantizes it to NVFP4 during loading.
 - **Other layers:** Dense linear layers stay in their source checkpoint precision or checkpoint quantization path.
 

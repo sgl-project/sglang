@@ -243,6 +243,21 @@ def get_quant_config(
 ) -> QuantizationConfig:
     quant_cls = get_quantization_config(model_config.quantization)
 
+    if (
+        model_config.is_embedded_draft_model
+        and model_config.is_draft_quantization_explicit
+        and model_config.quantization == "modelopt_fp4"
+    ):
+        # An explicitly selected embedded MTP path has floating-point weights
+        # even when target metadata describes serialized ModelOpt tensors.
+        return ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=False,
+            group_size=16,
+            exclude_modules=[],
+            packed_modules_mapping=packed_modules_mapping,
+            use_per_token_activation=False,
+        )
+
     # GGUF doesn't have config file
     if model_config.quantization == "gguf":
         return quant_cls.from_config({})
@@ -332,6 +347,16 @@ def get_quant_config(
         f for f in config_files if any(f.endswith(x) for x in possible_config_filenames)
     ]
     if len(quant_config_files) == 0:
+        if model_config.quantization == "modelopt_fp4":
+            # modelopt_fp4 can quantize floating MoE expert weights online;
+            # dense layers stay in their source precision on this path.
+            return ModelOptFp4Config(
+                is_checkpoint_nvfp4_serialized=False,
+                group_size=16,
+                exclude_modules=[],
+                packed_modules_mapping=packed_modules_mapping,
+                use_per_token_activation=False,
+            )
         raise ValueError(f"Cannot find the config file for {model_config.quantization}")
     if len(quant_config_files) > 1:
         raise ValueError(

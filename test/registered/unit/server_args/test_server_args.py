@@ -1,3 +1,4 @@
+import dataclasses
 import importlib
 import json
 import os
@@ -80,6 +81,17 @@ class TestPrepareServerArgs(CustomTestCase):
                 model_path="dummy",
                 return_hidden_states_mode="lst",
             )
+
+    def test_draft_quantization_explicitness_survives_asdict_round_trip(self):
+        inherited = ServerArgs(model_path="dummy", quantization="modelopt_fp4")
+        inherited._handle_missing_default_values()
+        self.assertEqual(inherited.speculative_draft_model_quantization, "modelopt_fp4")
+        self.assertFalse(inherited._speculative_draft_quantization_explicitly_set)
+
+        reconstructed = ServerArgs(**dataclasses.asdict(inherited))
+        reconstructed._handle_missing_default_values()
+
+        self.assertFalse(reconstructed._speculative_draft_quantization_explicitly_set)
 
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:

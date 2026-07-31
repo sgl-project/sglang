@@ -16,8 +16,6 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
-    get_deepep_mode,
-    get_moe_a2a_backend,
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -1208,7 +1206,16 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 
 
 class ModelOptFp4Config(ModelOptQuantConfig):
-    """Config class for FP4."""
+    """Config for serialized ModelOpt FP4 checkpoints.
+
+    ModelOpt FP4 ordinarily loads packed NVFP4 weights and checkpoint-provided
+    per-tensor FP32 activation scales. As a small extension, floating MoE expert
+    weights can also be quantized while loading. Missing activation scales use
+    a static 1.0 fallback; checkpoint tensors overwrite it. `nvfp4_online` has
+    a different activation contract: online per-token FP32 activation scales.
+    The existing per-token environment switch for serialized checkpoints is
+    retained for compatibility.
+    """
 
     def __init__(
         self,
@@ -1229,11 +1236,20 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             )
         self.is_awq = is_awq
         self.group_size = group_size
-        self.use_per_token_activation = (
-            envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
-            if use_per_token_activation is None
-            else use_per_token_activation
-        )
+        if not is_checkpoint_nvfp4_serialized:
+            if use_per_token_activation:
+                raise ValueError(
+                    "Non-serialized modelopt_fp4 uses static per-tensor FP32 "
+                    "activation scales. Use nvfp4_online for online per-token "
+                    "FP32 activation scales."
+                )
+            self.use_per_token_activation = False
+        else:
+            self.use_per_token_activation = (
+                envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+                if use_per_token_activation is None
+                else use_per_token_activation
+            )
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -1381,6 +1397,24 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.quantization.nvfp4_online import (
+            ModelOptNvFp4OnlineWeightFusedMoEMethod,
+        )
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        if not self.is_checkpoint_nvfp4_serialized:
+            if isinstance(layer, (LinearBase, ParallelLMHead)):
+                # Online conversion is MoE-only; dense layers stay in their
+                # source precision.
+                return UnquantizedLinearMethod()
+            if isinstance(layer, FusedMoE):
+                if self.is_layer_excluded(prefix):
+                    return None
+                return ModelOptNvFp4OnlineWeightFusedMoEMethod(self, prefix)
+            return None
+
         return self._get_quant_method(
             layer,
             prefix,
@@ -1499,6 +1533,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         input_scale = _make_per_tensor_scale_parameter(
             (len(output_partition_sizes),),
             weight_loader=weight_loader,
+            fill_value=1.0,
             needs_scalar_to_array=True,
         )
         layer.register_parameter("input_scale", input_scale)
@@ -1990,17 +2025,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         return get_moe_runner_backend().is_flashinfer_cutedsl()
 
-    @property
-    def supports_nvfp4_online_moe(self) -> bool:
-        a2a_backend = get_moe_a2a_backend()
-        return self.enable_flashinfer_trtllm_moe or (
-            self.enable_flashinfer_cutedsl_moe
-            and (
-                a2a_backend.is_flashinfer()
-                or (a2a_backend.is_deepep() and get_deepep_mode().is_low_latency())
-            )
-        )
-
     # ----- CuteDSL v1 vs v2 path helpers -----
     #
     # "v1": cutedsl + deepep low-latency.
@@ -2024,6 +2048,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         """CuteDSL v2 standard path (a2a=none or flashinfer, uses CuteDslMoEWrapper)."""
         return self.enable_flashinfer_cutedsl_moe and not self._is_cutedsl_v1_deepep
 
+    def prepare_weight_loader(self, layer, weight_loader):
+        """Return the loader for ordinary serialized ModelOpt FP4 tensors."""
+        if not self.quant_config.is_checkpoint_nvfp4_serialized:
+            raise ValueError(
+                "The ordinary ModelOpt FP4 method requires serialized NVFP4 "
+                "weights; floating MoE weights require its online-weight loader."
+            )
+        return weight_loader
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -2033,22 +2066,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        is_nvfp4_online = getattr(self.quant_config, "is_nvfp4_online", False)
-        if not self.quant_config.is_checkpoint_nvfp4_serialized and not is_nvfp4_online:
-            raise ValueError(
-                "NVFP4 quantization was selected, "
-                " dynamic quantization is not supported."
-            )
-        # Online conversion changes only weight loading; downstream tensors use
-        # the same packed weight and scale layout as serialized ModelOpt NVFP4.
-        if is_nvfp4_online:
-            if not self.supports_nvfp4_online_moe:
-                raise ValueError(
-                    "--quantization nvfp4_online supports flashinfer_trtllm, "
-                    "flashinfer_trtllm_routed, or flashinfer_cutedsl with "
-                    "FlashInfer A2A or DeepEP low_latency."
-                )
-
         # TODO(ch-wan): check if this is needed
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
@@ -2056,9 +2073,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         weight_dtype = torch.uint8
         weight_scale_dtype = torch.float8_e4m3fn
-        weight_loader = extra_weight_attrs.get("weight_loader")
-        if is_nvfp4_online:
-            weight_loader = self.get_online_weight_loader(layer, weight_loader)
+        weight_loader = self.prepare_weight_loader(
+            layer, extra_weight_attrs.get("weight_loader")
+        )
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
@@ -2157,7 +2174,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
 
-        if is_nvfp4_online and self.quant_config.is_checkpoint_fp8_serialized:
+        if not self.quant_config.is_checkpoint_nvfp4_serialized and getattr(
+            self.quant_config, "is_checkpoint_fp8_serialized", False
+        ):
             # FP8 checkpoints usually store expert scales as weight_scale_inv.
             # Online NVFP4 consumes them in the loader and writes the generated
             # NVFP4 scales into w*_weight_scale / w*_weight_scale_2 instead.
@@ -2178,11 +2197,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
 
-        input_scale_fill = 1.0 if is_nvfp4_online else None
+        # nvfp4_online uses 1.0 only as a neutral placeholder because the
+        # backend computes an FP32 scale per token. modelopt_fp4 uses 1.0 as
+        # the actual static per-tensor fallback for any module whose checkpoint
+        # omits activation-scale tensors. A loaded tensor overwrites it.
         w13_input_scale = _make_per_tensor_scale_parameter(
             (layer.num_experts, num_shards),
             weight_loader=weight_loader,
-            fill_value=input_scale_fill,
+            fill_value=1.0,
         )
         w13_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w13_input_scale", w13_input_scale)
@@ -2190,16 +2212,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale = _make_per_tensor_scale_parameter(
             (layer.num_experts,),
             weight_loader=weight_loader,
-            fill_value=input_scale_fill,
+            fill_value=1.0,
         )
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Process FP4 MoE weights after loading from serialized checkpoint.
-
-        Only supports pre-quantized checkpoints with FP8 weights and scales.
-        """
+        """Prepare packed FP4 MoE weights and scales for the selected backend."""
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):

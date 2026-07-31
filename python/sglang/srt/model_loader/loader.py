@@ -835,8 +835,13 @@ class DefaultModelLoader(BaseModelLoader):
 
         quant_config = getattr(model, "quant_config", None)
         is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
+        is_modelopt_fp4_online = (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and not quant_config.is_checkpoint_nvfp4_serialized
+        )
 
-        if is_nvfp4_online:
+        if is_nvfp4_online or is_modelopt_fp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.
             with temp_set_env(FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1"):
@@ -4096,9 +4101,16 @@ def get_model_loader(
     # ModelOptModelLoader's local-copy quantize-and-export workflow doesn't apply
     # to non-local loaders. These loaders own their weight transport path and still
     # initialize the model with ModelOpt quantization config where applicable.
-    model_optloader_allowed = model_config and load_config.load_format not in (
-        LoadFormat.RUNAI_STREAMER,
-        LoadFormat.REMOTE_INSTANCE,
+    modelopt_fp4_online = (
+        model_config
+        and model_config.quantization == "modelopt_fp4"
+        and not model_config._is_already_quantized()
+    )
+    model_optloader_allowed = (
+        model_config
+        and not modelopt_fp4_online
+        and load_config.load_format
+        not in (LoadFormat.RUNAI_STREAMER, LoadFormat.REMOTE_INSTANCE)
     )
 
     if model_optloader_allowed and (

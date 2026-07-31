@@ -1582,7 +1582,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-draft-model-quantization`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The quantization method for speculative model.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The quantization method for the speculative draft model. <code>nvfp4_online</code> requires online per-token FP32 activation scales. Use <code>modelopt_fp4</code> for online-capable NVFP4 with static per-tensor FP32 activation scales; missing activation scales default to <code>1.0</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Same as `--quantization` options</td>
     </tr>

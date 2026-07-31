@@ -6,6 +6,7 @@ applies NVIDIA Model Optimizer quantization to models during loading.
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -24,7 +25,12 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4A16LinearMethod,
 )
-from sglang.srt.model_loader.loader import ModelOptModelLoader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    ModelOptModelLoader,
+    get_model_loader,
+)
+from sglang.srt.model_loader.weight_utils import get_quant_config
 from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import get_device
@@ -519,8 +525,128 @@ class TestParseQuantHfConfig(CustomTestCase):
         self.assertEqual(result["quant_method"], "gptq")
         self.assertNotIn("quant_algo", result)
 
+    def test_mixed_target_preserves_explicit_modelopt_fp4_draft(self):
+        self.model_config.quantization = "modelopt_fp4"
+        self.model_config.is_draft_model = True
+        self.model_config.is_embedded_draft_model = True
+        self.model_config.is_draft_quantization_explicit = True
+        with (
+            patch.object(
+                self.model_config,
+                "_parse_quant_hf_config",
+                return_value={
+                    "quant_method": "modelopt_mixed",
+                    "quant_algo": "MIXED_PRECISION",
+                },
+            ),
+            patch.object(
+                self.model_config,
+                "_find_quant_modelslim_config",
+                return_value=None,
+            ),
+        ):
+            self.model_config._verify_quantization()
+
+        self.assertEqual(self.model_config.quantization, "modelopt_fp4")
+
+    def test_mixed_target_overrides_inherited_modelopt_fp4_draft(self):
+        self.model_config.quantization = "modelopt_fp4"
+        self.model_config.is_draft_model = True
+        self.model_config.is_embedded_draft_model = True
+        self.model_config.is_draft_quantization_explicit = False
+        with (
+            patch.object(
+                self.model_config,
+                "_parse_quant_hf_config",
+                return_value={
+                    "quant_method": "modelopt_mixed",
+                    "quant_algo": "MIXED_PRECISION",
+                },
+            ),
+            patch.object(
+                self.model_config,
+                "_find_quant_modelslim_config",
+                return_value=None,
+            ),
+        ):
+            self.model_config._verify_quantization()
+
+        self.assertEqual(self.model_config.quantization, "modelopt_mixed")
+
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
+    def test_draft_modelopt_fp4_ignores_target_mixed_config(self):
+        model_config = SimpleNamespace(
+            model_path="target-model",
+            quantization="modelopt_fp4",
+            is_draft_model=True,
+            is_embedded_draft_model=True,
+            is_draft_quantization_explicit=True,
+            hf_config=SimpleNamespace(
+                quantization_config={"quant_algo": "MIXED_PRECISION"}
+            ),
+        )
+
+        config = get_quant_config(model_config, LoadConfig(), {})
+
+        self.assertIsInstance(config, ModelOptFp4Config)
+        self.assertFalse(config.is_checkpoint_nvfp4_serialized)
+        self.assertFalse(config.use_per_token_activation)
+        self.assertEqual(config.group_size, 16)
+
+    def test_external_serialized_modelopt_fp4_draft_uses_checkpoint_config(self):
+        model_config = SimpleNamespace(
+            model_path="draft-model",
+            quantization="modelopt_fp4",
+            is_draft_model=True,
+            is_embedded_draft_model=False,
+            is_draft_quantization_explicit=True,
+            hf_config=SimpleNamespace(
+                quantization_config={
+                    "quant_algo": "NVFP4",
+                    "group_size": 16,
+                    "ignore": [],
+                }
+            ),
+        )
+
+        config = get_quant_config(model_config, LoadConfig(), {})
+
+        self.assertIsInstance(config, ModelOptFp4Config)
+        self.assertTrue(config.is_checkpoint_nvfp4_serialized)
+
+    def test_inherited_modelopt_fp4_draft_uses_checkpoint_config(self):
+        model_config = SimpleNamespace(
+            model_path="target-model",
+            quantization="modelopt_fp4",
+            is_draft_model=True,
+            is_embedded_draft_model=True,
+            is_draft_quantization_explicit=False,
+            hf_config=SimpleNamespace(
+                quantization_config={
+                    "quant_algo": "NVFP4",
+                    "group_size": 16,
+                    "ignore": [],
+                }
+            ),
+        )
+
+        config = get_quant_config(model_config, LoadConfig(), {})
+
+        self.assertIsInstance(config, ModelOptFp4Config)
+        self.assertTrue(config.is_checkpoint_nvfp4_serialized)
+
+    def test_unquantized_modelopt_fp4_uses_default_loader(self):
+        model_config = SimpleNamespace(
+            quantization="modelopt_fp4",
+            _is_already_quantized=lambda: False,
+        )
+
+        loader = get_model_loader(LoadConfig(), model_config)
+
+        self.assertIsInstance(loader, DefaultModelLoader)
+        self.assertNotIsInstance(loader, ModelOptModelLoader)
+
     def test_minimax_mixed_precision_resolves_runtime_names_and_mxfp8(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(
             {
@@ -648,7 +774,11 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         return_value=True,
     )
     def test_explicit_nvfp4_per_token_activation_false_overrides_env(self, _):
-        config = ModelOptFp4Config(use_per_token_activation=False)
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            use_per_token_activation=False,
+        )
 
         self.assertFalse(config.use_per_token_activation)
 
