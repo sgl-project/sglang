@@ -281,9 +281,18 @@ class TestPrepareServerArgs(CustomTestCase):
             dllm_algorithm="LowConfidence",
             _cuda_graph_config_locked=set(),
             cuda_graph_config=config,
-            page_size=32,
+            page_size=None,
+            attention_backend=None,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            _resolved_overrides=[
+                ("_attention_backend_default", {"attention_backend": "fa3"}),
+                ("_dllm_attention_backend", {"attention_backend": "flashinfer"}),
+                ("_page_size_default", {"page_size": 1}),
+                ("_dllm_page_size", {"page_size": 32}),
+            ],
             max_prefill_tokens=768,
-            get_attention_backends=lambda: ("flashinfer", "flashinfer"),
+            get_attention_backends=lambda: (None, None),
         )
         dllm_config = SimpleNamespace(
             block_size=32,

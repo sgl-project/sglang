@@ -3788,8 +3788,11 @@ class ServerArgs:
         from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
         from sglang.srt.dllm.config import DllmConfig
 
-        is_server_args = dataclasses.is_dataclass(self)
-        view = resolved_view(self) if is_server_args else self
+        use_resolved_view = (
+            dataclasses.is_dataclass(self)
+            or getattr(self, "_resolved_overrides", None) is not None
+        )
+        view = resolved_view(self) if use_resolved_view else self
         if view.dllm_algorithm is None:
             return
         locked = getattr(self, "_cuda_graph_config_locked", set())
@@ -3799,14 +3802,15 @@ class ServerArgs:
         if graph_config is None or graph_config.prefill.backend != Backend.BREAKABLE:
             return
 
-        if is_server_args:
-            prefill_backend, _ = attention_backends_of(view)
-        else:
-            prefill_backend, _ = self.get_attention_backends()
+        prefill_backend, _ = (
+            attention_backends_of(view)
+            if use_resolved_view
+            else self.get_attention_backends()
+        )
         if prefill_backend != "flashinfer":
             return
 
-        dllm_config = DllmConfig.from_server_args(view if is_server_args else self)
+        dllm_config = DllmConfig.from_server_args(view if use_resolved_view else self)
         alignment = math.lcm(view.page_size, dllm_config.block_size)
         max_tokens = (
             dllm_config.prefill_block_size * dllm_config.max_running_requests
@@ -3822,7 +3826,7 @@ class ServerArgs:
             if max_tokens > 0
             else []
         )
-        if is_server_args:
+        if dataclasses.is_dataclass(self):
             declare_resolution(
                 self,
                 "_configure_dllm_prefill_cuda_graph_buckets",
