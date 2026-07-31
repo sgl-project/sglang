@@ -20,6 +20,7 @@ from sglang.srt.function_call.kimik3_format import (
     THINK_OPEN,
     TOOLS_OPEN,
     partial_suffix_len,
+    strip_partial_marker_suffix,
     strip_response_wrappers,
 )
 from sglang.srt.parser.harmony_parser import HarmonyParser
@@ -491,7 +492,17 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
     @staticmethod
     def _strip_dangling_think_close(text: str) -> str:
-        return text.removesuffix(_THINK_CLOSE_WITHOUT_SEP)
+        """Remove partial XTML marker suffixes from *text*.
+
+        XTML markers are multi-token sequences.  When ``max_tokens`` cuts
+        generation inside a marker, the detokenized text ends with a
+        partial marker prefix.  These fragments are internal protocol
+        markers and must not appear in user-visible output.
+
+        Only suffixes that correspond to token-level truncation boundaries
+        are stripped; arbitrary character prefixes are left intact.
+        """
+        return strip_partial_marker_suffix(text)
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         in_reasoning = self._in_reasoning or self.think_start_token in text
