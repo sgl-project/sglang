@@ -1,6 +1,7 @@
+import struct
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
@@ -13,8 +14,16 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
     unpack_list_of_buffers,
 )
+from sglang.srt.disaggregation.mooncake.conn import (
+    KVArgsRegisterInfo as MooncakeKVArgsRegisterInfo,
+)
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.nixl.conn import (
+    KVArgsRegisterInfo as NixlKVArgsRegisterInfo,
+)
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    build_kv_transfer_layer_ids,
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
 )
@@ -60,6 +69,116 @@ class TestDisaggregationWire(unittest.TestCase):
     def test_list_of_buffers_roundtrip(self):
         bufs = [b"abc", b"", b"de", b"x" * 17]
         self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
+
+    def test_target_and_draft_kv_layer_ids_use_disjoint_namespaces(self):
+        target_pool = SimpleNamespace(get_kv_layer_ids=lambda: [2, 5])
+
+        layer_ids = build_kv_transfer_layer_ids(
+            target_pool,
+            draft_token_to_kv_pool=SimpleNamespace(),
+            target_entry_count=2,
+            draft_entry_count=2,
+        )
+
+        self.assertEqual(layer_ids[:2], [2, 5])
+        self.assertEqual(layer_ids[2:], [1 << 31, (1 << 31) + 1])
+
+    def test_kv_layer_metadata_rejects_registered_entry_mismatch(self):
+        target_pool = SimpleNamespace(get_kv_layer_ids=lambda: [2])
+
+        with self.assertRaisesRegex(RuntimeError, "must match registered entries"):
+            build_kv_transfer_layer_ids(
+                target_pool,
+                draft_token_to_kv_pool=None,
+                target_entry_count=2,
+                draft_entry_count=0,
+            )
+
+    def test_mooncake_registration_roundtrips_layer_metadata(self):
+        msg = [
+            b"None",
+            b"127.0.0.1",
+            b"5000",
+            b"session",
+            struct.pack("2Q", 100, 200),
+            struct.pack("Q", 300),
+            pack_int_lists([[400, 500]], "Q"),
+            b"3",
+            b"8",
+            b"64",
+            pack_int_lists([[128, 256]], "I"),
+            pack_int_lists([[4, 8]], "I"),
+            struct.pack("2I", 2, 1 << 31),
+            pack_int_lists([[7, 9]], "I"),
+            b"",
+            b"",
+            b"8",
+            b"3",
+        ]
+
+        info = MooncakeKVArgsRegisterInfo.from_zmq(msg)
+
+        self.assertEqual(info.dst_kv_layer_ids, [2, 1 << 31])
+        self.assertEqual(info.dst_state_layer_ids, [[7, 9]])
+        self.assertEqual((info.dst_dcp_size, info.dst_dcp_rank), (8, 3))
+
+    def test_nixl_registration_roundtrips_layer_metadata(self):
+        msg = [
+            b"None",
+            b"127.0.0.1",
+            b"5000",
+            b"agent",
+            b"metadata",
+            struct.pack("2Q", 100, 200),
+            struct.pack("Q", 300),
+            pack_int_lists([[400, 500]], "Q"),
+            b"0",
+            b"8",
+            b"3",
+            b"64",
+            pack_int_lists([[128, 256]], "I"),
+            pack_int_lists([[4, 8]], "I"),
+            b"",
+            b"",
+            b"16",
+            b"VRAM,VRAM",
+            struct.pack("2Q", 64, 64),
+            pack_int_lists([[7, 9]], "I"),
+            struct.pack("2I", 2, 1 << 31),
+            b"8",
+            b"3",
+        ]
+
+        info = NixlKVArgsRegisterInfo.from_zmq(msg)
+
+        self.assertEqual(info.dst_kv_layer_ids, [2, 1 << 31])
+        self.assertEqual(info.dst_state_layer_ids, [[7, 9]])
+        self.assertEqual((info.dst_dcp_size, info.dst_dcp_rank), (8, 3))
+
+    def test_mooncake_mamba_transfer_pairs_active_and_checkpoint_states(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.pp_size = 1
+        manager._transfer_data = MagicMock(return_value=0)
+        req = SimpleNamespace(mooncake_session_id="session")
+
+        manager._send_mamba_state(
+            req,
+            prefill_mamba_index=[2, 5],
+            src_state_data_ptrs=[1000, 2000],
+            src_state_item_lens=[16, 32],
+            dst_state_data_ptrs=[3000, 4000],
+            dst_mamba_index=[7, 11],
+        )
+
+        manager._transfer_data.assert_called_once_with(
+            "session",
+            [
+                (1032, 3112, 16),
+                (2064, 4224, 32),
+                (1080, 3176, 16),
+                (2160, 4352, 32),
+            ],
+        )
 
 
 class TestGroupConcurrentContiguous(unittest.TestCase):

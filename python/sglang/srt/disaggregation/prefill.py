@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    build_kv_transfer_layer_ids,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -208,6 +209,8 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        target_kv_entry_count = len(kv_data_ptrs)
+        draft_kv_entry_count = 0
         kv_args.prefill_end_layer = (
             kv_args.prefill_start_layer + len(kv_data_ptrs)
             if layer_shard_enabled
@@ -220,6 +223,7 @@ class PrefillBootstrapQueue:
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
+            draft_kv_entry_count = len(draft_kv_data_ptrs)
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
@@ -227,11 +231,11 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
-            self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
-            else []
+        kv_args.kv_layer_ids = build_kv_transfer_layer_ids(
+            self.token_to_kv_pool,
+            self.draft_token_to_kv_pool,
+            target_kv_entry_count,
+            draft_kv_entry_count,
         )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
