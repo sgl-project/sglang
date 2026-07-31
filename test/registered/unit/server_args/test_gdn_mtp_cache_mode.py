@@ -21,6 +21,7 @@ def make_server_args(
     *,
     gdn_mtp_cache_mode="none",
     enable_gdn_replayssm_spec=False,
+    enable_linear_replayssm=False,
     speculative_eagle_topk=None,
     disable_radix_cache=True,
     mamba_radix_cache_strategy="no_buffer",
@@ -28,6 +29,7 @@ def make_server_args(
     sa = ServerArgs.__new__(ServerArgs)
     sa.gdn_mtp_cache_mode = gdn_mtp_cache_mode
     sa.enable_gdn_replayssm_spec = enable_gdn_replayssm_spec
+    sa.enable_linear_replayssm = enable_linear_replayssm
     sa.speculative_eagle_topk = speculative_eagle_topk
     sa.disable_radix_cache = disable_radix_cache
     sa.mamba_radix_cache_strategy = mamba_radix_cache_strategy
@@ -41,6 +43,7 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
                 sa = make_server_args(
                     gdn_mtp_cache_mode=mode,
                     enable_gdn_replayssm_spec=True,
+                    enable_linear_replayssm=True,
                     speculative_eagle_topk=8,
                     disable_radix_cache=False,
                     mamba_radix_cache_strategy="extra_buffer",
@@ -48,17 +51,21 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
                 self.assertIsNone(sa._validate_gdn_mtp_cache_mode())
 
     def test_none_mode_rejects_replayssm(self):
-        sa = make_server_args(
-            enable_gdn_replayssm_spec=True,
-            speculative_eagle_topk=1,
-        )
-        with self.assertRaises(ValueError) as cm:
-            sa._validate_gdn_mtp_cache_mode()
-        self.assertIn(
-            "--gdn-mtp-cache-mode=none is mutually exclusive with "
-            "--enable-gdn-replayssm-spec",
-            str(cm.exception),
-        )
+        # Both ReplaySSM flags must be rejected, not just the spec-verify one.
+        # RecoverSSM's runtime gate (GDNAttnBackend._recover_ssm) reads the cache
+        # mode alone, so this validator is the only thing keeping the two verify
+        # protocols from both claiming the verify-commit path. --enable-linear-
+        # replayssm is separately reachable: it requires no_buffer, which
+        # none-mode also permits, so no other guard excludes the combination.
+        for flag in ("enable_gdn_replayssm_spec", "enable_linear_replayssm"):
+            with self.subTest(flag=flag):
+                sa = make_server_args(**{flag: True}, speculative_eagle_topk=1)
+                with self.assertRaises(ValueError) as cm:
+                    sa._validate_gdn_mtp_cache_mode()
+                self.assertIn(
+                    "--gdn-mtp-cache-mode=none is mutually exclusive with ReplaySSM",
+                    str(cm.exception),
+                )
 
     def test_replayssm_guard_wins_over_topk_guard(self):
         sa = make_server_args(
@@ -68,7 +75,7 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
         with self.assertRaises(ValueError) as cm:
             sa._validate_gdn_mtp_cache_mode()
         msg = str(cm.exception)
-        self.assertIn("mutually exclusive with --enable-gdn-replayssm-spec", msg)
+        self.assertIn("mutually exclusive with ReplaySSM", msg)
         self.assertNotIn("linear draft chain", msg)
 
     def test_none_mode_rejects_topk_gt_one(self):
