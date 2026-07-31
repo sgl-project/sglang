@@ -5,6 +5,22 @@ import torch
 from sgl_kernel import fp8_scaled_mm
 
 
+def _cuda_version_at_least(major, minor):
+    if torch.version.cuda is None:
+        return False
+    version = tuple(int(component) for component in torch.version.cuda.split(".")[:2])
+    return version >= (major, minor)
+
+
+def _native_scalar_a_supported():
+    if not torch.cuda.is_available():
+        return False
+    capability = torch.cuda.get_device_capability()
+    if capability == (9, 0):
+        return _cuda_version_at_least(12, 0)
+    return capability[0] in (10, 12) and _cuda_version_at_least(12, 8)
+
+
 def torch_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias):
     o = torch.matmul(a.to(torch.float32), b.to(torch.float32))
     o = o.to(torch.float32)
@@ -127,8 +143,8 @@ def test_accuracy_sm90_swap_ab(shape_mn, K, with_bias, out_dtype):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
-    reason="native scalar A scales are currently supported only on SM90",
+    not _native_scalar_a_supported(),
+    reason="native scalar A scales require a compatible SM90, SM100, or SM120 build",
 )
 @pytest.mark.parametrize("M", [1, 2, 8, 16, 64, 189])
 @pytest.mark.parametrize("with_bias", [True, False])
@@ -145,6 +161,21 @@ def test_rejects_invalid_a_scale_count():
     scale_b = torch.ones(N, device="cuda", dtype=torch.float32)
 
     with pytest.raises(RuntimeError, match="scales_a must contain either"):
+        fp8_scaled_mm(a, b, scale_a, scale_b, torch.bfloat16, None)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 9),
+    reason="SM89-specific scalar A validation",
+)
+def test_rejects_scalar_a_with_multiple_rows_on_sm89():
+    M, N, K = 8, 128, 512
+    a = torch.randn(M, K, device="cuda").to(torch.float8_e4m3fn)
+    b = torch.randn(N, K, device="cuda").to(torch.float8_e4m3fn).t()
+    scale_a = torch.ones(1, device="cuda", dtype=torch.float32)
+    scale_b = torch.ones(N, device="cuda", dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="scalar scales_a with M > 1 is unsupported"):
         fp8_scaled_mm(a, b, scale_a, scale_b, torch.bfloat16, None)
 
 

@@ -1849,13 +1849,15 @@ def apply_fp8_linear(
     use_cutlass_channelwise_gemm = (
         channelwise_cutlass and cutlass_compatible_b and not use_triton_w8a8_fp8_kernel
     )
-    native_scalar_a_scale = use_cutlass_channelwise_gemm and _is_sm90_supported
+    native_scalar_a_scale = use_cutlass_channelwise_gemm and (
+        _is_sm90_supported or _is_sm100_supported or _is_sm120_supported
+    )
 
     if input_prequantized:
         assert input_scale is not None and input_scale.numel() == 1
         qinput = input_2d
         if channelwise_cutlass and not native_scalar_a_scale:
-            # SM89, SM100, and SM120 CUTLASS epilogues require one A scale per row.
+            # Unsupported CUTLASS epilogues require one A scale per row.
             x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
         else:
             x_scale = input_scale

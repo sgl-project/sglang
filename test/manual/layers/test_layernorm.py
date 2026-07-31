@@ -344,66 +344,82 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
         weight_scale = torch.linspace(0.01, 0.03, N, dtype=torch.float32)
         return input, qinput, weight, input_scale, weight_scale
 
-    def test_sm90_static_prequant_and_dynamic_scale_shapes(self):
+    def test_native_scalar_a_static_prequant_and_dynamic_scale_shapes(self):
         import sglang.srt.layers.quantization.fp8_utils as fp8_utils
-
-        input, qinput, weight, input_scale, weight_scale = self._make_inputs()
-        seen_scales = []
-
-        def fake_fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
-            seen_scales.append(scales_a)
-            return torch.empty(
-                (mat_a.shape[0], mat_b.shape[1]), dtype=out_dtype, device=mat_a.device
-            )
 
         server_args = SimpleNamespace(
             cuda_graph_config=SimpleNamespace(
                 prefill=SimpleNamespace(tc_compiler="none")
             )
         )
-        with patch.object(fp8_utils, "_is_sm90_supported", True), patch.object(
-            fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm
-        ), patch.object(fp8_utils, "get_server_args", return_value=server_args):
-            fp8_utils.apply_fp8_linear(
-                input,
-                weight,
-                weight_scale,
-                input_scale=input_scale,
-                cutlass_fp8_supported=True,
-            )
-            fp8_utils.apply_fp8_linear(
-                input,
-                weight,
-                weight_scale,
-                input_scale=input_scale,
-                cutlass_fp8_supported=True,
-                use_per_token_if_dynamic=True,
-                compressed_tensor_quant=True,
-            )
-            fp8_utils.apply_fp8_linear(
-                qinput,
-                weight,
-                weight_scale,
-                input_scale=input_scale,
-                cutlass_fp8_supported=True,
-                pre_quant_output_dtype=input.dtype,
-            )
-            fp8_utils.apply_fp8_linear(
-                input,
-                weight,
-                weight_scale,
-                input_scale=None,
-                cutlass_fp8_supported=True,
-                use_per_token_if_dynamic=True,
-                compressed_tensor_quant=True,
-            )
+        for capability in (
+            "_is_sm90_supported",
+            "_is_sm100_supported",
+            "_is_sm120_supported",
+        ):
+            with self.subTest(capability=capability):
+                input, qinput, weight, input_scale, weight_scale = self._make_inputs()
+                seen_scales = []
 
-        self.assertEqual(seen_scales[0].numel(), 1)
-        self.assertEqual(seen_scales[1].numel(), 1)
-        self.assertIs(seen_scales[2], input_scale)
-        self.assertEqual(tuple(seen_scales[3].shape), (input.shape[0], 1))
+                def fake_fp8_scaled_mm(
+                    mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None
+                ):
+                    seen_scales.append(scales_a)
+                    return torch.empty(
+                        (mat_a.shape[0], mat_b.shape[1]),
+                        dtype=out_dtype,
+                        device=mat_a.device,
+                    )
 
-    def test_non_sm90_static_scale_is_repeated(self):
+                capabilities = {
+                    "_is_sm90_supported": False,
+                    "_is_sm100_supported": False,
+                    "_is_sm120_supported": False,
+                }
+                capabilities[capability] = True
+                with patch.multiple(fp8_utils, **capabilities), patch.object(
+                    fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm
+                ), patch.object(fp8_utils, "get_server_args", return_value=server_args):
+                    fp8_utils.apply_fp8_linear(
+                        input,
+                        weight,
+                        weight_scale,
+                        input_scale=input_scale,
+                        cutlass_fp8_supported=True,
+                    )
+                    fp8_utils.apply_fp8_linear(
+                        input,
+                        weight,
+                        weight_scale,
+                        input_scale=input_scale,
+                        cutlass_fp8_supported=True,
+                        use_per_token_if_dynamic=True,
+                        compressed_tensor_quant=True,
+                    )
+                    fp8_utils.apply_fp8_linear(
+                        qinput,
+                        weight,
+                        weight_scale,
+                        input_scale=input_scale,
+                        cutlass_fp8_supported=True,
+                        pre_quant_output_dtype=input.dtype,
+                    )
+                    fp8_utils.apply_fp8_linear(
+                        input,
+                        weight,
+                        weight_scale,
+                        input_scale=None,
+                        cutlass_fp8_supported=True,
+                        use_per_token_if_dynamic=True,
+                        compressed_tensor_quant=True,
+                    )
+
+                self.assertEqual(seen_scales[0].numel(), 1)
+                self.assertEqual(seen_scales[1].numel(), 1)
+                self.assertIs(seen_scales[2], input_scale)
+                self.assertEqual(tuple(seen_scales[3].shape), (input.shape[0], 1))
+
+    def test_without_native_scalar_a_static_scale_is_repeated(self):
         import sglang.srt.layers.quantization.fp8_utils as fp8_utils
 
         input, qinput, weight, input_scale, weight_scale = self._make_inputs()
@@ -415,9 +431,12 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
                 (mat_a.shape[0], mat_b.shape[1]), dtype=out_dtype, device=mat_a.device
             )
 
-        with patch.object(fp8_utils, "_is_sm90_supported", False), patch.object(
-            fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm
-        ):
+        with patch.multiple(
+            fp8_utils,
+            _is_sm90_supported=False,
+            _is_sm100_supported=False,
+            _is_sm120_supported=False,
+        ), patch.object(fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm):
             fp8_utils.apply_fp8_linear(
                 input,
                 weight,
