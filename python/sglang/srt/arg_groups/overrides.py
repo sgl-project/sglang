@@ -442,6 +442,17 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             # under high-concurrency CUDA-graph replay on ROCm.
             if server_args.dcp_replicate_q_proj is None:
                 overrides["dcp_replicate_q_proj"] = dcp_comm in ("a2a", "fi_a2a")
+            if server_args.page_size is None:
+                # gluon's MLA decode takes its KV tile straight from the paged
+                # block size (TILE_SIZE == block_size, and the kernel asserts
+                # NUM_BLOCKS_GATHER_PER_TILE == 1), so page_size 1 shrinks every
+                # tile to a single token: 27 vs 511 GB/s on gfx950, which at 128k
+                # context was 96% of the decode step (median ITL 1073 -> 87 ms,
+                # 12.3x, gsm8k unchanged at 0.980). Under DCP the allocator's
+                # page is page_size * dcp_size, so 16 leaves each rank 16
+                # contiguous physical slots per virtual page -- exactly the tile
+                # gluon wants. 64/128 measured slower than 16.
+                overrides["page_size"] = 16
             return overrides
         if decode_backend == "cutedsl_mla" or decode_backend is None:
             _require_kimi_k3_cutedsl_dcp_support()

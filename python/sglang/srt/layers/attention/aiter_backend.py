@@ -134,6 +134,10 @@ class ForwardMetadata:
     dcp_g_kv_indptr: Optional[torch.Tensor] = None
     dcp_cp_world_size: int = 1
     dcp_cp_rank: int = 0
+    # Per-rank PAGE table + shard length (tokens) for the gluon DCP decode,
+    # built once per forward instead of per layer. See build_dcp_page_table.
+    dcp_block_table: Optional[torch.Tensor] = None
+    dcp_local_kv_lens: Optional[torch.Tensor] = None
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
@@ -857,33 +861,31 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         from sglang.kernels.ops.attention.dcp_gluon_mla_reduce import (
-            build_dcp_block_table,
             dcp_gluon_mla_reduce,
         )
 
         fm = self.forward_metadata
-        # kv_indptr / kv_indices were localized to this rank's round-robin shard
-        # by _plan_dcp_decode_metadata during init_forward_metadata.
+        # kv_indptr was localized to this rank's round-robin shard by
+        # _plan_dcp_decode_metadata during init_forward_metadata, which also
+        # built the per-rank PAGE table (once per forward, not per layer).
         kv_indptr = fm.kv_indptr
-        kv_indices = fm.kv_indices
         bs = kv_indptr.shape[0] - 1
         num_heads = layer.tp_q_head_num  # gathered heads = num_local_heads * dcp
         kv_lora_rank = layer.v_head_dim
         qk_rope_head_dim = layer.qk_head_dim - kv_lora_rank
 
-        # per-request local shard length + ragged -> 2D block table (block_size==1)
-        seqused_k = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int32)
+        seqused_k = fm.dcp_local_kv_lens
+        block_tables = fm.dcp_block_table
         # Under cuda-graph capture/replay a GPU->CPU sync (.item()) is illegal, and
-        # a per-step max would make gluon's NUM_SEGMENTS (and thus the segm-buffer /
-        # block-table shapes) vary between capture and replay. Pin max_local to a
-        # fixed per-graph upper bound (worst-case local shard = ceil(ctx_len / W))
-        # so every shape is static; per-token correctness still comes from the
-        # exact per-request seqused_k masking inside gluon and the reduce.
+        # a per-step max would make gluon's NUM_SEGMENTS (and thus the segm-buffer
+        # shapes) vary between capture and replay. Pin max_local to a fixed
+        # per-graph upper bound (worst-case local shard = ceil(ctx_len / W)) so
+        # every shape is static; per-token correctness still comes from the exact
+        # per-request seqused_k masking inside gluon and the reduce.
         if fm.run_graph:
             max_local = self._dcp_graph_max_local_kv_len()
         else:
             max_local = int(seqused_k.max().item())
-        block_tables = build_dcp_block_table(kv_indptr, kv_indices, bs, max_local)
 
         # cu_seqlens_q for decode is [0, 1, ..., bs] (1 query token per request),
         # which is exactly the MLA qo_indptr already built in the metadata.
@@ -958,6 +960,13 @@ class AiterAttnBackend(AttentionBackend):
         out = q.new_empty(
             (q.shape[0], num_heads * kv_lora_rank), dtype=self.input_dtype
         )
+        # TODO(gluon, block_size): like the decode path used to, this feeds a
+        # block size of 1, so gluon's TILE_SIZE collapses to a single token
+        # (~19x off peak on gfx950). dcp_kv_buffer is assembled per forward and
+        # is contiguous within each request's prefix / extend region, so it can
+        # be addressed in multi-token blocks. This is why aiter gluon prefill is
+        # ~28x slower than triton at long input; the mixed backend
+        # (--prefill-attention-backend triton) sidesteps it for now.
         gluon_mla_prefill_fwd(
             q.view(-1, num_heads, layer.qk_head_dim),
             kv_buffer.view(-1, 1, 1, layer.qk_head_dim),
@@ -1122,6 +1131,8 @@ class AiterAttnBackend(AttentionBackend):
         dcp_g_kv_indptr = None
         dcp_cp_world_size = 1
         dcp_cp_rank = 0
+        dcp_block_table = None
+        dcp_local_kv_lens = None
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
@@ -1156,6 +1167,16 @@ class AiterAttnBackend(AttentionBackend):
                             kv_lens,
                             forward_batch.seq_lens_cpu,
                             bs,
+                        )
+                        (
+                            dcp_block_table,
+                            dcp_local_kv_lens,
+                        ) = self._build_dcp_decode_page_table(
+                            kv_indptr,
+                            forward_batch.req_pool_indices,
+                            bs,
+                            (max_kv_len + self.dcp_world_size - 1)
+                            // self.dcp_world_size,
                         )
                 else:
                     max_q_len = 1
@@ -1263,6 +1284,8 @@ class AiterAttnBackend(AttentionBackend):
                 dcp_g_kv_indptr=dcp_g_kv_indptr,
                 dcp_cp_world_size=dcp_cp_world_size,
                 dcp_cp_rank=dcp_cp_rank,
+                dcp_block_table=dcp_block_table,
+                dcp_local_kv_lens=dcp_local_kv_lens,
             )
 
         elif forward_batch.forward_mode.is_draft_extend_v2():
@@ -1639,6 +1662,50 @@ class AiterAttnBackend(AttentionBackend):
                 bs=bs,
             )
 
+    def _build_dcp_decode_page_table(
+        self,
+        kv_indptr: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        bs: int,
+        max_local_kv_len: int,
+        out: Optional[torch.Tensor] = None,
+        out_lens: Optional[torch.Tensor] = None,
+    ):
+        """Per-rank page table + shard lengths for the gluon DCP decode.
+
+        Built once per forward (the gluon call is per layer, and rebuilding the
+        table 24x per step is pure overhead). ``kv_indptr`` must already be
+        localized by ``_plan_dcp_decode_metadata``, so its per-request diffs are
+        this rank's shard lengths in tokens (gluon's ``seqused_k``).
+
+        Both outputs are written into caller-provided buffers on the cuda-graph
+        path: this runs OUT of the graph, so a freshly allocated tensor would be
+        invisible to the captured kernels, which keep the capture-time pointer.
+        """
+        from sglang.kernels.ops.attention.dcp_gluon_mla_reduce import (
+            build_dcp_page_table,
+        )
+
+        lens = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int32)
+        if out_lens is not None:
+            out_lens.copy_(lens)
+            local_kv_lens = out_lens
+        else:
+            local_kv_lens = lens
+        max_pages = (max_local_kv_len + self.page_size - 1) // self.page_size
+        block_table = build_dcp_page_table(
+            self.req_to_token,
+            req_pool_indices,
+            local_kv_lens,
+            bs,
+            max_pages,
+            self.page_size,
+            self.dcp_world_size,
+            get_attention_dcp_rank(),
+            out=out,
+        )
+        return block_table, local_kv_lens
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -1669,6 +1736,18 @@ class AiterAttnBackend(AttentionBackend):
         if self.use_mla and dcp_enabled():
             self.cuda_graph_dcp_g_kv_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=self.device
+            )
+            # Page table for the gluon DCP decode: capture-stable shape, filled
+            # out-of-graph in _apply_cuda_graph_metadata. Width is the worst-case
+            # local shard (ceil(ctx_len / W)) in pages.
+            max_local_pages = (
+                self._dcp_graph_max_local_kv_len() + self.page_size - 1
+            ) // self.page_size
+            self.cuda_graph_dcp_block_table = torch.zeros(
+                (max_bs, max_local_pages), dtype=torch.int32, device=self.device
+            )
+            self.cuda_graph_dcp_local_kv_lens = torch.zeros(
+                (max_bs,), dtype=torch.int32, device=self.device
             )
         if kv_indices_buf is None:
             max_num_blocks_per_seq = (
@@ -1791,6 +1870,8 @@ class AiterAttnBackend(AttentionBackend):
         dcp_g_kv_indptr = None
         dcp_cp_world_size = 1
         dcp_cp_rank = 0
+        dcp_block_table = None
+        dcp_local_kv_lens = None
 
         swa_page_table = None
         max_kv_len = (
@@ -1838,6 +1919,19 @@ class AiterAttnBackend(AttentionBackend):
                             kv_lens,
                             seq_lens_cpu,
                             bs,
+                        )
+                        # Runs out-of-graph, so filling the capture-stable page
+                        # table buffer here is legal.
+                        (
+                            dcp_block_table,
+                            dcp_local_kv_lens,
+                        ) = self._build_dcp_decode_page_table(
+                            kv_indptr,
+                            req_pool_indices,
+                            bs,
+                            self._dcp_graph_max_local_kv_len(),
+                            out=self.cuda_graph_dcp_block_table[:bs],
+                            out_lens=self.cuda_graph_dcp_local_kv_lens[:bs],
                         )
                 else:
                     max_q_len = 1
@@ -1948,6 +2042,8 @@ class AiterAttnBackend(AttentionBackend):
                 dcp_g_kv_indptr=dcp_g_kv_indptr,
                 dcp_cp_world_size=dcp_cp_world_size,
                 dcp_cp_rank=dcp_cp_rank,
+                dcp_block_table=dcp_block_table,
+                dcp_local_kv_lens=dcp_local_kv_lens,
                 # num_kv_splits_indptr=num_kv_splits_indptr,
             )
 

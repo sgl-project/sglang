@@ -25,9 +25,17 @@ This kernel replicates aiter's reduce math (base-2, unnormalized ``segm_output``
 log2(overall_expsum)`` so the DCP cross-rank merge can consume it directly.
 """
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
+
+from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
+from sglang.kernels.ops.kvcache.kv_indices import (
+    get_num_kv_index_blocks_flashmla,
+    get_num_page_per_block_flashmla,
+)
 
 
 @triton.jit
@@ -68,6 +76,58 @@ def build_dcp_block_table(
         MAX_COLS=triton.next_power_of_2(max_cols),
     )
     return block_tables
+
+
+def build_dcp_page_table(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    local_kv_lens: torch.Tensor,
+    bs: int,
+    max_pages: int,
+    page_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+    out: Optional[torch.Tensor] = None,
+):
+    """Build this rank's PAGE table for aiter's gluon ``mla_decode_fwd``.
+
+    gluon derives its KV tile straight from the paged block size
+    (``TILE_SIZE == block_size``; the MLA kernel asserts
+    ``NUM_BLOCKS_GATHER_PER_TILE == 1``), so a block size of 1 collapses every
+    tile to a single token: measured on gfx950 that is ~19x slower than a block
+    size of 16 at the same KV volume (27 vs 511 GB/s), and it dominated the DCP
+    decode step (~96% of a 128k-context ITL).
+
+    Under DCP the allocator's page is ``page_size * dcp_size`` (see
+    kv_cache_builder), so each rank holds ``page_size`` CONTIGUOUS physical
+    slots per virtual page and the shard can be addressed by page. The
+    per-token owner rule is unchanged (``pos % dcp_size == rank``, physical
+    ``pos // dcp_size``); paging only guarantees the contiguity that lets the
+    tile match the page.
+
+    ``local_kv_lens`` is this rank's shard length per request, in TOKENS
+    (gluon's ``seqused_k``); the table itself is indexed in pages.
+    """
+    if out is None:
+        out = torch.zeros(bs, max_pages, dtype=torch.int32, device=req_to_token.device)
+    if max_pages == 0:
+        return out
+    pages_per_block = get_num_page_per_block_flashmla(page_size)
+    create_mla_kv_page_table_for_dcp[
+        (bs, get_num_kv_index_blocks_flashmla(max_pages, page_size))
+    ](
+        req_to_token,
+        req_pool_indices,
+        local_kv_lens,
+        out,
+        req_to_token.stride(0),
+        out.stride(0),
+        PHYSICAL_PAGE_SIZE=page_size,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
+        PAGES_PER_BLOCK=pages_per_block,
+    )
+    return out
 
 
 @triton.jit
