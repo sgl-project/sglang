@@ -229,7 +229,7 @@ class DSAMetadata:
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     # Precomputed once per forward batch and reused across layers: the
     # DeepSeek-V4 top-k v2 plan (cluster-threshold metadata) for the folded
-    # decode top-k transform. None unless SGLANG_OPT_USE_TOPK_V2 and decode.
+    # decode top-k transform. None unless the SGL top-k v2 path is enabled.
     topk_v2_plan: Optional[torch.Tensor] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
@@ -329,6 +329,8 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             cu_topk_indices_offset = torch.repeat_interleave(
                 cu_seqlens_q_topk[:-1],
                 cu_seqlens_q,
+                # Avoid reading sum(cu_seqlens_q) back to the host.
+                output_size=logits.shape[0],
             )
         else:
             cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q
@@ -778,8 +780,8 @@ class DeepseekSparseAttnBackend(
         # that dispatches to `_topk_transform_v2_paged` -- decode AND MTP
         # target-verify / draft-extend, whose expanded row count is exactly what v2
         # sees -- otherwise the helper's plan-present assertion fires. None only
-        # when the fold is disabled; such metadata is never dispatched to v2.
-        if not envs.SGLANG_OPT_USE_TOPK_V2.get():
+        # when the SGL v2 path is disabled; such metadata is never dispatched to v2.
+        if not self.dsa_topk_backend.should_use_topk_v2():
             return None
         from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
@@ -1250,12 +1252,12 @@ class DeepseekSparseAttnBackend(
         # page_size=1 table. This MUST match the exact condition under which
         # `DSATopKBackend.topk_transform` dispatches decode PAGED to
         # `_topk_transform_v2_paged` -- otherwise the legacy transform would read a
-        # dropped (None) table. Hence: fused top-k AND v2 enabled AND index_topk in
-        # the kernel's supported range, on CUDA with page_size>1. Excludes HIP (its
-        # indexer reads page_table_1), hisparse (needs page_size=1 loc translation),
-        # and spec decoding (MTP precompute fast-path + target-verify/draft-extend
-        # still consume the wide table). Computed once from stable config; the graph
-        # is captured once per process.
+        # dropped (None) table. Hence: SGL top-k backend AND fused top-k AND v2
+        # enabled AND index_topk in the kernel's supported range, on CUDA with
+        # page_size>1. Excludes HIP (its indexer reads page_table_1), hisparse
+        # (needs page_size=1 loc translation), and spec decoding (MTP precompute
+        # fast-path + target-verify/draft-extend still consume the wide table).
+        # Computed once from stable config; the graph is captured once per process.
         self.dsa_drop_wide_page_table = (
             is_cuda()
             and not _is_hip
@@ -1263,9 +1265,9 @@ class DeepseekSparseAttnBackend(
             and self.hisparse_coordinator is None
             and not self.speculative_num_draft_tokens
             and self.use_fused_topk
-            and envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and self.dsa_topk_backend.should_use_topk_v2()
             and self.dsa_index_topk is not None
-            and self.dsa_index_topk <= 2048
+            and 0 < self.dsa_index_topk <= 2048
         )
 
         max_ctx_len = self.req_to_token.shape[1]
