@@ -264,6 +264,8 @@ async fn server_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
         "min_running_requests": 0,
         "max_running_requests": 2048,
         "max_req_num": 8192,
+        "max_req_input_len": 32767,
+        "supports_disagg_max_req_input_len": true,
         "max_batch_tokens": 32768,
         "schedule_policy": "lpm",
         "schedule_conservativeness": 1.0,

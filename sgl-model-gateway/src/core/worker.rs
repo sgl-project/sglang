@@ -32,6 +32,19 @@ pub const DEFAULT_WORKER_COST: f32 = 1.0;
 /// Default HTTP client timeout for worker requests (in seconds)
 pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
 
+/// Router-managed worker metadata discovered from SRT's `/server_info`.
+pub const MAX_REQ_INPUT_LEN_LABEL: &str = "max_req_input_len";
+pub const SUPPORTS_DISAGG_MAX_REQ_INPUT_LEN_LABEL: &str = "supports_disagg_max_req_input_len";
+
+/// These labels describe backend capabilities and must never be supplied or
+/// overwritten by worker registration/update requests.
+pub fn is_pd_input_limit_metadata_label(key: &str) -> bool {
+    matches!(
+        key,
+        MAX_REQ_INPUT_LEN_LABEL | SUPPORTS_DISAGG_MAX_REQ_INPUT_LEN_LABEL
+    )
+}
+
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(DEFAULT_WORKER_HTTP_TIMEOUT_SECS))
@@ -163,6 +176,22 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Returns cached port from WorkerType::Prefill
     fn bootstrap_port(&self) -> Option<u16> {
         self.metadata().bootstrap_port
+    }
+
+    /// Maximum prompt length accepted by this worker after tokenization.
+    fn max_req_input_len(&self) -> Option<usize> {
+        self.metadata()
+            .labels
+            .get(MAX_REQ_INPUT_LEN_LABEL)
+            .and_then(|value| value.parse().ok())
+    }
+
+    /// Whether this worker honors the router-provided PD shared input limit.
+    fn supports_disagg_max_req_input_len(&self) -> bool {
+        self.metadata()
+            .labels
+            .get(SUPPORTS_DISAGG_MAX_REQ_INPUT_LEN_LABEL)
+            .is_some_and(|value| value == "true")
     }
 
     /// Check if the worker is currently healthy

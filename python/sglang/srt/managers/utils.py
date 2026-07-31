@@ -3,7 +3,8 @@ from __future__ import annotations
 import dataclasses
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import torch
 
@@ -20,6 +21,34 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_disagg_max_req_input_len(
+    local_max_req_input_len: int,
+    disagg_max_req_input_len: Optional[int],
+) -> Tuple[Optional[int], Optional[str], Optional[HTTPStatus]]:
+    """Resolve the prompt limit shared by a router-selected P/D pair."""
+    if disagg_max_req_input_len is None:
+        return local_max_req_input_len, None, None
+
+    if disagg_max_req_input_len <= 0:
+        return (
+            None,
+            "Invalid disagg_max_req_input_len: the value must be positive, "
+            f"got {disagg_max_req_input_len}.",
+            HTTPStatus.BAD_REQUEST,
+        )
+
+    if disagg_max_req_input_len > local_max_req_input_len:
+        return (
+            None,
+            "PD shared input limit exceeds this worker's local capacity: "
+            f"disagg_max_req_input_len={disagg_max_req_input_len}, "
+            f"local_max_req_input_len={local_max_req_input_len}.",
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
+    return disagg_max_req_input_len, None, None
 
 
 def _async_d2h(t: torch.Tensor) -> torch.Tensor:
