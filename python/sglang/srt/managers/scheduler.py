@@ -167,6 +167,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
 )
+from sglang.srt.managers.rust_server import RustServer
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -185,7 +186,10 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
-from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
+from sglang.srt.managers.scheduler_components.idle_sleeper import (
+    IdleSleeper,
+    RustServerIdleSleeper,
+)
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
     create_scheduler_watchdog,
@@ -597,6 +601,10 @@ class Scheduler(
 
         self.maybe_init_scripted_scheduler_hook()
 
+        # Start the embedded Rust frontend (rank 0) before the request receiver,
+        # which reads self.rust_ring_recv to pick its ingress transport.
+        self.maybe_init_rust_server()
+
         self.init_request_receiver()
 
         self.init_dp_attn_adapter()
@@ -672,9 +680,12 @@ class Scheduler(
         )
 
         self.load_snapshot_writer = None
+        self.recv_from_tokenizer = None
+
         if not is_rank_zero:
             return
 
+        self.recv_from_tokenizer = self.ipc_channels.recv_from_tokenizer
         dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
         try:
             self.load_snapshot_writer = create_load_snapshot_writer(
@@ -1748,11 +1759,16 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if not isinstance(output, RpcReqOutput):
-                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
-                else:
+                if self.rust_server is not None:
+                    # Embedded Rust server: every control-request response goes
+                    # back through the egress ring (the zmq tokenizer socket is
+                    # not consumed); the Rust api_server shapes it per-endpoint.
+                    self.rust_server.push_control_output(recv_req, output)
+                elif isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
+                else:
+                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
@@ -1808,9 +1824,33 @@ class Scheduler(
         else:
             self.scripted_scheduler_hook = None
 
+    def maybe_init_rust_server(self) -> None:
+        """Start the embedded Rust server (rank 0) if ``SGLANG_RUST_SERVER`` is
+        set, and point the ingress receiver at it. All the plumbing lives in
+        ``RustServer`` (scheduler_components/rust_scheduler.py)."""
+
+        is_rank_zero = (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        )
+        if not (envs.SGLANG_RUST_SERVER.get() and is_rank_zero):
+            # Always define the attribute: init_output_streamer and the
+            # process_input_requests hook read self.rust_server unconditionally.
+            self.rust_server = None
+            return
+
+        rust_server = RustServer.launch(self)
+        self.rust_server = rust_server
+        # The rust server *is* the ingress source: SchedulerRequestReceiver
+        # drains its request ring (rust_server_mode) instead of a zmq socket.
+        self.recv_from_tokenizer = rust_server
+        # Park the idle loop on the request ring within the rank-0 rust-server
+        self.idle_sleeper = RustServerIdleSleeper(rust_server)
+
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(
-            recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
+            recv_from_tokenizer=self.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
@@ -1936,6 +1976,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
+            rust_server=self.rust_server,
         )
 
     def init_batch_result_processor(self) -> None:
@@ -3226,11 +3267,6 @@ class Scheduler(
             batch.batch_is_full = False
             return batch
 
-        # Eagerly release lock_ref on completed write-through nodes so they
-        # become evictable, improving batch scheduling headroom.
-        if self.enable_hierarchical_cache:
-            self.tree_cache.flush_write_through_acks()
-
         # Check if decode out of memory
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
@@ -4229,6 +4265,8 @@ class Scheduler(
 
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
+                    if self.ps.pp_size > 1:
+                        prepare_abort(req, "Aborted by AbortReq.")
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
@@ -4243,6 +4281,8 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+                    if self.ps.pp_size > 1:
+                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
@@ -4458,6 +4498,8 @@ class Scheduler(
                 pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
                 scale_phase=ElasticEPStateManager.get_scale_phase(),
             )
+        if (eplb_manager := self.tp_worker.model_runner.eplb_manager) is not None:
+            eplb_manager.disable_rebalance("elastic EP scale-up is pending")
         logger.debug(
             "[Elastic EP][scale] scale requested: target_ep_size=%d; "
             "waiting for a joining cohort",

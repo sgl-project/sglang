@@ -801,7 +801,6 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             all_reduce = get_parallel().attn_tp_group.all_reduce
         else:
             all_reduce = tensor_model_parallel_all_reduce
-
         lora_active = self.lora_active
         if lora_active and should_reduce:
             lora_a_output = self.lora_backend.run_lora_a_sgemm(

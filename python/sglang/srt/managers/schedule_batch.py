@@ -907,6 +907,9 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
+        # per-component nodes this req skipped locking (e.g. mamba on the decode
+        # hold, already COW'd), so their dec releases only what it took.
+        self.skip_lock_node_ids: dict = {}
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
@@ -1447,7 +1450,28 @@ class Req(ReqDllmMixin):
             # Check stop regex
             if len(self.sampling_params.stop_regex_strs) > 0:
                 for stop_regex_str in self.sampling_params.stop_regex_strs:
-                    if re.search(stop_regex_str, tail_str):
+                    # Seatbelt, not validation: patterns are checked at ingress
+                    # (Python's `normalize`, or the rust server's stricter
+                    # `stop_regex_bound`). This runs per decode step on the hot
+                    # path, so an `re.error` escaping here would take the whole
+                    # scheduler down over one malformed request. Fail that request
+                    # instead.
+                    try:
+                        matched = re.search(stop_regex_str, tail_str)
+                    except (re.error, RecursionError) as e:
+                        logger.warning(
+                            "req %s: invalid stop_regex %r (%s); aborting the request",
+                            self.rid,
+                            stop_regex_str,
+                            e,
+                        )
+                        self.finished_reason = FINISH_ABORT(
+                            f"invalid stop_regex {stop_regex_str!r}: {e}",
+                            HTTPStatus.BAD_REQUEST,
+                            "BadRequestError",
+                        )
+                        break
+                    if matched:
                         self.finished_reason = FINISHED_MATCHED_REGEX(
                             matched=stop_regex_str
                         )
@@ -1522,6 +1546,7 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
+        self.skip_lock_node_ids = {}
         self.extend_range = None
         self.dllm_initialized = False
         self.is_retracted = True
@@ -3130,7 +3155,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         and req.decode_batch_idx >= sliding_window_size
                     ):
                         self.tree_cache.dec_swa_lock_only(
-                            req.last_node, req.swa_uuid_for_lock
+                            req.last_node,
+                            req.swa_uuid_for_lock,
+                            skip_lock_node_ids=req.skip_lock_node_ids,
                         )
                         req.swa_prefix_lock_released = True
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
