@@ -178,6 +178,7 @@ class KvVmmArena:
             is_python_module=False,
             verbose=False,
             build_directory=out_dir,
+            no_implicit_headers=True,
         )
         self._so_path = f"{out_dir}/{libname}.so"
         lib = ctypes.CDLL(self._so_path)
