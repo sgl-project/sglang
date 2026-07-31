@@ -30,6 +30,7 @@ Two declaration forms, keyed on ``hf_config.architectures[0]``:
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -336,6 +337,35 @@ def _dspark_verify_on_decode_backend(
     return False
 
 
+_KIMI_K3_DCP_PATCH_URL = (
+    "https://github.com/sgl-project/sglang/blob/"
+    "b701464720ca22aa1851d5dda7144e84a410f2c7/"
+    "docker/kimi_k3/kimi_k3_cu13.Dockerfile#L116-L123"
+)
+
+
+def _require_kimi_k3_cutedsl_dcp_support() -> None:
+    try:
+        from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
+
+        parameters = inspect.signature(trtllm_batch_decode_with_kv_cache_mla).parameters
+    except (ImportError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Kimi-K3 DCP with decode_attention_backend='cutedsl_mla' requires "
+            "a DCP-patched FlashInfer "
+            "trtllm_batch_decode_with_kv_cache_mla exposing enable_dcp in its "
+            f"signature. Apply the patch as shown in {_KIMI_K3_DCP_PATCH_URL}."
+        ) from exc
+
+    if "enable_dcp" not in parameters:
+        raise RuntimeError(
+            "Kimi-K3 DCP with decode_attention_backend='cutedsl_mla' requires "
+            "enable_dcp in the signature of "
+            "flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla. Apply "
+            f"the FlashInfer DCP patch as shown in {_KIMI_K3_DCP_PATCH_URL}."
+        )
+
+
 @_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     if server_args.dcp_size > 1:
@@ -370,6 +400,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 
         prefill_backend, decode_backend = attention_backends_of(server_args)
         if decode_backend == "cutedsl_mla" or decode_backend is None:
+            _require_kimi_k3_cutedsl_dcp_support()
             logger.info(
                 "Kimi-K3 DCP keeps decode attention backend 'cutedsl_mla' "
                 f"(prefill={prefill_backend!r} -> 'trtllm_mla')."
@@ -481,9 +512,10 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # MoE runner default, independent of the attention-backend gate above.
     # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode
     # (M=bs) and the target-verify (M=bs*(gamma+1)) regimes on SM100/SM103;
-    # it hard-requires the SiTU cubin SDK on the box (K3's SiTU activation has
-    # no public cubins), so fall back to marlin when the SDK is absent.
-    if server_args.moe_runner_backend != "auto":
+    # it hard-requires the SiTU cubin pool on the box (K3's SiTU activation has
+    # no public cubins). Do not silently trade W4A8 for Marlin W4A16 when the
+    # default cannot start; explicit non-FlashInfer runner choices still win.
+    if server_args.moe_runner_backend not in ("auto", "flashinfer_mxfp4"):
         return {}
     if not (is_sm100_supported() and get_device_sm() in (100, 103)):
         return {}
@@ -491,17 +523,32 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
         return {}
     from sglang.kernels.ops.moe.trtllm_gen_moe import available as _trtllm_gen_moe_ok
 
-    if _trtllm_gen_moe_ok():
+    if not _trtllm_gen_moe_ok():
+        raise RuntimeError(
+            "Kimi-K3 on Blackwell with moe_runner_backend='auto' or "
+            "'flashinfer_mxfp4' requires a valid "
+            "SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL. Install it with:\n"
+            "wget https://github.com/sgl-project/whl/releases/download/"
+            "trtllm_gen_moe_cubin_20260617/"
+            "trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip\n"
+            "sudo mkdir -p /opt/trtllm_gen_moe_cubin_pool\n"
+            "sudo unzip -q "
+            "trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip -d "
+            "/opt/trtllm_gen_moe_cubin_pool\n"
+            "export "
+            "SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/opt/trtllm_gen_moe_cubin_pool/"
+            "trtllm_gen_moe_cubin_pool_20260617_v0613rc1\n"
+            "To use Marlin "
+            "instead, set --moe-runner-backend marlin explicitly."
+        )
+
+    if server_args.moe_runner_backend == "auto":
         logger.info(
             "Kimi-K3 on SM100/SM103: moe_runner_backend=flashinfer_mxfp4 "
-            "(trtllm-gen SiTU cubin SDK found)."
+            "(trtllm-gen SiTU cubin pool found)."
         )
         return {"moe_runner_backend": "flashinfer_mxfp4"}
-    logger.info(
-        "Kimi-K3 on SM100/SM103: trtllm-gen MoE SDK not found; "
-        "moe_runner_backend=marlin."
-    )
-    return {"moe_runner_backend": "marlin"}
+    return {}
 
 
 @_register_for(
