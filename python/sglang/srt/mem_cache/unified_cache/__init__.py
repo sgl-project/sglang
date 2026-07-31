@@ -5,7 +5,7 @@
   events -- the only object that touches that state; no scheduling policy or IO,
   and never touches the cache. References the cache-owned component drivers to
   drive their tree-level hooks.
-- **Components** (``unified_cache_components.TreeComponent`` subclasses): the
+- **Components** (``unified_cache.components.TreeComponent`` subclasses): the
   per-component (FULL/SWA/MAMBA) drivers. Built and owned by the Controller;
   hold the cache for cache-level logic and the TreeCore for tree state.
 - **Controller** (``unified_radix_cache.UnifiedRadixCache``): the scheduling brain

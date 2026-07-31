@@ -208,6 +208,11 @@ class GenerateReqInput:
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
+    # Return prompt top logprobs as flat arrays plus shape metadata instead of
+    # the nested per-position [logprob, token_id, text] lists.
+    return_flat_raw_top_logprobs: bool = False
+    # Base64-encode the flat arrays. Requires return_flat_raw_top_logprobs.
+    return_flat_raw_top_logprobs_b64: bool = False
     # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -368,6 +373,22 @@ class GenerateReqInput:
         ):
             raise ValueError(
                 "Either text, input_ids or input_embeds should be provided."
+            )
+        if (
+            self.return_flat_raw_top_logprobs
+            and self.multi_item_delimiter_indices is not None
+        ):
+            raise ValueError(
+                "return_flat_raw_top_logprobs does not support multi-item "
+                "scoring: delimiter-sparse top logprob rows have no contiguous "
+                "position mapping."
+            )
+        if (
+            self.return_flat_raw_top_logprobs_b64
+            and not self.return_flat_raw_top_logprobs
+        ):
+            raise ValueError(
+                "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs."
             )
 
     def _determine_batch_size(self):
@@ -724,6 +745,8 @@ class GenerateReqInput:
             token_ids_logprob=self.token_ids_logprob[i],
             return_sampling_mask=self.return_sampling_mask[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
+            return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
+            return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
             return_hidden_states=(
@@ -2036,7 +2059,10 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
     # The PEFT adapter_config.json, already JSON — a tighter type would only add
     # decode strictness with no benefit.
     config_dict: Dict[str, Any]
-    serialized_tensors: str
+    # One serialized copy of the adapter tensors per TP rank; each rank
+    # deserializes only its own copy. Same normalization conventions as
+    # UpdateWeightsFromTensorReqInput.serialized_named_tensors.
+    serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
     pinned: bool = False
     added_tokens_config: Optional[Dict[str, int]] = None
     lora_id: Optional[str] = None
