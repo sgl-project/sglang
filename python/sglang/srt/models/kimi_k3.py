@@ -344,6 +344,8 @@ def _add3(
         return a + b
     from sglang.kernels.ops.elementwise import add3
 
+    if not add3.covered(a, b, c):
+        return (a + b) + c
     return add3.add3(a, b, c, prefetch_bc=prefetch_bc)
 
 
@@ -489,7 +491,11 @@ class KimiK3MoE(nn.Module):
         # (DP attention) — with every global token dispatched exactly once.
         # No DP gather and no TP reduce is needed anywhere in the region.
         _a2a_backend = get_moe_a2a_backend()
-        self._ep_a2a = _a2a_backend.is_megamoe() or _a2a_backend.is_deepep()
+        self._ep_a2a = (
+            _a2a_backend.is_megamoe()
+            or _a2a_backend.is_deepep()
+            or _a2a_backend.is_ascend_fuseep()
+        )
 
         # The flashinfer_mxfp4 (trtllm-gen) runner quantizes routed_input with
         # the strided-input JIT group quant (_use_jit_mxfp8_quant in mxfp4.py),
@@ -553,11 +559,20 @@ class KimiK3MoE(nn.Module):
 
         # Latent MoE projections
         if self.use_latent_moe:
+            latent_quant_config = (
+                quant_config
+                if getattr(
+                    quant_config,
+                    "supports_kimi_k3_quantized_latent_projections",
+                    False,
+                )
+                else None
+            )
             self.routed_expert_down_proj = ReplicatedLinear(
                 hidden_size,
                 self.moe_hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=latent_quant_config,
                 prefix=f"{prefix}.routed_expert_down_proj",
             )
             self.routed_expert_norm = (
@@ -569,7 +584,7 @@ class KimiK3MoE(nn.Module):
                 self.moe_hidden_size,
                 hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=latent_quant_config,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
         else:
@@ -1946,7 +1961,11 @@ class KimiK3DecoderLayer(nn.Module):
         # token shard.
         _a2a_backend = get_moe_a2a_backend()
         self._sp_moe = (
-            (_a2a_backend.is_megamoe() or _a2a_backend.is_deepep())
+            (
+                _a2a_backend.is_megamoe()
+                or _a2a_backend.is_deepep()
+                or _a2a_backend.is_ascend_fuseep()
+            )
             and self._is_moe_layer
             and get_parallel().attn_tp_group.world_size > 1
         )
@@ -3004,10 +3023,20 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
         self.language_model = None
         if not config.encoder_only:
+            quant_description = getattr(quant_config, "quant_description", {})
+            uses_wrapper_quant_prefix = any(
+                isinstance(name, str) and name.startswith("language_model.")
+                for name in quant_description
+            )
+            language_prefix = (
+                maybe_prefix(prefix, "language_model")
+                if uses_wrapper_quant_prefix
+                else prefix
+            )
             self.language_model = KimiK3LinearForCausalLM(
                 config.text_config,
                 quant_config,
-                prefix="",
+                prefix=language_prefix,
             )
 
     @property

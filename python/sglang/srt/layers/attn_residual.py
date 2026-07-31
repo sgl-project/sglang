@@ -34,7 +34,12 @@ def _use_fast(hidden_size: int) -> bool:
     template instantiation; everything else takes the triton pipeline."""
     global _FAST_SUPPORTED
     if _FAST_SUPPORTED is None:
-        major, _ = torch.cuda.get_device_capability()
+        capability = (
+            torch.cuda.get_device_capability()
+            if torch.cuda.is_available()
+            else None
+        )
+        major = capability[0] if capability is not None else -1
         _FAST_SUPPORTED = major >= 10
     return _FAST_SUPPORTED and hidden_size == 7168
 

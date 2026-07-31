@@ -213,9 +213,14 @@ def kda_target_verify_npu(
         raise ValueError("a must have shape [tokens, H_k, K]")
     if tuple(b.shape) != (q.shape[1], h_v):
         raise ValueError("b must have shape [tokens, H_v]")
+    # K3 stores A_log as [1, 1, H_k, 1] and dt_bias as [H_k * K].
+    # The kernel reads both as flat buffers, so validate element counts.
     if (
         not gates_are_preactivated
-        and (A_log.numel() != h_k or tuple(dt_bias.shape) != (h_k, key_dim))
+        and (
+            A_log.numel() != h_k
+            or dt_bias.numel() != h_k * key_dim
+        )
     ):
         raise ValueError("A_log and dt_bias shapes do not match KDA heads")
     if (
