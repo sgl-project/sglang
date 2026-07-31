@@ -32,6 +32,13 @@ class TritonLoRABackend(BaseLoRABackend):
         **kwargs,
     ):
         super().__init__(max_loras_per_batch, device)
+        # Merged-segment variant of batch_info; set alongside it in
+        # prepare_lora_batch and cleared together in reset_batch_state.
+        self.sgemm_batch_info: Optional[LoRABatchInfo] = None
+
+    def reset_batch_state(self):
+        super().reset_batch_state()
+        self.sgemm_batch_info = None
 
     def run_lora_a_embedding(
         self,
@@ -55,7 +62,12 @@ class TritonLoRABackend(BaseLoRABackend):
         """Return the sgemm batch_info (merged segments when available)."""
         if pruned_batch_info is not None:
             return pruned_batch_info
-        return getattr(self, "sgemm_batch_info", None) or self.batch_info
+        assert self.batch_info is not None, (
+            "LoRA kernel invoked with no prepared batch (DP-attention idle "
+            "forward?). Gate the caller on lora_active, as in "
+            "sglang/srt/lora/layers.py forwards."
+        )
+        return self.sgemm_batch_info or self.batch_info
 
     def run_lora_a_sgemm(
         self,

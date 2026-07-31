@@ -849,6 +849,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            if model_runner.server_args.enable_lora:
+                model_runner.lora_manager.reset_lora_batch()
             return ret
 
         # Override the positions with diffusion LLM or spec_info
