@@ -1335,9 +1335,13 @@ class GptOssForCausalLM(nn.Module):
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
             self.capture_aux_hidden_states = True
-            # EAGLE3 configs index hidden-state boundaries: layer N is the
-            # output after N transformer blocks, including the final boundary.
-            self.model.layers_to_capture = list(layer_ids)
+            # EAGLE3 configs use either output-layer IDs (starting at 1) or
+            # hidden-state boundary IDs. Mirror DeepseekV2ForCausalLM:
+            # convert the former to boundary indices and preserve the latter.
+            if layer_ids and layer_ids[0] == 1:
+                self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            else:
+                self.model.layers_to_capture = list(layer_ids)
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
         if not self.pp_group.is_last_rank:
