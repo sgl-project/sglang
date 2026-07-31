@@ -365,7 +365,7 @@ def test_lingbot_realtime_adapter_rejects_composite_input_atomically():
 
     state = adapter._state(session)
     assert not state.has_prompt()
-    assert state.sample_camera_actions(3) is None
+    assert state.sample_camera_actions(3) == [[], [], []]
 
 
 def test_lingbot_realtime_prompt_event_marks_crossattn_reset():

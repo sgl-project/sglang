@@ -256,8 +256,8 @@ def test_raw_rgb_realtime_output_adapter_defaults_to_webp_preview_frames():
     assert first_header["content_type"] == WEBP_FRAME_CONTENT_TYPE
     assert first_header["encoding"] == "webp"
     assert first_header["source_width"] == 1000
-    assert first_header["preview_width"] == 640
-    assert first_header["width"] == 640
+    assert first_header["preview_width"] == 480
+    assert first_header["width"] == 480
     assert first_header["num_frames"] == 2
     assert first_payload.startswith(b"RIFF")
 
@@ -334,6 +334,7 @@ def test_raw_rgb_realtime_output_adapter_does_not_require_previous_frame_referen
             height=1,
             enable_upscaling=False,
             realtime_event_id=9,
+            realtime_output_format="raw",
         )
         next_batch = SimpleNamespace(
             block_idx=1,
@@ -342,6 +343,7 @@ def test_raw_rgb_realtime_output_adapter_does_not_require_previous_frame_referen
             height=1,
             enable_upscaling=False,
             realtime_event_id=9,
+            realtime_output_format="raw",
         )
         metadata = {
             "format": "rgb24",
@@ -397,6 +399,7 @@ def test_raw_rgb_realtime_output_adapter_splits_large_frame_batches():
             height=1,
             enable_upscaling=False,
             realtime_event_id=12,
+            realtime_output_format="raw",
         )
         result = OutputBatch(
             raw_frame_batches=[frames],
@@ -447,6 +450,7 @@ def test_raw_rgb_realtime_output_adapter_sends_large_payload_separately():
             height=1,
             enable_upscaling=False,
             realtime_event_id=3,
+            realtime_output_format="raw",
         )
         result = OutputBatch(
             raw_frame_batches=[[frame]],
