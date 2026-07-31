@@ -7,7 +7,9 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
@@ -20,7 +22,6 @@ from sglang.srt.layers.moe.topk import (
     remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
-from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_hip, is_npu
 
 logger = logging.getLogger(__name__)
@@ -43,9 +44,10 @@ class HashTopK(nn.Module):
     ):
         super().__init__()
         self.layer_id = layer_id
+        from sglang.srt.runtime_context import get_server_args
 
         self.enable_waterfill = (
-            num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
+            num_fused_shared_experts > 0 and get_server_args().enable_waterfill
         )
         self.waterfill_balancer = None
 

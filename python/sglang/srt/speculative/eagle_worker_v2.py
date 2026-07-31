@@ -21,7 +21,9 @@ from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
-from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+from sglang.srt.layers.attention.trtllm_mla_backend import (
+    TRTLLMMLABackend,
+)
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -41,13 +43,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.runtime_context import (
-    get_context,
-    get_exec,
-    get_model,
-    get_parallel,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -140,7 +136,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Args for easy access
         self.device = server_args.device
         self.topk = server_args.speculative_eagle_topk
-        if get_spec().speculative_use_rejection_sampling:
+        if self.server_args.speculative_use_rejection_sampling:
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
@@ -148,9 +144,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             server_args.speculative_algorithm
         )
 
-        # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
-        self._topk1_parents_prealloc = None
-        self._topk1_score_indices_prealloc = None
         self._rebuild_topk1_chain_buffers()
 
         # Load draft model weights only.
@@ -199,7 +192,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.init_token_map()
         self.init_lm_head()
 
-        if get_spec().speculative_use_rejection_sampling:
+        if self.server_args.speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
             draft_vocab_size = (
                 self.hot_token_id.shape[0]
@@ -255,50 +248,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
         )
 
-    def _rebuild_topk1_chain_buffers(self) -> None:
-        # For topk=1 the draft tree degenerates to a chain, so parent_list and
-        # top_scores_index are runtime-invariant. Must be rebuilt after any
-        # change to speculative_num_steps / speculative_num_draft_tokens.
-        if self.topk != 1:
-            return
-        # _override_worker_state can set both directly, bypassing the hook that
-        # pins this relation; the fast path is only valid when it holds.
-        assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
-            "topk=1 requires speculative_num_draft_tokens == speculative_num_steps + 1, "
-            f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
-        )
-        num_steps = self.speculative_num_steps
-        sa = self.server_args
-        decode_max_bs = (
-            sa.cuda_graph_config.decode.max_bs
-            if sa.cuda_graph_config is not None
-            else None
-        )
-        max_bs = max(
-            decode_max_bs or 0,
-            sa.max_running_requests or 0,
-            1,
-        )
-        # A single-step chain has no parent entries (slow path drops the last
-        # step). repeat (not expand): the kernel reads these as contiguous.
-        parent_width = num_steps if num_steps > 1 else 0
-        self._topk1_parents_prealloc = torch.arange(
-            -1, parent_width - 1, dtype=torch.long, device=self.device
-        ).repeat(max_bs, 1)
-        self._topk1_score_indices_prealloc = torch.arange(
-            num_steps, dtype=torch.long, device=self.device
-        ).repeat(max_bs, 1)
-
     def init_token_map(self):
         # Load hot token ids
         if self.speculative_algorithm.is_eagle3():
-            if get_spec().speculative_token_map is not None:
+            if self.server_args.speculative_token_map is not None:
                 logger.warning(
                     "Speculative token map specified, but EAGLE3 models already have this. Ignoring the specified token map."
                 )
             self.hot_token_id = None
-        elif get_spec().speculative_token_map is not None:
-            self.hot_token_id = load_token_map(get_spec().speculative_token_map)
+        elif self.server_args.speculative_token_map is not None:
+            self.hot_token_id = load_token_map(self.server_args.speculative_token_map)
             self.server_args.override(
                 "eagle_worker.hot_token_map",
                 json_model_override_args=(
@@ -383,7 +342,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
-        if get_model().model_impl == "mindspore":
+        if self.server_args.model_impl == "mindspore":
             return
 
         Device2DraftCudaGraphRunner = {
@@ -393,7 +352,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             "musa": EAGLEDraftCudaGraphRunner,
         }
         # Capture draft
-        decode_backend = get_exec().graph.cuda_graph_config.decode.backend
+        decode_backend = self.server_args.cuda_graph_config.decode.backend
         capture_bs, _ = get_batch_sizes_to_capture(self.draft_runner)
         if self.speculative_num_steps > 1:
             tic = time.perf_counter()
@@ -590,7 +549,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
-        if get_spec().speculative_use_rejection_sampling:
+        if self.server_args.speculative_use_rejection_sampling:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
 
         topk1_chain_fits = (
@@ -605,7 +564,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk1_chain_fits
             and _is_cuda
             and self.hot_token_id is None
-            and not get_spec().speculative_use_rejection_sampling
+            and not self.server_args.speculative_use_rejection_sampling
         ):
             draft_tokens_topk1 = torch.empty(
                 (topk_index.shape[0], self.speculative_num_steps),
@@ -670,7 +629,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            if get_spec().speculative_use_rejection_sampling:
+            if self.server_args.speculative_use_rejection_sampling:
                 probs, topk_p, topk_index = sample_draft_proposal(
                     logits_output.next_token_logits,
                     forward_batch.sampling_info.temperatures,
@@ -696,7 +655,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 probs = renorm_draft_probs(
                     logits_output.next_token_logits,
                     forward_batch.sampling_info,
-                    get_spec().speculative_use_rejection_sampling,
+                    self.server_args.speculative_use_rejection_sampling,
                 )
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                 forward_batch.positions.add_(1)
@@ -716,7 +675,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1)
-            if get_spec().speculative_use_rejection_sampling
+            if self.server_args.speculative_use_rejection_sampling
             else None
         )
 
@@ -836,7 +795,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             prefill_dsa_topk = self.dsa_extend_topk_buf[:bs].clone()
 
         # Assemble the next-iter draft spec_info from the extend output.
-        use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+        use_rejection_sampling = self.server_args.speculative_use_rejection_sampling
         probs = renorm_draft_probs(
             logits_output.next_token_logits,
             batch.sampling_info,
@@ -982,7 +941,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ]
         # The draft-extend graph only anchors full logits; selected-row topk is
         # owned by the worker for both graph and eager paths.
-        if get_spec().speculative_use_rejection_sampling:
+        if self.server_args.speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
@@ -999,7 +958,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             probs = renorm_draft_probs(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info,
-                get_spec().speculative_use_rejection_sampling,
+                self.server_args.speculative_use_rejection_sampling,
             )
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             ret_draft_probs = None
@@ -1016,7 +975,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_index,
             ret_hidden_states,
         )
-        if get_spec().speculative_use_rejection_sampling:
+        if self.server_args.speculative_use_rejection_sampling:
             next_draft_input.draft_probs = ret_draft_probs
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
@@ -1119,7 +1078,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     cuda_graph_bs=(
                         None
                         if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-                        else get_exec().graph.cuda_graph_bs_decode
+                        else self.server_args.cuda_graph_bs_decode
                     ),
                 )
 
@@ -1242,9 +1201,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         retrieve_next_sibling = torch.full((bs, 1), -1, dtype=torch.long, device=device)
 
         attn_backend = self._target_worker.model_runner.attn_backend
-        mask_buf, position_buf = attn_backend.get_verify_buffers_to_fill_after_draft()
-        if mask_buf is not None:
-            custom_mask = mask_buf
+        verify_mask = attn_backend.verify_mask
+        # Every position in a 1-node tree is visible, so an all-True fill is
+        # correct under either layout.
+        if verify_mask is not None and verify_mask.fits(bs, 1):
+            custom_mask = verify_mask.buffer
             custom_mask.fill_(True)
         else:
             if batch.seq_lens_sum is not None:
@@ -1255,11 +1216,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 seq_lens_sum = bs * attn_backend.max_context_len
             custom_mask = torch.ones(seq_lens_sum + bs, dtype=torch.bool, device=device)
 
-        if position_buf is not None:
-            positions = position_buf
-            positions[:bs].copy_(batch.seq_lens)
-        else:
-            positions = batch.seq_lens.to(torch.int64)
+        positions = batch.seq_lens.to(torch.int64)
 
         return EagleVerifyInput(
             draft_token=draft_input.bonus_tokens,
@@ -1422,29 +1379,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             state.target_graph_runner
         )
 
-        # Sync the step/draft-token counts on both config stores.
-        self._apply_adaptive_config(
+        # Sync server_args
+        self.server_args.override(
             "adaptive_spec.restore",
             speculative_num_steps=state.speculative_num_steps,
             speculative_num_draft_tokens=state.speculative_num_draft_tokens,
         )
-
-    def _apply_adaptive_config(self, source: str, **fields) -> None:
-        """Rebind adaptive-spec config on both stores that back these fields.
-
-        Adaptive speculative decoding temporarily changes the step / draft-token
-        counts (and the decode graph-capture knobs) while it prebuilds per-step
-        runtime states. Those fields are read from two places: the resolved
-        config bag (runtime readers such as ``tp_worker`` / ``tokenizer_manager``
-        via ``get_spec()``) *and* ``server_args`` — attention backends and graph
-        runners read the count as ``model_runner.server_args.<field>`` and are
-        not migrated to the bag. Write both so an in-flight CUDA-graph capture
-        and later reads agree; updating only the bag leaves a rebuilt attention
-        backend sizing its metadata from the stale ``server_args`` count while
-        the graph is captured for the overridden count, which corrupts the
-        capture (illegal memory access)."""
-        get_context().override(source, **fields)
-        self.server_args.override(source, **fields)
 
     @contextlib.contextmanager
     def _override_worker_state(
@@ -1477,7 +1417,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
         dw.speculative_num_steps = speculative_num_steps
         dw.speculative_num_draft_tokens = speculative_num_draft_tokens
-        self._apply_adaptive_config(
+        sa.override(
             "adaptive_spec.capture_override",
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
@@ -1487,7 +1427,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # for steps that no BS range uses (e.g. step=1). Disable graph
             # capture for those steps; restore in finally so subsequent steps
             # are not affected.
-            self._apply_adaptive_config(
+            sa.override(
                 "adaptive_spec.capture_override",
                 cuda_graph_bs_decode=cuda_graph_bs,
                 **({"disable_cuda_graph": True} if not cuda_graph_bs else {}),
@@ -1509,7 +1449,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dw.cuda_graph_runner,
                 dw.cuda_graph_runner_for_draft_extend,
             ) = backup[:10]
-            self._apply_adaptive_config(
+            sa.override(
                 "adaptive_spec.capture_restore",
                 speculative_num_steps=backup[10],
                 speculative_num_draft_tokens=backup[11],

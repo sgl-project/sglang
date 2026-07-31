@@ -16,7 +16,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.runtime_context import get_server_args, get_serving
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -123,9 +123,10 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
                 EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
             )
     else:
-        # Standard allocator
-        if allocator.available_size() < num_tokens:
-            tree_cache.evict(EvictParams(num_tokens=num_tokens))
+        # Standard allocator: evict only the shortfall (mirrors the SWA arm)
+        available_size = allocator.available_size()
+        if available_size < num_tokens:
+            tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
@@ -183,7 +184,7 @@ def _release_overallocated_kv_indices(
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
-    if spec_algo is None and not get_serving().strip_thinking_cache:
+    if spec_algo is None and not global_server_args.strip_thinking_cache:
         assert (
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
@@ -195,7 +196,11 @@ def _release_overallocated_kv_indices(
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
-        tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+        # start_p is ceil-aligned above: never shares a page with
+        # cache_finished_req's tail frees in the same group.
+        tree_cache.token_to_kv_pool_allocator.free_segment(
+            indices_to_free, start_pos=start_p
+        )
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
