@@ -276,7 +276,12 @@ class FusedMoE(torch.nn.Module):
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
         assert intermediate_size % self.moe_tp_size == 0
-        self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
+        self.intermediate_size_per_partition_unpadded = (
+            intermediate_size // self.moe_tp_size
+        )
+        self.intermediate_size_per_partition = (
+            self.intermediate_size_per_partition_unpadded
+        )
         self.reduce_results = reduce_results
         self.use_presharded_weights = use_presharded_weights
 
@@ -680,8 +685,8 @@ class FusedMoE(torch.nn.Module):
             shard_size = expert_data.shape[shard_dim]
 
         if self.use_padded_loading:
-            if _is_cpu and is_bias:
-                shard_dim = 1
+            if is_bias:
+                shard_dim = -1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,

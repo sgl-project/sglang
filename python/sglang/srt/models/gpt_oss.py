@@ -44,7 +44,10 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    should_skip_post_experts_all_reduce,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -118,6 +121,26 @@ class GptOssConfig(PretrainedConfig):
 logger = logging.getLogger(__name__)
 
 
+def _narrow_fused_moe_ep_weight(
+    loaded_weight: torch.Tensor, num_experts: int
+) -> torch.Tensor:
+    parallel = get_parallel()
+    if parallel.moe_ep_size == 1:
+        return loaded_weight
+    assert num_experts % parallel.moe_ep_size == 0
+    num_local_experts = num_experts // parallel.moe_ep_size
+    if loaded_weight.shape[0] == num_local_experts:
+        return loaded_weight
+    if loaded_weight.shape[0] != num_experts:
+        raise ValueError(
+            f"Expected {num_experts} global or {num_local_experts} local experts, "
+            f"got {loaded_weight.shape[0]}"
+        )
+    return loaded_weight.narrow(
+        0, parallel.moe_ep_rank * num_local_experts, num_local_experts
+    )
+
+
 # Aligned with HF's implementation, using sliding window inclusive with the last token
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
@@ -147,6 +170,9 @@ class TinyGemmLinear(ReplicatedLinear):
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if x.ndim == 2 and x.shape[0] == 0:
+            return x.new_empty((0, self.output_size)), None
+
         if (
             self._use_tinygemm
             and x.ndim == 2
@@ -330,7 +356,9 @@ class GptOssSparseMoeBlock(nn.Module):
             topk_output = self.topk(router_input, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         # When input was pre-padded, FusedMoE.forward_impl captured the
@@ -1253,6 +1281,9 @@ class GptOssForCausalLM(nn.Module):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
+                    loaded_weight = _narrow_fused_moe_ep_weight(
+                        loaded_weight, self.config.num_local_experts
+                    )
                     if "bias" not in name:
                         loaded_weight = loaded_weight.transpose(-2, -1)
                     if "w2_weight_bias" in name and get_parallel().moe_tp_rank != 0:
