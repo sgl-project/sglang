@@ -17,14 +17,26 @@ def _jit_sparse_module(
     block_size: int,
     num_top_k: int,
     hot_buffer_size: int,
+    host_cache_locs_dtype: torch.dtype,
     is_mla: bool = False,
     is_dsv4_layout: bool = False,
 ) -> Module:
     template_args = make_cpp_args(
-        block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        is_mla,
+        is_dsv4_layout,
+        host_cache_locs_dtype,
     )
     cache_args = make_cpp_args(
-        item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout
+        item_size_bytes,
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        host_cache_locs_dtype,
+        is_mla,
+        is_dsv4_layout,
     )
     return load_jit(
         "sparse_cache",
@@ -37,6 +49,20 @@ def _jit_sparse_module(
             )
         ],
     )
+
+
+def _validate_host_cache_locs(host_cache_locs: torch.Tensor) -> None:
+    if host_cache_locs.dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            "host_cache_locs must use torch.int32 or torch.int64, "
+            f"got {host_cache_locs.dtype}"
+        )
+    if host_cache_locs.ndim != 2:
+        raise ValueError(
+            f"host_cache_locs must be 2D, got {host_cache_locs.ndim} dimensions"
+        )
+    if not host_cache_locs.is_contiguous():
+        raise ValueError("host_cache_locs must be contiguous")
 
 
 @functools.cache
@@ -95,12 +121,14 @@ def _load_cache_to_device_buffer_mla(
     assert (
         hot_buffer_size >= num_top_k
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    _validate_host_cache_locs(host_cache_locs)
 
     module = _jit_sparse_module(
         item_size_bytes,
         block_size,
         num_top_k,
         hot_buffer_size,
+        host_cache_locs.dtype,
         is_mla=True,
         is_dsv4_layout=is_dsv4_layout,
     )
@@ -149,7 +177,7 @@ def load_cache_to_device_buffer_mla(
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
 ) -> None:
-    """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
+    """Generic MLA swap-in with a contiguous int32/int64 host-location table."""
     _load_cache_to_device_buffer_mla(
         is_dsv4_layout=False,
         top_k_tokens=top_k_tokens,
@@ -189,7 +217,7 @@ def load_cache_to_device_buffer_dsv4_mla(
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
 ) -> None:
-    """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
+    """DSv4 paged-layout swap-in with an int32/int64 host-location table."""
     _load_cache_to_device_buffer_mla(
         is_dsv4_layout=True,
         top_k_tokens=top_k_tokens,

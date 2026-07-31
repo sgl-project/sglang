@@ -139,6 +139,7 @@ def _make_state(
     device_buffer_locs_rows: list[list[int]],
     device_buffer_tokens_rows: list[list[int]],
     newest_tokens: list[int],
+    host_cache_locs_dtype: torch.dtype = torch.int64,
 ):
     host_cache = _host_cache()
     device_buffer = torch.full(
@@ -156,7 +157,7 @@ def _make_state(
         .repeat(device_buffer_locs.shape[0], 1)
     )
     host_cache_locs = (
-        torch.arange(HOST_CACHE_SIZE, dtype=torch.int64, device=DEVICE)
+        torch.arange(HOST_CACHE_SIZE, dtype=host_cache_locs_dtype, device=DEVICE)
         .view(1, -1)
         .repeat(device_buffer_locs.shape[0], 1)
     )
@@ -260,13 +261,18 @@ def test_dsv4_swap_in_reads_paged_host_layout() -> None:
     )
 
 
-def _long_case():
+def _long_case(host_cache_locs_dtype: torch.dtype = torch.int64):
     # One-request baseline used by the stateful cases below:
     # req 0 LRU slots      : [0, 1, 2, 3]
     # req 0 cached tokens  : slot0->1, slot1->4, slot2->2, slot3->5
     # req 0 physical locs  : slot0->9, slot1->7, slot2->3, slot3->5
     # req 0 newest slot    : slot4/newest -> token 7 at physical loc 11
-    return _make_state([[9, 7, 3, 5, 11]], [[1, 4, 2, 5, -1]], [7])
+    return _make_state(
+        [[9, 7, 3, 5, 11]],
+        [[1, 4, 2, 5, -1]],
+        [7],
+        host_cache_locs_dtype=host_cache_locs_dtype,
+    )
 
 
 @pytest.mark.parametrize("seq_lens_dtype", [torch.int32, torch.int64])
@@ -351,8 +357,11 @@ def test_load_cache_to_device_buffer_hits_newest_and_updates_lru() -> None:
     )
 
 
-def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot() -> None:
-    state = _long_case()
+@pytest.mark.parametrize("host_cache_locs_dtype", [torch.int32, torch.int64])
+def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot(
+    host_cache_locs_dtype: torch.dtype,
+) -> None:
+    state = _long_case(host_cache_locs_dtype)
 
     # Step 1: touch tokens [4, 2], so LRU becomes [0, 3, 1, 2].
     # Step 2: query token 6, which is a miss.

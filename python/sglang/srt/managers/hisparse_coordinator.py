@@ -288,6 +288,16 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req_pool_idx] = 0
 
+    def get_swap_host_cache_locs(self) -> torch.Tensor:
+        """Return the request-position-to-CPU-L1 table used by swap-in.
+
+        Radix reuses ReqToTokenPool's canonical int32 L1 table directly. The
+        legacy path keeps its independent int64 request-to-host allocation.
+        """
+        if self.is_radix_hisparse:
+            return self.req_to_token_pool.req_to_token
+        return self.req_to_host_pool
+
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True
 
@@ -876,7 +886,7 @@ class HiSparseCoordinator:
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
-            host_cache_locs=self.req_to_host_pool,
+            host_cache_locs=self.get_swap_host_cache_locs(),
             device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
             host_cache=self.mem_pool_host.kv_buffer[layer_id],
             device_buffer=self.mem_pool_device.kv_buffer[layer_id],
