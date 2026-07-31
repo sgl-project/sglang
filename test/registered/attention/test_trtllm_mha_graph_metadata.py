@@ -49,7 +49,7 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     return backend
 
 
-def test_cuda_graph_metadata_launch_runs_in_out_graph_hook(monkeypatch):
+def test_cuda_graph_metadata_launch_runs_in_graph_hook(monkeypatch):
     calls = []
 
     def fake_update(**kwargs):
@@ -70,21 +70,20 @@ def test_cuda_graph_metadata_launch_runs_in_out_graph_hook(monkeypatch):
     )
 
     backend.init_forward_metadata_out_graph(fb, in_capture=True)
-    assert len(calls) == 1
-    assert calls[0]["out_cache_loc"] is fb.out_cache_loc
+    assert calls == []
     assert backend.forward_metadata is backend.decode_cuda_graph_metadata[2]
 
     backend.init_forward_metadata_in_graph(fb)
     assert len(calls) == 1
+    assert calls[0]["out_cache_loc"] is fb.out_cache_loc
 
     calls.clear()
     backend.init_forward_metadata_out_graph(fb)
-    assert len(calls) == 1
-    assert calls[0]["out_cache_loc"] is fb.out_cache_loc
+    assert calls == []
     assert backend.forward_metadata is backend.decode_cuda_graph_metadata[2]
 
 
-def test_draft_extend_out_graph_uses_captured_static_q_stride(monkeypatch):
+def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
     calls = []
 
     def fake_update(**kwargs):
@@ -92,7 +91,7 @@ def test_draft_extend_out_graph_uses_captured_static_q_stride(monkeypatch):
 
     class ExplodingAcceptTokens:
         def __getitem__(self, key):
-            raise AssertionError("metadata must not inspect accept tokens")
+            raise AssertionError("in-graph metadata must not inspect accept tokens")
 
     monkeypatch.setattr(
         trtllm_mha_backend, "update_trtllm_mha_graph_metadata", fake_update
@@ -112,9 +111,9 @@ def test_draft_extend_out_graph_uses_captured_static_q_stride(monkeypatch):
     )
 
     backend.init_forward_metadata_out_graph(fb, in_capture=True)
-    # Metadata is rebuilt at replay preparation; later spec_info mutations
-    # must not affect the captured static stride.
+    # The in-graph body must use the captured static stride, not replay-time state.
     fb.spec_info.num_tokens_per_req = 0
+    backend.init_forward_metadata_in_graph(fb)
 
     assert len(calls) == 1
     assert calls[0]["q_mode"] == Q_MODE_STRIDED
@@ -122,7 +121,9 @@ def test_draft_extend_out_graph_uses_captured_static_q_stride(monkeypatch):
 
 
 def test_hybrid_wrappers_forward_in_graph_hook():
-    """Hybrid wrappers must forward init_forward_metadata_in_graph to wrapped backends."""
+    """Hybrid wrappers must forward init_forward_metadata_in_graph to the
+    wrapped backend(s) — the inherited no-op would leave the fused metadata
+    rebuild out of the captured graph (stale page table on every replay)."""
     from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
     from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
         HybridLinearAttnBackend,
@@ -163,7 +164,7 @@ def test_hybrid_wrappers_forward_in_graph_hook():
     assert calls == ["full", "linear"]
 
 
-def test_metadata_update_finishes_before_cuda_graph_replay():
+def test_metadata_update_records_inside_cuda_graph():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
@@ -187,17 +188,14 @@ def test_metadata_update_finishes_before_cuda_graph_replay():
     )
 
     backend.init_forward_metadata_out_graph(fb, in_capture=True)
+    backend.init_forward_metadata_in_graph(fb)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
-    graph_sentinel = torch.zeros(1, device=DEVICE)
     with torch.cuda.graph(graph):
         backend.init_forward_metadata_in_graph(fb)
-        graph_sentinel.add_(1)
 
     fb.seq_lens.copy_(torch.tensor([5, 6], dtype=torch.int32, device=DEVICE))
-    backend.init_forward_metadata_out_graph(fb)
-    fb.seq_lens.copy_(torch.tensor([7, 8], dtype=torch.int32, device=DEVICE))
     graph.replay()
     torch.cuda.synchronize()
 
@@ -209,92 +207,7 @@ def test_metadata_update_finishes_before_cuda_graph_replay():
     )
 
 
-def test_graph_metadata_keeps_pre_boundary_slot_snapshot():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-
-    backend = _make_backend_for_hook_test()
-    backend.device = torch.device(DEVICE)
-    backend.page_size = 2
-    backend.max_num_pages = 2
-    backend.use_sliding_window_kv_pool = True
-    backend._swa_kv_pool = object()
-    backend.req_to_token = torch.tensor(
-        [[0, 1, 2, 3], [8, 9, 10, 11]], dtype=torch.int32, device=DEVICE
-    )
-    backend._swa_full_to_swa_mapping = (
-        torch.arange(32, dtype=torch.int64, device=DEVICE) * 2
-    )
-    backend.init_cuda_graph_state(max_bs=1, max_num_tokens=1)
-
-    forward_batch = SimpleNamespace(
-        batch_size=1,
-        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
-        seq_lens=torch.tensor([4], dtype=torch.int32, device=DEVICE),
-        forward_mode=ForwardMode.DECODE,
-        spec_info=None,
-        positions=torch.tensor([0], dtype=torch.int64, device=DEVICE),
-        out_cache_loc=torch.tensor([3], dtype=torch.int64, device=DEVICE),
-    )
-
-    backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
-    backend.init_forward_metadata_in_graph(forward_batch)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    graph_sentinel = torch.zeros(1, device=DEVICE)
-    with torch.cuda.graph(graph):
-        backend.init_forward_metadata_in_graph(forward_batch)
-        graph_sentinel.add_(1)
-
-    backend.init_forward_metadata_out_graph(forward_batch)
-    expected_page_table = torch.tensor([[0, 1]], dtype=torch.int32, device=DEVICE)
-    expected_swa_page_table = torch.tensor([[0, 2]], dtype=torch.int32, device=DEVICE)
-    expected_swa_out_cache_loc = torch.tensor([6], dtype=torch.int64, device=DEVICE)
-
-    read_done = torch.cuda.Event()
-    mutation_done = torch.cuda.Event()
-    scheduler_stream = torch.cuda.Stream()
-    read_done.record()
-    with torch.cuda.stream(scheduler_stream):
-        scheduler_stream.wait_event(read_done)
-        backend.req_to_token.copy_(
-            torch.tensor(
-                [[8, 9, 10, 11], [0, 1, 2, 3]],
-                dtype=torch.int32,
-                device=DEVICE,
-            )
-        )
-        backend._swa_full_to_swa_mapping.copy_(
-            torch.arange(32, dtype=torch.int64, device=DEVICE) * 2 + 64
-        )
-        mutation_done.record()
-
-    torch.cuda.current_stream().wait_event(mutation_done)
-    graph.replay()
-    torch.cuda.synchronize()
-
-    torch.testing.assert_close(
-        backend.forward_metadata.page_table,
-        expected_page_table,
-        rtol=0,
-        atol=0,
-    )
-    torch.testing.assert_close(
-        backend.forward_metadata.swa_page_table,
-        expected_swa_page_table,
-        rtol=0,
-        atol=0,
-    )
-    torch.testing.assert_close(
-        backend.forward_metadata.swa_out_cache_loc,
-        expected_swa_out_cache_loc,
-        rtol=0,
-        atol=0,
-    )
-
-
-def test_swa_cache_write_uses_pre_boundary_slot_snapshot():
+def test_swa_cache_write_uses_metadata_slot_snapshot():
     snapshot = torch.tensor([6], dtype=torch.int64)
 
     def translate_live_mapping(_):
