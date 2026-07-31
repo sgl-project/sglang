@@ -369,10 +369,12 @@ Phoenix Local Zone 不能直接作为区域 NLB 的 target。把 Local Zone subn
   导入它；原生镜像因没有该 WebSocket 依赖而失败。现在
   `decode_frames` 也只在真正发起 WebSocket 请求时导入，并新增无 WebSocket
   依赖的 import 回归测试。
-- 天鹏镜像固定 Transformers 4.56.0，而当前 SGLang pin 是 5.12.1。为保持
-  两路 text encoder 的数值依赖完全相同，parity lane 不升级 Transformers，
-  只给 SGLang 的 `PreTrainedConfig` import 加 4.56 命名兼容别名。非数值依赖
-  由 `install_parity_dependencies.py` 递归补齐，并在启动 server 前再次比较
+- 天鹏镜像固定 Transformers 4.56.0，而当前 SGLang pin 是 5.12.1。原先
+  diffusion quantization registry 会在 import 时加载所有量化 backend，
+  继而把未使用的 SRT/LLM 配置和 Transformers 5 专属配置带入无量化 MinWM。
+  现在 registry 只在真正选中某个量化方法时加载对应 backend。parity lane
+  因此无需 patch Transformers，也不升级它；非数值依赖由
+  `install_parity_dependencies.py` 递归补齐，并在启动 server 前再次比较
   Torch、Transformers、Diffusers、FlashAttention 和 TorchVision 版本。
 
 第一轮 H200 原生 baseline 已完整跑完 69 block：

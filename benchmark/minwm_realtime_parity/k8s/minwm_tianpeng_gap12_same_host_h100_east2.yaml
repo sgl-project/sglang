@@ -241,33 +241,6 @@ spec:
               [[ "$(git -C /workspace/sglang rev-parse HEAD)" \
                 == "${SGLANG_GIT_REF}" ]]
 
-              # The baseline image intentionally keeps its numerical stack,
-              # including transformers 4.56.0. SGLang main pins transformers
-              # 5.12.1, where this compatibility alias is available. Add the
-              # alias without upgrading transformers so both parity lanes keep
-              # exactly the same text-encoder dependency.
-              python3 - <<'PY'
-              from pathlib import Path
-
-              path = Path(
-                  "/workspace/sglang/python/sglang/srt/configs/cohere2_moe.py"
-              )
-              source = (
-                  "from transformers.configuration_utils import "
-                  "PreTrainedConfig\n"
-              )
-              replacement = (
-                  "from transformers.configuration_utils import "
-                  "PretrainedConfig as PreTrainedConfig\n"
-              )
-              text = path.read_text()
-              if text.count(source) != 1:
-                  raise RuntimeError(
-                      "expected exactly one transformers 5 PreTrainedConfig import"
-                  )
-              path.write_text(text.replace(source, replacement))
-              PY
-
               python3 \
                 /workspace/sglang/benchmark/minwm_realtime_parity/install_parity_dependencies.py \
                 --pyproject /workspace/sglang/python/pyproject.toml
