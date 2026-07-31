@@ -29,7 +29,7 @@ struct AppState {
     /// The tokenizer loaded once at startup and shared with the encode/detok
     /// workers. OpenAI also uses it for token-ID prompt echo.
     tokenizer: Option<dynamo_tokenizers::Tokenizer>,
-    chat_formatter: Option<dynamo_renderer::PromptFormatter>,
+    chat_formatter: Option<openai::ChatFormatter>,
     /// Chat templates already contain their special tokens, so their rendered
     /// prompts must be encoded without adding another BOS/EOS.
     chat_tokenizer: Option<dynamo_tokenizers::Tokenizer>,

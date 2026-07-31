@@ -14,7 +14,6 @@ use axum::{
 };
 use dynamo_protocols::types::ChatCompletionRequestMessage;
 use dynamo_protocols::types::responses::Response as OpenAIResponse;
-use dynamo_renderer::{ChatTemplate, ContextMixins, PromptContextMixin, PromptFormatter};
 use futures::StreamExt;
 use serde::Serialize;
 use tokio::sync::{RwLock, mpsc};
@@ -24,7 +23,10 @@ mod completions;
 mod models;
 mod response_stream;
 mod responses;
+mod template;
 mod tools;
+
+pub(super) use template::ChatFormatter;
 
 use super::AppState;
 use super::frame::OutputAccumulator;
@@ -60,10 +62,7 @@ pub(super) fn routes() -> Router<AppState> {
 
 pub(super) fn load_chat_support(
     server_args: &ServerArgs,
-) -> (
-    Option<PromptFormatter>,
-    Option<dynamo_tokenizers::Tokenizer>,
-) {
+) -> (Option<ChatFormatter>, Option<dynamo_tokenizers::Tokenizer>) {
     if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
         return (None, None);
     }
@@ -82,28 +81,8 @@ pub(super) fn load_chat_support(
         return (None, None);
     };
 
-    let formatter = std::fs::read_to_string(&config_file)
-        .map_err(|error| error.to_string())
-        .and_then(|json| {
-            let mut config: serde_json::Value =
-                serde_json::from_str(&json).map_err(|error| error.to_string())?;
-            if let Some(path) = server_args.chat_template.as_deref() {
-                let template = std::fs::read_to_string(path)
-                    .map_err(|error| format!("failed to read chat template `{path}`: {error}"))?;
-                config["chat_template"] = serde_json::Value::String(template);
-            }
-            let template: ChatTemplate =
-                serde_json::from_value(config).map_err(|error| error.to_string())?;
-            if template.chat_template.is_none() {
-                return Err("tokenizer has no chat template".into());
-            }
-            PromptFormatter::from_parts(
-                template,
-                ContextMixins::new(&[PromptContextMixin::OaiChat]),
-                true,
-            )
-            .map_err(|error| error.to_string())
-        });
+    let formatter =
+        template::load_chat_formatter(&config_file, server_args.chat_template.as_deref());
     let tokenizer = dynamo_tokenizers::Tokenizer::from_file_with_options(
         &tokenizer_file,
         dynamo_tokenizers::TokenizerOptions {
@@ -112,16 +91,16 @@ pub(super) fn load_chat_support(
     )
     .map_err(|error| error.to_string());
 
-    match (formatter, tokenizer) {
+    let error = match (formatter, tokenizer) {
         (Ok(formatter), Ok(tokenizer)) => {
             tracing::info!(%config_file, "loaded OpenAI chat template");
-            (Some(formatter), Some(tokenizer))
+            return (Some(formatter), Some(tokenizer));
         }
-        (Err(error), _) | (_, Err(error)) => {
-            tracing::warn!(%error, "OpenAI chat completions disabled");
-            (None, None)
-        }
-    }
+        (Err(error), _) => error.to_string(),
+        (_, Err(error)) => error,
+    };
+    tracing::warn!(%error, "OpenAI chat completions disabled");
+    (None, None)
 }
 
 #[derive(Debug, Serialize)]
