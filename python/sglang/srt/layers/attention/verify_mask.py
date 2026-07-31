@@ -46,10 +46,8 @@ class VerifyMask(msgspec.Struct):
     def fits(self, bs: int, num_draft_tokens: int) -> bool:
         """Whether this batch's writes stay inside the buffer.
 
-        Only the compact layout is checked. FULL_MASK keeps its pre-existing
-        unconditional reuse -- its bound needs a max_context_len that composite
-        backends do not carry -- so a batch past max_bs can still overflow it
-        when draft * sum(seq_len) exceeds the buffer, as it could before.
+        Only the compact layout is checked. FULL_MASK keeps unconditional reuse
+        because its runtime bound depends on sequence lengths not passed to fits().
         """
         if self.mode != TreeMaskMode.QLEN_ONLY:
             return True

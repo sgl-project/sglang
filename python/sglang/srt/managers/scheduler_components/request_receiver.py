@@ -27,6 +27,7 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -231,8 +232,8 @@ class SchedulerRequestReceiver:
         # Process MM requests under EPD-disaggregation mode
         if (
             self.ps.pp_rank == 0
-            and self.server_args.language_only
-            and self.server_args.encoder_transfer_backend
+            and get_disagg().language_only
+            and get_disagg().encoder_transfer_backend
             in ["zmq_to_scheduler", "mooncake"]
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
