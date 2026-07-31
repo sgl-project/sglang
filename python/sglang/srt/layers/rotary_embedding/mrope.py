@@ -163,11 +163,16 @@ class MRotaryEmbedding(RotaryEmbedding):
         self.position_sin = sin.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
-        if (
-            self.cos_sin_cache.device != query.device
-            or self.cos_sin_cache.dtype != query.dtype
-        ):
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+        # Keep the cache in fp32 like the base RotaryEmbedding (see the NOTE in
+        # RotaryEmbedding.__init__): downcasting it to bf16/fp16 shifts the
+        # rotary phase enough to cause visible logit drift on long multimodal
+        # contexts. Only match the device here. XPU is the exception: its fused
+        # multimodal_rotary_embedding kernel requires the cache and query
+        # dtypes to match (see #31441).
+        if _is_xpu:
+            super()._match_cos_sin_cache_dtype(query)
+        elif self.cos_sin_cache.device != query.device:
+            self.cos_sin_cache = self.cos_sin_cache.to(query.device)
 
     def forward_native(
         self,
