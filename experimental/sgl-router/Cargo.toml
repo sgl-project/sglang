@@ -28,7 +28,7 @@ dynamo-tokenizers = { git = "https://github.com/ai-dynamo/dynamo", rev = "1efdd4
 dynamo-parsers = { git = "https://github.com/ai-dynamo/dynamo", rev = "1efdd4dcb901caeae636131321094090d252c8d6" }
 
 # Async runtime + http
-tokio = { version = "=1.48.0", features = ["full"] }
+tokio = { version = "1.42", features = ["full"] }
 axum = { version = "0.8", features = ["macros", "tracing"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "request-id"] }
@@ -69,7 +69,6 @@ k8s-openapi = { version = "0.23", features = ["v1_31"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
 prost = "0.13"
-prost-types = "0.13"
 tonic = { version = "0.12", features = ["transport"] }
 
 # KV-event subsystem — msgpack-encoded events over ZMQ and sha256-based
@@ -88,7 +87,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
-tokio = { version = "=1.48.0", features = ["test-util"] }
+tokio = { version = "1.42", features = ["test-util"] }
 # Low-level msgpack encoder used to hand-construct wire bytes in
 # kv_events golden-bytes tests (decode-only path uses rmp-serde).
 rmp = "0.8"

@@ -163,21 +163,6 @@ impl Cli {
     pub fn into_config(self) -> Result<Config> {
         let discovery = self.build_discovery()?;
 
-        let tuned_load_monitor = self.load_monitor_bind_host.is_some()
-            || self.load_monitor_bind_port.is_some()
-            || self.load_monitor_report_ip.is_some();
-        if !self.load_monitor && tuned_load_monitor {
-            return Err(anyhow!(
-                "--load-monitor-bind-host / --load-monitor-bind-port / \
-                 --load-monitor-report-ip require --load-monitor"
-            ));
-        }
-        if self.load_monitor && self.load_monitor_report_ip.is_none() {
-            return Err(anyhow!(
-                "--load-monitor-report-ip is required when --load-monitor is enabled"
-            ));
-        }
-
         // Reject knobs that only take effect alongside another flag, rather
         // than silently dropping them — mirrors the discovery mutual-exclusion
         // checks. Otherwise an operator believes they tuned something that has
@@ -704,9 +689,6 @@ mod tests {
             "http://10.0.0.1:30000",
             "--policy",
             "load_based",
-            "--load-monitor",
-            "--load-monitor-report-ip",
-            "127.0.0.1",
         ]))
         .unwrap();
         assert_eq!(c.model.policy, PolicyKind::LoadBased);
@@ -780,9 +762,6 @@ mod tests {
             "cache_aware_zmq",
             "--cache-threshold",
             "0.7",
-            "--load-monitor",
-            "--load-monitor-report-ip",
-            "127.0.0.1",
         ]))
         .unwrap();
         let ca = c.model.cache_aware.expect("cache_aware set");
@@ -798,9 +777,6 @@ mod tests {
             "http://x:30000",
             "--policy",
             "cache_aware_zmq",
-            "--load-monitor",
-            "--load-monitor-report-ip",
-            "127.0.0.1",
         ]))
         .unwrap();
         assert!(c.model.cache_aware.is_none());
@@ -886,9 +862,6 @@ mod tests {
             "120",
             "--sticky-eviction-interval-secs",
             "15",
-            "--load-monitor",
-            "--load-monitor-report-ip",
-            "127.0.0.1",
         ]))
         .unwrap();
         let s = c.model.sticky.expect("sticky config built");
@@ -1024,7 +997,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("--load-monitor-report-ip is required"),
+            err.contains("load_monitor.report_ip must be non-empty"),
             "got: {err}"
         );
     }
@@ -1040,7 +1013,10 @@ mod tests {
         ]))
         .unwrap_err()
         .to_string();
-        assert!(err.contains("require --load-monitor"), "got: {err}");
+        assert!(
+            err.contains("load-monitor address configuration requires load monitoring"),
+            "got: {err}"
+        );
     }
 
     /// Non-load-scored policies keep their legacy behavior while disabled.

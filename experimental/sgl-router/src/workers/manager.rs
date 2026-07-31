@@ -40,30 +40,6 @@ struct ManagerContext {
     introspector: Arc<WorkerIntrospector>,
 }
 
-impl ManagerContext {
-    /// Creates the dependency bundle consumed by the manager loop.
-    ///
-    /// Each optional service remains disabled when its argument is `None`; the
-    /// returned context owns `Arc` handles and is cheap to clone into tasks.
-    fn new(
-        registry: Arc<WorkerRegistry>,
-        cfg: Option<Arc<Config>>,
-        kv_index: Option<Arc<KvEventIndex>>,
-        active_load: Option<Arc<ActiveLoadRegistry>>,
-        load_monitor: Option<Arc<LoadMonitor>>,
-        introspector: Arc<WorkerIntrospector>,
-    ) -> Self {
-        Self {
-            registry,
-            cfg,
-            kv_index,
-            active_load,
-            load_monitor,
-            introspector,
-        }
-    }
-}
-
 /// Resolve the circuit-breaker config for all model IDs carried by a spec.
 ///
 /// The router serves a single configured model; apply its circuit-breaker
@@ -82,13 +58,14 @@ fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerC
 }
 
 pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistry>) {
-    run_with_config(rx, registry, None, None, None).await;
+    run_with_config(rx, registry, None, None, None, None).await;
 }
 
 /// Run the worker manager, optionally honoring per-model circuit-breaker
 /// configuration from `cfg`, an optional KV-event index that is notified
-/// on every worker add / remove, and an optional active-load registry
-/// that is asked to forget per-worker counters on `Removed`.
+/// on every worker add / remove, an optional active-load registry that is
+/// asked to forget per-worker counters on `Removed`, and an optional load
+/// monitor that reconciles engine-reporting targets after topology changes.
 ///
 /// When `kv_index` is `None` the cache-aware-zmq path is disabled
 /// (selection falls through to the non-cache-aware policies); when
@@ -96,7 +73,8 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// on worker removal (leaks one `WorkerCounters` slot per departed
 /// worker — fine for tests, but production passes `Some(...)`); when
 /// `cfg` is `None` the default CB config is used for every worker
-/// (threshold = 3).
+/// (threshold = 3); when `load_monitor` is `None`, no engine-reporting
+/// registration tasks are created.
 ///
 /// Uses the default HTTP client (2-second timeout) for `/server_info`
 /// introspection.  Tests that want a tighter timeout call
@@ -107,27 +85,19 @@ pub async fn run_with_config(
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
     active_load: Option<Arc<ActiveLoadRegistry>>,
-) {
-    run_with_config_and_monitor(rx, registry, cfg, kv_index, active_load, None).await;
-}
-
-/// Runs the worker manager with an optional load-monitor topology consumer.
-pub async fn run_with_config_and_monitor(
-    rx: mpsc::Receiver<DiscoveryEvent>,
-    registry: Arc<WorkerRegistry>,
-    cfg: Option<Arc<Config>>,
-    kv_index: Option<Arc<KvEventIndex>>,
-    active_load: Option<Arc<ActiveLoadRegistry>>,
     load_monitor: Option<Arc<LoadMonitor>>,
 ) {
-    run_with_introspector_and_monitor(
+    run_manager(
         rx,
-        registry,
-        cfg,
-        kv_index,
-        active_load,
-        load_monitor,
-        Arc::new(WorkerIntrospector::default()),
+        ManagerContext {
+            registry,
+            cfg,
+            kv_index,
+            active_load,
+            load_monitor,
+            introspector: Arc::new(WorkerIntrospector::default()),
+        },
+        RECONCILE_INTERVAL,
     )
     .await
 }
@@ -145,30 +115,16 @@ pub async fn run_with_introspector(
     active_load: Option<Arc<ActiveLoadRegistry>>,
     introspector: Arc<WorkerIntrospector>,
 ) {
-    run_with_introspector_and_monitor(rx, registry, cfg, kv_index, active_load, None, introspector)
-        .await;
-}
-
-/// Runs the testable manager entry point with an optional load monitor.
-pub async fn run_with_introspector_and_monitor(
-    rx: mpsc::Receiver<DiscoveryEvent>,
-    registry: Arc<WorkerRegistry>,
-    cfg: Option<Arc<Config>>,
-    kv_index: Option<Arc<KvEventIndex>>,
-    active_load: Option<Arc<ActiveLoadRegistry>>,
-    load_monitor: Option<Arc<LoadMonitor>>,
-    introspector: Arc<WorkerIntrospector>,
-) {
     run_manager(
         rx,
-        ManagerContext::new(
+        ManagerContext {
             registry,
             cfg,
             kv_index,
             active_load,
-            load_monitor,
+            load_monitor: None,
             introspector,
-        ),
+        },
         RECONCILE_INTERVAL,
     )
     .await
@@ -205,7 +161,14 @@ pub async fn run_with_introspector_and_reconcile(
 ) {
     run_manager(
         rx,
-        ManagerContext::new(registry, cfg, kv_index, active_load, None, introspector),
+        ManagerContext {
+            registry,
+            cfg,
+            kv_index,
+            active_load,
+            load_monitor: None,
+            introspector,
+        },
         reconcile_interval,
     )
     .await;
@@ -829,6 +792,7 @@ mod tests {
             None,
             Some(kv_index.clone()),
             None,
+            None,
         ));
 
         let spec = WorkerSpec {
@@ -888,6 +852,7 @@ mod tests {
             registry.clone(),
             None,
             Some(kv_index.clone()),
+            None,
             None,
         ));
 

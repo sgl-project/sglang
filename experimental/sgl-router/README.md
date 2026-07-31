@@ -4,8 +4,7 @@ Slim, KV-aware, OpenAI-compatible router for SGLang workers.
 
 Serves a single model and routes across its workers. Exposes
 `/v1/tokenize`, `/v1/detokenize`, `/v1/models`, `/v1/chat/completions`
-(buffered and SSE), plus `/healthz` / `/readyz`, `/metrics`, and the
-load-monitor diagnostic endpoint `/v1/load_monitor/snapshot`. Worker pools
+(buffered and SSE), plus `/healthz` / `/readyz` and `/metrics`. Worker pools
 come from either a static URL list or Kubernetes EndpointSlice discovery.
 
 ## Building
@@ -76,13 +75,10 @@ window, 15-second lease, and 2-second registration timeout. This change keeps
 routing policies unchanged; the immutable snapshot is the read-only boundary
 for follow-up scheduling integrations.
 
-The Snapshot endpoint returns one immutable, versioned capture with worker
+The monitor maintains an internal immutable, versioned snapshot with worker
 freshness, source and sequence metadata, complete DP-rank values, and aggregate
-load. When monitoring is disabled it returns:
-
-```json
-{"enabled":false,"version":0,"captured_at":null,"workers":[]}
-```
+load. This snapshot is intentionally not exposed as a public HTTP endpoint;
+follow-up scheduling policies consume it inside the Router process.
 
 The Router intentionally sends no `Authorization` header to
 `/v1/start_reporting`. It is therefore compatible with an unauthenticated

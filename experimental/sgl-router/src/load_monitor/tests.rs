@@ -58,14 +58,14 @@ fn test_monitor() -> LoadMonitor {
     .unwrap()
 }
 
-/// Disabled snapshots preserve the documented exact empty shape.
+/// Disabled snapshots preserve the documented empty state.
 #[test]
-fn disabled_snapshot_has_exact_empty_shape() {
-    let json = serde_json::to_value(LoadMonitor::disabled().snapshot()).unwrap();
-    assert_eq!(
-        json,
-        serde_json::json!({"enabled":false,"version":0,"captured_at":null,"workers":[]})
-    );
+fn disabled_snapshot_is_empty() {
+    let snapshot = LoadMonitor::disabled().snapshot();
+    assert!(!snapshot.enabled);
+    assert_eq!(snapshot.version, 0);
+    assert!(snapshot.captured_at.is_none());
+    assert!(snapshot.workers.is_empty());
 }
 
 /// Rank aggregation sums counters and generation throughput.

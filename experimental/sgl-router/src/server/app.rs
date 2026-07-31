@@ -64,10 +64,6 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
             get(crate::server::routes::models::list_models),
         )
         .route(
-            "/v1/load_monitor/snapshot",
-            get(crate::server::routes::load_monitor::snapshot),
-        )
-        .route(
             "/v1/tokenize",
             post(crate::server::routes::tokenize::tokenize),
         )

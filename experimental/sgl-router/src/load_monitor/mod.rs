@@ -14,7 +14,6 @@ use parking_lot::RwLock;
 use proto::load_monitor_service_server::{LoadMonitorService, LoadMonitorServiceServer};
 use proto::{LoadReport, RankLoad, ReportStatus, WorkerType};
 use rand::Rng;
-use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -59,8 +58,7 @@ fn ingest_status(status: Status) -> Box<Status> {
 }
 
 /// Freshness classification exposed by immutable monitor snapshots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Freshness {
     /// The worker has not delivered any report since it was registered.
     Missing,
@@ -73,7 +71,7 @@ pub enum Freshness {
 }
 
 /// Fully owned per-rank load values retained for diagnostics.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RankSnapshot {
     pub dp_rank: i32,
     pub snapshot_time_unix_ms: i64,
@@ -91,7 +89,7 @@ pub struct RankSnapshot {
 }
 
 /// Aggregated worker load used by policies and exposed for diagnostics.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AggregateLoad {
     pub rank_count: usize,
     pub num_running_reqs: u64,
@@ -112,7 +110,7 @@ pub struct AggregateLoad {
 }
 
 /// Owned worker entry returned by one immutable snapshot capture.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorkerSnapshot {
     pub worker_id: String,
     pub url: String,
@@ -129,8 +127,8 @@ pub struct WorkerSnapshot {
     pub ranks: Vec<RankSnapshot>,
 }
 
-/// HTTP-facing immutable view captured under one store read lock.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// Internal immutable view captured under one store read lock.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LoadMonitorSnapshot {
     pub enabled: bool,
     pub version: u64,
@@ -719,6 +717,31 @@ impl LoadMonitor {
                 "worker_addr, worker_type, and source_instance_id must remain stable",
             )));
         }
+        {
+            let store = self.inner.store.read();
+            let state = store
+                .workers
+                .get(&binding.id)
+                .ok_or_else(|| ingest_status(Status::not_found("worker was removed")))?;
+            if state.active_session != Some(binding.session) {
+                return Err(ingest_status(Status::aborted(
+                    "stream source was superseded",
+                )));
+            }
+            if state
+                .report
+                .as_ref()
+                .is_some_and(|current| report.sequence_id <= current.sequence_id)
+            {
+                return Ok(());
+            }
+        }
+
+        // Rank validation, sorting, allocation, and aggregation are pure work.
+        // Keep them outside the global store write lock so independent engine
+        // streams do not serialize their millisecond-scale report processing.
+        let accepted = validate_report(&report, SystemTime::now())?;
+
         let mut store = self.inner.store.write();
         let state = store
             .workers
@@ -736,7 +759,7 @@ impl LoadMonitor {
         {
             return Ok(());
         }
-        state.report = Some(validate_report(&report, SystemTime::now())?);
+        state.report = Some(accepted);
         store.version = store.version.wrapping_add(1);
         Ok(())
     }
@@ -760,7 +783,7 @@ enum RegistrationOutcome {
     WaitForTopology,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, serde::Serialize)]
 struct StartReportingRequest<'a> {
     ip: &'a str,
     port: u16,
@@ -843,10 +866,9 @@ impl GrpcServerHandle {
         self.local_addr
     }
 
-    /// Stops renewals, waits one lease window for streams, then terminates the
-    /// gRPC server and joins its task.
+    /// Waits one lease window for streams, then terminates the gRPC server and
+    /// joins its task. The caller must stop registration renewals first.
     pub async fn shutdown(self, monitor: &LoadMonitor) {
-        monitor.stop_registrations().await;
         monitor.wait_for_streams_or_lease_expiry().await;
         self.cancel.cancel();
         match self.join.await {

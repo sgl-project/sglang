@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
         .context("spawn discovery")?;
     let kv_index_opt: Option<Arc<sgl_router::policies::kv_events::KvEventIndex>> =
         Some(Arc::clone(&kv_index));
-    let manager_handle = tokio::spawn(sgl_router::workers::manager::run_with_config_and_monitor(
+    let manager_handle = tokio::spawn(sgl_router::workers::manager::run_with_config(
         event_rx,
         registry.clone(),
         Some(Arc::new(cfg.clone())),
@@ -187,14 +187,13 @@ async fn main() -> Result<()> {
     );
 
     let ctx = Arc::new(
-        sgl_router::server::app_context::AppContext::with_active_load_and_monitor(
+        sgl_router::server::app_context::AppContext::with_active_load(
             cfg.clone(),
             tokenizers,
             proxy,
             registry,
             policies,
             active_load,
-            Arc::clone(&load_monitor),
         ),
     );
 
@@ -211,29 +210,13 @@ async fn main() -> Result<()> {
     ctx.mark_ready();
     tracing::info!(address = %actual_http_addr, "HTTP listener ready");
 
-    let http_shutdown = tokio_util::sync::CancellationToken::new();
-    let http_shutdown_for_signal = http_shutdown.clone();
-    let load_monitor_for_signal = Arc::clone(&load_monitor);
-    let shutdown_task = tokio::spawn(async move {
-        shutdown_signal(sigterm, sigint).await;
-        http_shutdown_for_signal.cancel();
-        load_monitor_for_signal.stop_registrations().await;
-    });
-    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
-        http_shutdown.cancelled().await;
-    });
+    let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(sigterm, sigint));
     let server_result = serve.await.context("axum serve");
 
-    // Best-effort: cancel discovery + manager + janitor on shutdown.
-    // The janitor handle's drop signals cancellation; we additionally
-    // await `shutdown` so the task joins cleanly before the process
-    // exits — useful for tracing tail logs.
+    // Cancel discovery and manager work, stop reporting renewals once, then
+    // join the janitor and gRPC listener before the process exits.
     discovery_handle.abort();
     manager_handle.abort();
-    if !shutdown_task.is_finished() {
-        shutdown_task.abort();
-    }
-    let _ = shutdown_task.await;
     load_monitor.stop_registrations().await;
     janitor_handle.shutdown().await;
     if let Some(handle) = grpc_handle {

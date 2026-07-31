@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Config;
-use crate::load_monitor::LoadMonitor;
 
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::PolicyRegistry;
@@ -23,9 +22,6 @@ pub struct AppContext {
     /// Per-worker active-load bookkeeping shared by the proxy, policies,
     /// timeout janitor, and metrics.
     pub active_load: Arc<ActiveLoadRegistry>,
-    /// Engine-reported load store used by HTTP diagnostics and future routing
-    /// consumers through immutable snapshots.
-    pub load_monitor: Arc<LoadMonitor>,
     /// Lightweight Prometheus-format metrics registry served via
     /// `/metrics`. Shared with the chat handler (requests_total),
     /// cache-aware-zmq policy (overlap_blocks), active-load registry
@@ -36,8 +32,7 @@ pub struct AppContext {
 }
 
 impl AppContext {
-    /// Constructs an application context with default lifecycle bookkeeping
-    /// and a disabled load monitor.
+    /// Constructs an application context with default lifecycle bookkeeping.
     ///
     /// The supplied configuration and shared service registries are retained;
     /// the returned context starts with HTTP readiness unset.
@@ -70,28 +65,6 @@ impl AppContext {
         policies: Arc<PolicyRegistry>,
         active_load: Arc<ActiveLoadRegistry>,
     ) -> Self {
-        Self::with_active_load_and_monitor(
-            config,
-            tokenizers,
-            proxy,
-            registry,
-            policies,
-            active_load,
-            Arc::new(LoadMonitor::disabled()),
-        )
-    }
-
-    /// Constructs an [`AppContext`] with explicit request-lifecycle and
-    /// engine-reported load stores.
-    pub fn with_active_load_and_monitor(
-        config: Config,
-        tokenizers: Arc<TokenizerRegistry>,
-        proxy: Arc<Proxy>,
-        registry: Arc<WorkerRegistry>,
-        policies: Arc<PolicyRegistry>,
-        active_load: Arc<ActiveLoadRegistry>,
-        load_monitor: Arc<LoadMonitor>,
-    ) -> Self {
         let metrics = MetricsRegistry::new();
         // Wire the per-worker active-load gauge so `sgl_router_active_load`
         // mirrors the live counter on every register / drop / sweep.
@@ -110,7 +83,6 @@ impl AppContext {
             registry,
             policies,
             active_load,
-            load_monitor,
             metrics,
             ready: AtomicBool::new(false),
         }
@@ -160,7 +132,6 @@ impl AppContext {
             registry: Arc::new(WorkerRegistry::default()),
             policies: Arc::new(PolicyRegistry::default()),
             active_load: ActiveLoadRegistry::with_defaults(),
-            load_monitor: Arc::new(LoadMonitor::disabled()),
             metrics: MetricsRegistry::new(),
             ready: AtomicBool::new(false),
         }
