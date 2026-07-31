@@ -927,6 +927,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         # a fresh mask every step.
         return self.full_attn_backend.get_verify_buffers_to_fill_after_draft()
 
+    def target_verify_reads_custom_mask(self) -> bool:
+        # Same child that hands out the mask buffer answers whether it is read.
+        return self.full_attn_backend.target_verify_reads_custom_mask()
+
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
