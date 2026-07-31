@@ -1,8 +1,6 @@
 """K3 fused o_proj GEMM + all-reduce for decode (bf16, TP row-parallel).
 
-One entry point over ``csrc/kimi_k3/comm/gemm_ar.cuh`` (host shim; the
-kernels ship as a prebuilt cubin, see ``SGLANG_K3_GEMM_AR_CUBIN`` and
-:func:`cubin_path`): a single kernel per
+One entry point over ``csrc/kimi_k3/comm/gemm_ar.cuh``: a single kernel per
 rank computes the local ``x_r [M, K] @ W_r [7168, K]^T`` partial AND the
 cross-rank sum — the epilogue pushes finished tiles straight into a
 peer-mapped P2P comm region, one flag boundary, then a tile-local reduce
@@ -27,19 +25,16 @@ Contracts:
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_jit_cuda_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.environ import envs
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -64,13 +59,12 @@ def _jit_module(k: int, world_size: int) -> Module:
         cuda_wrappers=[
             ("run", f"{cls}::run"),
             ("set_bases", f"{cls}::set_bases"),
-            ("set_cubin", f"{cls}::set_cubin"),
             ("region_nbytes", f"{cls}::region_nbytes"),
             ("gather_words", f"{cls}::gather_words"),
             ("num_fams", f"{cls}::num_fams"),
         ],
         extra_cuda_cflags=["-O3"],
-        extra_ldflags=["-lcuda"],
+        extra_dependencies=["cutlass"],
     )
 
 
@@ -152,37 +146,14 @@ def initialized() -> bool:
     return _STATE is not None
 
 
-def cubin_path(k: int, world_size: int) -> str:
-    """The prebuilt device plane for this config. ``SGLANG_K3_GEMM_AR_CUBIN``
-    is either the cubin itself or a directory of them; the kernels are not in
-    this tree (see csrc/kimi_k3/comm/gemm_ar.cuh)."""
-    root = envs.SGLANG_K3_GEMM_AR_CUBIN.get()
-    if not root:
-        raise RuntimeError(
-            "gemm_ar: SGLANG_K3_GEMM_AR_CUBIN is unset — point it at the "
-            "prebuilt cubin (or a directory of them)"
-        )
-    if root.endswith(".cubin"):
-        path = root
-    else:
-        arch = get_jit_cuda_arch().target_name.replace(".", "")
-        pdl = int(is_arch_support_pdl())
-        path = os.path.join(root, f"gemm_ar_k{k}_r{world_size}_pdl{pdl}_sm{arch}.cubin")
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"gemm_ar: no cubin at {path}")
-    return path
-
-
 @cache_once
 def _module_with_bases(k: int, world_size: int) -> Module:
-    """The per-K JIT module with the cubin loaded and the comm-region base
-    addresses stashed host-side (per-call CPU-tensor derefs from inside the
-    custom op segfault under the sglang scheduler, so the module holds them
-    in a static)."""
+    """The per-K JIT module with the comm-region base addresses stashed
+    host-side (per-call CPU-tensor derefs from inside the custom op segfault
+    under the sglang scheduler, so the module holds them in a static)."""
     state = _STATE
     assert state is not None
     mod = _jit_module(k, world_size)
-    mod.set_cubin(cubin_path(k, world_size))
     mod.set_bases(state.uc_bases)
     return mod
 

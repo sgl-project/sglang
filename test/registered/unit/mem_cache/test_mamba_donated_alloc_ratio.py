@@ -19,9 +19,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     IncLockRefResult,
 )
-from sglang.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode
+from sglang.srt.mem_cache.unified_cache.components.mamba_component import MambaComponent
+from sglang.srt.mem_cache.unified_cache.components.tree_component import ComponentType
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -78,6 +79,8 @@ def _build_peak(pool_size: int, lock_prefixes: bool):
     cache = _RatioCache(pool_size)
     component = object.__new__(MambaComponent)
     component.cache = cache
+    # The TreeCore owns the tree member-var state the component reads through.
+    component.tree_core = cache
     component.component_type = ComponentType.MAMBA
 
     owned = [cache.allocator.alloc(1) for _ in range(N)]
@@ -156,7 +159,9 @@ class _RecordingComp:
     def release_component_lock(self, node, params):
         self.released.append(params)
 
-    def release_window_lock(self, node, swa_uuid_for_lock):  # SWA only
+    def release_window_lock(  # SWA only
+        self, node, swa_uuid_for_lock, device_frees, host_frees
+    ):
         pass
 
 
@@ -172,16 +177,16 @@ class TestDecSwaLockSkip(unittest.TestCase):
         full = _RecordingComp(ComponentType.FULL, 2)
         swa = _RecordingComp(ComponentType.SWA, 1)
         mamba = _RecordingComp(ComponentType.MAMBA, 0)
-        cache = SimpleNamespace(
-            disable=False,
-            components={ComponentType.SWA: swa},
-            _components_tuple=(full, swa, mamba),
-        )
         node = SimpleNamespace(id=7)
+        tree_core = SimpleNamespace(
+            components=(full, swa, mamba),
+            components_by_type={ComponentType.SWA: swa},
+            node_by_id=lambda node_id: node,
+        )
 
-        UnifiedRadixCache.dec_swa_lock_only(
-            cache,
-            node,
+        UnifiedTreeCore.dec_swa_lock_only(
+            tree_core,
+            node.id,
             swa_uuid_for_lock=None,
             skip_lock_node_ids={ComponentType.MAMBA: {7}},
         )
