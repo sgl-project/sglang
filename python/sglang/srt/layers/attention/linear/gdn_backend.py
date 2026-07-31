@@ -725,17 +725,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             "ReplaySSM fold-every-commit supports a linear draft chain only "
             "(topk <= 1); EAGLE tree verify must use the recurrent verify."
         )
+        seq_len = query.shape[1]
+        batch_size = query_start_loc.shape[0] - 1
+        draft_token_num = seq_len // batch_size
         if (
             self.kernel_dispatcher.verify_kernel_is_flashinfer
             and ssm_states.dtype == torch.bfloat16
+            and draft_token_num >= 3
         ):
             from sglang.kernels.ops.attention.cutedsl_gdn_mtp_ring import (
                 gated_delta_rule_mtp,
             )
 
-            seq_len = query.shape[1]
-            batch_size = query_start_loc.shape[0] - 1
-            draft_token_num = seq_len // batch_size
             num_v_heads = value.shape[2]
             head_v_dim = value.shape[3]
             out = gated_delta_rule_mtp(
