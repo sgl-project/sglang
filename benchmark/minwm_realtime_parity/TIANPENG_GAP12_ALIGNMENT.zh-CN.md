@@ -523,6 +523,83 @@ SP / CFG parallel                 1 / false
 checkpoint 和请求下的可比结论是，最终档显著快于 dense compile，但单卡仍未达到
 24 FPS。上述最终数字取远端运行文件 SHA 与提交 `9ef0696d1c` 对齐后的重跑。
 
+### 8.2 7 月 27 日与 7 月 31 日 B200 吞吐差异的同机归因
+
+2026-07-31 在公网实例所在的同一台 `p6-b200.48xlarge` 上，用空闲 B200 重新运行
+了 7 月 27 日 checkpoint、SGLang `8de158c6e9` 和同一容器镜像。两次都是单卡，
+PyTorch 都是 `2.11.0+cu130`。因此这里没有把 B300 理论算力、Spot 日期或不同
+GPU 型号混入比较；7 月 27 日和本节复现实际都是 B200。
+
+固定 832×480、4 DMD steps、raw transport、10 个 warmup chunks 和 20 个 measured
+chunks 后，结果如下：
+
+| checkpoint / runtime | KV 合同 | whole-DiT compile | scheduler ms/chunk | scheduler FPS |
+| --- | --- | --- | ---: | ---: |
+| 7/27 存档：旧权重 + 旧 runtime | 原配置，full history | 开 | 422.10 | 37.906 |
+| 7/31 同机复现：旧权重 + 旧 runtime | 原配置，full history | 开 | 448.20 | 35.698 |
+| 新权重 + 旧 absolute-RoPE runtime（仅性能消融） | window 32 | 开 | 416.25 | 38.438 |
+| 新权重 + 当前 parity-capable runtime | window 20 | 关；segment compile | 1233.50 | 12.971 |
+| 新权重 + 当前 parity-capable runtime | window 32 | 关；segment compile | 1415.80 | 11.301 |
+
+“新权重 + 旧 runtime”会删除 `block_relative/gap12/prompt-first-frame-pin` 配置，缓存
+RoPE 后的 K，因此**不能用于视频数值对齐或产品部署**。它的用途只是性能归因：在
+相同新权重、相同 B200、相同 I2V case 和 window 32 下，旧执行路径仍能达到
+38.44 FPS，说明 5B 权重本身没有让矩阵计算慢三倍。当前正确语义路径的 11.30 FPS
+主要是实现问题。
+
+window 32 改为 20 只把当前路径从 1415.8 ms 降到 1233.5 ms，改善 182.3 ms / 12.9%。
+以旧 runtime 同权重的 416.25 ms 为参照，总退化是 999.55 ms；window 变大只能解释
+其中约 18.2%，不是主因。raw transport 在两条路径都只有约 7～8 ms/chunk，也不是
+WebUI、WebSocket 或浏览器造成的 scheduler 差异。
+
+同 checkpoint、同 window 32 的 PyTorch trace 进一步显示：
+
+| 每个完整 chunk | 旧 absolute-RoPE runtime | 当前 gap12 runtime | 倍数 |
+| --- | ---: | ---: | ---: |
+| CUDA kernels | 5,730 | 32,901 | 5.74× |
+| `cudaLaunchKernel` | 1,599 | 30,173 | 18.87× |
+| `cudaStreamSynchronize` | 40 | 2,468 | 61.70× |
+| D2H memcpy events | 17 | 1,545 | 90.88× |
+| GPU kernel 累计时间 | 267.79 ms | 397.70 ms | 1.49× |
+
+trace 开启后 wall time 会被导出和栈采集严重放大，因此表中不使用 profiler wall time；
+这里只使用 kernel 时间戳、调用数和同步事件，且不把 Torch profiler 的静态 occupancy
+当成 GPU 利用率。当前镜像/主机没有 `nsys`，所以本节没有声称 SM/Tensor Core
+hardware counter 数字。
+
+根因是 `4220c8a` baseline 要求的新 cache 语义改变了可编译边界：
+
+1. 旧路径把 RMSNorm/RoPE 后的 K 写入 cache，历史 K 可直接复用；当前路径为支持
+   `block_relative`、gap clamp、sink/tail/dynamic pin，必须保存 raw K，并在可见
+   window 改变后重新生成整段 key RoPE。
+2. 当前每个 chunk 有 5 次 DiT forward，每次 30 层；每层各自做 window 选择、
+   position metadata、raw-K gather/copy 和 query/key RoPE。相同的层无关 metadata
+   被重复 150 次，并触发大量 `.item()`、D2H 和 stream synchronization。
+3. 每层还有 self/cross 两次 packed FA4，共 300 次 attention 调用。PyTorch 2.11
+   Inductor 不能 lowering 运行时 `cumsum` 构造的 varlen metadata，FA4 边界必须
+   graph break；segment compile 最终只编译许多小 norm/AdaLN 区域，不能像旧
+   whole-DiT graph 那样持续喂满 GPU。
+4. 强行打开 whole-DiT compile 并没有恢复旧图：动态 KV 长度和有状态 cache 使其
+   成为负优化，window 饱和时 dense 路径仅 1.22 FPS。
+
+所以“同为 B200，FPS 差一半”更准确的描述是：在稳态同口径下，当前正确语义路径
+是旧 compiled 路径的约 `0.30×`（11.30 vs 38.44 FPS），其中 window 只占小头，
+主要损失来自 raw-K/block-relative cache 的逐层重复工作、CPU/GPU 同步和 compile
+失效。达到 24 FPS 需要把 16 帧 chunk 压到 666.7 ms；trace 中当前 GPU kernel
+累计时间约 398 ms，说明单张 B200 的算力预算原则上足够，优先级应是：把层无关的
+window/position metadata 与 RoPE 表移到 chunk 级只算一次、批量更新 30 层 cache、
+用常量 cu-seqlens 的 FA4 custom op 消除 graph break，并为 window 饱和形状建立
+可复用 compiled/CUDA-graph 路径。每项都必须重新跑 gap12/prompt-switch numerical
+parity，不能直接上线旧 absolute-RoPE 快路径。
+
+复现脚本和原始统计保存在：
+
+```text
+benchmark/minwm_realtime_parity/k8s/tianpeng_gap12_b200_standalone/
+  run_old_0727_diagnosis.sh
+benchmark/minwm_realtime_parity/results/tianpeng-gap12-b200-0727-diagnosis/
+```
+
 最终服务由 systemd 管理，使用单张 B200（物理 GPU 3），API/UI 分别监听
 30060/18060，再由 Nginx 暴露 80 端口。其余 7 张 GPU 已释放。验证产物在：
 
