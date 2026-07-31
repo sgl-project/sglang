@@ -1324,6 +1324,7 @@ class HiRadixCache(RadixCache):
             key = x.key.child_key(self.page_size)
             v = x.parent.children.pop(key, None)
             assert v == x, f"parent does not have child key, {key}"
+            self.entry_count_ -= 1
             if x in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(x)
             self._update_host_leaf_status(x.parent)
@@ -1806,6 +1807,7 @@ class HiRadixCache(RadixCache):
             new_node.host_value = host_value.clone()
             new_node.hash_value = hash_value
             node.children[child_key] = new_node
+            self.entry_count_ += 1
             self._update_host_leaf_status(new_node)
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
@@ -1866,6 +1868,7 @@ class HiRadixCache(RadixCache):
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[key.child_key(self.page_size)] = new_node
+        self.entry_count_ += 1
 
         if child.backuped:
             self._replace_pending_write_through_node(child, [new_node, child])
@@ -1942,6 +1945,7 @@ class HiRadixCache(RadixCache):
             new_node.value = value.clone()
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
+            self.entry_count_ += 1
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
 
