@@ -607,7 +607,8 @@ class ModelRunner:
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=self.server_args.enable_memory_saver
+            enable=self.server_args.enable_memory_saver,
+            hook_mode=self.server_args.memory_saver_hook_mode,
         )
 
     def maybe_init_remote_instance_transfer_engine(self):

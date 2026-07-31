@@ -13,10 +13,14 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+_configured_hook_mode = None
+
 
 class TorchMemorySaverAdapter(ABC):
     @staticmethod
-    def create(enable: bool):
+    def create(enable: bool, hook_mode=None):
+        global _configured_hook_mode
+
         if enable and import_error is not None:
             logger.warning(
                 "enable_memory_saver is enabled, but "
@@ -24,6 +28,18 @@ class TorchMemorySaverAdapter(ABC):
                 "via `pip3 install torch-memory-saver`. "
             )
             raise import_error
+
+        if enable and hook_mode is not None:
+            if _configured_hook_mode is None:
+                _memory_saver.hook_mode = hook_mode
+                _configured_hook_mode = hook_mode
+            elif _configured_hook_mode != hook_mode:
+                raise RuntimeError(
+                    "torch_memory_saver hook mode is already configured as "
+                    f"{_configured_hook_mode!r}; cannot reconfigure it as "
+                    f"{hook_mode!r} in the same process"
+                )
+
         return (
             _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
         )

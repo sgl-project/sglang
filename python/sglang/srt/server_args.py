@@ -3288,6 +3288,11 @@ class ServerArgs:
         "Allow saving memory using release_memory_occupation and resume_memory_occupation",
         NS("exec.features"),
     ] = False
+    memory_saver_hook_mode: A[
+        str,
+        "Select the torch_memory_saver hook mode or registered backend.",
+        NS("exec.features"),
+    ] = "preload"
     enable_weights_cpu_backup: A[
         bool,
         "Save model weights (both main model and draft model, if any) to CPU memory during release_weights_occupation and resume_weights_occupation",

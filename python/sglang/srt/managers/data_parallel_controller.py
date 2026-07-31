@@ -48,6 +48,7 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
@@ -601,7 +602,8 @@ class DataParallelController:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
+            enable=server_args.enable_memory_saver,
+            hook_mode=server_args.memory_saver_hook_mode,
         )
 
         scheduler_pipe_readers = []
@@ -813,6 +815,7 @@ def run_data_parallel_controller_process(
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
     kill_itself_when_parent_died()
+    load_plugins()
     parent_process = psutil.Process().parent()
 
     configure_logger(server_args)
