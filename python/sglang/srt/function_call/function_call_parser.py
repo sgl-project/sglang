@@ -254,16 +254,31 @@ class FunctionCallParser:
         try:
             if tool_choice == "auto" and not should_constrain_auto:
                 structural_tag = self.detector.get_auto_tool_call_structural_tag(
-                    tools=self.tools
+                    tools=self.tools,
+                    thinking_mode=thinking_mode,
+                    parallel_tool_calls=parallel_tool_calls,
                 )
                 if structural_tag is not None:
                     return ("structural_tag", structural_tag)
 
             if is_required or should_constrain_auto:
+                structural_tag_tools = self.tools
+                if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
+                    structural_tag_tools = [
+                        tool.model_copy(
+                            update={
+                                "function": tool.function.model_copy(
+                                    update={"strict": True}
+                                )
+                            }
+                        )
+                        for tool in self.tools
+                    ]
                 structural_tag = self.detector.get_structural_tag(
-                    tools=self.tools,
+                    tools=structural_tag_tools,
                     thinking_mode=thinking_mode,
                     tool_choice=tool_choice,
+                    parallel_tool_calls=parallel_tool_calls,
                 )
                 if structural_tag is not None:
                     return ("structural_tag", structural_tag)

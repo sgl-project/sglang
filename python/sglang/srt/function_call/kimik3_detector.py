@@ -1,9 +1,11 @@
 import json
 import logging
 import re
-from typing import List
+from typing import List, Literal, Optional, Union
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+from xgrammar import StructuralTag
+
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -18,6 +20,10 @@ from sglang.srt.function_call.kimik3_format import (
     TOOLS_OPEN,
     partial_suffix_len,
     strip_response_wrappers,
+)
+from sglang.srt.function_call.kimik3_structural_tag import (
+    get_kimik3_auto_tool_call_structural_tag,
+    get_kimik3_structural_tag,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,9 +66,7 @@ class KimiK3Detector(BaseFormatDetector):
 
     ``type="string"`` argument values are raw text; other types are
     JSON-decoded. Attribute values reverse the template's ``&amp;``/``&quot;``
-    escaping. Constrained generation is unsupported: XTML per-argument
-    encoding cannot be expressed as a JSON-schema or structural-tag grammar,
-    so ``required`` tool choice is parsed natively without a constraint.
+    escaping.
     """
 
     def __init__(self):
@@ -75,14 +79,40 @@ class KimiK3Detector(BaseFormatDetector):
         return self.bot_token in text
 
     def supports_structural_tag(self) -> bool:
-        return False
+        return True
 
     def parses_required_natively(self) -> bool:
-        return True
+        return False
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError(
-            "Kimi K3 XTML tool calls do not support constrained generation"
+            "Kimi K3 uses its model-native structural tag implementation"
+        )
+
+    def get_auto_tool_call_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+    ) -> Optional[StructuralTag]:
+        return get_kimik3_auto_tool_call_structural_tag(
+            tools or [],
+            thinking_mode=thinking_mode,
+            parallel_tool_calls=parallel_tool_calls,
+        )
+
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+    ) -> StructuralTag:
+        return get_kimik3_structural_tag(
+            tools=tools or [],
+            tool_choice=tool_choice,
+            thinking_mode=thinking_mode,
+            parallel_tool_calls=parallel_tool_calls,
         )
 
     def _decode_call(self, attrs: str, body: str) -> dict | None:

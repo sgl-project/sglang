@@ -210,11 +210,11 @@ def test_streaming_bookkeeping_for_serving_layer() -> None:
 
 def test_detector_capabilities_and_registration() -> None:
     detector = KimiK3Detector()
-    assert not detector.supports_structural_tag()
-    assert detector.parses_required_natively()
+    assert detector.supports_structural_tag()
+    assert not detector.parses_required_natively()
     parser = FunctionCallParser([_make_tool("python")], "kimi_k3")
     assert isinstance(parser.detector, KimiK3Detector)
-    assert parser.get_structure_constraint("required") is None
+    assert parser.get_structure_constraint("required") is not None
 
 
 if __name__ == "__main__":
