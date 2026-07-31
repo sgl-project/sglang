@@ -271,7 +271,6 @@ class HiCacheController:
         self.draft_page_set_func = None
         self.has_mtp_draft = False
         self.mtp_draft_device_pools = ()
-        self.mtp_draft_transfer_layer_start = 0
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -863,13 +862,10 @@ class HiCacheController:
         # Otherwise this will be deferred until attach_storage_backend().
         self._maybe_register_draft_with_storage()
 
-    def set_mtp_draft_pools(
-        self, transfer_layer_start: int, device_pools
-    ) -> None:
+    def set_mtp_draft_pools(self, device_pools) -> None:
         """Register MTP device pools used for L2 load-back."""
         self.mtp_draft_device_pools = tuple(device_pools)
         self.has_mtp_draft = bool(self.mtp_draft_device_pools)
-        self.mtp_draft_transfer_layer_start = transfer_layer_start
 
     def _maybe_register_draft_with_storage(self) -> None:
         """Pick the draft L3 IO implementation."""

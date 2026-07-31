@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
-def _register_hicache_draft(
+def maybe_register_hicache_draft(
     *,
     tree_cache,
     draft_plan: HiCacheDraftPlan,
@@ -103,6 +103,9 @@ def _register_legacy_hicache_draft(
     pool = draft_pool
     if pool.layer_num == 0:
         return
+
+    # Create host pool for draft with the same slot count as the target host pool,
+    # so that host indices stay 1-to-1 between target and draft KV caches.
     primary_host_pool = tree_cache.cache_controller.mem_pool_host
     host_pool_kwargs = dict(
         host_to_device_ratio=primary_host_pool.size / pool.size,
@@ -257,7 +260,7 @@ def build_kv_cache(
     )
 
     if enable_hierarchical_cache and hicache_draft_plan is not None:
-        _register_hicache_draft(
+        maybe_register_hicache_draft(
             tree_cache=tree_cache,
             draft_plan=hicache_draft_plan,
             server_args=server_args,

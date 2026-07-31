@@ -778,8 +778,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
-            # DSV4/MLA-style pools are packed into one object; ordinary MHA
-            # pools store separate K/V objects.
             if isinstance(
                 host_pool,
                 (DeepSeekV4PagedHostPool, MLATokenToKVPoolHost),

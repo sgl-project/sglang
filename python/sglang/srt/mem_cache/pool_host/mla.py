@@ -234,12 +234,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
 
     def load_to_device_per_layer(
-        self,
-        device_pool,
-        host_indices,
-        device_indices,
-        layer_id,
-        io_backend,
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
         if not self._is_device_layer_owned(device_pool, layer_id):
             return

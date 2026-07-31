@@ -534,7 +534,7 @@ class HybridCacheController(BaseHiCacheController):
                         self.mtp_draft_device_pools[i],
                         host_indices,
                         device_indices,
-                        self.mtp_draft_transfer_layer_start + i,
+                        self.layer_num + i,
                         self.io_backend,
                         pool_transfers=resolved_pool_transfers,
                     )
