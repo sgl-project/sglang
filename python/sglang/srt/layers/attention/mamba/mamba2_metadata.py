@@ -55,6 +55,9 @@ class ForwardMetadata:
     track_ssm_h_dst: Optional[torch.Tensor] = None
     track_ssm_final_src: Optional[torch.Tensor] = None
     track_ssm_final_dst: Optional[torch.Tensor] = None
+    track_ssm_h_trusted: bool = False
+    track_ssm_final_trusted: bool = False
+    track_ssm_final_disjoint: bool = False
     state_checkpoint_cu_starts: Optional[torch.Tensor] = None
     num_state_checkpoints: int = 0
     state_checkpoint_every_n_tokens: int = 0
@@ -159,7 +162,6 @@ class Mamba2Metadata(ForwardMetadata):
 
         p = 0  # num of insertions
         for s, e in zip(cu_seqlens[:-1], cu_seqlens[1:]):
-
             # if does not divide chunk_size, then there is one chunk insertion
             p += s % chunk_size > 0
 
@@ -196,6 +198,9 @@ class Mamba2Metadata(ForwardMetadata):
             track_ssm_h_dst=forward_metadata.track_ssm_h_dst,
             track_ssm_final_src=forward_metadata.track_ssm_final_src,
             track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
+            track_ssm_h_trusted=forward_metadata.track_ssm_h_trusted,
+            track_ssm_final_trusted=forward_metadata.track_ssm_final_trusted,
+            track_ssm_final_disjoint=forward_metadata.track_ssm_final_disjoint,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
             num_decodes=len(seq_lens) if num_decodes is None else num_decodes,
             num_prefills=0,
@@ -297,6 +302,9 @@ class Mamba2Metadata(ForwardMetadata):
             track_ssm_h_dst=forward_metadata.track_ssm_h_dst,
             track_ssm_final_src=forward_metadata.track_ssm_final_src,
             track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
+            track_ssm_h_trusted=forward_metadata.track_ssm_h_trusted,
+            track_ssm_final_trusted=forward_metadata.track_ssm_final_trusted,
+            track_ssm_final_disjoint=forward_metadata.track_ssm_final_disjoint,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
             mamba_track_mask_indices=mamba_track_mask_indices,
             conv_states_mask_indices=conv_states_mask_indices,
