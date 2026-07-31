@@ -599,7 +599,7 @@ export const Playground = ({ config }) => {
         };
       },
 
-      apply: ({ flags, env, value, fc, h, derived }) => {
+      apply: ({ flags, env, value, fc, sel, h, derived }) => {
         if (value.backend !== null) {
           flags = h.stripFlagsByFirstToken(flags, [
             "--moe-a2a-backend", "--moe-runner-backend",
@@ -809,8 +809,10 @@ export const Playground = ({ config }) => {
         // No-op when the pick already matches base (preserves flag position).
         if (derived && value === derived) return { flags, env };
         const picked = (fc.options || []).find((p) => p.id === value);
-        if (picked && h.evaluateChip(picked,
-            { dpAttnOn: h.hasFlag(flags, "--enable-dp-attention") }).disabled) {
+        if (picked && h.evaluateChip(picked, {
+          ...sel,
+          dpAttnOn: h.hasFlag(flags, "--enable-dp-attention"),
+        }).disabled) {
           return { flags, env };
         }
         flags = h.stripFlagsByFirstToken(flags, [
