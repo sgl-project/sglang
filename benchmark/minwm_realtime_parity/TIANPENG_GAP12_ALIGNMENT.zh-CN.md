@@ -374,7 +374,9 @@ Phoenix Local Zone 不能直接作为区域 NLB 的 target。把 Local Zone subn
   继而把未使用的 SRT/LLM 配置和 Transformers 5 专属配置带入无量化 MinWM。
   现在 registry 只在真正选中某个量化方法时加载对应 backend；未启用
   `SGLANG_CACHE_DIT_ENABLED` 时也不 import `cache_dit`，避免它要求较新的
-  Diffusers。parity lane 因此无需 patch Transformers/Diffusers，也不安装
+  Diffusers；diffusion transformer loader 的类型声明也改回它实际使用的
+  diffusion `QuantizationConfig`，不再误导入 SRT 量化 registry。parity lane
+  因此无需 patch Transformers/Diffusers，也不安装
   会改变 Transformers 4.56 import 路径的 LLM-only `kernels` 包；其余非数值依赖由
   `install_parity_dependencies.py` 递归补齐，并在启动 server 前再次比较
   Torch、Transformers、Diffusers、FlashAttention 和 TorchVision 版本。
