@@ -1,10 +1,20 @@
-import unittest
+import sys
 from types import SimpleNamespace
+
+import pytest
+import torch
 
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(
+    est_time=2,
+    suite="base-a-test-cpu",
+    nightly=False,
+    disabled=None,
+    stage=None,
+    runner_config=None,
+)
 
 
 def _batch(
@@ -23,105 +33,138 @@ def _batch(
     )
 
 
-class TestIndexTopKShareState(unittest.TestCase):
-    def test_batch_state_is_noop_when_mtp_reuse_disabled(self):
-        batch = _batch(reuse=False, carried="old")
-        state = IndexTopKShareState(batch)
+def test_mtp_carry_is_empty_when_reuse_disabled():
+    batch = _batch(reuse=False, carried="old")
+    state = IndexTopKShareState.from_mtp_carry(batch)
 
-        self.assertIsNone(state.prev_topk_indices())
-        state.store_topk_indices("new")
+    assert state.topk_indices is None
+    state.update("new")
+    state.publish()
 
-        self.assertEqual(batch.spec_info.dsa_topk_indices, "old")
+    assert state.topk_indices == "new"
+    assert batch.spec_info.dsa_topk_indices == "old"
 
-    def test_batch_state_carries_topk_when_mtp_reuse_enabled(self):
-        batch = _batch(reuse=True, carried="old")
-        state = IndexTopKShareState(batch)
 
-        self.assertEqual(state.prev_topk_indices(), "old")
-        state.store_topk_indices("new")
+def test_mtp_carry_reads_and_publishes_when_reuse_enabled():
+    batch = _batch(reuse=True, carried="old")
+    state = IndexTopKShareState.from_mtp_carry(batch)
 
-        self.assertEqual(batch.spec_info.dsa_topk_indices, "new")
+    assert state.topk_indices == "old"
+    state.update("new")
+    state.publish()
 
-    def test_store_publishes_draft_extend_seed(self):
-        import torch
+    assert state.topk_indices == "new"
+    assert batch.spec_info.dsa_topk_indices == "new"
 
-        seed_buf = torch.zeros(2, 3, dtype=torch.int64)
-        batch = _batch(reuse=False, carried=None, is_extend=True, seed_buf=seed_buf)
-        state = IndexTopKShareState(batch)
 
-        self.assertTrue(state.should_update)
-        state.store_topk_indices(torch.arange(12, dtype=torch.int64).view(4, 3))
+def test_target_carry_stays_local_without_publish():
+    batch = _batch(reuse=False, carried="batch")
+    state = IndexTopKShareState(batch, "layer")
 
-        self.assertTrue(
-            torch.equal(seed_buf, torch.arange(6, dtype=torch.int64).view(2, 3))
-        )
-        # No carry write without reuse.
-        self.assertIsNone(batch.spec_info.dsa_topk_indices)
+    assert state.topk_indices == "layer"
+    assert batch.spec_info.dsa_topk_indices == "batch"
 
-    def test_seed_buf_ignored_outside_extend(self):
-        import torch
+    state.update(None)
 
-        seed_buf = torch.zeros(2, 3, dtype=torch.int64)
-        batch = _batch(reuse=False, carried=None, is_extend=False, seed_buf=seed_buf)
-        state = IndexTopKShareState(batch)
+    assert state.topk_indices is None
+    assert batch.spec_info.dsa_topk_indices == "batch"
 
-        self.assertFalse(state.should_update)
-        state.store_topk_indices(torch.ones(4, 3, dtype=torch.int64))
-        self.assertTrue(torch.equal(seed_buf, torch.zeros(2, 3, dtype=torch.int64)))
 
-    def test_context_manager_clears_batch_state_after_mtp_iteration(self):
-        batch = _batch(reuse=False, carried="stale")
+def test_target_none_does_not_fall_back_to_mtp_carry():
+    batch = _batch(reuse=True, carried="batch")
+    state = IndexTopKShareState(batch, None)
 
-        with IndexTopKShareState.mtp_iteration(batch) as state:
-            self.assertIsNotNone(state)
-            self.assertTrue(batch.reuse_dsa_topk_indices)
-            self.assertIsNone(batch.spec_info.dsa_topk_indices)
+    assert state.topk_indices is None
+
+    state.update("layer")
+
+    assert state.topk_indices == "layer"
+    assert batch.spec_info.dsa_topk_indices == "batch"
+
+
+def test_publish_captures_draft_extend_seed():
+    seed_buf = torch.zeros(2, 3, dtype=torch.int64)
+    batch = _batch(reuse=False, carried=None, is_extend=True, seed_buf=seed_buf)
+    state = IndexTopKShareState.from_mtp_carry(batch)
+
+    assert state.should_publish
+    state.update(torch.arange(12, dtype=torch.int64).view(4, 3))
+    state.publish()
+
+    assert torch.equal(seed_buf, torch.arange(6, dtype=torch.int64).view(2, 3))
+    assert batch.spec_info.dsa_topk_indices is None
+
+
+def test_seed_buffer_is_ignored_outside_extend():
+    seed_buf = torch.zeros(2, 3, dtype=torch.int64)
+    batch = _batch(reuse=False, carried=None, is_extend=False, seed_buf=seed_buf)
+    state = IndexTopKShareState.from_mtp_carry(batch)
+
+    assert not state.should_publish
+    state.update(torch.ones(4, 3, dtype=torch.int64))
+    state.publish()
+
+    assert torch.equal(seed_buf, torch.zeros(2, 3, dtype=torch.int64))
+
+
+def test_mtp_iteration_clears_batch_state():
+    batch = _batch(reuse=False, carried="stale")
+
+    with IndexTopKShareState.mtp_iteration(batch) as state:
+        assert state is not None
+        assert batch.reuse_dsa_topk_indices
+        assert batch.spec_info.dsa_topk_indices is None
+        batch.spec_info.dsa_topk_indices = "draft-topk"
+
+    assert not batch.reuse_dsa_topk_indices
+    assert batch.spec_info.dsa_topk_indices is None
+
+
+def test_mtp_iteration_clears_batch_state_on_exception():
+    batch = _batch(reuse=False, carried=None)
+
+    with pytest.raises(RuntimeError, match="draft step blew up"):
+        with IndexTopKShareState.mtp_iteration(batch):
             batch.spec_info.dsa_topk_indices = "draft-topk"
+            raise RuntimeError("draft step blew up")
 
-        self.assertFalse(batch.reuse_dsa_topk_indices)
-        self.assertIsNone(batch.spec_info.dsa_topk_indices)
+    assert not batch.reuse_dsa_topk_indices
+    assert batch.spec_info.dsa_topk_indices is None
 
-    def test_context_manager_clears_batch_state_on_exception(self):
-        batch = _batch(reuse=False, carried=None)
 
-        with self.assertRaises(RuntimeError):
-            with IndexTopKShareState.mtp_iteration(batch):
-                batch.spec_info.dsa_topk_indices = "draft-topk"
-                raise RuntimeError("draft step blew up")
+def test_disabled_mtp_iteration_is_passthrough():
+    batch = _batch(reuse=False, carried="untouched")
 
-        self.assertFalse(batch.reuse_dsa_topk_indices)
-        self.assertIsNone(batch.spec_info.dsa_topk_indices)
+    with IndexTopKShareState.mtp_iteration(batch, enabled=False) as state:
+        assert state is None
+        assert not batch.reuse_dsa_topk_indices
+        assert batch.spec_info.dsa_topk_indices == "untouched"
 
-    def test_context_manager_is_passthrough_when_disabled(self):
-        batch = _batch(reuse=False, carried="untouched")
+    assert not batch.reuse_dsa_topk_indices
+    assert batch.spec_info.dsa_topk_indices == "untouched"
 
-        with IndexTopKShareState.mtp_iteration(batch, enabled=False) as state:
-            self.assertIsNone(state)
-            self.assertFalse(batch.reuse_dsa_topk_indices)
-            self.assertEqual(batch.spec_info.dsa_topk_indices, "untouched")
 
-        self.assertFalse(batch.reuse_dsa_topk_indices)
-        self.assertEqual(batch.spec_info.dsa_topk_indices, "untouched")
+def test_mtp_iteration_preserves_draft_extend_seed():
+    batch = _batch(reuse=False, carried="extend-seed")
 
-    def test_keep_carry_seed_preserves_draft_extend_seed(self):
-        batch = _batch(reuse=False, carried="extend-seed")
+    with IndexTopKShareState.mtp_iteration(batch, keep_carry_seed=True) as state:
+        assert state is not None
+        assert batch.spec_info.dsa_topk_indices == "extend-seed"
+        assert state.topk_indices == "extend-seed"
 
-        with IndexTopKShareState.mtp_iteration(batch, keep_carry_seed=True) as state:
-            self.assertEqual(batch.spec_info.dsa_topk_indices, "extend-seed")
-            self.assertEqual(state.prev_topk_indices(), "extend-seed")
+    assert not batch.reuse_dsa_topk_indices
+    assert batch.spec_info.dsa_topk_indices is None
 
-        self.assertFalse(batch.reuse_dsa_topk_indices)
-        self.assertIsNone(batch.spec_info.dsa_topk_indices)
 
-    def test_keep_carry_seed_still_clears_when_no_seed(self):
-        batch = _batch(reuse=False, carried=None)
+def test_mtp_iteration_clears_missing_draft_extend_seed():
+    batch = _batch(reuse=False, carried=None)
 
-        with IndexTopKShareState.mtp_iteration(batch, keep_carry_seed=True):
-            self.assertIsNone(batch.spec_info.dsa_topk_indices)
+    with IndexTopKShareState.mtp_iteration(batch, keep_carry_seed=True):
+        assert batch.spec_info.dsa_topk_indices is None
 
-        self.assertFalse(batch.reuse_dsa_topk_indices)
-        self.assertIsNone(batch.spec_info.dsa_topk_indices)
+    assert not batch.reuse_dsa_topk_indices
+    assert batch.spec_info.dsa_topk_indices is None
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))

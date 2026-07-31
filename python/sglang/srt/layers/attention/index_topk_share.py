@@ -10,51 +10,64 @@ if TYPE_CHECKING:
 
 
 class IndexTopKShareState:
-    """Adapter around the state that carries DSA indexer topk across an MTP
-    draft iteration: the ``reuse_dsa_topk_indices`` flag on ForwardBatch and the
-    carried topk on ``spec_info.dsa_topk_indices`` (the carry must live on
-    spec_info, not ForwardBatch — per-step ForwardBatch copies drop it, #29654).
+    """Carries DSA indexer topk between layers and publishes it for MTP reuse.
 
-    Replaces raw attribute writes scattered across the EAGLE V2 draft worker and
-    the NextN decoder with an explicit read/store lifecycle, plus the
-    ``mtp_iteration`` context manager that guarantees the flags are reset even
-    if a draft step raises.
+    MTP publication uses ``spec_info.dsa_topk_indices`` because per-step
+    ForwardBatch copies drop ForwardBatch-only state (#29654).
     """
 
-    def __init__(self, forward_batch: ForwardBatch):
-        self.forward_batch = forward_batch
+    def __init__(
+        self,
+        forward_batch: ForwardBatch,
+        topk_indices: Optional[torch.Tensor],
+    ):
+        self._forward_batch = forward_batch
+        self._topk_indices = topk_indices
+
+    @classmethod
+    def from_mtp_carry(cls, forward_batch: ForwardBatch) -> IndexTopKShareState:
+        topk_indices = (
+            forward_batch.spec_info.dsa_topk_indices
+            if forward_batch.reuse_dsa_topk_indices
+            else None
+        )
+        return cls(forward_batch, topk_indices)
 
     @property
     def enabled(self) -> bool:
-        return bool(self.forward_batch.reuse_dsa_topk_indices)
+        return bool(self._forward_batch.reuse_dsa_topk_indices)
 
     @property
-    def seed_buf(self) -> Optional[torch.Tensor]:
+    def _seed_buf(self) -> Optional[torch.Tensor]:
         """Draft-extend seed buffer: publish the last-token indexer top-k there
         so the draft-decode loop reuses it instead of recomputing."""
-        if self.forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-            return self.forward_batch.spec_info.dsa_seed_topk_capture
+        if self._forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            return self._forward_batch.spec_info.dsa_seed_topk_capture
         return None
 
     @property
-    def should_update(self) -> bool:
-        return self.enabled or self.seed_buf is not None
+    def should_publish(self) -> bool:
+        return self.enabled or self._seed_buf is not None
 
-    def prev_topk_indices(self) -> Optional[torch.Tensor]:
-        if not self.enabled:
-            return None
-        return self.forward_batch.spec_info.dsa_topk_indices
+    @property
+    def topk_indices(self) -> Optional[torch.Tensor]:
+        return self._topk_indices
 
-    def store_topk_indices(self, topk_indices: Optional[torch.Tensor]) -> None:
-        if topk_indices is None or not self.should_update:
+    def update(self, topk_indices: Optional[torch.Tensor]) -> None:
+        self._topk_indices = topk_indices
+
+    def publish(self) -> None:
+        if self._topk_indices is None or not self.should_publish:
             return
         if self.enabled:
-            self.forward_batch.spec_info.dsa_topk_indices = topk_indices
-        seed_buf = self.seed_buf
+            self._forward_batch.spec_info.dsa_topk_indices = self._topk_indices
+        seed_buf = self._seed_buf
         if seed_buf is not None:
-            sel = self.forward_batch.spec_info.dsa_seed_topk_select
+            sel = self._forward_batch.spec_info.dsa_seed_topk_select
             src = (
-                topk_indices[: seed_buf.shape[0]] if sel is None else topk_indices[sel]
+                self._topk_indices[: seed_buf.shape[0]]
+                if sel is None
+                else self._topk_indices[sel]
             )
             seed_buf[: src.shape[0]].copy_(src)
 
@@ -75,7 +88,7 @@ class IndexTopKShareState:
         if not (keep_carry_seed and spec_info.dsa_topk_indices is not None):
             spec_info.dsa_topk_indices = None
         try:
-            yield cls(forward_batch)
+            yield cls.from_mtp_carry(forward_batch)
         finally:
             spec_info.dsa_topk_indices = None
             forward_batch.reuse_dsa_topk_indices = False

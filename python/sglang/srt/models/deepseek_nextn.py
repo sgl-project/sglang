@@ -262,7 +262,7 @@ class DeepseekModelNextN(nn.Module):
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
             residual = None
-            index_topk_share = IndexTopKShareState(forward_batch)
+            index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states, residual, topk_indices = self.decoder(
                     positions,
@@ -270,7 +270,7 @@ class DeepseekModelNextN(nn.Module):
                     forward_batch,
                     residual,
                     zero_allocator,
-                    prev_topk_indices=index_topk_share.prev_topk_indices(),
+                    prev_topk_indices=index_topk_share.topk_indices,
                 )
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:
@@ -286,7 +286,7 @@ class DeepseekModelNextN(nn.Module):
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
-                    if index_topk_share.should_update and topk_indices is not None:
+                    if index_topk_share.should_publish and topk_indices is not None:
                         topk_indices = _gather_dsa_topk_indices_for_cp(
                             topk_indices,
                             local_num_tokens,
@@ -294,7 +294,8 @@ class DeepseekModelNextN(nn.Module):
                             forward_batch,
                             torch.cuda.current_stream(),
                         )
-            index_topk_share.store_topk_indices(topk_indices)
+            index_topk_share.update(topk_indices)
+            index_topk_share.publish()
         finally:
             exit_stack.close()
 
