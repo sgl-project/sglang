@@ -552,11 +552,24 @@ def get_mhc_pre_token_count_representatives(
 ) -> Tuple[int, ...]:
     """One representative token count per distinct mhc_pre n_splits bucket over
     [1, max_num_tokens] (the kernel is specialized only by n_splits)."""
+    max_num_tokens = max(1, max_num_tokens)
     reps = {}
-    for grid in range(1, (max(1, max_num_tokens) + 63) // 64 + 1):
+    for grid in range(1, (max_num_tokens + 63) // 64 + 1):
         num_tokens = min(grid * 64, max_num_tokens)
         reps[_compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)] = num_tokens
     return tuple(sorted(reps.values()))
+
+
+def get_mhc_pre_max_num_tokens(server_args) -> int:
+    chunked_prefill_size = getattr(server_args, "chunked_prefill_size", None)
+    if chunked_prefill_size is not None and chunked_prefill_size > 0:
+        return chunked_prefill_size
+
+    max_prefill_tokens = getattr(server_args, "max_prefill_tokens", None)
+    if max_prefill_tokens is not None and max_prefill_tokens > 0:
+        return max_prefill_tokens
+
+    return 1
 
 
 def prewarm_mhc_pre(
@@ -582,7 +595,7 @@ def prewarm_mhc_pre(
     from sglang.srt.runtime_context import get_server_args
 
     hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
-    max_num_tokens = get_server_args().chunked_prefill_size
+    max_num_tokens = get_mhc_pre_max_num_tokens(get_server_args())
     buckets = get_mhc_pre_token_count_representatives(
         max_num_tokens, hc_mult * hidden_size
     )

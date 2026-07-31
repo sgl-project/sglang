@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -8,6 +9,20 @@ from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_p
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
+
+
+def test_mhc_pre_max_num_tokens_falls_back_when_chunked_prefill_disabled():
+    args = SimpleNamespace(chunked_prefill_size=-1, max_prefill_tokens=16384)
+
+    assert mhc.get_mhc_pre_max_num_tokens(args) == 16384
+
+
+def test_mhc_pre_token_count_representatives_clamps_non_positive_max_tokens(
+    monkeypatch,
+):
+    monkeypatch.setattr(mhc, "_compute_num_split_for_mhc_pre", lambda *_: 1)
+
+    assert mhc.get_mhc_pre_token_count_representatives(-1, 4 * 4096) == (1,)
 
 
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
