@@ -29,9 +29,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(
-    est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large"
-)
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def test_q8kv8_sparse_prefill_backend_selector_uses_cli_value():
@@ -326,10 +324,14 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path():
         )
 
     assert backend.forward_metadata.sparse_prefill_cache is sparse_cache
-    assert bf16_out.shape == q8_out.shape == (
-        forward_batch.extend_num_tokens,
-        16,
-        512,
+    assert (
+        bf16_out.shape
+        == q8_out.shape
+        == (
+            forward_batch.extend_num_tokens,
+            16,
+            512,
+        )
     )
     assert len(bf16_capture.calls) == 1
     assert len(q8_capture.calls) == 1
@@ -402,10 +404,14 @@ def test_q8kv8_sparse_prefill_real_kernel_matches_bf16_sparse_path():
     torch.cuda.synchronize()
 
     assert backend.forward_metadata.sparse_prefill_cache is sparse_cache
-    assert bf16_out.shape == q8_out.shape == (
-        forward_batch.extend_num_tokens,
-        64,
-        512,
+    assert (
+        bf16_out.shape
+        == q8_out.shape
+        == (
+            forward_batch.extend_num_tokens,
+            64,
+            512,
+        )
     )
     assert bf16_out.dtype == torch.bfloat16
     assert q8_out.dtype == torch.bfloat16

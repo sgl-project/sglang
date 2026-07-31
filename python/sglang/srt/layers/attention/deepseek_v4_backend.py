@@ -1918,7 +1918,11 @@ class DeepseekV4AttnBackend(
         )
 
         sink_pad = getattr(self, "_q8kv8_attn_sink_pad", None)
-        if sink_pad is None or sink_pad.shape != (padded_heads,) or sink_pad.device != q.device:
+        if (
+            sink_pad is None
+            or sink_pad.shape != (padded_heads,)
+            or sink_pad.device != q.device
+        ):
             sink_pad = torch.zeros(padded_heads, dtype=torch.float32, device=q.device)
             self._q8kv8_attn_sink_pad = sink_pad
 
@@ -1957,7 +1961,9 @@ class DeepseekV4AttnBackend(
 
         q_flat = q.squeeze(1)
         if q_flat.ndim != 3:
-            raise ValueError(f"Q8KV8 sparse prefill expects 3D Q after squeeze, got {q_flat.shape}")
+            raise ValueError(
+                f"Q8KV8 sparse prefill expects 3D Q after squeeze, got {q_flat.shape}"
+            )
 
         if attn_sink.numel() != q_flat.shape[1]:
             raise ValueError(
