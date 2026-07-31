@@ -5,6 +5,8 @@ import unittest
 import torch
 
 from sglang.kernels.ops.diffusion.common.fallback_torch import (
+    apply_rotary_embedding_native,
+    fuse_scale_shift_kernel_native,
     norm_infer_native,
     rms_norm_fn_native,
     triton_one_pass_rms_norm_native,
@@ -52,6 +54,53 @@ class TestDiffusionTorchFallback(unittest.TestCase):
                 returned = norm_infer_native(x, weight, bias, 1e-5, out=out)
                 self.assertIs(returned, out)
                 torch.testing.assert_close(out.cpu(), layer_ref.cpu())
+
+    def test_scale_shift_matches_broadcast_reference(self):
+        x = torch.randn(2, 6, 8, device=self.device)
+        scale = torch.randn(2, 8, device=self.device)
+        shift = torch.randn(2, 8, device=self.device)
+
+        result = fuse_scale_shift_kernel_native(x, scale, shift, scale_constant=0.5)
+        reference = x * (0.5 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        torch.testing.assert_close(result.cpu(), reference.cpu())
+
+        frame_scale = torch.randn(2, 3, 1, 8, device=self.device)
+        frame_shift = torch.randn(2, 3, 1, 8, device=self.device)
+        result = fuse_scale_shift_kernel_native(x, frame_scale, frame_shift)
+        expanded_scale = (
+            frame_scale.squeeze(2).unsqueeze(2).expand(-1, -1, 2, -1).reshape_as(x)
+        )
+        expanded_shift = (
+            frame_shift.squeeze(2).unsqueeze(2).expand(-1, -1, 2, -1).reshape_as(x)
+        )
+        reference = x * (1.0 + expanded_scale) + expanded_shift
+        torch.testing.assert_close(result.cpu(), reference.cpu())
+
+    def test_rotary_embedding_matches_reference(self):
+        x = torch.randn(4, 3, 8, device=self.device)
+        cos = torch.randn(4, 4, device=self.device)
+        sin = torch.randn(4, 4, device=self.device)
+
+        result = apply_rotary_embedding_native(x, cos, sin)
+        cos_expanded = cos.unsqueeze(-2)
+        sin_expanded = sin.unsqueeze(-2)
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        reference = torch.stack(
+            (
+                x1 * cos_expanded - x2 * sin_expanded,
+                x2 * cos_expanded + x1 * sin_expanded,
+            ),
+            dim=-1,
+        ).flatten(-2)
+        torch.testing.assert_close(result.cpu(), reference.cpu())
+
+        full_cos = torch.repeat_interleave(cos, 2, dim=-1)
+        full_sin = torch.repeat_interleave(sin, 2, dim=-1)
+        interleaved = apply_rotary_embedding_native(
+            x, full_cos, full_sin, interleaved=True
+        )
+        torch.testing.assert_close(interleaved.cpu(), reference.cpu())
 
     def test_one_pass_rms_norm_matches_reference(self):
         x = torch.randn(8, 128, device=self.device, dtype=torch.float32)
