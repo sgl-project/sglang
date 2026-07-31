@@ -80,6 +80,17 @@ class TestDynamicLoRAMultiTokenizerWorkerGuard(CustomTestCase):
         self.assertFalse(result.success)
         self.assertIn("--tokenizer-worker-num", result.error_message)
         self.assertIn("31084", result.error_message)
+        # The same guard message is returned for load and unload requests,
+        # so it must describe both operations. A user whose unload request
+        # fails must not get an error that talks only about loading.
+        self.assertIn("loading", result.error_message)
+        self.assertIn("unloading", result.error_message)
+        # Preloading with --lora-paths only works for adapters stored on
+        # disk. If the message suggests it, the suggestion must be scoped
+        # to adapters on disk, because load_lora_adapter_from_tensors
+        # receives adapters as in memory tensors with no file path.
+        if "--lora-paths" in result.error_message:
+            self.assertIn("disk", result.error_message)
         # The backend must never be reached, and this worker's local LoRA
         # state must not diverge from its siblings'.
         manager.update_lora_adapter_communicator.assert_not_awaited()

@@ -553,12 +553,14 @@ class TokenizerControlMixin:
         """
         if self.server_args.tokenizer_worker_num > 1:
             raise ValueError(
-                "Dynamic LoRA loading is currently not supported with "
+                "Dynamic LoRA updates (loading or unloading adapters while the "
+                "server is running) are currently not supported with "
                 "--tokenizer-worker-num > 1: each tokenizer worker keeps its own "
                 "LoRA registry and dynamic updates are not synchronized across "
                 "workers (https://github.com/sgl-project/sglang/issues/31084). "
-                "Please launch the server with --tokenizer-worker-num 1, or "
-                "preload adapters at startup via --lora-paths."
+                "Please launch the server with --tokenizer-worker-num 1. "
+                "Adapters stored on disk can instead be preloaded at startup "
+                "via --lora-paths."
             )
 
     async def _unload_lora_adapter_locked(
