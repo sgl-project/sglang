@@ -970,6 +970,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     )
 
     num_fused_shared = runner_config.num_fused_shared_experts or 0
+    # FlashInfer FP4 kernel convention: num_experts and local_num_experts are
+    # ROUTED-only counts; the kernel adds num_fused_shared_experts internally
+    # to size tensor expectations.  Subtract the shared slot so we don't pass
+    # 257 when the kernel expects 256 + 1.
+    fp4_num_experts = quant_info.global_num_experts - num_fused_shared
+    fp4_local_num_experts = quant_info.local_num_experts - num_fused_shared
     if num_fused_shared > 0:
         if not _FP4_TRTLLM_HAS_FUSED_SHARED:
             raise RuntimeError(
@@ -977,7 +983,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 "num_fused_shared_experts on trtllm_fp4_block_scale_moe. "
                 "Upgrade FlashInfer or pass --disable-shared-experts-fusion."
             )
-        if quant_info.local_num_experts < quant_info.global_num_experts:
+        if fp4_local_num_experts < fp4_num_experts:
             raise NotImplementedError(
                 "FP4 fused shared-expert fusion is not supported with expert "
                 "parallelism. Pass --disable-shared-experts-fusion or disable EP."
@@ -1100,13 +1106,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             output1_scale_gate_scalar=quant_info.g1_alphas,
             output2_scale_scalar=quant_info.g2_alphas,
             per_token_scale=per_token_scale,
-            num_experts=quant_info.global_num_experts,
+            num_experts=fp4_num_experts,
             top_k=packed_topk_ids.shape[1],
             n_group=0,
             topk_group=0,
             intermediate_size=quant_info.intermediate_size_per_partition,
             local_expert_offset=quant_info.local_expert_offset,
-            local_num_experts=quant_info.local_num_experts,
+            local_num_experts=fp4_local_num_experts,
             routed_scaling_factor=None,
             routing_method_type=1,  # Unused, but must be 1 to pass validation.
             do_finalize=True,
@@ -1144,13 +1150,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             output1_scale_gate_scalar=quant_info.g1_alphas,
             output2_scale_scalar=quant_info.g2_alphas,
             per_token_scale=per_token_scale,
-            num_experts=quant_info.global_num_experts,
+            num_experts=fp4_num_experts,
             top_k=topk_config.top_k,
             n_group=topk_config.num_expert_group,
             topk_group=topk_config.topk_group,
             intermediate_size=quant_info.intermediate_size_per_partition,
             local_expert_offset=quant_info.local_expert_offset,
-            local_num_experts=quant_info.local_num_experts,
+            local_num_experts=fp4_local_num_experts,
             routed_scaling_factor=runner_config.routed_scaling_factor,
             routing_method_type=(
                 routing_method_type
