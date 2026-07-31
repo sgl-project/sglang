@@ -31,7 +31,6 @@ from sglang.srt.disaggregation.encode_server import (
     EncoderProfiler,
     MMEncoder,
     MMError,
-    ReqState,
     launch_encoder,
 )
 from sglang.srt.environ import envs
@@ -59,10 +58,9 @@ logger = logging.getLogger(__name__)
 
 
 class PendingRequest:
-    __slots__ = ("state", "request", "future", "submit_time")
+    __slots__ = ("request", "future", "submit_time")
 
-    def __init__(self, state: ReqState, request: dict, loop: asyncio.AbstractEventLoop):
-        self.state = state
+    def __init__(self, request: dict, loop: asyncio.AbstractEventLoop):
         self.request = request
         self.future: asyncio.Future = loop.create_future()
         self.submit_time = time.time()
@@ -119,20 +117,15 @@ class EncoderScheduler:
                 pending.future.set_exception(RuntimeError("EncoderScheduler stopped"))
 
     async def submit(self, request: dict) -> Tuple:
-        req_id = request["req_id"]
-        async with self.encoder.req_states_lock:
-            state = self.encoder.get_request_state(req_id)
-            if state is None:
-                # Scheduler submission is a valid initial request event.
-                state = ReqState(req_id=req_id)
-                self.encoder.req_states[req_id] = state
-        pending = PendingRequest(state, request, asyncio.get_running_loop())
+        pending = PendingRequest(request, asyncio.get_running_loop())
         await self.pending_queue.put(pending)
         try:
             return await asyncio.wait_for(pending.future, timeout=self.request_timeout)
         except asyncio.TimeoutError:
             if not pending.future.done():
                 pending.future.cancel()
+            req_id = request.get("req_id")
+            # Free anything the abandoned batch may still stage for this rid.
             self.encoder.discard_embedding(req_id)
             logger.error(
                 f"EncoderScheduler.submit timed out after {self.request_timeout}s "
@@ -241,9 +234,7 @@ class EncoderScheduler:
         logger.info(f"Dispatching batch of {len(group)} {modality.name} requests")
 
         try:
-            results = await self.encoder.batch_encode(
-                requests, modality, states=[p.state for p in group]
-            )
+            results = await self.encoder.batch_encode(requests, modality)
             if len(group) > 1:
                 logger.info(
                     f"Batch of {len(group)} {modality.name} requests completed in "
@@ -290,7 +281,7 @@ class EncoderScheduler:
                     )
                 for sock in self.send_sockets:
                     sock_send(sock, wrap_as_pickle(req))
-                result = await self.encoder.encode_request(req, modality, state=p.state)
+                result = await self.encoder.encode_request(req, modality)
                 if not p.future.done():
                     p.future.set_result(result)
             except Exception as e:
@@ -341,7 +332,7 @@ class DPDispatcher:
         self.dispatch_sockets = dispatch_sockets
         self.result_socket = result_socket
         self.worker_processes = worker_processes
-        # Key = req_id for encode/broadcast, req_id + "_send" for mooncake /send.
+        # Key = req_id for encode/broadcast, _send_req_key for mooncake /send.
         self.pending_futures: List[Dict[str, asyncio.Future]] = [
             {} for _ in range(dp_size)
         ]
@@ -402,15 +393,26 @@ class DPDispatcher:
         self.req_id_to_rank.pop(req_id, None)
         self._update_pending_gauge()
 
+    @staticmethod
+    def _send_req_key(req_id: str, request: dict) -> str:
+        """One in-flight /send future per decoder TP rank, keyed by the rank's
+        ZMQ-ack endpoint; a retry from the same rank reuses the key."""
+        endpoint = NetworkAddress(
+            request["prefill_host"], request["embedding_port"]
+        ).to_host_port_str()
+        return f"{req_id}_send_{endpoint}"
+
     def _fail_pending_for_rank(self, rank: int, reason: str, error_type: str) -> None:
         # Resolve a rank's outstanding futures with 503 so awaiters don't hang.
         pending = self.pending_futures[rank]
         for key, future in list(pending.items()):
             if not future.done():
+                # /send keys are _send_req_key's shape; the rest are req_id.
+                marker = key.rfind("_send_")
                 future.set_result(
                     {
-                        "req_id": key.removesuffix("_send"),
-                        "_dp_type": "send" if key.endswith("_send") else "encode",
+                        "req_id": key[:marker] if marker >= 0 else key,
+                        "_dp_type": "send" if marker >= 0 else "encode",
                         "content": None,
                         "_error": reason,
                         "_error_type": error_type,
@@ -504,13 +506,15 @@ class DPDispatcher:
                 "_error": f"DP worker rank={rank} died before /send for req_id={req_id}",
                 "_error_code": int(HTTPStatus.SERVICE_UNAVAILABLE),
             }
-        key = req_id + "_send"
+        key = self._send_req_key(req_id, request)
         future = asyncio.get_running_loop().create_future()
         self.pending_futures[rank][key] = future
+        self._update_pending_gauge()
         request["_dp_type"] = "send"
+        request["_dp_send_key"] = key
         logger.info(
             f"MM-Encoder DP dispatch_send: req_id={req_id}, "
-            f"dp_rank={rank}, pending={self.pending_counts}"
+            f"dp_rank={rank}, send_key={key}, pending={self.pending_counts}"
         )
         try:
             await async_sock_send(self.dispatch_sockets[rank], wrap_as_pickle(request))
@@ -519,7 +523,9 @@ class DPDispatcher:
             )
         except asyncio.TimeoutError:
             self.pending_futures[rank].pop(key, None)
-            self.req_id_to_rank.pop(req_id, None)
+            self._update_pending_gauge()
+            # Siblings still route via req_id_to_rank; the stale sweep evicts it.
+            self._pending_send_at[req_id] = time.monotonic()
             return self._timeout_envelope(
                 req_id,
                 "send",
@@ -527,7 +533,8 @@ class DPDispatcher:
             )
         except BaseException:
             self.pending_futures[rank].pop(key, None)
-            self.req_id_to_rank.pop(req_id, None)
+            self._update_pending_gauge()
+            self._pending_send_at[req_id] = time.monotonic()
             raise
 
     async def broadcast(
@@ -662,19 +669,33 @@ class DPDispatcher:
                 continue
             req_id = msg.get("req_id", "")
             dp_type = msg.get("_dp_type", "encode")
-            key = (req_id + "_send") if dp_type == "send" else req_id
+            if dp_type == "send":
+                key = msg.get("_dp_send_key")
+                if key is None:
+                    # Workers always echo the key; never fall back to req_id,
+                    # which would wrongly resolve the encode future.
+                    logger.warning(
+                        f"_result_listener: send envelope without _dp_send_key "
+                        f"for req_id={req_id}, dropping"
+                    )
+                    continue
+            else:
+                key = req_id
             rank = self.req_id_to_rank.get(req_id)
             if rank is None or key not in self.pending_futures[rank]:
                 logger.warning(
                     f"_result_listener: no pending future for "
-                    f"req_id={req_id}, dp_type={dp_type}, dropping"
+                    f"req_id={req_id}, dp_type={dp_type}, key={key}, dropping"
                 )
                 continue
             future = self.pending_futures[rank].pop(key)
             self._update_pending_gauge()
-            # Only mooncake encode (content=request dict) needs the mapping
-            # kept for the follow-up /send.
-            keep_mapping = dp_type == "encode" and msg.get("content") is not None
+            # Each decoder TP rank sends against the same req_id, so dropping the
+            # mapping on the first /send leaves the siblings unroutable. Refresh
+            # the timestamp instead and let the stale-mapping sweep evict it.
+            keep_mapping = dp_type == "send" or (
+                dp_type == "encode" and msg.get("content") is not None
+            )
             if keep_mapping:
                 self._pending_send_at[req_id] = time.monotonic()
             else:
@@ -685,7 +706,7 @@ class DPDispatcher:
             except asyncio.InvalidStateError:
                 logger.warning(
                     f"_result_listener: future already done for "
-                    f"req_id={req_id}, dp_type={dp_type}"
+                    f"req_id={req_id}, dp_type={dp_type}, key={key}"
                 )
 
     async def _cleanup_stale_mappings(self) -> None:
@@ -789,16 +810,10 @@ async def _dp_worker_encode_and_send(
             logger.error(
                 f"DP error-send failed for req_id={req_id}: {e}", exc_info=True
             )
-        # Free the error EmbeddingData stored during encode, or it leaks in
-        # pending embedding state and pins /health into "busy". Neither path
-        # guarantees cleanup on its own: mooncake's _push_embedding_to_prefill
-        # is a no-op, and a swallowed zmq send failure above skips its own pop.
-        # zmq lacks the Mooncake inflight state, so discard its embedding
-        # directly. Mirrors the non-DP error path.
-        if backend == "mooncake":
-            await enc.complete_inflight_encode(req_id, None)
-        else:
-            enc.discard_embedding(req_id)
+        # Free the error EmbeddingData or it pins /health into "busy": mooncake's
+        # _push_embedding_to_prefill is a no-op and a swallowed zmq send failure
+        # above skips its own pop. The main process publishes the error.
+        enc.discard_embedding(req_id)
         raise MMError(error_msg, code=error_code or HTTPStatus.INTERNAL_SERVER_ERROR)
 
     time_stats.set_mm_encode_end_time()
@@ -810,10 +825,10 @@ async def _dp_worker_encode_and_send(
             embedding_len=embedding_len,
             embedding_dim=embedding_dim,
         )
-        # Free the held embedding if the follow-up /send never arrives (same
-        # send_timeout cleanup the non-DP path uses).
-        await enc.complete_inflight_encode(
-            req_id, (nbytes, embedding_len, embedding_dim)
+        # Arm this worker's own sweep in case the follow-up /send never arrives;
+        # the main process publishes separately to serve the decoder's pull.
+        await encode_server_module.meta_registry.publish(
+            req_id, nbytes, embedding_len, embedding_dim
         )
         return request
 
@@ -835,7 +850,7 @@ async def _dp_worker_health_encode(enc: MMEncoder) -> None:
     # and report healthy — the same pending-embedding signal the non-DP
     # /health path uses. A wedged-but-busy worker never reaches here because
     # it can't service the recv, so the dispatcher's broadcast still times out → 503.
-    if enc.has_active_requests():
+    if enc.has_pending_embeddings():
         return None
 
     if enc.supports_modality(Modality.IMAGE):
@@ -915,14 +930,29 @@ async def _dp_worker_handle_request(
             content = await _dp_worker_health_encode(enc)
         elif dp_type == "send":
             req_id = request["req_id"]
-            await enc.send(
+            sent = await enc.send(
                 req_id=req_id,
                 prefill_host=request["prefill_host"],
                 embedding_port=request["embedding_port"],
                 session_id=request["session_id"],
                 buffer_address=request["buffer_address"],
             )
-            await enc.release_inflight_encode(req_id)
+            if not sent:
+                # Error envelope, not 200 + phantom count: the decoder must
+                # fail fast instead of waiting for a ZMQ ack that never comes.
+                raise MMError(
+                    f"no staged embedding for /send req_id={req_id} "
+                    f"(already released)"
+                )
+            # Releasing on the first /send breaks decoder TP > 1. No count means
+            # a pre-refcount decoder: stay eager rather than pin until the sweep.
+            receive_count = request.get("receive_count")
+            if receive_count:
+                await encode_server_module.meta_registry.note_send_done(
+                    req_id, receive_count
+                )
+            else:
+                enc.discard_embedding(req_id)
             content = None
         else:
             content = await _dp_worker_encode_and_send(enc, sched, request)
@@ -942,6 +972,8 @@ async def _dp_worker_handle_request(
             "_dp_type": dp_type,
             "content": content,
         }
+        if dp_type == "send" and request.get("_dp_send_key") is not None:
+            envelope["_dp_send_key"] = request["_dp_send_key"]
     except Exception as e:
         logger.error(
             f"DP worker {dp_rank} error on {dp_type} "
@@ -961,6 +993,8 @@ async def _dp_worker_handle_request(
             "_error_type": type(e).__name__,
             "_error_code": err_code,
         }
+        if dp_type == "send" and request.get("_dp_send_key") is not None:
+            envelope["_dp_send_key"] = request["_dp_send_key"]
 
     # pyzmq async send isn't safe for concurrent senders.
     try:
@@ -990,8 +1024,9 @@ async def run_dp_worker(
     # 0 when CVD is pinned to one GPU, else the absolute id. rank=0, so
     # MMEncoder runs set_device(base_gpu_id).
     args = copy.deepcopy(server_args)
-    args.base_gpu_id = gpu_id
-    args.tp_size = 1
+    # The copy is already resolved (read-only); route the per-worker
+    # specialization through the audited mutation entry.
+    args.override("encode_server.dp_worker", base_gpu_id=gpu_id, tp_size=1)
     enc = MMEncoder(args, dist_init_method=f"tcp://127.0.0.1:{get_free_port()}", rank=0)
 
     if server_args.enable_metrics:

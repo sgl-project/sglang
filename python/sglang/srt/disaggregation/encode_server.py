@@ -6,9 +6,9 @@ import os
 import pickle
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -61,10 +61,149 @@ def is_health_check_request(rid: Optional[str]) -> bool:
     return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
 
 
+rid_lock = asyncio.Lock()
+rid_to_receive_endpoint: Dict[str, Set[str]] = dict()
+rid_to_receive_count: Dict[str, int] = dict()
+cond_dict_lock = asyncio.Lock()
+rid_to_cond: Dict[str, asyncio.Condition] = {}
+
+
+async def _get_receive_condition(req_id: str) -> asyncio.Condition:
+    async with cond_dict_lock:
+        if req_id not in rid_to_cond:
+            rid_to_cond[req_id] = asyncio.Condition()
+        return rid_to_cond[req_id]
+
+
 ENCODER_MAX_BATCH_SIZE = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.get()
 # Watchdog: max time to wait for a batched /encode result. Bounds HTTP latency
 # if the batch worker stalls (NCCL hang, dead worker proc, etc.).
 ENCODER_REQ_TIMEOUT = envs.SGLANG_ENCODER_REQ_TIMEOUT.get()
+
+
+class EncoderMetaRegistry:
+    """Per-part encode metadata rendezvous for the mooncake backend. Decoder TP
+    ranks pull the sizes they need for a landing buffer; ``claim`` keeps that to
+    one encode per req_id. Lives wherever the decoder's HTTP is served."""
+
+    def __init__(self, *, wait_timeout: float, sweep_timeout: float):
+        # How long a decoder blocks in /scheduler_receive_meta_data.
+        self.wait_timeout = wait_timeout
+        # Backstop for state whose /send calls never all land.
+        self.sweep_timeout = sweep_timeout
+        # None value = claimed but not yet published, so waiters keep waiting.
+        self._rid_to_meta: Dict[str, Optional[dict]] = {}
+        self._rid_to_send_done: Dict[str, int] = {}
+        self._pending_at: Dict[str, float] = {}
+        self._sweeper_task: Optional[asyncio.Task] = None
+        # Set only where the embedding also lives; None in the DP main process.
+        self.on_release: Optional[Callable[[str], None]] = None
+
+    def _touch(self, req_id: str) -> None:
+        self._pending_at[req_id] = time.monotonic()
+        self._ensure_sweeper()
+
+    def _ensure_sweeper(self) -> None:
+        if self._sweeper_task is not None and not self._sweeper_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._sweeper_task = loop.create_task(self._sweep_loop())
+
+    async def _sweep_loop(self) -> None:
+        # Same idiom as DPDispatcher._cleanup_stale_mappings: one eternal
+        # scanner; interval re-read each pass so the MMEncoder override applies.
+        while True:
+            await asyncio.sleep(max(self.sweep_timeout / 4, 0.01))
+            now = time.monotonic()
+            stale = [
+                rid
+                for rid, ts in self._pending_at.items()
+                if now - ts > self.sweep_timeout
+            ]
+            for rid in stale:
+                await self._release(rid)
+
+    async def claim(self, req_id: str) -> bool:
+        """True if this caller owns the encode, False if someone already does."""
+        async with rid_lock:
+            if req_id in self._rid_to_meta:
+                existing = self._rid_to_meta[req_id]
+                if not (
+                    isinstance(existing, dict) and existing.get("error") is not None
+                ):
+                    return False
+                self._rid_to_send_done.pop(req_id, None)
+            self._rid_to_meta[req_id] = None
+            self._touch(req_id)
+            return True
+
+    async def publish(
+        self,
+        req_id: str,
+        nbytes: int,
+        embedding_len: int,
+        embedding_dim: int,
+        error: Optional[str] = None,
+    ) -> None:
+        """Publish per-part metadata (or an error), wake waiters, arm the sweep."""
+        meta = (
+            {"error": error}
+            if error is not None
+            else {
+                "embedding_size": nbytes,
+                "embedding_len": embedding_len,
+                "embedding_dim": embedding_dim,
+            }
+        )
+        async with rid_lock:
+            self._rid_to_meta[req_id] = meta
+            self._touch(req_id)
+        cond = await _get_receive_condition(req_id)
+        async with cond:
+            cond.notify_all()
+
+    async def wait(self, req_id: str) -> Optional[dict]:
+        """Block until req_id's metadata is published; TimeoutError past wait_timeout.
+        No _touch here: a pull-first timestamp would let the sweeper pop the very
+        Condition this waiter holds, stranding it when publish notifies a new one."""
+        cond = await _get_receive_condition(req_id)
+        async with cond:
+            await asyncio.wait_for(
+                cond.wait_for(lambda: self._rid_to_meta.get(req_id) is not None),
+                timeout=self.wait_timeout,
+            )
+        return self._rid_to_meta.get(req_id)
+
+    async def note_send_done(self, req_id: str, receive_count: int) -> None:
+        """Count one completed ``/send``; release everything at receive_count."""
+        async with rid_lock:
+            count = self._rid_to_send_done.get(req_id, 0) + 1
+            self._rid_to_send_done[req_id] = count
+        if count >= receive_count:
+            await self._release(req_id)
+
+    async def _release(self, req_id: str) -> None:
+        if self.on_release is not None:
+            self.on_release(req_id)
+        await self.discard(req_id)
+
+    async def discard(self, req_id: str) -> None:
+        """Drop the meta rendezvous state for req_id. Idempotent."""
+        async with rid_lock:
+            self._rid_to_meta.pop(req_id, None)
+            self._rid_to_send_done.pop(req_id, None)
+            self._pending_at.pop(req_id, None)
+        async with cond_dict_lock:
+            rid_to_cond.pop(req_id, None)
+
+
+meta_registry = EncoderMetaRegistry(
+    wait_timeout=ENCODER_REQ_TIMEOUT,
+    sweep_timeout=envs.SGLANG_ENCODER_SEND_TIMEOUT.get(),
+)
 
 
 class MMError(Exception):
@@ -98,24 +237,6 @@ class EncodeContext:
     str_mm_hashes: Optional[List[str]]
     use_global_cache: bool
     is_health_check: bool
-
-
-@dataclass
-class ReqState:
-    """Process-local mutable state owned by one encoder request."""
-
-    req_id: str
-    embedding_data: Optional[EmbeddingData] = None
-    forward_ready_event: Optional[asyncio.Event] = None
-    forward_embedding: Optional[torch.Tensor] = None
-    forward_error: Optional[str] = None
-    mr_ptr: Optional[int] = None
-    encode_event: Optional[asyncio.Event] = None
-    encode_metadata: Optional[Tuple[int, int, int]] = None
-    cleanup_task: Optional[asyncio.Task] = None
-    receive_urls: Set[str] = field(default_factory=set)
-    receive_count: Optional[int] = None
-    receive_cond: asyncio.Condition = field(default_factory=asyncio.Condition)
 
 
 class TensorWrapper:
@@ -304,8 +425,6 @@ class MMEncoder:
                 self.context, zmq.PULL, schedule_path, True
             )
         self.background_tasks: Set[asyncio.Task] = set()
-        self.req_states: Dict[str, ReqState] = {}
-        self.req_states_lock = asyncio.Lock()
 
         # Embedding dtype = model param dtype. Always available (both transfer
         # backends and the global-cache pool rely on it).
@@ -313,7 +432,6 @@ class MMEncoder:
         self._element_size = torch.tensor(
             [], dtype=self._embedding_dtype
         ).element_size()
-        self._embedding_dims = self._infer_embedding_dims()
 
         if self.server_args.enable_mm_global_cache:
             from sglang.srt.mem_cache.embedding_cache_controller import (
@@ -324,7 +442,7 @@ class MMEncoder:
             embedding_store = EmbeddingStoreFactory.create_backend(
                 self.server_args.mm_global_cache_backend,
             )
-            hidden_dims = self._embedding_dims
+            hidden_dims = self._infer_embedding_dims()
             self.mm_global_cache = EmbeddingCacheController(
                 rank,
                 server_args.tp_size,
@@ -360,27 +478,34 @@ class MMEncoder:
                         ),
                     )
 
+            self.embedding_to_send = dict()
             # Need to ensure the NCCL launch order on rank0 matches the dispatch order rank>0
             self.encode_dispatch_lock = asyncio.Lock()
+
+            if self.server_args.encoder_transfer_backend == "mooncake":
+                # Embeddings live here, so dropping metadata must drop them too.
+                meta_registry.on_release = self.discard_embedding
+                meta_registry.sweep_timeout = self.send_timeout
 
         logger.info(f"rank {rank} init finish ")
 
     def supports_modality(self, modality: Modality) -> bool:
         return self.preprocessor.supports_modality(modality)
 
-    def has_active_requests(self) -> bool:
-        return bool(self.req_states)
-
-    def get_request_state(self, req_id: str) -> Optional[ReqState]:
-        return self.req_states.get(req_id)
+    def has_pending_embeddings(self) -> bool:
+        return bool(getattr(self, "embedding_to_send", None))
 
     def discard_embedding(self, req_id: str) -> None:
-        state = self.req_states.get(req_id)
-        if state is None:
+        """Drop the staged embedding and its mooncake MR. Idempotent, all backends."""
+        embedding_to_send = getattr(self, "embedding_to_send", None)
+        if embedding_to_send is None:
             return
-        state.embedding_data = None
-        if state.encode_event is None and state.forward_ready_event is None:
-            self.req_states.pop(req_id, None)
+        mm_data = embedding_to_send.pop(req_id, None)
+        if mm_data is not None and mm_data._mr_ptr is not None:
+            try:
+                self.engine.deregister(mm_data._mr_ptr)
+            except Exception as dereg_err:
+                logger.warning(f"Shared-MR deregister failed for {req_id}: {dereg_err}")
 
     async def register_embedding_destinations(
         self,
@@ -388,20 +513,16 @@ class MMEncoder:
         expected_destination_count: int,
         destination_urls: Iterable[str],
     ) -> None:
-        async with self.req_states_lock:
-            state = self.req_states.get(req_id)
-            if state is None:
-                # The scheduler protocol registers its destination before
-                # /encode, so this is also a valid initial request event.
-                state = ReqState(req_id=req_id)
-                self.req_states[req_id] = state
-            if state.receive_count is None:
-                state.receive_count = expected_destination_count
-            assert state.receive_count == expected_destination_count
-            state.receive_urls.update(destination_urls)
+        async with rid_lock:
+            if req_id not in rid_to_receive_endpoint:
+                rid_to_receive_endpoint[req_id] = set()
+                rid_to_receive_count[req_id] = expected_destination_count
+            assert rid_to_receive_count[req_id] == expected_destination_count
+            rid_to_receive_endpoint[req_id].update(destination_urls)
 
-        async with state.receive_cond:
-            state.receive_cond.notify_all()
+        cond = await _get_receive_condition(req_id)
+        async with cond:
+            cond.notify_all()
 
     def _infer_embedding_dims(self) -> dict:
         """Infer per-modality embedding dimensions from hf_config at init time."""
@@ -439,7 +560,7 @@ class MMEncoder:
                     dims[Modality.AUDIO] = int(val)
                     break
 
-        logger.info(f"Encoder embedding dims: {dims}")
+        logger.info(f"Global cache embedding dims: {dims}")
         return dims
 
     def get_num_patches(
@@ -472,9 +593,7 @@ class MMEncoder:
             )
         return int(values[-2]), int(values[-1])
 
-    def _kimi_tokens_from_patch_grid(
-        self, grid: Union[torch.Tensor, List[int]]
-    ) -> int:
+    def _kimi_tokens_from_patch_grid(self, grid: Union[torch.Tensor, List[int]]) -> int:
         """Calculate Kimi image tokens from either 2D or 3D patch metadata."""
         h, w = self._kimi_hw_from_patch_grid(grid)
         merge_h, merge_w = self.model_config.hf_config.vision_config.merge_kernel_size
@@ -487,10 +606,7 @@ class MMEncoder:
         if modality == Modality.AUDIO:
             input_length = self.get_num_patches(grid, modality)
             return self.preprocessor._get_feat_extract_output_lengths(input_length)
-        if (
-            self.model_type in ("kimi_k25", "kimi_vl")
-            and modality == Modality.IMAGE
-        ):
+        if self.model_type in ("kimi_k25", "kimi_vl") and modality == Modality.IMAGE:
             return self._kimi_tokens_from_patch_grid(grid)
         merge_size = getattr(self.preprocessor.image_processor, "merge_size", 2)
         return self.get_num_patches(grid, modality) // (merge_size**2)
@@ -1163,24 +1279,8 @@ class MMEncoder:
         url=None,
     ):
         if self.server_args.encoder_transfer_backend == "mooncake":
-            # Wait for async VIT forward completion if needed
+            # Encode is synchronous, so mm_data was staged before /encode returned.
             req_id = mm_data.req_id
-            state = self.get_request_state(req_id)
-            if state is None:
-                raise InternalError(f"Unknown encoder request: {req_id}")
-            if state.forward_ready_event is not None:
-                await state.forward_ready_event.wait()
-                if state.forward_error is not None:
-                    raise InternalError(f"VIT forward failed: {state.forward_error}")
-                embedding = state.forward_embedding
-                # Cache the embedding on mm_data so subsequent /send calls
-                # from other decoder TP ranks can reuse it.
-                mm_data.cached_embedding = embedding
-
-            # Retrieve cached embedding for duplicate /send calls from other
-            # decoder TP ranks.
-            if embedding is None:
-                embedding = mm_data.cached_embedding
             if embedding is None:
                 raise InternalError(
                     f"No embedding available for Mooncake GPU-direct transfer: {req_id}"
@@ -1193,14 +1293,10 @@ class MMEncoder:
                 f"(shape={mm_data.shape}, element_size={self._element_size})"
             )
 
-            # Request-level shared MR, registered lazily on the first /send;
-            # deregistration is deferred to _cleanup_inflight_encode_state.
-            if self.get_request_state(req_id) is not state:
-                raise InternalError(f"Encoder request was released: {req_id}")
-            mr_already_registered = state.mr_ptr == embedding.data_ptr()
+            # Fall back to a per-send registration only if the shared one failed.
+            mr_already_registered = mm_data._mr_ptr == embedding.data_ptr()
             if not mr_already_registered:
                 self.engine.register(embedding.data_ptr(), embedding.nbytes)
-                state.mr_ptr = embedding.data_ptr()
             _t_xfer_start = time.monotonic()
             xfer_ret = await asyncio.to_thread(
                 self.engine.transfer_sync,
@@ -1214,19 +1310,22 @@ class MMEncoder:
                 encoder_metrics_collector.observe_transfer(
                     xfer_ms / 1000.0, backend="mooncake"
                 )
+            if not mr_already_registered:
+                self.engine.deregister(embedding.data_ptr())
             if xfer_ret < 0:
                 raise InternalError(
                     f"Mooncake transfer_sync failed for {req_id} "
                     f"(session={session_id}, nbytes={embedding.nbytes}, "
                     f"ret={xfer_ret})"
                 )
-            # Only emit at INFO when transfer is slow or the MR was
-            # registered lazily by this /send;
+            # Emit at INFO for slow transfers or per-send registrations.
             if xfer_ms > 200.0 or not mr_already_registered:
                 logger.info(
                     f"[{req_id}] mooncake transfer_sync={xfer_ms:.1f}ms "
                     f"nbytes={embedding.nbytes} shared_mr={mr_already_registered}"
                 )
+
+            # Sibling ranks re-read mm_data here; meta_registry owns the release.
 
         # Send ack/data
         if url is not None:
@@ -1275,54 +1374,59 @@ class MMEncoder:
                 backend=self.server_args.encoder_transfer_backend,
             )
 
-    def _setup_per_request_encode(
+    async def _encode_zmq(
         self,
         ctx: EncodeContext,
         num_parts: int,
         part_idx: int,
-        use_mooncake: bool,
-        state: Optional[ReqState],
     ):
-        """Setup metadata and event management for async encode.
-        Returns ((nbytes, total_tokens, embedding_dim), event).
-        """
-        total_tokens = sum(ctx.token_counts)
-        embedding_dim = self._embedding_dims[ctx.modality]
-        nbytes = total_tokens * embedding_dim * self._element_size
+        """Compute synchronously and stage a CPU embedding for ZMQ transfer."""
+        mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=False)
 
-        event = None
-        if self.rank == 0 and use_mooncake:
-            if state is None or self.get_request_state(ctx.req_id) is not state:
-                raise InternalError(f"Unknown encoder request: {ctx.req_id}")
+        if self.profiler is not None:
+            self.profiler.step()
+
+        if self.rank == 0:
+            if mm_embedding is None:
+                raise InternalError(
+                    f"Rank 0 produced no embedding for request {ctx.req_id}"
+                )
             mm_data = EmbeddingData(
                 ctx.req_id,
                 num_parts,
                 part_idx,
                 ctx.grid_thw,
                 ctx.modality,
-                embedding=None,
-                embedding_shape=[total_tokens, embedding_dim],
+                mm_embedding,
                 **ctx.aux_data,
             )
-            state.embedding_data = mm_data
-            event = asyncio.Event()
-            state.forward_ready_event = event
-            state.forward_embedding = None
-            state.forward_error = None
-            state.mr_ptr = None
+            self.embedding_to_send[ctx.req_id] = mm_data
+        if mm_embedding is None:
+            return (0, 0, 0, None, None)
+        return (
+            mm_embedding.nbytes,
+            mm_embedding.shape[0],
+            mm_embedding.shape[1],
+            None,
+            None,
+        )
 
-        return (nbytes, total_tokens, embedding_dim), event
+    def _register_shared_mr(self, mm_data: EmbeddingData, embedding: torch.Tensor):
+        """Register one MR shared by every rank's /send; _send re-registers on failure."""
+        try:
+            self.engine.register(embedding.data_ptr(), embedding.nbytes)
+            mm_data._mr_ptr = embedding.data_ptr()
+        except Exception as reg_err:
+            logger.warning(
+                f"Shared-MR register failed for {mm_data.req_id}, "
+                f"falling back to per-/send register: {reg_err}"
+            )
 
     def _handle_mooncake_encode_error(
-        self, req_id, num_parts, part_idx, modality, error_msg, error_code, state
+        self, req_id, num_parts, part_idx, modality, error_msg, error_code
     ):
-        """Handle outer exception for mooncake async encode methods."""
-        if self.rank == 0 and state is not None:
-            if self.get_request_state(req_id) is not state:
-                return 0, 0, 0, error_msg, error_code
-            state.forward_error = error_msg
-            if state.forward_ready_event is not None:
-                state.forward_ready_event.set()
+        """Stage an error EmbeddingData so /send reports the encode failure."""
+        if self.rank == 0:
             mm_data = EmbeddingData(
                 req_id,
                 num_parts,
@@ -1332,207 +1436,57 @@ class MMEncoder:
                 error_msg=error_msg,
                 error_code=error_code,
             )
-            state.embedding_data = mm_data
+            self.embedding_to_send[req_id] = mm_data
         return 0, 0, 0, error_msg, error_code
 
-    def _launch_encode_background_task(self, coro):
-        """Launch an async background task and track it."""
-        task = asyncio.create_task(coro)
-        self.background_tasks.add(task)
-        task.add_done_callback(self.background_tasks.discard)
-        return task
-
-    async def begin_or_wait_inflight_encode(
-        self, req_id: str
-    ) -> Tuple[bool, Optional[Tuple[int, int, int]]]:
-        """Claim an encode request or wait for its owner's metadata."""
-        if self.server_args.encoder_transfer_backend != "mooncake":
-            return True, None
-
-        async with self.req_states_lock:
-            state = self.req_states.get(req_id)
-            if state is None:
-                state = ReqState(req_id=req_id)
-                self.req_states[req_id] = state
-            if state.encode_event is None:
-                state.encode_event = asyncio.Event()
-                return True, None
-            event = state.encode_event
-
-        await event.wait()
-        async with self.req_states_lock:
-            return False, state.encode_metadata
-
-    async def complete_inflight_encode(
-        self,
-        req_id: str,
-        metadata: Optional[Tuple[int, int, int]],
-    ) -> None:
-        """Publish encode metadata, or signal failure when metadata is None."""
-        if self.server_args.encoder_transfer_backend != "mooncake":
-            return
-
-        async with self.req_states_lock:
-            state = self.req_states.get(req_id)
-            if state is not None and state.encode_event is not None:
-                state.encode_metadata = metadata
-                event = state.encode_event
-                event.set()
-
-        if metadata is None:
-            await self.release_inflight_encode(req_id)
-        else:
-            self._schedule_inflight_encode_cleanup(req_id)
-
-    async def release_inflight_encode(self, req_id: str) -> None:
-        """Release duplicate-request, embedding, and Mooncake forward state."""
-        if self.server_args.encoder_transfer_backend != "mooncake":
-            return
-        async with self.req_states_lock:
-            state = self.req_states.pop(req_id, None)
-            task = state.cleanup_task if state is not None else None
-            if (
-                task is not None
-                and task is not asyncio.current_task()
-                and not task.done()
-            ):
-                task.cancel()
-        if state is None:
-            return
-        # Also clean up embedding data and forward state
-        mm_data = state.embedding_data
-        # Release the rkey after all /send calls have completed.
-        if state.mr_ptr is not None:
-            try:
-                self.engine.deregister(state.mr_ptr)
-            except Exception as dereg_err:
-                logger.warning(f"Shared-MR deregister failed for {req_id}: {dereg_err}")
-        state.forward_embedding = None
-        # Release the embedding only after the MR is deregistered.
-        if mm_data is not None:
-            mm_data.embedding = None
-            mm_data.cached_embedding = None
-
-    def _schedule_inflight_encode_cleanup(self, req_id: str):
-        if self.server_args.encoder_transfer_backend != "mooncake":
-            return
-        state = self.req_states.get(req_id)
-        if state is None:
-            return
-
-        async def _cleanup_later():
-            await asyncio.sleep(self.send_timeout)
-            await self.release_inflight_encode(req_id)
-
-        old_task = state.cleanup_task
-        if old_task is not None and not old_task.done():
-            old_task.cancel()
-        task = asyncio.create_task(_cleanup_later())
-        state.cleanup_task = task
-        self.background_tasks.add(task)
-        task.add_done_callback(self.background_tasks.discard)
-
-    def _start_per_request_encode(
+    async def _encode_mooncake(
         self,
         ctx: EncodeContext,
         num_parts: int,
         part_idx: int,
-        use_mooncake: bool,
-        state: Optional[ReqState],
     ):
-        """Launch one common forward; callers decide whether to await it."""
-        metadata, event = self._setup_per_request_encode(
-            ctx,
+        """Compute synchronously and stage a GPU embedding for RDMA transfer.
+
+        Returning only after the forward means every later /send finds it staged.
+        """
+        mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=True)
+        # transfer_sync bypasses CUDA streams, so GPU writes must land first.
+        if mm_embedding is not None and mm_embedding.is_cuda:
+            torch.cuda.current_stream(mm_embedding.device).synchronize()
+
+        if self.profiler is not None:
+            self.profiler.step()
+
+        if self.rank != 0:
+            return (0, 0, 0, None, None)
+
+        if mm_embedding is None:
+            raise InternalError(
+                f"Rank 0 produced no embedding for request {ctx.req_id}"
+            )
+        mm_data = EmbeddingData(
+            ctx.req_id,
             num_parts,
             part_idx,
-            use_mooncake,
-            state,
+            ctx.grid_thw,
+            ctx.modality,
+            mm_embedding,
+            **ctx.aux_data,
+        )
+        # Global-cache embeddings keep registering per /send instead.
+        if not ctx.use_global_cache:
+            self._register_shared_mr(mm_data, mm_embedding)
+        self.embedding_to_send[ctx.req_id] = mm_data
+        return (
+            mm_embedding.nbytes,
+            mm_embedding.shape[0],
+            mm_embedding.shape[1],
+            None,
+            None,
         )
 
-        # All ranks launch in dispatch order. The model feature method must
-        # remain on the event-loop thread because its inference session is
-        # not available in a ThreadPoolExecutor worker.
-        async def _run_forward():
-            try:
-                emb = await self._compute_embedding(ctx, keep_on_gpu=use_mooncake)
-                # The transfer engine operates outside the CUDA stream, so GPU
-                # writes must complete before a transfer can start.
-                if use_mooncake and emb is not None and emb.is_cuda:
-                    torch.cuda.current_stream(emb.device).synchronize()
-                if self.rank == 0:
-                    if state is None or self.get_request_state(ctx.req_id) is not state:
-                        return
-                    if emb is None:
-                        raise InternalError(
-                            f"Rank 0 produced no embedding for request {ctx.req_id}"
-                        )
-                    actual_metadata = (
-                        emb.nbytes,
-                        emb.shape[0],
-                        emb.shape[1],
-                    )
-                    if actual_metadata != metadata:
-                        raise InternalError(
-                            f"Embedding metadata mismatch for {ctx.req_id}: "
-                            f"expected={metadata}, actual={actual_metadata}"
-                        )
-                    if use_mooncake:
-                        # Direct embeddings share this registration across /send
-                        # calls. Global-cache embeddings register inside _send.
-                        if not ctx.use_global_cache:
-                            try:
-                                self.engine.register(emb.data_ptr(), emb.nbytes)
-                                state.mr_ptr = emb.data_ptr()
-                            except Exception as reg_err:
-                                logger.warning(
-                                    f"Shared-MR register failed for {ctx.req_id}, "
-                                    f"falling back to per-/send register: {reg_err}"
-                                )
-                                state.mr_ptr = None
-                        state.forward_embedding = emb
-                    else:
-                        state.embedding_data = EmbeddingData(
-                            ctx.req_id,
-                            num_parts,
-                            part_idx,
-                            ctx.grid_thw,
-                            ctx.modality,
-                            emb,
-                            **ctx.aux_data,
-                        )
-            except Exception as e:
-                if not use_mooncake:
-                    raise
-
-                error_msg = str(e)
-                logger.error(
-                    f"Encoder forward failed for {ctx.req_id}: {error_msg}",
-                    exc_info=True,
-                )
-                if (
-                    self.rank == 0
-                    and state is not None
-                    and self.get_request_state(ctx.req_id) is state
-                ):
-                    state.forward_error = error_msg
-            finally:
-                if self.rank == 0 and event is not None:
-                    event.set()
-                if self.profiler is not None:
-                    self.profiler.step()
-
-        task = self._launch_encode_background_task(_run_forward())
-        return metadata, task
-
     async def encode(
-        self,
-        mm_items,
-        modality: Modality,
-        req_id,
-        num_parts,
-        part_idx,
-        hashes=None,
-        state: Optional[ReqState] = None,
+        self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
     ):
         """Encode one request through the configured transfer backend.
 
@@ -1545,16 +1499,6 @@ class MMEncoder:
             self.server_args.encoder_transfer_backend == "mooncake"
             and not is_health_check
         )
-        if self.rank == 0:
-            if state is None:
-                async with self.req_states_lock:
-                    state = self.req_states.get(req_id)
-                    if state is None:
-                        # Direct encode is a valid initial request event.
-                        state = ReqState(req_id=req_id)
-                        self.req_states[req_id] = state
-            elif self.get_request_state(req_id) is not state:
-                raise InternalError(f"Encoder request was released: {req_id}")
         try:
             use_global_cache = self.mm_global_cache is not None and not is_health_check
             ctx = await self._prepare_encode_context(
@@ -1565,22 +1509,17 @@ class MMEncoder:
                 use_global_cache=use_global_cache,
                 is_health_check=is_health_check,
             )
-            metadata, encode_task = self._start_per_request_encode(
+            if use_mooncake:
+                return await self._encode_mooncake(
+                    ctx,
+                    num_parts,
+                    part_idx,
+                )
+            return await self._encode_zmq(
                 ctx,
                 num_parts,
                 part_idx,
-                use_mooncake,
-                state,
             )
-            if use_mooncake:
-                if self.rank == 0:
-                    logger.info(
-                        f"Returning metadata immediately for {ctx.req_id}, "
-                        f"encoder forward running async"
-                    )
-                return (*metadata, None, None)
-            await encode_task
-            return (*metadata, None, None)
         except Exception as e:
             error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
             error_msg = str(e)
@@ -1596,13 +1535,8 @@ class MMEncoder:
                     modality,
                     error_msg,
                     error_code,
-                    state,
                 )
-            if (
-                self.rank == 0
-                and state is not None
-                and self.get_request_state(req_id) is state
-            ):
+            if self.rank == 0:
                 mm_data = EmbeddingData(
                     req_id,
                     num_parts,
@@ -1612,13 +1546,11 @@ class MMEncoder:
                     error_msg=error_msg,
                     error_code=error_code,
                 )
-                state.embedding_data = mm_data
+                self.embedding_to_send[req_id] = mm_data
                 logger.debug(f"Created error EmbeddingData: {mm_data}")
             return 0, 0, 0, error_msg, error_code
 
-    async def encode_request(
-        self, req: dict, modality: Modality, state: Optional[ReqState] = None
-    ):
+    async def encode_request(self, req: dict, modality: Modality):
         """Adapt a request dictionary to the single-request encode interface."""
         return await self.encode(
             mm_items=req["mm_items"],
@@ -1627,25 +1559,12 @@ class MMEncoder:
             num_parts=req["num_parts"],
             part_idx=req["part_idx"],
             hashes=req.get("hashes"),
-            state=state,
         )
 
     async def batch_encode(
-        self,
-        requests: List[dict],
-        modality: Modality,
-        states: Optional[List[ReqState]] = None,
+        self, requests: List[dict], modality: Modality
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
         """Cross-request encoder fusion (image/audio). No cache path."""
-        request_states: List[Optional[ReqState]] = (
-            list(states)
-            if states is not None
-            else [self.get_request_state(req["req_id"]) for req in requests]
-        )
-        if len(request_states) != len(requests):
-            raise InternalError(
-                f"Expected {len(requests)} request states, got {len(request_states)}"
-            )
         try:
             preprocess_start = time.perf_counter()
             mm_inputs, token_counts, items_per_req = (
@@ -1662,17 +1581,11 @@ class MMEncoder:
             get_feat = getattr(target, f"get_{modality.name.lower()}_feature")
         except NotImplementedError as e:
             return self._batch_set_error(
-                requests,
-                modality,
-                InternalError(f"Not implemented error: {e}"),
-                request_states,
+                requests, modality, InternalError(f"Not implemented error: {e}")
             )
         except Exception as e:
             return self._batch_set_error(
-                requests,
-                modality,
-                BadRequestError(f"Failed to process mm items: {e}"),
-                request_states,
+                requests, modality, BadRequestError(f"Failed to process mm items: {e}")
             )
 
         if len(items_per_req) != len(requests) or any(n <= 0 for n in items_per_req):
@@ -1682,7 +1595,6 @@ class MMEncoder:
                 InternalError(
                     f"Invalid batch layout {items_per_req} for {len(requests)} requests"
                 ),
-                request_states,
             )
 
         total = sum(items_per_req)
@@ -1694,7 +1606,6 @@ class MMEncoder:
                     f"Preprocessor returned {len(token_counts)} token counts for "
                     f"batch layout {items_per_req}"
                 ),
-                request_states,
             )
         if encoder_metrics_collector is not None:
             modality_str = modality.name.lower()
@@ -1721,9 +1632,9 @@ class MMEncoder:
                         f"{len(grid_dim)}. Processor batch layout must report "
                         f"one entry per encoder grid."
                     ),
-                    request_states,
                 )
 
+            keep_on_gpu = self.server_args.encoder_transfer_backend == "mooncake"
             final_slices = self._encode_missing(
                 mm_feature,
                 mm_inputs,
@@ -1731,6 +1642,7 @@ class MMEncoder:
                 token_counts,
                 modality,
                 get_feat,
+                keep_on_gpu=keep_on_gpu,
             )
 
             if self.profiler is not None:
@@ -1741,15 +1653,16 @@ class MMEncoder:
             # video-meta fields — which never appear in image/audio mm_inputs.
             results = []
             offset = 0
-            for req, n, state in zip(requests, items_per_req, request_states):
+            staged_device = None
+            for req, n in zip(requests, items_per_req):
                 slices = final_slices[offset : offset + n]
-                emb = slices[0] if n == 1 else torch.cat(slices, dim=0)
-                if (
-                    self.rank == 0
-                    and state is not None
-                    and self.get_request_state(req["req_id"]) is state
-                ):
-                    state.embedding_data = EmbeddingData(
+                if n > 1:
+                    emb = torch.cat(slices, dim=0)
+                else:
+                    # A view would pin the whole batch tensor until the last transfer.
+                    emb = slices[0].clone() if keep_on_gpu else slices[0]
+                if self.rank == 0:
+                    mm_data = EmbeddingData(
                         req["req_id"],
                         req["num_parts"],
                         req["part_idx"],
@@ -1757,32 +1670,30 @@ class MMEncoder:
                         modality,
                         emb,
                     )
+                    if keep_on_gpu:
+                        self._register_shared_mr(mm_data, emb)
+                    self.embedding_to_send[req["req_id"]] = mm_data
+                if keep_on_gpu and emb.is_cuda:
+                    staged_device = emb.device
                 results.append((emb.nbytes, emb.shape[0], emb.shape[1], None, None))
                 offset += n
+            if staged_device is not None:
+                torch.cuda.current_stream(staged_device).synchronize()
             return results
         except Exception as e:
             return self._batch_set_error(
-                requests,
-                modality,
-                InternalError(f"Internal encoding error: {e}"),
-                request_states,
+                requests, modality, InternalError(f"Internal encoding error: {e}")
             )
 
     def _batch_set_error(
-        self,
-        requests: List[dict],
-        modality: Modality,
-        exc: Exception,
-        states: List[Optional[ReqState]],
+        self, requests: List[dict], modality: Modality, exc: Exception
     ) -> List[Tuple[int, int, int, str, int]]:
         code = getattr(exc, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
         msg = str(exc)
         logger.error(f"Rank {self.rank} batch_encode failed: {msg} {code = }")
         if self.rank == 0:
-            for req, state in zip(requests, states):
-                if state is None or self.get_request_state(req["req_id"]) is not state:
-                    continue
-                state.embedding_data = EmbeddingData(
+            for req in requests:
+                self.embedding_to_send[req["req_id"]] = EmbeddingData(
                     req["req_id"],
                     req["num_parts"],
                     req["part_idx"],
@@ -1797,12 +1708,15 @@ class MMEncoder:
     async def send(
         self, req_id, prefill_host, embedding_port, session_id=None, buffer_address=None
     ):
-        state = self.get_request_state(req_id)
-        if state is None:
-            raise InternalError(f"Unknown encoder request: {req_id}")
-        mm_data = state.embedding_data
+        mm_data = self.embedding_to_send.get(req_id)
         if mm_data is None:
-            raise InternalError(f"No embedding available for request: {req_id}")
+            # False = nothing transferred: callers must not count this send
+            # nor report success, or the decoder waits on an ack never coming.
+            logger.warning(
+                f"MMEncoder.send: no embedding for req_id={req_id} "
+                f"(already released or unknown)"
+            )
+            return False
         await self._send(
             mm_data.embedding,
             mm_data,
@@ -1811,27 +1725,27 @@ class MMEncoder:
             prefill_host=prefill_host,
             embedding_port=embedding_port,
         )
+        return True
 
     # For zmq_to_scheduler
     async def send_with_url(
         self,
         req_id,
     ):
-        state = self.req_states.get(req_id)
-        if state is None or state.embedding_data is None:
+        mm_data = self.embedding_to_send.get(req_id)
+        if not mm_data:
             return
-        mm_data = state.embedding_data
         sent_urls: Set[str] = set()
         all_tasks: List[Tuple[asyncio.Task, str]] = []
         start_time = asyncio.get_running_loop().time()
         timeout = self.send_timeout
-        cond = state.receive_cond
+        cond = await _get_receive_condition(req_id)
 
         try:
             while True:
-                async with self.req_states_lock:
-                    current_targets = state.receive_urls.copy()
-                    expected_count = state.receive_count
+                async with rid_lock:
+                    current_targets = rid_to_receive_endpoint.get(req_id, set()).copy()
+                    expected_count = rid_to_receive_count.get(req_id)
 
                 new_targets = current_targets - sent_urls
 
@@ -1886,8 +1800,12 @@ class MMEncoder:
 
         finally:
             logger.info(f"Cleaning up resources for req_id {req_id}")
-            async with self.req_states_lock:
-                self.req_states.pop(req_id, None)
+            async with rid_lock:
+                rid_to_receive_endpoint.pop(req_id, None)
+                rid_to_receive_count.pop(req_id, None)
+            async with cond_dict_lock:
+                rid_to_cond.pop(req_id, None)
+            self.embedding_to_send.pop(req_id, None)
 
     async def get_embedding_port(self, prefill_url):
         async with aiohttp.ClientSession(

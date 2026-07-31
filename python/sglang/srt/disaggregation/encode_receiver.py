@@ -429,7 +429,9 @@ class EmbeddingData:
             self.shape = embedding_shape
         else:
             self.shape = list(embedding.shape) if embedding is not None else None
-        self.cached_embedding = None
+        # Encoder-side mooncake MR for `embedding`. Underscored so
+        # copy_without_embedding drops this process-local address.
+        self._mr_ptr: Optional[int] = None
         self.error_msg = error_msg
         # Coerce to plain int: this object crosses process boundaries via
         # safe_pickle_loads, whose allowlist blocks http.HTTPStatus.
@@ -461,8 +463,7 @@ class EmbeddingData:
             error_code=self.error_code,
         )
         for key, value in self.__dict__.items():
-            # cached_embedding is a GPU tensor used only by mooncake's in-process
-            if key.startswith("_") or key in ("embedding", "cached_embedding"):
+            if key.startswith("_") or key == "embedding":
                 continue
             setattr(new_data, key, value)
         return new_data
@@ -999,79 +1000,69 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         self._pool_slot_id: Optional[int] = None
 
     def send_encode_request(self):
-        self._encode_thread = threading.Thread(
-            target=self._run_encode_in_thread, daemon=True
+        # Base-class hook. The tokenizer owns /encode, so this rank only pulls
+        # sizes and drives the RDMA receive.
+        self._receive_thread = threading.Thread(
+            target=self._run_receive_in_thread, daemon=True
         )
-        self._encode_thread.start()
+        self._receive_thread.start()
 
-    def _run_encode_in_thread(self):
+    def _run_receive_in_thread(self):
         try:
-            asyncio.run(self._send_encode_and_rdma_request())
+            asyncio.run(self._pull_meta_and_receive_embedding())
         except Exception as e:
-            logger.error(f"RDMA encode request failed for rid={self.rid}: {e}")
+            logger.error(f"RDMA receive failed for rid={self.rid}: {e}")
             self.status = WaitingImageRequestStatus.FAIL
             self.error_msg = str(e)
             self._cleanup_gpu_buffer()
             self.recv_socket.close()
 
-    async def _send_encode_and_rdma_request(self):
+    async def _pull_meta_and_receive_embedding(self):
+        """Pull per-part sizes, allocate the landing buffer, then drive /send.
+
+        The tokenizer owns /encode; part_idx numbering matches it because both
+        derive it from the num_items_assigned frozen onto the request.
+        """
         modalities = list(self.num_items_assigned.keys())
         _, modality_num_parts = calculate_modality_num_parts(
             modalities, self.num_items_assigned
         )
         encode_requests = []
-        # Use the URL list captured at tokenizer time.  TokenizedGenerateReqInput
-        # has no image_data field, so reading recv_req.image_data here would
-        # always return None and produce empty mm_items.
-        mm_data_all = self.recv_req.mm_data_mooncake or []
 
         total_num_parts = sum(modality_num_parts.values())
         part_idx_offset = 0
         for modality in modalities:
             assigned_nums = self.num_items_assigned[modality]
-            num_parts = modality_num_parts[modality]
-            mm_data_modality = [d for d in mm_data_all if d["modality"] == modality]
-            cum_num_items = 0
             cum_idx = 0
             for idx, assigned_num in enumerate(assigned_nums):
                 if assigned_num == 0:
                     continue
                 part_idx = part_idx_offset + cum_idx
-                part_req_id = create_part_req_id(self.recv_req.rid, part_idx)
                 encode_requests.append(
                     {
                         "encoder_idx": idx,
-                        "mm_items": [
-                            d["url"]
-                            for d in mm_data_modality[
-                                cum_num_items : cum_num_items + assigned_num
-                            ]
-                        ],
-                        "num_parts": total_num_parts,
                         "part_idx": part_idx,
-                        "req_id": part_req_id,
-                        "modality": modality.name,
-                        "prefill_host": self.host_name,
-                        "embedding_port": self.embedding_port,
+                        "req_id": create_part_req_id(self.recv_req.rid, part_idx),
                     }
                 )
                 cum_idx += 1
-                cum_num_items += assigned_num
-            part_idx_offset += num_parts
+            part_idx_offset += modality_num_parts[modality]
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get())
         ) as session:
-            # Phase 1: POST /encode to all encoder shards in parallel.
+            # Phase 1: pull per-part sizes, blocking until the encode publishes.
             tasks = [
                 session.post(
-                    f"{self.encoder_urls[r['encoder_idx']]}/encode",
-                    json=r,
+                    f"{self.encoder_urls[r['encoder_idx']]}/scheduler_receive_meta_data",
+                    json={"req_id": r["req_id"], "part_idx": r["part_idx"]},
                 )
                 for r in encode_requests
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
-            if not await self._check_encoder_responses(responses, "/encode"):
+            if not await self._check_encoder_responses(
+                responses, "/scheduler_receive_meta_data"
+            ):
                 return
             response_json_list = [await r.json() for r in responses]
 
@@ -1130,21 +1121,28 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                 self.embeddings_buffer = None
                 buffer_address = 0
 
-            # Phase 2 cont: POST /send with RDMA info.
+            # Phase 2 cont: POST /send. Metadata carries no routing, so the
+            # shard comes from our own part map.
+            encoder_idx_by_part = {
+                r["part_idx"]: r["encoder_idx"] for r in encode_requests
+            }
             offset = 0
             send_tasks = []
             for idx in range(total_num_parts):
                 rj = response_sorted[idx]
-                encoder_idx = rj.pop("encoder_idx", None)
                 rj.update(
                     {
+                        "prefill_host": self.host_name,
+                        "embedding_port": self.embedding_port,
                         "session_id": self.embeddings_engine.session_id,
                         "buffer_address": offset + buffer_address,
+                        # Frees the embedding once all of us have taken it.
+                        "receive_count": self.receive_count,
                     }
                 )
                 send_tasks.append(
                     session.post(
-                        f"{self.encoder_urls[encoder_idx]}/send",
+                        f"{self.encoder_urls[encoder_idx_by_part[idx]]}/send",
                         json=rj,
                     )
                 )
@@ -1453,7 +1451,7 @@ def _view_pool_buffer_by_modality(raw_buffer, embedding_data, dtype):
 
     Replaces _slice_embedding_buffer + get_embedding(is_concat=True): parts of
     the same modality are contiguous in raw_buffer (encoder writes them
-    modality-outer in _send_encode_and_rdma_request), so we can reshape the
+    modality-outer in _pull_meta_and_receive_embedding), so we can reshape the
     byte range directly — no per-part split, no torch.cat copy.
 
     Caller must keep raw_buffer's storage alive while the returned views are
@@ -1669,7 +1667,6 @@ class MMReceiverBase(ABC):
                     mm_data,
                     embedding_port,
                     "encode",
-                    "send",
                     encode_urls=encode_urls,
                 )
             )
@@ -1800,15 +1797,6 @@ class MMReceiverBase(ABC):
             # Freeze the encoder URL snapshot onto obj so the scheduler
             # subprocess uses the same list when indexing encoder_idx.
             obj.encoder_urls = encode_urls
-
-            # For mooncake, No tokenizer-side thread.
-            # Save mm_data (extracted URL list) onto obj so the scheduler-side
-            # WaitingImageRDMARequest can use it.  TokenizedGenerateReqInput does
-            # NOT carry image_data, so re-reading recv_req.image_data at scheduler
-            # time would always return None.
-            if self.encoder_transfer_backend == "mooncake":
-                obj.mm_data_mooncake = mm_data
-                return
 
             encode_thread = threading.Thread(
                 target=self._run_encode_in_thread,
@@ -1964,7 +1952,6 @@ class MMReceiverBase(ABC):
                     mm_data=mm_data,
                     embedding_port=embedding_port,
                     endpoint_encode=endpoint_encode,
-                    endpoint_send=None,
                     num_items_assigned=num_items_assigned,
                     encode_urls=encode_urls,
                     time_stats_json=time_stats_json,
@@ -2184,7 +2171,6 @@ class MMReceiverHTTP(MMReceiverBase):
         mm_data,
         embedding_port,
         endpoint_encode,
-        endpoint_send,
         num_items_assigned=None,
         encode_urls=None,
         time_stats_json=None,
@@ -2261,49 +2247,11 @@ class MMReceiverHTTP(MMReceiverBase):
             ]
 
             responses = await asyncio.gather(*tasks, return_exceptions=True)
-
-            if not await self._check_encoder_responses(
-                responses, encode_requests, req_id
-            ):
-                return
-            response_json_list_unsort = [
-                await response.json() for response in responses
-            ]
-
-            # zmq backend: return is None
-            if None in response_json_list_unsort:
-                return
-
-            # mooncake backend: send bootstrap info
-
-            embedding_size_list_sort, response_json_list_sort, total_embedding_bytes = (
-                _sort_responses_and_compute_total_bytes(
-                    response_json_list_unsort, total_num_parts
-                )
-            )
-            offset = 0
-            metadata_tasks = []
-            buffer_address = await self.allocate_embedding_buffer(
-                req_id,
-                total_embedding_bytes,
-            )
-            for idx in range(len(tasks)):
-                response_json = response_json_list_sort[idx]
-                buffer_address_adjust = offset + buffer_address
-                response_json.update(
-                    {
-                        "session_id": self.embeddings_engine.session_id,
-                        "buffer_address": buffer_address_adjust,
-                    }
-                )
-                metadata_tasks.append(
-                    session.post(
-                        f"{effective_urls[response_json['encoder_idx']]}/{endpoint_send}",
-                        json=response_json,
-                    )
-                )
-                offset += embedding_size_list_sort[idx]
-            await asyncio.gather(*metadata_tasks)
+            # Dispatch only. The embedding never comes back through this call:
+            # zmq_to_tokenizer is pushed to our PULL socket during /encode,
+            # zmq_to_scheduler to the ports its ranks registered, and mooncake
+            # by RDMA once those ranks have pulled sizes and driven /send.
+            await self._check_encoder_responses(responses, encode_requests, req_id)
 
 
 class MMReceiverGrpc(MMReceiverBase):
@@ -2347,7 +2295,6 @@ class MMReceiverGrpc(MMReceiverBase):
         mm_data,
         embedding_port,
         endpoint_encode,
-        endpoint_send,
         num_items_assigned=None,
         encode_urls=None,
     ):
