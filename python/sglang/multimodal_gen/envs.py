@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     # cache-dit env vars (primary transformer)
     # on by default: it only engages on 2 ranks with peer-to-peer access and
     # falls back to NCCL on any failure. Set 0 to force NCCL.
-    SGLANG_DIFFUSION_IPC_A2A: bool = True
+    SGLANG_DIFFUSION_IPC_A2A: bool = False
     # generous enough to outlast one DiT block's compute on the peer, short
     # enough that a desync degrades to NCCL instead of hanging the server
     SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS: float = 200.0
