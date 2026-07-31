@@ -99,6 +99,9 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify = (
             MagicMock()
         )
+        mamba_pool = target_worker.model_runner.req_to_token_pool.mamba_pool
+        mamba_pool.replayssm_spec_fold = False
+        mamba_pool.replayssm_cache_base = None
         return target_worker
 
     def test_mamba_verify_update_called_with_correct_indices(self):

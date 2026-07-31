@@ -41,6 +41,7 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
+from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
@@ -132,30 +133,6 @@ LOAD_FORMAT_CHOICES = [
 
 # TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
 # Some of the choices here do NOT support online quantization.
-# Attention backends whose kernels read the chunked prefix-cache layout.
-# Out-of-tree platforms may extend this list (via
-# add_chunked_prefix_cache_attention_backend) before ServerArgs construction;
-# the chunked-prefix gate is evaluated during resolution.
-CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
-    "flashinfer",
-    "fa3",
-    "fa4",
-    "flashmla",
-    "cutedsl_mla",
-    "cutlass_mla",
-    "trtllm_mla",
-    "tokenspeed_mla",
-]
-
-
-def add_chunked_prefix_cache_attention_backend(backend_name):
-    if backend_name not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS:
-        CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
-        logger.info(
-            f"Added {backend_name} to CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS."
-        )
-
-
 QUANTIZATION_CHOICES = [
     "awq",
     "fp8",  # MOE + linear online quantization.
@@ -194,9 +171,6 @@ QUANTIZATION_CHOICES = [
     "humming",
 ]
 
-
-SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = QUANTIZATION_CHOICES
-
 ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
@@ -217,7 +191,7 @@ ATTENTION_BACKEND_CHOICES = [
     "tokenspeed_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
-    "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper+, requires --page-size 64
+    "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
     # AMD specific
     "aiter",
     "wave",
@@ -225,6 +199,21 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+]
+
+# Attention backends whose kernels read the chunked prefix-cache layout.
+# Out-of-tree platforms may extend this list (via
+# add_chunked_prefix_cache_attention_backend) before ServerArgs construction;
+# the chunked-prefix gate is evaluated during resolution.
+CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "flashmla",
+    "cutedsl_mla",
+    "cutlass_mla",
+    "trtllm_mla",
+    "tokenspeed_mla",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
@@ -271,7 +260,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "marlin",
     "humming",
     "experimental_sgl_marlin",
-    "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper+
+    "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -283,6 +272,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_fuseep",
     "flashinfer",
     "megamoe",
+    "pplx",
     "ascend_tp",
 ]
 
@@ -336,6 +326,7 @@ DSA_CHOICES = [
     "flashmla_sparse_q8",
     "flashmla_kv",
     "flashmla_auto",
+    "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
     "aiter",
@@ -370,6 +361,10 @@ def add_quantization_method_choices(choices):
 
 def add_attention_backend_choices(choices):
     ATTENTION_BACKEND_CHOICES.extend(choices)
+
+
+def add_chunked_prefix_cache_attention_backend(backend_name):
+    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
 
 
 def add_deterministic_attention_backend_choices(choices):
@@ -1045,14 +1040,6 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
-    dcp_size: A[
-        int,
-        Arg(
-            help="The decode context parallelism size.",
-            aliases=["--decode-context-parallel-size"],
-        ),
-        NS("parallel"),
-    ] = 1
     dwdp_size: A[
         int,
         Arg(
@@ -1071,20 +1058,24 @@ class ServerArgs:
             "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
             "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
             choices=["ag_rs", "a2a", "fi_a2a"],
+            resolvable=True,
         ),
         NS("parallel"),
     ] = "ag_rs"
     dcp_replicate_q_proj: A[
-        bool,
+        Optional[bool],
         Arg(
             help="For MLA decode context parallelism with the a2a/fi_a2a "
             "backend: replicate the Q projection so each DCP rank computes the "
             "full-head query locally (redundant projection compute), eliminating "
             "the per-layer head-dim all-gather of Q. Trades a small amount of "
-            "extra GEMM for one fewer collective per layer.",
+            "extra GEMM for one fewer collective per layer. Use "
+            "--no-dcp-replicate-q-proj to disable the model-specific default.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
         ),
         NS("parallel"),
-    ] = False
+    ] = None
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -2140,7 +2131,7 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="The quantization method for speculative model.",
-            choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
+            choices=QUANTIZATION_CHOICES,
         ),
         NS("spec"),
     ] = None
@@ -2203,6 +2194,7 @@ class ServerArgs:
         NS("spec"),
     ] = None
 
+    # -------------------------------------------------------------------------
     # Speculative decoding (ngram)
     # -------------------------------------------------------------------------
     speculative_ngram_min_bfs_breadth: A[
@@ -2262,7 +2254,7 @@ class ServerArgs:
             "ascend_fuseep",
             "flashinfer",
             "megamoe",
-            "ascend_tp",
+            "pplx",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -2550,14 +2542,13 @@ class ServerArgs:
         NS("exec.mamba"),
     ] = 16
     # ReplaySSM spec-verify (Part B of RFC #28511): GDN linear-chain target-verify
-    # via a per-slot circular (d, k, g) ring + periodic flush instead of per-draft
-    # full-state snapshots. GDN only; linear-chain (topk <= 1) only. Reuses the
-    # `linear_replayssm` ring (replayssm_d/k/g + write_pos) and adds two per-slot
-    # cursors (cache_base, is_flush); the ring length reuses
-    # `linear_replayssm_cache_len`.
+    # via fold-every-commit instead of per-draft full-state snapshots -- the
+    # verify stores each draft step's raw inputs into a per-slot window and the
+    # commit replays the accepted prefix into the fp32 checkpoint. GDN only;
+    # linear-chain (topk <= 1) only.
     enable_gdn_replayssm_spec: A[
         bool,
-        "Enable the ReplaySSM GDN spec-verify kernel (Part B of RFC #28511): a per-slot circular (d, k, g) ring + periodic flush replacing the recurrent verify's per-draft full-state snapshots. GDN only, linear-chain (--speculative-eagle-topk in {None, 1}) only. Reuses --linear-replayssm-cache-len for the ring length.",
+        "Enable the ReplaySSM GDN spec-verify (Part B of RFC #28511): fold-every-commit -- a per-slot raw-input window sized to the draft maximum replaces the recurrent verify's per-draft full-state snapshots. GDN only, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
         NS("exec.mamba"),
     ] = False
 
@@ -3336,6 +3327,9 @@ class ServerArgs:
         NS("exec.features"),
     ] = False
 
+    # -------------------------------------------------------------------------
+    # Weight cache
+    # -------------------------------------------------------------------------
     weight_cache_mode: A[
         str,
         Arg(
@@ -3412,8 +3406,6 @@ class ServerArgs:
         # direct handler invocations can rely on it even when
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
-
-        self._validate_mamba_max_states_per_path()
 
         if self.model_path.lower() in ["none", "dummy"]:
             return
@@ -3544,7 +3536,6 @@ class ServerArgs:
         handle_speculative_decoding(self)
 
         # Needs the draft-token count derived just above.
-        self._validate_gdn_replayssm_spec_ring()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -3592,14 +3583,6 @@ class ServerArgs:
 
         materialize_declarations(self)
 
-    def _validate_mamba_max_states_per_path(self):
-        value = self.mamba_max_states_per_path
-        if value == 0 or value < -1:
-            raise ValueError(
-                "--mamba-max-states-per-path must be -1 (unlimited) or a positive "
-                f"integer, got {value}."
-            )
-
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
@@ -3636,6 +3619,101 @@ class ServerArgs:
                 "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
                 "--disable-cuda-graph for correctness of the bidirectional "
                 "prompt attention."
+            )
+
+        # EmbeddingGemma is a Gemma3TextModel with bidirectional prompt
+        # attention. Prefix reuse and split prefills would reuse K/V states
+        # whose values depend on later prompt tokens, so both are invalid.
+        # Breakable CUDA Graph captures one complete prefill and is the graph
+        # mode validated for this encoder-style attention.
+        # Native encoder architectures declare a pooling-only task and do not
+        # need the legacy --is-embedding intent flag. Decoder checkpoints still
+        # require that explicit opt-in because their architecture alone does
+        # not distinguish embedding from generation serving.
+        #
+        # ``_handle_model_capability_adjustments`` is also exercised directly
+        # by a few focused tests that use a small ModelConfig stand-in. Keep
+        # the old predicate as a compatibility fallback while production
+        # ModelConfig instances use the central capability contract.
+        embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
+        if (
+            embedding_model_spec is not None
+            and embedding_model_spec.auto_enable_embedding
+            and not self.is_embedding
+        ):
+            self.is_embedding = True
+            logger.info(
+                "Embedding architecture detected: enabling embedding mode automatically."
+            )
+
+        is_embedding_gemma = (
+            embedding_model_spec is not None
+            and embedding_model_spec.bcg_prefill_policy == BCGPrefillPolicy.FULL_ENCODER
+        )
+        if embedding_model_spec is None:
+            is_embedding_gemma = getattr(model_config, "is_embedding_gemma", False)
+        if is_embedding_gemma:
+            # This is an encoder-only model even though its HF architecture is
+            # named Gemma3TextModel. Marking it as embedding mode enables the
+            # FlashAttention raw-K/V fast path, which does not write or read
+            # the paged KV cache during its single prefill forward.
+            self.is_embedding = True
+            self.disable_radix_cache = True
+            self.chunked_prefill_size = -1
+            # Submit a list-valued embeddings request atomically so BCG can
+            # replay its full prefill batch instead of starting item zero
+            # while the remaining texts are still being tokenized.
+            self.enable_tokenizer_batch_encode = True
+            requested_prefill_backend = (
+                self.prefill_attention_backend or self.attention_backend
+            )
+            if (
+                is_cuda()
+                and (is_sm90_supported() or is_sm100_supported())
+                and requested_prefill_backend in (None, "fa3", "fa4")
+            ):
+                # Hopper/Blackwell's default FA backend can consume raw K/V
+                # tensors for a single embedding prefill. Enable its no-KV
+                # pool path before memory-pool sizing; an explicit non-FA
+                # backend retains the existing paged-KV behavior.
+                self.prefill_only_disable_kv_cache = True
+                self._validate_prefill_only_disable_kv_cache_args()
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            if is_cuda() and self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                self.cuda_graph_config.prefill.backend = Backend.BREAKABLE
+                # CUDA-graph sizing has already run by this point and derives
+                # its generic maximum from the 8K chunked-prefill default.
+                # On the Hopper/Blackwell FA raw-K/V path, raise the unlocked
+                # default to a full eight-way 2K embedding batch; callers can
+                # still override this for larger aggregate prefills.
+                prefill_config = self.cuda_graph_config.prefill
+                # Unit-level capability tests may invoke this hook without
+                # running the full CUDA-graph configuration parser, which is
+                # where this internal lock set is normally initialized.
+                # Treat that minimal construction as having no user-locked
+                # graph settings.
+                cuda_graph_config_locked = getattr(
+                    self, "_cuda_graph_config_locked", set()
+                )
+                if (Phase.PREFILL, "max_bs") not in cuda_graph_config_locked:
+                    prefill_config.max_bs = max(
+                        prefill_config.max_bs or 0,
+                        model_config.context_len,
+                        16384,
+                    )
+                    if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
+                        prefill_config.bs = (
+                            self._generate_prefill_cuda_graph_batch_sizes(
+                                prefill_config.max_bs
+                            )
+                        )
+            elif not is_cuda():
+                # BCG is CUDA-only. Other graph backends do not support this
+                # encoder-style prefill, so retain the eager Triton path.
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            logger.info(
+                "EmbeddingGemma detected: disabling radix cache and chunked "
+                "prefill; using breakable CUDA graph for CUDA prefill."
             )
 
         if (
@@ -3707,13 +3785,35 @@ class ServerArgs:
             return
         elif is_cuda():
             if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "Decode context parallel (--dcp-size / "
-                    "--decode-context-parallel-size > 1) on CUDA platform "
-                    "does not support any speculative algorithm, but got "
-                    f"dcp_size={self.dcp_size} on a CUDA platform with "
-                    "speculative decoding enabled."
+                model_arches = self.get_model_config().hf_config.architectures
+                decode_backend = self.decode_attention_backend or self.attention_backend
+                kimi_linear_dspark = (
+                    self.speculative_algorithm == "DSPARK"
+                    and "KimiLinearForCausalLM" in model_arches
+                    and self.speculative_attention_mode == "decode"
+                    and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
                 )
+                if kimi_linear_dspark:
+                    ragged_verify_mode = envs.SGLANG_RAGGED_VERIFY_MODE.get()
+                    if ragged_verify_mode != "static":
+                        raise ValueError(
+                            "Kimi Linear DCP + DSPARK currently requires "
+                            "SGLANG_RAGGED_VERIFY_MODE=static, but got "
+                            f"{ragged_verify_mode!r}."
+                        )
+                else:
+                    raise ValueError(
+                        "Decode context parallel (--dcp-size / "
+                        "--decode-context-parallel-size > 1) with speculative "
+                        "decoding on CUDA is supported only for Kimi Linear + "
+                        "DSPARK + --speculative-attention-mode decode + "
+                        "tokenspeed_mla, or experimental cutedsl_mla, but got "
+                        f"architectures={model_arches}, "
+                        f"speculative_algorithm={self.speculative_algorithm!r}, "
+                        "speculative_attention_mode="
+                        f"{self.speculative_attention_mode!r}, "
+                        f"decode_attention_backend={decode_backend!r}."
+                    )
         else:
             raise ValueError(
                 "Decode context parallel (--dcp-size / "
@@ -4248,6 +4348,8 @@ class ServerArgs:
                 "MoE A2A backend",
                 lambda: _resolved_view(self).moe_a2a_backend != "none",
             ),
+            # Dynamo blocks LoRA under tc_piecewise (per-batch LoRABatchInfo
+            # rebinds break guards); breakable/full support LoRA.
             ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
             (
                 "multimodal model",
@@ -4323,8 +4425,6 @@ class ServerArgs:
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
             ),
-            # BCG capture + LoRA adapter weights exceed host RAM headroom.
-            ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
             # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
             (
                 "MoE A2A backend",
@@ -4673,9 +4773,9 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         return not (is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config))
 
-    def mamba_pre_capture_reserve_mb(self, gpu_mem: Optional[float]) -> float:
-        # Realistic runtime reserve for the fixed (non-resizable) mamba state cache,
-        # which post-capture can't size from measured free memory.
+    def pre_capture_activation_reserve_mb(self, gpu_mem: Optional[float]) -> float:
+        # Runtime activation working-set reserve for eager decode above the captured
+        # max_bs and transient prefill/logits; also covers fixed state caches.
         if self.disaggregation_mode == "decode":
             running_requests = (
                 self.max_running_requests or self.cuda_graph_config.decode.max_bs or 1
@@ -5321,7 +5421,7 @@ class ServerArgs:
             # _glm4_moe_overrides).
             pass
 
-        elif model_arch in ["Lfm2ForCausalLM"]:
+        elif model_arch in ["Lfm2ForCausalLM", "Lfm2MoeForCausalLM"]:
             # Attention backend selection moved to the override registry
             # (arg_groups/overrides.py: _lfm2_overrides).
             assert resolved_view(self).attention_backend != "triton", (
@@ -5491,6 +5591,10 @@ class ServerArgs:
                     or self.speculative_eagle_topk is not None
                 )
             ):
+                # trtllm_mha requires equal K/V row widths; fa4 carries
+                # v_head_dim through.
+                if model_config.has_asymmetric_kv:
+                    return "fa4"
                 return "trtllm_mha"
             elif is_hip():
                 return "aiter"
@@ -5747,6 +5851,12 @@ class ServerArgs:
         if self.mamba_cache_philox_rounds < 0:
             raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
 
+        if self.mamba_max_states_per_path == 0 or self.mamba_max_states_per_path < -1:
+            raise ValueError(
+                "--mamba-max-states-per-path must be -1 (unlimited) or a positive "
+                f"integer, got {self.mamba_max_states_per_path}."
+            )
+
         if self.enable_mamba_cache_stochastic_rounding:
             if self.mamba_ssm_dtype != "float16":
                 raise ValueError(
@@ -5949,32 +6059,29 @@ class ServerArgs:
                     "EAGLE tree verify. Got "
                     f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
                 )
-            if decode != "triton":
+            if decode not in ("triton", "flashinfer"):
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec requires the Triton linear-attn "
-                    "decode backend, got "
+                    "--enable-gdn-replayssm-spec requires the triton or "
+                    "flashinfer linear-attn decode backend, got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
-            if self.enable_mamba_extra_buffer():
-                # The spec-verify path does not yet implement the device-side
-                # force-flush needed to keep `temporal` consistent with the ring at
-                # radix mamba-track boundaries, so it is incompatible with
-                # extra_buffer (radix prefix caching).
+            # The auto->extra_buffer strategy resolution is still a declaration
+            # here, so read it through the resolved view.
+            view = self._resolved()
+            if (
+                view.disable_radix_cache is False
+                and view.mamba_radix_cache_strategy == "extra_buffer_lazy"
+            ):
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec is not yet compatible with mamba "
-                    "extra_buffer (radix prefix caching); use --disable-radix-cache "
-                    "or --mamba-radix-cache-strategy no_buffer."
+                    "--enable-gdn-replayssm-spec is not validated with "
+                    "--mamba-radix-cache-strategy extra_buffer_lazy yet; "
+                    "use extra_buffer."
                 )
-            if self.disaggregation_mode != "null":
+            if self.disaggregation_mode == "prefill":
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec is not supported under PD "
-                    "disaggregation yet (follow-up). Got "
-                    f"--disaggregation-mode={self.disaggregation_mode!r}."
-                )
-            if self.linear_replayssm_cache_len < 1:
-                raise ValueError(
-                    "--linear-replayssm-cache-len must be >= 1, got "
-                    f"{self.linear_replayssm_cache_len}."
+                    "--enable-gdn-replayssm-spec is not supported on a PD "
+                    "prefill server: the ring is spec-verify-only scratch and "
+                    "the prefill server never runs spec verify."
                 )
             if self.enable_linear_replayssm:
                 raise ValueError(
@@ -5983,56 +6090,22 @@ class ServerArgs:
                     "with incompatible cursor protocols (per-decode-forward vs "
                     "per-verify-commit advance)."
                 )
-            ring_len = self.linear_replayssm_cache_len
-            if ring_len & (ring_len - 1) != 0:
-                raise ValueError(
-                    "--linear-replayssm-cache-len must be a power of two for the "
-                    f"circular spec-verify ring, got {ring_len}."
-                )
-            # ring_len >= 2 * max drafts is checked in
-            # _validate_gdn_replayssm_spec_ring() (draft tokens not derived yet).
-            # Closed-loop exact fold: the flush replays raw ring inputs through
-            # the recurrent update into the checkpoint, bit-identical to the
-            # recurrent baseline -- which keeps its state in fp32. A 16-bit
-            # checkpoint would re-quantize the exactly-folded state every flush
-            # and become the dominant residual error source, so require fp32.
             if self.mamba_ssm_dtype is None:
                 logger.info(
                     "--enable-gdn-replayssm-spec: setting --mamba-ssm-dtype "
-                    "float32 (the closed-loop exact fold requires the fp32 SSM "
-                    "checkpoint for recurrent-parity)."
+                    "float32 (the closed-loop exact fold keeps the SSM checkpoint "
+                    "bit-identical to the recurrent baseline)."
                 )
                 self.mamba_ssm_dtype = "float32"
             elif self.mamba_ssm_dtype != "float32":
-                raise ValueError(
-                    "--enable-gdn-replayssm-spec requires --mamba-ssm-dtype "
-                    f"float32, got {self.mamba_ssm_dtype!r}. The closed-loop "
-                    "exact fold keeps the committed state bit-identical to the "
-                    "recurrent baseline, which is only meaningful against the "
-                    "fp32 checkpoint; a 16-bit checkpoint would re-quantize it "
-                    "every flush."
+                logger.warning(
+                    "--enable-gdn-replayssm-spec with --mamba-ssm-dtype=%s: the "
+                    "closed-loop fold re-quantizes the committed state each "
+                    "commit/flush (fp32 keeps it bit-exact to the fp32 recurrent "
+                    "baseline), so it may drift over long sequences. Validate "
+                    "accuracy for your model.",
+                    self.mamba_ssm_dtype,
                 )
-
-    def _validate_gdn_replayssm_spec_ring(self):
-        """Enforce ring_len >= 2 * max draft tokens for the spec-verify ring.
-
-        Early-flush margin: write_pos + spec_len <= ring_len must hold on every
-        verify step (see _advance_gdn_spec_cursors_kernel). Runs after
-        handle_speculative_decoding() so the (adaptive-aware) max is final;
-        MambaPool re-checks at ring allocation as a backstop.
-        """
-        if not self.enable_gdn_replayssm_spec:
-            return
-        max_drafts = self.max_speculative_num_draft_tokens
-        if max_drafts is None:
-            return
-        ring_len = self.linear_replayssm_cache_len
-        if ring_len < 2 * max_drafts:
-            raise ValueError(
-                "--linear-replayssm-cache-len must be >= 2 * the maximum "
-                "speculative draft-token count for the spec-verify ring "
-                f"(early-flush margin), got {ring_len} < {2 * max_drafts}."
-            )
 
     def _handle_legacy_cp_arguments(self):
         legacy_mode_to_strategy = {
@@ -6078,15 +6151,26 @@ class ServerArgs:
 
     def _handle_context_parallelism(self):
         if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
+            from sglang.srt.configs.model_config import is_deepseek_dsa
             from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
 
             model_config = self.get_model_config()
-            model_arch = model_config.hf_config.architectures[0]
-            if (
-                model_arch in CP_V2_DEFAULT_MODEL_CLASSES
-                and not envs.SGLANG_ENABLE_CP_V2.is_set()
-            ):
-                envs.SGLANG_ENABLE_CP_V2.set(True)
+            hf_config = model_config.hf_config
+            model_arch = hf_config.architectures[0]
+            if model_arch in CP_V2_DEFAULT_MODEL_CLASSES:
+                if getattr(hf_config, "index_share_for_mtp_iteration", False):
+                    # GLM 5.2 (DSA index-share MTP): CP-v2 is not ready for it
+                    # yet, so default the env to off and keep the legacy CP path.
+                    if not envs.SGLANG_ENABLE_CP_V2.is_set():
+                        envs.SGLANG_ENABLE_CP_V2.set(False)
+                else:
+                    is_dsa_default_model = is_deepseek_dsa(hf_config)
+                    # DSA CP-v2 currently supports only the interleave strategy.
+                    enable_default_cp_v2 = not is_dsa_default_model or (
+                        self.enable_prefill_cp and self.cp_strategy == "interleave"
+                    )
+                    if enable_default_cp_v2 and not envs.SGLANG_ENABLE_CP_V2.is_set():
+                        envs.SGLANG_ENABLE_CP_V2.set(True)
 
             if (
                 self.enable_prefill_cp
@@ -6227,6 +6311,24 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _data_parallelism_defaults)
+
+        if self.mm_enable_dp_encoder:
+            if self.tp_size == 1:
+                logger.warning(
+                    "--mm-enable-dp-encoder is enabled with TP=1, so the encoder "
+                    "has no data-parallel work to distribute. Disable it unless "
+                    "you need to validate this configuration."
+                )
+            else:
+                logger.info(
+                    "--mm-enable-dp-encoder is enabled across TP=%d. It replicates "
+                    "the vision encoder and distributes image work across ranks; "
+                    "this is most useful when high-resolution or multi-image ViT "
+                    "prefill is a material part of TTFT. Measure against the default "
+                    "for small-image workloads because replication and aggregation "
+                    "can increase memory use and overhead.",
+                    self.tp_size,
+                )
 
         if self._resolved().enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -6547,9 +6649,59 @@ class ServerArgs:
                     "(chunked_prefill_size by default)"
                 )
 
+        if a2a_backend == "pplx":
+            if self.deepep_mode == "normal":
+                raise ValueError(
+                    "moe_a2a_backend='pplx' only supports low-latency mode; "
+                    "set --deepep-mode to 'low_latency' or 'auto'."
+                )
+            if self.deepep_mode == "auto":
+                self.deepep_mode = "low_latency"
+                logger.warning("auto set deepep_mode=`low_latency` for PPLX EP")
+            # pplx-kernels' AllToAll needs numDPGroups (== attention dp_size) > 1;
+            # without DP attention numDPGroups == 1 and construction fails deep in
+            # the kernel. This also implies ep_size >= 2.
+            assert resolved_view(self).enable_dp_attention and self.dp_size >= 2, (
+                "moe_a2a_backend='pplx' requires --enable-dp-attention with at "
+                "least 2 DP groups (--dp-size >= 2)."
+            )
+            # pplx runs the masked DeepGEMM expert path (sm_90a): reject other
+            # runners and resolve auto -> deep_gemm. Unquantized bf16 pplx needs
+            # an explicit deep_gemm backend, otherwise the expert layer falls
+            # through to the deprecated masked path and asserts at runtime.
+            assert resolved_view(self).moe_runner_backend in ("deep_gemm", "auto"), (
+                "moe_a2a_backend='pplx' is only supported with --moe-runner-backend "
+                "deep_gemm (or auto)."
+            )
+            if self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "deep_gemm"
+                logger.warning("auto set moe_runner_backend=`deep_gemm` for PPLX EP")
+            logger.warning(
+                f"PPLX MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+            # Check per-rank dispatch tokens for pplx
+            # Skip validation if chunked prefill is disabled (i.e., size <= 0)
+            # Skip validation if disaggregation mode is decode
+            if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
+                assert (
+                    self._required_pplx_dispatch_tokens_per_rank()
+                ) <= envs.SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), (
+                    "SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 128) "
+                    "must be >= the per-rank pplx dispatch tokens "
+                    "(chunked_prefill_size, or the decode cuda-graph batch size)"
+                )
+
     def _required_mori_dispatch_tokens_per_rank(self) -> int:
         """Max tokens a single rank dispatches through MoRI in one forward."""
         return self.chunked_prefill_size
+
+    def _required_pplx_dispatch_tokens_per_rank(self) -> int:
+        """Max tokens a single rank dispatches through pplx in one forward."""
+        required = self.chunked_prefill_size
+        if self.cuda_graph_max_bs_decode is not None:
+            required = max(required, self.cuda_graph_max_bs_decode)
+        return required
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
@@ -6558,10 +6710,29 @@ class ServerArgs:
                 "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
 
+        # Without an a2a backend all EP ranks run the MoE over the same tokens and
+        # sum their partial outputs, so the pick has to agree across ranks.
+        needs_rank_invariant_dispatch = self._resolved().moe_a2a_backend == "none"
+
         if (self.enable_eplb or (self.init_expert_location != "trivial")) and (
             self.ep_dispatch_algorithm is None
         ):
-            self.ep_dispatch_algorithm = "static"
+            self.ep_dispatch_algorithm = (
+                "dynamic" if needs_rank_invariant_dispatch else "static"
+            )
+
+        # `dynamic` / `fake` switch to the row-index pick; `static` reads a
+        # per-rank table and `lp` samples inside its kernel.
+        if needs_rank_invariant_dispatch and self.ep_dispatch_algorithm in (
+            "static",
+            "lp",
+        ):
+            raise ValueError(
+                f"--ep-dispatch-algorithm {self.ep_dispatch_algorithm} picks a "
+                "different physical replica per rank, which only holds up when an "
+                "a2a backend routes each token to a single rank. Use "
+                "--ep-dispatch-algorithm dynamic with --moe-a2a-backend none."
+            )
 
         if self.enable_eplb and self.ep_join_mode != "scale":
             assert self._resolved().ep_size > 1
@@ -7534,13 +7705,33 @@ class ServerArgs:
         if not self.enable_page_major_kv_layout:
             return
         # Only the Triton attention kernels read the strided 4-D envelope K/V
-        # views; FA3 / FlashInfer do not.
+        # views; FA3 / FlashInfer do not. EXCEPTION: the unified-memory MLA pool
+        # exposes each layer as a DENSE contiguous per-layer view
+        # (build_dense_mla_views), which the paged MLA kernels consume directly,
+        # with their kv_indices / block tables remapped to dense ids. Names below
+        # are the RESOLVED ids from _resolved_attention_backends: "flashinfer" is
+        # FlashInferMLAAttnBackend for an MLA model, "trtllm_mla" the trtllm
+        # decode kernel; "cutedsl_mla" and "tokenspeed_mla" subclass
+        # TRTLLMMLABackend and inherit its dense read/write path.
+        # flashmla / cutlass_mla share the create_flashmla block-table path and
+        # can be added the same way once exercised.
+        if self.enable_unified_memory and self.use_mla_backend():
+            allowed_full = {
+                "triton",
+                "trtllm_mla",
+                "flashinfer",
+                "cutedsl_mla",
+                "tokenspeed_mla",
+            }
+        else:
+            allowed_full = {"triton"}
         backends = set(self._resolved_attention_backends())
         backends.discard(None)
-        assert backends <= {"triton"}, (
+        assert backends <= allowed_full, (
             "--enable-page-major-kv-layout requires the Triton attention backend "
-            f"for the full-attention layers; got {sorted(backends)}. Pass "
-            "--attention-backend triton."
+            "for the full-attention layers (unified-memory MLA also allows the "
+            f"paged MLA backends); got {sorted(backends)}, allowed "
+            f"{sorted(allowed_full)}. Pass a compatible --attention-backend."
         )
         # The Mamba state is stored in envelope-strided views; only the
         # stride-aware Triton causal-conv / SSM kernels read them correctly.
