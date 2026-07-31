@@ -79,6 +79,11 @@ def synchronized(func):
 
 
 class HostKVCache(abc.ABC):
+    # Subclasses that build their fields without running this __init__ (e.g.
+    # MHATokenToKOnlyPoolHost, which mirrors an anchor pool) still need the
+    # DCP-aware accessors below to work, so the knobs default at class level.
+    dcp_size = 1
+    dcp_rank = 0
 
     def __init__(
         self,
@@ -106,7 +111,6 @@ class HostKVCache(abc.ABC):
             f"dcp_size ({dcp_size}); expected the widened page from the DCP "
             "paged allocator."
         )
-        self.logical_page_size = page_size
         self.page_size = page_size // dcp_size
         self.layout = layout
         self.pin_memory = pin_memory
@@ -125,9 +129,6 @@ class HostKVCache(abc.ABC):
         # Align up the host memory pool size to the (physical) page size
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
-        # Logical capacity exposed to the radix/controller layer: one slot per
-        # logical token, dcp_size of which collapse onto one physical row.
-        self.logical_size = self.size * self.dcp_size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
@@ -311,6 +312,16 @@ class HostKVCache(abc.ABC):
 
         self.release_slots = []
         self.num_release_slots = 0
+
+    @property
+    def logical_size(self) -> int:
+        """Slots the radix/controller layer sees: dcp_size of them share a row."""
+        return self.size * self.dcp_size
+
+    @property
+    def logical_page_size(self) -> int:
+        """Page size in that same logical space (the widened DCP page)."""
+        return self.page_size * self.dcp_size
 
     def dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
         """Translate logical slot indices to this rank's physical buffer rows.

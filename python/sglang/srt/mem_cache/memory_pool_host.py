@@ -111,10 +111,6 @@ class MambaPoolHost(HostKVCache):
 
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
-        # This pool holds per-request state rather than token-interleaved KV, so
-        # DCP never widens it; it sets its own fields instead of going through
-        # HostKVCache.__init__, so mirror the physical size explicitly.
-        self.logical_size = self.size
 
         if self.size <= device_pool.size:
             logger.warning(
