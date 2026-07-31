@@ -754,9 +754,9 @@ def extend_attention_fwd(
 
     USE_CUSTOM_MASK = custom_mask is not None
     USE_IMAGE_SPANS = image_span_indptr is not None
-    assert not (USE_CUSTOM_MASK and USE_IMAGE_SPANS), (
-        "custom_mask and image spans are mutually exclusive"
-    )
+    assert not (
+        USE_CUSTOM_MASK and USE_IMAGE_SPANS
+    ), "custom_mask and image spans are mutually exclusive"
     assert USE_IMAGE_SPANS == (image_span_begin is not None)
     assert USE_IMAGE_SPANS == (image_span_end is not None)
     # Skip custom mask for prefix part
@@ -1293,9 +1293,9 @@ def extend_attention_fwd_unified(
 
     USE_CUSTOM_MASK = custom_mask is not None
     USE_IMAGE_SPANS = image_span_indptr is not None
-    assert not (USE_CUSTOM_MASK and USE_IMAGE_SPANS), (
-        "custom_mask and image spans are mutually exclusive"
-    )
+    assert not (
+        USE_CUSTOM_MASK and USE_IMAGE_SPANS
+    ), "custom_mask and image spans are mutually exclusive"
     assert USE_IMAGE_SPANS == (image_span_begin is not None)
     assert USE_IMAGE_SPANS == (image_span_end is not None)
     HAS_SINK = sinks is not None
