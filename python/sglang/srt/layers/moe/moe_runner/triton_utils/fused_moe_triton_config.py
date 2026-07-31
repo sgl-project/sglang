@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_device_name, is_hip
 
@@ -88,8 +89,8 @@ def get_moe_configs(
 
     # We found that using the fused_moe_kernel config from Triton 3.1.0 with Triton 3.2.0 results in negative performance gains,
     # so we also include the Triton version as a key for finding the fused_moe_kernel config to achieve the best performance.
-    config_dir = os.environ.get(
-        "SGLANG_MOE_CONFIG_DIR", os.path.dirname(os.path.realpath(__file__))
+    config_dir = envs.SGLANG_MOE_CONFIG_DIR.get() or os.path.dirname(
+        os.path.realpath(__file__)
     )
 
     triton_version = triton.__version__

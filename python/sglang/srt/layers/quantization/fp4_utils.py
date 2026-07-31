@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.gemm import nvfp4_gemm
+from sglang.kernels.spec import KernelBackend
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
@@ -164,3 +166,32 @@ def get_fp4_gemm_runner_backend() -> Fp4GemmRunnerBackend:
     if FP4_GEMM_RUNNER_BACKEND is None:
         FP4_GEMM_RUNNER_BACKEND = Fp4GemmRunnerBackend.AUTO
     return FP4_GEMM_RUNNER_BACKEND
+
+
+def dispatch_fp4_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_features: int,
+) -> torch.Tensor:
+    """Dispatch a dense NVFP4 GEMM to the FlashInfer sub-kernel selected by
+    ``--fp4-gemm-backend`` (via `sglang.kernels.ops.gemm.nvfp4_gemm`)."""
+    fp4_backend = get_fp4_gemm_runner_backend()
+    if not fp4_backend.is_flashinfer():
+        raise ValueError(
+            f"fp4_gemm: unsupported --fp4-gemm-backend={fp4_backend} "
+            "(expected one of the flashinfer_* backends)"
+        )
+    return nvfp4_gemm(
+        input,
+        weight,
+        input_sf,
+        weight_sf,
+        alpha,
+        out_dtype,
+        out_features,
+        backend=KernelBackend(fp4_backend.value),
+    )

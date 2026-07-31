@@ -9,8 +9,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8LinearMethod,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
-    cutlass_fp8_supported,
+    get_device_sm,
     input_to_float8,
+    is_cuda,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -26,7 +27,7 @@ TEST_CASES = [
 
 
 def _modelopt_fp8_supported() -> bool:
-    return torch.cuda.is_available() and cutlass_fp8_supported()
+    return is_cuda() and get_device_sm() >= 89
 
 
 def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:

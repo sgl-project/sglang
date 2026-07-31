@@ -70,6 +70,12 @@ BACKEND_METHODS: Dict[KernelBackend, str] = {
     KernelBackend.FLASHINFER: "forward_flashinfer",
     KernelBackend.DEEPGEMM: "forward_deepgemm",
     KernelBackend.AITER: "forward_aiter",
+    KernelBackend.MARLIN: "forward_marlin",
+    KernelBackend.FLASHINFER_TRTLLM: "forward_flashinfer_trtllm",
+    KernelBackend.FLASHINFER_CUTLASS: "forward_flashinfer_cutlass",
+    KernelBackend.FLASHINFER_DEEPGEMM: "forward_flashinfer_deepgemm",
+    KernelBackend.FLASHINFER_CUDNN: "forward_flashinfer_cudnn",
+    KernelBackend.FLASHINFER_CUTEDSL: "forward_flashinfer_cutedsl",
     KernelBackend.TORCH_NPU: "forward_npu",
 }
 
@@ -79,11 +85,17 @@ BACKEND_METHODS: Dict[KernelBackend, str] = {
 DEFAULT_PRIORITY: Tuple[KernelBackend, ...] = (
     KernelBackend.AOT,
     KernelBackend.JIT,
-    KernelBackend.FLASHINFER,
     KernelBackend.DEEPGEMM,
-    KernelBackend.CUTE_DSL,
+    KernelBackend.FLASHINFER_TRTLLM,
+    KernelBackend.FLASHINFER_CUTLASS,
+    KernelBackend.FLASHINFER_DEEPGEMM,
+    KernelBackend.FLASHINFER_CUDNN,
+    KernelBackend.FLASHINFER_CUTEDSL,
+    KernelBackend.FLASHINFER,
     KernelBackend.AITER,
     KernelBackend.TORCH_NPU,
+    KernelBackend.MARLIN,
+    KernelBackend.CUTE_DSL,
     KernelBackend.TRITON,
     KernelBackend.TORCH,
 )
@@ -271,6 +283,24 @@ class BaseFusedOp(ABC):
     def forward_aiter(self, *args, **kwargs):
         raise NotImplementedError(f"{self.op}: no aiter backend")
 
+    def forward_marlin(self, *args, **kwargs):
+        raise NotImplementedError(f"{self.op}: no marlin backend")
+
+    def forward_flashinfer_trtllm(self, *args, **kwargs):
+        raise NotImplementedError(f"{self.op}: no flashinfer_trtllm backend")
+
+    def forward_flashinfer_cutlass(self, *args, **kwargs):
+        raise NotImplementedError(f"{self.op}: no flashinfer_cutlass backend")
+
+    def forward_flashinfer_deepgemm(self, *args, **kwargs):
+        raise NotImplementedError(f"{self.op}: no flashinfer_deepgemm backend")
+
+    def forward_flashinfer_cudnn(self, *args, **kwargs):
+        raise NotImplementedError(f"{self.op}: no flashinfer_cudnn backend")
+
+    def forward_flashinfer_cutedsl(self, *args, **kwargs):
+        raise NotImplementedError(f"{self.op}: no flashinfer_cutedsl backend")
+
     def forward_npu(self, *args, **kwargs):
         raise NotImplementedError(f"{self.op}: no npu backend")
 
@@ -292,7 +322,8 @@ class BaseFusedOp(ABC):
             self.capabilities.get(backend, frozenset()), _platform()
         )
 
-    def _resolve_backend(self, *args, **kwargs) -> KernelBackend:
+    def resolve_backend(self, *args, **kwargs) -> KernelBackend:
+        """Pick the highest-priority backend eligible for this call."""
         forced = get_fused_op_backend()
         if forced is not None:
             return forced
@@ -306,7 +337,7 @@ class BaseFusedOp(ABC):
     def forward(self, *args, backend: Optional[KernelBackend] = None, **kwargs):
         """Run the op on ``backend``, or on the best eligible one when omitted."""
         if backend is None:
-            backend = self._resolve_backend(*args, **kwargs)
+            backend = self.resolve_backend(*args, **kwargs)
         result = getattr(self, BACKEND_METHODS[backend])(*args, **kwargs)
         if _trace_enabled:
             _trace_records.append(

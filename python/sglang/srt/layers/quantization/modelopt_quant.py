@@ -33,15 +33,16 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp4_utils import (
+    dispatch_fp4_gemm,
     fp4_quantize,
     get_fp4_gemm_runner_backend,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
-    apply_fp8_linear_bmm_flashinfer,
+    apply_fp8_linear_flashinfer,
     can_auto_enable_marlin_fp8,
-    cutlass_fp8_supported,
+    get_fp8_gemm_runner_backend,
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -65,6 +66,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.utils.common import (
     get_device_capability,
+    get_device_sm,
     is_cuda,
     is_flashinfer_available,
     is_sm100_supported,
@@ -103,12 +105,8 @@ def _make_per_tensor_scale_parameter(
 
 
 try:
-    from flashinfer import mm_fp4 as flashinfer_fp4_gemm
     from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
-
-    enable_flashinfer_fp4_gemm = True
 except ImportError:
-    enable_flashinfer_fp4_gemm = False
     reorder_rows_for_gated_act_gemm = None
     shuffle_matrix_a = None
     shuffle_matrix_sf_a = None
@@ -141,15 +139,8 @@ def fp4_gemm(
     out_dtype: torch.dtype,
     out_features: int,
 ) -> torch.Tensor:
-    if not enable_flashinfer_fp4_gemm:
-        raise RuntimeError(
-            "NVFP4 GEMM requires flashinfer's mm_fp4; please install flashinfer."
-        )
-    fp4_backend = get_fp4_gemm_runner_backend()
-    # Use the remapping logic to convert SGLang backend names to FlashInfer API names
-    backend = fp4_backend.get_flashinfer_backend()
-    return flashinfer_fp4_gemm(
-        input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
+    return dispatch_fp4_gemm(
+        input, weight, input_sf, weight_sf, alpha, out_dtype, out_features
     )
 
 
@@ -504,10 +495,12 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: ModelOptFp8Config):
         super().__init__()
         self.quant_config = quant_config
-        self.cutlass_fp8_supported = cutlass_fp8_supported()
+        gemm_backend = get_fp8_gemm_runner_backend()
         self.enable_flashinfer_bmm = (
-            is_sm100_supported() or is_sm120_supported()
-        ) and is_flashinfer_available()
+            (is_sm100_supported() or is_sm120_supported())
+            and is_flashinfer_available()
+            and (gemm_backend.is_auto() or gemm_backend.is_flashinfer())
+        )
         self.use_marlin = False
         if is_cuda():
             self.use_marlin = (
@@ -571,7 +564,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             layer.weight, layer.weight_scale, layer.logical_widths
         )
         layer.weight = Parameter(quantized_weight.t(), requires_grad=False)
-        if self.cutlass_fp8_supported and not self.enable_flashinfer_bmm:
+        if (is_cuda() and get_device_sm() >= 89) and not self.enable_flashinfer_bmm:
             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
@@ -598,7 +591,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
         if self.enable_flashinfer_bmm and layer.input_scale is not None:
-            return apply_fp8_linear_bmm_flashinfer(
+            return apply_fp8_linear_flashinfer(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -611,7 +604,6 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             weight_scale=layer.weight_scale,
             input_scale=layer.input_scale,
             bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
         )
 
 
@@ -869,7 +861,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp8Config):
         self.quant_config = quant_config
-        self.cutlass_fp8_supported = cutlass_fp8_supported()
 
     def create_weights(
         self,
@@ -1754,11 +1745,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
         x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
 
-        w = layer.weight
-        w_scale_interleaved = layer.weight_scale_interleaved
-        if enable_flashinfer_fp4_gemm:
-            w = layer.weight.T
-            w_scale_interleaved = layer.weight_scale_interleaved.T
+        w = layer.weight.T
+        w_scale_interleaved = layer.weight_scale_interleaved.T
 
         out = fp4_gemm(
             x_fp4,

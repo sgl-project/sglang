@@ -24,7 +24,8 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
-    cutlass_fp8_supported,
+    get_device_sm,
+    is_cuda,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
     pad_nvfp4_activation_for_cutlass,
@@ -357,7 +358,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: ModelOptFp8Config):
         self.quant_config = quant_config
-        self.cutlass_fp8_supported = cutlass_fp8_supported()
+        self.cutlass_fp8_supported = is_cuda() and get_device_sm() >= 89
 
     def create_weights(
         self,
@@ -435,7 +436,6 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             weight_scale=layer.weight_scale,
             input_scale=layer.input_scale,
             bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
         )
 
 
