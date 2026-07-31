@@ -66,6 +66,61 @@ class TestPrepareServerArgs(CustomTestCase):
         finally:
             os.unlink(config_file)
 
+    def test_dllm_prefill_graph_buckets_cover_exact_aligned_totals(self):
+        config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.BREAKABLE, max_bs=512)
+        )
+        args = SimpleNamespace(
+            dllm_algorithm="LowConfidence",
+            _cuda_graph_config_locked=set(),
+            cuda_graph_config=config,
+            page_size=None,
+            attention_backend=None,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            _resolved_overrides=[
+                ("_attention_backend_default", {"attention_backend": "fa3"}),
+                ("_dllm_attention_backend", {"attention_backend": "flashinfer"}),
+                ("_page_size_default", {"page_size": 1}),
+                ("_dllm_page_size", {"page_size": 32}),
+            ],
+            max_prefill_tokens=768,
+            get_attention_backends=lambda: (None, None),
+        )
+        args._resolved_attention_backends = (
+            lambda: ServerArgs._resolved_attention_backends(args)
+        )
+        dllm_config = SimpleNamespace(
+            block_size=32,
+            prefill_block_size=128,
+            max_running_requests=8,
+        )
+
+        with patch(
+            "sglang.srt.dllm.config.DllmConfig.from_server_args",
+            return_value=dllm_config,
+        ):
+            ServerArgs._configure_dllm_prefill_cuda_graph_buckets(args)
+
+        self.assertEqual(config.prefill.bs, list(range(32, 513, 32)))
+
+    def test_dllm_prefill_graph_buckets_preserve_explicit_config(self):
+        config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.BREAKABLE, bs=[128])
+        )
+        args = SimpleNamespace(
+            dllm_algorithm="LowConfidence",
+            _cuda_graph_config_locked={("prefill", "bs")},
+            cuda_graph_config=config,
+            page_size=32,
+            max_prefill_tokens=1024,
+            get_attention_backends=MagicMock(),
+        )
+
+        ServerArgs._configure_dllm_prefill_cuda_graph_buckets(args)
+
+        self.assertEqual(config.prefill.bs, [128])
+
 
 class TestMmEncoderDataParallelLogging(CustomTestCase):
     def test_logs_when_encoder_dp_has_no_parallelism(self):

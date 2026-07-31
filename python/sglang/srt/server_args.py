@@ -2934,6 +2934,10 @@ class ServerArgs:
         ),
         NS("exec.dllm"),
     ] = True
+    dllm_prefill_block_size: A[
+        Optional[int],
+        "Maximum tokens a dLLM request may pure-prefill per scheduling round. Overrides prefill_block_size in --dllm-algorithm-config.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # PD disaggregation
@@ -3561,6 +3565,7 @@ class ServerArgs:
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
+        self._configure_dllm_prefill_cuda_graph_buckets()
 
         # Handle crash dump environment variables (must run before CUDA init).
         self._handle_crash_dump_env()
@@ -7749,6 +7754,60 @@ class ServerArgs:
             "--mamba-backend triton."
         )
 
+    def _configure_dllm_prefill_cuda_graph_buckets(self) -> None:
+        """Install exact-token prefill graph buckets for supported dLLM runs.
+
+        Pure dLLM prefill is page/block aligned and the prefill graph runner
+        intentionally rejects padded buckets.  The generic prefill schedule is
+        therefore a poor fit: it can omit a legal dLLM chunk size.  Generate
+        every reachable aligned total instead, while preserving an explicit
+        user-provided bucket list.
+        """
+        if self.dllm_algorithm is None:
+            return
+        if (Phase.PREFILL, "bs") in self._cuda_graph_config_locked:
+            return
+        if self.cuda_graph_config.prefill.backend != Backend.BREAKABLE:
+            return
+
+        # Read declarations before materialization to configure exact dLLM buckets.
+        prefill_backend, _ = self._resolved_attention_backends()
+        if prefill_backend != "flashinfer":
+            return
+
+        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.dllm.config import DllmConfig
+
+        view = resolved_view(self)
+        dllm_config = DllmConfig.from_server_args(view)
+        # Use the resolved page size before declarations are materialized.
+        page_size = view.page_size
+        alignment = math.lcm(page_size, dllm_config.block_size)
+        max_tokens = dllm_config.prefill_block_size * dllm_config.max_running_requests
+
+        # PrefillAdder cannot schedule beyond either the per-round prefill
+        # budget or the graph runner's configured prefill ceiling.
+        if self.max_prefill_tokens is not None:
+            max_tokens = min(max_tokens, self.max_prefill_tokens)
+        if self.cuda_graph_config.prefill.max_bs is not None:
+            max_tokens = min(max_tokens, self.cuda_graph_config.prefill.max_bs)
+
+        max_tokens = max_tokens // alignment * alignment
+        if max_tokens <= 0:
+            self.cuda_graph_config.prefill.bs = []
+            return
+
+        self.cuda_graph_config.prefill.bs = list(
+            range(alignment, max_tokens + 1, alignment)
+        )
+        logger.info(
+            "Configured %d exact dLLM prefill CUDA graph buckets: "
+            "alignment=%d, max_tokens=%d",
+            len(self.cuda_graph_config.prefill.bs),
+            alignment,
+            max_tokens,
+        )
+
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
@@ -8416,6 +8475,14 @@ class ServerArgs:
         return self._mamba_cache_chunk_size
 
     def _check_two_batch_overlap(self):
+        # dLLM model forward paths do not implement the model-specific TBO
+        # operation strategies.
+        if self.enable_two_batch_overlap and self.dllm_algorithm is not None:
+            raise ValueError(
+                "--enable-two-batch-overlap is not supported with diffusion LLM "
+                "inference (--dllm-algorithm)."
+            )
+
         # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
         # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
         # the other ubatch's compute), which requires DP attention. Enabling it

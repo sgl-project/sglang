@@ -1186,7 +1186,6 @@ class Req(ReqDllmMixin):
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
-            self.determine_dllm_phase()
         else:
             self._refresh_fill_ids()
 
@@ -1281,6 +1280,12 @@ class Req(ReqDllmMixin):
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
+
+        # Cache matching can move the next semantic block from pure prompt
+        # tokens to a prompt-tail-plus-mask block. Classify dLLM phase only
+        # after the final prefix length is known.
+        if self.is_dllm():
+            self.determine_dllm_phase()
 
         if (
             self.is_retracted
@@ -1969,6 +1974,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
+    # True only when the dLLM scheduler selected the pure-prefill phase.
+    is_dllm_prefill: bool = False
 
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
@@ -2014,6 +2021,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
+        is_dllm_prefill: bool = False,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -2036,6 +2044,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 model_config.vocab_size,
             ),
             dllm_config=dllm_config,
+            is_dllm_prefill=is_dllm_prefill,
         )
         return batch
 
