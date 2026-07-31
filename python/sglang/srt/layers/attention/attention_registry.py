@@ -354,7 +354,14 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     runner.server_args.attention_backend == "ascend"
                 ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
-            linear_attn_backend = GDNAttnBackend(runner)
+            if runner.spec_algorithm.is_dvr() and not runner.is_draft_worker:
+                from sglang.srt.layers.attention.dvr.gdn_backend import (
+                    DVRGDNAttnBackend,
+                )
+
+                linear_attn_backend = DVRGDNAttnBackend(runner)
+            else:
+                linear_attn_backend = GDNAttnBackend(runner)
         elif mamba2_config(runner.model_config) is not None:
             from sglang.srt.configs.lfm2 import Lfm2Config
             from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig

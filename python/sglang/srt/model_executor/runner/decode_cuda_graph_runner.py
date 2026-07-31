@@ -1241,9 +1241,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Publish a read-done event for the WAR barrier: a cuda-graph forward
         # finishes its shared req_to_token / SWA reads at this pre-replay
         # snapshot, so plain DECODE and block-draft TARGET_VERIFY qualify.
-        publish_read_done = forward_batch.forward_mode.is_decode() or (
+        publish_read_done = (
+            forward_batch.forward_mode.is_decode()
+            and not self.model_runner.spec_algorithm.is_dvr_self_draft()
+        ) or (
             forward_batch.forward_mode.is_target_verify()
-            and self.model_runner.spec_algorithm.is_dflash_family()
+            and (
+                self.model_runner.spec_algorithm.is_dflash_family()
+                or self.model_runner.spec_algorithm.is_dvr_self_draft()
+            )
         )
         # Exception: breakable-graph verify replays (captured forward metadata)
         # re-read req_to_token *during* replay, so the pre-replay snapshot is
