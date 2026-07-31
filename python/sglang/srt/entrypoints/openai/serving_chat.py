@@ -1022,7 +1022,12 @@ class OpenAIServingChat(OpenAIServingBase):
             template_kwargs = dict(request.chat_template_kwargs or {})
             template_kwargs.pop("tokenize", None)
             template_kwargs.pop("return_dict", None)
-            template_kwargs["image_prompts"] = ["<|media_pad|>"] * len(image_data)
+            # `None`, not `[]`: an empty list makes the encoder treat a literal
+            # "<|kimi_image_placeholder|>" in message text as a real placeholder
+            # and reject the request.
+            template_kwargs["image_prompts"] = (
+                ["<|media_pad|>"] * len(image_data) if image_data else None
+            )
             # encoding_k3 accepts thinking_effort in {low, high, max} and
             # asserts on anything else; "none" is handled at the protocol
             # level by disabling thinking.
