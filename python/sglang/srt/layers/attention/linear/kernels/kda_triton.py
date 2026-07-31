@@ -225,6 +225,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
         return_intermediate_states: bool = False,
+        initial_state_io_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         return chunk_kda(
@@ -235,6 +236,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             beta=beta,
             initial_state=ssm_states,
             initial_state_indices=cache_indices,
+            initial_state_io_indices=initial_state_io_indices,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=query_start_loc,
             A_log=A_log,

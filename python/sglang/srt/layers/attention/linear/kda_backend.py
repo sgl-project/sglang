@@ -4,10 +4,14 @@ from typing import Optional, Tuple, Union
 import torch
 
 from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.kernels.ops.attention.fla.chunk_delta_h import (
+    prepare_kda_state_io_indices,
+)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.configs.model_config import is_kimi_k3
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -362,6 +366,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         verify_backend = get_linear_attn_verify_backend()
+        self.temporal_cow_source_map = None
+        if (
+            is_cuda()
+            and getattr(model_runner.server_args, "enable_kda_temporal_cow", False)
+            and prefill_backend.is_triton()
+            and is_kimi_k3(model_runner.model_config.hf_config)
+        ):
+            self.temporal_cow_source_map = (
+                self.req_to_token_pool.mamba_pool.enable_temporal_cow()
+            )
         # KDA FlashInfer target_verify (recurrent_kda) is chain-only (no tree-ancestor
         # traversal). Reject EAGLE tree verify (topk > 1) early at setup, keyed on the
         # verify backend (not decode). The kernel keeps a per-call
@@ -391,6 +405,31 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
+        self.temporal_state_io_indices = (
+            torch.empty(
+                self.verify_intermediate_state_indices.numel(),
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
+            if self.temporal_cow_source_map is not None
+            else None
+        )
+        self._active_temporal_state_io_indices = None
+
+    def _refresh_temporal_state_io_indices(self, forward_batch: ForwardBatch):
+        self._active_temporal_state_io_indices = None
+        if (
+            self.temporal_state_io_indices is None
+            or not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            return
+        self._active_temporal_state_io_indices = prepare_kda_state_io_indices(
+            self.forward_metadata.mamba_cache_indices,
+            self.temporal_cow_source_map,
+            self.temporal_state_io_indices,
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -403,6 +442,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+        self._refresh_temporal_state_io_indices(forward_batch)
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        super().init_forward_metadata_out_graph(
+            forward_batch,
+            in_capture=in_capture,
+        )
+        self._refresh_temporal_state_io_indices(forward_batch)
 
     def forward_decode(
         self,
@@ -663,6 +714,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             beta=b,
             ssm_states=ssm_states,
             cache_indices=cache_indices,
+            initial_state_io_indices=self._active_temporal_state_io_indices,
             query_start_loc=query_start_loc,
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,

@@ -720,6 +720,7 @@ class UnifiedMambaPool(MambaPool):
         self.enable_linear_replayssm_spec = False
         self.replayssm_cache_base = None
         self.replayssm_is_flush = None
+        self.temporal_cow_source_map = None
         self.debug_memory_pool = False
         self.conv_shard_groups = None
         self.conv_slice_axis = spec.conv_slice_axis

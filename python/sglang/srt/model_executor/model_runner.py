@@ -30,6 +30,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
+    is_kimi_k3,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
@@ -1485,11 +1486,30 @@ class ModelRunner:
                     forward_batch.mamba_cow_dst_indices,
                 )
             else:
-                # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
-                pool.mamba_pool.copy_from(
-                    pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
-                    pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
+                # K3 Triton prefill can leave the FP32 temporal checkpoint at
+                # its immutable source. The KDA backend resolves source ownership
+                # once, then each layer reads src and writes its final state
+                # directly to dst; only the small BF16 convolution window is
+                # copied here. Other backends retain the proven full-copy path.
+                from sglang.srt.layers.attention.linear.utils import (
+                    get_linear_attn_prefill_backend,
                 )
+
+                src_indices = pool.translate_mamba_indices(
+                    forward_batch.mamba_cow_src_indices
+                )
+                dst_indices = pool.translate_mamba_indices(
+                    forward_batch.mamba_cow_dst_indices
+                )
+                use_temporal_cow = (
+                    is_kimi_k3(self.model_config.hf_config)
+                    and get_linear_attn_prefill_backend().is_triton()
+                    and pool.mamba_pool.temporal_cow_source_map is not None
+                )
+                if use_temporal_cow:
+                    pool.mamba_pool.prepare_temporal_cow(src_indices, dst_indices)
+                else:
+                    pool.mamba_pool.copy_from(src_indices, dst_indices)
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None

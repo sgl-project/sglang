@@ -26,6 +26,56 @@ GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
 
+@triton.jit
+def _prepare_kda_state_io_indices_kernel(
+    cache_indices,
+    source_map,
+    output,
+    N: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < N
+    dst = tl.load(cache_indices + offsets, mask=mask, other=-1).to(tl.int64)
+    valid = mask & (dst >= 0)
+    src = tl.load(source_map + dst, mask=valid, other=-1).to(tl.int32)
+    packed = (src << 16) | dst.to(tl.int32)
+    tl.store(output + offsets, packed, mask=mask)
+    # Ownership is consumed into ``output``. Restore identity in the same
+    # launch so a later extend cannot observe stale COW state.
+    tl.store(source_map + dst, dst.to(tl.int32), mask=valid)
+
+
+def prepare_kda_state_io_indices(
+    cache_indices: torch.Tensor,
+    source_map: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Pack 16-bit temporal read/write owners into one int32 kernel input."""
+    assert cache_indices.dtype == torch.int32 and cache_indices.ndim == 1
+    assert source_map.dtype == torch.int32 and source_map.ndim == 1
+    assert output.dtype == torch.int32 and output.ndim == 1
+    assert cache_indices.is_contiguous() and source_map.is_contiguous()
+    assert output.is_contiguous() and output.numel() >= cache_indices.numel()
+    assert cache_indices.device == source_map.device == output.device
+    assert source_map.numel() <= 65536, (
+        "KDA temporal COW packs source/destination state slots into 16 bits; "
+        f"got {source_map.numel()} slots"
+    )
+    n = cache_indices.numel()
+    if n == 0:
+        return output[:0]
+    block = min(triton.next_power_of_2(n), 256)
+    _prepare_kda_state_io_indices_kernel[(triton.cdiv(n, block),)](
+        cache_indices,
+        source_map,
+        output,
+        N=n,
+        BLOCK=block,
+    )
+    return output[:n]
+
+
 @triton.autotune(
     # Single hardcoded config. The kernel writes ht (final state) back into
     # initial_state in-place; with multiple configs, triton's autotune benchmark
@@ -46,7 +96,7 @@ GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
             num_stages=GDN_CHUNK_H_NUM_STAGES,
         )
     ],
-    key=["H", "K", "V", "BT", "USE_GK", "NT_BUCKET"],
+    key=["H", "K", "V", "BT", "USE_GK", "USE_IO_INDICES", "NT_BUCKET"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -60,6 +110,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     h,
     initial_state,
     initial_state_indices,
+    initial_state_io_indices,
     stride_init_state,
     cu_seqlens,
     chunk_offsets,
@@ -73,6 +124,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     USE_G: tl.constexpr,
     USE_GK: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
+    USE_IO_INDICES: tl.constexpr,
     INPLACE_UPDATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
@@ -118,9 +170,15 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     # may be an envelope-strided view (page-major / unified memory), where the
     # per-slot pitch spans ALL layers' state, not H*V*K. int64: envelope pitches
     # overflow an int32 index product.
-    index = tl.load(initial_state_indices + i_n).to(tl.int64)
-    h0 = initial_state + index * stride_init_state
-    ht = initial_state + index * stride_init_state
+    if USE_IO_INDICES:
+        packed_index = tl.load(initial_state_io_indices + i_n).to(tl.int32)
+        src_index = ((packed_index >> 16) & 0xFFFF).to(tl.int64)
+        dst_index = (packed_index & 0xFFFF).to(tl.int64)
+    else:
+        src_index = tl.load(initial_state_indices + i_n).to(tl.int64)
+        dst_index = src_index
+    h0 = initial_state + src_index * stride_init_state
+    ht = initial_state + dst_index * stride_init_state
     if USE_INITIAL_STATE:
         h0 = h0 + i_h * V * K
     if INPLACE_UPDATE:
@@ -322,6 +380,7 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
     use_exp2: bool = False,
+    initial_state_io_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert not (
         use_exp2 and g is not None
@@ -342,6 +401,13 @@ def chunk_gated_delta_rule_fwd_h(
             prepare_chunk_offsets(cu_seqlens, BT),
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
+    if initial_state_io_indices is not None:
+        assert initial_state is not None and initial_state_indices is not None
+        assert initial_state_io_indices.dtype == torch.int32
+        assert initial_state_io_indices.ndim == 1
+        assert initial_state_io_indices.is_contiguous()
+        assert initial_state_io_indices.device == initial_state.device
+        assert initial_state_io_indices.numel() >= N
 
     h = k.new_empty(B, NT, H, V, K)
 
@@ -360,6 +426,7 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        initial_state_io_indices=initial_state_io_indices,
         # Envelope-strided state pools (page-major / unified memory) have a
         # per-slot pitch != H*V*K; contiguous pools pass exactly H*V*K.
         stride_init_state=(initial_state.stride(0) if initial_state is not None else 0),
@@ -374,6 +441,7 @@ def chunk_gated_delta_rule_fwd_h(
         USE_G=g is not None,
         USE_GK=gk is not None,
         USE_INITIAL_STATE=initial_state is not None,
+        USE_IO_INDICES=initial_state_io_indices is not None,
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,

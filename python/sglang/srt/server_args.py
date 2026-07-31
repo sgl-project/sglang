@@ -2527,6 +2527,15 @@ class ServerArgs:
         "Number of int8 mamba checkpoint slots (default: 2x the active mamba pool size).",
         NS("exec.mamba"),
     ] = None
+    enable_kda_temporal_cow: A[
+        bool,
+        "Enable copy-free KDA temporal-state restore for radix-prefix hits. "
+        "Kimi K3 with the Triton prefill backend copies only the BF16 convolution "
+        "window, reads the immutable FP32 temporal checkpoint in place, and writes "
+        "the updated state directly to the destination slot. This saves restore "
+        "bandwidth but adds a small KDA prefill indexing cost.",
+        NS("exec.mamba"),
+    ] = False
     linear_attn_backend: A[
         str,
         Arg(

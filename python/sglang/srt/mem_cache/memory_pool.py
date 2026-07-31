@@ -837,6 +837,7 @@ class MambaPool:
                 if enable_linear_replayssm_spec
                 else None
             )
+            self.temporal_cow_source_map = None
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
             if isinstance(self.mamba_cache, self.SpeculativeState):
                 # `intermediate_conv_window` is an as_strided view whose logical
@@ -899,6 +900,21 @@ class MambaPool:
     def _should_fuse_slot_ops(self) -> bool:
         return self._conv_fuse_ok and not envs.SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS.get()
 
+    def enable_temporal_cow(self) -> torch.Tensor:
+        """Allocate the pool-stable KDA source map before CUDA graph capture."""
+        if self.temporal_cow_source_map is None:
+            temporal = self.mamba_cache.temporal
+            self.temporal_cow_source_map = torch.arange(
+                temporal.shape[1],
+                dtype=torch.int32,
+                device=temporal.device,
+            )
+            if hasattr(self, "mem_usage"):
+                self.mem_usage += (
+                    get_tensor_size_bytes(self.temporal_cow_source_map) / GB
+                )
+        return self.temporal_cow_source_map
+
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
         if self._should_fuse_slot_ops():
@@ -908,6 +924,8 @@ class MambaPool:
             temporal = self.mamba_cache.temporal
             if temporal.numel() > 0:
                 temporal[:, indices] = 0
+            if self.temporal_cow_source_map is not None:
+                self.temporal_cow_source_map[indices] = indices.to(torch.int32)
             return
         if not _is_npu:
             need_size = len(indices)
@@ -928,6 +946,71 @@ class MambaPool:
                 t[:, indices] = 0
             t = self.mamba_cache.temporal
             t[:, indices] = 0
+        if self.temporal_cow_source_map is not None:
+            self.temporal_cow_source_map[indices] = indices.to(torch.int32)
+
+    def _validate_copy_source(
+        self, src_indices: torch.Tensor, dst_indices: torch.Tensor
+    ) -> None:
+        """Check the shared source invariants for full and copy-free COW."""
+        if self.replayssm_write_pos is not None and self.debug_memory_pool:
+            src_wp = self.replayssm_write_pos[src_indices]
+            assert bool((src_wp == 0).all().item()), (
+                "copy_from requires a fully-flushed ReplaySSM source "
+                f"(write_pos==0), got {src_wp.tolist()} for src "
+                f"{src_indices.tolist()}"
+            )
+        if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+            overlap = set(src_indices.tolist()) & set(dst_indices.tolist())
+            assert not overlap, (
+                "mamba COW requires disjoint src/dst slots; "
+                f"overlap={sorted(overlap)}"
+            )
+
+    def _copy_conv_from(
+        self, src_indices: torch.Tensor, dst_indices: torch.Tensor
+    ) -> None:
+        if self._should_fuse_slot_ops():
+            from sglang.srt.mem_cache.mamba_slot_fused import fused_copy_conv_slots
+
+            fused_copy_conv_slots(self._conv_slot_desc, src_indices, dst_indices)
+        else:
+            for i in range(len(self.mamba_cache.conv)):
+                self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
+                    :, src_indices
+                ]
+
+    def _reset_copied_slot_metadata(
+        self, dst_indices: torch.Tensor, *, reset_source_map: bool
+    ) -> None:
+        if self.replayssm_write_pos is not None:
+            self.replayssm_write_pos[dst_indices] = 0
+        # ReplaySSM spec-verify ring: a copied checkpoint has no pending ring
+        # entries, so its rolling origin + flush flag reset alongside write_pos.
+        if self.replayssm_cache_base is not None:
+            self.replayssm_cache_base[dst_indices] = 0
+        if self.replayssm_is_flush is not None:
+            self.replayssm_is_flush[dst_indices] = 0
+        if reset_source_map and self.temporal_cow_source_map is not None:
+            self.temporal_cow_source_map[dst_indices] = dst_indices.to(torch.int32)
+
+    def prepare_temporal_cow(
+        self, src_indices: torch.Tensor, dst_indices: torch.Tensor
+    ) -> None:
+        """Copy only the KDA convolution window and publish temporal sources.
+
+        The KDA backend resolves the persistent source map once per forward into
+        stable source/destination indices. Each layer then reads
+        ``temporal[src]`` and commits its final state directly to
+        ``temporal[dst]``. Source slots remain immutable and may be shared by
+        several restored requests.
+        """
+        if self.temporal_cow_source_map is None:
+            raise RuntimeError("copy-free temporal COW is not available for this pool")
+        self._validate_copy_source(src_indices, dst_indices)
+        self._copy_conv_from(src_indices, dst_indices)
+        self._reset_copied_slot_metadata(dst_indices, reset_source_map=False)
+        self.temporal_cow_source_map[dst_indices] = src_indices.to(torch.int32)
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Clone mamba state (conv + temporal) from src slots into dst slots.
@@ -940,43 +1023,12 @@ class MambaPool:
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
-        if self.replayssm_write_pos is not None and self.debug_memory_pool:
-            # Debug-only (syncs): catch any copy of an active, un-flushed slot.
-            src_wp = self.replayssm_write_pos[src_indices]
-            assert bool((src_wp == 0).all().item()), (
-                "copy_from requires a fully-flushed ReplaySSM source "
-                f"(write_pos==0), got {src_wp.tolist()} for src "
-                f"{src_indices.tolist()}"
-            )
-        if self._should_fuse_slot_ops():
-            from sglang.srt.mem_cache.mamba_slot_fused import fused_copy_conv_slots
-
-            if envs.SGLANG_DEBUG_MEMORY_POOL.get():
-                overlap = set(src_indices.tolist()) & set(dst_indices.tolist())
-                assert not overlap, (
-                    "fused copy_from requires disjoint src/dst slots; "
-                    f"overlap={sorted(overlap)}"
-                )
-            fused_copy_conv_slots(self._conv_slot_desc, src_indices, dst_indices)
-            temporal = self.mamba_cache.temporal
-            if temporal.numel() > 0:
-                temporal[:, dst_indices] = temporal[:, src_indices]
-        else:
-            for i in range(len(self.mamba_cache.conv)):
-                self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
-                    :, src_indices
-                ]
-            self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
-                :, src_indices
-            ]
-        if self.replayssm_write_pos is not None:
-            self.replayssm_write_pos[dst_indices] = 0
-        # ReplaySSM spec-verify ring: a copied checkpoint has no pending ring
-        # entries, so its rolling origin + flush flag reset alongside write_pos.
-        if self.replayssm_cache_base is not None:
-            self.replayssm_cache_base[dst_indices] = 0
-        if self.replayssm_is_flush is not None:
-            self.replayssm_is_flush[dst_indices] = 0
+        self._validate_copy_source(src_indices, dst_indices)
+        self._copy_conv_from(src_indices, dst_indices)
+        temporal = self.mamba_cache.temporal
+        if temporal.numel() > 0:
+            temporal[:, dst_indices] = temporal[:, src_indices]
+        self._reset_copied_slot_metadata(dst_indices, reset_source_map=True)
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
