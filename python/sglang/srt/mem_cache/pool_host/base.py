@@ -79,9 +79,6 @@ def synchronized(func):
 
 
 class HostKVCache(abc.ABC):
-    # Subclasses that build their fields without running this __init__ (e.g.
-    # MHATokenToKOnlyPoolHost, which mirrors an anchor pool) still need the
-    # DCP-aware accessors below to work, so the knobs default at class level.
     dcp_size = 1
     dcp_rank = 0
 
@@ -99,11 +96,7 @@ class HostKVCache(abc.ABC):
         dcp_rank: int = 0,
     ):
         self.device_pool = device_pool
-        # Under DCP the controller/radix layer works in the widened logical
-        # index space (page_size here is page_size * dcp_size), while this
-        # rank's buffer only materializes its owned 1/dcp_size token shard.
-        # self.page_size / self.size / self.page_num are kernel-facing
-        # (physical); the alloc/free/mem_state surface below is logical.
+        # page_size arrives widened (x dcp_size); size/page_size/page_num are physical.
         self.dcp_size = dcp_size
         self.dcp_rank = dcp_rank
         assert page_size % dcp_size == 0, (
