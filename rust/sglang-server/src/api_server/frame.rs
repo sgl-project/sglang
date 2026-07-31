@@ -272,7 +272,12 @@ pub(super) fn cumulative_frame_json(
     if let Some(v) = &acc.in_tid_json {
         let _ = write!(m, ",\"input_token_ids_logprobs\":{v}");
     }
-    if let Some(v) = &acc.in_lp_json {
+    // Input+output token logprobs are emitted as a PAIR whenever either side has
+    // data (empty list included), matching `frame_value` byte for byte — see the
+    // PD-router rationale there.
+    let lp_pair = acc.in_lp_json.is_some() || !acc.out_lp_json.is_empty();
+    if lp_pair {
+        let v = acc.in_lp_json.as_deref().unwrap_or("[]");
         let _ = write!(m, ",\"input_token_logprobs\":{v}");
     }
     if let Some(v) = &acc.in_top_json {
@@ -283,7 +288,7 @@ pub(super) fn cumulative_frame_json(
     if !acc.out_tid_json.is_empty() {
         let _ = write!(m, ",\"output_token_ids_logprobs\":[{}]", acc.out_tid_json);
     }
-    if !acc.out_lp_json.is_empty() {
+    if lp_pair {
         let _ = write!(m, ",\"output_token_logprobs\":[{}]", acc.out_lp_json);
     }
     if !acc.out_top_json.is_empty() {
