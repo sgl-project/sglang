@@ -22,13 +22,15 @@ def _fake_sgl_kernel_npu(gemma_kernel, add_gemma_kernel):
     package.__path__ = []
     norm_package = ModuleType("sgl_kernel_npu.norm")
     norm_package.__path__ = []
-    module = ModuleType("sgl_kernel_npu.norm.gemma_rmsnorm")
-    module.npu_gemma_rms_norm = gemma_kernel
-    module.add_gemma_rms_norm = add_gemma_kernel
+    gemma_module = ModuleType("sgl_kernel_npu.norm.gemma_rmsnorm")
+    gemma_module.npu_gemma_rms_norm = gemma_kernel
+    add_module = ModuleType("sgl_kernel_npu.norm.add_rmsnorm_bias")
+    add_module.add_gemma_rms_norm = add_gemma_kernel
     return {
         "sgl_kernel_npu": package,
         "sgl_kernel_npu.norm": norm_package,
-        "sgl_kernel_npu.norm.gemma_rmsnorm": module,
+        "sgl_kernel_npu.norm.gemma_rmsnorm": gemma_module,
+        "sgl_kernel_npu.norm.add_rmsnorm_bias": add_module,
     }
 
 
@@ -134,9 +136,7 @@ def test_srt_gemma_layers_delegate_plain_npu_path(layer_name):
     x = torch.randn(2, 4)
     unified_op = MagicMock(return_value=(x, "rstd"))
 
-    with patch.object(
-        layernorm_module, "npu_gemma_rms_norm", unified_op, create=True
-    ):
+    with patch.object(layernorm_module, "npu_gemma_rms_norm", unified_op, create=True):
         result = layer.forward_npu(x)
 
     assert result is x

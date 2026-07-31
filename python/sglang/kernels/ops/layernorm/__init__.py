@@ -465,7 +465,7 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         enable_pdl: Optional[bool] = None,
     ) -> None:
         try:
-            from sgl_kernel_npu.norm.gemma_rmsnorm import add_gemma_rms_norm
+            from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
         except ImportError as error:
             raise RuntimeError(
                 "Gemma RMSNorm on Ascend requires a target-specific "

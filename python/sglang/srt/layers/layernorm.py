@@ -159,11 +159,8 @@ logger = logging.getLogger(__name__)
 
 if _is_npu:
     import torch_npu
-
-    from sgl_kernel_npu.norm.gemma_rmsnorm import (
-        add_gemma_rms_norm,
-        npu_gemma_rms_norm,
-    )
+    from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
+    from sgl_kernel_npu.norm.gemma_rmsnorm import npu_gemma_rms_norm
 
 
 @lru_cache(maxsize=1)
