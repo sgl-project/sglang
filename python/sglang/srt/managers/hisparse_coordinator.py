@@ -725,10 +725,9 @@ class HiSparseCoordinator:
 
         done_event = device_module.Event()
         done_event.record()
-        if host_locs.is_cuda:
-            host_locs.record_stream(device_module.current_stream())
-        if device_locs.is_cuda:
-            device_locs.record_stream(device_module.current_stream())
+        # The batch owns l1_locs on the scheduling/forward stream, while this
+        # backup may consume it on copy_stream. host_locs aliases l1_locs in the
+        # identity L1 design, and device_locs is created on the current stream.
         if l1_locs.is_cuda:
             l1_locs.record_stream(device_module.current_stream())
         self._radix_decode_backup_event = done_event

@@ -1929,11 +1929,7 @@ class Scheduler(
             max_total_num_tokens=self.max_total_num_tokens * self.server_args.dcp_size,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
-            get_quarantined_reqs=lambda: (
-                self.disagg_decode_transfer_queue.get_quarantined_reqs()
-                if self.disagg_decode_transfer_queue is not None
-                else []
-            ),
+            get_quarantined_reqs=self._get_quarantined_reqs,
         )
 
     def init_invariant_checker(self) -> None:
@@ -1952,12 +1948,12 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
-            get_quarantined_reqs=lambda: (
-                self.disagg_decode_transfer_queue.get_quarantined_reqs()
-                if self.disagg_decode_transfer_queue is not None
-                else []
-            ),
+            get_quarantined_reqs=self._get_quarantined_reqs,
         )
+
+    def _get_quarantined_reqs(self):
+        queue = self.disagg_decode_transfer_queue
+        return queue.get_quarantined_reqs() if queue is not None else []
 
     def init_kv_events_publisher(self) -> None:
         self.kv_events_publisher = SchedulerKvEventsPublisher(
