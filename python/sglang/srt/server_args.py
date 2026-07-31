@@ -1892,6 +1892,14 @@ class ServerArgs:
         "Enable fused qk normalization and rope rotary embedding.",
         NS("exec.kernel"),
     ] = False
+    enable_flashinfer_rmsnorm_fp8_quant: A[
+        bool,
+        "Fuse RMSNorm with the downstream FP8 static per-tensor activation "
+        "quantization using FlashInfer's rmsnorm_quant / "
+        "fused_add_rmsnorm_quant kernels. Only applies to FP8 linears with "
+        "static per-tensor input scales (per-tensor quant only).",
+        NS("exec.kernel"),
+    ] = False
     enable_precise_embedding_interpolation: A[
         bool,
         "Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",
@@ -8265,10 +8273,7 @@ class ServerArgs:
     def _resolved_attention_backends(self):
         """Mid-resolution (prefill, decode) backends: reads through the pass
         view so declared fields resolve from the declaration stash."""
-        from sglang.srt.arg_groups.overrides import (
-            attention_backends_of,
-            resolved_view,
-        )
+        from sglang.srt.arg_groups.overrides import attention_backends_of, resolved_view
 
         return attention_backends_of(resolved_view(self))
 
