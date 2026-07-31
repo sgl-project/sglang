@@ -1467,7 +1467,7 @@ sgl-eval run aime25 \\
 
     {
       match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1498,7 +1498,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1506,6 +1506,7 @@ sgl-eval run aime25 \\
         "--tp 4",
         "--moe-runner-backend flashinfer_mxfp4",
         "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.88",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1529,7 +1530,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
