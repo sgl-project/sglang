@@ -41,6 +41,7 @@ from sglang.srt.utils import (
     ceil_div,
     get_bool_env_var,
     get_device_capability,
+    get_device_sm,
     get_hip_version,
     is_blackwell_supported,
     is_cuda,
@@ -48,8 +49,6 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_musa,
-    is_sm89_supported,
-    is_sm90_or_newer_supported,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -2162,7 +2161,7 @@ def apply_fp8_linear(
 ) -> torch.Tensor:
     gemm_backend = get_fp8_gemm_runner_backend()
     _validate_pertensor_fp8_backend(gemm_backend)
-    cutlass_fp8_supported = is_sm89_supported() or is_sm90_or_newer_supported()
+    cutlass_fp8_supported = is_cuda() and get_device_sm() >= 89
 
     if (
         use_flashinfer_fp8()

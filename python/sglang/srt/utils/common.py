@@ -309,22 +309,6 @@ is_sm90_supported = lru_cache(maxsize=1)(
 )
 
 
-@lru_cache(maxsize=1)
-def is_sm89_supported() -> bool:
-    if not is_cuda():
-        return False
-    major, minor = get_device_capability()
-    return major == 8 and minor == 9 and get_cuda_version() >= (12, 4)
-
-
-@lru_cache(maxsize=1)
-def is_sm90_or_newer_supported() -> bool:
-    if not is_cuda():
-        return False
-    major, _ = get_device_capability()
-    return major >= 9 and get_cuda_version() >= (12, 0)
-
-
 try:
     import sgl_kernel  # noqa: F401
 

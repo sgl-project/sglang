@@ -66,10 +66,9 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.utils.common import (
     get_device_capability,
+    get_device_sm,
     is_cuda,
     is_flashinfer_available,
-    is_sm89_supported,
-    is_sm90_or_newer_supported,
     is_sm100_supported,
     is_sm120_supported,
     round_up,
@@ -565,9 +564,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             layer.weight, layer.weight_scale, layer.logical_widths
         )
         layer.weight = Parameter(quantized_weight.t(), requires_grad=False)
-        if (
-            is_sm89_supported() or is_sm90_or_newer_supported()
-        ) and not self.enable_flashinfer_bmm:
+        if (is_cuda() and get_device_sm() >= 89) and not self.enable_flashinfer_bmm:
             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)

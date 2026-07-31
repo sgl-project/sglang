@@ -26,8 +26,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     use_flashinfer_fp8,
 )
 from sglang.srt.utils import (
-    is_sm89_supported,
-    is_sm90_or_newer_supported,
+    get_device_sm,
+    is_cuda,
     set_weight_attrs,
 )
 
@@ -124,9 +124,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
         else:
             # If checkpoint not offline quantized, quantize the weights with per-channel quantization.
-            if (
-                is_sm89_supported() or is_sm90_or_newer_supported()
-            ) and not use_flashinfer_fp8():
+            if (is_cuda() and get_device_sm() >= 89) and not use_flashinfer_fp8():
                 # if cutlass supported, we use cutlass_scaled_mm
                 # which requires per-channel quantization on weight
                 qweight, weight_scale = per_token_group_quant_fp8(

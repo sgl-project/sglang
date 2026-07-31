@@ -85,14 +85,13 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device_sm,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
     is_hip,
     is_musa,
     is_npu,
-    is_sm89_supported,
-    is_sm90_or_newer_supported,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -836,10 +835,7 @@ class Fp8LinearMethod(LinearMethodBase):
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.is_checkpoint_fp8_serialized:
                 if (
-                    (
-                        (is_sm89_supported() or is_sm90_or_newer_supported())
-                        and not use_flashinfer_fp8()
-                    )
+                    ((is_cuda() and get_device_sm() >= 89) and not use_flashinfer_fp8())
                     or self.use_marlin
                     or (_use_aiter and self.use_aiter_fp8_per_token)
                 ):
@@ -880,10 +876,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
                 # cutlass sgl-kernel and marlin only support per-channel scale; aiter supports per-channel scale
                 if (
-                    (
-                        (is_sm89_supported() or is_sm90_or_newer_supported())
-                        and not use_flashinfer_fp8()
-                    )
+                    ((is_cuda() and get_device_sm() >= 89) and not use_flashinfer_fp8())
                     or self.use_marlin
                     or (_use_aiter and self.use_aiter_fp8_per_token)
                 ):
@@ -1074,7 +1067,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.with_bias = False
         if get_moe_runner_backend().is_cutlass():
             assert (
-                is_sm90_or_newer_supported()
+                is_cuda() and get_device_sm() >= 90
             ), "cutlass_fp8 MoE requires SM90 or newer"
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert (
