@@ -14,6 +14,8 @@ from sglang.kernels.ops.diffusion.common.fallback_torch import (
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-b-test-cpu")
+register_cpu_ci(est_time=1, suite="base-b-test-cpu-arm64")
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
 
@@ -44,7 +46,15 @@ class TestDiffusionTorchFallback(unittest.TestCase):
                 ).to(dtype)
 
                 layer = norm_infer_native(x, weight, bias, 1e-5)
-                layer_ref = torch.nn.functional.layer_norm(x, (32,), weight, bias, 1e-5)
+                mean = x_fp32.mean(-1, keepdim=True)
+                layer_ref = (
+                    (x_fp32 - mean)
+                    * torch.rsqrt(
+                        (x_fp32 - mean).square().mean(-1, keepdim=True) + 1e-5
+                    )
+                    * weight.float()
+                    + bias.float()
+                ).to(dtype)
 
                 tolerance = 2e-2 if dtype != torch.float32 else 2e-5
                 torch.testing.assert_close(
@@ -56,6 +66,27 @@ class TestDiffusionTorchFallback(unittest.TestCase):
                 returned = norm_infer_native(x, weight, bias, 1e-5, out=out)
                 self.assertIs(returned, out)
                 torch.testing.assert_close(out.cpu(), layer_ref.cpu())
+
+    def test_norm_infer_preserves_input_dtype_with_fp32_parameters(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                x = torch.randn(4, 32, device=self.device, dtype=dtype)
+                weight = torch.randn(32, device=self.device, dtype=torch.float32)
+                bias = torch.randn(32, device=self.device, dtype=torch.float32)
+
+                result = norm_infer_native(x, weight, bias, 1e-5, is_rms_norm=True)
+                x_fp32 = x.float()
+                reference = (
+                    x_fp32
+                    * torch.rsqrt(x_fp32.square().mean(-1, keepdim=True) + 1e-5)
+                    * weight
+                    + bias
+                ).to(dtype)
+
+                self.assertEqual(result.dtype, dtype)
+                torch.testing.assert_close(
+                    result.cpu(), reference.cpu(), rtol=2e-2, atol=2e-2
+                )
 
     def test_scale_shift_matches_broadcast_reference(self):
         x = torch.randn(2, 6, 8, device=self.device)
