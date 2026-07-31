@@ -146,6 +146,7 @@ def test_hybrid_wrappers_forward_in_graph_hook():
             token_to_kv_pool=None,
             req_to_token_pool=None,
             server_args=SimpleNamespace(speculative_attention_mode="decode"),
+            model_config=SimpleNamespace(context_len=2048),
         ),
         prefill_backend=make_fake("prefill", calls),
         decode_backend=make_fake("decode", calls),
