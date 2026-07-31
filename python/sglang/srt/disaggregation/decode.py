@@ -72,7 +72,7 @@ from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.radix_hisparse import (
-    RadixHiSparseTokenToKVPoolAllocator,
+    is_radix_hisparse_allocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
@@ -1376,10 +1376,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # HiSparse pre-alloc only allocates logical indices, so the
                 # logical pool is the binding constraint for admission control.
                 available_size = logical_allocator.available_size()
-            if isinstance(
-                self.token_to_kv_pool_allocator,
-                RadixHiSparseTokenToKVPoolAllocator,
-            ):
+            if is_radix_hisparse_allocator(self.token_to_kv_pool_allocator):
                 available_size += self.tree_cache.evictable_size()
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
@@ -1557,7 +1554,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
-            if isinstance(allocator, RadixHiSparseTokenToKVPoolAllocator):
+            if is_radix_hisparse_allocator(allocator):
                 # This sibling allocator intentionally excludes HiCache: the
                 # complete decode hit is already resident in composite L1.
                 assert total_prefix_len == prefix_len
@@ -1664,8 +1661,9 @@ def alloc_for_decode_prealloc_hisparse(
     prefix_lens_cpu = torch.tensor([prefix_len], dtype=torch.int64)
     seq_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
     seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
+    # Radix node values already use the allocator device and int64 dtype.
     last_loc = (
-        prefix_indices[-1:].to(dtype=torch.int64, device=device)
+        prefix_indices[-1:]
         if prefix_len > 0
         else torch.tensor([-1], dtype=torch.int64, device=device)
     )

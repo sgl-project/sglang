@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 )
 from sglang.srt.mem_cache.allocator.radix_hisparse import (
     RadixHiSparseTokenToKVPoolAllocator,
+    is_radix_hisparse_allocator,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
@@ -72,8 +73,8 @@ class HiSparseCoordinator:
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
-        self.is_radix_hisparse = isinstance(
-            self.token_to_kv_pool_allocator, RadixHiSparseTokenToKVPoolAllocator
+        self.is_radix_hisparse = is_radix_hisparse_allocator(
+            self.token_to_kv_pool_allocator
         )
         if self.is_radix_hisparse:
             assert self.compress_ratio == 1

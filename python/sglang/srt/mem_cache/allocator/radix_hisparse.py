@@ -28,7 +28,7 @@ coordinator reaches L0 and the CPU L1 backing through explicit facade methods.
 """
 
 import weakref
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, TypeGuard
 
 import torch
 
@@ -522,3 +522,9 @@ class RadixHiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self._owns_l1_host_pool and not self._l1_host_pool_destroyed:
             self.l1_host_pool._storage_pool.destroy()
             self._l1_host_pool_destroyed = True
+
+
+def is_radix_hisparse_allocator(
+    allocator: BaseTokenToKVPoolAllocator,
+) -> TypeGuard[RadixHiSparseTokenToKVPoolAllocator]:
+    return isinstance(allocator, RadixHiSparseTokenToKVPoolAllocator)
