@@ -12,6 +12,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 class HybridAttnBackend(AttentionBackend):
@@ -114,6 +115,14 @@ class HybridAttnBackend(AttentionBackend):
     @property
     def verify_mask(self) -> Optional[VerifyMask]:
         return self._select_backend(ForwardMode.TARGET_VERIFY).verify_mask
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # Plan-stream fixup goes to the same child that handed out the mask.
+        self._select_backend(
+            ForwardMode.TARGET_VERIFY
+        ).update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)
 
     def forward(
         self,

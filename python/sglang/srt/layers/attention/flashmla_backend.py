@@ -285,6 +285,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.cuda_graph_draft_extend_seq_lens_k = torch.ones(
                 max_bs, dtype=torch.int32, device="cuda"
             )
+            # Target verify never reaches the parent's mask read: every
+            # init_forward_metadata* branch handles is_target_verify() itself and
+            # only falls through to super() otherwise.
             self._verify_mask = maybe_create_verify_mask(
                 is_draft_runner=self.is_draft_runner,
                 skip_prefill=self.skip_prefill,
@@ -292,7 +295,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 max_context_len=self.max_context_len,
                 num_draft_tokens=self.num_draft_tokens,
                 device=self.device,
-                is_read=True,
+                is_read=False,
             )
 
     @property

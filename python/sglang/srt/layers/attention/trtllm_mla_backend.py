@@ -357,6 +357,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
+        # Target verify never reaches the parent's mask read: it is excluded from
+        # every super() dispatch (init_forward_metadata, _out_graph, forward_extend)
+        # and runs the trtllm-gen kernel, which takes no mask.
         self._verify_mask = maybe_create_verify_mask(
             is_draft_runner=self.is_draft_runner,
             skip_prefill=self.skip_prefill,
@@ -364,7 +367,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             max_context_len=self.max_context_len,
             num_draft_tokens=self.num_draft_tokens,
             device=self.device,
-            is_read=True,
+            is_read=False,
         )
 
         super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
