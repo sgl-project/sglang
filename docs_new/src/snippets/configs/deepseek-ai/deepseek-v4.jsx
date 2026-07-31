@@ -1151,7 +1151,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--trust-remote-code",
@@ -1187,7 +1187,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
       ],
