@@ -107,7 +107,6 @@ def _online_partial_kernel(
     temperature = tl.load(temperatures_ptr + row)
     s = logits / temperature
     tile_max = tl.max(s, axis=0)
-    tile_max = tl.where(tile_max == float("-inf"), 0.0, tile_max)
     greedy = tl.load(greedy_mask_ptr + row) != 0
     noise = tl.load(exp_noise_ptr + row * V + offs, mask=mask, other=1.0)
     denom = tl.where(greedy, 1.0, noise)
@@ -140,7 +139,6 @@ def _online_combine_kernel(
         partial_idx_ptr + row * n_tiles + offs, mask=mask, other=_IDX_SENTINEL
     )
     global_max = tl.max(tile_max, axis=0)
-    global_max = tl.where(global_max == float("-inf"), 0.0, global_max)
     rescaled = keys * tl.exp(tile_max - global_max)
     rescaled = tl.where(mask, rescaled, -1.0)
     best = tl.max(rescaled, axis=0)
