@@ -7,7 +7,6 @@ import torch
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     DiffusionBreakableCudaGraphRunner,
     _CaptureEntry,
-    _signature_kwargs,
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
     DynamicVarlenMaskMeta,
@@ -23,6 +22,7 @@ from sglang.multimodal_gen.runtime.server_args import (
     BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
     BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
 )
+from sglang.multimodal_gen.runtime.utils.graph_tensor_tree import signature_kwargs
 
 
 class QwenImageTransformer2DModel(torch.nn.Module):
@@ -98,7 +98,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(short["freqs_cis"][1].shape, (256, 128))
         self.assertEqual(short["txt_seq_lens"], [256])
         self.assertEqual(longer["txt_seq_lens"], [256])
-        self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
+        self.assertEqual(signature_kwargs(short), signature_kwargs(longer))
 
     def test_qwen_prompt_content_changes_do_not_change_signature(self):
         with self._patch_buckets(256, 512, 1024):
@@ -115,7 +115,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
                 second["encoder_hidden_states"][0],
             )
         )
-        self.assertEqual(_signature_kwargs(first), _signature_kwargs(second))
+        self.assertEqual(signature_kwargs(first), signature_kwargs(second))
 
     def test_qwen_dynamic_varlen_meta_is_not_tail_pad_meta(self):
         self.assertEqual(_attn_mask_meta_local_pad(None), 0)
@@ -145,7 +145,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertFalse(first["encoder_hidden_states_mask"][0, 19:].any())
         self.assertTrue(second["encoder_hidden_states_mask"][0, :47].all())
         self.assertFalse(second["encoder_hidden_states_mask"][0, 47:].any())
-        self.assertEqual(_signature_kwargs(first), _signature_kwargs(second))
+        self.assertEqual(signature_kwargs(first), signature_kwargs(second))
 
     def test_non_qwen_kwargs_do_not_take_qwen_padding_path(self):
         kwargs = self._qwen_kwargs(47)
@@ -195,7 +195,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertFalse(short["encoder_hidden_states_mask"][0, 19:].any())
         self.assertFalse(longer["encoder_hidden_states_mask"][0, 47:].any())
         self.assertEqual(short["freqs_cis"][0].shape, (64, 8))
-        self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
+        self.assertEqual(signature_kwargs(short), signature_kwargs(longer))
 
     def _minimax_h3_kwargs(self, text_seq: int):
         image_seq = 4
@@ -321,7 +321,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertFalse(short["attn_mask"][0, 23:].any())
         self.assertIsInstance(short["attn_mask_meta"], DynamicVarlenMaskMeta)
         self.assertIs(short["attn_mask_meta"], longer["attn_mask_meta"])
-        self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
+        self.assertEqual(signature_kwargs(short), signature_kwargs(longer))
 
     def test_ideogram_image_only_kwargs_are_not_prompt_padded(self):
         kwargs = self._ideogram_kwargs(0)
