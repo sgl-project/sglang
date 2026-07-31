@@ -25,6 +25,13 @@ def _get_sparse_kv_manager(backend: AscendAttnBackend):
     return backend.sparse_kv_manager
 
 
+def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
+    """Expand [T, K] to [T, 1, K] for NPU sparse attention."""
+    if topk_indices.dim() == 2:
+        return topk_indices.unsqueeze(-2)
+    return topk_indices
+
+
 def forward_sparsity_driven_kv_offload(
     backend: AscendAttnBackend,
     q: torch.Tensor,
@@ -260,6 +267,7 @@ def forward_sparsity_driven_kv_offload(
             k_nope_sfa, k_pe_sfa = k_nope, k_pe
             forward_actual_seq_lengths_kv = actual_seq_lengths_kv
 
+        topk_indices = _expand_dsa_sparse_indices(topk_indices)
         attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope,
             key=k_nope_sfa,
