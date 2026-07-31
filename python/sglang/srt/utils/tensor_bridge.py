@@ -120,10 +120,12 @@ def mlx_to_torch(
 ) -> torch.Tensor:
     """Convert MLX array to PyTorch tensor.
 
-    MLX arrays share their unified-memory allocation with PyTorch through
-    DLPack, including explicit CPU views. MLX is evaluated before the handoff
-    because the frameworks do not share stream state. Only CPU and MPS targets
-    are supported; other target devices are rejected.
+    MLX arrays with PyTorch-compatible strides share their unified-memory
+    allocation through DLPack, including explicit CPU views. Negative-stride
+    views are materialized because PyTorch's DLPack importer cannot represent
+    them safely. MLX is evaluated before the handoff because the frameworks do
+    not share stream state. Only CPU and MPS targets are supported; other
+    target devices are rejected.
 
     Args:
         array: MLX array
@@ -136,6 +138,21 @@ def mlx_to_torch(
     target_device = _get_torch_device() if device is None else torch.device(device)
 
     mx.eval(array)
+    # PyTorch's DLPack importer aborts the process for negative-stride tensors
+    # instead of raising a Python exception. MLX 0.32 exposes evaluated layout
+    # metadata through the buffer protocol, so materialize only that unsupported
+    # case and retain zero-copy export for positive-stride views.
+    with memoryview(array) as view:
+        has_negative_stride = any(stride < 0 for stride in (view.strides or ()))
+    if has_negative_stride:
+        materialize_stream = (
+            mx.cpu
+            if target_device.type == "cpu" or array.dtype == mx.float64
+            else mx.gpu
+        )
+        array = mx.contiguous(array, stream=materialize_stream)
+        mx.eval(array)
+
     if target_device.type == "cpu":
         # MLX owns CPU-accessible unified memory, so request a CPU DLPack view
         # explicitly instead of importing on MPS and copying back to CPU.
