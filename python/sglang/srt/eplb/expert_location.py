@@ -32,10 +32,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _prefer_same_node_experts(server_args: ServerArgs) -> bool:
+def _prefer_same_node_experts() -> bool:
     from sglang.srt.elastic_ep.elastic_ep import elastic_expanded_world_enabled
+    from sglang.srt.runtime_context import get_exec
 
-    return server_args.ep_join_mode != "scale" and not elastic_expanded_world_enabled()
+    return (
+        get_exec().moe.ep_join_mode != "scale" and not elastic_expanded_world_enabled()
+    )
 
 
 def _compute_elastic_expert_layout(
@@ -156,7 +159,6 @@ class ExpertLocationMetadata:
                 )
             assert physical_to_logical_map.shape[-1] == common["num_physical_experts"]
         logical_to_all_physical_map = _compute_logical_to_all_physical_map(
-            server_args=server_args,
             physical_to_logical_map=physical_to_logical_map,
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
             ep_size=common["ep_size"],
@@ -223,6 +225,8 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def _init_common(server_args: ServerArgs, model_config: ModelConfig):
+        from sglang.srt.runtime_context import get_parallel
+
         model_config_for_expert_location = (
             ModelConfigForExpertLocation.from_model_config(model_config)
         )
@@ -234,7 +238,10 @@ class ExpertLocationMetadata:
             model_config_for_expert_location.num_logical_experts
             + server_args.ep_num_redundant_experts
         )
-        ep_size = server_args.ep_size
+        # ep_size is rewritten by elastic-EP scale-up via
+        # get_context().override(...), so read the bag (the single resolved
+        # source) rather than the pristine ``server_args`` parameter.
+        ep_size = get_parallel().ep_size
         num_physical_experts = base_num_physical_experts
         initial_ep_size = server_args.elastic_ep_initial_size
         if initial_ep_size is not None:
@@ -291,7 +298,6 @@ class ExpertLocationMetadata:
             ep_size=ep_size,
             logical_to_rank_dispatch_physical_map=(
                 compute_logical_to_rank_dispatch_physical_map(
-                    server_args=server_args,
                     logical_to_all_physical_map=logical_to_all_physical_map,
                     ep_size=ep_size,
                     num_physical_experts=num_physical_experts,
@@ -536,12 +542,13 @@ def broadcast_global_expert_location_metadata(
 
 
 def _compute_logical_to_all_physical_map(
-    server_args: ServerArgs,
     physical_to_logical_map: torch.Tensor,
     num_logical_experts: int,
     ep_size: int,
     moe_ep_rank: int,
 ):
+    from sglang.srt.runtime_context import get_exec, get_parallel
+
     # This is rarely called, so we use for loops for maximum clarity
 
     num_layers, num_physical_experts = physical_to_logical_map.shape
@@ -564,11 +571,15 @@ def _compute_logical_to_all_physical_map(
     # without an a2a backend, where all EP ranks must agree on the pick: this
     # collapse is per-rank, and the full candidate list is what lets the dispatch
     # spread a hot expert over its replicas. See ExpertLocationDispatchInfo.
-    if moe_ep_rank is not None and server_args.moe_a2a_backend != "none":
+    if moe_ep_rank is not None and get_exec().moe.moe_a2a_backend != "none":
         num_local_gpu_physical_experts = num_physical_experts // ep_size
-        prefer_same_node = _prefer_same_node_experts(server_args)
+        prefer_same_node = _prefer_same_node_experts()
+        # get_parallel().ep_size: elastic-EP scale-up rewrites ep_size on the
+        # bag, and this runs on the post-scale path (init_by_mapping).
         num_gpus_per_node = (
-            server_args.ep_size // server_args.nnodes if prefer_same_node else None
+            get_parallel().ep_size // get_parallel().nnodes
+            if prefer_same_node
+            else None
         )
         num_local_node_physical_experts = (
             num_local_gpu_physical_experts * num_gpus_per_node
@@ -614,22 +625,25 @@ def _pad_nested_array(arr, pad_value):
 
 # TODO optimize performance (rewrite and/or run in separate process with overlap)
 def compute_logical_to_rank_dispatch_physical_map(
-    server_args: ServerArgs,
     logical_to_all_physical_map: torch.Tensor,
     ep_size: int,
     num_physical_experts: int,
     ep_rank: int,
     seed: int = 42,
 ):
+    from sglang.srt.runtime_context import get_parallel
+
     r = random.Random(seed)
 
     device = logical_to_all_physical_map.device
     logical_to_all_physical_map = logical_to_all_physical_map.cpu()
 
     num_local_gpu_physical_experts = num_physical_experts // ep_size
-    prefer_same_node = _prefer_same_node_experts(server_args)
+    prefer_same_node = _prefer_same_node_experts()
+    # get_parallel().ep_size: see _init_common — elastic-EP scale-up rewrites
+    # ep_size on the bag.
     num_gpus_per_node = (
-        server_args.ep_size // server_args.nnodes if prefer_same_node else None
+        get_parallel().ep_size // get_parallel().nnodes if prefer_same_node else None
     )
     num_local_node_physical_experts = (
         num_local_gpu_physical_experts * num_gpus_per_node
