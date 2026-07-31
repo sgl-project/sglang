@@ -19,6 +19,7 @@ from torch import nn
 
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     is_dp_attention_enabled,
@@ -138,6 +139,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=prefix,
+            is_mtp=True,
         )
         self.has_start_projections = has_start_projections
         self.has_end_norm = has_end_norm
@@ -288,22 +290,24 @@ class NemotronHMultiTokenPredictor(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings(input_ids)
 
+        hidden_states = forward_batch.spec_info.hidden_states
         residual = None
 
-        for i in range(self.pattern_len):
-            hidden_states, residual = self.layers[str(i)](
-                inputs_embeds=inputs_embeds,
-                hidden_states=hidden_states,
-                residual=residual,
-                forward_batch=forward_batch,
-            )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            for i in range(self.pattern_len):
+                hidden_states, residual = self.layers[str(i)](
+                    inputs_embeds=inputs_embeds,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    forward_batch=forward_batch,
+                )
         return hidden_states
 
 
@@ -352,11 +356,9 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         input_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = forward_batch.spec_info.hidden_states
-
         hidden_states = self.model(
             input_ids,
-            hidden_states,
+            positions,
             forward_batch,
             input_embeds,
         )
