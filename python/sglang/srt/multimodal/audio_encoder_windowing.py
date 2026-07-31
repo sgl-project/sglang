@@ -27,7 +27,7 @@ class AudioEncoderWindowConfig(msgspec.Struct, frozen=True):
     window_tokens: int
 
 
-class _AudioEncoderWindow(msgspec.Struct, frozen=True):
+class _AudioWindowFeatures(msgspec.Struct, frozen=True):
     feature: torch.Tensor
     attention_mask: torch.Tensor
     token_count: int
@@ -56,12 +56,12 @@ def resolve_audio_encoder_window_config(
     )
 
 
-def _preprocess_audio_encoder_windows(
+def _extract_audio_window_features(
     samples: Any,
     config: AudioEncoderWindowConfig,
     *,
     processor: Any,
-) -> tuple[list[_AudioEncoderWindow], int]:
+) -> tuple[list[_AudioWindowFeatures], int]:
     """Extract one feature row per complete window plus a mutable tail."""
     samples = np.asarray(samples, dtype=np.float32)
     if samples.ndim != 1:
@@ -107,26 +107,26 @@ def _preprocess_audio_encoder_windows(
     if any(count <= 0 for count in token_counts):
         raise ValueError("audio window produced no encoder tokens")
 
-    entries = [
-        _AudioEncoderWindow(
+    window_features = [
+        _AudioWindowFeatures(
             feature=processed_features[row : row + 1].clone(),
             attention_mask=processed_masks[row : row + 1].clone(),
             token_count=token_counts[row],
         )
         for row in range(len(windows))
     ]
-    return entries, complete_count
+    return window_features, complete_count
 
 
-def _assemble_audio_encoder_windows(
+def _build_audio_window_items(
     input_ids: torch.Tensor,
     placeholder_token_id: int,
-    entries: list[_AudioEncoderWindow],
+    window_features: list[_AudioWindowFeatures],
     complete_window_count: int,
 ) -> tuple[list[MultimodalDataItem], torch.Tensor]:
     """Expand one audio placeholder and create feature-backed window items."""
     input_ids = input_ids.flatten()
-    token_counts = [entry.token_count for entry in entries]
+    token_counts = [window.token_count for window in window_features]
 
     placeholder_positions = (input_ids == placeholder_token_id).nonzero(as_tuple=True)[
         0
@@ -149,15 +149,15 @@ def _assemble_audio_encoder_windows(
 
     mm_items = []
     offset_start = placeholder_position
-    for index, entry in enumerate(entries):
-        offset_end = offset_start + entry.token_count - 1
+    for index, window in enumerate(window_features):
+        offset_end = offset_start + window.token_count - 1
         # The mutable tail changes every request; only complete windows get a
         # stable identity in the embedding cache.
         use_embedding_cache = index < complete_window_count
         item_hash = None
         if use_embedding_cache:
             item_hash = hash_mm_item(
-                hash_feature(entry.feature),
+                hash_feature(window.feature),
                 Modality.AUDIO,
                 [(offset_start, offset_end)],
             )
@@ -166,10 +166,10 @@ def _assemble_audio_encoder_windows(
                 modality=Modality.AUDIO,
                 hash=item_hash,
                 offsets=[(offset_start, offset_end)],
-                feature=entry.feature,
+                feature=window.feature,
                 use_embedding_cache=use_embedding_cache,
                 model_specific_data={
-                    "feature_attention_mask": entry.attention_mask,
+                    "feature_attention_mask": window.attention_mask,
                 },
             )
         )
@@ -178,7 +178,7 @@ def _assemble_audio_encoder_windows(
     return mm_items, expanded_ids
 
 
-def build_audio_encoder_windows(
+def build_audio_encoder_window_items(
     samples: Any,
     input_ids: torch.Tensor,
     placeholder_token_id: int,
@@ -187,11 +187,11 @@ def build_audio_encoder_windows(
     processor: Any,
 ) -> tuple[list[MultimodalDataItem], torch.Tensor]:
     """Convert one audio input into reusable complete windows and a mutable tail."""
-    entries, complete_count = _preprocess_audio_encoder_windows(
+    window_features, complete_count = _extract_audio_window_features(
         samples,
         config,
         processor=processor,
     )
-    return _assemble_audio_encoder_windows(
-        input_ids, placeholder_token_id, entries, complete_count
+    return _build_audio_window_items(
+        input_ids, placeholder_token_id, window_features, complete_count
     )

@@ -9,7 +9,7 @@ import msgspec
 import numpy as np
 
 # Realtime input is validated as PCM16; keep all byte offsets sample-aligned.
-PCM_SAMPLE_WIDTH = 2
+PCM_SAMPLE_WIDTH_BYTES = 2
 
 # Only skip windows that are effectively digital silence. This avoids empty
 # audio-feature requests without treating low-volume speech as silence.
@@ -58,11 +58,10 @@ class AudioBuffer(msgspec.Struct):
     data: bytearray = bytearray()
     # Resident bytes may start after offset zero once compaction drops them.
     base_offset_bytes: int = 0
-    # `attempted` marks audio covered by an inference attempt; `accepted` marks
-    # audio whose result entered the transcript. A deferred result advances only
-    # `attempted`, so pacing waits while the next request re-covers the rest.
-    attempted_offset_bytes: int = 0
-    accepted_offset_bytes: int = 0
+    # A deferred decode advances only `last_attempted`, so pacing waits for new
+    # input while `last_processed` keeps that audio in the next request.
+    last_attempted_offset_bytes: int = 0
+    last_processed_offset_bytes: int = 0
 
     @property
     def received_bytes(self) -> int:
@@ -92,7 +91,7 @@ class AudioBuffer(msgspec.Struct):
                 f"[{self.base_offset_bytes}, {self.received_bytes}]"
             )
         drop_bytes = offset_bytes - self.base_offset_bytes
-        drop_bytes -= drop_bytes % PCM_SAMPLE_WIDTH
+        drop_bytes -= drop_bytes % PCM_SAMPLE_WIDTH_BYTES
         if drop_bytes <= 0:
             return
 

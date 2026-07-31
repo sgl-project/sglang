@@ -285,8 +285,8 @@ def _get_chunked_embedding_full(
 
 
 @dataclass
-class PerImageRequestInfo:
-    """Metadata for a single request using the per-image encoding path."""
+class _PerItemRequestInfo:
+    """Metadata for a request whose multimodal inputs encode independently."""
 
     req_idx: int
     items: List[MultimodalDataItem]
@@ -298,14 +298,14 @@ class PerImageRequestInfo:
     )
 
 
-def _batch_encode_per_image_misses(
+def _batch_encode_per_item_misses(
     data_embedding_func: DataEmbeddingFunc,
-    per_image_requests: List[PerImageRequestInfo],
+    per_item_requests: List[_PerItemRequestInfo],
     device: torch.device,
 ) -> Dict[int, torch.Tensor]:
     """
-    Collect cache misses across ALL per-image requests, deduplicate by hash,
-    encode in a single ViT call, and populate the cache.
+    Collect cache misses across all per-item requests, deduplicate by hash,
+    encode in one multimodal encoder call, and populate the cache.
 
     Returns:
         hash_to_embedding: mapping from item.hash to its full embedding tensor.
@@ -314,7 +314,7 @@ def _batch_encode_per_image_misses(
     hash_to_embedding: Dict[int, torch.Tensor] = {}
 
     # Phase 1a: find overlapping items per request and collect cache misses
-    for req_info in per_image_requests:
+    for req_info in per_item_requests:
         chunk_start = req_info.extend_prefix_len
         chunk_end = chunk_start + req_info.extend_seq_len  # exclusive
         overlapping = []
@@ -418,8 +418,8 @@ def _get_chunked_embedding_by_item(
     device: torch.device,
 ) -> Optional[torch.Tensor]:
     """
-    Per-image chunk-aware encoding for one request.
-    Items must already be split per-image (each item has exactly one offset).
+    Per-item chunk-aware encoding for one request.
+    Each item must encode independently and have exactly one offset.
     """
     chunk_start = extend_prefix_len
     chunk_end = extend_prefix_len + extend_seq_len  # exclusive
@@ -512,7 +512,7 @@ def _get_chunked_embedding_by_item(
     return torch.cat(chunk_slices, dim=0)
 
 
-def _assemble_per_image_chunk(
+def _assemble_per_item_chunk(
     overlapping: List[Tuple[int, MultimodalDataItem, int, int]],
     hash_to_embedding: Dict[int, torch.Tensor],
     extend_prefix_len: int,
@@ -551,15 +551,15 @@ def _get_chunked_prefill_embedding(
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """
     Chunked prefill embedding: encode items across all requests and extract
-    per-request chunks. Images from all requests are batched into a single
-    ViT call for efficiency.
+    per-request chunks. Independently encodable items from all requests are
+    batched into one multimodal encoder call.
     """
     device = input_ids.device
     # FIXME(Xinyuan): temporary workaround for eagle3
     max_iterations = min(len(items_size) - 1, len(prefix_length))
 
-    # Phase 0: classify requests into per-image vs full/EVS path
-    per_image_requests = []  # batched ViT encoding
+    # Phase 0: classify requests into independent-item vs full/EVS paths.
+    per_item_requests = []  # batched multimodal encoding
     full_path_requests = []  # per-request encoding (EVS etc.)
     all_chunks: List[Tuple[int, torch.Tensor]] = []
 
@@ -579,7 +579,7 @@ def _get_chunked_prefill_embedding(
         if all(offset_end < prefix_length[i] for _, offset_end in items_offset):
             continue
 
-        req_info = PerImageRequestInfo(
+        req_info = _PerItemRequestInfo(
             req_idx=i,
             items=embedding_items_per_req,
             items_offset=items_offset,
@@ -587,11 +587,13 @@ def _get_chunked_prefill_embedding(
             extend_seq_len=extend_seq_len,
         )
 
-        is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
-        if is_per_image:
+        uses_independent_items = all(
+            len(item.offsets) == 1 for item in embedding_items_per_req
+        )
+        if uses_independent_items:
             if _is_hip or _is_npu:
-                # ROCm CI regressed with one large cross-request ViT batch; keep
-                # the previous per-request path on HIP while CUDA uses batching.
+                # ROCm CI regressed with one large cross-request encoder batch;
+                # keep the previous per-request path on HIP while CUDA batches.
                 chunk = _get_chunked_embedding_by_item(
                     data_embedding_func,
                     embedding_items_per_req,
@@ -603,20 +605,20 @@ def _get_chunked_prefill_embedding(
                 if chunk is not None:
                     all_chunks.append((i, chunk))
             else:
-                per_image_requests.append(req_info)
+                per_item_requests.append(req_info)
         else:
             full_path_requests.append(req_info)
 
-    # Phase 1: batch encode all per-image cache misses in ONE ViT call
+    # Phase 1: batch all independent-item cache misses in one encoder call.
     hash_to_embedding: Dict[int, torch.Tensor] = {}
-    if per_image_requests:
-        hash_to_embedding = _batch_encode_per_image_misses(
-            data_embedding_func, per_image_requests, device
+    if per_item_requests:
+        hash_to_embedding = _batch_encode_per_item_misses(
+            data_embedding_func, per_item_requests, device
         )
 
     # Phase 2: assemble per-request chunks in original request order
-    for req_info in per_image_requests:
-        chunk = _assemble_per_image_chunk(
+    for req_info in per_item_requests:
+        chunk = _assemble_per_item_chunk(
             req_info.overlapping,
             hash_to_embedding,
             req_info.extend_prefix_len,

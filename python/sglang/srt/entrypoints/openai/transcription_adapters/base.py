@@ -108,8 +108,8 @@ class TranscriptionAdapter(ABC):
         return {}
 
     @property
-    def realtime_long_audio_config(self) -> dict:
-        """Long-audio tuning: the activation gate plus windowed-decoding knobs."""
+    def realtime_encoder_window_config(self) -> dict:
+        """Optional realtime encoder-window and decoder-prefix settings."""
         return {}
 
     def postprocess_text(self, text: str) -> str:

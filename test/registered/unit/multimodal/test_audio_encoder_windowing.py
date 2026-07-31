@@ -11,7 +11,7 @@ import torch
 from sglang.srt.managers.mm_utils import hash_feature, hash_mm_item
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.audio_encoder_windowing import (
-    build_audio_encoder_windows,
+    build_audio_encoder_window_items,
     resolve_audio_encoder_window_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -52,7 +52,7 @@ class TestAudioEncoderWindowing(CustomTestCase):
         )
 
     def _build(self, sample_count):
-        return build_audio_encoder_windows(
+        return build_audio_encoder_window_items(
             samples=np.arange(sample_count, dtype=np.float32),
             input_ids=torch.tensor([10, 99, 11]),
             placeholder_token_id=99,

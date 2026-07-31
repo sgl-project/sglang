@@ -312,7 +312,7 @@ class MultimodalDataItem:
     For example, if there are 3 images and 1 audio, there will be 4 MultimodalDataItems.
     A processor may also split one input into several items when they encode independently.
 
-    Each item has its own hash and pad_value, enabling per-image RadixAttention caching.
+    Each item has its own hash and pad_value, enabling per-item RadixAttention caching.
 
     We put the common fields first and the model-specific fields in model_specific_data.
     """

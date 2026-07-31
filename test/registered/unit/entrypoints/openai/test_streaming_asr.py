@@ -26,10 +26,10 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 _AUDIO = np.zeros(1600, dtype=np.float32)
-_WINDOW_CONFIG = AudioEncoderWindowConfig(
+_ENCODER_WINDOW_GEOMETRY = AudioEncoderWindowConfig(
     min_input_samples=4, window_samples=16, window_tokens=8
 )
-_WINDOWED_CONFIG = {
+_ENCODER_WINDOW_POLICY = {
     "decoder_prefix_max_tokens": 3,
     "decoder_prefix_holdback_words": 1,
     "max_audio_context_windows": 2,
@@ -39,15 +39,15 @@ _WINDOWED_CONFIG = {
 def _adapter(
     *,
     min_audio_sec=0.0,
-    windowed_config=None,
+    encoder_window_config=None,
     unfixed_token_num=1,
 ):
     return SimpleNamespace(
         prompt_template="PROMPT:",
         model_sample_rate=1,
         postprocess_text=lambda text: text,
-        realtime_long_audio_config=(
-            {"min_audio_sec": min_audio_sec} | (windowed_config or {})
+        realtime_encoder_window_config=(
+            {"min_audio_sec": min_audio_sec} | (encoder_window_config or {})
         ),
         chunked_streaming_config={
             "chunk_size_sec": 2.0,
@@ -58,7 +58,7 @@ def _adapter(
 
 
 class _MockTokenizerManager:
-    def __init__(self, transcripts=None, *, windowed=False, fail=False):
+    def __init__(self, transcripts=None, *, supports_encoder_windows=False, fail=False):
         self._transcripts = (
             list(transcripts) if isinstance(transcripts, list) else [transcripts]
         )
@@ -69,9 +69,11 @@ class _MockTokenizerManager:
             encode=lambda text, add_special_tokens=False: text.split(),
             decode=lambda token_ids, **kwargs: " ".join(token_ids),
         )
-        if windowed:
+        if supports_encoder_windows:
             self.mm_processor = Mock(
-                resolve_audio_encoder_window_config=lambda *args: _WINDOW_CONFIG
+                resolve_audio_encoder_window_config=lambda *args: (
+                    _ENCODER_WINDOW_GEOMETRY
+                )
             )
 
     def generate_request(self, adapted_request, raw_request=None, **kwargs):
@@ -117,13 +119,15 @@ def _chunk(state, transcript, *, is_last=False):
     return tokenizer_manager, delta
 
 
-def _windowed_processor(transcripts, *, min_audio_sec=0.0):
-    tokenizer_manager = _MockTokenizerManager(transcripts, windowed=True)
+def _encoder_window_processor(transcripts, *, min_audio_sec=0.0):
+    tokenizer_manager = _MockTokenizerManager(
+        transcripts, supports_encoder_windows=True
+    )
     processor = RealtimeASRProcessor(
         tokenizer_manager,
         _adapter(
             min_audio_sec=min_audio_sec,
-            windowed_config=_WINDOWED_CONFIG,
+            encoder_window_config=_ENCODER_WINDOW_POLICY,
         ),
         _server_args(120),
     )
@@ -132,7 +136,7 @@ def _windowed_processor(transcripts, *, min_audio_sec=0.0):
 
 class TestStreamingASR(CustomTestCase):
     def test_cumulative_prompt_and_word_reconciliation(self):
-        state = _state(emitted_text="hello", chunk_index=5)
+        state = _state(emitted_text="hello", decode_count=5)
         tokenizer_manager, _ = _chunk(state, "hello world foo")
         self.assertEqual(tokenizer_manager.requests[0].text, "PROMPT:hello")
 
@@ -153,17 +157,19 @@ class TestStreamingASR(CustomTestCase):
         self.assertEqual(state.emitted_text, "你好世界")
 
         repeated = "你好世界" * 10
-        self.assertEqual(state.update(repeated), "")
-        state.full_transcript = repeated
-        state.finalize()
+        self.assertEqual(
+            state.reconcile_cumulative_transcript(repeated, is_last=False), ""
+        )
+        state.latest_text = repeated
+        state.flush_cumulative_transcript()
         self.assertEqual(state.emitted_text, repeated)
 
         state = _state(emitted_text="你好，世界。你好")
-        state.full_transcript = "你好。世界。你好世界"
-        self.assertEqual(state.finalize(), "世界")
+        state.latest_text = "你好。世界。你好世界"
+        self.assertEqual(state.flush_cumulative_transcript(), "世界")
 
-    def test_windowed_path_emits_only_the_agreed_suffix(self):
-        tokenizer_manager, processor, state = _windowed_processor(
+    def test_encoder_window_path_emits_only_the_agreed_suffix(self):
+        tokenizer_manager, processor, state = _encoder_window_processor(
             ["three four five", "four five six", "five six seven"]
         )
         state.transcript.emitted_text = "one two three"
@@ -182,7 +188,7 @@ class TestStreamingASR(CustomTestCase):
         )
         self.assertEqual(
             tokenizer_manager.processor_kwargs[0]["audio_encoder_window_config"],
-            _WINDOW_CONFIG,
+            _ENCODER_WINDOW_GEOMETRY,
         )
 
         state.audio.append_pcm(b"\x03\x00\x04\x00")
@@ -207,8 +213,8 @@ class TestStreamingASR(CustomTestCase):
             tokenizer_manager.requests[-1].sampling_params["max_new_tokens"], 256
         )
 
-    def test_windowed_mode_starts_only_after_the_audio_gate(self):
-        tokenizer_manager, processor, state = _windowed_processor(
+    def test_encoder_window_mode_starts_only_after_the_audio_gate(self):
+        tokenizer_manager, processor, state = _encoder_window_processor(
             "alpha beta", min_audio_sec=60.0
         )
         state.audio.append_pcm(bytes(120))
@@ -217,7 +223,7 @@ class TestStreamingASR(CustomTestCase):
             tokenizer_manager.processor_kwargs[0]["audio_encoder_window_config"]
         )
 
-        tokenizer_manager, processor, state = _windowed_processor(
+        tokenizer_manager, processor, state = _encoder_window_processor(
             "four five", min_audio_sec=60.0
         )
         state.transcript.emitted_text = "one two three"
@@ -225,11 +231,11 @@ class TestStreamingASR(CustomTestCase):
         _run(processor.process(state, is_last=False, sampling_params={}))
         self.assertEqual(
             tokenizer_manager.processor_kwargs[0]["audio_encoder_window_config"],
-            _WINDOW_CONFIG,
+            _ENCODER_WINDOW_GEOMETRY,
         )
 
-    def test_windowed_mode_compacts_on_encoder_boundaries(self):
-        tokenizer_manager, processor, state = _windowed_processor(
+    def test_encoder_window_mode_compacts_on_encoder_boundaries(self):
+        tokenizer_manager, processor, state = _encoder_window_processor(
             ["three four five", "four five six"], min_audio_sec=60.0
         )
         state.transcript.emitted_text = "one two three"
@@ -247,8 +253,8 @@ class TestStreamingASR(CustomTestCase):
             state.audio.received_bytes,
         )
 
-    def test_windowed_cjk_retries_cumulatively(self):
-        tokenizer_manager, processor, state = _windowed_processor(
+    def test_encoder_window_cjk_retries_cumulatively(self):
+        tokenizer_manager, processor, state = _encoder_window_processor(
             ["你好世界", "你好世界"]
         )
         state.audio.append_pcm(b"\x01\x00\x02\x00")
@@ -256,12 +262,12 @@ class TestStreamingASR(CustomTestCase):
         delta = _run(processor.process(state, is_last=False, sampling_params={}))
 
         self.assertEqual(delta, "你好世")
-        self.assertTrue(state.windowed_disabled)
-        self.assertFalse(state.windowed_started)
+        self.assertTrue(state.encoder_window_disabled)
+        self.assertFalse(state.encoder_window_active)
         self.assertEqual(len(tokenizer_manager.requests), 2)
         self.assertEqual(
             tokenizer_manager.processor_kwargs[0]["audio_encoder_window_config"],
-            _WINDOW_CONFIG,
+            _ENCODER_WINDOW_GEOMETRY,
         )
         self.assertIsNone(
             tokenizer_manager.processor_kwargs[1]["audio_encoder_window_config"]
@@ -288,21 +294,21 @@ class TestStreamingASR(CustomTestCase):
         )
         connection.config.sampling_params = {}
         connection.asr_state.audio.append_pcm(bytes(range(12)))
-        connection.asr_state.audio.attempted_offset_bytes = 8
-        connection.asr_state.audio.accepted_offset_bytes = 8
+        connection.asr_state.audio.last_attempted_offset_bytes = 8
+        connection.asr_state.audio.last_processed_offset_bytes = 8
 
         with self.assertLogs(level="WARNING"):
             self.assertFalse(_run(connection._run_inference(is_last=False)))
 
         self.assertEqual(bytes(connection.asr_state.audio.data), bytes(range(12)))
-        self.assertEqual(connection.asr_state.audio.accepted_offset_bytes, 8)
+        self.assertEqual(connection.asr_state.audio.last_processed_offset_bytes, 8)
         websocket.close.assert_awaited_with(code=1011)
 
         connection._reset_inference_state()
         self.assertEqual(connection.asr_state.audio.data, bytearray())
         self.assertEqual(connection.asr_state.audio.received_bytes, 0)
-        self.assertEqual(connection.asr_state.audio.attempted_offset_bytes, 0)
-        self.assertEqual(connection.asr_state.audio.accepted_offset_bytes, 0)
+        self.assertEqual(connection.asr_state.audio.last_attempted_offset_bytes, 0)
+        self.assertEqual(connection.asr_state.audio.last_processed_offset_bytes, 0)
 
 
 if __name__ == "__main__":

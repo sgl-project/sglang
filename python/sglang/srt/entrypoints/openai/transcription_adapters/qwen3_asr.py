@@ -36,11 +36,11 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
         return DEFAULT_ASR_PROMPT
 
     @property
-    def realtime_long_audio_config(self) -> dict:
+    def realtime_encoder_window_config(self) -> dict:
         # Window geometry itself comes from the mm processor.
         return {
             # Activation threshold: equals the default --asr-max-buffer-seconds,
-            # so windowed mode stays dormant until an operator raises the cap.
+            # so encoder windowing stays dormant until an operator raises the cap.
             "min_audio_sec": 60.0,
             # Rolling context once active: 8 encoder-native 8s windows (64s of
             # audio) per request; older history is carried by the prefix.

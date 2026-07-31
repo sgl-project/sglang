@@ -17,10 +17,7 @@ logger = logging.getLogger(__name__)
 AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
 
 DEFAULT_ASR_PROMPT = (
-    f"<|im_start|>user\n"
-    f"{AUDIO_PLACEHOLDER}"
-    f"<|im_end|>\n"
-    f"<|im_start|>assistant\n"
+    f"<|im_start|>user\n{AUDIO_PLACEHOLDER}<|im_end|>\n<|im_start|>assistant\n"
 )
 
 
@@ -65,11 +62,11 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
             model_sample_rate=model_sample_rate,
         )
 
-    def _process_audio_encoder_windows(self, base_output, window_config):
+    def _build_audio_encoder_window_items(self, base_output, encoder_window_config):
         """Split one audio into per-window mm items; windowing requires exactly
         one audio item so window offsets in the prompt stay unambiguous."""
-        raw_items = base_output.audios
-        if len(base_output.organize_results()) != 1 or len(raw_items) != 1:
+        audios = base_output.audios
+        if len(base_output.organize_results()) != 1 or len(audios) != 1:
             raise ValueError("audio windowing requires exactly one audio item")
 
         input_ids = self._tokenizer(
@@ -77,11 +74,11 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
             return_tensors="pt",
             padding=False,
         ).input_ids.flatten()
-        mm_items, input_ids = audio_encoder_windowing.build_audio_encoder_windows(
-            samples=raw_items[0],
+        mm_items, input_ids = audio_encoder_windowing.build_audio_encoder_window_items(
+            samples=audios[0],
             input_ids=input_ids,
             placeholder_token_id=self.audio_token_id,
-            config=window_config,
+            config=encoder_window_config,
             processor=self._processor,
         )
         # Window items arrive with offsets and features set; only transport
@@ -120,11 +117,11 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
         if base_output is None:
             return None
 
-        window_config = kwargs.get("audio_encoder_window_config")
-        if window_config is not None:
+        encoder_window_config = kwargs.get("audio_encoder_window_config")
+        if encoder_window_config is not None:
             try:
-                mm_items, input_ids = self._process_audio_encoder_windows(
-                    base_output, window_config
+                mm_items, input_ids = self._build_audio_encoder_window_items(
+                    base_output, encoder_window_config
                 )
             except ValueError:
                 logger.warning(

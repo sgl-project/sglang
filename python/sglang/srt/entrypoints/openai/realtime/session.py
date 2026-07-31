@@ -55,7 +55,7 @@ from sglang.srt.entrypoints.openai.realtime.asr_processor import (
     RealtimeASRProcessor,
 )
 from sglang.srt.entrypoints.openai.realtime.audio_buffer import (
-    PCM_SAMPLE_WIDTH,
+    PCM_SAMPLE_WIDTH_BYTES,
     resample_to_target_rate,
 )
 from sglang.srt.entrypoints.openai.realtime.protocol import (
@@ -384,20 +384,22 @@ class RealtimeConnection:
             )
             return False
 
-        if len(data) % PCM_SAMPLE_WIDTH != 0:
+        if len(data) % PCM_SAMPLE_WIDTH_BYTES != 0:
             await self._send_error(
                 "invalid_audio_format",
-                f"PCM16 frame length must be a multiple of {PCM_SAMPLE_WIDTH} bytes",
+                "PCM16 frame length must be a multiple of "
+                f"{PCM_SAMPLE_WIDTH_BYTES} bytes",
             )
             return False
 
         # Estimate post-resample size before resampling so oversized frames fail early.
-        src_samples = len(data) // PCM_SAMPLE_WIDTH
+        src_samples = len(data) // PCM_SAMPLE_WIDTH_BYTES
         target_samples = math.ceil(
             src_samples * self.model_sample_rate / self.config.input_sample_rate
         )
         if (
-            self.asr_state.audio.received_bytes + target_samples * PCM_SAMPLE_WIDTH
+            self.asr_state.audio.received_bytes
+            + target_samples * PCM_SAMPLE_WIDTH_BYTES
             > self.asr_processor.max_buffer_bytes
         ):
             # Close 1009 ("message too big") so clients can distinguish
@@ -418,7 +420,7 @@ class RealtimeConnection:
                 self.model_sample_rate,
             )
         self.asr_state.audio.append_pcm(data)
-        if self.asr_processor.next_chunk_ready(self.asr_state):
+        if self.asr_processor.is_chunk_ready(self.asr_state):
             ok = await self._run_inference(is_last=False)
             if not ok:
                 # WS already closed inside _run_inference.
@@ -473,7 +475,8 @@ class RealtimeConnection:
         # Capture PCM duration before `_start_next_item()` clears the absolute
         # byte counters for the next item.
         pcm_duration_seconds = (
-            self.asr_state.audio.received_bytes / self.asr_processor.bytes_per_second
+            self.asr_state.audio.received_bytes
+            / self.asr_processor.pcm_bytes_per_second
         )
 
         if has_new_audio:
@@ -485,12 +488,12 @@ class RealtimeConnection:
         elif self.asr_state.has_transcript:
             # Audio length was exactly a chunk_size_bytes multiple. Flush
             # the tail tokens update() held back.
-            await self._emit_transcription_delta_text(
-                self.asr_processor.finalize(self.asr_state)
+            await self._emit_transcription_delta(
+                self.asr_processor.flush_pending_transcript(self.asr_state)
             )
 
-        # Transcript state may retain only the latest hypothesis or pending
-        # suffix; emitted deltas are the authoritative wire transcript.
+        # Transcript state may retain only the latest decode or pending suffix;
+        # emitted deltas are the authoritative wire transcript.
         transcript = normalize_whitespace("".join(self.item.emitted_deltas))
 
         await self._send(
@@ -536,7 +539,7 @@ class RealtimeConnection:
             )
         except Exception:
             return await self._handle_inference_failure(is_last)
-        await self._emit_transcription_delta_text(delta)
+        await self._emit_transcription_delta(delta)
         return True
 
     async def _handle_inference_failure(self, is_last: bool) -> bool:
@@ -572,7 +575,7 @@ class RealtimeConnection:
             )
         return False
 
-    async def _emit_transcription_delta_text(self, delta: str) -> None:
+    async def _emit_transcription_delta(self, delta: str) -> None:
         """emitted_deltas stores wire-formatted text (with leading
         boundary spaces baked in), so "".join(...) reconstructs the
         cumulative transcript verbatim."""
