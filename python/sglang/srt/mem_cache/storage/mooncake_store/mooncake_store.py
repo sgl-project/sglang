@@ -559,6 +559,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.pp_size = storage_config.pp_size
                 self.attn_cp_rank = storage_config.attn_cp_rank
                 self.attn_cp_size = storage_config.attn_cp_size
+                self.attn_dcp_rank = storage_config.attn_dcp_rank
+                self.attn_dcp_size = storage_config.attn_dcp_size
                 self.enable_storage_metrics = storage_config.enable_storage_metrics
             else:
                 self.is_mla_backend = False
@@ -567,6 +569,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.pp_size = 1
                 self.attn_cp_rank = 0
                 self.attn_cp_size = 1
+                self.attn_dcp_rank = 0
+                self.attn_dcp_size = 1
 
             self.enable_pp = self.pp_size > 1
             if self.enable_pp:
@@ -575,6 +579,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
+            if self.attn_dcp_size > 1:
+                dcp_suffix = f"dcp{self.attn_dcp_rank}of{self.attn_dcp_size}"
+                self.mla_suffix = (
+                    f"{self.mla_suffix}_{dcp_suffix}" if self.mla_suffix else dcp_suffix
+                )
 
             self.storage_config = storage_config
             self.should_split_heads = storage_config.should_split_heads
@@ -987,7 +996,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
-        assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
+        logical_page_size = getattr(
+            self.mem_pool_host,
+            "logical_page_size",
+            self.mem_pool_host.page_size,
+        )
+        assert len(keys) == len(host_indices) // logical_page_size
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
