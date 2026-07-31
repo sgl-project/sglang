@@ -109,6 +109,7 @@ this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.h
 | B300 | NVIDIA | 288GB | `lmsysorg/sglang:<ver>` (or `-cu130` when required) |
 | GB200 | NVIDIA | 192GB | `lmsysorg/sglang:<ver>` (or `-cu130`) |
 | GB300 | NVIDIA | 288GB | `lmsysorg/sglang:<ver>` (or `-cu130`) |
+| DGX Spark | NVIDIA | 128GB | `lmsysorg/sglang:<ver>` (or `-cu130`) |
 | MI300X | AMD | 192GB | `lmsysorg/sglang:<ver>-rocm720-mi30x` |
 | MI325X | AMD | 256GB | `lmsysorg/sglang:<ver>-rocm720-mi30x` |
 | MI350X | AMD | 288GB | `lmsysorg/sglang:<ver>-rocm720-mi35x` |

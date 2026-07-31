@@ -79,6 +79,8 @@ export const Deployment = ({ config, benchmarks }) => {
       { id: "gb300", label: "GB300", vram: "288GB" },
       { id: "b200",  label: "B200",  vram: "192GB" },
       { id: "gb200", label: "GB200", vram: "192GB" },
+      // GB10 Grace Blackwell — 128 GB coherent unified system memory (not discrete VRAM).
+      { id: "dgx-spark", label: "DGX Spark", vram: "128GB" },
     ],
     hopper: [
       { id: "h200",  label: "H200",  vram: "141GB" },
