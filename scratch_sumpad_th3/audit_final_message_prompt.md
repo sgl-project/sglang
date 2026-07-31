@@ -1,0 +1,19 @@
+# Adversarial audit: final message draft to the sglang maintainer
+
+You are auditing a short message that will be sent to an sglang maintainer (the author of the breakable prefill CUDA graph). Your ONLY priority is direction-level correctness: if any sentence asserts the maintainer is wrong where he is actually right, or asserts a mechanism that upstream code contradicts, that is a critical finding. Wording nits do not matter.
+
+## The message (verbatim, in Chinese)
+
+> hi，抽空初步看和做了实验，比较朴素的场景下，似乎（1）当batch激活bcg时，不均衡输入下有padding浪费attn proj计算token问题，但强制max pad，所以revert不改变行为（2）当batch未激活bcg时，sum pad似乎不浪费attn计算token，attn都算本地的（3）朴素revert时（PR32889中间commit），有的组件有些兼容性问题（4）在朴素模型上，prefill no bcg x sum pad选的有些通信kernel不优，但因为没graph应该可优化。感觉可能有复现命令后，我定向地确认和修复下，效率比较高
+
+## Glossary / background
+
+- "bcg" = breakable prefill CUDA graph (PR #30898). "revert" = reverting PR #10414 ("Fix cutlass moe accuracy drop caused by attention UB from DP padding mode", a 9-line change that pins extend batches to SUM_LEN dp padding). PR #32889 is the sender's own closed PR "Do not force sum padding for extend in batch scenario" (the revert attempt).
+- The maintainer's original claim was that SUM_LEN padding duplicates/wastes attention computation. Prior three-way analysis (two independent audits + raw data recomputation) concluded: attention always runs on rank-local rows (ScatterMode.TP_ATTN_FULL); the DP-gathered buffer is created after attention and only feeds MLP/MoE; the real compute duplication belongs to MAX_LEN on skewed batches.
+- Read upstream code via `git show upstream/main:<path>` from repo root (the local worktree is an experiment branch with debug hooks). Key files: `python/sglang/srt/layers/dp_attention.py` (get_dp_padding_mode: pplx force-MAX at 97-98, #10414 branch at 104-109, comm-cost heuristic at 113-118), `python/sglang/srt/model_executor/forward_batch_info.py` (force-MAX for bcg at 1241-1260, MAX local padding at 1263-1275, idle-rank fabrication at 1319-1366), `python/sglang/srt/layers/communicator.py` (attn_mode TP_ATTN_FULL at 373, post-attn dp_gather at 1127-1134), `python/sglang/srt/layers/radix_attention.py:308-319` (num_token_non_padded slicing).
+- Experimental artifacts: `/Users/tom/domains/human/others/artifacts/sglang/2026-07-30-dp-padding-th3/` with index (per-cell numbers + exact re-extraction commands, note the merged-trace 2x pitfall documented there): `/Users/tom/domains/human/context/notes/projects/sglang/2026-07-29-dp-prefill-sum-padding/agent-drafts/2026-07-30-index-th3-all-experiments.md`. The audited evidence report (v2, already fixed once after adversarial review): `2026-07-31-report-th3-lianmin-message-evidence.md` in the same directory.
+- Known facts from prior verified analysis: under bcg, force-MAX applies and revert does not change behavior (forced_max_steps identical); SUM local forward has zero pad tokens at attn_tp=1 (measured real==padded exactly); the eager comm-cost heuristic picks SUM for extreme skew (2*max < 8*max) and MAX for near-uniform; true revert crashes hybrid-SSM models (AssertionError "extend-idle conversion expects an empty rank" / CUDA illegal memory access in FLA); SUM's cost is collective choice (full all_reduce over zero-padded sum-len buffer, ~2x ring traffic vs all_gather; AR kernel per-call cost is normal), and an env-gated `SGLANG_DP_USE_GATHERV` variable-length path exists.
+
+## Your task
+
+Attack the message claim by claim (1)-(4). For each: does upstream code or the archived data contradict the DIRECTION of the sentence? Could the maintainer, with his own quick repro, produce a result that makes the sentence look wrong? Is there any scenario where the maintainer's original "sum padding wastes attention compute" claim is actually right and this message wrongly denies it? Conclude with per-claim verdicts (SAFE / RISKY / WRONG) and a final judgment: send as-is, or must-fix items.
