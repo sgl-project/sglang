@@ -66,16 +66,15 @@ class TestLoadBackDurationMetric(CustomTestCase):
             num_tokens=1024,
             timing_enabled=True,
         )
-        stub = SimpleNamespace(
-            cache_controller=SimpleNamespace(ack_load_queue=[ack]),
-            ongoing_load_back={1: object(), 2: object()},
-            dec_lock_ref=MagicMock(),
-            metrics_collector=MagicMock(),
-            pp_rank=0,
-            _all_reduce=MagicMock(),
-        )
+        stub = object.__new__(HiRadixCache)
+        stub.cache_controller = SimpleNamespace(ack_load_queue=[ack])
+        stub.ongoing_load_back = {1: object(), 2: object()}
+        stub.dec_lock_ref = MagicMock()
+        stub.metrics_collector = MagicMock()
+        stub.pp_rank = 0
+        stub._all_reduce = MagicMock()
 
-        HiRadixCache.loading_check(stub)
+        stub.loading_check()
 
         stub.metrics_collector.increment_load_back_num_tokens.assert_called_once_with(
             1024
@@ -102,16 +101,15 @@ class TestLoadBackDurationMetric(CustomTestCase):
             num_tokens=512,
             timing_enabled=False,
         )
-        stub = SimpleNamespace(
-            cache_controller=SimpleNamespace(ack_load_queue=[ack]),
-            ongoing_load_back={7: object()},
-            dec_lock_ref=MagicMock(),
-            metrics_collector=MagicMock(),
-            pp_rank=0,
-            _all_reduce=MagicMock(),
-        )
+        stub = object.__new__(HiRadixCache)
+        stub.cache_controller = SimpleNamespace(ack_load_queue=[ack])
+        stub.ongoing_load_back = {7: object()}
+        stub.dec_lock_ref = MagicMock()
+        stub.metrics_collector = MagicMock()
+        stub.pp_rank = 0
+        stub._all_reduce = MagicMock()
 
-        HiRadixCache.loading_check(stub)
+        stub.loading_check()
 
         stub.metrics_collector.increment_load_back_num_tokens.assert_called_once_with(
             512

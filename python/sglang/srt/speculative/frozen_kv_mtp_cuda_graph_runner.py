@@ -41,6 +41,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
@@ -446,11 +447,12 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         shape_key = self._make_graph_key(bs)
         # NVTX span: the graph bypasses `model_runner.forward`'s record_function.
         span_name = f"step[DRAFT_LOOP raw_bs={raw_bs} bs={bs} topk={self.topk}]"
-        if torch.autograd._profiler_enabled():
-            with torch.profiler.record_function(span_name):
+        with device_timer_ctx(self.model_runner.device_timer, "frozen_kv_draft"):
+            if torch.autograd._profiler_enabled():
+                with torch.profiler.record_function(span_name):
+                    out = self._replay_graph(shape_key, forward_batch)
+            else:
                 out = self._replay_graph(shape_key, forward_batch)
-        else:
-            out = self._replay_graph(shape_key, forward_batch)
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)

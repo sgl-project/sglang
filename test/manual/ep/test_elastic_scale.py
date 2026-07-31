@@ -407,6 +407,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
         self._generate_logprob_ok("post-scale")
 
         self._run_post_scale_gsm8k()
+        self._generate_logprob_ok("after post-scale workload")
 
 
 @unittest.skipUnless(
@@ -458,6 +459,7 @@ class TestElasticScaleUp4To5To6(_ElasticScaleUpEndToEndBase):
         self._generate_ok("after second scale")
         self._generate_logprob_ok("after second scale")
         self._run_post_scale_gsm8k()
+        self._generate_logprob_ok("after post-scale workload")
 
 
 @unittest.skipUnless(

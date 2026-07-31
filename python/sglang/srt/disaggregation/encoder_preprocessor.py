@@ -21,7 +21,12 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import load_audio, load_image, load_video
+from sglang.srt.utils import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    load_audio,
+    load_image,
+    load_video,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +250,12 @@ class EncoderPreprocessor:
             elif modality == Modality.AUDIO:
                 return load_audio(data, self.model_audio_sr)
 
+        except CLIENT_MEDIA_EXCEPTIONS as e:
+            # Not ValueError: the DP envelope classifies by `.code`, which only
+            # MMError carries. Lazy import: encode_server imports this module.
+            from sglang.srt.disaggregation.encode_server import BadRequestError
+
+            raise BadRequestError(f"Error while loading data {data}: {e}") from e
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")
 

@@ -11,7 +11,7 @@ import unittest
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 from PIL import Image
@@ -42,6 +42,13 @@ from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.datasets.openai_dataset import sample_openai_requests
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
+from sglang.benchmark.serving import (
+    _BACKEND_API_PATHS,
+    _EMBEDDING_BACKENDS,
+    ASYNC_REQUEST_FUNCS,
+    async_request_openai_embeddings,
+    flush_server_cache,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
@@ -85,6 +92,33 @@ def create_lightweight_tokenizer() -> PreTrainedTokenizerFast:
         "{% if add_generation_prompt %}assistant:{% endif %}"
     )
     return hf_tokenizer
+
+
+class TestEmbeddingBenchmarkBackends(unittest.TestCase):
+    def test_vllm_embedding_reuses_the_openai_embedding_request_path(self):
+        self.assertIn("vllm-embedding", _EMBEDDING_BACKENDS)
+        self.assertIs(
+            ASYNC_REQUEST_FUNCS["vllm-embedding"], async_request_openai_embeddings
+        )
+        self.assertEqual(_BACKEND_API_PATHS["vllm-embedding"], "/v1/embeddings")
+
+    def test_embedding_cache_flush_uses_the_engine_specific_endpoint(self):
+        with (
+            patch("sglang.benchmark.serving.get_auth_headers", return_value={}),
+            patch("sglang.benchmark.serving.requests.post") as post,
+        ):
+            post.return_value = MagicMock()
+
+            flush_server_cache("http://127.0.0.1:8000", "vllm-embedding")
+            post.assert_called_once_with(
+                "http://127.0.0.1:8000/reset_prefix_cache", headers={}
+            )
+            post.reset_mock()
+
+            flush_server_cache("http://127.0.0.1:30000", "sglang-embedding")
+            post.assert_called_once_with(
+                "http://127.0.0.1:30000/flush_cache", headers={}
+            )
 
 
 class DummyProcessor:
