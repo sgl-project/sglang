@@ -868,6 +868,13 @@ class CompressorAscendBackendMixin:
                         kv_scale = kv_scale[valid]
 
         if fused_fp8_indexer_write:
+            if loc is None:
+                raise RuntimeError(
+                    "DSV4 A5 fused indexer epilog needs a slot mapping, but "
+                    f"loc is None (mode={forward_batch.forward_mode}, "
+                    f"ratio={compressor.ratio}). Writing nothing here would "
+                    "leave the indexer KV cache stale."
+                )
             torch.ops.custom.indexer_compress_epilog(
                 indexer_compress_cache=self.token_to_kv_pool.get_compress_buffer(
                     compressor.layer_id, True
