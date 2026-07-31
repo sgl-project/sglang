@@ -137,13 +137,18 @@ class TestInitProfileContext(CustomTestCase):
                 mod, "profile"
             ) as mock_profile, mock.patch(
                 "torch.profiler.schedule"
-            ), mock.patch(
+            ) as mock_schedule, mock.patch(
                 "torch.cuda.memory._record_memory_history"
             ):
                 os.environ.pop("SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE", None)
                 DecodeCudaGraphRunner._init_profile_context_and_memory_record(fake_self)
 
-            self.assertIsNone(mock_profile.call_args.kwargs["on_trace_ready"])
+            kwargs = mock_profile.call_args.kwargs
+            self.assertIsNone(kwargs["on_trace_ready"])
+            mock_schedule.assert_not_called()
+            self.assertIsNone(kwargs["schedule"])
+            self.assertTrue(kwargs["record_shapes"])
+            self.assertTrue(kwargs["profile_memory"])
             self.assertFalse(os.path.isdir(os.path.join(tmp, "capture_traces")))
             self.assertFalse(hasattr(fake_self, "_profile_bs_list"))
 
