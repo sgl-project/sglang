@@ -117,12 +117,17 @@ class TestTensorBridgeMetalSharing(unittest.TestCase):
         tensor = torch.randn(2, 8, device="mps", dtype=torch.float32)
         weight = torch.randn(8, device="mps", dtype=torch.float32)
         before = tensor.cpu().clone()
+        weight_before = weight.cpu().clone()
+        reference = torch.nn.functional.rms_norm(before, (8,), weight_before, 1e-6)
         result = mlx_call(lambda x, w: mx.fast.rms_norm(x, w, 1e-6), tensor, weight)
 
         torch.mps.synchronize()
         self.assertTrue(torch.equal(tensor.cpu(), before))
+        self.assertTrue(torch.equal(weight.cpu(), weight_before))
         self.assertNotEqual(result.data_ptr(), tensor.data_ptr())
-        reference = torch.nn.functional.rms_norm(before, (8,), weight.cpu(), 1e-6)
+
+        del tensor, weight
+        gc.collect()
         torch.testing.assert_close(result.cpu(), reference)
 
     def test_mlx_call_borrows_noncontiguous_view_for_call_scope(self):
