@@ -16,6 +16,7 @@ This guide explains how to benchmark online serving throughput and latency using
 - `sglang` / `sglang-native`: `POST /generate`
 - `sglang-oai`, `vllm`, `lmdeploy`: `POST /v1/completions`
 - `sglang-oai-chat`, `vllm-chat`, `lmdeploy-chat`: `POST /v1/chat/completions`
+- `sglang-embedding`, `vllm-embedding`: `POST /v1/embeddings`
 - `trt` (TensorRT-LLM): `POST /v2/models/ensemble/generate_stream`
 - `gserver`: Custom server (Not Implemented yet in this script)
 - `truss`: `POST /v1/models/model:predict`
@@ -55,6 +56,38 @@ python3 -m sglang.bench_serving \
   --model meta-llama/Llama-3.1-8B-Instruct
 ```
 
+### Fair embedding comparison
+
+Use the two embedding backends with the same model, tokenizer, input length, prompt count, and concurrency. The benchmark reports input-token throughput and end-to-end latency; embeddings have no decode-side TTFT or TPOT.
+
+```bash Command
+# Start either server on the same hardware and precision, then run one at a time.
+python3 -m sglang.bench_serving \
+  --backend sglang-embedding \
+  --model google/embeddinggemma-300m \
+  --dataset-name random \
+  --random-input-len 2048 \
+  --num-prompts 300 \
+  --max-concurrency 64 \
+  --warmup-requests 3 \
+  --flush-cache
+```
+
+```bash Command
+# vLLM's cache reset endpoint requires VLLM_SERVER_DEV_MODE=1 at server startup.
+python3 -m sglang.bench_serving \
+  --backend vllm-embedding \
+  --model google/embeddinggemma-300m \
+  --dataset-name random \
+  --random-input-len 2048 \
+  --num-prompts 300 \
+  --max-concurrency 64 \
+  --warmup-requests 3 \
+  --flush-cache
+```
+
+`--flush-cache` calls `/flush_cache` for SGLang and `/reset_prefix_cache` for vLLM after warmup. For vLLM, start the server with `VLLM_SERVER_DEV_MODE=1`; without it the benchmark fails loudly rather than accidentally measuring warm-cache performance.
+
 ### Datasets
 
 Select with `--dataset-name`:
@@ -66,6 +99,7 @@ Select with `--dataset-name`:
 - `generated-shared-prefix`: synthetic dataset with shared long system prompts and short questions
 - `mmmu`: samples from MMMU (Math split) and includes images
 - `speed-bench`: [SPEED-Bench](https://huggingface.co/datasets/nvidia/SPEED-Bench) (**SPEculative Evaluation Dataset**) — a unified benchmark for evaluating [Speculative Decoding (SD)](https://arxiv.org/abs/2604.09557) algorithms. Uses the Throughput split, which provides fixed-length input sequences (1K–32K tokens) grouped into three output-entropy categories (`low_entropy`, `mixed`, `high_entropy`). Requires a pre-downloaded JSONL file passed via `--dataset-path`.
+- `agentic-trace`: replays pre-built multi-turn agentic traces (e.g. OpenHands / SWE-smith). Each conversation is replayed round by round, feeding the server's real assistant reply back into the next round's history. Requires a chat backend (`--backend sglang-oai-chat`) and a trace JSON passed via `--dataset-path`.
 
 Common dataset flags:
 
@@ -92,6 +126,13 @@ Image dataset flags (for `image`):
 - `--image-resolution`: Image resolution; supports presets (4k, 1080p, 720p, 360p) or custom 'heightxwidth' format (e.g., 1080x1920, 512x768)
 - `--image-format`: Image format (jpeg or png)
 - `--image-content`: Image content type (random or blank)
+
+Agentic trace flags (for `agentic-trace`):
+
+- `--dataset-path`: path to the pre-built trace JSON
+- `--sharegpt-output-len`: per-turn output length (default: 220)
+- `--dataset-offset`: rotate the conversation list by this many entries before sampling, so successive sweep steps start on fresh conversations
+- `--agentic-max-turns`: cap each conversation to at most this many turns (useful for small, fast profiling runs)
 
 SPEED-Bench flags (for `speed-bench`):
 

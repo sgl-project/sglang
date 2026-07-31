@@ -26,6 +26,31 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
         )
 
+    if server_args.disaggregation_mode == "prefill" and server_args.dcp_size > 1:
+        logger.warning(
+            "DCP on a PD prefill server is supported when prefill and decode "
+            "use the same DCP layout, but it usually adds communication "
+            "overhead without improving prefill performance."
+        )
+
+    if server_args.disaggregation_mode == "decode" and server_args.dcp_size > 1:
+        if server_args.disaggregation_transfer_backend not in ("mooncake", "nixl"):
+            raise ValueError(
+                "PD decode DCP requires --disaggregation-transfer-backend "
+                "mooncake or nixl, got "
+                f"{server_args.disaggregation_transfer_backend!r}."
+            )
+        if server_args.disaggregation_decode_enable_radix_cache:
+            raise ValueError(
+                "PD decode DCP currently requires chunk cache; "
+                "--disaggregation-decode-enable-radix-cache is not supported."
+            )
+        if server_args.enable_hierarchical_cache:
+            raise ValueError(
+                "PD decode DCP currently requires chunk cache; "
+                "--enable-hierarchical-cache is not supported."
+            )
+
     if server_args.disaggregation_mode == "decode":
         if server_args.disaggregation_decode_enable_radix_cache:
             if server_args.enable_hisparse:
@@ -44,7 +69,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "with speculative decoding "
                     f"(--speculative-algorithm {server_args.speculative_algorithm})"
                 )
-            if server_args.enable_dp_attention:
+            from sglang.srt.arg_groups.overrides import resolved_view
+
+            if resolved_view(server_args).enable_dp_attention:
                 logger.warning(
                     "EXPERIMENTAL: Decode radix cache with DP attention. "
                     "Requires prefix-aware DP rank routing for optimal cache hits."
@@ -73,8 +100,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         assert (
             server_args.disaggregation_transfer_backend != "fake"
         ), "Prefill server does not support 'fake' as the transfer backend"
-
-        server_args.disable_cuda_graph = True
 
     if server_args.disaggregation_mode in ("prefill", "decode"):
         if (

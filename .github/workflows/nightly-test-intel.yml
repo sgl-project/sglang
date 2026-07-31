@@ -2,13 +2,20 @@ name: Nightly Test (Intel)
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    # 22:15 IST (UTC+5:30) → 16:45 UTC daily.
+    - cron: '45 16 * * *'
   push:
     branches:
       - main
     paths:
       - "python/sglang/version.py"
   workflow_dispatch:
+    inputs:
+      continue_on_error:
+        description: 'Continue on error (do not fail the workflow on test failures)'
+        required: false
+        type: boolean
+        default: true
   workflow_call:
     inputs:
       ref:
@@ -16,18 +23,233 @@ on:
         required: false
         type: string
         default: ""
+      continue_on_error:
+        description: 'Continue on error (do not fail the workflow on test failures)'
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
-  group: nightly-test-intel-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  group: nightly-test-intel-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  # Placeholder for Intel GPU tests
-  # Add Intel-specific nightly test workflows here when available
-
-  placeholder:
+  nightly-xpu-1-gpu:
     if: github.repository == 'sgl-project/sglang'
+    runs-on: intel-bmg-nightly
+    env:
+      DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
+      DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
+    steps:
+      - name: Reset workspace ownership
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Start CI container (pull intel/sglang-dev:latest)
+        run: |
+          export HF_TOKEN="$(cat ~/huggingface_token.txt)"
+          bash scripts/ci/xpu/xpu_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: HF login + install run_suite extras
+        timeout-minutes: 10
+        run: |
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "lm-eval==0.4.9"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest
+          # Diffusion extras (needed by test_xpu_flux2_dev, test_xpu_zimage_turbo).
+          # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sglang[diffusion]"
+          docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
+
+      - name: Download olmOCR-bench dataset (for test_deepseek_ocr_2_olmbench)
+        timeout-minutes: 30
+        run: |
+          # PyMuPDF renders the bench PDFs to images; bench_sglang.py errors
+          # every sample without it.
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pymupdf
+          docker exec ci_sglang_xpu /bin/bash -c '
+            /opt/venv/bin/hf download --repo-type dataset allenai/olmOCR-bench \
+              --local-dir /sglang-checkout/olmOCR-bench'
+
+      - name: Nightly Test (1-GPU XPU)
+        timeout-minutes: 240
+        run: |
+          touch github_summary.md
+          docker exec ci_sglang_xpu bash -c "
+            source /opt/venv/bin/activate &&
+            cd /sglang-checkout/test &&
+            OLMOCR_BENCH_DIR=/sglang-checkout/olmOCR-bench/bench_data \
+            GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
+            python3 run_suite.py --hw xpu --suite nightly-xpu-1-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+          " || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+          rm -rf test/result.jsonl test/results test/.pytest_cache .pytest_cache || true
+          find . -type d -name "__pycache__" -prune -exec rm -rf {} + || true
+          find . -type f -name "*.pyc" -delete || true
+          docker rm -f ci_sglang_xpu || true
+          if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
+            docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
+          fi
+
+  nightly-xpu-2-gpu:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: intel-bmg-nightly
+    env:
+      DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
+      DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
+    steps:
+      - name: Reset workspace ownership
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Start CI container (pull intel/sglang-dev:latest)
+        run: |
+          export HF_TOKEN="$(cat ~/huggingface_token.txt)"
+          bash scripts/ci/xpu/xpu_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: HF login + install run_suite extras
+        timeout-minutes: 10
+        run: |
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "lm-eval==0.4.9"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest
+          # Diffusion extras (needed by test_xpu_flux2_dev, test_xpu_zimage_turbo).
+          # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sglang[diffusion]"
+          docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
+
+      - name: Nightly Test (2-GPU XPU)
+        timeout-minutes: 240
+        run: |
+          touch github_summary.md
+          docker exec ci_sglang_xpu bash -c "
+            source /opt/venv/bin/activate &&
+            cd /sglang-checkout/test &&
+            GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
+            python3 run_suite.py --hw xpu --suite nightly-xpu-2-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+          " || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+          rm -rf test/result.jsonl test/results test/.pytest_cache .pytest_cache || true
+          find . -type d -name "__pycache__" -prune -exec rm -rf {} + || true
+          find . -type f -name "*.pyc" -delete || true
+          docker rm -f ci_sglang_xpu || true
+          if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
+            docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
+          fi
+
+  nightly-xpu-4-gpu:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: intel-bmg-nightly
+    env:
+      DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
+      DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
+    steps:
+      - name: Reset workspace ownership
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Start CI container (pull intel/sglang-dev:latest)
+        run: |
+          export HF_TOKEN="$(cat ~/huggingface_token.txt)"
+          bash scripts/ci/xpu/xpu_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: HF login + install run_suite extras
+        timeout-minutes: 10
+        run: |
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "lm-eval==0.4.9"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest
+          # Diffusion extras (needed by test_xpu_flux2_dev, test_xpu_zimage_turbo).
+          # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sglang[diffusion]"
+          docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
+
+      - name: Nightly Test (4-GPU XPU)
+        timeout-minutes: 480
+        run: |
+          touch github_summary.md
+          docker exec ci_sglang_xpu bash -c "
+            source /opt/venv/bin/activate &&
+            cd /sglang-checkout/test &&
+            GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
+            python3 run_suite.py --hw xpu --suite nightly-xpu-4-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+          " || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+          rm -rf test/result.jsonl test/results test/.pytest_cache .pytest_cache || true
+          find . -type d -name "__pycache__" -prune -exec rm -rf {} + || true
+          find . -type f -name "*.pyc" -delete || true
+          docker rm -f ci_sglang_xpu || true
+          if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
+            docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
+          fi
+
+  check-all-jobs:
+    if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')
+    needs:
+      - nightly-xpu-1-gpu
+      - nightly-xpu-2-gpu
+      - nightly-xpu-4-gpu
     runs-on: ubuntu-latest
     steps:
-      - name: Placeholder
-        run: echo "Intel nightly tests will be added here"
+      - name: Check if any job failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more nightly test jobs failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more nightly test jobs were cancelled"
+            exit 1
+          fi
+          echo "All nightly test jobs passed"

@@ -419,6 +419,7 @@ class StreamingSessionServerBase(CustomTestCase):
             stack.enter_context(
                 envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1)
             )
+            stack.enter_context(envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(True))
             for name, val in cls.env_overrides:
                 stack.enter_context(getattr(envs, name).override(val))
             cls.process = popen_launch_server(
