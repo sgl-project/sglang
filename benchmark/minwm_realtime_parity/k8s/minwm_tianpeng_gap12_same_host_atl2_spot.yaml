@@ -24,7 +24,7 @@ metadata:
     seedleap.ai/task: minwm-realtime-parity
     seedleap.ai/owner: chenshengdong
   annotations:
-    seedleap.ai/sglang-git-ref: 238af753f52bfe858a20709fecb32136926df869
+    seedleap.ai/sglang-git-ref: db5626ac4a95f7538e105068ea16ceb3e4da805c
     seedleap.ai/minwm-git-ref: 4220c8a
     seedleap.ai/checkpoint-source-version-id: sL6CTylRv4QWY98mVTkuLoe5REbKHlvd
     seedleap.ai/checkpoint-staged-version-id: yPbAthXMihZVEbfNFK4Ew2AVYs0FGDUq
@@ -72,7 +72,7 @@ spec:
             - name: MINWM_GIT_REF
               value: 4220c8a
             - name: SGLANG_GIT_REF
-              value: 238af753f52bfe858a20709fecb32136926df869
+              value: db5626ac4a95f7538e105068ea16ceb3e4da805c
             - name: CHECKPOINT_SHA256
               value: 18a48a2709d74b93ce26f0b808f381d191553853aae81dd72d2438430251d379
             - name: CHECKPOINT_BYTES
@@ -196,7 +196,7 @@ spec:
             - name: MINWM_GIT_REF
               value: 4220c8a
             - name: SGLANG_GIT_REF
-              value: 238af753f52bfe858a20709fecb32136926df869
+              value: db5626ac4a95f7538e105068ea16ceb3e4da805c
             - name: CHECKPOINT_SHA256
               value: 18a48a2709d74b93ce26f0b808f381d191553853aae81dd72d2438430251d379
             - name: MINWM_PARITY_DETERMINISTIC
