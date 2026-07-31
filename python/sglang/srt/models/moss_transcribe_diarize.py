@@ -26,6 +26,11 @@ from sglang.srt.utils import add_prefix
 logger = logging.getLogger(__name__)
 
 
+def whisper_encoder_output_length(input_frames: int) -> int:
+    """Return the Whisper encoder length after its stride-2 convolution."""
+    return (input_frames - 1) // 2 + 1
+
+
 class VQAdaptor(nn.Module):
     def __init__(self, input_dim: int, hidden_size: int, norm_eps: float = 1e-6):
         super().__init__()
@@ -168,7 +173,7 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
             batched_features = torch.stack(chunks).to(
                 device=device, dtype=encoder_dtype
             )
-            encoder_len = (batched_features.shape[-1] - 1) // 2 + 1
+            encoder_len = whisper_encoder_output_length(batched_features.shape[-1])
             encoder_position_ids = torch.arange(
                 encoder_len, device=device, dtype=torch.long
             )
