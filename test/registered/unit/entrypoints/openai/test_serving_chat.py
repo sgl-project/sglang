@@ -673,6 +673,136 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertIsNone(result.stop)
 
+    def test_kimi_k3_encoder_receives_wire_request_fields(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.model_config.is_multimodal = True
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {"type": "object"},
+            },
+        }
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "developer",
+                    "content": "<|kimi_image_placeholder|>",
+                    "tools": [tool],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Explain <|kimi_image_placeholder|>",
+                        },
+                        {"type": "image_url", "image_url": {"url": "image-1"}},
+                    ],
+                },
+            ],
+            tools=[tool],
+            tool_choice="required",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object"},
+                    "strict": False,
+                },
+            },
+        )
+
+        result = self.chat._process_messages(request, is_multimodal=True)
+
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        rendered_messages = call.args[0]
+        self.assertEqual(rendered_messages[0]["role"], "system")
+        self.assertEqual(
+            rendered_messages[0]["content"], "<| kimi_image_placeholder |>"
+        )
+        self.assertNotIn("strict", rendered_messages[0]["tools"][0]["function"])
+        self.assertEqual(
+            rendered_messages[1]["content"][0]["text"],
+            "Explain <| kimi_image_placeholder |>",
+        )
+        self.assertEqual(call.kwargs["image_prompts"], ["<|media_pad|>"])
+        self.assertEqual(call.kwargs["tool_choice"], "required")
+        self.assertNotIn("strict", call.kwargs["tools"][0]["function"])
+        self.assertEqual(
+            call.kwargs["response_format"]["json_schema"]["schema"],
+            {"type": "object"},
+        )
+        self.assertNotIn("schema_", call.kwargs["response_format"]["json_schema"])
+        self.assertEqual(result.prompt_ids, [7, 8, 9])
+        self.assertEqual(result.image_data[0].url, "image-1")
+
+    def test_kimi_k3_preserves_assistant_history_and_raw_arguments(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Run it"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "shell",
+                                "arguments": "not-json",
+                            },
+                        }
+                    ],
+                },
+            ],
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
+        self.assertEqual(messages[-1]["role"], "assistant")
+        self.assertEqual(
+            messages[-1]["tool_calls"][0]["function"]["arguments"], "not-json"
+        )
+
+    def test_message_tools_participate_in_validation(self):
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {"type": "object"},
+            },
+        }
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "system", "content": "", "tools": [tool]},
+                {"role": "user", "content": "Weather?"},
+            ],
+            tool_choice=None,
+        )
+        self.assertEqual(request.tool_choice, "auto")
+        self.assertIsNone(self.chat._validate_request(request))
+
+        duplicate = ChatCompletionRequest(
+            model="x",
+            messages=request.messages,
+            tools=[tool],
+            tool_choice="required",
+        )
+        self.assertEqual(
+            self.chat._validate_request(duplicate),
+            "Tool names must be unique across request and message tools.",
+        )
+
     def test_jinja_rejects_non_object_tool_call_arguments(self):
         """History tool call arguments must parse to a JSON object."""
         self.template_manager.chat_template_name = None
@@ -1296,6 +1426,19 @@ class ServingChatTestCase(unittest.TestCase):
         tm.tokenizer.chat_template = None
         serving_chat = OpenAIServingChat(tm, TemplateManager())
         self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
+
+    def test_kimi_k3_encoding_detection(self):
+        from sglang.srt.parser.template_manager import TemplateManager
+
+        tm = _MockTokenizerManager()
+        tm.model_config.hf_config.architectures = ["KimiK3ForConditionalGeneration"]
+        serving_chat = OpenAIServingChat(tm, TemplateManager())
+        self.assertEqual(serving_chat.chat_encoding_spec, "kimi_k3")
+
+        tm.model_config.hf_config.architectures = ["LlamaForCausalLM"]
+        tm.server_args.tool_call_parser = "kimi_k3"
+        serving_chat = OpenAIServingChat(tm, TemplateManager())
+        self.assertEqual(serving_chat.chat_encoding_spec, "kimi_k3")
 
     # ------------- dsv4 task + latest_reminder -------------
     def test_dsv4_task_field_schema(self):

@@ -438,6 +438,24 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(name, "VoiceNote")
         self.assertEqual(strict, True)
 
+    def test_non_strict_response_format_is_not_a_sampling_constraint(self):
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Return JSON"}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object"},
+                    "strict": False,
+                },
+            },
+        )
+        sampling_params = request.to_sampling_params(
+            stop=[], model_generation_config={}
+        )
+        self.assertNotIn("json_schema", sampling_params)
+
 
 class TestModelSerialization(unittest.TestCase):
     """Test model serialization with hidden states"""

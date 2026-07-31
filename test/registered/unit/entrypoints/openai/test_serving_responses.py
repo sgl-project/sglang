@@ -206,6 +206,41 @@ class ChatToolForwardingTestCase(unittest.TestCase):
         result = asyncio.run(serving.create_responses(request, raw_request=None))
         self.assertEqual(getattr(result, "status_code", None), 400)
 
+    def test_kimi_k3_request_uses_chat_encoder_fields(self):
+        serving = make_serving()
+        serving.chat_encoding_spec = "kimi_k3"
+        serving.default_chat_template_kwargs = {}
+        serving.template_manager.chat_template_name = None
+        serving.tokenizer_manager.tokenizer.apply_chat_template.return_value = [4, 5, 6]
+        request = ResponsesRequest(
+            model="x",
+            input="Explain <|kimi_image_placeholder|>",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object"},
+                }
+            ],
+            tool_choice="required",
+            reasoning={"effort": "high"},
+            store=False,
+        )
+
+        _, request_prompts, engine_prompts, _ = asyncio.run(
+            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        )
+
+        call = serving.tokenizer_manager.tokenizer.apply_chat_template.call_args
+        self.assertEqual(
+            call.args[0][0]["content"], "Explain <| kimi_image_placeholder |>"
+        )
+        self.assertEqual(call.kwargs["thinking_effort"], "high")
+        self.assertEqual(call.kwargs["tool_choice"], "required")
+        self.assertEqual(call.kwargs["tools"][0]["function"]["name"], "lookup")
+        self.assertEqual(request_prompts, [[4, 5, 6]])
+        self.assertEqual(engine_prompts, [[4, 5, 6]])
+
 
 class ReasoningRequestForwardingTestCase(unittest.TestCase):
     def test_create_responses_uses_processed_reasoning_state(self):

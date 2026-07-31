@@ -43,7 +43,6 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response import ToolChoice
-from openai.types.responses.tool import Tool
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -213,7 +212,7 @@ class JsonSchemaResponseFormat(BaseModel):
     description: Optional[str] = None
     # use alias to workaround pydantic conflict
     schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    strict: Optional[bool] = False
+    strict: Optional[bool] = None
 
 
 class ResponseFormat(BaseModel):
@@ -597,6 +596,37 @@ class ToolCall(BaseModel):
     function: FunctionResponse
 
 
+class Function(BaseModel):
+    """Function descriptions."""
+
+    description: Optional[str] = Field(default=None, examples=[None])
+    name: str
+    parameters: Optional[object] = None
+    strict: bool = False
+    defer_loading: Optional[bool] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.defer_loading is None:
+            data.pop("defer_loading", None)
+        return data
+
+
+class Tool(BaseModel):
+    """Function wrapper."""
+
+    type: str = Field(default="function", examples=["function"])
+    function: Function
+    defer_loading: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _propagate_defer_loading(self) -> Tool:
+        if self.defer_loading is not None and self.function.defer_loading is None:
+            self.function.defer_loading = self.defer_loading
+        return self
+
+
 _GenericMessageRole = Literal[
     "system", "assistant", "tool", "function", "developer", "latest_reminder"
 ]
@@ -656,37 +686,6 @@ ChatCompletionMessageParam = Union[
 ]
 
 
-class Function(BaseModel):
-    """Function descriptions."""
-
-    description: Optional[str] = Field(default=None, examples=[None])
-    name: str
-    parameters: Optional[object] = None
-    strict: bool = False
-    defer_loading: Optional[bool] = None
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        data = handler(self)
-        if self.defer_loading is None:
-            data.pop("defer_loading", None)
-        return data
-
-
-class Tool(BaseModel):
-    """Function wrapper."""
-
-    type: str = Field(default="function", examples=["function"])
-    function: Function
-    defer_loading: Optional[bool] = None
-
-    @model_validator(mode="after")
-    def _propagate_defer_loading(self) -> Tool:
-        if self.defer_loading is not None and self.function.defer_loading is None:
-            self.function.defer_loading = self.defer_loading
-        return self
-
-
 class ToolChoiceFuncName(BaseModel):
     """The name of tool choice function."""
 
@@ -715,6 +714,18 @@ ReasoningEffortType = Optional[
         Annotated[float, Field(ge=0.0, le=0.99, allow_inf_nan=False)],
     ]
 ]
+
+
+def _has_message_level_tools(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return False
+    return any(
+        isinstance(message, dict)
+        and isinstance(message.get("role"), str)
+        and message["role"].lower() in ("system", "developer")
+        and bool(message.get("tools"))
+        for message in messages
+    )
 
 
 class ChatCompletionRequest(BaseModel):
@@ -859,7 +870,9 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def set_tool_choice_default(cls, values):
         if values.get("tool_choice") is None:
-            if values.get("tools") is None:
+            if values.get("tools") is None and not _has_message_level_tools(
+                values.get("messages")
+            ):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
@@ -949,11 +962,10 @@ class ChatCompletionRequest(BaseModel):
 
         if schema:
             name_ = schema.get("title", "Schema")
-            strict_ = False
+            strict_ = None
             if "properties" in schema and "strict" in schema["properties"]:
                 item = schema["properties"].pop("strict", None)
-                if item and item.get("default", False):
-                    strict_ = True
+                strict_ = bool(item and item.get("default", False))
 
             response_format["json_schema"] = {
                 "name": name_,
@@ -1015,9 +1027,10 @@ class ChatCompletionRequest(BaseModel):
         }
 
         if self.response_format and self.response_format.type == "json_schema":
-            sampling_params["json_schema"] = convert_json_schema_to_str(
-                self.response_format.json_schema.schema_
-            )
+            if self.response_format.json_schema.strict is not False:
+                sampling_params["json_schema"] = convert_json_schema_to_str(
+                    self.response_format.json_schema.schema_
+                )
         elif self.response_format and self.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
         elif self.response_format and self.response_format.type == "structural_tag":
