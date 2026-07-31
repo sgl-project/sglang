@@ -1,4 +1,7 @@
+import json
+import os
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 from typing import cast
@@ -29,6 +32,155 @@ class _FakeModel:
 
 
 class TestRunaiModelStreamerLoader(CustomTestCase):
+    def _write_index(self, folder, weight_map):
+        with open(
+            os.path.join(folder, "model.safetensors.index.json"),
+            "w",
+            encoding="utf-8",
+        ) as index_file:
+            json.dump({"weight_map": weight_map}, index_file)
+
+    def test_selects_only_requested_native_mtp_layer_shards(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self._write_index(
+                folder,
+                {
+                    "model.layers.0.weight": "model-00001.safetensors",
+                    "mtp.0.decoder.weight": "mtp-00000.safetensors",
+                    "mtp.1.decoder.weight": "mtp-00001.safetensors",
+                    "mtp.shared_norm.weight": "mtp-shared.safetensors",
+                },
+            )
+            files = [
+                os.path.join(folder, filename)
+                for filename in (
+                    "model-00001.safetensors",
+                    "mtp-00000.safetensors",
+                    "mtp-00001.safetensors",
+                    "mtp-shared.safetensors",
+                )
+            ]
+
+            selected = loader_mod._select_runai_draft_weight_files(
+                folder, folder, files, draft_model_idx=1
+            )
+
+        self.assertEqual(selected, [files[2], files[3]])
+
+    def test_selects_hf_mtp_layer_and_common_mtp_shards(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self._write_index(
+                folder,
+                {
+                    "model.mtp.layers.0.decoder.weight": "mtp-0.safetensors",
+                    "model.mtp.layers.1.decoder.weight": "mtp-1.safetensors",
+                    "model.mtp.norm.weight": "mtp-common.safetensors",
+                },
+            )
+            files = [
+                os.path.join(folder, filename)
+                for filename in (
+                    "mtp-0.safetensors",
+                    "mtp-1.safetensors",
+                    "mtp-common.safetensors",
+                )
+            ]
+
+            selected = loader_mod._select_runai_draft_weight_files(
+                folder, folder, files, draft_model_idx=0
+            )
+
+        self.assertEqual(selected, [files[0], files[2]])
+
+    def test_reads_object_storage_index_from_metadata_cache(self):
+        with tempfile.TemporaryDirectory() as metadata_folder:
+            self._write_index(
+                metadata_folder,
+                {"mtp.0.decoder.weight": "mtp.safetensors"},
+            )
+            files = [
+                "s3://bucket/model/model.safetensors",
+                "s3://bucket/model/mtp.safetensors",
+            ]
+
+            with patch(
+                "sglang.srt.utils.runai_utils.ObjectStorageModel.get_path",
+                return_value=metadata_folder,
+            ):
+                selected = loader_mod._select_runai_draft_weight_files(
+                    "s3://bucket/model",
+                    "s3://bucket/model",
+                    files,
+                    draft_model_idx=0,
+                )
+
+        self.assertEqual(selected, [files[1]])
+
+    def test_falls_back_to_all_shards_for_unrecognized_checkpoint(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self._write_index(
+                folder,
+                {"model.layers.0.weight": "model.safetensors"},
+            )
+
+            selected = loader_mod._select_runai_draft_weight_files(
+                folder,
+                folder,
+                [os.path.join(folder, "model.safetensors")],
+                draft_model_idx=0,
+            )
+
+        self.assertIsNone(selected)
+
+    def test_get_weights_iterator_passes_only_draft_shards_to_runai(self):
+        runai_loader = loader_mod.RunaiModelStreamerLoader(
+            LoadConfig(
+                load_format=LoadFormat.RUNAI_STREAMER,
+                model_loader_extra_config={},
+                draft_model_idx=0,
+            )
+        )
+        runai_loader.target_device_str = "cpu"
+        runai_loader._is_distributed = False
+
+        with tempfile.TemporaryDirectory() as folder:
+            self._write_index(
+                folder,
+                {
+                    "model.layers.0.weight": "model.safetensors",
+                    "mtp.0.decoder.weight": "mtp.safetensors",
+                },
+            )
+            files = [
+                os.path.join(folder, "model.safetensors"),
+                os.path.join(folder, "mtp.safetensors"),
+            ]
+            source = loader_mod.RunaiModelStreamerLoader.Source(
+                model_or_path=folder,
+                revision=None,
+                model_config=cast(
+                    ModelConfig,
+                    SimpleNamespace(
+                        is_draft_model=True,
+                        hf_config=SimpleNamespace(architectures=[None]),
+                    ),
+                ),
+            )
+
+            with (
+                patch.object(
+                    runai_loader, "_prepare_weights", return_value=(folder, files)
+                ),
+                patch.object(
+                    weight_utils,
+                    "runai_safetensors_weights_iterator",
+                    return_value=iter([("mtp.0.decoder.weight", torch.tensor([1]))]),
+                ) as mock_iterator,
+            ):
+                list(runai_loader._get_weights_iterator(source))
+
+        mock_iterator.assert_called_once_with([files[1]], False, "cpu")
+
     def test_passes_quant_config_to_model_init(self):
         quant_config = object()
         fake_model = _FakeModel()
