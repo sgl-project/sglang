@@ -3,7 +3,7 @@
 更新时间：2026-07-31
 
 状态：实现与 CPU 语义门已完成；L40S 全量 1089 帧诊断已完成，但尚未达到
-数值对齐；B200/B300 同机原生 baseline 门正在等待 Local Zone Spot 容量。
+数值对齐；同机原生 baseline 门已调度到 us-east-2b 的 8×H100 Spot。
 
 ## 1. 本次对齐对象
 
@@ -294,9 +294,23 @@ GPU，并在同一台 8×B200/B300 节点上串行执行：
 | SGLang parity | 1 |
 | 保留给其他任务 | 5 |
 
-目标是 `us-east-1-atl-2a` 的 Local Zone Spot
-`p6-b200.48xlarge / p6-b300.48xlarge`。截至本次记录时间，Karpenter 正在因
-`UnfulfillableCapacity` 重试；不能把 Pending 状态误报为已经完成对齐。
+最初依次尝试了 `us-east-1-atl-2a` Local Zone 和 `us-east-1d` 的
+`p6-b200.48xlarge / p6-b300.48xlarge` Spot，并短暂允许 On-Demand 兜底；
+EC2 都返回 `UnfulfillableCapacity` / `InsufficientInstanceCapacity`。继续提高
+出价无法解决物理容量不足，因此按“尽快可测”的优先级转向 H100。
+
+最终在 `us-east-2b` 成功获得一台 `p5.48xlarge` Spot：
+
+| 字段 | 值 |
+| --- | --- |
+| 实例 | `i-059aa7485618a331b` |
+| GPU | 8×NVIDIA H100 80GB |
+| NodePool | `minwm-test-h100-spot` |
+| 任务申请 | 3 GPU |
+| 空闲 | 5 GPU |
+
+服务和两路 parity Pod 被调度到同一节点。失败的 us-east-1 Deployment、Job、
+NLB、PVC 和临时 NodePool/NodeClass 已删除；没有遗留第二台 GPU 主机。
 
 ## 9. 交给克君部署前的检查
 

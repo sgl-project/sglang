@@ -1,18 +1,3 @@
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: minwm-tianpeng-realtime-gp3-20260731
-  labels:
-    app.kubernetes.io/name: minwm-tianpeng-realtime
-    seedleap.ai/owner: chenshengdong
-provisioner: ebs.csi.eks.amazonaws.com
-parameters:
-  type: gp3
-  encrypted: "true"
-reclaimPolicy: Delete
-allowVolumeExpansion: true
-volumeBindingMode: WaitForFirstConsumer
----
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -24,7 +9,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  storageClassName: minwm-tianpeng-realtime-gp3-20260731
+  storageClassName: gp2
   resources:
     requests:
       storage: 200Gi
@@ -70,14 +55,11 @@ spec:
       terminationGracePeriodSeconds: 90
       nodeSelector:
         karpenter.sh/capacity-type: spot
-        karpenter.sh/nodepool: minwm-test-atl2-p6-spot
-        seedleap.ai/capacity-pool: minwm-test-atl2-karpenter
-        topology.kubernetes.io/zone: us-east-1-atl-2a
-      tolerations:
-        - key: seedleap.ai/capacity-pool
-          operator: Equal
-          value: minwm-test-atl2-karpenter
-          effect: NoSchedule
+        karpenter.sh/nodepool: minwm-test-h100-spot
+        seedleap.ai/capacity-pool: minwm-test-h100-karpenter
+      securityContext:
+        seLinuxOptions:
+          type: spc_t
       containers:
         - name: server
           image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
@@ -305,8 +287,9 @@ metadata:
     seedleap.ai/task: minwm-realtime-serving
   annotations:
     service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    service.beta.kubernetes.io/aws-load-balancer-type: external
     service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
-    service.beta.kubernetes.io/aws-load-balancer-subnets: subnet-015571b6146f10903,subnet-00769f1a545d7d317
+    service.beta.kubernetes.io/aws-load-balancer-subnets: subnet-0e620ab50b1526027,subnet-088ba5d2aed6aebbe,subnet-071af04f93cf04b0c
     service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
     service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: project=seed-leap,environment=dev,managed_by=kubernetes,service=minwm-tianpeng-realtime
     service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: HTTP
@@ -314,7 +297,7 @@ metadata:
     service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /health
 spec:
   type: LoadBalancer
-  loadBalancerClass: eks.amazonaws.com/nlb
+  loadBalancerClass: service.k8s.aws/nlb
   allocateLoadBalancerNodePorts: false
   loadBalancerSourceRanges:
     - 5.34.217.44/32

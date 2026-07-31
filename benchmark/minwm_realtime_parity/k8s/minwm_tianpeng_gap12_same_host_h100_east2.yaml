@@ -9,7 +9,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  storageClassName: minwm-tianpeng-realtime-gp3-20260731
+  storageClassName: gp2
   resources:
     requests:
       storage: 200Gi
@@ -48,14 +48,11 @@ spec:
       terminationGracePeriodSeconds: 120
       nodeSelector:
         karpenter.sh/capacity-type: spot
-        karpenter.sh/nodepool: minwm-test-atl2-p6-spot
-        seedleap.ai/capacity-pool: minwm-test-atl2-karpenter
-        topology.kubernetes.io/zone: us-east-1-atl-2a
-      tolerations:
-        - key: seedleap.ai/capacity-pool
-          operator: Equal
-          value: minwm-test-atl2-karpenter
-          effect: NoSchedule
+        karpenter.sh/nodepool: minwm-test-h100-spot
+        seedleap.ai/capacity-pool: minwm-test-h100-karpenter
+      securityContext:
+        seLinuxOptions:
+          type: spc_t
       containers:
         - name: native-minwm
           image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
