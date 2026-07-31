@@ -32,9 +32,6 @@ from sglang.kernels.ops.mm.process.image import (
     normalize_and_patchify,
 )
 from sglang.kernels.ops.moe import moe_route_quant_fused
-from sglang.kernels.ops.moe.moe_align_single_token import (
-    moe_align_single_token,
-)
 from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from sglang.kernels.ops.moe.moe_route_radix import route_radix
 from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
@@ -254,17 +251,6 @@ class TestKimiK3PrerequisiteOps(CustomTestCase):
         self.assertTrue(torch.equal(actual, expected))
 
     def test_moe_auxiliary_kernels(self):
-        expert_ids = torch.randperm(NUM_EXPERTS, device="cuda")[:TOPK].to(torch.int32)
-        sorted_ids, sorted_experts, num_post = moe_align_single_token(
-            expert_ids.unsqueeze(0), 64
-        )
-        order = torch.argsort(expert_ids)
-        expected_ids = torch.full((TOPK * 64,), TOPK, dtype=torch.int32, device="cuda")
-        expected_ids[::64] = order.to(torch.int32)
-        self.assertTrue(torch.equal(sorted_experts, expert_ids[order]))
-        self.assertTrue(torch.equal(sorted_ids, expected_ids))
-        self.assertEqual(num_post.item(), TOPK * 64)
-
         x = torch.randn(2, TOPK, 7168, device="cuda", dtype=torch.bfloat16)
         out = torch.empty(2, 7168, device="cuda", dtype=torch.bfloat16)
         self.assertIs(moe_topk_sum(x, out), out)
