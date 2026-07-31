@@ -25,13 +25,13 @@ jobs:
       - name: Checkout miles repository
         uses: actions/checkout@v4
         with:
-          repository: radixark/miles
-          ref: main
+          repository: XinyuJiangCMU/miles
+          ref: pr/dockerfile-rm-dead-aiter-args-20260627
           fetch-depth: 0
           persist-credentials: false
 
       - name: Record miles commit
-        run: echo "Building from miles main @ $(git rev-parse HEAD)"
+        run: echo "Building from miles pr/dockerfile-rm-dead-aiter-args-20260627 @ $(git rev-parse HEAD)"
 
       - name: Set date
         run: echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
