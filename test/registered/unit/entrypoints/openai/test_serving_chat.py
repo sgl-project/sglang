@@ -50,6 +50,10 @@ class _MockTokenizerManager:
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["LlamaForCausalLM"]
+        mock_hf_config.dspark_block_size = None
+        mock_hf_config.dspark_markov_rank = None
+        mock_hf_config.dspark_noise_token_id = None
+        mock_hf_config.dspark_target_layer_ids = None
         self.model_config.hf_config = mock_hf_config
 
         self.chat_template_name: Optional[str] = "llama-3"
@@ -1256,6 +1260,68 @@ class ServingChatTestCase(unittest.TestCase):
         serving_chat = OpenAIServingChat(tm, TemplateManager())
         self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
 
+    def test_dsv4_0731_reasoning_effort_detection(self):
+        from sglang.srt.parser.template_manager import TemplateManager
+
+        tm = _MockTokenizerManager()
+        mock_hf_config = tm.model_config.hf_config
+        mock_hf_config.architectures = ["DeepseekV4ForCausalLM"]
+
+        serving_chat = OpenAIServingChat(tm, TemplateManager())
+        self.assertFalse(serving_chat._dsv4_uses_three_tier_reasoning_effort)
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hello"}],
+            reasoning_effort="max",
+        )
+        serving_chat._process_messages(request, is_multimodal=False)
+        legacy_prompt = tm.tokenizer.encode.call_args.args[0]
+        self.assertIn("Reasoning Effort: Absolute maximum", legacy_prompt)
+        self.assertNotIn("Reasoning Effort: Beyond maximum", legacy_prompt)
+        for effort in ("low", "medium"):
+            request = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hello"}],
+                reasoning_effort=effort,
+            )
+            serving_chat._process_messages(request, is_multimodal=False)
+            self.assertNotIn("Reasoning Effort:", tm.tokenizer.encode.call_args.args[0])
+
+        mock_hf_config.dspark_block_size = 5
+        serving_chat = OpenAIServingChat(tm, TemplateManager())
+        self.assertTrue(serving_chat._dsv4_uses_three_tier_reasoning_effort)
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hello"}],
+            reasoning_effort="max",
+        )
+        serving_chat._process_messages(request, is_multimodal=False)
+        prompt_0731 = tm.tokenizer.encode.call_args.args[0]
+        self.assertIn("Reasoning Effort: Beyond maximum", prompt_0731)
+
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hello"}],
+            reasoning_effort="medium",
+        )
+        serving_chat._process_messages(request, is_multimodal=False)
+        self.assertNotIn("Reasoning Effort:", tm.tokenizer.encode.call_args.args[0])
+
+        mock_hf_config.dspark_block_size = None
+        mock_hf_config.dspark_markov_rank = 2
+        serving_chat = OpenAIServingChat(tm, TemplateManager())
+        self.assertTrue(serving_chat._dsv4_uses_three_tier_reasoning_effort)
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hello"}],
+            reasoning_effort="max",
+        )
+        serving_chat._process_messages(request, is_multimodal=False)
+        self.assertIn(
+            "Reasoning Effort: Beyond maximum", tm.tokenizer.encode.call_args.args[0]
+        )
+        mock_hf_config.dspark_markov_rank = None
+
     # ------------- dsv4 task + latest_reminder -------------
     def test_dsv4_task_field_schema(self):
         """Top-level `task` accepts the 6 DS task tokens and rejects others."""
@@ -1405,6 +1471,89 @@ class ServingChatTestCase(unittest.TestCase):
             out.index("<｜User｜>"),
         )
         self.assertIn("<｜Assistant｜>", out)
+
+    def test_dsv4_reasoning_effort_checkpoint_compatibility(self):
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        messages = [{"role": "user", "content": "Hello"}]
+        base = "<｜begin▁of▁sentence｜><｜User｜>Hello" "<｜Assistant｜><think>"
+        high_prefix = (
+            "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+            "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+            "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+        )
+        max_prefix = (
+            "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
+            "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+            "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
+        )
+
+        self.assertEqual(
+            encoding_dsv4.encode_messages(messages, thinking_mode="thinking"),
+            base,
+        )
+        self.assertEqual(
+            encoding_dsv4.encode_messages(
+                messages, thinking_mode="thinking", reasoning_effort="high"
+            ),
+            base,
+        )
+        self.assertEqual(
+            encoding_dsv4.encode_messages(
+                messages, thinking_mode="thinking", reasoning_effort="max"
+            ),
+            f"<｜begin▁of▁sentence｜>{high_prefix}{base[len('<｜begin▁of▁sentence｜>'):]}",
+        )
+
+        with self.assertRaises(AssertionError):
+            encoding_dsv4.encode_messages(
+                messages, thinking_mode="thinking", reasoning_effort="low"
+            )
+
+        self.assertEqual(
+            encoding_dsv4.encode_messages(
+                messages,
+                thinking_mode="thinking",
+                use_three_tier_reasoning_effort=True,
+            ),
+            base,
+        )
+        self.assertEqual(
+            encoding_dsv4.encode_messages(
+                messages,
+                thinking_mode="thinking",
+                reasoning_effort="low",
+                use_three_tier_reasoning_effort=True,
+            ),
+            base,
+        )
+        self.assertEqual(
+            encoding_dsv4.encode_messages(
+                messages,
+                thinking_mode="thinking",
+                reasoning_effort="high",
+                use_three_tier_reasoning_effort=True,
+            ),
+            f"<｜begin▁of▁sentence｜>{high_prefix}{base[len('<｜begin▁of▁sentence｜>'):]}",
+        )
+        self.assertEqual(
+            encoding_dsv4.encode_messages(
+                messages,
+                thinking_mode="thinking",
+                reasoning_effort="max",
+                use_three_tier_reasoning_effort=True,
+            ),
+            f"<｜begin▁of▁sentence｜>{max_prefix}{base[len('<｜begin▁of▁sentence｜>'):]}",
+        )
+        self.assertEqual(
+            encoding_dsv4.encode_messages(
+                messages,
+                thinking_mode="chat",
+                reasoning_effort="max",
+                use_three_tier_reasoning_effort=True,
+            ),
+            "<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>",
+        )
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""

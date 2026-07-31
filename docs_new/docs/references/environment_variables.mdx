@@ -712,7 +712,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV4_REASONING_EFFORT</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default <code>reasoning_effort</code> for the DeepSeek V4 chat encoder when a request does not set it (accepts <code>max</code>, <code>high</code>; empty means unset).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default <code>reasoning_effort</code> for the DeepSeek V4 chat encoder when a request does not set it. Accepts <code>high</code> and <code>max</code>; checkpoints with bundled DSpark config also accept <code>low</code> and use the checkpoint's low/high/max mapping. Empty means unset.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
     </tr>
     <tr>
