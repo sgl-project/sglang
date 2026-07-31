@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
@@ -306,6 +306,55 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         # Restore original shape (replace last dim with output features)
         output_shape = list(input_shape[:-1]) + [output.shape[-1]]
         return output.reshape(output_shape)
+
+
+def npu_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Block-FP8 linear on Atlas A5, used as the ``w8a8_block_fp8_linear``
+    backend on NPU (see ``fp8_utils._dispatch_auto_backend``).
+
+    The DeepSeek [128, 128] block scales are reinterpreted into the A5 MXFP8
+    layout by ``Fp8LinearMethod.process_weights_after_loading``; activations are
+    quantized per call. ``input_scale`` is unused — activation scales are always
+    dynamic here.
+    """
+    if block_size != [128, 128]:
+        raise ValueError(
+            f"npu_w8a8_block_fp8_linear only supports block_size [128, 128], "
+            f"got {block_size}"
+        )
+    if weight.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"npu_w8a8_block_fp8_linear expects float8_e4m3fn weights, "
+            f"got {weight.dtype}"
+        )
+
+    orig_shape = input.shape
+    input_2d = input.reshape(-1, orig_shape[-1]).contiguous()
+
+    x_fp8, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        input_2d, dst_type=torch.float8_e4m3fn
+    )
+    e8m0_dtype = _get_float8_e8m0fnu_dtype()
+    output_2d = torch.ops.npu.npu_quant_matmul(
+        x_fp8,
+        weight,
+        scale=weight_scale,
+        scale_dtype=e8m0_dtype,
+        pertoken_scale=x_scale,
+        pertoken_scale_dtype=e8m0_dtype,
+        bias=bias,
+        output_dtype=torch.bfloat16,
+        group_sizes=(1, 1, MXFP8_BLOCK_SIZE),
+    )
+
+    return output_2d.reshape(*orig_shape[:-1], output_2d.shape[-1])
 
 
 class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
