@@ -26,11 +26,9 @@ class SconvExtendMetadata(TypedDict):
 class SconvMetadataOut(TypedDict):
     """Preallocated destinations for the fused metadata kernels.
 
-    The kernels normally allocate their outputs. A caller that must keep the
-    addresses stable across cuda-graph replays -- the attention backend, whose
-    metadata prep runs *out of graph* while the conv kernels reading it are
-    captured -- passes its static buffers (already sliced to this step's B / T)
-    so the kernel writes straight into them, with no extra copy.
+    A caller that needs the addresses to stay stable across cuda-graph replays
+    passes its static buffers, already sliced to this step's B / T, so the kernel
+    writes straight into them instead of allocating.
     """
 
     query_start_loc: torch.Tensor  # [B + 1] int32
@@ -44,8 +42,7 @@ class SconvMetadataOut(TypedDict):
 def _metadata_out(
     out: "SconvMetadataOut | None", *, B: int, T: int, device: torch.device
 ) -> SconvMetadataOut:
-    """Return the metadata destinations: freshly allocated, or ``out`` validated
-    against this step's shapes."""
+    """Metadata destinations: freshly allocated, or ``out`` shape-checked."""
     spec = (
         ("query_start_loc", (B + 1,), torch.int32),
         ("has_initial_state", (B,), torch.bool),

@@ -87,13 +87,11 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
 
     # dtype of the slot-index view handed to the model's conv kernel. int64 is
     # canonical (the CUDA causal_conv1d narrows at its own boundary); a subclass
-    # whose kernels take int32 sets int32 so the narrowing cast does not re-run
-    # per conv layer.
+    # whose kernels take int32 sets int32 to skip that per-layer cast.
     cache_indices_dtype: torch.dtype = torch.int64
 
-    # Whether the extend path needs the ``slot_ids_cpu`` / ``has_prefix_cpu``
-    # host mirrors. They cost a device->host sync per extend step, so only
-    # models whose extend path runs a host loop (ZAYA1 v1) ask for them.
+    # The ``slot_ids_cpu`` / ``has_prefix_cpu`` host mirrors cost a device->host
+    # sync per extend step, so only models with a host extend loop (ZAYA1 v1) ask.
     needs_extend_host_mirrors: bool = True
 
     def __init__(self, model_runner: ModelRunner):
@@ -118,12 +116,10 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         self._has_prefix_cpu = None
 
     def _alloc_cache_indices_buf(self, max_bs: int):
-        # Persistent index buffer, refilled in place per step so the captured
-        # (cuda or cpu) graph reads a stable address. Grow-only and never
-        # reallocated at the same size: a graph that already captured this
-        # buffer's address must keep reading the same memory, and the cuda- and
-        # cpu-graph state hooks can both run (in either order, and after another
-        # phase's graphs were captured).
+        # Persistent index buffer, refilled in place per step so a captured graph
+        # reads a stable address. Grow-only, never reallocated at the same size:
+        # the cuda- and cpu-graph state hooks can both run, in either order, and
+        # after another phase's graphs were already captured.
         buf = self._cache_indices_buf
         if buf is not None and buf.shape[0] >= max_bs:
             return
@@ -137,11 +133,9 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
 
     def _refresh_cache_indices(self):
         # Resolve the slot-index view ONCE per step, shared by every conv layer.
-        # When a graph index buffer is allocated and large enough, refill it IN
-        # PLACE and hand out a view -- the captured graph then reads a stable
-        # address that this (pre-replay) hook keeps current, so it is cuda- and
-        # cpu-graph safe. Otherwise (eager, or bs beyond the buffer) a fresh
-        # cast is fine.
+        # With a graph buffer available, refill it IN PLACE and hand out a view, so
+        # the captured graph reads a stable address this pre-replay hook keeps
+        # current. Otherwise (eager, or bs past the buffer) a fresh cast is fine.
         md = self.forward_metadata
         idx = md.mamba_cache_indices if md is not None else None
         buf = self._cache_indices_buf

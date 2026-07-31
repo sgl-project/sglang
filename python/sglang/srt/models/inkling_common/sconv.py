@@ -125,11 +125,9 @@ class ShortConvolution(nn.Module):
     def _conv_state(self, forward_batch: ForwardBatch):
         """This layer's conv-state handle for the current step.
 
-        The backend (``InklingShortConvAttnBackend``) resolved the whole
-        step-global metadata set -- slot indices, ``query_start_loc``,
-        ``has_initial_state``, the precomputed conv metadata and the prefix-cache
-        track indices -- ONCE during metadata prep, so this is a pure read shared
-        by every conv module in the step.
+        ``InklingShortConvAttnBackend`` resolved the whole step-global metadata set
+        once during metadata prep, so this is a pure read shared by every conv
+        module in the step.
         """
         return get_attn_backend().conv_state_metadata(self.layer_id, forward_batch)
 
@@ -176,8 +174,8 @@ class ShortConvolution(nn.Module):
         track_conv_indices: torch.Tensor | None,
     ):
         if track_conv_indices is not None:
-            # Track conv state for prefix caching. Fused gather→scatter writes
-            # directly into sconv_cache without an intermediate [B, W-1, D] buffer.
+            # Fused gather->scatter straight into sconv_cache, with no intermediate
+            # [B, W-1, D] buffer.
             fused_gather_scatter_to_sconv_cache(
                 hidden_states=hidden_states,
                 sconv_cache=sconv_cache,
@@ -311,8 +309,8 @@ class ShortConvolution(nn.Module):
         in-kernel prefix-cache track."""
         meta = self._conv_state(forward_batch)
         precomputed = meta.precomputed
-        # Prefix-cache track inputs; the backend resolves the rows only for the
-        # extend modes that snapshot windows (never decode or target-verify).
+        # The backend resolves track rows only for the extend modes that snapshot
+        # windows -- never decode or target-verify.
         dev = meta.cache_indices.device
         if meta.track_conv_indices is not None:
             track_rows = meta.track_conv_indices

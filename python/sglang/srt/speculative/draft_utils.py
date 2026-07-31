@@ -101,8 +101,7 @@ class DraftBackendFactory:
             backend_map,
             "EAGLE is not supported in attention backend {backend_type}",
         )
-        # A draft model with linear/conv layers of its own (Inkling's short convs)
-        # needs its sidecar here too; a no-op for every other model.
+        # A draft with conv layers of its own (Inkling) needs its sidecar here too.
         from sglang.srt.layers.attention.attention_registry import (
             attn_backend_wrapper_for_draft_extend,
         )

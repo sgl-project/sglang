@@ -1,19 +1,15 @@
 """Inkling's short-conv metadata must be resolved exactly ONCE per forward step.
 
-``InklingShortConvAttnBackend`` owns the step-global conv-state metadata -- the
-per-request slot gather + virtual->physical translate, the fused
-``query_start_loc`` / ``has_initial_state`` / ``(cache_mask, safe_idx, cu, si)``
-launch, and the prefix-cache track indices -- and hands it out through
-``conv_state_metadata``. Inkling has FOUR ``ShortConvolution`` modules per decoder
-layer (``k_sconv`` / ``v_sconv`` plus the ``attn`` / ``mlp`` output streams), so
-the pre-backend "layer 0 owns the metadata" rule recomputed the whole set once per
-conv module of layer 0 instead of once per step. These tests pin:
+``InklingShortConvAttnBackend`` owns the step-global conv metadata and hands it out
+through ``conv_state_metadata``. Inkling has FOUR ``ShortConvolution`` modules per
+decoder layer, so the pre-backend "layer 0 owns the metadata" rule recomputed the
+whole set once per conv module of layer 0. These tests pin:
 
-1. one metadata resolution per step no matter how many conv modules ask;
+1. one resolution per step no matter how many conv modules ask;
 2. every module gets the *same* tensors back;
-3. the graph-path destinations are address-stable across steps, including across
-   a later ``init_cuda_graph_state`` (a reallocation there would move the address
-   an already-captured prefill graph reads).
+3. the graph-path destinations stay address-stable across steps, including across
+   a later ``init_cuda_graph_state`` (reallocating there would move the address an
+   already-captured prefill graph reads).
 """
 
 import unittest
@@ -230,12 +226,10 @@ class TestInklingSconvMetadataOnce(CustomTestCase):
                 self._check_address_stable(slots_in_graph)
 
     def _check_address_stable(self, slots_in_graph: bool):
-        """The graph path must keep writing into the same memory.
-
-        A captured graph holds the *address* of every metadata tensor its conv
-        kernels read, so each step has to refill those buffers in place -- and a
+        """A captured graph holds the address of every metadata tensor its conv
+        kernels read, so each step must refill those buffers in place -- and a
         later ``init_cuda_graph_state`` (the decode runner reports its bounds only
-        after the prefill graphs are already captured) must not reallocate them.
+        after the prefill graphs are captured) must not reallocate them.
         """
         backend, _pool = self._build_backend()
         # Cover the recorded-slot-lookup split too (the mock pool's translate is
@@ -279,11 +273,10 @@ class TestInklingSconvMetadataOnce(CustomTestCase):
 class TestInklingMtpVerifyCommit(CustomTestCase):
     """Inkling's accepted-verify conv commit must not use this step's metadata.
 
-    The commit runs after the forward context exits, so the sidecar's per-step
-    slot buffer may already have been refilled by a later forward -- the generic
-    mamba path sources its slot ids from ``forward_metadata`` and died on the
-    resulting length mismatch (dst=15 vs step=16). The override must instead
-    re-derive them from the ``req_pool_indices`` it is handed.
+    The commit runs after the forward context exits, so the sidecar's per-step slot
+    buffer may already have been refilled by a later forward -- the generic mamba
+    path sources slot ids from ``forward_metadata`` and died on the resulting length
+    mismatch (dst=15 vs step=16).
     """
 
     @classmethod
