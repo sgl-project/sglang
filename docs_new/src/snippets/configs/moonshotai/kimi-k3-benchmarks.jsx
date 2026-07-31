@@ -5,7 +5,6 @@ export const benchmarks = [
   { match: { hw: "b200",  pdMode: "unified", strategy: "low-latency" } },
   { match: { hw: "b200",  pdMode: "unified", strategy: "balanced"    } },
   { match: { hw: "b200",  pdMode: "unified", strategy: "high-throughput"    } },
-  { match: { hw: "b200",  pdMode: "unified", strategy: "long-context" } },
   { match: { hw: "mi350x", pdMode: "unified", strategy: "balanced"    } },
   { match: { hw: "mi355x", pdMode: "unified", strategy: "balanced"    } },
   { match: { hw: "h100",  pdMode: "unified", strategy: "low-latency" } },

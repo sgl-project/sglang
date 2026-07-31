@@ -36,14 +36,15 @@ If you do not want to use a Docker image, reproduce the dependency installation 
 
 Pick your hardware, then the deployment shape and operating point. Node count follows the hardware recipe (B200 2×8, GB200 4×4, H100 4×8, B300 1×8, H200 2×8 — 4×8 on Unified High-Throughput, GB300 2×4, MI350X/MI355X 1×8), so it is not a separate choice.
 
-**PD Mode** — `Unified` serves prefill and decode together. `Prefill` / `Decode` split them into dedicated pools (see [PD disaggregation](#3-4-pd-disaggregation)); `Prefill` ships two strategies on the TP8 platforms, both chunked at 16k: `Default` (TP8) and `Long-Context` (`--pp-size 8 --tp-size 1`, see [Deep PP](#deep-pp-for-long-context-prefill)).
+**PD Mode** — `Unified` serves prefill and decode together. `Prefill` / `Decode` split them into dedicated pools (see [PD disaggregation](#3-4-pd-disaggregation)); `Prefill` ships two strategies, both chunked at 16k. On the 8-GPU platforms (B300 1×8, GB300 2×4), `Default` is TP8 and `Long-Context` is `--pp-size 8 --tp-size 1`. On the 16-GPU platforms (B200 2×8, GB200 4×4), both are `--pp-size 16 --tp-size 1` and differ only in `--mem-fraction-static` (0.85 vs 0.90) — deep PP is the throughput shape there, not just the long-context one (see [Deep PP](#deep-pp-for-prefill)).
 
 **Strategy** — the operating point within that shape:
 
 - **Low-Latency** — no DCP, so the MLA KV stays TP-replicated. For chat. B200 splits its two nodes into PP2 × TP8; every other platform is flat TP.
 - **Balanced** — the accuracy-preserving default: PP2 × TP8 on B200, TP16/DCP16 on GB200, TP8/DCP8 on B300/GB300, TP8 ROCm/AITER on MI35x.
-- **High-Throughput** — the large-scale lane: pick a **Cluster Size** and **Large-Scale Preset** in the Playground ([details](#large-scale-presets)). On H100: Balanced plus `extra_buffer_lazy`; on H200 the cell itself widens to 4×8 TP32/EP32 at `--mem-fraction-static 0.90`.
-- **Long-Context** — B200 only: PP2 × DCPEP8 — the two pipeline stages and DCP8 split KV and KDA state.
+- **High-Throughput** — the large-scale lane: pick a **Cluster Size** and **Large-Scale Preset** in the Playground ([details](#large-scale-presets)). On H100: Balanced plus `extra_buffer_lazy`; on H200 the cell itself widens to 4×8 TP32/EP32 at `--mem-fraction-static 0.90`. On B200 this is the PP2 × DCPEP8 cell, where the two pipeline stages and DCP8 split KV and KDA state.
+
+`Long-Context` appears only under the `Prefill` PD mode; for long-context unified serving on B200, start from High-Throughput and raise `--context-length`.
 
 **Spec Decode** — layers onto the strategy without changing it, on every platform except B200. DSPARK proposes 7 draft tokens per step (tune in the Playground) and requires `pp_size == 1`, so on B200 it also drops the pipeline and re-lays the same 16 GPUs flat: PP2 × TP8 → TP16, PP2 × DCPEP8 → DCPEP16. DFLASH has no published draft checkpoint. The win is largest on short interactive traffic and fades as the prompt grows.
 
@@ -149,13 +150,13 @@ Remaining kernel sources JIT once from the public `flashinfer` wheel (a few minu
 |---|---|---|
 | B300 1×8 | TP8 (+DCP8) | accuracy-first defaults on Low-Latency and Balanced |
 | GB300 2×4 | TP8/DCP8 | MNNVL transport and cuMem auto-detected |
-| B200 2×8 | PP2 × TP8; +DCP8/EP8 on High-Throughput and Long-Context (128K ctx, 8192 chunked prefill). DSPARK re-lays the same 16 GPUs as TP16 / TP16+DCP16+EP16 | DSPARK off on Long-Context (`pp_size == 1` required) |
+| B200 2×8 | PP2 × TP8; +DCP8/EP8 on High-Throughput. DSPARK re-lays the same 16 GPUs as TP16 / TP16+DCP16+EP16. PD prefill is TP1 × PP16 | Unified serves all three operating points; `Long-Context` is a `Prefill`-only strategy |
 | GB200 4×4 | TP16/DCP16 | MNNVL auto-detected |
 | H200 2×8 (4×8 on Unified High-Throughput) | TP16/EP16 + symm-mem, Marlin + FlashMLA; High-Throughput widens to TP32/EP32 over 4 nodes at mem-frac 0.90 with `extra_buffer_lazy` | same block on every node; export the cross-node NIC (`GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME`, `SGLANG_HOST_IP`); keep `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1` |
 | H100 4×8 | TP32/EP32, Marlin + FlashMLA | SM90a build of the K3 image; pin NCCL/Gloo to the same NIC on all nodes; least post-weight headroom (80 GB) |
 | MI350X/MI355X 1×8 | TP8 ROCm/AITER | AITER A8W4 FlyDSL MoE, Triton attention, graph bs up to 256; DSPARK supported |
 
-**DCP notes** — the DCP cells are Balanced / High-Throughput on B300/GB300/GB200, and High-Throughput / Long-Context on B200:
+**DCP notes** — the DCP cells are Balanced / High-Throughput on B300/GB300/GB200, and High-Throughput on B200:
 
 - DCP is the only axis that shards the TP-replicated MLA KV; Low-Latency skips it.
 - Leave `--dcp-comm-backend` unset (fabric-resolved: `fi_a2a` on GB200/GB300, `a2a` on B200/B300).
@@ -244,7 +245,7 @@ Pending update...
 
 K3's hybrid HiCache tiers the paged MLA KV **and** the KDA/mamba state across L1 (GPU) / L2 (host) / L3 (Mooncake) — enable it from the **HiCache** card in the [Playground above](#playground) for long multi-turn workloads.
 
-- On the DCP recipes (Balanced / High-Throughput on B300/GB300/GB200; High-Throughput / Long-Context on B200), the host tiers are not fully DCP-aware yet: **L3 always, and L1+L2 with Spec Decode on, drop the DCP flags** (the command hints call it out — per-request KV capacity shrinks accordingly). L1+L2 NOSPEC keeps DCP. Only DCP goes: the MLA KV reverts to TP-replicated, but the cell's other parallelism stays, so B300/GB300/GB200 land on plain TP while B200 keeps its `--pp-size 2` / `--ep-size`.
+- On the DCP recipes (Balanced / High-Throughput on B300/GB300/GB200; High-Throughput on B200), the host tiers are not fully DCP-aware yet: **L3 always, and L1+L2 with Spec Decode on, drop the DCP flags** (the command hints call it out — per-request KV capacity shrinks accordingly). L1+L2 NOSPEC keeps DCP. Only DCP goes: the MLA KV reverts to TP-replicated, but the cell's other parallelism stays, so B300/GB300/GB200 land on plain TP while B200 keeps its `--pp-size 2` / `--ep-size`.
 - Low-Latency and the Hopper recipes take all tiers unchanged.
 
 <a id="pd-disaggregation" />
@@ -257,13 +258,13 @@ PD splits prefill and decode into separate server groups; because K3 is hybrid, 
 - **Ports**: prefill `30000`, decode `30100` (derived ZMQ/dist ranges must not collide on a shared host). The positional `8998` after `--prefill` must match `--disaggregation-bootstrap-port`, or only the decode worker registers.
 - **Decode state pool**: chunk cache — one slot per request; `--mamba-radix-cache-strategy` is inert. Keep `--disaggregation-decode-extra-slots` pinned: unpinned it defaults to twice the batch below 32 requests and **zero** above.
 
-#### Deep PP for long-context prefill
+#### Deep PP for prefill
 
-The `Long-Context` prefill strategy is `--pp-size 8 --tp-size 1`: pipeline P2P overlaps the next microbatch's compute, unlike TP/EP collectives, and each stage owns whole layers (a clean slice of KV and state).
+Deep PP is `--tp-size 1` with one pipeline stage per GPU — `--pp-size 8` on B300/GB300, `--pp-size 16` on B200/GB200. Pipeline P2P overlaps the next microbatch's compute, unlike TP/EP collectives, and each stage owns whole layers (a clean slice of KV and state). `--tp-size 1` is also what buys context: above TP1 the MLA KV is replicated across the TP ranks, so TP2 × PP8 holds roughly half the tokens of TP1 × PP16 for the same memory.
 
-- Use all eight stages; a shallow split still pays the in-stage all-reduce and can lose to TP8.
-- Pays only with several requests in flight (hence `Default` = TP8).
-- DSPARK off (`pp_size == 1` required).
+- Use one stage per GPU; a shallow split still pays the in-stage all-reduce and can lose to flat TP.
+- Pays only with several requests in flight. On the 8-GPU platforms that is why `Default` stays TP8; on the 16-GPU platforms deep PP wins at the Default operating point too, so both strategies use it — measured on GB200 at ISL 8192 / concurrency 32, PP16 × TP1 reached 4550 prefill tok/s/GPU vs 3596 (PP8 × TP2), 2407 (TEP16), and 1652 (TP16). Below concurrency ~8 the pipeline cannot fill and TEP16 leads instead (1947 vs 1227) — use `--tp-size 16 --ep-size 16` there.
+- DSPARK off (`pp_size == 1` required) — on B200/GB200 that applies to `Default` as well.
 - Fan one prefill role out to several decode roles; budget for in-transfer KV on the decode side.
 
 <Accordion title="Router">
