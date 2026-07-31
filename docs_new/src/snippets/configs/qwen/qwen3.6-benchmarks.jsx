@@ -8,6 +8,15 @@
 // H100 (all), B300 35B-A3B NVFP4 (loader crash, under investigation). sglang_version
 // per box (B200 0.5.15; H200/B300 0.5.16). Cells without an entry render "pending".
 
+//
+// 35B-A3B NVFP4 (MoE) note: on sglang 0.5.16 the generator's command crashes at
+// CUDA-graph capture (NVFP4-MoE unsupported on the FLASHINFER_TRTLLM moe runner);
+// the config adds --moe-runner-backend flashinfer_cutlass for these cells (the
+// engine-recommended fix — generator should adopt it). B300 35B-A3B NVFP4 cells
+// were measured on 0.5.16 WITH that flag; B200's are on 0.5.15 (pre-check, plain
+// FLASHINFER_TRTLLM path) — different backend, compare with care. 27B NVFP4 is
+// dense (no MoE) and unaffected.
+
 export const benchmarks = [
   {
     match: { hw: "h200", variant: "35b-a3b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
@@ -247,6 +256,26 @@ export const benchmarks = [
         ttft_ms: 101, tpot_ms: 1.71, tokens_per_sec_per_gpu: 5108 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
         ttft_ms: 161, tpot_ms: 4.47, tokens_per_sec_per_gpu: 28910 },
+    ],
+  },
+  {
+    match: { hw: "b300", variant: "35b-a3b", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 123937, tpot_ms: 39.39, tokens_per_sec_per_gpu: 51550 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 645007, tpot_ms: 39.84, tokens_per_sec_per_gpu: 52068 },
+    ],
+  },
+  {
+    match: { hw: "b300", variant: "35b-a3b", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 115, tpot_ms: 1.88, tokens_per_sec_per_gpu: 4705 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 128, tpot_ms: 5.2, tokens_per_sec_per_gpu: 25907 },
     ],
   },
   {
