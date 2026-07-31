@@ -78,6 +78,13 @@ class GraniteSWAAttention(GraniteAttention):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        # Per-layer RoPE base (`config.layer_rope_theta`): this layer's theta, or 0 => NoPE.
+        # Build the parent rotary at the layer's theta; NoPE layers keep a (valid, unused) rotary
+        # built at the incoming/global base and skip it in forward.
+        layer_rope_theta = getattr(config, "layer_rope_theta", None)
+        use_rope = layer_rope_theta is None or layer_rope_theta[layer_id] != 0
+        if layer_rope_theta is not None and use_rope:
+            rope_theta = layer_rope_theta[layer_id]
         super().__init__(
             config=config,
             hidden_size=hidden_size,
@@ -99,9 +106,7 @@ class GraniteSWAAttention(GraniteAttention):
             torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False
         )
 
-        # Per-layer RoPE vs. NoPE (`config.no_rope_layers`): 1 => apply RoPE, 0 => NoPE.
-        no_rope_layers = getattr(config, "no_rope_layers", None)
-        self.use_rope = no_rope_layers is None or bool(no_rope_layers[layer_id])
+        self.use_rope = use_rope
 
         # Per-layer attention type from `config.layer_types`. SGLang's window is
         # exclusive, hence `sliding_window - 1` (matching gpt_oss).

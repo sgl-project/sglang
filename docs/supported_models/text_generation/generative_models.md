@@ -73,6 +73,6 @@ in the GitHub search bar.
 | **Falcon-H1** (0.5B–34B) | `tiiuae/Falcon-H1-34B-Instruct` | TII's hybrid Mamba-Transformer architecture combining attention and state-space models for efficient long-context inference. |
 | **Hunyuan-Large** (389B, MoE) | `tencent/Tencent-Hunyuan-Large` | Tencent's open-source MoE model with 389B total / 52B active parameters, featuring Cross-Layer Attention (CLA) for improved efficiency. |
 | **IBM Granite 4.0 (Hybrid, Dense)** | `ibm-granite/granite-4.0-h-micro`, `ibm-granite/granite-4.0-micro` | IBM Granite 4.0 micro models: hybrid Mamba–MoE (`h-micro`) and dense (`micro`) variants. Enterprise-focused reasoning models |
-| **Granite SWA** (IBM) | `ibm-research/granite-4.5-3b-pipecleaner-r260528a` | IBM Granite dense model with per-layer sliding window attention and learnable per-head attention sinks. |
-| **Granite MoE SWA** (IBM) | `ibm-research/granite-4.5-3b-pipecleaner-r260528a` | IBM Granite Mixture-of-Experts model with per-layer sliding window attention, learnable attention sinks, and optional shared experts. |
+| **Granite SWA** (IBM) | `ibm-granite/granite-swash-2b` | IBM Granite dense model with per-layer sliding window attention and learnable per-head attention sinks. |
+| **Granite MoE SWA** (IBM) | `ibm-granite/granite-swash-3b-a600m` | IBM Granite Mixture-of-Experts model with per-layer sliding window attention, learnable attention sinks, and optional shared experts. |
 | **Sarvam 2** (30B-A2B, 105B-A10B) | `sarvamai/sarvam-2` | Sarvam's Mixture-of-Experts models. The 105B variant uses MLA (Multi-head Latent Attention) and the 30B variant uses GQA, both with 128 routed experts. |
