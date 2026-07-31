@@ -16,6 +16,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     inverse_transform_scale_ue8m0,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
     ModelOptNvFp4FusedMoEMethod,
     ModelOptQuantConfig,
 )
@@ -156,7 +157,11 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
 class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     """MoE method that converts source expert weights to NVFP4 during loading."""
 
-    def __init__(self, quant_config: ModelOptQuantConfig, layer_prefix: str):
+    def __init__(
+        self,
+        quant_config: NvFp4OnlineConfig | ModelOptFp4Config,
+        layer_prefix: str,
+    ):
         super().__init__(quant_config)
         if (
             quant_config.use_per_token_activation
@@ -179,6 +184,12 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     def prepare_weight_loader(self, layer, weight_loader):
         """Wrap floating expert tensors with load-time NVFP4 conversion."""
         return self.get_online_weight_loader(layer, weight_loader)
+
+    def _uses_serialized_fp8_source(self) -> bool:
+        return (
+            isinstance(self.quant_config, NvFp4OnlineConfig)
+            and self.quant_config.is_checkpoint_fp8_serialized
+        )
 
     @staticmethod
     def _quantize_weight_nvfp4(
@@ -271,7 +282,9 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         weight_scale: torch.Tensor,
         device: torch.device,
     ) -> torch.Tensor:
-        if getattr(self.quant_config, "use_mxfp8", False):
+        if not isinstance(self.quant_config, NvFp4OnlineConfig):
+            raise TypeError("FP8 source weights require NvFp4OnlineConfig.")
+        if self.quant_config.use_mxfp8:
             raise ValueError(
                 "--quantization nvfp4_online does not support online "
                 "requantization from MXFP8 expert checkpoints."
@@ -499,7 +512,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                     param, loaded_weight, weight_name, shard_id, expert_id
                 )
                 return
-            if not getattr(self.quant_config, "is_checkpoint_fp8_serialized", False):
+            if not self._uses_serialized_fp8_source():
                 raise ValueError(
                     "Online NVFP4 weight conversion received an FP8 expert "
                     "weight, but the checkpoint quantization config does not "

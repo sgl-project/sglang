@@ -565,11 +565,7 @@ class ModelConfig:
             is_draft_model=is_draft_model,
             is_draft_quantization_explicit=(
                 is_draft_model
-                and getattr(
-                    server_args,
-                    "_speculative_draft_quantization_explicitly_set",
-                    False,
-                )
+                and server_args._speculative_draft_quantization_explicitly_set
             ),
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,

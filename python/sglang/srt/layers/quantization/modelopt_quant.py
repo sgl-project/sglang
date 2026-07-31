@@ -2060,6 +2060,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
         return weight_loader
 
+    def _uses_serialized_fp8_source(self) -> bool:
+        return False
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -2177,9 +2180,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
 
-        if not self.quant_config.is_checkpoint_nvfp4_serialized and getattr(
-            self.quant_config, "is_checkpoint_fp8_serialized", False
-        ):
+        if self._uses_serialized_fp8_source():
             # FP8 checkpoints usually store expert scales as weight_scale_inv.
             # Online NVFP4 consumes them in the loader and writes the generated
             # NVFP4 scales into w*_weight_scale / w*_weight_scale_2 instead.

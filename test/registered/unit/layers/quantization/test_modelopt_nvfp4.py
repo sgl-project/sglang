@@ -228,6 +228,25 @@ class TestModelOptNvfp4(CustomTestCase):
             layer.w13_weight_scale_2,
         )
 
+    def test_online_modelopt_config_rejects_fp8_source_weight(self):
+        method = object.__new__(ModelOptNvFp4OnlineFusedMoEMethod)
+        method.quant_config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=False,
+            group_size=16,
+            use_per_token_activation=False,
+        )
+        method.layer_log_name = "mtp.layers.0.mlp.experts"
+        weight_loader = method.get_online_weight_loader(SimpleNamespace(), MagicMock())
+
+        with self.assertRaisesRegex(ValueError, "does not declare serialized FP8"):
+            weight_loader(
+                SimpleNamespace(device=torch.device("cpu")),
+                torch.ones(2, 16, dtype=torch.float8_e4m3fn),
+                "mtp.layers.0.mlp.experts.0.down_proj.weight",
+                "w2",
+                None,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -240,7 +240,7 @@ def _resolve_modelopt_fp4_draft_config(
 ) -> QuantizationConfig:
     if (
         model_config.quantization == "modelopt_fp4"
-        and getattr(model_config, "is_draft_quantization_explicit", False)
+        and model_config.is_draft_quantization_explicit
         and isinstance(quant_config, ModelOptFp4Config)
         and quant_config.is_checkpoint_nvfp4_serialized
         and quant_config.is_layer_excluded("mtp.layers.0.mlp.experts")
