@@ -6,12 +6,12 @@ from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.attention.dsv4 import (
     clear_unaccepted_c128_draft_states,
     fused_k_norm_rope_flashmla,
     fused_store_cache,
 )
-from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
@@ -646,10 +646,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._init_compressed_layer_mapping()
 
-        if _is_hip:
-            self._init_paged_compress_states(False)
-        else:
-            self._init_paged_compress_states(enable_memory_saver)
+        self._init_paged_compress_states(enable_memory_saver)
 
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
         # Under HiCache the compressed region is loaded H->D per layer; wait for this
