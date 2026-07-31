@@ -141,7 +141,12 @@ class TestNvidiaNemotron3SuperNVFP4DPAttentionEP(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         with (
             envs.SGLANG_ENABLE_ASYNC_ASSERT.override(0),
-            envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(2048),
+            # Must cover BOTH the launch-time check (per-rank * ep_size >=
+            # max_prefill_tokens) and the per-rank tokens the dispatcher
+            # actually sees at runtime (chunked_prefill_size, 4096 under DP
+            # attention) — this value replaces the dispatcher default, it does
+            # not raise it.
+            envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(4096),
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.override(1024 * 1024 * 1024),
         ):
             cls.process = popen_launch_server(
