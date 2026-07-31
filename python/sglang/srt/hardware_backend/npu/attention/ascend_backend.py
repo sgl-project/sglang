@@ -2248,11 +2248,8 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
-        # Only enter the sinks path when a sink tensor is actually present.
-        # Using `or self.is_hybrid_swa` here would force sinkless hybrid-SWA
-        # models (e.g. Mellum) into attention_sinks_triton with sinks=None,
-        # crashing Triton compilation during decode graph capture. Mirror the
-        # non-graph forward_decode condition instead.
+        # Sinks-aware path: models that carry an attention sink (sinks is not
+        # None), or SWA layers when FIA is enabled.
         if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
             # Use SWA block tables if hybrid SWA is enabled for this layer
             if self._is_swa_layer(layer):
