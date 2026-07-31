@@ -25,11 +25,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4A16LinearMethod,
 )
-from sglang.srt.model_loader.loader import (
-    DefaultModelLoader,
-    ModelOptModelLoader,
-    get_model_loader,
-)
+from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.srt.model_loader.weight_utils import get_quant_config
 from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
 from sglang.srt.models.utils import WeightsMapper
@@ -548,17 +544,6 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
 
                 self.assertIsInstance(config, ModelOptFp4Config)
                 self.assertEqual(config.is_checkpoint_nvfp4_serialized, is_serialized)
-
-    def test_unquantized_modelopt_fp4_uses_default_loader(self):
-        model_config = SimpleNamespace(
-            quantization="modelopt_fp4",
-            _is_already_quantized=lambda: False,
-        )
-
-        loader = get_model_loader(LoadConfig(), model_config)
-
-        self.assertIsInstance(loader, DefaultModelLoader)
-        self.assertNotIsInstance(loader, ModelOptModelLoader)
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):

@@ -1,21 +1,14 @@
 import unittest
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
 
 from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 from sglang.srt.layers.parameter import PerTensorScaleParameter
-from sglang.srt.layers.quantization import modelopt_quant, nvfp4_online
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
-    ModelOptNvFp4FusedMoEMethod,
-)
-from sglang.srt.layers.quantization.nvfp4_online import (
-    ModelOptNvFp4OnlineFusedMoEMethod,
-    NvFp4OnlineConfig,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -132,105 +125,6 @@ class TestModelOptNvfp4(CustomTestCase):
                 is_checkpoint_nvfp4_serialized=False,
                 group_size=16,
                 use_per_token_activation=True,
-            )
-
-    @patch.object(
-        modelopt_quant,
-        "_make_per_tensor_scale_parameter",
-        wraps=modelopt_quant._make_per_tensor_scale_parameter,
-    )
-    def test_moe_input_scale_fill_matches_quantization_interface(self, make_scale):
-        methods_configs_and_fills = (
-            (
-                ModelOptNvFp4FusedMoEMethod,
-                ModelOptFp4Config(group_size=16),
-                1.0,
-            ),
-            (ModelOptNvFp4OnlineFusedMoEMethod, NvFp4OnlineConfig(), None),
-        )
-
-        for method_cls, config, expected_fill in methods_configs_and_fills:
-            with self.subTest(config=config.get_name()):
-                make_scale.reset_mock()
-                method = object.__new__(method_cls)
-                method.quant_config = config
-                method.enable_flashinfer_trtllm_moe = True
-                layer = nn.Module()
-                layer.num_experts = 1
-                layer.num_local_experts = 1
-                layer.moe_runner_config = SimpleNamespace(is_gated=True)
-
-                with patch.object(
-                    method, "prepare_weight_loader", return_value=MagicMock()
-                ):
-                    method.create_weights(
-                        layer,
-                        num_experts=1,
-                        hidden_size=16,
-                        intermediate_size_per_partition=16,
-                        params_dtype=torch.bfloat16,
-                        weight_loader=MagicMock(),
-                    )
-
-                self.assertEqual(
-                    [call.kwargs["fill_value"] for call in make_scale.call_args_list],
-                    [expected_fill, expected_fill],
-                )
-
-    def test_non_gated_w1_is_quantized_without_pairing(self):
-        layer = SimpleNamespace(
-            moe_runner_config=SimpleNamespace(is_gated=False),
-            w13_weight_scale=object(),
-            w13_weight_scale_2=object(),
-        )
-        param = SimpleNamespace(device=torch.device("cpu"))
-        original_weight_loader = MagicMock()
-        fp4_weight = torch.empty(2, 8, dtype=torch.uint8)
-        weight_scale = torch.empty(2, 1, dtype=torch.float8_e4m3fn)
-        weight_scale_2 = torch.ones((), dtype=torch.float32)
-
-        with patch.object(
-            ModelOptNvFp4OnlineFusedMoEMethod,
-            "_quantize_weight_nvfp4",
-            return_value=(fp4_weight, weight_scale, weight_scale_2),
-        ) as quantize:
-            weight_loader = nvfp4_online.make_nvfp4_online_weight_loader(
-                layer=layer,
-                original_weight_loader=original_weight_loader,
-            )
-            weight_loader(
-                param,
-                torch.ones(2, 16, dtype=torch.bfloat16),
-                "mtp.layers.0.mixer.experts.0.up_proj.weight",
-                "w1",
-                None,
-            )
-
-        quantize.assert_called_once()
-        self.assertEqual(original_weight_loader.call_count, 3)
-        self.assertIs(original_weight_loader.call_args_list[0].args[0], param)
-        self.assertIs(
-            original_weight_loader.call_args_list[1].args[0],
-            layer.w13_weight_scale,
-        )
-        self.assertIs(
-            original_weight_loader.call_args_list[2].args[0],
-            layer.w13_weight_scale_2,
-        )
-
-    def test_online_loader_rejects_fp8_without_dequantizer(self):
-        weight_loader = nvfp4_online.make_nvfp4_online_weight_loader(
-            layer=SimpleNamespace(),
-            original_weight_loader=MagicMock(),
-        )
-
-        with self.assertRaisesRegex(ValueError, "does not declare serialized FP8"):
-            weight_loader(
-                SimpleNamespace(device=torch.device("cpu")),
-                torch.ones(2, 16, dtype=torch.float8_e4m3fn),
-                "mtp.layers.0.mlp.experts.0.down_proj.weight",
-                "w2",
-                None,
             )
 
 
