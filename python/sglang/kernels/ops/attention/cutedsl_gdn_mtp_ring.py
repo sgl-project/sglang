@@ -1,5 +1,8 @@
 # Vendored from flashinfer 0.6.15.post1 (flashinfer/gdn_kernels/gdn_decode_bf16_state.py,
 # Apache-2.0) to add the ReplaySSM fused ring-write to the GDN MTP verify kernels.
+# Covers only the BF16-STATE (SM100) variant; the fp32-state SM90 entry in
+# flashinfer/gdn_decode.py is untouched -- fold verify on fp32 states falls back
+# to the Triton ring-writing kernel (see gdn_backend._replayssm_fold_target_verify).
 # Keep upstream-diffable: functional changes are guarded by CACHE_RING/cache_ring.
 """
 Copyright (c) 2025 by FlashInfer team.
