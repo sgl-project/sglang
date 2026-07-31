@@ -338,8 +338,9 @@ def _dspark_verify_on_decode_backend(
 
 
 _KIMI_K3_DCP_PATCH_URL = (
-    "https://github.com/sgl-project/sglang/blob/main/"
-    "docker/kimi_k3/kimi_k3_cu13.Dockerfile#L116"
+    "https://github.com/sgl-project/sglang/blob/"
+    "b701464720ca22aa1851d5dda7144e84a410f2c7/"
+    "docker/kimi_k3/kimi_k3_cu13.Dockerfile#L116-L123"
 )
 
 
