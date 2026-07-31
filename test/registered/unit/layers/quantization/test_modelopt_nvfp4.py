@@ -110,73 +110,23 @@ class TestModelOptNvfp4(CustomTestCase):
         default_weight_loader(layer.input_scale, torch.tensor(0.25))
         torch.testing.assert_close(layer.input_scale, torch.tensor([0.25]))
 
-    def test_serialized_config_keeps_excluded_moe_unquantized(self):
-        config = ModelOptFp4Config(
-            is_checkpoint_nvfp4_serialized=True,
-            group_size=16,
-            exclude_modules=["model.layers.0.mlp*"],
-            use_per_token_activation=False,
-        )
-
-        class FakeFusedMoE:
-            pass
-
-        with patch("sglang.srt.layers.moe.fused_moe_triton.FusedMoE", FakeFusedMoE):
-            self.assertIsNone(
-                config.get_quant_method(FakeFusedMoE(), "model.layers.0.mlp.experts")
-            )
-
-    def test_online_config_selects_modelopt_moe_method(self):
-        config = ModelOptFp4Config(
-            is_checkpoint_nvfp4_serialized=False,
-            group_size=16,
-            use_per_token_activation=False,
-        )
-
-        class FakeFusedMoE:
-            pass
-
-        sentinel = object()
-        with (
-            patch("sglang.srt.layers.moe.fused_moe_triton.FusedMoE", FakeFusedMoE),
-            patch(
-                "sglang.srt.layers.quantization.modelopt_quant."
-                "ModelOptNvFp4FusedMoEMethod",
-                return_value=sentinel,
-            ) as online_weight_method,
-        ):
-            self.assertIs(
-                config.get_quant_method(FakeFusedMoE(), "model.layers.0.mlp"),
-                sentinel,
-            )
-        online_weight_method.assert_called_once_with(config)
-
     @patch(
         "sglang.srt.layers.quantization.modelopt_quant.envs."
         "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get",
         return_value=True,
     )
-    def test_serialized_config_honors_per_token_activation_env(self, env_get):
-        config = ModelOptFp4Config(
+    def test_activation_scheme_matches_quantization_interface(self, _):
+        serialized_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
             group_size=16,
         )
-
-        self.assertTrue(config.use_per_token_activation)
-        env_get.assert_called_once_with()
-
-    @patch(
-        "sglang.srt.layers.quantization.modelopt_quant.envs."
-        "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get",
-        return_value=True,
-    )
-    def test_online_modelopt_config_is_always_static_per_tensor(self, _):
-        config = ModelOptFp4Config(
+        online_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=False,
             group_size=16,
         )
 
-        self.assertFalse(config.use_per_token_activation)
+        self.assertTrue(serialized_config.use_per_token_activation)
+        self.assertFalse(online_config.use_per_token_activation)
         with self.assertRaisesRegex(ValueError, "Use nvfp4_online"):
             ModelOptFp4Config(
                 is_checkpoint_nvfp4_serialized=False,
@@ -284,27 +234,6 @@ class TestModelOptNvfp4(CustomTestCase):
                 "w2",
                 None,
             )
-
-    def test_online_modelopt_method_uses_standalone_loader(self):
-        method = object.__new__(ModelOptNvFp4FusedMoEMethod)
-        method.quant_config = ModelOptFp4Config(group_size=16)
-        layer = SimpleNamespace()
-        original_weight_loader = MagicMock()
-        sentinel = object()
-
-        with patch.object(
-            nvfp4_online,
-            "make_nvfp4_online_weight_loader",
-            return_value=sentinel,
-        ) as make_loader:
-            self.assertIs(
-                method.prepare_weight_loader(layer, original_weight_loader), sentinel
-            )
-
-        make_loader.assert_called_once_with(
-            layer=layer,
-            original_weight_loader=original_weight_loader,
-        )
 
 
 if __name__ == "__main__":

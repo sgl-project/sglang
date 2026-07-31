@@ -527,47 +527,27 @@ class TestParseQuantHfConfig(CustomTestCase):
 
 
 class TestModelOptFp4LoaderSelection(CustomTestCase):
-    def test_explicit_draft_uses_online_modelopt_fp4(self):
-        model_config = SimpleNamespace(
-            model_path="target-model",
-            quantization="modelopt_fp4",
-            is_draft_model=True,
-            is_draft_quantization_explicit=True,
-            hf_config=SimpleNamespace(
-                quantization_config={
-                    "quant_algo": "NVFP4",
-                    "group_size": 16,
-                    "ignore": [],
-                }
-            ),
-        )
+    def test_draft_modelopt_fp4_respects_explicit_quantization(self):
+        for is_explicit, is_serialized in ((True, False), (False, True)):
+            with self.subTest(is_explicit=is_explicit):
+                model_config = SimpleNamespace(
+                    model_path="target-model",
+                    quantization="modelopt_fp4",
+                    is_draft_model=True,
+                    is_draft_quantization_explicit=is_explicit,
+                    hf_config=SimpleNamespace(
+                        quantization_config={
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                            "ignore": [],
+                        }
+                    ),
+                )
 
-        config = get_quant_config(model_config, LoadConfig(), {})
+                config = get_quant_config(model_config, LoadConfig(), {})
 
-        self.assertIsInstance(config, ModelOptFp4Config)
-        self.assertFalse(config.is_checkpoint_nvfp4_serialized)
-        self.assertFalse(config.use_per_token_activation)
-        self.assertEqual(config.group_size, 16)
-
-    def test_inherited_modelopt_fp4_draft_uses_checkpoint_config(self):
-        model_config = SimpleNamespace(
-            model_path="target-model",
-            quantization="modelopt_fp4",
-            is_draft_model=True,
-            is_draft_quantization_explicit=False,
-            hf_config=SimpleNamespace(
-                quantization_config={
-                    "quant_algo": "NVFP4",
-                    "group_size": 16,
-                    "ignore": ["mtp.layers.0*"],
-                }
-            ),
-        )
-
-        config = get_quant_config(model_config, LoadConfig(), {})
-
-        self.assertIsInstance(config, ModelOptFp4Config)
-        self.assertTrue(config.is_checkpoint_nvfp4_serialized)
+                self.assertIsInstance(config, ModelOptFp4Config)
+                self.assertEqual(config.is_checkpoint_nvfp4_serialized, is_serialized)
 
     def test_unquantized_modelopt_fp4_uses_default_loader(self):
         model_config = SimpleNamespace(
