@@ -173,6 +173,13 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
         if combine_input is not None:
             return combine_input
 
+        combine_input = npu_apply_w4a4_mxfp_moe_ascend_tp(layer, dispatch_output)
+        if combine_input is not None:
+            return combine_input
+
+        # Standard dispatch. Unreachable on NPU today — create_moe_dispatcher
+        # picks AscendTPDispatcher whenever is_npu() and no a2a backend is set —
+        # but kept so this method is not silently wrong if that changes.
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         hidden_states = dispatch_output.hidden_states
@@ -386,6 +393,33 @@ def npu_fused_experts_w4a4_mxfp_decode(
     if len(original_shape) == 3:
         final_hidden_states = final_hidden_states.view(original_shape)
     return final_hidden_states
+
+
+def npu_apply_w4a4_mxfp_moe_ascend_tp(
+    layer: torch.nn.Module,
+    dispatch_output: "DispatchOutput",
+) -> Optional["CombineInput"]:
+    """Ascend TP path. Returns ``None`` when the dispatch is not an Ascend TP one.
+
+    AscendTPDispatcher already ran npu_moe_init_routing_v2 on dispatch and runs
+    npu_moe_finalize_routing (with topk_weights) on combine, so this only owns
+    the grouped-matmul chain in between — no permute, no routing-weight apply.
+    """
+    from sglang.srt.layers.moe.token_dispatcher import AscendTPCombineInput
+    from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
+
+    if not DispatchOutputChecker.format_is_ascend_tp(dispatch_output):
+        return None
+
+    hidden_states = npu_apply_without_routing_weights_w4a4_mxfp(
+        layer,
+        dispatch_output.hidden_states,
+        dispatch_output.hidden_states_scale,
+        group_list_type=dispatch_output.group_list_type,
+        group_list=dispatch_output.expert_tokens,
+        output_dtype=torch.bfloat16,
+    )
+    return AscendTPCombineInput(hidden_states=hidden_states)
 
 
 def npu_apply_w4a4_mxfp_moe_deepep(
