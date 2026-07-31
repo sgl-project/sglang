@@ -2,13 +2,13 @@
 
 #pragma once
 
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
+#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
+#include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
 
 #include <sgl_kernel/tile.cuh>
-#include <sgl_kernel/utils.cuh>
-#include <sgl_kernel/vec.cuh>
-#include <sgl_kernel/warp.cuh>
+#include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE, PDL helpers
+#include <sgl_kernel/vec.cuh>    // For AlignedVector
+#include <sgl_kernel/warp.cuh>   // For warp::copy_bytes, elect_one_lane, inclusive_sum
 
 #include <cuda/ptx>
 #include <dlpack/dlpack.h>

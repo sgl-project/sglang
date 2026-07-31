@@ -4,13 +4,13 @@
 
 #pragma once
 
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
+#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
+#include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
 
-#include <sgl_kernel/type.cuh>
-#include <sgl_kernel/utils.cuh>
-#include <sgl_kernel/vec.cuh>
-#include <sgl_kernel/warp.cuh>
+#include <sgl_kernel/type.cuh>   // For dtype_trait, bf16_t, fp32_t, cast
+#include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE, PDL helpers
+#include <sgl_kernel/vec.cuh>    // For AlignedVector
+#include <sgl_kernel/warp.cuh>   // For warp::copy_bytes, elect_one_lane, inclusive_sum
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -56,20 +56,11 @@ SGL_DEVICE void bar_sync(uint32_t id, uint32_t num_threads) {
   asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(num_threads) : "memory");
 }
 
-SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
-#pragma unroll
-  for (uint32_t offset = 1; offset < 32; offset *= 2) {
-    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
-    if (lane_id >= offset) val += n;
-  }
-  return val;
-}
-
 // Exclusive prefix (block-wide, thread-rank order) of `cnt`. Uses
 // smem_warp_sum[kNumWarps]; syncs on entry (so the workspace can be reused
 // across calls) and before the cross-warp read.
 SGL_DEVICE uint32_t block_exclusive_sum(uint32_t cnt, uint32_t lane_id, uint32_t warp_id, uint32_t* smem_warp_sum) {
-  const uint32_t inc = warp_inclusive_sum(lane_id, cnt);
+  const uint32_t inc = device::warp::inclusive_sum(lane_id, cnt);
   if (lane_id == 31) smem_warp_sum[warp_id] = inc;
   __syncthreads();
   // TODO: replace `__reduce_add_sync` with `warp::reduce_sum`
@@ -216,7 +207,7 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
         AlignedVector<uint32_t, 2> hist;
         hist.load(smem.histogram, tx);
         const auto local_val = hist[0] + hist[1];
-        const auto warp_inc = moe::radix::warp_inclusive_sum(lane_id, local_val);
+        const auto warp_inc = device::warp::inclusive_sum(lane_id, local_val);
         if (lane_id == kWarpThreads - 1) smem.warp_sum[0][warp_id] = warp_inc;
         moe::radix::bar_sync(BAR_SUM, kRadixLanes);
         const auto inter = __reduce_add_sync(0xFFFFFFFF, lane_id < warp_id ? smem.warp_sum[0][lane_id] : 0u);
@@ -466,7 +457,7 @@ SGL_DEVICE void fgt_select_topk(
         device::AlignedVector<uint32_t, 2> hist;
         hist.load(smem.histogram, tx);
         const auto local_val = hist[0] + hist[1];
-        const auto warp_inc = moe::radix::warp_inclusive_sum(lane_id, local_val);
+        const auto warp_inc = device::warp::inclusive_sum(lane_id, local_val);
         if (lane_id == 31) smem.warp_sum[0][warp_id] = warp_inc;
         moe::radix::bar_sync(BAR_SUM, kRadixLanes);
         const auto inter = __reduce_add_sync(0xFFFFFFFF, lane_id < warp_id ? smem.warp_sum[0][lane_id] : 0u);

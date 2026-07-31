@@ -3,15 +3,15 @@
 
 #pragma once
 
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
+#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
+#include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
 
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/tile.cuh>
-#include <sgl_kernel/type.cuh>
-#include <sgl_kernel/utils.cuh>
-#include <sgl_kernel/vec.cuh>
-#include <sgl_kernel/warp.cuh>
+#include <sgl_kernel/type.cuh>   // For dtype_trait, bf16_t, fp32_t, cast
+#include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE, PDL helpers
+#include <sgl_kernel/vec.cuh>    // For AlignedVector
+#include <sgl_kernel/warp.cuh>   // For warp::copy_bytes, elect_one_lane, inclusive_sum
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
@@ -203,16 +203,6 @@ struct alignas(16) CTAWork {
   bool valid;
 };
 
-SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
-  static_assert(device::kWarpThreads == 32);
-#pragma unroll
-  for (uint32_t offset = 1; offset < 32; offset *= 2) {
-    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
-    if (lane_id >= offset) val += n;
-  }
-  return val;
-}
-
 // SiTU (SoftCap-GLU) activation:
 //   gate_out = beta * tanh(gate / beta) * sigmoid(gate)
 //   up_out   = linear_beta * tanh(up / linear_beta)
@@ -255,7 +245,7 @@ SGL_DEVICE CTAWork get_work(const SituMulQuantVarlenParams& params) {
   const uint32_t val = tx < params.num_experts ? params.masked_m[tx] : 0u;
 
   // Per-warp inclusive scan of masked_m.
-  const uint32_t warp_inclusive = warp_inclusive_sum(lane_id, val);
+  const uint32_t warp_inclusive = device::warp::inclusive_sum(lane_id, val);
   const uint32_t warp_exclusive = warp_inclusive - val;
 
   // Write each warp total.

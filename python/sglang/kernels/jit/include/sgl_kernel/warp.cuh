@@ -174,6 +174,19 @@ SGL_DEVICE void copy_bytes(const void* __restrict__ src, void* __restrict__ dst)
   }
 }
 
+/// Inclusive prefix sum across one warp, thread-rank order. Distinct from
+/// reduce_sum above: every lane keeps its own running total rather than the
+/// whole-warp result.
+SGL_DEVICE uint32_t inclusive_sum(uint32_t lane_id, uint32_t val) {
+  static_assert(kWarpThreads == 32);
+#pragma unroll
+  for (uint32_t offset = 1; offset < 32; offset *= 2) {
+    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
+    if (lane_id >= offset) val += n;
+  }
+  return val;
+}
+
 // One elected lane, via elect.sync. Raw PTX rather than cute::elect_one_sync,
 // which would drag the whole CuTe include path into elementwise JIT modules;
 // cuda::ptx has no elect_sync in CUDA 13.0. Use this to gate a single-thread
