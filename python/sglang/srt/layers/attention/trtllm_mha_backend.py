@@ -209,19 +209,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
-        # Persistent scratch owned by this backend so that no per-layer,
-        # per-forward allocation lands inside a captured CUDA graph. Both
-        # buffers below otherwise cost one tiny fill kernel per attention
-        # layer per decode step (~3.5us/layer at bs=1 on B200).
-        #
-        # 1. trtllm-gen multi-CTA KV semaphores. FlashInfer allocates a fresh
-        #    zeroed buffer per call when the caller does not supply one; the
-        #    kernel self-resets the counters at the end of every launch, so one
-        #    zeroing at lease time is enough. Sized for the widest batch this
-        #    backend can ever see (over-sizing is explicitly allowed).
-        #    Owned per backend instance (not a shared lease) so a co-resident
-        #    draft backend with a smaller pool cannot size it down. Verify
-        #    batches run bs * num_draft_tokens rows through the same call.
+        # Owned here, and sized for the widest batch this backend can see, so
+        # FlashInfer does not allocate and zero a fresh counter buffer per
+        # attention layer inside the captured decode graph.
         self._multi_ctas_kv_counter_buffer = (
             make_persistent_multi_ctas_kv_counter_buffer(
                 torch.device(self.device),
@@ -230,9 +220,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 * max(1, self.speculative_num_draft_tokens or 1),
             )
         )
-        # 2. Fallback K/V dequant scales for the fused FP8 KV-cache write. The
-        #    op needs float32 [1] tensors; layers without checkpoint kv scales
-        #    would otherwise build them with torch.ones() on every call.
+        # Same reason for the fused FP8 KV-cache write's fallback scales: it
+        # needs float32 [1] tensors, and layers without checkpoint kv scales
+        # would otherwise have torch.ones() build them on every call.
         self._default_kv_scale = get_buffer(
             "trtllm_mha_default_kv_scale",
             lambda: torch.ones(1, dtype=torch.float32, device=self.device),
