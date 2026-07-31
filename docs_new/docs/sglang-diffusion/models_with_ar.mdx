@@ -1,5 +1,6 @@
 ---
 title: "Diffusion models with AR stage like GLM-Image"
+description: "Run diffusion pipelines that delegate an AR stage to a separate SGLang server, such as GLM-Image."
 ---
 
 ## Quick Start
@@ -27,7 +28,9 @@ sglang serve --model-path /path/to/zai-org/GLM-Image/vision_language_encoder/ \
 ```
 ```bash
 # Terminal 2 : launch server with Diffusion model
-sglang serve --model-path /path/to/zai-org/GLM-Image/ --srt-encoder-url "http://${HOST}:${AR_PORT}"
+sglang serve --model-path /path/to/zai-org/GLM-Image/ \
+  --srt-encoder-url "http://${HOST}:${AR_PORT}" \
+  --port ${PORT}
 ```
 ```bash
 # Terminal 3 : launch client

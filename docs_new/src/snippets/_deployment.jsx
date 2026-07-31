@@ -163,8 +163,8 @@ export const Deployment = ({ config, benchmarks }) => {
       color: isDark ? "#e5e7eb" : "#374151",
       whiteSpace: "pre-wrap", overflowX: "auto", margin: 0,
     },
-    // Amber callout under the command when speculative decoding (MTP) is on
-    // but --max-running-requests isn't set (SGLang then caps it at 48).
+    // Amber callout under the command when speculative decoding (MTP, DSpark, ...)
+    // is on but --max-running-requests isn't set (SGLang then caps it at 48).
     mtpWarn: {
       margin: "8px 0 0", padding: "8px 12px", borderRadius: "8px",
       fontSize: "12px", lineHeight: "1.45",
@@ -1176,13 +1176,37 @@ export const Deployment = ({ config, benchmarks }) => {
     return { ...cell, flags };
   })();
   const command = renderCommand(cellWithRatio, sel, env, runMode);
-  // MTP hint on the EFFECTIVE flags — speculation arrives via the Spec Decode
-  // overlay, never the cell. SGLang resets --max-running-requests to 48 when
-  // spec is on and it's unset.
+  // Speculative-decoding hint on the EFFECTIVE flags — speculation can arrive via
+  // the Spec Decode overlay as well as the cell. SGLang resets
+  // --max-running-requests to 48 when spec is on and it's unset; verified for both
+  // EAGLE/MTP and DSPARK (server_args reports max_running_requests=48 either way).
   const effFlags = cell ? [...overlayStrip(cell.flags, sel), ...overlayFlags(sel)] : [];
-  const mtpHint =
-    effFlags.some((f) => f.split(/[\s=]/)[0] === "--speculative-algorithm") &&
-    !effFlags.some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
+  const specAlgoFlag = effFlags.find(
+    (f) => f.split(/[\s=]/)[0] === "--speculative-algorithm");
+  const specMrrFlag = effFlags.find(
+    (f) => f.split(/[\s=]/)[0] === "--max-running-requests");
+  // Two cases, both worth surfacing when speculation is on:
+  //   mtpHint       — the flag is MISSING, so SGLang silently caps at 48 (a hazard)
+  //   specPinnedHint— the recipe PINS it, which is safe but is a fixed number the
+  //                   reader still has to match to their own concurrency
+  const mtpHint = !!specAlgoFlag && !specMrrFlag;
+  const specPinnedHint = !!specAlgoFlag && !!specMrrFlag;
+  const specMrrValue = specMrrFlag
+    ? (specMrrFlag.split(/[\s=]/).filter(Boolean)[1] || "")
+    : "";
+  // Name the algorithm in the banner rather than hardcoding "MTP" — the same reset
+  // applies to DSpark and friends, and a DSpark user reading "(MTP)" would be
+  // misled. The cookbook calls the EAGLE-based path MTP, so keep that mapping.
+  const SPEC_ALGO_LABEL = {
+    EAGLE: "MTP", EAGLE3: "MTP", FROZEN_KV_MTP: "MTP",
+    DSPARK: "DSpark", DFLASH: "DFlash", NGRAM: "N-gram",
+    STANDALONE: "standalone draft",
+  };
+  const specAlgoName = (() => {
+    if (!specAlgoFlag) return "MTP";
+    const v = specAlgoFlag.split(/[\s=]/).filter(Boolean)[1] || "";
+    return SPEC_ALGO_LABEL[v.toUpperCase()] || v || "MTP";
+  })();
   // cell.warn may embed [label](#anchor) links — rendered as scrollIntoView
   // buttons, not hrefs, so the hash (which carries the selection) isn't overwritten.
   const renderWarn = (text) => {
@@ -1413,7 +1437,12 @@ export const Deployment = ({ config, benchmarks }) => {
             {cell && cell.warn && <div style={s.mtpWarn}>⚠️ {renderWarn(cell.warn)}</div>}
             {mtpHint && (
               <div style={s.mtpWarn}>
-                ⚠️ Speculative decoding (MTP) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+                ⚠️ Speculative decoding ({specAlgoName}) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+              </div>
+            )}
+            {specPinnedHint && (
+              <div style={s.mtpWarn}>
+                ℹ️ Speculative decoding ({specAlgoName}) is on and this recipe pins <code>--max-running-requests</code> to <strong>{specMrrValue}</strong>. Adjust it to match your target concurrency — if you remove the flag, SGLang falls back to <strong>48</strong>.
               </div>
             )}
           </>)}
