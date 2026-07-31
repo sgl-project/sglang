@@ -131,6 +131,11 @@ _gdn_use_alt_stream = _is_cuda or (
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
+# ``in_proj_ba`` is tiny next to ``in_proj_qkvz`` and reads the same activation, so as
+# its own GEMM it is nearly all launch overhead. Merge the two into one GEMM.
+_fuse_gdn_qkvzba = get_bool_env_var("SGLANG_GDN_FUSE_QKVZBA", "False")
+# Output-tile granularity the a8w8 GEMMs want from the merged projection's N.
+_GEMM_N_ALIGN = 128
 _is_amx_available = cpu_has_amx_support()
 
 cached_get_processor = lru_cache(get_processor)
@@ -198,6 +203,23 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     if name == "QuarkLinearMethod":
         return bool(getattr(getattr(linear, "scheme", None), "per_token", False))
     return False
+
+
+def _gdn_input_proj_stacked_mapping(model: nn.Module):
+    """Checkpoint shard -> parameter mapping, following whichever layout was built."""
+    if any("in_proj_qkvzba." in name for name, _ in model.named_parameters()):
+        return [
+            ("in_proj_qkvzba.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_qkvzba.", "in_proj_z.", 3),
+            ("in_proj_qkvzba.", "in_proj_b.", 4),
+            ("in_proj_qkvzba.", "in_proj_a.", 5),
+        ]
+    return [
+        ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+        ("in_proj_qkvz.", "in_proj_z.", 3),
+        ("in_proj_ba.", "in_proj_b.", 0),
+        ("in_proj_ba.", "in_proj_a.", 1),
+    ]
 
 
 def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
@@ -315,31 +337,48 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        # projection of the input hidden states
-        self.in_proj_qkvz = self.create_qkvz_proj(
+        # projection of the input hidden states, as one merged GEMM when qkvz and ba
+        # can share a quantization scheme, otherwise as the separate pair
+        self.qkvz_width = (2 * self.key_dim + 2 * self.value_dim) // self.attn_tp_size
+        self.ba_width = (2 * self.num_v_heads) // self.attn_tp_size
+        self.in_proj_qkvz = None
+        self.in_proj_ba = None
+        self.in_proj_qkvzba = self.create_qkvzba_proj(
             hidden_size=self.hidden_size,
             key_dim=self.key_dim,
             value_dim=self.value_dim,
-            quant_config=quant_config,
-            prefix=add_prefix("in_proj_qkvz", prefix),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-        )
-
-        self.in_proj_ba = self.create_ba_proj(
-            hidden_size=self.hidden_size,
             num_v_heads=self.num_v_heads,
             quant_config=quant_config,
-            prefix=add_prefix("in_proj_ba", prefix),
+            prefix=add_prefix("in_proj_qkvzba", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
         )
+        if self.in_proj_qkvzba is None:
+            self.in_proj_qkvz = self.create_qkvz_proj(
+                hidden_size=self.hidden_size,
+                key_dim=self.key_dim,
+                value_dim=self.value_dim,
+                quant_config=quant_config,
+                prefix=add_prefix("in_proj_qkvz", prefix),
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+            )
+
+            self.in_proj_ba = self.create_ba_proj(
+                hidden_size=self.hidden_size,
+                num_v_heads=self.num_v_heads,
+                quant_config=quant_config,
+                prefix=add_prefix("in_proj_ba", prefix),
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+            )
 
         # Override weight loaders for packed checkpoint format.
         # Important: for FP8, this must cover not only `.weight` but also
         # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
-        self._bind_packed_weight_loaders(self.in_proj_qkvz)
-        self._bind_packed_weight_loaders(self.in_proj_ba)
+        for proj in (self.in_proj_qkvzba, self.in_proj_qkvz, self.in_proj_ba):
+            if proj is not None:
+                self._bind_packed_weight_loaders(proj)
         self._fused_input_proj_cpu_enabled = LazyValue(
             lambda: (
                 _is_cpu
@@ -570,6 +609,89 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=tp_size,
         )
 
+    def create_qkvzba_proj(
+        self,
+        hidden_size: int,
+        key_dim: int,
+        value_dim: int,
+        num_v_heads: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
+    ) -> Optional[MergedColumnParallelLinear]:
+        """Both input projections as one GEMM, or None to keep them separate.
+
+        Requires all four checkpoint shards to resolve to the same quantization scheme;
+        ``_find_matched_config`` raises when they don't, and the separate pair stays
+        correct in that case.
+
+        b and a leave N ragged, which is free while the GEMM is launch-bound but wastes
+        tiles once it is compute-bound, so N is padded to a multiple of _GEMM_N_ALIGN.
+        The padding rows are zeroed and their outputs discarded.
+        """
+        if not _fuse_gdn_qkvzba or _is_cpu or _is_npu:
+            return None
+        server_args = get_server_args()
+        if bool(server_args.lora_paths) or server_args.enable_lora:
+            # supported_lora_modules names in_proj_qkvz, which is gone once merged.
+            return None
+
+        output_sizes = [
+            key_dim,
+            key_dim,
+            value_dim,
+            value_dim,
+            num_v_heads,
+            num_v_heads,
+        ]
+        shards = tp_size if tp_size is not None else 1
+        pad = (-(sum(output_sizes) // shards)) % _GEMM_N_ALIGN * shards
+        if pad:
+            output_sizes.append(pad)
+        try:
+            merged = MergedColumnParallelLinear(
+                input_size=hidden_size,
+                output_sizes=output_sizes,
+                bias=False,
+                quant_config=quant_config,
+                prefix=prefix,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+            )
+        except (ValueError, NotImplementedError) as e:
+            logger.debug("in_proj_qkvz and in_proj_ba kept separate: %s", e)
+            return None
+        weight = getattr(merged, "weight", None)
+        if pad and weight is not None:
+            # Nothing loads these rows.
+            weight.data[-(pad // shards) :].zero_()
+        return merged
+
+    @property
+    def qkvz_proj(self) -> nn.Module:
+        """The module producing the qkvz outputs, whether or not ba rides along."""
+        return (
+            self.in_proj_qkvzba
+            if self.in_proj_qkvzba is not None
+            else self.in_proj_qkvz
+        )
+
+    @property
+    def ba_proj(self) -> nn.Module:
+        """The module producing the b/a outputs, whether or not it is merged."""
+        return (
+            self.in_proj_qkvzba if self.in_proj_qkvzba is not None else self.in_proj_ba
+        )
+
+    def _split_qkvzba(self, projected: torch.Tensor):
+        """qkvz and ba views of the merged output, leaving the padding behind."""
+        ba_end = self.qkvz_width + self.ba_width
+        return (
+            projected[..., : self.qkvz_width],
+            projected[..., self.qkvz_width : ba_end],
+        )
+
     def fix_query_key_value_ordering(
         self,
         mixed_qkvz: torch.Tensor,
@@ -600,6 +722,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # the tuple branch and keep the original control flow below unchanged.
         if _use_aiter and isinstance(hidden_states, tuple):
             return self._forward_input_proj_fused_quant_amd(hidden_states)
+
+        if self.in_proj_qkvzba is not None:
+            projected_states, _ = self.in_proj_qkvzba(hidden_states)
+            return self._split_qkvzba(projected_states)
 
         if (
             _is_cpu
@@ -652,6 +778,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         Per-projection input selection (and the per-group/per-token/MXFP4
         distinction) is handled by ``_select_fused_ar_input_for_linear``.
         """
+        if self.in_proj_qkvzba is not None:
+            hs = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_qkvzba)
+            projected_states, _ = self.in_proj_qkvzba(hs)
+            return self._split_qkvzba(projected_states)
+
         hs_qkvz = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_qkvz)
         hs_ba = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_ba)
         seq_len = hidden_states[0].shape[0]
@@ -816,7 +947,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # it. Otherwise, stay on the plain AR+RMSNorm path.
         enable_fused_ar_quant = (
             _enable_qwen35_fused_ar_quant()
-            and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
+            and _linear_accepts_fp8_tuple(self.linear_attn.qkvz_proj)
         )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -831,12 +962,12 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # GDN has two parallel input projections. Opt into the fused quant
         # epilogue on ``in_proj_qkvz`` (it dominates the bytes).
         self._fused_ar_quant_format = _detect_fused_ar_quant_format(
-            self.linear_attn.in_proj_qkvz
+            self.linear_attn.qkvz_proj
         )
         # Emit the bf16 sidecar only for an unquantized ``in_proj_ba``; when it
         # is already quantized, skip it and let the single kernel emit only
         # (quant, scale) (a sidecar would just be re-quantized, a regression).
-        _ba_quantized = bool(_detect_fused_ar_quant_format(self.linear_attn.in_proj_ba))
+        _ba_quantized = bool(_detect_fused_ar_quant_format(self.linear_attn.ba_proj))
         self._emit_bf16_for_ba = bool(self._fused_ar_quant_format) and not _ba_quantized
 
     def forward(
@@ -1329,6 +1460,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        "in_proj_qkvzba": ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
     }
 
     supported_lora_modules = [
@@ -1569,10 +1701,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            *_gdn_input_proj_stacked_mapping(self),
         ]
 
         loaded_params: Set[str] = set()
@@ -1658,10 +1787,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            *_gdn_input_proj_stacked_mapping(self),
         ]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
@@ -1920,10 +2046,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN fused projections
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            *_gdn_input_proj_stacked_mapping(self),
         ]
 
         loaded_params: Set[str] = set()
@@ -2080,10 +2203,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN fused projections
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            *_gdn_input_proj_stacked_mapping(self),
         ]
 
         num_experts = self.config.num_experts
