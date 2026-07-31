@@ -66,6 +66,7 @@ _TRITON_KERNELS = [
     ("kv_indices", "create_chunked_prefix_cache_kv_indices"),
     ("kv_indices", "get_num_kv_index_blocks_flashmla"),
     ("kv_indices", "get_num_page_per_block_flashmla"),
+    ("kv_indices", "translate_full_to_swa_int32"),
     ("rope_cache", "fused_qk_rope_reshape_and_cache"),
     ("trtllm_mha_page_table", "build_trtllm_mha_page_table"),
     ("trtllm_mha_graph_metadata", "update_trtllm_mha_graph_metadata"),

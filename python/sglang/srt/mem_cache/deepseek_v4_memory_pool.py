@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
 from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.kernels.ops.kvcache.kv_indices import translate_full_to_swa_int32
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -665,6 +666,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
+
+    def translate_loc_from_full_to_swa_int32(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        assert self.full_to_swa_index_mapping is not None
+        return translate_full_to_swa_int32(
+            self.full_to_swa_index_mapping,
+            kv_indices,
+        )
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []

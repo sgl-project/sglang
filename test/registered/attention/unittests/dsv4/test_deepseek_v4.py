@@ -623,5 +623,41 @@ class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
         self.assertEqual(out.tolist(), [0, 0])
 
 
+class TestDSV4InGraphMetadata(CustomTestCase):
+    def test_draft_extend_uses_fused_int32_translation(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+        )
+
+        translated = torch.tensor([6, 8], dtype=torch.int32)
+        translate_int32 = mock.Mock(return_value=translated)
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.forward_metadata = DSV4Metadata(
+            core_attn_metadata=SimpleNamespace(swa_out_cache_loc=None),
+            indexer_metadata=None,
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            translate_loc_from_full_to_swa_int32=translate_int32,
+        )
+        backend.topk = 0
+        backend.speculative_num_steps = 0
+        backend.is_dspark_draft = False
+        out_cache_loc = torch.tensor([3, 4], dtype=torch.int64)
+        forward_batch = SimpleNamespace(
+            out_cache_loc=out_cache_loc,
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            batch_size=2,
+        )
+
+        backend.init_forward_metadata_in_graph(forward_batch)
+
+        translate_int32.assert_called_once_with(out_cache_loc)
+        self.assertIs(
+            backend.forward_metadata.core_attn_metadata.swa_out_cache_loc,
+            translated,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

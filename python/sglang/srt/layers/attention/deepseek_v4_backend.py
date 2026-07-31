@@ -1131,8 +1131,8 @@ class DeepseekV4AttnBackend(
                     self.speculative_num_steps,
                 )[self.speculative_step_id]
             metadata.core_attn_metadata.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
-                    torch.int32
+                self.token_to_kv_pool.translate_loc_from_full_to_swa_int32(
+                    out_cache_loc
                 )
             )
 
