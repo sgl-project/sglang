@@ -75,6 +75,12 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 _VARLEN_FA_ENABLED = os.environ.get("SGLANG_VARLEN_FA", "1") != "0"
 
 
+def _get_sp_attention_mode() -> str:
+    from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+    return get_global_server_args().sp_attention_mode
+
+
 def build_varlen_mask_meta(
     key_mask: torch.Tensor,
 ) -> dict:
@@ -225,7 +231,6 @@ class UlyssesAttention(nn.Module):
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
-        sp_attention_mode: str | None = None,
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -267,17 +272,16 @@ class UlyssesAttention(nn.Module):
         self.backend = attn_backend.get_enum()
         self.dtype = dtype
         self.causal = causal
-        if sp_attention_mode is None:
-            from sglang.multimodal_gen.runtime.server_args import (
-                get_global_server_args,
-            )
-
-            sp_attention_mode = get_global_server_args().sp_attention_mode
-        if sp_attention_mode not in ("ulysses", "kv_gather"):
-            raise ValueError(
-                "sp_attention_mode must be either 'ulysses' or 'kv_gather'"
-            )
-        self.sp_attention_mode = sp_attention_mode
+        self.sp_attention_mode = _get_sp_attention_mode()
+        if self.sp_attention_mode == "kv_gather":
+            if causal:
+                raise ValueError("K/V-gather SP does not support causal attention.")
+            if get_ring_parallel_world_size() != 1:
+                raise ValueError("K/V-gather SP requires ring_degree=1.")
+            if self.backend.is_sparse:
+                raise NotImplementedError(
+                    "K/V-gather SP does not support sparse UlyssesAttention backends."
+                )
 
     def _forward_with_kv_gather(
         self,
@@ -290,17 +294,9 @@ class UlyssesAttention(nn.Module):
         replicated_v: torch.Tensor | None,
         seq_lens: list[int] | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if self.causal:
-            raise ValueError("K/V-gather SP does not support causal attention.")
-        if get_ring_parallel_world_size() != 1:
-            raise ValueError("K/V-gather SP requires ring_degree=1.")
         if seq_lens is not None:
             raise NotImplementedError(
                 "K/V-gather SP does not support varlen UlyssesAttention."
-            )
-        if self.backend.is_sparse:
-            raise NotImplementedError(
-                "K/V-gather SP does not support sparse UlyssesAttention backends."
             )
         if any(x is not None for x in (replicated_q, replicated_k, replicated_v)):
             if any(x is None for x in (replicated_q, replicated_k, replicated_v)):
@@ -627,7 +623,6 @@ class USPAttention(nn.Module):
         dropout_rate: float = 0.0,
         skip_sequence_parallel: bool = False,
         enable_packed_qkv_input_a2a: bool = False,
-        sp_attention_mode: str | None = None,
         **extra_impl_args,
     ) -> None:
         """
@@ -637,8 +632,6 @@ class USPAttention(nn.Module):
               text/image encoder outputs), the full USP pipeline is redundant:
               each rank's local Q shard can attend directly to the locally-held
               full KV without any collective communication.
-            sp_attention_mode:
-              ``ulysses`` (default from ServerArgs) or ``kv_gather``.
         """
         super().__init__()
         if softmax_scale is None:
@@ -686,17 +679,12 @@ class USPAttention(nn.Module):
 
         self.skip_sequence_parallel = skip_sequence_parallel
         self.enable_packed_qkv_input_a2a = bool(enable_packed_qkv_input_a2a)
-        if sp_attention_mode is None:
-            from sglang.multimodal_gen.runtime.server_args import (
-                get_global_server_args,
-            )
-
-            sp_attention_mode = get_global_server_args().sp_attention_mode
-        if sp_attention_mode not in ("ulysses", "kv_gather"):
-            raise ValueError(
-                "sp_attention_mode must be either 'ulysses' or 'kv_gather'"
-            )
-        self.sp_attention_mode = sp_attention_mode
+        self.sp_attention_mode = _get_sp_attention_mode()
+        if self.sp_attention_mode == "kv_gather":
+            if causal:
+                raise ValueError("K/V-gather SP does not support causal attention.")
+            if get_ring_parallel_world_size() != 1:
+                raise ValueError("K/V-gather SP requires ring_degree=1.")
 
     def _get_usp_a2a_stream(self):
         if USPAttention._usp_a2a_stream is None:
@@ -766,11 +754,23 @@ class USPAttention(nn.Module):
             and not effective_skip_sp
             and get_sequence_parallel_world_size() > 1
         )
+        replicated_mode_count = sum(
+            value > 0
+            for value in (
+                num_replicated_prefix,
+                num_replicated_suffix,
+                num_replicated_kv_prefix,
+            )
+        )
         if (
             self.sp_attention_mode == "kv_gather"
             and not effective_skip_sp
             and get_sequence_parallel_world_size() > 1
         ):
+            if replicated_mode_count > 1:
+                raise ValueError(
+                    "K/V-gather SP supports at most one replicated-token mode per call."
+                )
             return self._forward_with_kv_gather(
                 q,
                 k,
@@ -1046,11 +1046,7 @@ class USPAttention(nn.Module):
             return out
 
         sp_size = get_ulysses_parallel_world_size()
-        if (
-            (num_replicated_prefix > 0 and num_replicated_suffix > 0)
-            or (num_replicated_prefix > 0 and num_replicated_kv_prefix > 0)
-            or (num_replicated_suffix > 0 and num_replicated_kv_prefix > 0)
-        ):
+        if replicated_mode_count > 1:
             raise ValueError(
                 "USPAttention supports at most one replicated-token mode per call."
             )
@@ -1142,18 +1138,6 @@ class USPAttention(nn.Module):
         num_replicated_suffix: int,
         num_replicated_kv_prefix: int,
     ) -> torch.Tensor:
-        if self.causal:
-            raise ValueError("K/V-gather SP does not support causal attention.")
-        if get_ring_parallel_world_size() != 1:
-            raise ValueError("K/V-gather SP requires ring_degree=1.")
-        if (
-            (num_replicated_prefix > 0 and num_replicated_suffix > 0)
-            or (num_replicated_prefix > 0 and num_replicated_kv_prefix > 0)
-            or (num_replicated_suffix > 0 and num_replicated_kv_prefix > 0)
-        ):
-            raise ValueError(
-                "K/V-gather SP supports at most one replicated-token mode per call."
-            )
         if attn_mask is not None and num_replicated_kv_prefix:
             raise NotImplementedError(
                 "K/V-gather SP masked attention does not support a KV-only prefix."
@@ -1389,10 +1373,6 @@ class USPAttention(nn.Module):
             return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
         if self.sp_attention_mode == "kv_gather":
-            if self.causal:
-                raise ValueError("K/V-gather SP does not support causal attention.")
-            if get_ring_parallel_world_size() != 1:
-                raise ValueError("K/V-gather SP requires ring_degree=1.")
             k_suffix = sequence_model_parallel_all_gather(k_suffix, dim=1)
             v_suffix = sequence_model_parallel_all_gather(v_suffix, dim=1)
             k = torch.cat([k_prefix, k_suffix], dim=1)
