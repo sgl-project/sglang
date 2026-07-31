@@ -133,6 +133,23 @@ def action_labels_to_primitive_bits(labels: torch.Tensor) -> torch.Tensor:
     return _LABEL_TO_BITS.to(device=labels.device)[labels]
 
 
+def action_sinusoidal_embedding_1d(
+    dim: int, position: torch.Tensor
+) -> torch.Tensor:
+    if dim % 2:
+        raise ValueError("MinWM action sinusoidal embedding dimension must be even")
+    half = dim // 2
+    position = position.to(torch.float64).mul(1000.0)
+    sinusoid = torch.outer(
+        position,
+        torch.pow(
+            10000,
+            -torch.arange(half, device=position.device, dtype=torch.float64) / half,
+        ),
+    )
+    return torch.cat([torch.cos(sinusoid) - 1, torch.sin(sinusoid)], dim=1)
+
+
 class CausalActionTemporalBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int):
         super().__init__()
@@ -218,6 +235,86 @@ class PrimitiveTokenResidualActionEncoder(nn.Module):
             raise ValueError(
                 "MinWM action tensor must have shape [B, F] or [B, F, S, 8]"
             )
+        if action.shape[1] < num_current_frames:
+            raise ValueError(
+                "MinWM action window is shorter than the current latent chunk"
+            )
+        states = self.frame_states(action)[:, -num_current_frames:]
+        return (
+            states[:, :, None]
+            .expand(-1, -1, tokens_per_frame, -1)
+            .reshape(states.shape[0], num_current_frames * tokens_per_frame, -1)
+            .to(dtype=dtype)
+            .contiguous()
+        )
+
+
+class PrimitiveRoPETokenResidualActionEncoder(nn.Module):
+    """Exact ``primitive_rope_token_residual`` conditioner from minWM."""
+
+    def __init__(
+        self,
+        dim: int,
+        embed_dim: int = 256,
+        hidden_dim: int = 512,
+        kernel_size: int = 3,
+    ) -> None:
+        super().__init__()
+        if embed_dim % (2 * BITS_PER_SUBSET):
+            raise ValueError(
+                "MinWM primitive RoPE embed_dim must be divisible by "
+                f"{2 * BITS_PER_SUBSET}"
+            )
+        self.embed_dim = embed_dim
+        self.fuse = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim * 2),
+            nn.SiLU(),
+            nn.Linear(embed_dim * 2, embed_dim * 2),
+        )
+        self.encode_1 = CausalActionTemporalBlock(
+            embed_dim * 2, hidden_dim, kernel_size
+        )
+        self.encode_2 = CausalActionTemporalBlock(hidden_dim, hidden_dim, kernel_size)
+        self.proj = nn.Linear(hidden_dim, dim)
+
+    def frame_states(self, action: torch.Tensor) -> torch.Tensor:
+        if action.ndim == 2:
+            weights = action_labels_to_primitive_bits(action)
+        elif action.ndim == 4 and action.shape[-1] == PRIMITIVE_BIT_WIDTH:
+            weights = action
+            if not torch.isfinite(weights).all():
+                raise ValueError("MinWM action weights must be finite")
+            if torch.any((weights < 0) | (weights > 1)):
+                raise ValueError("MinWM action weights must be in [0, 1]")
+        else:
+            raise ValueError(
+                "MinWM primitive RoPE action must have shape [B, F] labels "
+                "or [B, F, S, 8] weights"
+            )
+        weights = weights.to(device=self.proj.weight.device, dtype=torch.float32)
+        if weights.ndim == 3:
+            weights = weights.unsqueeze(2)
+        weights = weights.mean(dim=2)
+        hidden_states = action_sinusoidal_embedding_1d(
+            self.embed_dim // BITS_PER_SUBSET, weights.reshape(-1)
+        )
+        hidden_states = hidden_states.to(dtype=weights.dtype).reshape(
+            *weights.shape[:-1], self.embed_dim * 2
+        )
+        hidden_states = hidden_states.to(dtype=self.fuse[0].weight.dtype)
+        hidden_states = hidden_states + self.fuse(hidden_states)
+        hidden_states = self.encode_1(hidden_states.transpose(1, 2))
+        hidden_states = self.encode_2(hidden_states).transpose(1, 2)
+        return self.proj(hidden_states.to(dtype=self.proj.weight.dtype))
+
+    def token_residual(
+        self,
+        action: torch.Tensor,
+        *,
+        num_current_frames: int,
+        tokens_per_frame: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
         if action.shape[1] < num_current_frames:
             raise ValueError(
                 "MinWM action window is shorter than the current latent chunk"

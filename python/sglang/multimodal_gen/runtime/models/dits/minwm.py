@@ -51,7 +51,11 @@ from sglang.multimodal_gen.runtime.models.dits.causal_wanvideo import (
     CausalWanTransformer3DModel,
 )
 from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
+    PrimitiveRoPETokenResidualActionEncoder,
     PrimitiveTokenResidualActionEncoder,
+)
+from sglang.multimodal_gen.runtime.models.dits.minwm_kv_cache import (
+    MinWMCausalSelfAttentionKVCache,
 )
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanT2VCrossAttention
 from sglang.multimodal_gen.runtime.platforms import (
@@ -321,11 +325,9 @@ def _minwm_qk_norm_rope_op(
     rope: torch.Tensor,
     num_heads: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    query = MinWMRMSNorm._norm(query, query_weight, eps)
-    key = MinWMRMSNorm._norm(key, key_weight, eps)
-    *leading, dim = query.shape
-    query = query.reshape(*leading, num_heads, dim // num_heads)
-    key = key.reshape(*leading, num_heads, dim // num_heads)
+    query, key = _minwm_qk_norm_op(
+        query, key, query_weight, key_weight, eps, num_heads
+    )
 
     def apply(hidden_states: torch.Tensor) -> torch.Tensor:
         sequence_length = hidden_states.shape[-3]
@@ -338,18 +340,25 @@ def _minwm_qk_norm_rope_op(
             2,
         )
         cos, sin = shaped_rope[..., 0], shaped_rope[..., 1]
-        real = hidden_states[..., 0::2].float()
-        imaginary = hidden_states[..., 1::2].float()
-        return (
-            torch.stack(
-                (real * cos - imaginary * sin, real * sin + imaginary * cos),
-                dim=-1,
-            )
-            .flatten(-2)
-            .type_as(hidden_states)
-        )
+        return apply_minwm_rotary_embedding(hidden_states, cos, sin)
 
     return apply(query), apply(key)
+
+
+def _minwm_qk_norm_op(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    query_weight: torch.Tensor,
+    key_weight: torch.Tensor,
+    eps: float,
+    num_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    query = MinWMRMSNorm._norm(query, query_weight, eps)
+    key = MinWMRMSNorm._norm(key, key_weight, eps)
+    *leading, dim = query.shape
+    query = query.reshape(*leading, num_heads, dim // num_heads)
+    key = key.reshape(*leading, num_heads, dim // num_heads)
+    return query, key
 
 
 def _minwm_packed_varlen_attention(
@@ -444,6 +453,19 @@ class MinWMCausalSelfAttention(CausalWanSelfAttention):
                 f"ulysses_degree ({ulysses_world_size})."
             )
         self.ulysses_num_heads = self.num_heads // ulysses_world_size
+        self._minwm_rotary_emb = NDRotaryEmbedding(
+            rope_dim_list=[
+                self.head_dim - 4 * (self.head_dim // 6),
+                2 * (self.head_dim // 6),
+                2 * (self.head_dim // 6),
+            ],
+            rope_theta=10000,
+            dtype=(
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
+            ),
+        )
         self.ulysses_attn = (
             self.attn
             if ulysses_world_size == 1
@@ -485,12 +507,10 @@ class MinWMCausalSelfAttention(CausalWanSelfAttention):
                 cache_start,
                 qk_already_roped=qk_already_roped,
             )
+        if not isinstance(kv_cache, MinWMCausalSelfAttentionKVCache):
+            raise TypeError("MinWM inference requires its position-aware raw-K cache")
         if qk_already_roped:
-            roped_query, roped_key = query.type_as(value), key.type_as(value)
-        else:
-            cos, sin = freqs_cis
-            roped_query = apply_minwm_rotary_embedding(query, cos, sin).type_as(value)
-            roped_key = apply_minwm_rotary_embedding(key, cos, sin).type_as(value)
+            raise ValueError("MinWM inference cache must receive unrotated Q/K")
 
         forward_batch = get_forward_context().forward_batch
         sequence_shard_enabled = (
@@ -509,27 +529,34 @@ class MinWMCausalSelfAttention(CausalWanSelfAttention):
                 )
             seq_splits = list(seq_splits)
             uniform_seq_splits = sequence_splits_are_uniform(seq_splits)
-            qkv = torch.cat([roped_query, roped_key, value], dim=-1)
+            qkv = torch.cat([query, key, value], dim=-1)
             qkv = (
                 _usp_input_all_to_all(qkv, head_dim=2)
                 if uniform_seq_splits
                 else _usp_input_all_to_all_varlen(qkv, seq_splits, head_dim=2)
             )
-            roped_query, roped_key, value = qkv.chunk(3, dim=-1)
+            query, key, value = qkv.chunk(3, dim=-1)
 
-        if not sequence_shard_enabled and kv_cache.can_direct_current_attention(
-            roped_key.shape[1]
-        ):
-            attention_key, attention_value = roped_key, value
-        else:
-            cache_view = _minwm_update_and_get_attention_kv(
-                kv_cache,
-                key=roped_key,
-                value=value,
-                current_chunk_start=current_start,
-                cache_head_start=0 if sequence_shard_enabled else self.head_start,
-            )
-            attention_key, attention_value = cache_view.k, cache_view.v
+        cache_view = _minwm_update_and_get_attention_kv(
+            kv_cache,
+            key=key,
+            value=value,
+            current_chunk_start=current_start,
+            cache_head_start=0 if sequence_shard_enabled else self.head_start,
+        )
+        query_cos, query_sin = self._minwm_rotary_emb.forward_uncached(
+            cache_view.query_position_ids
+        )
+        key_cos, key_sin = self._minwm_rotary_emb.forward_uncached(
+            cache_view.key_position_ids
+        )
+        roped_query = apply_minwm_rotary_embedding(
+            query, query_cos, query_sin
+        ).type_as(value)
+        attention_key = apply_minwm_rotary_embedding(
+            cache_view.k, key_cos, key_sin
+        ).type_as(value)
+        attention_value = cache_view.v
         if _MINWM_ATTENTION_IMPL == "dense":
             output = (self.ulysses_attn if sequence_shard_enabled else self.attn)(
                 roped_query, attention_key, attention_value
@@ -679,19 +706,23 @@ class MinWMCausalTransformerBlock(CausalWanTransformerBlock):
             key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
             qk_already_roped = False
         else:
-            rope = torch.stack(freqs_cis, dim=-1)
-            query, key = _MinWMSegmentCompile.get(
-                _minwm_qk_norm_rope_op, query.is_cuda
-            )(
+            qk_op = (
+                _minwm_qk_norm_rope_op
+                if kv_cache is None
+                else _minwm_qk_norm_op
+            )
+            qk_args = [
                 query.squeeze(1),
                 key.squeeze(1),
                 self.norm_q.weight,
                 self.norm_k.weight,
                 self.norm_q.eps,
-                rope,
-                self.local_num_heads,
-            )
-            qk_already_roped = True
+            ]
+            if kv_cache is None:
+                qk_args.append(torch.stack(freqs_cis, dim=-1))
+            qk_args.append(self.local_num_heads)
+            query, key = _MinWMSegmentCompile.get(qk_op, query.is_cuda)(*qk_args)
+            qk_already_roped = kv_cache is None
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         attn_output = self.attn1(
             query,
@@ -814,7 +845,12 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
             block.norm_k = MinWMRMSNorm(config.hidden_size, eps=config.eps)
             block.attn2.norm_q = MinWMRMSNorm(config.hidden_size, eps=config.eps)
             block.attn2.norm_k = MinWMRMSNorm(config.hidden_size, eps=config.eps)
-        self.action_in = PrimitiveTokenResidualActionEncoder(
+        action_encoder_cls = (
+            PrimitiveRoPETokenResidualActionEncoder
+            if config.action_type == "primitive_rope_token_residual"
+            else PrimitiveTokenResidualActionEncoder
+        )
+        self.action_in = action_encoder_cls(
             self.hidden_size,
             embed_dim=config.action_embed_dim,
             hidden_dim=config.action_hidden_dim,
@@ -865,6 +901,40 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
         start_frame: int = 0,
         action: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if kv_cache is not None:
+            _, _, num_frames, latent_height, latent_width = hidden_states.shape
+            _, patch_height, patch_width = self.patch_size
+            grid_height = latent_height // patch_height
+            grid_width = latent_width // patch_width
+            temporal = (
+                torch.arange(
+                    num_frames,
+                    device=hidden_states.device,
+                    dtype=torch.long,
+                )
+                + int(start_frame)
+            )
+            temporal = temporal[:, None, None].expand(
+                num_frames, grid_height, grid_width
+            )
+            height_ids = torch.arange(
+                grid_height, device=hidden_states.device, dtype=torch.long
+            )[None, :, None].expand(num_frames, grid_height, grid_width)
+            width_ids = torch.arange(
+                grid_width, device=hidden_states.device, dtype=torch.long
+            )[None, None, :].expand(num_frames, grid_height, grid_width)
+            position_ids = torch.stack(
+                [temporal, height_ids, width_ids], dim=-1
+            ).reshape(-1, 3)
+            for cache_block in kv_cache:
+                if not isinstance(
+                    cache_block, MinWMCausalSelfAttentionKVCache
+                ):
+                    raise TypeError(
+                        "MinWM transformer requires position-aware raw-K caches"
+                    )
+                cache_block.set_current_position_ids(position_ids)
+
         forward_batch = get_forward_context().forward_batch
         sequence_shard_enabled = (
             forward_batch is not None

@@ -8,6 +8,11 @@ from typing import TYPE_CHECKING, Any
 from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
     MINWM_ACTION_LABELS_CONDITION,
     MINWM_ACTION_WEIGHTS_CONDITION,
+    MINWM_CHUNK_SEED_CONDITION,
+    MINWM_CHUNK_SEED_PREFIX_FRAMES_CONDITION,
+    MINWM_CHUNK_SEEDS_INPUT,
+    MINWM_CONDITION_SWITCH_CONDITION,
+    MINWM_PROMPT_SCHEDULE_INPUT,
     MINWM_PROMPT_UPDATED_CONDITION,
     MINWM_TOTAL_CHUNKS_CONDITION,
     MINWM_TOTAL_LATENT_FRAMES_CONDITION,
@@ -53,10 +58,15 @@ class MinWMRealtimeState(RealtimeCameraControlState):
         self.action_weight_queue = ControlScriptQueue(
             "action_weights", max_events=32768, default_item=[0.0] * 8
         )
-        self.prompt_queue = ControlSignalQueue(max_events={"prompt": 1})
+        self.prompt_queue = ControlSignalQueue(max_events={"condition_switch": 1})
+        self.seed_queue = ControlScriptQueue(
+            "chunk_seeds", max_events=4096, default_item=0
+        )
         self.prompt_event_id: int | None = None
         self.label_event_id: int | None = None
         self.weight_event_id: int | None = None
+        self.seed_event_id: int | None = None
+        self.prompt_schedule: dict[int, tuple[str, str]] = {}
         self.action_mode = "camera"
 
     def clear(self) -> None:
@@ -64,9 +74,12 @@ class MinWMRealtimeState(RealtimeCameraControlState):
         self.action_label_queue.clear()
         self.action_weight_queue.clear()
         self.prompt_queue.clear()
+        self.seed_queue.clear()
         self.prompt_event_id = None
         self.label_event_id = None
         self.weight_event_id = None
+        self.seed_event_id = None
+        self.prompt_schedule.clear()
         self.action_mode = "camera"
 
     def receive_action_labels(
@@ -109,15 +122,50 @@ class MinWMRealtimeState(RealtimeCameraControlState):
         self.action_mode = "camera"
         super().receive_camera_state_transitions(transitions)
 
-    def receive_prompt(self, prompt: str, *, event_id: int | None = None) -> None:
-        self.prompt_queue.replace("prompt", prompt, event_id=event_id)
+    def receive_prompt(
+        self,
+        prompt: str,
+        *,
+        event_id: int | None = None,
+        switch_kind: str = "prompt",
+    ) -> None:
+        if switch_kind not in {"prompt", "scene_cut"}:
+            raise ValueError("MinWM condition switch must be prompt or scene_cut")
+        self.prompt_queue.replace(
+            "condition_switch",
+            {"kind": switch_kind, "prompt": prompt},
+            event_id=event_id,
+        )
 
-    def sample_prompt(self) -> str:
-        prompt = self.prompt_queue.pop_latest("prompt")
-        if not isinstance(prompt, str):
-            raise ValueError("prompt event payload must be a string")
-        self.prompt_event_id = self.prompt_queue.last_sampled_seq_id("prompt")
-        return prompt
+    def receive_chunk_seeds(
+        self, seeds: list[int], *, event_id: int | None = None
+    ) -> None:
+        self.seed_queue.push_script(seeds, event_id=event_id)
+
+    def receive_prompt_schedule(
+        self, schedule: dict[int, tuple[str, str]]
+    ) -> None:
+        self.prompt_schedule = dict(schedule)
+
+    def sample_chunk_seed(self) -> int | None:
+        if not self.seed_queue.has_script():
+            return None
+        seed = self.seed_queue.sample_script(1)[0]
+        self.seed_event_id = self.seed_queue.last_sampled_seq_id()
+        return int(seed)
+
+    def sample_prompt(self) -> tuple[str, str]:
+        condition_switch = self.prompt_queue.pop_latest("condition_switch")
+        if not isinstance(condition_switch, dict):
+            raise ValueError("MinWM condition switch payload must be an object")
+        prompt = condition_switch.get("prompt")
+        switch_kind = condition_switch.get("kind")
+        if not isinstance(prompt, str) or switch_kind not in {"prompt", "scene_cut"}:
+            raise ValueError("invalid MinWM condition switch payload")
+        self.prompt_event_id = self.prompt_queue.last_sampled_seq_id(
+            "condition_switch"
+        )
+        return prompt, switch_kind
 
     def sample_action_labels(self, chunk_size: int) -> list[int]:
         if self.action_label_queue.has_script():
@@ -165,6 +213,51 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
             raise ValueError("prompt event payload must be a non-empty string")
         return payload
 
+    @staticmethod
+    def _validate_chunk_seeds(payload: Any) -> list[int]:
+        if not isinstance(payload, list) or not payload:
+            raise ValueError("chunk_seeds must be a non-empty list[int]")
+        seeds = []
+        for seed in payload:
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise ValueError("chunk_seeds must be a non-empty list[int]")
+            if not 0 <= seed < 2**63:
+                raise ValueError("MinWM chunk seeds must be in [0, 2**63)")
+            seeds.append(seed)
+        return seeds
+
+    @staticmethod
+    def _validate_prompt_schedule(payload: Any) -> dict[int, tuple[str, str]]:
+        if not isinstance(payload, list):
+            raise ValueError("minwm_prompt_schedule must be a list")
+        schedule = {}
+        for item in payload:
+            if not isinstance(item, dict):
+                raise ValueError("each MinWM prompt schedule item must be an object")
+            target_chunk = item.get("target_chunk")
+            prompt = item.get("prompt")
+            switch_kind = item.get("kind", "prompt")
+            if (
+                isinstance(target_chunk, bool)
+                or not isinstance(target_chunk, int)
+                or target_chunk < 1
+            ):
+                raise ValueError(
+                    "MinWM prompt schedule target_chunk must be a positive integer"
+                )
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise ValueError("MinWM prompt schedule prompt must be non-empty")
+            if switch_kind not in {"prompt", "scene_cut"}:
+                raise ValueError(
+                    "MinWM prompt schedule kind must be prompt or scene_cut"
+                )
+            if target_chunk in schedule:
+                raise ValueError(
+                    f"duplicate MinWM prompt schedule chunk {target_chunk}"
+                )
+            schedule[target_chunk] = (prompt, switch_kind)
+        return schedule
+
     async def on_init(
         self,
         session: GenerateSession,
@@ -179,6 +272,20 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
         request.guidance_scale = 0.0
         request.guidance_scale_2 = None
         inputs = request.condition_inputs or {}
+        chunk_seeds_value = inputs.get(
+            "chunk_seeds", inputs.get(MINWM_CHUNK_SEEDS_INPUT)
+        )
+        chunk_seeds = (
+            None
+            if chunk_seeds_value is None
+            else self._validate_chunk_seeds(chunk_seeds_value)
+        )
+        if chunk_seeds is not None:
+            state.receive_chunk_seeds(chunk_seeds)
+        prompt_schedule = self._validate_prompt_schedule(
+            inputs.get(MINWM_PROMPT_SCHEDULE_INPUT, [])
+        )
+        state.receive_prompt_schedule(prompt_schedule)
         label_values = [
             value
             for key in ("action_labels", MINWM_ACTION_LABELS_CONDITION)
@@ -224,6 +331,19 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
                     f"expected {total_chunks}, got {request.max_chunks}"
                 )
             request.max_chunks = total_chunks
+        if (
+            chunk_seeds is not None
+            and request.max_chunks is not None
+            and len(chunk_seeds) != request.max_chunks
+        ):
+            raise ValueError(
+                "MinWM chunk_seeds length must match max_chunks: "
+                f"{len(chunk_seeds)} vs {request.max_chunks}"
+            )
+        if request.max_chunks is not None and any(
+            chunk_index >= request.max_chunks for chunk_index in prompt_schedule
+        ):
+            raise ValueError("MinWM prompt schedule target is outside max_chunks")
 
     @staticmethod
     def _t2v_total_latent_frames(
@@ -294,10 +414,19 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
                 event_id=event.event_id,
                 validate_camera_actions=self._validate_camera_actions,
             )
-        if event.kind == "prompt":
+        if event.kind in {"prompt", "scene_cut"}:
             prompt = self._validate_prompt(event.payload)
-            state.receive_prompt(prompt, event_id=event.event_id)
-            return f"kind=prompt, prompt_len={len(prompt)}"
+            state.receive_prompt(
+                prompt,
+                event_id=event.event_id,
+                switch_kind=event.kind,
+            )
+            return f"kind={event.kind}, prompt_len={len(prompt)}"
+        if event.kind in {"seed", "chunk_seeds"}:
+            payload = [event.payload] if event.kind == "seed" else event.payload
+            seeds = self._validate_chunk_seeds(payload)
+            state.receive_chunk_seeds(seeds, event_id=event.event_id)
+            return f"kind={event.kind}, seeds={len(seeds)}"
         raise ValueError(f"unsupported MinWM event kind: {event.kind}")
 
     def sample_chunk_inputs(
@@ -312,24 +441,39 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
         if request is None:
             raise ValueError("realtime request is not initialized")
         prompt_updated = False
+        condition_switch = None
         prompt = request.prompt
-        if chunk.index > 0 and state.prompt_queue.has_events("prompt"):
-            prompt = state.sample_prompt()
+        scheduled_prompt = state.prompt_schedule.get(chunk.index)
+        if scheduled_prompt is not None:
+            prompt, condition_switch = scheduled_prompt
+            request.prompt = prompt
+            prompt_updated = True
+        elif chunk.index > 0 and state.prompt_queue.has_events("condition_switch"):
+            prompt, condition_switch = state.sample_prompt()
             request.prompt = prompt
             prompt_updated = True
         condition_inputs = {}
+        t2v_first_block = (
+            getattr(request, "first_frame", None) is None and chunk.index == 0
+        )
         if state.action_mode == "weights":
             temporal_factor = int(
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_temporal
             )
-            rows = state.sample_action_weights(chunk_size * temporal_factor)
+            rows = (
+                [[0.0] * 8] * (chunk_size * temporal_factor)
+                if t2v_first_block
+                else state.sample_action_weights(chunk_size * temporal_factor)
+            )
             condition_inputs[MINWM_ACTION_WEIGHTS_CONDITION] = [
                 rows[start : start + temporal_factor]
                 for start in range(0, len(rows), temporal_factor)
             ]
         else:
             condition_inputs[MINWM_ACTION_LABELS_CONDITION] = (
-                state.sample_action_labels(chunk_size)
+                [0] * chunk_size
+                if t2v_first_block
+                else state.sample_action_labels(chunk_size)
             )
         if request.max_chunks is not None:
             condition_inputs[MINWM_TOTAL_CHUNKS_CONDITION] = int(request.max_chunks)
@@ -338,6 +482,22 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
             condition_inputs[MINWM_TOTAL_LATENT_FRAMES_CONDITION] = total_latent_frames
         if prompt_updated:
             condition_inputs[MINWM_PROMPT_UPDATED_CONDITION] = True
+            condition_inputs[MINWM_CONDITION_SWITCH_CONDITION] = condition_switch
+        chunk_seed = state.sample_chunk_seed()
+        if chunk_seed is not None:
+            condition_inputs[MINWM_CHUNK_SEED_CONDITION] = chunk_seed
+            if getattr(request, "first_frame", None) is not None:
+                prefix_frames = 1 + chunk.index * int(
+                    server_args.pipeline_config.dit_config.arch_config.num_frames_per_block
+                )
+            elif chunk.index == 0:
+                prefix_frames = 0
+            else:
+                arch_config = server_args.pipeline_config.dit_config.arch_config
+                prefix_frames = int(arch_config.num_frame_first_block) + (
+                    chunk.index - 1
+                ) * int(arch_config.num_frames_per_block)
+            condition_inputs[MINWM_CHUNK_SEED_PREFIX_FRAMES_CONDITION] = prefix_frames
         return RealtimeChunkInputs(prompt=prompt, condition_inputs=condition_inputs)
 
     def build_sampling_params(
@@ -372,6 +532,7 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
             state.prompt_event_id,
             state.label_event_id,
             state.weight_event_id,
+            state.seed_event_id,
             state.latest_sampled_event_id,
         )
         return max(

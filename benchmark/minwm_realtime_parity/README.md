@@ -15,6 +15,10 @@ evidence, and one-time cutover cost are recorded in
 The 60-second Dragon Ride UniPC run, exact W/S/idle timeline, native-scheduler
 decision, throughput result, and comprehension quiz are recorded in
 [`DRAGON_RIDE_60S_BITWISE.zh-CN.md`](DRAGON_RIDE_60S_BITWISE.zh-CN.md).
+The 2026-07-29 Tianpeng detailmix checkpoint, block-relative RoPE/cache port,
+per-block director replay contract, and synchronized comparison runner are
+documented in
+[`TIANPENG_GAP12_ALIGNMENT.zh-CN.md`](TIANPENG_GAP12_ALIGNMENT.zh-CN.md).
 
 ## Inputs
 

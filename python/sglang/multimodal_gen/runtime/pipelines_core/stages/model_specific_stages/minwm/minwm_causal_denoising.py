@@ -11,6 +11,9 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
     MINWM_ACTION_LABELS_CONDITION,
     MINWM_ACTION_WEIGHTS_CONDITION,
+    MINWM_CHUNK_SEED_CONDITION,
+    MINWM_CHUNK_SEED_PREFIX_FRAMES_CONDITION,
+    MINWM_CONDITION_SWITCH_CONDITION,
     MINWM_PROMPT_UPDATED_CONDITION,
     MINWM_TOTAL_CHUNKS_CONDITION,
     MINWM_TOTAL_LATENT_FRAMES_CONDITION,
@@ -23,6 +26,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
     validate_action_labels,
     validate_action_weights,
+)
+from sglang.multimodal_gen.runtime.models.dits.minwm_kv_cache import (
+    MinWMCausalSelfAttentionKVCache,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -109,14 +115,30 @@ class MinWMChunkLatentPreparationStage(PipelineStage):
             latent_width,
         )
         noise_bfchw = None
+        condition_inputs = batch.condition_inputs or {}
+        chunk_seed = condition_inputs.get(MINWM_CHUNK_SEED_CONDITION)
+        if chunk_seed is not None:
+            prefix_frames = int(
+                condition_inputs.get(MINWM_CHUNK_SEED_PREFIX_FRAMES_CONDITION, 0)
+            )
+            if prefix_frames < 0:
+                raise ValueError("MinWM chunk seed prefix frames must be non-negative")
+            chunk_generator = torch.Generator(device=get_local_torch_device())
+            chunk_generator.manual_seed(int(chunk_seed))
+            replay_noise_bfchw = torch.randn(
+                (batch_size, prefix_frames + chunk_size, *shape_tail),
+                generator=chunk_generator,
+                device=get_local_torch_device(),
+                dtype=latent_dtype,
+            )
+            noise_bfchw = replay_noise_bfchw[:, prefix_frames:]
         if batch.session is not None:
             state = get_realtime_causal_dit_state(batch.session)
-            condition_inputs = batch.condition_inputs or {}
             total_chunks = condition_inputs.get(MINWM_TOTAL_CHUNKS_CONDITION)
             total_latent_frames = condition_inputs.get(
                 MINWM_TOTAL_LATENT_FRAMES_CONDITION
             )
-            if batch.block_idx == 0:
+            if batch.block_idx == 0 and chunk_seed is None:
                 if total_chunks is not None and int(total_chunks) < 1:
                     raise ValueError("MinWM total chunk count must be positive")
                 if total_latent_frames is not None:
@@ -154,7 +176,7 @@ class MinWMChunkLatentPreparationStage(PipelineStage):
                     _parity_dump("image_latent.pt", condition)
                 _parity_dump("initial_noise_bfchw.pt", full_noise)
             cached_noise = state.runtime_cache.get(MINWM_INITIAL_NOISE_CACHE)
-            if cached_noise is not None:
+            if noise_bfchw is None and cached_noise is not None:
                 start = int(
                     state.runtime_cache.get(MINWM_INITIAL_NOISE_CURSOR_CACHE, 0)
                 )
@@ -236,7 +258,10 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 None,
             )
         super()._apply_causal_cache_overrides(batch, server_args)
-        self._minwm_unbounded_cache = explicit_window is None
+        arch_config = self.transformer.config.arch_config
+        self._minwm_unbounded_cache = (
+            explicit_window is None and int(arch_config.local_attn_size) == -1
+        )
         if not self._minwm_unbounded_cache:
             return
         total_chunks = (batch.condition_inputs or {}).get(MINWM_TOTAL_CHUNKS_CONDITION)
@@ -276,11 +301,97 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             self.sliding_window_num_frames = int(arch_config.sliding_window_num_frames)
 
     def _causal_kv_cache_kwargs(self, policy: CausalDMDCachePolicy) -> dict:
+        arch_config = getattr(
+            getattr(self.transformer, "config", None), "arch_config", None
+        )
         return {
             "sequence_shard_enabled": policy.sequence_shard_enabled,
             "kv_cache_size": policy.expected_cache_tokens,
             "allow_growth": bool(getattr(self, "_minwm_unbounded_cache", True)),
+            "rope_position_mode": str(
+                getattr(arch_config, "rope_position_mode", "absolute")
+            ),
+            "rope_max_frame_gap": int(
+                getattr(arch_config, "rope_max_frame_gap", 1)
+            ),
+            "prompt_first_frame_pin_enabled": bool(
+                getattr(arch_config, "prompt_first_frame_pin_enabled", False)
+            ),
+            "scene_cut_rope_offset": int(
+                getattr(arch_config, "scene_cut_rope_offset", 0)
+            ),
+            "scene_cut_sink_enabled": bool(
+                getattr(arch_config, "scene_cut_sink_enabled", False)
+            ),
         }
+
+    def _initialize_kv_cache(
+        self,
+        batch_size,
+        dtype,
+        device,
+        *,
+        sequence_shard_enabled: bool = False,
+        kv_cache_size: int | None = None,
+        allow_growth: bool = False,
+        rope_position_mode: str = "absolute",
+        rope_max_frame_gap: int = 1,
+        prompt_first_frame_pin_enabled: bool = False,
+        scene_cut_rope_offset: int = 0,
+        scene_cut_sink_enabled: bool = False,
+    ) -> None:
+        num_attention_heads = self._num_causal_cache_attention_heads(
+            sequence_shard_enabled=sequence_shard_enabled
+        )
+        attention_head_dim = self.transformer.attention_head_dim
+        if kv_cache_size is None:
+            kv_cache_size = self._get_causal_kv_cache_size(
+                sequence_shard_enabled=sequence_shard_enabled
+            )
+        use_int_indices = self._use_causal_cache_int_indices(
+            sequence_shard_enabled=sequence_shard_enabled
+        )
+        int_index = 0 if use_int_indices else None
+        sink_tokens = self._get_causal_sink_tokens()
+        attention_window_size = self._get_causal_attention_window_size(kv_cache_size)
+        self.causal_kv_cache = [
+            MinWMCausalSelfAttentionKVCache(
+                k=torch.zeros(
+                    (
+                        batch_size,
+                        kv_cache_size,
+                        num_attention_heads,
+                        attention_head_dim,
+                    ),
+                    dtype=dtype,
+                    device=device,
+                ),
+                v=torch.zeros(
+                    (
+                        batch_size,
+                        kv_cache_size,
+                        num_attention_heads,
+                        attention_head_dim,
+                    ),
+                    dtype=dtype,
+                    device=device,
+                ),
+                global_end_index=torch.zeros(1, dtype=torch.long, device=device),
+                local_end_index=torch.zeros(1, dtype=torch.long, device=device),
+                global_end_index_int=int_index,
+                local_end_index_int=int_index,
+                cache_size=kv_cache_size,
+                sink_tokens=sink_tokens,
+                attention_window_size=attention_window_size,
+                allow_growth=allow_growth,
+                rope_position_mode=rope_position_mode,
+                rope_max_frame_gap=rope_max_frame_gap,
+                prompt_first_frame_pin_enabled=prompt_first_frame_pin_enabled,
+                scene_cut_rope_offset=scene_cut_rope_offset,
+                scene_cut_sink_enabled=scene_cut_sink_enabled,
+            )
+            for _ in range(self.num_transformer_blocks)
+        ]
 
     def _use_causal_cache_int_indices(
         self,
@@ -302,15 +413,32 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             )
         causal_kv_cache = cache_state.kv_cache
         crossattn_cache = cache_state.crossattn_cache
+        first_cache = (
+            causal_kv_cache[0]
+            if causal_kv_cache and len(causal_kv_cache) == self.num_transformer_blocks
+            else None
+        )
+        expected = policy.kv_cache_kwargs
         return (
             batch.block_idx == 0
             or causal_kv_cache is None
             or crossattn_cache is None
             or len(causal_kv_cache) != self.num_transformer_blocks
             or len(crossattn_cache) != self.num_transformer_blocks
-            or causal_kv_cache[0].k.shape[1] < policy.expected_cache_tokens
-            or causal_kv_cache[0].k.shape[2] != policy.num_attention_heads
-            or causal_kv_cache[0].sink_tokens != policy.expected_sink_tokens
+            or not isinstance(first_cache, MinWMCausalSelfAttentionKVCache)
+            or first_cache.k.shape[1] < policy.expected_cache_tokens
+            or first_cache.k.shape[2] != policy.num_attention_heads
+            or first_cache.sink_tokens != policy.expected_sink_tokens
+            or first_cache.rope_position_mode
+            != expected.get("rope_position_mode", "absolute")
+            or first_cache.rope_max_frame_gap
+            != expected.get("rope_max_frame_gap", 1)
+            or first_cache.prompt_first_frame_pin_enabled
+            != expected.get("prompt_first_frame_pin_enabled", False)
+            or first_cache.scene_cut_rope_offset
+            != expected.get("scene_cut_rope_offset", 0)
+            or first_cache.scene_cut_sink_enabled
+            != expected.get("scene_cut_sink_enabled", False)
         )
 
     def _flow_prediction_to_x0(
@@ -486,6 +614,18 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         cache_ctx = super()._prepare_realtime_causal_caches(batch, server_args, ctx)
         if (batch.condition_inputs or {}).get(MINWM_PROMPT_UPDATED_CONDITION):
             self._reset_crossattn_cache(cache_ctx.crossattn_cache)
+            condition_switch = (batch.condition_inputs or {}).get(
+                MINWM_CONDITION_SWITCH_CONDITION, "prompt"
+            )
+            if condition_switch not in {"prompt", "scene_cut"}:
+                raise ValueError(
+                    "MinWM condition switch must be prompt or scene_cut"
+                )
+            for cache_block in cache_ctx.kv_cache:
+                if condition_switch == "scene_cut":
+                    cache_block.mark_scene_cut()
+                else:
+                    cache_block.mark_prompt_switch()
 
         if batch.block_idx == 0 and cache_ctx.current_start_frame == 0:
             if batch.image_latent is None:

@@ -36,7 +36,7 @@ TRANSFORMER_CONFIG = {
     "_diffusers_version": "0.36.0",
     "model_type": "t2v",
     "patch_size": [1, 2, 2],
-    "text_len": 1024,
+    "text_len": 512,
     "in_dim": 48,
     "out_dim": 48,
     "dim": 3072,
@@ -55,6 +55,11 @@ TRANSFORMER_CONFIG = {
     "rope_max_seq_len": 1024,
     "local_attn_size": -1,
     "sink_size": 0,
+    "rope_position_mode": "absolute",
+    "rope_max_frame_gap": 1,
+    "prompt_first_frame_pin_enabled": False,
+    "scene_cut_rope_offset": 0,
+    "scene_cut_sink_enabled": False,
     "num_frame_per_block": 4,
     "num_frame_first_block": 1,
     "num_frames_per_block": 4,
@@ -124,13 +129,27 @@ def validate_generator_state_dict(state_dict: dict[str, torch.Tensor]) -> dict:
     required_shapes = {
         "patch_embedding.weight": (3072, 48, 1, 2, 2),
         "patch_embedding.bias": (3072,),
-        "action_in.move_embedding.weight": (5, 256),
-        "action_in.look_embedding.weight": (5, 256),
         "action_in.encode_1.conv.weight": (512, 512, 3),
         "action_in.encode_2.conv.weight": (512, 512, 3),
         "action_in.proj.weight": (3072, 512),
         "head.head.weight": (192, 3072),
     }
+    has_move_embedding = "action_in.move_embedding.weight" in state_dict
+    has_look_embedding = "action_in.look_embedding.weight" in state_dict
+    if has_move_embedding != has_look_embedding:
+        raise ValueError("incompatible MinWM checkpoint: incomplete action embeddings")
+    action_type = (
+        "primitive_token_residual"
+        if has_move_embedding
+        else "primitive_rope_token_residual"
+    )
+    if has_move_embedding:
+        required_shapes.update(
+            {
+                "action_in.move_embedding.weight": (5, 256),
+                "action_in.look_embedding.weight": (5, 256),
+            }
+        )
     errors = []
     for name, shape in required_shapes.items():
         tensor = state_dict.get(name)
@@ -155,7 +174,7 @@ def validate_generator_state_dict(state_dict: dict[str, torch.Tensor]) -> dict:
         "tensor_count": len(state_dict),
         "parameter_count": sum(tensor.numel() for tensor in state_dict.values()),
         "block_count": len(block_indices),
-        "action_type": "primitive_token_residual",
+        "action_type": action_type,
     }
 
 
@@ -216,6 +235,12 @@ def build_transformer_config(
     local_attn_size: int,
     sink_size: int,
     sliding_window_num_frames: int,
+    action_type: str = "primitive_token_residual",
+    rope_position_mode: str = "absolute",
+    rope_max_frame_gap: int = 1,
+    prompt_first_frame_pin_enabled: bool = False,
+    scene_cut_rope_offset: int = 0,
+    scene_cut_sink_enabled: bool = False,
 ) -> dict:
     if local_attn_size != -1 and local_attn_size <= 0:
         raise ValueError("local_attn_size must be -1 or positive")
@@ -225,14 +250,41 @@ def build_transformer_config(
         raise ValueError("sink_size must be smaller than finite local_attn_size")
     if sliding_window_num_frames <= 0:
         raise ValueError("sliding_window_num_frames must be positive")
+    if (
+        local_attn_size != -1
+        and sliding_window_num_frames != local_attn_size
+    ):
+        raise ValueError(
+            "bounded MinWM requires sliding_window_num_frames to equal "
+            "local_attn_size"
+        )
     if local_attn_size == -1 and sink_size >= sliding_window_num_frames:
         raise ValueError("sink_size must be smaller than sliding_window_num_frames")
+    if action_type not in {
+        "primitive_token_residual",
+        "primitive_rope_token_residual",
+    }:
+        raise ValueError(f"unsupported MinWM action_type={action_type!r}")
+    if rope_position_mode not in {"absolute", "block_relative"}:
+        raise ValueError("rope_position_mode must be absolute or block_relative")
+    if rope_max_frame_gap < 1:
+        raise ValueError("rope_max_frame_gap must be >= 1")
+    if rope_position_mode == "block_relative" and scene_cut_rope_offset:
+        raise ValueError(
+            "block_relative RoPE does not support nonzero scene_cut_rope_offset"
+        )
     config = dict(TRANSFORMER_CONFIG)
     config.update(
         {
             "local_attn_size": local_attn_size,
             "sink_size": sink_size,
             "sliding_window_num_frames": sliding_window_num_frames,
+            "action_type": action_type,
+            "rope_position_mode": rope_position_mode,
+            "rope_max_frame_gap": rope_max_frame_gap,
+            "prompt_first_frame_pin_enabled": prompt_first_frame_pin_enabled,
+            "scene_cut_rope_offset": scene_cut_rope_offset,
+            "scene_cut_sink_enabled": scene_cut_sink_enabled,
         }
     )
     return config
@@ -251,6 +303,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-attn-size", type=int, default=-1)
     parser.add_argument("--sink-size", type=int, default=0)
     parser.add_argument("--sliding-window-num-frames", type=int, default=128)
+    parser.add_argument(
+        "--action-type",
+        choices=(
+            "auto",
+            "primitive_token_residual",
+            "primitive_rope_token_residual",
+        ),
+        default="auto",
+    )
+    parser.add_argument(
+        "--rope-position-mode",
+        choices=("absolute", "block_relative"),
+        default="absolute",
+    )
+    parser.add_argument("--rope-max-frame-gap", type=int, default=1)
+    parser.add_argument("--prompt-first-frame-pin-enabled", action="store_true")
+    parser.add_argument("--scene-cut-rope-offset", type=int, default=0)
+    parser.add_argument("--scene-cut-sink-enabled", action="store_true")
     return parser.parse_args()
 
 
@@ -263,6 +333,14 @@ def main() -> None:
 
     state_dict, selected_key = extract_generator_state_dict(args.minwm_checkpoint)
     summary = validate_generator_state_dict(state_dict)
+    action_type = (
+        summary["action_type"] if args.action_type == "auto" else args.action_type
+    )
+    if action_type != summary["action_type"]:
+        raise ValueError(
+            f"--action-type={action_type} does not match checkpoint tensors "
+            f"({summary['action_type']})"
+        )
     transformer_dir = output_dir / "transformer"
     transformer_dir.mkdir()
     shard_summary = save_sharded_state_dict(
@@ -274,6 +352,12 @@ def main() -> None:
         local_attn_size=args.local_attn_size,
         sink_size=args.sink_size,
         sliding_window_num_frames=args.sliding_window_num_frames,
+        action_type=action_type,
+        rope_position_mode=args.rope_position_mode,
+        rope_max_frame_gap=args.rope_max_frame_gap,
+        prompt_first_frame_pin_enabled=args.prompt_first_frame_pin_enabled,
+        scene_cut_rope_offset=args.scene_cut_rope_offset,
+        scene_cut_sink_enabled=args.scene_cut_sink_enabled,
     )
     with (transformer_dir / "config.json").open("w", encoding="utf-8") as handle:
         json.dump(transformer_config, handle, indent=2, sort_keys=True)

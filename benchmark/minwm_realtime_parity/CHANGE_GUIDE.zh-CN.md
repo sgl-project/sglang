@@ -6,6 +6,9 @@
 [`MinWM-Realtime.zh-CN.mdx`](../../docs_new/cookbook/diffusion/MinWM/MinWM-Realtime.zh-CN.mdx)。
 0724 checkpoint 的 WASD/视角键验证过程单独记录在
 [`ACTION_CONTROL_INVESTIGATION.zh-CN.md`](./ACTION_CONTROL_INVESTIGATION.zh-CN.md)。
+2026-07-29 天鹏 detailmix 模型的 block-relative RoPE、prompt pin、逐 block
+seed 与 1089 帧对齐记录见
+[`TIANPENG_GAP12_ALIGNMENT.zh-CN.md`](./TIANPENG_GAP12_ALIGNMENT.zh-CN.md)。
 
 ## 1. 一句话结论
 

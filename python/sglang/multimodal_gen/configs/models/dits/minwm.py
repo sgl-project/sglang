@@ -42,7 +42,7 @@ class MinWMVideoArchConfig(DiTArchConfig):
     lora_param_names_mapping: dict = field(default_factory=lambda: {})
 
     patch_size: tuple[int, int, int] = (1, 2, 2)
-    text_len: int = 1024
+    text_len: int = 512
     num_attention_heads: int = 24
     attention_head_dim: int = 128
     in_channels: int = 48
@@ -62,6 +62,11 @@ class MinWMVideoArchConfig(DiTArchConfig):
 
     local_attn_size: int = -1
     sink_size: int = 0
+    rope_position_mode: str = "absolute"
+    rope_max_frame_gap: int = 1
+    prompt_first_frame_pin_enabled: bool = False
+    scene_cut_rope_offset: int = 0
+    scene_cut_sink_enabled: bool = False
     num_frame_first_block: int = 1
     num_frames_per_block: int = 4
     sliding_window_num_frames: int = 128
@@ -73,9 +78,39 @@ class MinWMVideoArchConfig(DiTArchConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.action_type != "primitive_token_residual":
+        if self.action_type not in {
+            "primitive_token_residual",
+            "primitive_rope_token_residual",
+        }:
             raise ValueError(
-                "this checkpoint only supports action_type=primitive_token_residual"
+                "MinWM action_type must be primitive_token_residual or "
+                "primitive_rope_token_residual"
+            )
+        if self.rope_position_mode not in {"absolute", "block_relative"}:
+            raise ValueError(
+                "MinWM rope_position_mode must be absolute or block_relative"
+            )
+        if self.rope_max_frame_gap < 1:
+            raise ValueError("MinWM rope_max_frame_gap must be >= 1")
+        if self.local_attn_size != -1 and self.local_attn_size <= 0:
+            raise ValueError("MinWM local_attn_size must be -1 or positive")
+        if self.sink_size < 0:
+            raise ValueError("MinWM sink_size must be non-negative")
+        if (
+            self.local_attn_size != -1
+            and self.sink_size >= self.local_attn_size
+        ):
+            raise ValueError("MinWM sink_size must be smaller than local_attn_size")
+        if (
+            self.local_attn_size != -1
+            and self.sliding_window_num_frames != self.local_attn_size
+        ):
+            raise ValueError(
+                "MinWM sliding_window_num_frames must equal bounded local_attn_size"
+            )
+        if self.rope_position_mode == "block_relative" and self.scene_cut_rope_offset:
+            raise ValueError(
+                "MinWM block_relative RoPE does not support scene_cut_rope_offset"
             )
         self.hidden_size = self.num_attention_heads * self.attention_head_dim
         self.num_channels_latents = self.out_channels

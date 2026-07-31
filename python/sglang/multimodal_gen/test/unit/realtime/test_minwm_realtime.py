@@ -7,6 +7,9 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
     MINWM_ACTION_LABELS_CONDITION,
     MINWM_ACTION_WEIGHTS_CONDITION,
+    MINWM_CHUNK_SEED_CONDITION,
+    MINWM_CHUNK_SEED_PREFIX_FRAMES_CONDITION,
+    MINWM_CONDITION_SWITCH_CONDITION,
     MINWM_PROMPT_UPDATED_CONDITION,
     MINWM_TOTAL_CHUNKS_CONDITION,
     MINWM_TOTAL_LATENT_FRAMES_CONDITION,
@@ -30,15 +33,20 @@ from sglang.multimodal_gen.runtime.models.dits.minwm import (
     _minwm_frame_indices,
     _minwm_layer_norm,
     _minwm_packed_attention_backend,
+    _minwm_qk_norm_op,
     _minwm_qk_norm_rope_op,
     apply_minwm_rotary_embedding,
 )
 from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
+    PrimitiveRoPETokenResidualActionEncoder,
     PrimitiveTokenResidualActionEncoder,
     action_labels_to_primitive_bits,
     key_state_to_action_label,
     validate_action_labels,
     validate_action_weights,
+)
+from sglang.multimodal_gen.runtime.models.dits.minwm_kv_cache import (
+    MinWMCausalSelfAttentionKVCache,
 )
 from sglang.multimodal_gen.runtime.pipelines.minwm_causal_dmd_pipeline import (
     MinWMCausalDMDPipeline,
@@ -197,6 +205,131 @@ def test_minwm_binary_weight_windows_are_label_path_degenerate_case():
         rtol=3e-5,
         atol=3e-7,
     )
+
+
+def test_minwm_primitive_rope_action_binary_windows_match_labels():
+    torch.manual_seed(29)
+    encoder = PrimitiveRoPETokenResidualActionEncoder(
+        dim=24, embed_dim=8, hidden_dim=16, kernel_size=3
+    )
+    labels = torch.tensor([[0, 9, 10, 1]])
+    windows = (
+        action_labels_to_primitive_bits(labels).unsqueeze(2).expand(-1, -1, 4, -1)
+    )
+    torch.testing.assert_close(
+        encoder.frame_states(windows),
+        encoder.frame_states(labels),
+        rtol=0,
+        atol=0,
+    )
+
+
+def _make_minwm_test_cache(
+    *,
+    cache_size=6,
+    sink_tokens=1,
+    rope_position_mode="absolute",
+    rope_max_frame_gap=1,
+    prompt_first_frame_pin_enabled=False,
+    scene_cut_rope_offset=0,
+    scene_cut_sink_enabled=False,
+):
+    return MinWMCausalSelfAttentionKVCache(
+        k=torch.zeros(1, cache_size, 1, 2),
+        v=torch.zeros(1, cache_size, 1, 2),
+        global_end_index=torch.zeros(1, dtype=torch.long),
+        local_end_index=torch.zeros(1, dtype=torch.long),
+        cache_size=cache_size,
+        sink_tokens=sink_tokens,
+        attention_window_size=cache_size,
+        rope_position_mode=rope_position_mode,
+        rope_max_frame_gap=rope_max_frame_gap,
+        prompt_first_frame_pin_enabled=prompt_first_frame_pin_enabled,
+        scene_cut_rope_offset=scene_cut_rope_offset,
+        scene_cut_sink_enabled=scene_cut_sink_enabled,
+    )
+
+
+def _append_minwm_test_frames(cache, frames, *, token_start):
+    frames = torch.tensor(frames, dtype=torch.long)
+    position_ids = torch.stack(
+        [frames, torch.zeros_like(frames), torch.zeros_like(frames)], dim=1
+    )
+    values = (
+        torch.arange(token_start, token_start + len(frames), dtype=torch.float32)
+        .view(1, -1, 1, 1)
+        .expand(-1, -1, -1, 2)
+    )
+    return cache.update_and_get_attention_kv(
+        key=values,
+        value=-values,
+        current_chunk_start=token_start,
+        position_ids=position_ids,
+    )
+
+
+def test_minwm_raw_k_cache_overwrites_active_chunk_without_appending():
+    cache = _make_minwm_test_cache(cache_size=4, sink_tokens=0)
+    first = _append_minwm_test_frames(cache, [0, 1], token_start=0)
+    replacement = torch.full((1, 2, 1, 2), 7.0)
+    cache.update_and_get_attention_kv(
+        key=replacement,
+        value=-replacement,
+        current_chunk_start=0,
+        position_ids=torch.tensor([[0, 0, 0], [1, 0, 0]]),
+    )
+    assert cache._read_indices() == (2, 2)
+    assert cache.token_ids.tolist() == [0, 1]
+    torch.testing.assert_close(cache.k[:, :2], replacement, rtol=0, atol=0)
+    assert first.key_position_ids[:, 0].tolist() == [0, 1]
+
+
+def test_minwm_block_relative_rope_clamps_visible_frame_gaps():
+    cache = _make_minwm_test_cache(
+        cache_size=6,
+        sink_tokens=1,
+        rope_position_mode="block_relative",
+        rope_max_frame_gap=3,
+    )
+    view = None
+    for token_start, frame in enumerate([0, 1, 2, 10, 11, 12, 13, 14]):
+        view = _append_minwm_test_frames(cache, [frame], token_start=token_start)
+    assert cache.position_ids[:, 0].tolist() == [0, 10, 11, 12, 13, 14]
+    assert view.key_position_ids[:, 0].tolist() == [0, 3, 4, 5, 6, 7]
+    assert view.query_position_ids[:, 0].tolist() == [7]
+
+
+def test_minwm_prompt_first_frame_promotes_only_when_leaving_tail():
+    cache = _make_minwm_test_cache(
+        cache_size=6,
+        sink_tokens=1,
+        rope_position_mode="block_relative",
+        prompt_first_frame_pin_enabled=True,
+    )
+    _append_minwm_test_frames(cache, [0, 1], token_start=0)
+    cache.mark_prompt_switch()
+    _append_minwm_test_frames(cache, [2], token_start=2)
+    for frame in (3, 4, 5, 6):
+        _append_minwm_test_frames(cache, [frame], token_start=frame)
+    assert cache.token_ids.tolist() == [0, 2, 3, 4, 5, 6]
+    assert cache.pinned_token_start is None
+    _append_minwm_test_frames(cache, [7], token_start=7)
+    assert cache.token_ids.tolist() == [0, 2, 4, 5, 6, 7]
+    assert (cache.pinned_token_start, cache.pinned_token_end) == (2, 3)
+
+
+def test_minwm_scene_cut_updates_absolute_rope_and_pins_sink_prefix():
+    cache = _make_minwm_test_cache(
+        cache_size=6,
+        sink_tokens=2,
+        scene_cut_rope_offset=11,
+        scene_cut_sink_enabled=True,
+    )
+    _append_minwm_test_frames(cache, [0, 1], token_start=0)
+    cache.mark_scene_cut()
+    view = _append_minwm_test_frames(cache, [2, 3, 4], token_start=2)
+    assert view.query_position_ids[:, 0].tolist() == [13, 14, 15]
+    assert (cache.pinned_token_start, cache.pinned_token_end) == (2, 4)
 
 
 def test_minwm_action_history_chunk_matches_full_sequence():
@@ -360,12 +493,66 @@ def test_minwm_t2v_presamples_exact_horizon_without_reference_slot(monkeypatch):
     assert torch.equal(generator.get_state(), expected_generator.get_state())
 
 
+def test_minwm_director_chunk_seed_replays_prefix_rng_before_tail(monkeypatch):
+    import sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minwm.minwm_causal_denoising as stage_module
+
+    monkeypatch.setattr(
+        stage_module, "get_local_torch_device", lambda: torch.device("cpu")
+    )
+    transformer = SimpleNamespace(
+        config=SimpleNamespace(
+            arch_config=SimpleNamespace(num_frames_per_block=4, out_channels=2)
+        )
+    )
+    stage = MinWMChunkLatentPreparationStage(transformer)
+    prefix_frames = 5
+    chunk_frames = 4
+    seed = 729003
+    batch = SimpleNamespace(
+        latents=None,
+        image_latent=None,
+        realtime_chunk_size=chunk_frames,
+        generator=torch.Generator().manual_seed(1),
+        session=RealtimeSession(),
+        block_idx=2,
+        condition_inputs={
+            MINWM_CHUNK_SEED_CONDITION: seed,
+            MINWM_CHUNK_SEED_PREFIX_FRAMES_CONDITION: prefix_frames,
+        },
+        raw_latent_shape=None,
+        height=16,
+        width=32,
+        batch_size=1,
+        prompt_embeds=[torch.zeros(1, 1, 1)],
+    )
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(scale_factor_spatial=16)
+            )
+        )
+    )
+    expected_generator = torch.Generator().manual_seed(seed)
+    expected = torch.randn(
+        (1, prefix_frames + chunk_frames, 2, 1, 2),
+        generator=expected_generator,
+    )[:, prefix_frames:]
+    output = stage.forward(batch, server_args)
+    torch.testing.assert_close(
+        output.latents,
+        expected.permute(0, 2, 1, 3, 4),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_minwm_default_kv_horizon_retains_complete_bounded_session():
     stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
     stage.transformer = SimpleNamespace(
         config=SimpleNamespace(
             arch_config=SimpleNamespace(
                 sink_size=0,
+                local_attn_size=-1,
                 sliding_window_num_frames=128,
             )
         )
@@ -403,6 +590,7 @@ def test_minwm_causal_cache_overrides_do_not_leak_between_requests():
         config=SimpleNamespace(
             arch_config=SimpleNamespace(
                 sink_size=0,
+                local_attn_size=-1,
                 sliding_window_num_frames=128,
             )
         )
@@ -445,6 +633,7 @@ def test_minwm_t2v_default_kv_horizon_uses_exact_latent_count():
         config=SimpleNamespace(
             arch_config=SimpleNamespace(
                 sink_size=0,
+                local_attn_size=-1,
                 sliding_window_num_frames=128,
                 num_frame_first_block=1,
             )
@@ -470,6 +659,38 @@ def test_minwm_t2v_default_kv_horizon_uses_exact_latent_count():
 
     assert stage.sliding_window_num_frames == 182
     assert stage._minwm_unbounded_cache is True
+
+
+def test_minwm_model_bounded_window_is_not_expanded_to_request_horizon():
+    stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
+    stage.transformer = SimpleNamespace(
+        config=SimpleNamespace(
+            arch_config=SimpleNamespace(
+                sink_size=8,
+                local_attn_size=32,
+                sliding_window_num_frames=32,
+            )
+        )
+    )
+    stage.sink_size = 8
+    stage.sliding_window_num_frames = 32
+    stage.num_frames_per_block = 4
+    batch = SimpleNamespace(
+        realtime_causal_sink_size=None,
+        realtime_causal_kv_cache_num_frames=None,
+        condition_inputs={MINWM_TOTAL_LATENT_FRAMES_CONDITION: 273},
+        image_latent=None,
+    )
+    pipeline_config = SimpleNamespace(
+        realtime_causal_sink_size=None,
+        realtime_causal_kv_cache_num_frames=None,
+    )
+    stage._apply_causal_cache_overrides(
+        batch, SimpleNamespace(pipeline_config=pipeline_config)
+    )
+    assert stage.sliding_window_num_frames == 32
+    assert stage.sink_size == 8
+    assert stage._minwm_unbounded_cache is False
 
 
 def test_minwm_t2v_decoder_does_not_prepend_a_reference(monkeypatch):
@@ -699,7 +920,12 @@ def test_minwm_realtime_adapter_groups_pixel_weights_by_vae_factor():
     state.receive_action_weights([row] * 16)
     session = SimpleNamespace(
         adapter_state=state,
-        request=SimpleNamespace(prompt="test", max_chunks=8),
+        request=SimpleNamespace(
+            prompt="test",
+            max_chunks=8,
+            first_frame="/tmp/reference.png",
+            num_frames=None,
+        ),
     )
     server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(
@@ -719,6 +945,114 @@ def test_minwm_realtime_adapter_groups_pixel_weights_by_vae_factor():
     assert all(len(window) == 4 for window in windows)
     assert windows == [[row] * 4] * 4
     assert inputs.condition_inputs[MINWM_TOTAL_CHUNKS_CONDITION] == 8
+
+
+def test_minwm_t2v_first_latent_is_noop_without_consuming_pixel_actions():
+    state = MinWMRealtimeState()
+    first_action = [0.8, 0, 0, 0, 0, 0, 0, 0]
+    state.receive_action_weights([first_action] * 16)
+    session = SimpleNamespace(
+        adapter_state=state,
+        request=SimpleNamespace(
+            prompt="test",
+            max_chunks=2,
+            first_frame=None,
+            num_frames=17,
+        ),
+    )
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            dit_config=SimpleNamespace(
+                arch_config=SimpleNamespace(
+                    num_frame_first_block=1,
+                    num_frames_per_block=4,
+                )
+            ),
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(scale_factor_temporal=4)
+            ),
+        )
+    )
+    adapter = MinWMRealtimeAdapter()
+    first = adapter.sample_chunk_inputs(
+        session, server_args, SimpleNamespace(index=0), chunk_size=1
+    )
+    assert first.condition_inputs[MINWM_ACTION_WEIGHTS_CONDITION] == [
+        [[0.0] * 8] * 4
+    ]
+    second = adapter.sample_chunk_inputs(
+        session, server_args, SimpleNamespace(index=1), chunk_size=4
+    )
+    assert second.condition_inputs[MINWM_ACTION_WEIGHTS_CONDITION] == [
+        [first_action] * 4
+    ] * 4
+
+
+def test_minwm_scheduled_prompt_and_seed_target_exact_chunk():
+    state = MinWMRealtimeState()
+    state.receive_prompt_schedule({3: ("night", "prompt")})
+    state.receive_chunk_seeds([729001, 729002, 729003, 729004])
+    session = SimpleNamespace(
+        adapter_state=state,
+        request=SimpleNamespace(
+            prompt="day",
+            max_chunks=4,
+            first_frame=None,
+            num_frames=53,
+        ),
+    )
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            dit_config=SimpleNamespace(
+                arch_config=SimpleNamespace(
+                    num_frame_first_block=1,
+                    num_frames_per_block=4,
+                )
+            ),
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(scale_factor_temporal=4)
+            ),
+        )
+    )
+    adapter = MinWMRealtimeAdapter()
+    for chunk_index, expected_seed in enumerate(range(729001, 729005)):
+        chunk_size = 1 if chunk_index == 0 else 4
+        inputs = adapter.sample_chunk_inputs(
+            session,
+            server_args,
+            SimpleNamespace(index=chunk_index),
+            chunk_size=chunk_size,
+        )
+        assert inputs.condition_inputs[MINWM_CHUNK_SEED_CONDITION] == expected_seed
+        expected_prefix = 0 if chunk_index == 0 else 1 + (chunk_index - 1) * 4
+        assert (
+            inputs.condition_inputs[MINWM_CHUNK_SEED_PREFIX_FRAMES_CONDITION]
+            == expected_prefix
+        )
+        if chunk_index == 3:
+            assert inputs.prompt == "night"
+            assert inputs.condition_inputs[MINWM_PROMPT_UPDATED_CONDITION] is True
+            assert (
+                inputs.condition_inputs[MINWM_CONDITION_SWITCH_CONDITION] == "prompt"
+            )
+        else:
+            assert inputs.prompt == "day"
+
+
+def test_minwm_prompt_schedule_validation_accepts_scene_cut_kind():
+    assert MinWMRealtimeAdapter._validate_prompt_schedule(
+        [
+            {"target_chunk": 2, "prompt": "snow", "kind": "scene_cut"},
+            {"target_chunk": 5, "prompt": "night"},
+        ]
+    ) == {2: ("snow", "scene_cut"), 5: ("night", "prompt")}
+    with pytest.raises(ValueError, match="duplicate"):
+        MinWMRealtimeAdapter._validate_prompt_schedule(
+            [
+                {"target_chunk": 2, "prompt": "snow"},
+                {"target_chunk": 2, "prompt": "night"},
+            ]
+        )
 
 
 def test_minwm_text_context_keeps_zero_padded_512_contract():
@@ -765,13 +1099,19 @@ def test_minwm_converter_defaults_to_requested_0721_checkpoint():
 
 def test_minwm_converter_records_explicit_cache_policy():
     config = build_transformer_config(
-        local_attn_size=18,
-        sink_size=9,
-        sliding_window_num_frames=18,
+        local_attn_size=32,
+        sink_size=8,
+        sliding_window_num_frames=32,
+        rope_position_mode="block_relative",
+        rope_max_frame_gap=12,
+        prompt_first_frame_pin_enabled=True,
     )
-    assert config["local_attn_size"] == 18
-    assert config["sink_size"] == 9
-    assert config["sliding_window_num_frames"] == 18
+    assert config["local_attn_size"] == 32
+    assert config["sink_size"] == 8
+    assert config["sliding_window_num_frames"] == 32
+    assert config["rope_position_mode"] == "block_relative"
+    assert config["rope_max_frame_gap"] == 12
+    assert config["prompt_first_frame_pin_enabled"] is True
     assert TRANSFORMER_CONFIG["local_attn_size"] == -1
     assert TRANSFORMER_CONFIG["num_frame_first_block"] == 1
     with pytest.raises(ValueError, match="smaller"):
@@ -779,6 +1119,12 @@ def test_minwm_converter_records_explicit_cache_policy():
             local_attn_size=18,
             sink_size=18,
             sliding_window_num_frames=18,
+        )
+    with pytest.raises(ValueError, match="equal"):
+        build_transformer_config(
+            local_attn_size=32,
+            sink_size=8,
+            sliding_window_num_frames=128,
         )
 
 
@@ -928,7 +1274,18 @@ def test_minwm_causal_cache_uses_local_ulysses_heads(monkeypatch):
     import sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minwm.minwm_causal_denoising as stage_module
 
     stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
-    stage.transformer = SimpleNamespace(num_attention_heads=24)
+    stage.transformer = SimpleNamespace(
+        num_attention_heads=24,
+        config=SimpleNamespace(
+            arch_config=SimpleNamespace(
+                rope_position_mode="block_relative",
+                rope_max_frame_gap=12,
+                prompt_first_frame_pin_enabled=True,
+                scene_cut_rope_offset=0,
+                scene_cut_sink_enabled=False,
+            )
+        ),
+    )
     stage._minwm_unbounded_cache = True
     monkeypatch.setattr(stage_module, "get_ulysses_parallel_world_size", lambda: 4)
     monkeypatch.setattr(stage_module, "get_ring_parallel_world_size", lambda: 1)
@@ -944,6 +1301,11 @@ def test_minwm_causal_cache_uses_local_ulysses_heads(monkeypatch):
         "sequence_shard_enabled": True,
         "kv_cache_size": 123,
         "allow_growth": True,
+        "rope_position_mode": "block_relative",
+        "rope_max_frame_gap": 12,
+        "prompt_first_frame_pin_enabled": True,
+        "scene_cut_rope_offset": 0,
+        "scene_cut_sink_enabled": False,
     }
 
 
@@ -997,18 +1359,31 @@ def test_minwm_causal_attention_packs_one_ulysses_collective(monkeypatch, seq_sp
     torch.nn.Module.__init__(attention)
     attention.head_start = 0
 
-    class Cache:
-        def __init__(self):
-            self.kwargs = None
+    class IdentityRotary:
+        @staticmethod
+        def forward_uncached(position_ids):
+            shape = (position_ids.shape[0], head_dim // 2)
+            return torch.ones(shape), torch.zeros(shape)
 
-        def can_direct_current_attention(self, _num_tokens):
-            return False
-
-        def update_and_get_attention_kv(self, **kwargs):
-            self.kwargs = kwargs
-            return SimpleNamespace(k=kwargs["key"], v=kwargs["value"])
-
-    cache = Cache()
+    attention._minwm_rotary_emb = IdentityRotary()
+    cache = MinWMCausalSelfAttentionKVCache(
+        k=torch.zeros(1, global_seq, local_heads, head_dim),
+        v=torch.zeros(1, global_seq, local_heads, head_dim),
+        global_end_index=torch.zeros(1, dtype=torch.long),
+        local_end_index=torch.zeros(1, dtype=torch.long),
+        cache_size=global_seq,
+        attention_window_size=global_seq,
+    )
+    cache.set_current_position_ids(
+        torch.stack(
+            [
+                torch.arange(global_seq),
+                torch.zeros(global_seq, dtype=torch.long),
+                torch.zeros(global_seq, dtype=torch.long),
+            ],
+            dim=1,
+        )
+    )
 
     def fake_attention(query, key, value):
         assert torch.count_nonzero(query != 1).item() == 0
@@ -1025,19 +1400,18 @@ def test_minwm_causal_attention_packs_one_ulysses_collective(monkeypatch, seq_sp
         block_mask=None,
         kv_cache=cache,
         current_start=17,
-        qk_already_roped=True,
+        qk_already_roped=False,
     )
 
     assert output.shape == (1, local_seq, 4, head_dim)
     assert calls == {"input": 1, "output": 1}
-    assert cache.kwargs["key"].shape == (
+    assert cache.k[:, :global_seq].shape == (
         1,
         global_seq,
         local_heads,
         head_dim,
     )
-    assert cache.kwargs["current_chunk_start"] == 17
-    assert cache.kwargs["cache_head_start"] == 0
+    assert cache.token_ids.tolist() == list(range(17, 17 + global_seq))
 
 
 @pytest.mark.parametrize(
@@ -1213,6 +1587,17 @@ def test_minwm_fused_segments_match_main_eager_formulas():
     actual_query, actual_key = _minwm_qk_norm_rope_op(
         query, key, query_weight, key_weight, 1e-6, rope, 2
     )
+    raw_query, raw_key = _minwm_qk_norm_op(
+        query, key, query_weight, key_weight, 1e-6, 2
+    )
+    separated_query = apply_minwm_rotary_embedding(
+        raw_query, rope[..., 0], rope[..., 1]
+    )
+    separated_key = apply_minwm_rotary_embedding(
+        raw_key, rope[..., 0], rope[..., 1]
+    )
+    torch.testing.assert_close(separated_query, actual_query, rtol=0, atol=0)
+    torch.testing.assert_close(separated_key, actual_key, rtol=0, atol=0)
 
     def expected(value, weight):
         value_float = value.float()

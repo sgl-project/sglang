@@ -19,6 +19,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_TI2V_5B_Co
 
 MINWM_ACTION_LABELS_CONDITION = "minwm_action_labels"
 MINWM_ACTION_WEIGHTS_CONDITION = "minwm_action_weights"
+MINWM_CHUNK_SEED_CONDITION = "minwm_chunk_seed"
+MINWM_CHUNK_SEED_PREFIX_FRAMES_CONDITION = "minwm_chunk_seed_prefix_frames"
+MINWM_CHUNK_SEEDS_INPUT = "minwm_chunk_seeds"
+MINWM_CONDITION_SWITCH_CONDITION = "minwm_condition_switch"
+MINWM_PROMPT_SCHEDULE_INPUT = "minwm_prompt_schedule"
 MINWM_PROMPT_UPDATED_CONDITION = "minwm_prompt_updated"
 MINWM_TOTAL_CHUNKS_CONDITION = "minwm_total_chunks"
 MINWM_TOTAL_LATENT_FRAMES_CONDITION = "minwm_total_latent_frames"
