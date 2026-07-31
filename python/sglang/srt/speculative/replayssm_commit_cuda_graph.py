@@ -178,6 +178,7 @@ class ReplayssmCommitGraphRunner:
             with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 self._run_body(bs)
             self.graphs[bs] = graph
+            logger.info("ReplaySSM commit graph captured (bs=%d)", bs)
             return True
         graph.replay()
         return True
