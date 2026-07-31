@@ -81,12 +81,9 @@ async fn chat_completions(
             "max_completion_tokens must be positive",
         );
     }
-    if request.modalities.is_some()
-        && request.modalities.as_ref().is_some_and(|modalities| {
-            serde_json::to_value(modalities)
-                .is_ok_and(|value| value.to_string().contains("\"audio\""))
-        })
-        || request.audio.is_some()
+    if request.modalities.as_ref().is_some_and(|modalities| {
+        serde_json::to_value(modalities).is_ok_and(|value| value.to_string().contains("\"audio\""))
+    }) || request.audio.is_some()
         || request.prediction.is_some()
         || request.web_search_options.is_some()
         || request.mm_processor_kwargs.is_some()
