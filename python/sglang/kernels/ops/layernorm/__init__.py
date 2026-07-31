@@ -360,7 +360,7 @@ class GemmaRMSNormOp(BaseFusedOp):
         enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
         try:
-            from sgl_kernel_npu.norm.gemma_rmsnorm import gemma_rms_norm
+            from sgl_kernel_npu.norm.gemma_rmsnorm import npu_gemma_rms_norm
         except ImportError as error:
             raise RuntimeError(
                 "Gemma RMSNorm on Ascend requires a target-specific "
@@ -368,7 +368,7 @@ class GemmaRMSNormOp(BaseFusedOp):
                 "sgl_kernel_npu.norm.gemma_rmsnorm"
             ) from error
 
-        result = gemma_rms_norm(input, weight, eps)
+        result, _ = npu_gemma_rms_norm(input, weight, eps)
         if out is None:
             return result
         out.copy_(result)

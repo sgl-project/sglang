@@ -160,10 +160,10 @@ logger = logging.getLogger(__name__)
 if _is_npu:
     import torch_npu
 
-    from sglang.kernels.ops.layernorm import (
-        gemma_fused_add_rmsnorm as npu_gemma_fused_add_rmsnorm,
+    from sgl_kernel_npu.norm.gemma_rmsnorm import (
+        add_gemma_rms_norm,
+        npu_gemma_rms_norm,
     )
-    from sglang.kernels.ops.layernorm import gemma_rmsnorm as npu_gemma_rmsnorm
 
 
 @lru_cache(maxsize=1)
@@ -999,11 +999,13 @@ class GemmaRMSNorm(MultiPlatformOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            # The unified fused op updates both x and residual in place.
-            npu_gemma_fused_add_rmsnorm(x, residual, self.weight, self.variance_epsilon)
-            return x, residual
+            norm_out, residual = add_gemma_rms_norm(
+                x, self.weight, residual, self.variance_epsilon
+            )
+            return norm_out, residual
 
-        return npu_gemma_rmsnorm(x, self.weight, self.variance_epsilon)
+        x, _ = npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
+        return x
 
     def forward_xpu(
         self,
@@ -1098,10 +1100,9 @@ class Gemma3RMSNorm(MultiPlatformOp):
         if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
             return self.forward_native(x, residual)
         if residual is not None:
-            # The unified fused op updates both x and residual in place.
-            npu_gemma_fused_add_rmsnorm(x, residual, self.weight, self.eps)
-            return x, residual
-        return npu_gemma_rmsnorm(x, self.weight, self.eps)
+            return add_gemma_rms_norm(x, self.weight, residual, self.eps)
+        output, _ = npu_gemma_rms_norm(x, self.weight, self.eps)
+        return output
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"

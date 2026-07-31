@@ -23,7 +23,7 @@ def _fake_sgl_kernel_npu(gemma_kernel, add_gemma_kernel):
     norm_package = ModuleType("sgl_kernel_npu.norm")
     norm_package.__path__ = []
     module = ModuleType("sgl_kernel_npu.norm.gemma_rmsnorm")
-    module.gemma_rms_norm = gemma_kernel
+    module.npu_gemma_rms_norm = gemma_kernel
     module.add_gemma_rms_norm = add_gemma_kernel
     return {
         "sgl_kernel_npu": package,
@@ -77,7 +77,7 @@ def test_missing_kernel_package_reports_actionable_error():
 
 def test_incompatible_kernel_package_reports_actionable_error():
     modules = _fake_sgl_kernel_npu(MagicMock(), MagicMock())
-    del modules["sgl_kernel_npu.norm.gemma_rmsnorm"].gemma_rms_norm
+    del modules["sgl_kernel_npu.norm.gemma_rmsnorm"].npu_gemma_rms_norm
 
     with patch.dict(sys.modules, modules):
         with pytest.raises(RuntimeError, match="requires a target-specific"):
@@ -91,7 +91,7 @@ def test_sgl_kernel_npu_normal_out_contract():
     weight = torch.randn(4)
     expected = torch.randn_like(x)
     out = torch.empty_like(x)
-    gemma_kernel = MagicMock(return_value=expected)
+    gemma_kernel = MagicMock(return_value=(expected, "rstd"))
 
     with patch.dict(sys.modules, _fake_sgl_kernel_npu(gemma_kernel, MagicMock())):
         result = GemmaRMSNormOp().forward_sgl_kernel_npu(x, weight, 1e-5, out=out)
@@ -132,9 +132,11 @@ def test_srt_gemma_layers_delegate_plain_npu_path(layer_name):
     layer_cls = getattr(layernorm_module, layer_name)
     layer = layer_cls(4)
     x = torch.randn(2, 4)
-    unified_op = MagicMock(return_value=x)
+    unified_op = MagicMock(return_value=(x, "rstd"))
 
-    with patch.object(layernorm_module, "npu_gemma_rmsnorm", unified_op, create=True):
+    with patch.object(
+        layernorm_module, "npu_gemma_rms_norm", unified_op, create=True
+    ):
         result = layer.forward_npu(x)
 
     assert result is x
@@ -150,17 +152,19 @@ def test_srt_gemma_layers_delegate_residual_npu_path(layer_name):
     layer = layer_cls(4)
     x = torch.randn(2, 4)
     residual = torch.randn(2, 4)
-    fused_op = MagicMock()
+    norm_output = torch.randn_like(x)
+    residual_sum = torch.randn_like(residual)
+    fused_op = MagicMock(return_value=(norm_output, residual_sum))
 
     with patch.object(
         layernorm_module,
-        "npu_gemma_fused_add_rmsnorm",
+        "add_gemma_rms_norm",
         fused_op,
         create=True,
     ):
         result = layer.forward_npu(x, residual)
 
-    assert result[0] is x
-    assert result[1] is residual
+    assert result[0] is norm_output
+    assert result[1] is residual_sum
     eps = layer.variance_epsilon if hasattr(layer, "variance_epsilon") else layer.eps
-    fused_op.assert_called_once_with(x, residual, layer.weight, eps)
+    fused_op.assert_called_once_with(x, layer.weight, residual, eps)
