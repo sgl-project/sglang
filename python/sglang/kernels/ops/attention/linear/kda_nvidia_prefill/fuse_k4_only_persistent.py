@@ -102,9 +102,6 @@ except ImportError:
             "blackwell",
             "gated_delta_net",
         ),
-        # absolute fallback
-        "/home/scratch.hmi_wwfo/dynamic-kernel-generator/cutlass_ir/compiler/"
-        "python/examples/blackwell/gated_delta_net",
     ]
     for _p in _GDN_PATHS:
         if os.path.isdir(_p):
