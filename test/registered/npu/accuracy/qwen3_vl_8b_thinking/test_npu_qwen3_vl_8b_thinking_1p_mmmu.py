@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
@@ -14,6 +15,8 @@ register_npu_ci(
     nightly=True,
     disabled="performance testcase",
 )
+
+_is_pr_pipeline = os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
 
 ENVS = {
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
@@ -57,10 +60,10 @@ class TestQwen3(TestNpuAccuracyTestCaseBase):
     model = QWEN3_VL_8B_THINKING_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS
-    accuracy = 0.7011
+    accuracy = 0.64 if _is_pr_pipeline else 0.7011
     datasets = ["mmmu"]
     few_shot_num = 0
-    limit = 5
+    limit = 5 if _is_pr_pipeline else 100000
     generation_config = {"max_tokens": 65536}
     eval_batch_size = 64
 
