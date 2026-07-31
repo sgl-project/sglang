@@ -37,6 +37,22 @@
 
 namespace {
 
+// One elected lane, via elect.sync. Local on purpose: cute::elect_one_sync would
+// pull the whole CuTe include path into an elementwise JIT module, and
+// cuda::ptx has no elect_sync in CUDA 13.0.
+SGL_DEVICE bool elect_one_lane() {
+  uint32_t pred;
+  asm volatile(
+      "{\n"
+      "  .reg .pred p;\n"
+      "  .reg .b32  r;\n"
+      "  elect.sync r|p, 0xFFFFFFFF;\n"
+      "  selp.b32 %0, 1, 0, p;\n"
+      "}\n"
+      : "=r"(pred));
+  return pred != 0;
+}
+
 constexpr int kFp8NopeDim = 512;
 constexpr int kFp8RopeDim = 64;
 constexpr int kFp8RowBytes = kFp8NopeDim + kFp8RopeDim;  // fp8: 1 byte/elem
@@ -131,7 +147,9 @@ __global__ void set_mla_kv_concat_q_fp8_kernel(const __grid_constant__ SetMlaKVC
     __syncwarp();
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
-    if (lane_id == 0) {
+    // elect.sync rather than `lane_id == 0`: the TMA issue must not sit
+    // behind a lane-index predicate (same review point as the bf16 variant).
+    if (elect_one_lane()) {
       cuda::ptx::cp_async_bulk(
           cuda::ptx::space_global,
           cuda::ptx::space_shared,

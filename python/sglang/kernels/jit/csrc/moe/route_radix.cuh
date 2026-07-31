@@ -8,6 +8,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#include "radix_select_common.cuh"
 #include <cstdint>
 
 namespace sglang {
@@ -15,21 +16,13 @@ namespace sglang {
 inline constexpr uint32_t kNumExperts_ = 896;
 inline constexpr uint32_t kTopK_ = 16;
 
-struct LargeRouterRadixTrait {
+struct LargeRouterRadixTrait : moe::radix::RadixSelectBase {
   static constexpr uint32_t kNumExperts = kNumExperts_;
   static constexpr uint32_t kTopK = kTopK_;
   static constexpr uint32_t kVecSize = 4;
 
-  static constexpr uint32_t kRadixBits = 8;
-  static constexpr uint32_t kRadixSize = 1 << kRadixBits;
-  static constexpr uint32_t kRadixRounds = 32 / kRadixBits;
   static constexpr uint32_t kBlockSize = kNumExperts / kVecSize;  // 224 = 7 warps
   static constexpr uint32_t kNumWarps = kBlockSize / 32;
-  struct alignas(16) MatchBin {
-    uint32_t bin;
-    uint32_t above_count;  // active elements in bins strictly above `bin`
-    uint32_t equal_count;  // active elements in bin `bin`
-  };
   struct Smem {
     uint32_t warp_sum[3][kNumWarps];  // cross-warp scan workspace
     MatchBin match[kRadixRounds];
@@ -63,51 +56,6 @@ struct RouteRadixParams {
   int apply_scale;
   int sorted;
 };
-
-inline constexpr float kNanFloor_ = -1e30f;
-
-// Monotone unsigned key: larger biased -> larger key. Caller must have floored
-// biased-NaN. Canonicalizes -0.0 -> +0.0 so equal values get equal keys.
-SGL_DEVICE uint32_t biased_to_key(float biased) {
-  if (biased == 0.0f) biased = 0.0f;
-  uint32_t u = __float_as_uint(biased);
-  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-}
-
-// tl.sigmoid(x) = 1/(1+exp(-x)). Must stay instruction-identical to v1's
-// sigmoid_match so both kernels rank (and weight) identically.
-SGL_DEVICE float sigmoid_match(float x) {
-  return __fdividef(1.0f, 1.0f + __expf(-x));
-}
-
-SGL_DEVICE float nan_floor(float x) {
-  return (x == x) ? x : kNanFloor_;
-}
-
-SGL_DEVICE void bar_sync(uint32_t id, uint32_t num_threads) {
-  asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(num_threads) : "memory");
-}
-
-SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
-#pragma unroll
-  for (uint32_t offset = 1; offset < 32; offset *= 2) {
-    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
-    if (lane_id >= offset) val += n;
-  }
-  return val;
-}
-
-// Exclusive prefix (block-wide, thread-rank order) of `cnt`. Uses
-// smem_warp_sum[kNumWarps]; syncs on entry (so the workspace can be reused
-// across calls) and before the cross-warp read.
-SGL_DEVICE uint32_t block_exclusive_sum(uint32_t cnt, uint32_t lane_id, uint32_t warp_id, uint32_t* smem_warp_sum) {
-  const uint32_t inc = warp_inclusive_sum(lane_id, cnt);
-  if (lane_id == 31) smem_warp_sum[warp_id] = inc;
-  __syncthreads();
-  // TODO: replace `__reduce_add_sync` with `warp::reduce_sum`
-  const auto base = __reduce_add_sync(0xFFFFFFFF, lane_id < warp_id ? smem_warp_sum[lane_id] : 0u);
-  return base + inc - cnt;
-}
 
 // Whole-CTA routing body, callable from other kernels (the fused
 // route+quant launch runs it on its first M CTAs). Routes row `blockIdx.x`;
@@ -151,9 +99,9 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
         xy = cast<fp32x2_t>(scores_vec[i]);
       }
       const auto [x, y] = xy;
-      const auto sx = sigmoid_match(x), sy = sigmoid_match(y);
-      keys[2 * i + 0] = biased_to_key(nan_floor(sx + bias_vec[i].x));
-      keys[2 * i + 1] = biased_to_key(nan_floor(sy + bias_vec[i].y));
+      const auto sx = moe::radix::sigmoid_match(x), sy = moe::radix::sigmoid_match(y);
+      keys[2 * i + 0] = moe::radix::biased_to_key(moe::radix::nan_floor(sx + bias_vec[i].x));
+      keys[2 * i + 1] = moe::radix::biased_to_key(moe::radix::nan_floor(sy + bias_vec[i].y));
       act[2 * i + 0] = sx;
       act[2 * i + 1] = sy;
     }
@@ -202,9 +150,9 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
         AlignedVector<uint32_t, 2> hist;
         hist.load(smem.histogram, tx);
         const auto local_val = hist[0] + hist[1];
-        const auto warp_inc = warp_inclusive_sum(lane_id, local_val);
+        const auto warp_inc = moe::radix::warp_inclusive_sum(lane_id, local_val);
         if (lane_id == kWarpThreads - 1) smem.warp_sum[0][warp_id] = warp_inc;
-        bar_sync(BAR_SUM, kRadixLanes);
+        moe::radix::bar_sync(BAR_SUM, kRadixLanes);
         const auto inter = __reduce_add_sync(0xFFFFFFFF, lane_id < warp_id ? smem.warp_sum[0][lane_id] : 0u);
         const auto prefix = inter + warp_inc;        // active elements in bins [0, 2t+1]
         const auto above_r = total_active - prefix;  // in bins > 2t+1
@@ -257,7 +205,7 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
     for (uint32_t i = 0; i < kVecSize; ++i) {
       cnt += active[i] ? 1 : 0;
     }
-    uint32_t rank = block_exclusive_sum(cnt, lane_id, warp_id, smem.warp_sum[1]);
+    uint32_t rank = moe::radix::block_exclusive_sum(cnt, lane_id, warp_id, smem.warp_sum[1]);
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize; ++i) {
       const bool eq_win = active[i] && rank < topk;
@@ -272,7 +220,7 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
   for (uint32_t i = 0; i < kVecSize; ++i) {
     selected_cnt += selected[i] ? 1 : 0;
   }
-  uint32_t slot = block_exclusive_sum(selected_cnt, lane_id, warp_id, smem.warp_sum[2]);
+  uint32_t slot = moe::radix::block_exclusive_sum(selected_cnt, lane_id, warp_id, smem.warp_sum[2]);
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize; ++i) {
     if (selected[i] && slot < T::kTopK) {

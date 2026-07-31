@@ -2,6 +2,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/math.cuh>
+#include <sgl_kernel/mbarrier.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -21,13 +22,6 @@
 
 namespace ptx {
 
-// Generic ptr -> 32-bit `.shared` address: inline-PTX `.shared` instructions
-// take a byte offset in the shared window, not a generic pointer.
-template <typename T>
-static SGL_DEVICE uint32_t to_shared(T* ptr) {
-  return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
-}
-
 // ---- bulk 1D TMA (PTX ISA §9.7.9.25) ---------------------------------------
 
 // global -> shared::cluster, completed by an smem mbarrier. Arm `bar` with
@@ -41,41 +35,6 @@ static SGL_DEVICE void cp_async_bulk_1d_load(void* smem_dst, const void* gmem_sr
       "r"(bytes),
       "r"(to_shared(bar))
       : "memory");
-}
-
-// ---- mbarrier (PTX ISA §9.7.13.15) -----------------------------------------
-//
-// Only the `try_wait.parity` waiter is wrapped; the caller owns the phase
-// counter and flips it at the stage wrap. After `mbar_init` the bar is at
-// parity 0 and each full cycle (count arrivals -> fire -> reset) flips it, so a
-// consumer-first waiter starts at 0 and a producer-first waiter (whose first
-// wait must be a no-op skip) starts at 1. Getting this backwards deadlocks on
-// the second wait.
-static SGL_DEVICE void mbar_init(uint64_t* bar, uint32_t count) {
-  asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(to_shared(bar)), "r"(count));
-}
-
-static SGL_DEVICE uint64_t mbar_arrive(uint64_t* bar) {
-  uint64_t state;
-  asm volatile("mbarrier.arrive.shared.b64 %0, [%1];" : "=l"(state) : "r"(to_shared(bar)));
-  return state;
-}
-
-// Combined arrive + set tx-count, for TMA-load completion.
-static SGL_DEVICE void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
-  asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" ::"r"(to_shared(bar)), "r"(bytes));
-}
-
-// Wait for phase `parity` to complete. Looped because the spec allows spurious
-// early wakeups. The default `.acquire` semantics make prior `cp.async.bulk`
-// writes tracked by this mbarrier visible to later generic-proxy reads on this
-// thread with no `fence.proxy.async` (spec §9.7.13.15.16 point 3).
-static SGL_DEVICE void mbar_wait_parity(uint64_t* bar, uint32_t parity) {
-  asm volatile(
-      "{\n\t.reg .pred p;\n\t"
-      "WAIT_%=: mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t"
-      "@!p bra WAIT_%=;\n\t}\n" ::"r"(to_shared(bar)),
-      "r"(parity));
 }
 
 // Publish mbarrier initialization from the generic proxy before an async engine

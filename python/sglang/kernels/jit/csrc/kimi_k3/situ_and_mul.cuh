@@ -7,6 +7,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#include "situ_activation.cuh"
 #include <cstdint>
 #include <limits>
 
@@ -68,18 +69,8 @@ __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams par
     const float g = cast<fp32_t>(gate[i]);
     const float u = cast<fp32_t>(up[i]);
 
-    // gate_out = beta * tanh(g / beta) * sigmoid(g)
-    const float gate_out = beta * tanhf(g * inv_beta) * (1.0f / (1.0f + __expf(-g)));
-
-    // up_out = linear_beta * tanh(u / linear_beta) if has_linear_beta, else u
-    float up_out;
-    if constexpr (kHasLinearBeta) {
-      up_out = linear_beta * tanhf(u * inv_linear_beta);
-    } else {
-      up_out = u;
-    }
-
-    out[i] = cast<T>(gate_out * up_out);
+    out[i] =
+        cast<T>(sglang::kimi_k3::situ_activate<kHasLinearBeta>(g, u, beta, inv_beta, linear_beta, inv_linear_beta));
   }
 
   store_as<vec_t>(params.out, out, output_offset);

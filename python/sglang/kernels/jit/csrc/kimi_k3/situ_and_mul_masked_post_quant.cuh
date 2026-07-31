@@ -10,6 +10,7 @@
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
+#include "situ_activation.cuh"
 #include <cstdint>
 #include <cuda_fp8.h>
 #include <type_traits>
@@ -61,12 +62,9 @@ situ_and_mul(DType2 gate, DType2 up, float beta, float inv_beta, float linear_be
   using namespace device;
   const auto [g0, g1] = cast<fp32x2_t>(gate);
   const auto [u0, u1] = cast<fp32x2_t>(up);
-  const float gate_out0 = beta * tanhf(g0 * inv_beta) * math::sigmoid_fast(g0);
-  const float gate_out1 = beta * tanhf(g1 * inv_beta) * math::sigmoid_fast(g1);
-  const float up_out0 = linear_beta * tanhf(u0 * inv_linear_beta);
-  const float up_out1 = linear_beta * tanhf(u1 * inv_linear_beta);
-  const float val0 = gate_out0 * up_out0;
-  const float val1 = gate_out1 * up_out1;
+  // kHasLinearBeta=true: this path always softcaps the up operand, as before.
+  const float val0 = sglang::kimi_k3::situ_activate<true>(g0, u0, beta, inv_beta, linear_beta, inv_linear_beta);
+  const float val1 = sglang::kimi_k3::situ_activate<true>(g1, u1, beta, inv_beta, linear_beta, inv_linear_beta);
   if constexpr (kPrecise) {
     return {val0, val1};
   } else {

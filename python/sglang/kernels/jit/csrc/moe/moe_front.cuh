@@ -51,6 +51,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#include "radix_select_common.cuh"
 #include <cstdint>
 
 namespace sglang {
@@ -67,26 +68,17 @@ inline constexpr uint32_t kFGTTopK = 16;
 /// 224 (4 experts/thread) and 448 (2 experts/thread) are the legal choices for
 /// 896 experts.
 template <uint32_t kBlockSize_>
-struct MoEFrontTrait {
+struct MoEFrontTrait : moe::radix::RadixSelectBase {
   static constexpr uint32_t kNumExperts = kFGTNumExperts;
   static constexpr uint32_t kTopK = kFGTTopK;
   static constexpr uint32_t kBlockSize = kBlockSize_;
   static constexpr uint32_t kVecSize = kNumExperts / kBlockSize;  // experts per thread
   static constexpr uint32_t kNumWarps = kBlockSize / 32;
 
-  static constexpr uint32_t kRadixBits = 8;
-  static constexpr uint32_t kRadixSize = 1 << kRadixBits;
-  static constexpr uint32_t kRadixRounds = 32 / kRadixBits;
-
   static_assert(kNumExperts % kBlockSize == 0, "block size must divide the expert count");
   static_assert(kVecSize % 2 == 0, "experts per thread must be even (fp32x2 loads)");
   static_assert(kBlockSize >= kRadixSize / 2, "block must cover the split-bin search lanes");
 
-  struct alignas(16) MatchBin {
-    uint32_t bin;
-    uint32_t above_count;
-    uint32_t equal_count;
-  };
   struct Smem {
     uint32_t warp_sum[3][kNumWarps];
     MatchBin match[kRadixRounds];
@@ -115,45 +107,6 @@ struct MoEFrontParams {
   long long routed_stride;
 };
 
-inline constexpr float kFGTNanFloor = -1e30f;
-
-SGL_DEVICE uint32_t fgt_biased_to_key(float biased) {
-  if (biased == 0.0f) biased = 0.0f;
-  uint32_t u = __float_as_uint(biased);
-  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-}
-
-// Must stay instruction-identical to route_radix's sigmoid_match so both
-// kernels rank and weight identically.
-SGL_DEVICE float fgt_sigmoid_match(float x) {
-  return __fdividef(1.0f, 1.0f + __expf(-x));
-}
-
-SGL_DEVICE float fgt_nan_floor(float x) {
-  return (x == x) ? x : kFGTNanFloor;
-}
-
-SGL_DEVICE void fgt_bar_sync(uint32_t id, uint32_t num_threads) {
-  asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(num_threads) : "memory");
-}
-
-SGL_DEVICE uint32_t fgt_warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
-#pragma unroll
-  for (uint32_t offset = 1; offset < 32; offset *= 2) {
-    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
-    if (lane_id >= offset) val += n;
-  }
-  return val;
-}
-
-SGL_DEVICE uint32_t fgt_block_exclusive_sum(uint32_t cnt, uint32_t lane_id, uint32_t warp_id, uint32_t* smem_warp_sum) {
-  const uint32_t inc = fgt_warp_inclusive_sum(lane_id, cnt);
-  if (lane_id == 31) smem_warp_sum[warp_id] = inc;
-  __syncthreads();
-  const auto base = __reduce_add_sync(0xFFFFFFFF, lane_id < warp_id ? smem_warp_sum[lane_id] : 0u);
-  return base + inc - cnt;
-}
-
 /// Radix-select top-k over one token's fp32 logits.  Lifted from
 /// route_radix.cuh; the only change is the input dtype (fp32 in place of bf16).
 template <bool kUsePDL, typename T>
@@ -179,12 +132,12 @@ SGL_DEVICE void fgt_select_topk(
     }
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-      const float sx = fgt_sigmoid_match(logit[2 * i + 0]);
-      const float sy = fgt_sigmoid_match(logit[2 * i + 1]);
+      const float sx = moe::radix::sigmoid_match(logit[2 * i + 0]);
+      const float sy = moe::radix::sigmoid_match(logit[2 * i + 1]);
       act[2 * i + 0] = sx;
       act[2 * i + 1] = sy;
-      keys[2 * i + 0] = fgt_biased_to_key(fgt_nan_floor(sx + bias_vec[i].x));
-      keys[2 * i + 1] = fgt_biased_to_key(fgt_nan_floor(sy + bias_vec[i].y));
+      keys[2 * i + 0] = moe::radix::biased_to_key(moe::radix::nan_floor(sx + bias_vec[i].x));
+      keys[2 * i + 1] = moe::radix::biased_to_key(moe::radix::nan_floor(sy + bias_vec[i].y));
     }
   }
 
@@ -224,9 +177,9 @@ SGL_DEVICE void fgt_select_topk(
         device::AlignedVector<uint32_t, 2> hist;
         hist.load(smem.histogram, tx);
         const auto local_val = hist[0] + hist[1];
-        const auto warp_inc = fgt_warp_inclusive_sum(lane_id, local_val);
+        const auto warp_inc = moe::radix::warp_inclusive_sum(lane_id, local_val);
         if (lane_id == 31) smem.warp_sum[0][warp_id] = warp_inc;
-        fgt_bar_sync(BAR_SUM, kRadixLanes);
+        moe::radix::bar_sync(BAR_SUM, kRadixLanes);
         const auto inter = __reduce_add_sync(0xFFFFFFFF, lane_id < warp_id ? smem.warp_sum[0][lane_id] : 0u);
         const auto prefix = inter + warp_inc;
         const auto above_r = total_active - prefix;
@@ -269,7 +222,7 @@ SGL_DEVICE void fgt_select_topk(
     for (uint32_t i = 0; i < kVecSize; ++i) {
       cnt += active[i] ? 1 : 0;
     }
-    uint32_t rank = fgt_block_exclusive_sum(cnt, lane_id, warp_id, smem.warp_sum[1]);
+    uint32_t rank = moe::radix::block_exclusive_sum(cnt, lane_id, warp_id, smem.warp_sum[1]);
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize; ++i) {
       const bool eq_win = active[i] && rank < topk;
@@ -283,7 +236,7 @@ SGL_DEVICE void fgt_select_topk(
   for (uint32_t i = 0; i < kVecSize; ++i) {
     selected_cnt += selected[i] ? 1 : 0;
   }
-  uint32_t slot = fgt_block_exclusive_sum(selected_cnt, lane_id, warp_id, smem.warp_sum[2]);
+  uint32_t slot = moe::radix::block_exclusive_sum(selected_cnt, lane_id, warp_id, smem.warp_sum[2]);
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize; ++i) {
     if (selected[i] && slot < T::kTopK) {
