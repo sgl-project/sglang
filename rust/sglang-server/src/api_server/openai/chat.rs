@@ -22,7 +22,6 @@ use dynamo_protocols::types::{
     FinishReason as OpenAIFinishReason, ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop,
     TopLogprobs,
 };
-use dynamo_renderer::PromptFormatter;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -33,8 +32,8 @@ use super::tools::{
     parse_chat_tool_calls, parse_streaming_tool_calls,
 };
 use super::{
-    AppState, authorize, collect_output, contains_media, indexed_egress_stream, openai_error,
-    streaming_error, submit_generation, unix_seconds_u32,
+    AppState, ChatFormatter, authorize, collect_output, contains_media, indexed_egress_stream,
+    openai_error, streaming_error, submit_generation, unix_seconds_u32,
 };
 use crate::ids::Rid;
 use crate::message::{ChunkExtras, EgressItem, GenerateRequest, OneOrMany, SamplingParams};
@@ -272,11 +271,10 @@ async fn chat_completions(
 
 pub(super) async fn prepare_chat_request(
     request: CreateChatCompletionRequest,
-    formatter: PromptFormatter,
+    formatter: ChatFormatter,
     tokenizer: dynamo_tokenizers::Tokenizer,
 ) -> Result<(CreateChatCompletionRequest, Vec<i32>), String> {
     tokio::task::spawn_blocking(move || {
-        let PromptFormatter::OAI(formatter) = formatter;
         let prompt = formatter
             .render(&request)
             .map_err(|error| format!("chat template render failed: {error}"))?;

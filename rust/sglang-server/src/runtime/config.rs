@@ -86,8 +86,8 @@ pub struct ServerArgs {
     /// Shared OpenAI-compatible bearer token. `None` leaves the API ungated.
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Optional chat-template file override. Otherwise the tokenizer's
-    /// `tokenizer_config.json` template is used.
+    /// Optional built-in chat-template name or path to a Jinja/legacy JSON
+    /// template file. Without an override, uses the tokenizer config template.
     #[serde(default)]
     pub chat_template: Option<String>,
     /// Parser selected by `--tool-call-parser`.
