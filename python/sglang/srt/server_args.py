@@ -6710,10 +6710,29 @@ class ServerArgs:
                 "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
 
+        # Without an a2a backend all EP ranks run the MoE over the same tokens and
+        # sum their partial outputs, so the pick has to agree across ranks.
+        needs_rank_invariant_dispatch = self._resolved().moe_a2a_backend == "none"
+
         if (self.enable_eplb or (self.init_expert_location != "trivial")) and (
             self.ep_dispatch_algorithm is None
         ):
-            self.ep_dispatch_algorithm = "static"
+            self.ep_dispatch_algorithm = (
+                "dynamic" if needs_rank_invariant_dispatch else "static"
+            )
+
+        # `dynamic` / `fake` switch to the row-index pick; `static` reads a
+        # per-rank table and `lp` samples inside its kernel.
+        if needs_rank_invariant_dispatch and self.ep_dispatch_algorithm in (
+            "static",
+            "lp",
+        ):
+            raise ValueError(
+                f"--ep-dispatch-algorithm {self.ep_dispatch_algorithm} picks a "
+                "different physical replica per rank, which only holds up when an "
+                "a2a backend routes each token to a single rank. Use "
+                "--ep-dispatch-algorithm dynamic with --moe-a2a-backend none."
+            )
 
         if self.enable_eplb and self.ep_join_mode != "scale":
             assert self._resolved().ep_size > 1
