@@ -2751,10 +2751,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             norm_weight=layer.input_layernorm.weight.data,
             norm_eps=layer.input_layernorm.variance_epsilon,
         )
-        torch.cuda.synchronize()
+        if torch.xpu.is_available():
+            torch.xpu.synchronize()
+        else:
+            torch.cuda.synchronize()
         compile_secs = time.perf_counter() - tic
         # Runs before init_memory_pool(); don't let transients skew pool sizing.
-        torch.cuda.empty_cache()
+        if not torch.xpu.is_available():
+            torch.cuda.empty_cache()
         get_tp_group().barrier()
         logger.info(
             "DeepSeek V4 MHC prenorm prewarm at load: compile %.1fs, rank sync +%.1fs",
