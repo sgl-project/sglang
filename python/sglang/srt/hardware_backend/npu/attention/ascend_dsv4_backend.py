@@ -20,6 +20,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_npu_before_atlas_a5
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -27,6 +28,49 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _is_atlas_a5() -> bool:
+    """Atlas A5 (Ascend 950) ships kv-quant sparse attention and an FP8
+    lightning indexer; pre-A5 parts (910B/910C) keep the bf16 / int8 kernel
+    chain. Cheap to call — ``is_npu_before_atlas_a5`` is lru_cached — and
+    deliberately not a module constant so the device query happens after the
+    rank has pinned its die."""
+    return not is_npu_before_atlas_a5()
+
+
+# A5 kv-quant KV layout: nope is quantized in groups of 64 and the RoPE half is
+# stored unquantized, so the kernels need both dimensions spelled out.
+_A5_KV_TILE_SIZE = 64
+_A5_KV_ROPE_HEAD_DIM = 64
+
+
+def _sparse_attn_ops():
+    """(metadata op, attention op) for the DSV4 shared-KV sparse attention.
+
+    A5 reads a quantized KV cache, which is a different kernel rather than a
+    flag on the pre-A5 one.
+    """
+    if _is_atlas_a5():
+        return (
+            torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata,
+            torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv,
+        )
+    return (
+        torch.ops.custom.npu_sparse_attn_sharedkv_metadata,
+        torch.ops.custom.npu_sparse_attn_sharedkv,
+    )
+
+
+def _sparse_attn_kv_quant_kwargs() -> dict:
+    """Extra kwargs the A5 kv-quant kernels need to interpret the KV layout."""
+    if not _is_atlas_a5():
+        return {}
+    return {
+        "kv_quant_mode": 1,
+        "tile_size": _A5_KV_TILE_SIZE,
+        "rope_head_dim": _A5_KV_ROPE_HEAD_DIM,
+    }
 
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
@@ -440,6 +484,325 @@ class CompressorAscendBackendMixin:
                 cmp_kv = _apply_hadamard(cmp_kv, compressor.hadamard_matrix)
             self._compressor_epilog_npu(compressor, cmp_kv, forward_batch)
 
+    def _forward_compress_native(
+        self,
+        compressor,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Reference per-request unfused compress path for precision ablations.
+
+        Production dispatch no longer calls this path: ordinary prefill, every
+        chunked-prefill chunk, verify, and decode all use the fused compressor.
+
+        * Prefill: split seq into ``cutoff = seqlen - seqlen % ratio`` to compress
+          + ``remainder`` stashed as state (overlap/ratio=4 also stashes the last
+          ``ratio`` of the cutoff). State writes via ``set_state_buffer``; cutoff gets
+          ape-weighted softmax over ratio, sum, norm+rope+(opt) hadamard, then write.
+        * Non-prefill (one token/req): append (kv, score) to the state ring; if it
+          completes a ratio-aligned chunk, gather the chunk (overlap: 2*ratio, else
+          ratio), ape-weighted softmax + sum, and write via ``set_compress_buffer``.
+        """
+        import torch_npu  # local: NPU-only, used for npu_rotary_mul below
+
+        positions = forward_batch.positions
+        ratio, overlap, d = compressor.ratio, compressor.overlap, compressor.head_dim
+        device = x.device
+        self._ensure_compressor_hadamard(compressor, device)
+        dtype = x.dtype
+        x_f32 = x.float()
+        # wkv + wgate are fused into one wkv_gate.weight [2*coff*head_dim, hidden_size]
+        # (kv concatenated before wgate); split along the output dim to recover each.
+        coff = 1 + int(overlap)
+        W = compressor.wkv_gate.weight.float()
+        kv_full = F.linear(x_f32, W[: coff * d])  # [T, coff*d]
+        score_full = F.linear(x_f32, W[coff * d :])  # [T, coff*d]
+
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        extend_prefix_lens_cpu = self._extend_prefix_lens_cpu(forward_batch)
+        is_prefill = forward_batch.forward_mode.is_prefill()
+        token_to_kv_pool = self.token_to_kv_pool
+        backend_fm = self.forward_metadata
+        if ratio == 4:
+            page_table = backend_fm.c4_state_page_table
+        else:
+            page_table = backend_fm.c128_state_page_table
+
+        kv_out_list: list[torch.Tensor] = []
+        kv_state_to_be_cached: list[torch.Tensor] = []
+        score_state_to_be_cached: list[torch.Tensor] = []
+        state_loc_list: list[torch.Tensor] = []
+        kv_out_positions: list[torch.Tensor] = []
+        # Per-token write loc: record (req_idx_in_batch, compressed_seq_pos_in_req)
+        # to derive the c{N}_kv_pool slot from the slab allocator, not out_cache_loc
+        # // ratio (correct only when raw kv allocation aligns to ratio).
+        write_req_indices: list[torch.Tensor] = []
+        write_pos_in_req: list[torch.Tensor] = []
+        seqlen_offset = 0
+        # Running offset into the tail-only state bundle, flat layout
+        # ``[req0_alloc_len_slots, ...]`` where ``alloc_len_i = seqlen_i -
+        # c{ratio}_state_alloc_offset_i`` (NOT raw seqlen; see
+        # ScheduleBatch._compute_dsv4_state_lens_extend).
+        state_bundle_offset = 0
+
+        for idx, seqlen in enumerate(seq_lens_cpu):
+            seqlen = int(seqlen)
+            if seqlen == 0:
+                continue
+            if is_prefill:
+                # Chunked follow-up (prefix_len>0) is routed to the fused compressor
+                # by the forward_compress dispatch (main compressor + c4 indexer), so
+                # the native path only ever sees non-chunked / first-chunk prefill.
+                prefix_len = (
+                    int(extend_prefix_lens_cpu[idx])
+                    if extend_prefix_lens_cpu is not None
+                    else 0
+                )
+                assert prefix_len == 0, (
+                    "native compress prefill reached with prefix_len="
+                    f"{prefix_len}; chunked prefill must route to the fused op"
+                )
+                pos_req = positions[seqlen_offset : seqlen_offset + seqlen]
+
+                # Per-req tail-only state alloc range; same formula as
+                # ScheduleBatch._compute_dsv4_state_lens_extend (recomputed to
+                # avoid threading another tensor through forward_batch).
+                tail_128 = seqlen % 128
+                if ratio == 4:
+                    c_alloc_len = (
+                        tail_128 + 128
+                        if (tail_128 <= 3 and seqlen >= 128)
+                        else tail_128
+                    )
+                else:  # ratio == 128
+                    c_alloc_len = tail_128
+                c_alloc_offset = seqlen - c_alloc_len
+
+                # Bundle slice for this req. The NPU paged state pool emits real
+                # slot ids (no ring-hash); slice by ``state_bundle_offset`` (cumulative
+                # alloc_len), NOT ``seqlen_offset`` (cumulative raw seqlen).
+                bundle = forward_batch.out_cache_loc_dsv4
+                assert bundle is not None, (
+                    "unfused compress prefill on NPU needs the DSV4 "
+                    "alloc bundle; expected maybe_write_dsv4_extend to have "
+                    "populated batch.out_cache_loc_dsv4 before forward."
+                )
+                bundle_state_loc = (
+                    bundle.out_c4_state_loc if ratio == 4 else bundle.out_c128_state_loc
+                )
+                if c_alloc_len > 0:
+                    # Require a populated bundle only when this req allocates
+                    # slots. A 128-aligned ratio==128 prefill has c_alloc_len==0
+                    # (no partial tail), so an all-128-aligned batch legitimately
+                    # yields an empty bundle. Empty while c_alloc_len > 0 means
+                    # c{ratio}_state_attn_allocator was never initialized.
+                    assert (
+                        bundle_state_loc is not None and bundle_state_loc.numel() > 0
+                    ), (
+                        f"unfused compress prefill: bundle.out_c{ratio}_state_loc "
+                        f"is empty/None — DSV4NPUTokenToKVPoolAllocator's "
+                        f"c{ratio}_state_attn_allocator was not initialized (check "
+                        f"pool_configurator's NPU branch + npu_state_pool_size)."
+                    )
+                    out_cache_loc = bundle_state_loc[
+                        state_bundle_offset : state_bundle_offset + c_alloc_len
+                    ]
+                    state_bundle_offset += c_alloc_len
+                else:
+                    # No tail to cache: empty slot view, never indexed below.
+                    # Only reached for c128 (c4's c_alloc_len is always > 0).
+                    out_cache_loc = torch.empty((0,), dtype=torch.int64, device=device)
+                remainder = seqlen % ratio
+                cutoff = seqlen - remainder
+                # ``cutoff`` is raw coords; subtract ``c_alloc_offset`` for
+                # slice-relative indexing into the per-req bundle slice.
+                cutoff_in_slice = cutoff - c_alloc_offset
+                should_compress = cutoff >= ratio
+                # ratio-strided positions for the cutoff chunks (one rope pos per token).
+                pos_compressed = pos_req[:cutoff:ratio]
+                kv = kv_full[seqlen_offset : seqlen_offset + seqlen]
+                score = score_full[seqlen_offset : seqlen_offset + seqlen]
+
+                if overlap and should_compress:
+                    # Stash the trailing ratio tokens of the cutoff so the next
+                    # decode step can do overlap compression across the boundary
+                    # (for ratio=4 this window is inside the state alloc range).
+                    kv_state_to_be_cached.append(kv[cutoff - ratio : cutoff])
+                    score_state_to_be_cached.append(
+                        score[cutoff - ratio : cutoff] + compressor.ape
+                    )
+                    state_loc_list.append(
+                        out_cache_loc[cutoff_in_slice - ratio : cutoff_in_slice]
+                    )
+                if remainder > 0:
+                    kv_cut, kv_rem = kv.split([cutoff, remainder], dim=0)
+                    score_cut, score_rem = score.split([cutoff, remainder], dim=0)
+                    kv_state_to_be_cached.append(kv_rem)
+                    score_state_to_be_cached.append(
+                        score_rem + compressor.ape[:remainder]
+                    )
+                    state_loc_list.append(out_cache_loc[-remainder:])
+                    kv = kv_cut
+                    score = score_cut
+
+                if should_compress:
+                    kv = kv.unflatten(0, (-1, ratio))  # [n_chunks, ratio, coff*d]
+                    score = score.unflatten(0, (-1, ratio)) + compressor.ape
+                    if overlap:
+                        kv = _overlap_transform(kv, value=0.0, head_dim=d)
+                        score = _overlap_transform(
+                            score, value=float("-inf"), head_dim=d
+                        )
+                    kv_compressed = (kv * score.softmax(dim=1)).sum(
+                        dim=1
+                    )  # [n_chunks, d]
+                    n_compressed_this_req = kv_compressed.shape[0]
+                    kv_out_list.append(kv_compressed)
+                    kv_out_positions.append(pos_compressed)
+                    write_req_indices.append(
+                        torch.full(
+                            (n_compressed_this_req,),
+                            idx,
+                            dtype=torch.int64,
+                            device=device,
+                        )
+                    )
+                    write_pos_in_req.append(
+                        torch.arange(
+                            n_compressed_this_req,
+                            dtype=torch.int64,
+                            device=device,
+                        )
+                    )
+                seqlen_offset += seqlen
+            else:
+                # Decode: append (kv, score+ape[pos%r]) to the state ring at
+                # c{4,128}_state_loc[idx]; if this completes a ratio-aligned
+                # chunk, gather it and produce one compressed kv via ape-softmax-sum.
+                start_pos = seqlen - 1
+                should_compress = (start_pos + 1) % ratio == 0
+                pos_req = positions[idx : idx + 1] + (1 - ratio)
+                kv = kv_full[idx : idx + 1]
+                score = score_full[idx : idx + 1] + compressor.ape[start_pos % ratio]
+                if ratio == 4:
+                    state_loc_decode = backend_fm.c4_state_loc
+                else:
+                    state_loc_decode = backend_fm.c128_state_loc
+                token_to_kv_pool.set_state_buffer(
+                    compressor.layer_id,
+                    state_loc_decode[idx : idx + 1],
+                    kv.view(1, 1, -1),
+                    score.view(1, 1, -1),
+                    compressor.is_in_indexer,
+                )
+                if should_compress:
+                    if overlap:
+                        kv_indices = _get_kv_indices(
+                            forward_batch, 2 * ratio, page_table, idx, seqlen
+                        )
+                        kv_state, score_state = token_to_kv_pool.get_state_buffer(
+                            compressor.layer_id, compressor.is_in_indexer, kv_indices
+                        )
+                        # kv_state / score_state: [2*r, 1, coff*d] → [2*r, d]
+                        kv_state = kv_state.squeeze(1)
+                        score_state = score_state.squeeze(1)
+                        kv_state = torch.cat(
+                            [kv_state[:ratio, :d], kv_state[ratio:, d:]], dim=0
+                        )
+                        score_state = torch.cat(
+                            [score_state[:ratio, :d], score_state[ratio:, d:]],
+                            dim=0,
+                        )
+                        kv_compressed = (kv_state * score_state.softmax(dim=0)).sum(
+                            dim=0, keepdim=True
+                        )
+                    else:
+                        kv_indices = _get_kv_indices(
+                            forward_batch, ratio, page_table, idx, seqlen
+                        )
+                        kv_state, score_state = token_to_kv_pool.get_state_buffer(
+                            compressor.layer_id, compressor.is_in_indexer, kv_indices
+                        )
+                        kv_compressed = (
+                            kv_state[:, 0] * score_state[:, 0].softmax(dim=0)
+                        ).sum(dim=0, keepdim=True)
+                    kv_out_list.append(kv_compressed)
+                    kv_out_positions.append(pos_req)
+                    # Decode: 1 compressed token at compressed_seq_pos = seqlen//ratio - 1
+                    decode_pos = seqlen // ratio - 1
+                    write_req_indices.append(
+                        torch.tensor([idx], dtype=torch.int64, device=device)
+                    )
+                    write_pos_in_req.append(
+                        torch.tensor([decode_pos], dtype=torch.int64, device=device)
+                    )
+
+        # Flush the prefill state stash to the pool in one shot.
+        if kv_state_to_be_cached:
+            kv_state_cat = torch.cat(kv_state_to_be_cached, dim=0).unsqueeze(1)
+            score_state_cat = torch.cat(score_state_to_be_cached, dim=0).unsqueeze(1)
+            state_loc_cat = torch.cat(state_loc_list, dim=0)
+            token_to_kv_pool.set_state_buffer(
+                compressor.layer_id,
+                state_loc_cat,
+                kv_state_cat,
+                score_state_cat,
+                compressor.is_in_indexer,
+            )
+
+        # Norm + rope + optional hadamard on the freshly compressed tokens,
+        # then write via _compressor_epilog_npu with explicit slab-derived locs.
+        if kv_out_list:
+            # A5 stores compressed KV as FP8, so keep norm + RoPE in the
+            # accumulator's precision and narrow to the pool dtype only once,
+            # after the rotation. Pre-A5 narrows up front (unchanged).
+            narrow_after_rope = _is_atlas_a5()
+            kv_out = torch.cat(kv_out_list, dim=0)
+            if not narrow_after_rope:
+                kv_out = kv_out.to(dtype)
+            pos_out = torch.cat(kv_out_positions, dim=0)
+            kv_out = compressor.norm(kv_out)
+            rope_dim = compressor.rope_head_dim
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+
+            cos, sin = Dsv4NpuRoPE.for_freqs(
+                compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
+            ).get_cos_sin(
+                pos_out,
+                torch.float32 if narrow_after_rope else kv_out.dtype,
+                view_4d=True,
+                allow_build=False,
+                cache_dtype=torch.float32,
+            )
+            rope_slice = kv_out[..., -rope_dim:]
+            rope_view = rope_slice.unsqueeze(-2).unsqueeze(1)  # (T, 1, 1, rope_dim)
+            rope_rot = torch_npu.npu_rotary_mul(
+                rope_view, cos, sin, rotary_mode="interleave"
+            )
+            rope_slice.copy_(rope_rot.view_as(rope_slice))
+            if narrow_after_rope:
+                kv_out = kv_out.to(dtype)
+            if compressor.rotate:
+                kv_out = _apply_hadamard(kv_out, compressor.hadamard_matrix)
+            # c{N}_kv_pool slot per compressed token. DSV4NPUReqToTokenPool's
+            # token-level slot id table is indexed directly by compressed-seq
+            # position (elements already are c-pool slot ids; no page indirection).
+            req_indices_flat = torch.cat(write_req_indices, dim=0)
+            pos_in_req_flat = torch.cat(write_pos_in_req, dim=0)
+            req_pool_flat = forward_batch.req_pool_indices[req_indices_flat]
+            c_table = (
+                self.req_to_token_pool.req_to_token_c4
+                if ratio == 4
+                else self.req_to_token_pool.req_to_token_c128
+            )
+            write_locs = c_table[
+                req_pool_flat.to(torch.int64), pos_in_req_flat.to(torch.int64)
+            ].to(torch.int32)
+            self._compressor_epilog_npu(
+                compressor, kv_out, forward_batch, override_loc=write_locs
+            )
+        return None
+
     def _ensure_compressor_hadamard(self, compressor, device: torch.device) -> None:
         if getattr(compressor, "hadamard_matrix", None) is None:
             H = _walsh_hadamard_matrix(compressor.head_dim, torch.float32, device)
@@ -467,6 +830,9 @@ class CompressorAscendBackendMixin:
     ) -> None:
         kv_scale: Optional[torch.Tensor] = None
         li_kv_dtype = getattr(compressor, "li_kv_dtype", "bf16")
+        # A5 quantizes and scatters in one fused kernel, so the dequant scale is
+        # produced inside indexer_compress_epilog rather than here.
+        fused_fp8_indexer_write = li_kv_dtype == "float8" and compressor.is_in_indexer
         if li_kv_dtype == "int8" and compressor.is_in_indexer:
             kv, kv_scale = torch_npu.npu_dynamic_quant(kv)
             kv_scale = kv_scale.to(torch.float16)
@@ -500,6 +866,20 @@ class CompressorAscendBackendMixin:
                     kv = kv[valid]
                     if kv_scale is not None:
                         kv_scale = kv_scale[valid]
+
+        if fused_fp8_indexer_write:
+            torch.ops.custom.indexer_compress_epilog(
+                indexer_compress_cache=self.token_to_kv_pool.get_compress_buffer(
+                    compressor.layer_id, True
+                ),
+                indexer_compress_scale=self.token_to_kv_pool.get_compress_dequant_scale_buffer(
+                    compressor.layer_id, True
+                ),
+                x=kv,
+                slot_mapping=loc.to(torch.int32),
+            )
+            return
+
         self.token_to_kv_pool.set_compress_buffer(
             compressor.layer_id,
             loc,
@@ -595,7 +975,7 @@ class C4IndexerAscendBackendMixin:
         )
 
         li_kv_dtype = getattr(c4_indexer.compressor, "li_kv_dtype", "bf16")
-        if li_kv_dtype == "int8":
+        if li_kv_dtype in ("int8", "float8"):
             # Empty/idle rank (T=0) must skip the indexer kernel; test is_idle
             # rather than .item() since a host sync is illegal during capture.
             if bs == 0 or forward_batch.forward_mode.is_idle():
@@ -682,7 +1062,8 @@ class C4IndexerAscendBackendMixin:
         return torch.cat(topk_idxs, dim=0).to(dtype=torch.int32)
 
     def _ensure_npu_c4_indexer(self, c4_indexer, device: torch.device) -> None:
-        c4_indexer.compressor.li_kv_dtype = "int8"
+        # A5's lightning indexer consumes FP8 K + fp32 scales; pre-A5 stays int8.
+        c4_indexer.compressor.li_kv_dtype = "float8" if _is_atlas_a5() else "int8"
         if getattr(c4_indexer, "hadamard_matrix", None) is None:
             H = _walsh_hadamard_matrix(c4_indexer.head_dim, torch.float32, device)
             c4_indexer.register_buffer("hadamard_matrix", H, persistent=False)
@@ -725,20 +1106,33 @@ class C4IndexerAscendBackendMixin:
         weights: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
+        import torch_npu
+
+        if k.dtype == torch.float8_e4m3fn:
+            # A5: block-quantize Q to FP8 so it matches the FP8 K buffer; scales
+            # stay fp32 and the kernel wants one scale per (token, head).
+            q_quant, q_scale = torch_npu.npu_dynamic_block_quant(
+                q.view(-1, q.shape[-1]), dst_type=k.dtype
+            )
+            q_quant = q_quant.view(-1, c4_indexer.n_heads, c4_indexer.head_dim)
+            q_scale = q_scale.view(-1, c4_indexer.n_heads)
+        else:
+            q_quant, q_scale = torch_npu.npu_dynamic_quant(q)
+            q_scale = q_scale.to(torch.float16)
+
         fm = self.forward_metadata
         li_quant_metadata = fm.kernel_metadata["li_quant_metadata"]
         kwargs = dict(
-            query=q_int8,
+            query=q_quant,
             key=k,
-            key_dequant_scale=k_scale.squeeze(-2),
+            key_dequant_scale=k_scale.squeeze(-2).to(q_scale.dtype),
             actual_seq_lengths_query=fm.actual_seq_lengths_q,
             actual_seq_lengths_key=fm.actual_seq_lengths_kv,
             block_table=fm.c4_page_table,
             layout_query="TND",
             layout_key="PA_BSND",
-            weights=weights.to(torch.float16),
-            query_dequant_scale=q_scale.to(torch.float16),
+            weights=weights.to(q_scale.dtype),
+            query_dequant_scale=q_scale,
             cmp_ratio=4,
             query_quant_mode=0,
             key_quant_mode=0,
@@ -1512,8 +1906,9 @@ class DeepseekV4AscendAttnBackend(
         max_seqlen_q: int,
         is_nextn: bool,
     ) -> dict:
-        fm = self.forward_metadata
+        metadata_op, _ = _sparse_attn_ops()
         common = {
+            **_sparse_attn_kv_quant_kwargs(),
             "cu_seqlens_q": actual_seq_lengths_q_pa,
             "seqused_kv": actual_seq_lengths_kv,
             "cmp_ratio": 1,
@@ -1535,27 +1930,7 @@ class DeepseekV4AscendAttnBackend(
             "has_cmp_kv": False,
         }
         c1a_kwargs = base_kwargs | common
-        if self._is_dspark_draft_worker:
-            seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
-            max_seqlen_kv = (
-                int(seq_lens_cpu[:bs].max().item())
-                if seq_lens_cpu is not None and bs > 0
-                else int(actual_seq_lengths_kv[:bs].max().item())
-            )
-            c1a_kwargs.update(
-                cu_seqlens_ori_kv=actual_seq_lengths_q_pa,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_kv=max_seqlen_kv,
-            )
-            c1a_metadata = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
-                device=str(actual_seq_lengths_kv.device),
-                **c1a_kwargs,
-            )
-        else:
-            c1a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
-                **c1a_kwargs,
-            )
-        kernel_metadata = {"c1a_metadata": c1a_metadata}
+        kernel_metadata = {"c1a_metadata": metadata_op(**c1a_kwargs)}
 
         if self._dsv4_has_c4:
             c4a_overrides = {
@@ -1564,9 +1939,7 @@ class DeepseekV4AscendAttnBackend(
                 "cmp_topk": self._dsv4_index_topk,
             }
             c4a_kwargs = c1a_kwargs | c4a_overrides
-            kernel_metadata["c4a_metadata"] = (
-                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c4a_kwargs)
-            )
+            kernel_metadata["c4a_metadata"] = metadata_op(**c4a_kwargs)
 
             if actual_seq_lengths_q_pa is not None:
                 # the indexer metadata op wants a fresh contiguous tensor without the leading 0
@@ -1594,9 +1967,7 @@ class DeepseekV4AscendAttnBackend(
         if self._dsv4_has_c128:
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
             c128a_kwargs = c1a_kwargs | c128a_overrides
-            kernel_metadata["c128a_metadata"] = (
-                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c128a_kwargs)
-            )
+            kernel_metadata["c128a_metadata"] = metadata_op(**c128a_kwargs)
 
         return kernel_metadata
 
@@ -1641,7 +2012,13 @@ class DeepseekV4AscendAttnBackend(
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
 
+        _, attn_op = _sparse_attn_ops()
+        # cmp_ratio is implicit for the pre-A5 op but required by the kv-quant one.
+        a5_kwargs = _sparse_attn_kv_quant_kwargs()
+        if a5_kwargs:
+            a5_kwargs["cmp_ratio"] = 1
         attn_kwargs = dict(
+            **a5_kwargs,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
@@ -1659,16 +2036,7 @@ class DeepseekV4AscendAttnBackend(
             softmax_scale=layer.scaling,
             cmp_ratio=1,
         )
-        if self._is_dspark_draft_worker:
-            attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
-        ori_sparse_indices = getattr(fm, "ori_sparse_indices", None)
-        if ori_sparse_indices is not None:
-            attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
-        q_arg = attn_kwargs.pop("q")
-        if self._is_dspark_draft_worker:
-            out, _ = torch.ops._C_ascend.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
-        else:
-            out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
+        out, _ = attn_op(**attn_kwargs)
         return out
 
     def _forward_compressed(
@@ -1713,7 +2081,9 @@ class DeepseekV4AscendAttnBackend(
             "(see NPUDeepSeekV4SingleKVPool.kernel_page_size)"
         )
 
+        _, attn_op = _sparse_attn_ops()
         attn_kwargs = dict(
+            **_sparse_attn_kv_quant_kwargs(),
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
@@ -1738,8 +2108,7 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None
-        q_arg = attn_kwargs.pop("q")
-        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
+        out, _ = attn_op(**attn_kwargs)
         return out
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
