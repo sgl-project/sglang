@@ -421,11 +421,14 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 RUN pip freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt
 RUN cd sglang \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
-    && sed -i 's/compressed-tensors[^"]*"/compressed-tensors>=0.9.2"/g' python/pyproject.toml \
+    && case "${GPU_ARCH}" in \
+         *rocm7_15*) CT_EXTRA="rocm_rock" ;; \
+         *)           CT_EXTRA="rocm_legacy" ;; \
+       esac \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         SETUPTOOLS_SCM_PRETEND_VERSION="${SGLANG_VERSION}" python -m pip --no-cache-dir install --no-build-isolation -c /tmp/constraints.txt -e "python[srt_hip,diffusion_hip]"; \
+         SETUPTOOLS_SCM_PRETEND_VERSION="${SGLANG_VERSION}" python -m pip --no-cache-dir install --no-build-isolation -c /tmp/constraints.txt -e "python[srt_hip,diffusion_hip,${CT_EXTRA}]"; \
        else \
-         SETUPTOOLS_SCM_PRETEND_VERSION="${SGLANG_VERSION}" python -m pip --no-cache-dir install --no-build-isolation -c /tmp/constraints.txt -e "python[all_hip]"; \
+         SETUPTOOLS_SCM_PRETEND_VERSION="${SGLANG_VERSION}" python -m pip --no-cache-dir install --no-build-isolation -c /tmp/constraints.txt -e "python[all_hip,${CT_EXTRA}]"; \
        fi
 
 RUN python -m pip cache purge
