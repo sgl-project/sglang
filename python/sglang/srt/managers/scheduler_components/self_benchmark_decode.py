@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.mem_cache.common import alloc_for_extend, release_kv_cache
+from sglang.srt.mem_cache.allocation import alloc_for_extend
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
@@ -20,7 +21,19 @@ class SyntheticDecodeBatchBuilder:
     def __init__(self, scheduler: Scheduler):
         self.scheduler = scheduler
 
-    def build(self, reqs: list[Req], context_length: int) -> ScheduleBatch:
+    def build(
+        self,
+        reqs: list[Req],
+        context_lengths: int | Sequence[int] | None = None,
+        *,
+        context_length: int | None = None,
+    ) -> ScheduleBatch:
+        if context_lengths is None:
+            if context_length is None:
+                raise TypeError("context_lengths is required")
+            context_lengths = context_length
+        elif context_length is not None:
+            raise TypeError("pass only one of context_lengths and context_length")
         batch = ScheduleBatch.init_new(
             reqs=reqs,
             req_to_token_pool=self.scheduler.req_to_token_pool,
@@ -34,7 +47,7 @@ class SyntheticDecodeBatchBuilder:
         if getattr(self.scheduler, "enable_hisparse", False):
             batch.hisparse_coordinator = self.scheduler.hisparse_coordinator
 
-        self._place_context_cache(batch, context_length)
+        self._place_context_cache(batch, context_lengths)
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.scheduler.model_config.vocab_size
         )
@@ -51,13 +64,21 @@ class SyntheticDecodeBatchBuilder:
         batch.input_ids = None
         return batch
 
-    def _place_context_cache(self, batch: ScheduleBatch, context_length: int) -> None:
+    def _place_context_cache(
+        self, batch: ScheduleBatch, context_lengths: int | Sequence[int]
+    ) -> None:
         """Allocate synthetic context through the scheduler's canonical path."""
         batch_size = len(batch.reqs)
-        total_context_tokens = context_length * batch_size
+        if isinstance(context_lengths, int):
+            context_lengths = [context_lengths] * batch_size
+        else:
+            context_lengths = list(context_lengths)
+        if len(context_lengths) != batch_size:
+            raise ValueError("context_lengths must match the decode batch size")
+        total_context_tokens = sum(context_lengths)
         batch.forward_mode = ForwardMode.EXTEND
         batch.prefix_lens = [0] * batch_size
-        batch.extend_lens = [context_length] * batch_size
+        batch.extend_lens = list(context_lengths)
         batch.extend_num_tokens = total_context_tokens
         root_node = getattr(batch.tree_cache, "root_node", None)
         if root_node is not None:
@@ -65,12 +86,10 @@ class SyntheticDecodeBatchBuilder:
                 req.last_node = root_node
                 req.last_host_node = root_node
                 req.best_match_node = root_node
-        batch.seq_lens_cpu = torch.full(
-            (batch_size,), context_length, dtype=torch.int64
-        )
+        batch.seq_lens_cpu = torch.tensor(context_lengths, dtype=torch.int64)
         batch.seq_lens = batch.seq_lens_cpu.to(batch.device, non_blocking=True)
-        batch.orig_seq_lens = torch.full(
-            (batch_size,), context_length, dtype=torch.int32, device=batch.device
+        batch.orig_seq_lens = torch.tensor(
+            context_lengths, dtype=torch.int32, device=batch.device
         )
         batch.seq_lens_sum = total_context_tokens
         (

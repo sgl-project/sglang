@@ -1577,6 +1577,11 @@ class ServerArgs:
         ),
         NS("observability"),
     ] = None
+    benchmark_points_file: A[
+        Optional[str],
+        "JSON file containing explicit pure prefill/decode self-benchmark points. Explicit points replace the generated grid.",
+        NS("observability"),
+    ] = None
     benchmark_prefill_granularity: A[
         int,
         "Number of ISL sample points for self-benchmark prefill sweep.",
@@ -1587,6 +1592,11 @@ class ServerArgs:
         "Number of KV-read sample points per ISL for self-benchmark prefill sweep. The default keeps the existing miss-only sweep.",
         NS("observability"),
     ] = 1
+    benchmark_prefill_batch_granularity: A[
+        int,
+        "Maximum number of generated prefill request-batch-size samples for each token point.",
+        NS("observability"),
+    ] = 3
     benchmark_decode_length_granularity: A[
         int,
         "Number of context length sample points for self-benchmark decode sweep.",
@@ -3445,6 +3455,10 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        # Startup self-benchmark flags are model-independent and must also be
+        # validated for dummy model paths used by config/CLI tests.
+        self._handle_self_benchmark_validation()
+
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3463,9 +3477,6 @@ class ServerArgs:
             raise ValueError(
                 "--default-chat-template-kwargs must decode to a JSON object"
             )
-
-        # Validate self-benchmark flags.
-        self._handle_self_benchmark_validation()
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
@@ -7882,6 +7893,8 @@ class ServerArgs:
     def _handle_self_benchmark_validation(self):
         """Validate startup self-benchmark flags."""
         if self.benchmark_mode is None:
+            if self.benchmark_points_file is not None:
+                raise ValueError("--benchmark-points-file requires --benchmark-mode")
             return
         if not self.enable_forward_pass_metrics:
             raise ValueError(

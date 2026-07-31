@@ -694,6 +694,7 @@ class TestBenchmarkArgs(unittest.TestCase):
         "prefill": (
             "benchmark_prefill_granularity",
             "benchmark_prefill_kv_read_granularity",
+            "benchmark_prefill_batch_granularity",
         ),
         "decode": (
             "benchmark_decode_length_granularity",
@@ -758,6 +759,7 @@ class TestBenchmarkArgs(unittest.TestCase):
                 dict(
                     benchmark_prefill_granularity=64,
                     benchmark_prefill_kv_read_granularity=64,
+                    benchmark_prefill_batch_granularity=1,
                 ),
                 dict(benchmark_prefill_granularity=65),
             ),
@@ -774,6 +776,7 @@ class TestBenchmarkArgs(unittest.TestCase):
                 dict(
                     benchmark_prefill_granularity=32,
                     benchmark_prefill_kv_read_granularity=64,
+                    benchmark_prefill_batch_granularity=1,
                     benchmark_decode_length_granularity=32,
                     benchmark_decode_batch_granularity=64,
                 ),
@@ -789,6 +792,58 @@ class TestBenchmarkArgs(unittest.TestCase):
                     ValueError, rf"--benchmark-mode {mode} requests .* maximum is 4096"
                 ):
                     self._make_args(benchmark_mode=mode, **overflow_args)
+
+    @staticmethod
+    def _write_benchmark_points(payload):
+        file = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        with file:
+            json.dump(payload, file)
+        return file.name
+
+    def test_benchmark_points_file_requires_mode(self):
+        path = self._write_benchmark_points(
+            {"schema_version": 1, "prefill": [], "decode": []}
+        )
+        self.addCleanup(lambda: os.unlink(path))
+
+        with self.assertRaisesRegex(
+            ValueError, "--benchmark-points-file requires --benchmark-mode"
+        ):
+            ServerArgs(model_path="dummy", benchmark_points_file=path)
+
+    def test_benchmark_points_file_is_strict(self):
+        path = self._write_benchmark_points(
+            {
+                "schema_version": 1,
+                "prefill": [
+                    {
+                        "total_prefill_tokens": "4",
+                        "total_kv_read_tokens": 0,
+                        "batch_size": 1,
+                    }
+                ],
+                "decode": [],
+            }
+        )
+        self.addCleanup(lambda: os.unlink(path))
+
+        with self.assertRaisesRegex(ValueError, "--benchmark-points-file"):
+            self._make_args(benchmark_points_file=path)
+
+    def test_explicit_points_bypass_generated_axis_validation(self):
+        path = self._write_benchmark_points(
+            {"schema_version": 1, "prefill": [], "decode": []}
+        )
+        self.addCleanup(lambda: os.unlink(path))
+
+        server_args = self._make_args(
+            benchmark_points_file=path,
+            benchmark_prefill_granularity=0,
+            benchmark_prefill_batch_granularity=1025,
+            benchmark_decode_length_granularity=0,
+        )
+
+        self.assertEqual(server_args.benchmark_points_file, path)
 
     def test_benchmark_warmup_iterations_negative_rejected(self):
         with self.assertRaisesRegex(ValueError, "must be >= 0"):

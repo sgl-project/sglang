@@ -19,6 +19,8 @@ from sglang.srt.managers.scheduler_components.self_benchmark import (
     BenchmarkPoint,
     BenchmarkPointResult,
     SelfBenchmark,
+    _cudagraph_axis_points,
+    _limit_cudagraph_axis,
 )
 from sglang.srt.observability.forward_pass_metrics import (
     ForwardPassMetrics,
@@ -49,15 +51,18 @@ def _make_scheduler(output_path: str):
             model_path="test-model",
             served_model_name=None,
             benchmark_mode="agg",
+            benchmark_points_file=None,
             benchmark_prefill_granularity=2,
             benchmark_prefill_kv_read_granularity=1,
+            benchmark_prefill_batch_granularity=3,
             benchmark_decode_length_granularity=2,
             benchmark_decode_batch_granularity=2,
             benchmark_warmup_iterations=0,
             benchmark_output_path=output_path,
             chunked_prefill_size=None,
             cuda_graph_config=types.SimpleNamespace(
-                decode=types.SimpleNamespace(max_bs=4)
+                prefill=types.SimpleNamespace(bs=[]),
+                decode=types.SimpleNamespace(max_bs=4, bs=[1, 2, 4]),
             ),
             node_rank=0,
             nnodes=1,
@@ -499,7 +504,7 @@ class TestSelfBenchmark(CustomTestCase):
 
         self.assertEqual(injected, 2)
         self.assertIs(scheduler.running_batch, fake_batch)
-        self.assertEqual(captured["context_length"], 8)
+        self.assertEqual(captured["context_length"], [8, 8])
         self.assertEqual(benchmark._active_reqs, captured["reqs"])
 
         for req in captured["reqs"]:
@@ -511,7 +516,7 @@ class TestSelfBenchmark(CustomTestCase):
             )
             self.assertEqual(req.seqlen, 9)
             self.assertEqual(req.kv_committed_len, 8)
-            self.assertEqual(req.kv_allocated_len, 8)
+            self.assertEqual(req.kv.kv_allocated_len, 8)
             self.assertEqual(req.already_computed, 8)
             self.assertFalse(req.finished())
 
@@ -532,7 +537,53 @@ class TestSelfBenchmark(CustomTestCase):
         self.assertEqual(injected, 0)
         self.assertEqual(benchmark._active_reqs, [])
 
-    def test_prefill_grid_is_not_capped_at_chunked_prefill_size(self):
+    def test_cudagraph_axis_includes_capture_boundaries_and_eager_tail(self):
+        points = _cudagraph_axis_points([8, 16], 64)
+
+        self.assertEqual(points, [8, 9, 16, 17, 32, 64])
+        self.assertEqual(
+            _limit_cudagraph_axis(points, [8, 16], len(points)),
+            points,
+        )
+
+    def test_prefill_grid_records_graph_metadata(self):
+        scheduler = self._scheduler()
+        scheduler.server_args.benchmark_mode = "prefill"
+        scheduler.server_args.benchmark_prefill_granularity = 16
+        scheduler.server_args.benchmark_prefill_batch_granularity = 1
+        scheduler.server_args.cuda_graph_config.prefill = types.SimpleNamespace(
+            backend="full", bs=[8, 16]
+        )
+        scheduler.max_req_input_len = 128
+        scheduler.max_total_num_tokens = 128
+        scheduler.max_prefill_tokens = 64
+
+        benchmark = SelfBenchmark(scheduler)
+        points = {p.total_prefill_tokens: p for p in benchmark._grid}
+
+        self.assertEqual(points[9].expected_capture_size, 16)
+        self.assertEqual(points[9].padding_tokens, 7)
+        self.assertEqual(points[9].sample_reasons, ["post_capture"])
+        self.assertIsNone(points[32].expected_capture_size)
+        self.assertEqual(points[32].sample_reasons, ["eager_tail", "geometric_tail"])
+        self.assertEqual(points[64].sample_reasons, ["eager_tail", "engine_limit"])
+
+    def test_decode_axis_uses_largest_feasible_batch(self):
+        scheduler = self._scheduler()
+        scheduler.server_args.benchmark_mode = "decode"
+        scheduler.max_total_num_tokens = 6
+
+        benchmark = SelfBenchmark(scheduler)
+        decode_points = [p for p in benchmark._grid if p.point_type == "decode"]
+
+        self.assertEqual(benchmark._max_feasible_decode_batch_size(), 3)
+        self.assertEqual(max(p.batch_size for p in decode_points), 3)
+        max_batch_points = [p for p in decode_points if p.batch_size == 3]
+        self.assertTrue(
+            all("engine_limit" in p.sample_reasons for p in max_batch_points)
+        )
+
+    def test_prefill_grid_respects_chunked_prefill_per_request(self):
         scheduler = self._scheduler()
         scheduler.server_args.benchmark_mode = "prefill"
         scheduler.server_args.chunked_prefill_size = 8
@@ -543,8 +594,12 @@ class TestSelfBenchmark(CustomTestCase):
 
         prefill_points = [p for p in benchmark._grid if p.point_type == "prefill"]
         self.assertGreater(len(prefill_points), 0)
-        self.assertEqual(max(p.isl for p in prefill_points), 62)
-        self.assertTrue(all(p.kv_read_tokens == 0 for p in prefill_points))
+        self.assertEqual(max(p.total_prefill_tokens for p in prefill_points), 32)
+        self.assertTrue(any(p.batch_size > 1 for p in prefill_points))
+        self.assertTrue(all(p.total_kv_read_tokens == 0 for p in prefill_points))
+        for point in prefill_points:
+            new_lengths, _, _ = benchmark._prefill_lengths(point)
+            self.assertTrue(all(length <= 8 for length in new_lengths))
 
     def test_prefill_grid_is_capped_by_forward_token_budget(self):
         scheduler = self._scheduler()
@@ -557,12 +612,15 @@ class TestSelfBenchmark(CustomTestCase):
 
         prefill_points = [p for p in benchmark._grid if p.point_type == "prefill"]
         self.assertGreater(len(prefill_points), 0)
-        self.assertEqual(max(p.isl for p in prefill_points), 1024)
+        self.assertEqual(max(p.total_prefill_tokens for p in prefill_points), 1024)
         self.assertTrue(
-            all(p.isl <= scheduler.max_prefill_tokens for p in prefill_points)
+            all(
+                p.total_prefill_tokens <= scheduler.max_prefill_tokens
+                for p in prefill_points
+            )
         )
 
-    def test_prefill_kv_read_grid_crosses_with_isl(self):
+    def test_prefill_kv_read_grid_crosses_token_and_batch_axes(self):
         scheduler = self._scheduler()
         scheduler.server_args.benchmark_mode = "prefill"
         scheduler.server_args.benchmark_prefill_kv_read_granularity = 3
@@ -571,15 +629,11 @@ class TestSelfBenchmark(CustomTestCase):
 
         prefill_points = [p for p in benchmark._grid if p.point_type == "prefill"]
         self.assertEqual(
-            [(p.isl, p.kv_read_tokens) for p in prefill_points],
             [
-                (10, 0),
-                (10, 4),
-                (10, 9),
-                (15, 0),
-                (15, 7),
-                (15, 14),
+                (p.total_prefill_tokens, p.total_kv_read_tokens, p.batch_size)
+                for p in prefill_points
             ],
+            [(60, 0, 4), (1, 14, 1), (1, 4, 1), (1, 0, 1)],
         )
 
     def test_prefill_kv_read_grid_aligns_to_page_size(self):
@@ -592,38 +646,43 @@ class TestSelfBenchmark(CustomTestCase):
         benchmark = SelfBenchmark(scheduler)
 
         prefill_points = [p for p in benchmark._grid if p.point_type == "prefill"]
-        self.assertTrue(all(p.kv_read_tokens % 8 == 0 for p in prefill_points))
-        self.assertTrue(all(p.kv_read_tokens <= p.isl - 1 for p in prefill_points))
-        self.assertIn(
-            BenchmarkPoint(point_type="prefill", isl=39, kv_read_tokens=32),
-            prefill_points,
-        )
+        self.assertTrue(all(p.total_kv_read_tokens % 8 == 0 for p in prefill_points))
+        self.assertTrue(any(p.total_kv_read_tokens == 32 for p in prefill_points))
+        for point in prefill_points:
+            _, kv_lengths, prompt_lengths = benchmark._prefill_lengths(point)
+            self.assertTrue(all(length % 8 == 0 for length in kv_lengths))
+            self.assertTrue(
+                all(length < scheduler.max_req_input_len for length in prompt_lengths)
+            )
 
     def test_prefill_kv_read_point_seeds_then_measures_with_same_extra_key(self):
         scheduler = self._scheduler()
         scheduler.server_args.benchmark_mode = "prefill"
         benchmark = SelfBenchmark(scheduler)
-        point = BenchmarkPoint(point_type="prefill", isl=16, kv_read_tokens=8)
+        point = BenchmarkPoint(
+            point_type="prefill",
+            total_prefill_tokens=4,
+            total_kv_read_tokens=4,
+            batch_size=2,
+        )
         calls = []
 
         def fake_inject_requests(**kwargs):
             calls.append(kwargs)
-            return 1
+            return len(kwargs["prompt_lens"])
 
         benchmark.phase = BenchmarkPhase.SWEEP
         benchmark._grid = [point]
         benchmark._grid_index = 0
         benchmark._inject_requests = fake_inject_requests
-        benchmark._cached_kv_read_tokens_for_point = (
-            lambda cached_point, _extra_key: cached_point.kv_read_tokens
-        )
+        benchmark._cached_kv_read_tokens = lambda _prompt_len, _extra_key: 2
 
         benchmark.maybe_schedule_next()
 
         self.assertIsNone(benchmark._current)
         self.assertIs(benchmark._pending_seed_point, point)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["prompt_len"], 8)
+        self.assertEqual(calls[0]["prompt_lens"], [2, 2])
         self.assertEqual(calls[0]["max_tokens"], 0)
         self.assertFalse(calls[0]["track_active"])
 
@@ -631,11 +690,12 @@ class TestSelfBenchmark(CustomTestCase):
 
         self.assertIsNotNone(benchmark._current)
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[1]["prompt_len"], 16)
+        self.assertEqual(calls[1]["prompt_lens"], [4, 4])
         self.assertEqual(calls[1]["max_tokens"], 1)
         self.assertTrue(calls[1]["track_active"])
-        self.assertEqual(calls[0]["extra_key"], calls[1]["extra_key"])
-        self.assertIsNone(benchmark._pending_seed_extra_key)
+        self.assertEqual(calls[0]["extra_keys"], calls[1]["extra_keys"])
+        self.assertEqual(len(set(calls[0]["extra_keys"])), 2)
+        self.assertIsNone(benchmark._pending_seed_extra_keys)
 
     def test_prefill_kv_read_point_skips_when_seed_validation_misses(self):
         scheduler = self._scheduler()
@@ -652,7 +712,7 @@ class TestSelfBenchmark(CustomTestCase):
         benchmark._grid = [point]
         benchmark._grid_index = 0
         benchmark._inject_requests = fake_inject_requests
-        benchmark._cached_kv_read_tokens_for_point = lambda _point, _extra_key: 0
+        benchmark._cached_kv_read_tokens = lambda _prompt_len, _extra_key: 0
 
         benchmark.maybe_schedule_next()
         benchmark.maybe_schedule_next()
@@ -665,6 +725,129 @@ class TestSelfBenchmark(CustomTestCase):
         self.assertEqual(
             benchmark._skipped_points[0].reason, "seed_cache_validation_failed"
         )
+
+    def test_explicit_points_replace_generated_grid_and_preserve_order(self):
+        points_path = os.path.join(self._tmpdir.name, "points.json")
+        with open(points_path, "w") as f:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "prefill": [
+                        {
+                            "total_prefill_tokens": 4,
+                            "total_kv_read_tokens": 0,
+                            "batch_size": 2,
+                        },
+                        {
+                            "total_prefill_tokens": 2,
+                            "total_kv_read_tokens": 2,
+                            "batch_size": 2,
+                        },
+                    ],
+                    "decode": [
+                        {"total_kv_read_tokens": 8, "batch_size": 2},
+                    ],
+                },
+                f,
+            )
+        scheduler = self._scheduler()
+        scheduler.server_args.benchmark_points_file = points_path
+
+        benchmark = SelfBenchmark(scheduler)
+
+        self.assertEqual(
+            [
+                (
+                    p.point_type,
+                    p.total_prefill_tokens,
+                    p.total_kv_read_tokens,
+                    p.batch_size,
+                )
+                for p in benchmark._grid
+            ],
+            [
+                ("prefill", 4, 0, 2),
+                ("prefill", 2, 2, 2),
+                ("decode", 0, 8, 2),
+            ],
+        )
+        self.assertEqual([p.benchmark_id for p in benchmark._grid], [1, 2, 3])
+        self.assertTrue(all("explicit" in p.sample_reasons for p in benchmark._grid))
+        self.assertEqual(len(benchmark._grid_digest), 64)
+
+    def test_explicit_points_filter_by_mode_and_allow_empty_grid(self):
+        points_path = os.path.join(self._tmpdir.name, "decode-only.json")
+        with open(points_path, "w") as f:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "prefill": [],
+                    "decode": [
+                        {"total_kv_read_tokens": 8, "batch_size": 2},
+                    ],
+                },
+                f,
+            )
+        scheduler = self._scheduler()
+        scheduler.server_args.benchmark_mode = "prefill"
+        scheduler.server_args.benchmark_points_file = points_path
+
+        benchmark = SelfBenchmark(scheduler)
+
+        self.assertEqual(benchmark._grid, [])
+        benchmark.maybe_schedule_next()
+        self.assertFalse(benchmark.active)
+
+    def test_explicit_infeasible_point_reports_section_index(self):
+        points_path = os.path.join(self._tmpdir.name, "infeasible.json")
+        with open(points_path, "w") as f:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "prefill": [
+                        {
+                            "total_prefill_tokens": 2,
+                            "total_kv_read_tokens": 0,
+                            "batch_size": 1,
+                        },
+                        {
+                            "total_prefill_tokens": 64,
+                            "total_kv_read_tokens": 0,
+                            "batch_size": 1,
+                        },
+                    ],
+                    "decode": [],
+                },
+                f,
+            )
+        scheduler = self._scheduler()
+        scheduler.server_args.benchmark_mode = "prefill"
+        scheduler.server_args.benchmark_points_file = points_path
+
+        with self.assertRaisesRegex(ValueError, r"prefill\[1\].*infeasible"):
+            SelfBenchmark(scheduler)
+
+    def test_explicit_point_runtime_failure_is_fatal(self):
+        benchmark = SelfBenchmark(self._scheduler())
+        point = BenchmarkPoint(
+            point_type="decode",
+            benchmark_id=1,
+            total_kv_read_tokens=8,
+            batch_size=2,
+            sample_reasons=["explicit"],
+        )
+        benchmark._current = BenchmarkPointResult(point=point)
+        benchmark._current.fpms = [
+            {
+                "scheduled_requests": {
+                    "num_decode_requests": 1,
+                    "sum_decode_kv_tokens": 8,
+                }
+            }
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "explicit benchmark point"):
+            benchmark._save_current_point()
 
     def test_disaggregated_workers_only_build_supported_grid(self):
         scheduler = self._scheduler()
