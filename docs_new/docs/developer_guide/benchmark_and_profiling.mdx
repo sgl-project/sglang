@@ -298,11 +298,20 @@ The profile merger generates:
 
 ### Profile the CUDA graph capture phase
 
-The tools above profile the steady-state runtime (prefill / decode). To instead profile the **CUDA graph capture phase** that runs once at server startup, launch the server with `--enable-profile-cuda-graph`. This exports one PyTorch Profiler trace per captured batch size, which is useful for diagnosing slow or memory-heavy graph capture.
+The tools above profile the steady-state runtime (prefill / decode). To instead profile the **CUDA graph capture phase** that runs once at server startup, launch the server with `--enable-profile-cuda-graph`. This runs a PyTorch Profiler pass over each captured decode batch size, which is useful for diagnosing slow or memory-heavy graph capture.
+
+Capture profiling has two levels:
+
+- `--enable-profile-cuda-graph` (server arg) builds the capture profiler and always emits the per-kernel CPU/CUDA time summary tables and a CUDA memory snapshot for the capture phase.
+- `SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE=1` (env var) additionally persists one PyTorch Profiler Chrome trace per captured batch size. It is a no-op unless `--enable-profile-cuda-graph` is also set; when it is unset the profiler still runs, but no per-batch-size trace files are written.
 
 ```bash Command
 # set trace path
 export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
+
+# opt in to per-batch-size capture traces
+# (without this only the summary tables + memory snapshot are emitted)
+export SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE=1
 
 # launch the server with CUDA graph capture profiling enabled
 python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --enable-profile-cuda-graph
@@ -311,10 +320,10 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --e
 Behavior and output:
 
 - Traces are written to `$&#123;SGLANG_TORCH_PROFILER_DIR&#125;/capture_traces/` (falls back to `traces/capture_traces/` if the variable is unset).
-- One trace file is produced per captured batch size, named `bs_&#123;bs&#125;_rank0.json.gz`. The captured forward for each batch size is wrapped in a `capture_&#123;num_tokens&#125;_&#123;forward_mode&#125;` range, making it easy to locate in the trace.
-- The two warmup runs that precede each capture are skipped, so only the capture run is recorded.
-- Only tensor-parallel rank 0 is profiled.
-- A CUDA memory snapshot (`cuda_graph_runner_memory_usage.pickle`) and per-kernel CPU/CUDA time summary tables are also emitted for the capture phase.
+- One trace file is produced per captured batch size on every tensor-parallel rank, named `bs_&#123;bs&#125;_rank&#123;tp_rank&#125;.json.gz`; namespacing by rank keeps ranks from colliding.
+- The profiler uses a `wait=2, warmup=0, active=1` schedule, so the two dummy runs that precede each capture are skipped and only the capture run itself is recorded. `record_shapes`, `with_stack`, `with_flops`, and `profile_memory` are all enabled, so per-shape kernel identities, input shapes, FLOPs, and memory are captured.
+- A CUDA memory snapshot (`cuda_graph_runner_memory_usage.pickle`) and per-kernel CPU/CUDA time summary tables are also emitted for the capture phase (independent of the env var above).
+- Only the decode CUDA-graph runner is profiled.
 
 The capture traces are viewed the same way as other PyTorch Profiler traces (see [View traces](#view-traces)).
 
