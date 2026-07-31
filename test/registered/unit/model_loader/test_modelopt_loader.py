@@ -5,8 +5,6 @@ This test module verifies the functionality of ModelOptModelLoader, which
 applies NVIDIA Model Optimizer quantization to models during loading.
 """
 
-import json
-import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -529,31 +527,9 @@ class TestParseQuantHfConfig(CustomTestCase):
 
 
 class TestModelOptFp4LoaderSelection(CustomTestCase):
-    def test_explicit_excluded_draft_uses_online_modelopt_fp4(self):
+    def test_explicit_draft_uses_online_modelopt_fp4(self):
         model_config = SimpleNamespace(
             model_path="target-model",
-            quantization="modelopt_fp4",
-            is_draft_model=True,
-            is_draft_quantization_explicit=True,
-            hf_config=SimpleNamespace(
-                quantization_config={
-                    "quant_algo": "NVFP4",
-                    "group_size": 16,
-                    "ignore": ["mtp.layers.0*"],
-                }
-            ),
-        )
-
-        config = get_quant_config(model_config, LoadConfig(), {})
-
-        self.assertIsInstance(config, ModelOptFp4Config)
-        self.assertFalse(config.is_checkpoint_nvfp4_serialized)
-        self.assertFalse(config.use_per_token_activation)
-        self.assertEqual(config.group_size, 16)
-
-    def test_explicit_nonexcluded_draft_keeps_serialized_config(self):
-        model_config = SimpleNamespace(
-            model_path="draft-model",
             quantization="modelopt_fp4",
             is_draft_model=True,
             is_draft_quantization_explicit=True,
@@ -569,34 +545,9 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
         config = get_quant_config(model_config, LoadConfig(), {})
 
         self.assertIsInstance(config, ModelOptFp4Config)
-        self.assertTrue(config.is_checkpoint_nvfp4_serialized)
-
-    def test_legacy_excluded_draft_uses_online_modelopt_fp4(self):
-        with tempfile.TemporaryDirectory() as model_path:
-            with open(f"{model_path}/hf_quant_config.json", "w") as f:
-                json.dump(
-                    {
-                        "producer": {"name": "modelopt"},
-                        "quantization": {
-                            "quant_algo": "NVFP4",
-                            "group_size": 16,
-                            "exclude_modules": ["mtp.layers.0*"],
-                        },
-                    },
-                    f,
-                )
-
-            model_config = SimpleNamespace(
-                model_path=model_path,
-                revision=None,
-                quantization="modelopt_fp4",
-                is_draft_quantization_explicit=True,
-                hf_config=SimpleNamespace(quantization_config=None),
-            )
-            config = get_quant_config(model_config, LoadConfig(), {})
-
-        self.assertIsInstance(config, ModelOptFp4Config)
         self.assertFalse(config.is_checkpoint_nvfp4_serialized)
+        self.assertFalse(config.use_per_token_activation)
+        self.assertEqual(config.group_size, 16)
 
     def test_inherited_modelopt_fp4_draft_uses_checkpoint_config(self):
         model_config = SimpleNamespace(

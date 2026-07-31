@@ -1264,6 +1264,20 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         return "modelopt_fp4"
 
     @classmethod
+    def for_online_weight_quantization(
+        cls,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+    ) -> ModelOptFp4Config:
+        """Build the static-activation config for floating MoE weights."""
+        return cls(
+            is_checkpoint_nvfp4_serialized=False,
+            group_size=16,
+            exclude_modules=[],
+            packed_modules_mapping=packed_modules_mapping,
+            use_per_token_activation=False,
+        )
+
+    @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return [torch.bfloat16, torch.half, torch.float8_e4m3fn]
 
