@@ -6,10 +6,14 @@ token, so the over-drafted suffix is never committed to KV nor emitted.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components import (
+    batch_result_processor as result_processor_module,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -49,7 +53,7 @@ class _FakeBatch:
         self.spec_algorithm = _FakeSpecAlgorithm()
 
 
-def _make_processor() -> SchedulerBatchResultProcessor:
+def _make_processor(model_worker=None) -> SchedulerBatchResultProcessor:
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
@@ -65,7 +69,8 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         metrics_collector=None,
         metrics_reporter=SimpleNamespace(),
         draft_worker=None,
-        model_worker=SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
+        model_worker=model_worker
+        or SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
         logprob_result_processor=None,
         output_streamer=SimpleNamespace(),
         abort_request=lambda *a, **k: None,
@@ -88,8 +93,8 @@ def _make_req(terminate_after: int) -> Req:
 
 def _make_result(num_draft_tokens, accept_lens, flat_tokens):
     return SimpleNamespace(
-        next_token_ids=torch.tensor(flat_tokens, dtype=torch.long),
-        accept_lens=torch.tensor(accept_lens, dtype=torch.long),
+        next_token_ids=torch.tensor(flat_tokens, dtype=torch.long, device="cpu"),
+        accept_lens=torch.tensor(accept_lens, dtype=torch.long, device="cpu"),
         speculative_num_draft_tokens=num_draft_tokens,
         num_correct_drafts=None,
         num_correct_drafts_per_req_cpu=None,
@@ -99,6 +104,46 @@ def _make_result(num_draft_tokens, accept_lens, flat_tokens):
 
 
 class TestSpecV2GrammarTruncation(CustomTestCase):
+    def test_prefill_release_prepares_worker_state_before_free(self):
+        events = []
+        proc = _make_processor(
+            SimpleNamespace(
+                prepare_for_kv_cache_release=lambda _req: events.append("prepare")
+            )
+        )
+        proc.output_streamer.stream_output = lambda *_args: None
+        proc.metrics_reporter.report_prefill_stats = lambda **_kwargs: None
+        req = _make_req(terminate_after=99)
+        req.grammar = None
+        req.sampling_params.max_new_tokens = 0
+        batch = SimpleNamespace(
+            reqs=[req],
+            decoding_reqs=[],
+            return_logprob=False,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=SimpleNamespace(customized_info=None, hidden_states=None),
+            next_token_ids=torch.tensor([7]),
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            can_run_cuda_graph=False,
+        )
+        with patch.object(
+            result_processor_module,
+            "release_kv_cache",
+            side_effect=lambda *_args, **_kwargs: events.append("release"),
+        ):
+            SchedulerBatchResultProcessor.process_batch_result_prefill(
+                proc, batch, result
+            )
+
+        self.assertEqual(events, ["prepare", "release"])
+
     def test_resolve_truncates_after_grammar_completion(self):
         req = _make_req(terminate_after=2)
         proc = _make_processor()
