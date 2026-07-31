@@ -57,15 +57,20 @@ resilience feature.
 ## Data model
 
 ```text
-kvidx:{<hash>}:p         HASH  worker_id -> tier bitmask
-kvidx:{<hash>}:h         HASH  c (hit count), ls (last seen ms)
-kvidx:{w:<worker>}:blocks SET  block hashes this worker holds
-kvidx:{w:<worker>}:meta   HASH addr
+kvidx:{<hash>}:p          HASH  "<worker_id>\x1f<tier>" -> component bitmask
+                                "\x00sz" -> block token count
+kvidx:{<hash>}:h          HASH  c (hit count), ls (last seen ms)
+kvidx:{w:<worker>}:blocks SET   block hashes this worker holds
+kvidx:{w:<worker>}:meta   HASH  addr (router-facing URL),
+                                spec (encoded WorkerCacheSpec)
 ```
 
-A tier is one bit: `bit = 1 << tier` (HBM=1, DRAM=2, SSD=3). The hash tags keep
-placement co-located with its hit counter, and per-worker keys co-located with
-each other, so every Lua script stays within one cluster slot.
+Each placement field identifies one `(worker, tier)` pair; its value is a
+component mask (`FULL=1`, `SWA=2`, `MAMBA=4`, and `0` for legacy whole-block
+events). Tier masks (`1 << tier`) are stored separately inside
+`WorkerCacheSpec`. The hash tags keep placement co-located with its hit counter,
+and per-worker keys co-located with each other, so every Lua script stays within
+one cluster slot.
 
 ## Build
 
@@ -81,44 +86,97 @@ This produces:
 
 The `redis-backend` feature is required to run the Redis-backed server.
 
-## Run locally
+## End-to-end quickstart
 
-Start Redis:
+Component-aware routing requires an SGLang engine build that supports
+`component_types`. Start each command in its own terminal.
+
+1. Start Redis:
 
 ```bash
 redis-server --port 6379
 ```
 
-Start the indexer:
+2. Start the indexer:
 
 ```bash
 KV_INDEXER_BACKEND=redis \
 KV_INDEXER_REDIS_URL=redis://127.0.0.1:6379 \
 KV_INDEXER_LISTEN_ADDR=127.0.0.1:50051 \
-RUST_LOG=info \
   cargo run --release --features redis-backend --bin kv-indexer-server
 ```
 
-For chain bring-up before Redis is involved, `KV_INDEXER_BACKEND=logging` runs an
-in-memory backend that logs running block totals on every apply.
-
-Start one bridge for a SGLang worker:
+3. Start one bridge per worker event stream. This FULL+SWA example uses the
+worker URL that the router will register; set the window to the model's value:
 
 ```bash
 KV_INDEXER_WORKER_ID=worker-0 \
 KV_INDEXER_WORKER_ADDRESS=http://127.0.0.1:30000 \
 KV_INDEXER_ENDPOINT=http://127.0.0.1:50051 \
 SGLANG_KV_EVENT_ENDPOINT=tcp://127.0.0.1:5567 \
-RUST_LOG=info \
+SGLANG_KV_EVENT_TOPIC=kv-events \
+KV_INDEXER_CACHE_COMPONENTS=full,swa \
+KV_INDEXER_SWA_WINDOW_TOKENS=<model-window-tokens> \
+KV_INDEXER_FULL_TIERS=HBM \
+KV_INDEXER_SWA_TIERS=HBM \
   cargo run --release --bin kv-indexer-bridge
 ```
 
-The corresponding SGLang server must publish KV events at that endpoint, for
-example with a `kv-events-config` containing a ZMQ publisher endpoint. The replay
-endpoint is not used by this build.
+For FULL+MAMBA, replace the component-specific variables with:
 
-Deploy one bridge per independent SGLang KV-event stream (for example, per DP
-rank), each with a unique `KV_INDEXER_WORKER_ID`.
+```bash
+KV_INDEXER_CACHE_COMPONENTS=full,mamba
+KV_INDEXER_FULL_TIERS=HBM
+KV_INDEXER_MAMBA_TIERS=HBM
+```
+
+4. Start the matching SGLang worker. Component types are gated and off by
+default:
+
+```bash
+python -m sglang.launch_server \
+  --model-path <model> \
+  --port 30000 \
+  --kv-events-config \
+    '{"publisher":"zmq","endpoint":"tcp://*:5567","topic":"kv-events"}' \
+  --enable-kv-events-component-types
+```
+
+5. Start the router with the indexer as the preferred cache signal:
+
+```bash
+sgl-router \
+  --model-id <model-id> \
+  --tokenizer-path <huggingface-repo-or-tokenizer> \
+  --worker-urls http://127.0.0.1:30000 \
+  --policy cache_aware_zmq \
+  --kv-indexer-endpoint http://127.0.0.1:50051
+```
+
+For multiple workers, repeat steps 3–4 with a unique worker ID, HTTP port, and
+ZMQ port, then include every HTTP URL in `--worker-urls`. Each
+`KV_INDEXER_WORKER_ADDRESS` must match its router URL byte-for-byte.
+
+The bridge stores component snapshots, `MatchExternalKvPrefix` converts them to
+an effective reusable prefix, and the router consumes that prefix without
+implementing SWA or MAMBA rules. RPC failures fall back to the router's local
+cache-aware policy.
+
+### Verify and troubleshoot
+
+- Prefill a unique prompt directly on one worker, then send it through the
+  router; the router should select that worker.
+- Missing `--enable-kv-events-component-types` produces legacy whole-block
+  events, so FULL/SWA/MAMBA cannot be distinguished.
+- A wrong SWA window or cache-component list produces incorrect effective
+  prefixes; copy both from the model/cache configuration.
+- If the router gets no external signal, first compare
+  `KV_INDEXER_WORKER_ADDRESS` with the registered worker URL.
+- For chat requests, use a tokenizer configuration with the same chat template
+  as the engine; a bare `tokenizer.json` may not contain it.
+
+For non-component bring-up, omit the component variables and gated engine flag.
+`KV_INDEXER_BACKEND=logging` can replace Redis with an in-memory debug backend.
 
 ## Configuration
 
@@ -137,11 +195,21 @@ rank), each with a unique `KV_INDEXER_WORKER_ID`.
 | Variable | Default | Description |
 | --- | --- | --- |
 | `KV_INDEXER_WORKER_ID` | required | Unique ID for this worker event stream |
-| `KV_INDEXER_WORKER_ADDRESS` | empty | Address returned to match callers |
+| `KV_INDEXER_WORKER_ADDRESS` | empty | Router-facing worker URL; must exactly match the URL registered by the router |
 | `KV_INDEXER_ENDPOINT` | `http://[::1]:50051` | Indexer gRPC endpoint |
 | `SGLANG_KV_EVENT_ENDPOINT` | `tcp://127.0.0.1:5557` | SGLang event PUB endpoint |
 | `SGLANG_KV_EVENT_TOPIC` | empty | ZMQ subscription topic |
 | `KV_INDEXER_CLEAR_TIERS` | `HBM,DRAM,SSD` | Tiers affected by `AllBlocksCleared` |
+| `KV_INDEXER_CACHE_COMPONENTS` | unset (legacy) | Comma-separated `full`, `swa`, and/or `mamba`; FULL is always included when set |
+| `KV_INDEXER_SWA_WINDOW_TOKENS` | `0` | Required and greater than zero when `swa` is configured |
+| `KV_INDEXER_FULL_TIERS` | `HBM,DRAM` | Servable tiers for FULL (`HBM`/`GPU`, `DRAM`/`CPU`/`CPU_PINNED`, `SSD`/`DISK`) |
+| `KV_INDEXER_SWA_TIERS` | `HBM,DRAM` | Servable tiers for SWA, using the same aliases |
+| `KV_INDEXER_MAMBA_TIERS` | `HBM,DRAM` | Servable tiers for MAMBA, using the same aliases |
+| `KV_INDEXER_CACHE_SPEC_VERSION` | `1` | Component-rule version; versions newer than the server supports fail closed |
+
+The bridge builds its `WorkerCacheSpec` once at startup and sends it with every
+apply batch. Omitting `KV_INDEXER_CACHE_COMPONENTS` clears any previously stored
+spec and preserves legacy whole-block matching.
 
 ## API
 
@@ -159,13 +227,20 @@ There is no gRPC health service in this build.
 ## Prefix routing query
 
 `MatchExternalKvPrefix` answers, for a request's block-hash chain (prompt order,
-`hashes[0]` first), how long a contiguous prefix each worker holds. A worker's
-`matched_prefix_blocks` is the largest `n` such that it holds `hashes[0..n)` with
-no gap; the count stops at the first missing block. This is intentionally
-*stricter* than sgl-router's in-process `HashTree::match_prefix`, which credits a
-worker for the deepest matched node without checking every ancestor — so the
-indexer only ever under-reports a prefix, never routes a request to a worker that
-cannot serve it.
+`hashes[0]` first), how much prefix each worker can actually reuse.
+
+For a legacy worker, `matched_prefix_blocks` is the largest `n` such that it
+holds every block in `hashes[0..n)` with no gap. For a component-aware worker,
+the stored `WorkerCacheSpec` additionally applies the engine's fixed rules:
+
+- FULL must be contiguous on every matched block.
+- SWA, when configured, must cover the trailing `swa_window_tokens` at the
+  candidate boundary (or form an unbroken run from the prompt head).
+- MAMBA, when configured, must be present on the candidate boundary block.
+
+Component placements without a worker spec fail closed instead of being treated
+as legacy whole-block placements. A batch without a spec clears any older stored
+spec, preventing stale component rules from carrying across worker changes.
 
 The indexer does **not** pick a worker. It cannot see the router's health checks,
 circuit breakers, PD-pool split, or in-flight load, so it returns every candidate
@@ -173,13 +248,18 @@ sorted by prefix length and leaves the final choice to the router (intersect the
 cache-hit set with the router's own candidates, then pick by lowest load). It also
 does not return tier information: routing selects on prefix length alone.
 
-The scan reads the first block, then only the registry for that block's holders,
-then walks forward while candidates remain. Its benefit is *fewer Redis commands*
-(a first-block miss costs one command instead of one per block), **not** lower
-latency — a fully-cached long prefix takes more round-trips than reading every
-block at once. Because the registry is read as a snapshot and this build never
-fences restarted workers, a reported prefix can be longer than a worker truly
-holds (never shorter); the index is advisory, so this is acceptable.
+Prefix queries are capped at 2,048 blocks and at most 16 execute concurrently.
+The first block is read separately: a miss returns immediately with
+`blocks_read=1`. After a first-block hit, the indexer reads placement for every
+block in the bounded prefix (in chunks of 256), loads candidate worker address
+and spec metadata, and computes component-aware prefix lengths in memory.
+Consequently, the fast path saves work only on a first-block miss; a hit costs
+O(prefix blocks) placement reads plus O(candidate workers) metadata reads.
+
+Because placement and worker metadata are read as an advisory snapshot, and this
+basic build never fences restarted workers, a reported prefix can be longer than
+a worker truly holds. The router must continue to intersect results with its own
+healthy candidates and retain its normal fallback behavior.
 
 ### Worker address contract
 
