@@ -56,7 +56,7 @@ impl Default for RuntimeConfig {
 }
 
 /// The scheduler's startup blob (`RustServer._build_server_args`) parsed once into
-/// typed fields: values are post-`__post_init__`, unknown keys (e.g. `api_key`) are dropped.
+/// typed fields: values are post-`__post_init__`; unrelated unknown keys are dropped.
 #[derive(Debug, serde::Deserialize)]
 pub struct ServerArgs {
     /// HF repo id / local dir of the model, reported by `/get_model_info`.
@@ -83,6 +83,19 @@ pub struct ServerArgs {
     pub log_level: String,
     #[serde(default)]
     pub log_level_http: Option<String>,
+    /// Shared OpenAI-compatible bearer token. `None` leaves the API ungated.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Optional chat-template file override. Otherwise the tokenizer's
+    /// `tokenizer_config.json` template is used.
+    #[serde(default)]
+    pub chat_template: Option<String>,
+    /// Parser selected by `--tool-call-parser`.
+    #[serde(default)]
+    pub tool_call_parser: Option<String>,
+    /// Python's global default for whether an SSE stream ends with a usage chunk.
+    #[serde(default)]
+    pub stream_response_default_include_usage: bool,
     /// Pinned tokenizer threads / detok shards (Python asserts both ≥ 1).
     #[serde(default = "default_worker_num")]
     pub tokenizer_worker_num: usize,

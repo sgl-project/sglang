@@ -31,9 +31,13 @@ uuid = { workspace = true }
 
 axum = { version = "0.8.9", features = ["json", "tokio"] }
 core_affinity = "0.8"
-# pin the dynamo-tokenizers for now, 1.7.0 enables`serde_json/preserve_order`
-# transitively, which reorders every JSON object.
-dynamo-tokenizers = "=1.5.3"
+# Keep the HTTP adapter on Dynamo's public OpenAI types, renderer, and parsers.
+# `dynamo-llm` stays excluded because it pulls the full runtime just to reuse
+# small service helpers.
+dynamo-parsers = "~5.0.1"
+dynamo-protocols = "5.0.1"
+dynamo-renderer = "4.0.0"
+dynamo-tokenizers = "1.5.4"
 flume = "0.12.0"
 itertools = "0.14"
 hf-hub = { version = "0.4", default-features = false }

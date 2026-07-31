@@ -1,0 +1,797 @@
+//! Focused unit tests for the OpenAI endpoint adapters.
+
+use axum::http::StatusCode;
+use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
+use dynamo_protocols::types::responses::CreateResponse;
+use dynamo_protocols::types::{
+    ChatCompletionRequestMessage, ChatCompletionToolChoiceOption, Choice,
+    CreateChatCompletionRequest, CreateCompletionRequest, CreateCompletionResponse, Prompt,
+};
+use futures::StreamExt;
+use tokio::sync::mpsc;
+
+use super::super::guard::AbortGuard;
+use super::chat::{chat_event_stream, chat_logprobs, chat_sampling_params, unary_chat};
+use super::completions::{
+    ChoiceExtensions, SubmittedChoice, completion_event_stream, completion_logprobs,
+    completion_response_value, unary_completion,
+};
+use super::new_response_store;
+use super::response_stream::responses_event_stream;
+use super::responses::{responses_chat_request, unary_responses};
+use super::tools::{apply_tool_constraint, parse_chat_tool_calls};
+use crate::ids::Rid;
+use crate::message::{ChunkEvent, ChunkExtras, EgressItem, SamplingParams};
+use crate::tokenizer_manager::Senders;
+
+fn senders() -> Senders {
+    Senders {
+        tm: flume::unbounded().0,
+        abort: flume::unbounded().0,
+        tok: flume::unbounded().0,
+        detok: vec![],
+    }
+}
+
+fn chunk(rid: &str, text: &str, done: bool) -> EgressItem {
+    let output = ChunkEvent {
+        rid: rid.into(),
+        text: text.into(),
+        token_ids: vec![1],
+        prompt_tokens: 5,
+        completion_tokens: 1,
+        finish_reason: done.then(|| {
+            serde_json::from_value(serde_json::json!({
+                "type": "stop",
+                "matched": "</s>"
+            }))
+            .unwrap()
+        }),
+        ..Default::default()
+    };
+    if done {
+        EgressItem::Done(output)
+    } else {
+        EgressItem::Frame(output)
+    }
+}
+
+fn submitted(
+    index: usize,
+    prompt_index: usize,
+    rid: &str,
+) -> (SubmittedChoice, mpsc::Sender<EgressItem>) {
+    let (tx, rx) = mpsc::channel(8);
+    (
+        SubmittedChoice {
+            index,
+            prompt_index,
+            rid: rid.into(),
+            echo: String::new(),
+            rx,
+        },
+        tx,
+    )
+}
+
+fn chat_submitted(
+    index: usize,
+    rid: &str,
+) -> (
+    (usize, Rid, mpsc::Receiver<EgressItem>),
+    mpsc::Sender<EgressItem>,
+) {
+    let (tx, rx) = mpsc::channel(8);
+    ((index, rid.into(), rx), tx)
+}
+
+#[test]
+fn dynamo_completion_request_deserializes_directly() {
+    let request: CreateCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "m",
+        "prompt": ["a", "b"],
+        "max_tokens": 8,
+        "n": 2,
+        "stream_options": {
+            "include_usage": true,
+            "continuous_usage_stats": true
+        }
+    }))
+    .unwrap();
+    assert!(matches!(request.prompt, Prompt::StringArray(_)));
+    assert_eq!(request.n, Some(2));
+    assert!(request.stream_options.unwrap().continuous_usage_stats);
+}
+
+#[test]
+fn max_tokens_zero_is_rejected_before_submission() {
+    let request: CreateCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "m",
+        "prompt": "hello",
+        "max_tokens": 0
+    }))
+    .unwrap();
+    assert_eq!(request.max_tokens, Some(0));
+}
+
+#[test]
+fn zero_top_logprobs_keeps_selected_token_and_empty_top_map() {
+    let extras = ChunkExtras {
+        out_lp_val: vec![-0.25],
+        out_lp_idx: vec![7],
+        out_lp_txt: vec!["x".into()],
+        out_top_lens: vec![0],
+        ..Default::default()
+    };
+    let logprobs = completion_logprobs(Some(&extras), false);
+    assert_eq!(logprobs.tokens, ["x"]);
+    assert_eq!(logprobs.token_logprobs, [Some(-0.25)]);
+    assert_eq!(logprobs.top_logprobs, [serde_json::Value::Null]);
+
+    let value = completion_response_value(
+        CreateCompletionResponse {
+            id: "cmpl-test".into(),
+            choices: vec![Choice {
+                text: "x".into(),
+                index: 0,
+                logprobs: Some(logprobs),
+                finish_reason: None,
+            }],
+            created: 1,
+            model: "model".into(),
+            system_fingerprint: None,
+            object: "text_completion".into(),
+            usage: None,
+        },
+        &[ChoiceExtensions::default()],
+    );
+    assert_eq!(
+        value["choices"][0]["logprobs"]["text_offset"],
+        serde_json::json!([-1])
+    );
+}
+
+#[test]
+fn chat_logprobs_use_dynamo_wire_types() {
+    let extras = ChunkExtras {
+        out_lp_val: vec![-0.25],
+        out_lp_idx: vec![7],
+        out_lp_txt: vec!["x".into()],
+        out_top_val: vec![-0.25, -1.0],
+        out_top_idx: vec![7, 8],
+        out_top_lens: vec![2],
+        out_top_txt: vec!["x".into(), "y".into()],
+        ..Default::default()
+    };
+    let logprobs = chat_logprobs(Some(&extras));
+    let token = &logprobs.content.unwrap()[0];
+    assert_eq!(token.token, "x");
+    assert_eq!(token.top_logprobs.len(), 2);
+    assert_eq!(token.top_logprobs[1].token, "y");
+}
+
+#[tokio::test]
+async fn unary_fold_orders_choices_and_counts_each_prompt_once() {
+    let (choice0, tx0) = submitted(0, 0, "r0");
+    let (choice1, tx1) = submitted(1, 0, "r1");
+    tx0.send(chunk("r0", "a", false)).await.unwrap();
+    tx0.send(chunk("r0", "b", true)).await.unwrap();
+    tx1.send(chunk("r1", "x", false)).await.unwrap();
+    tx1.send(chunk("r1", "y", true)).await.unwrap();
+
+    let response = unary_completion(
+        vec![choice0, choice1],
+        AbortGuard::new_empty(senders()),
+        "cmpl-test".into(),
+        "model".into(),
+        1,
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["choices"][0]["text"], "ab");
+    assert_eq!(value["choices"][1]["text"], "xy");
+    assert_eq!(value["choices"][0]["matched_stop"], "</s>");
+    assert_eq!(value["usage"]["prompt_tokens"], 5);
+    assert_eq!(value["usage"]["completion_tokens"], 4);
+}
+
+#[tokio::test]
+async fn stream_uses_deltas_then_usage_and_done() {
+    let (choice, tx) = submitted(0, 0, "r0");
+    tx.send(chunk("r0", "a", false)).await.unwrap();
+    tx.send(chunk("r0", "b", true)).await.unwrap();
+
+    let stream = completion_event_stream(
+        vec![choice],
+        AbortGuard::new_empty(senders()),
+        "cmpl-test".into(),
+        "model".into(),
+        1,
+        false,
+        false,
+        true,
+        false,
+    );
+    futures::pin_mut!(stream);
+    let frames: Vec<String> = stream.collect().await;
+    assert_eq!(frames.len(), 4);
+    let first: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+    let terminal: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+    let usage: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
+    assert_eq!(first["choices"][0]["text"], "a");
+    assert_eq!(terminal["choices"][0]["text"], "b");
+    assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
+    assert!(usage["choices"].as_array().unwrap().is_empty());
+    assert_eq!(usage["usage"]["prompt_tokens"], 5);
+    assert_eq!(usage["usage"]["completion_tokens"], 2);
+    assert_eq!(frames[3], "[DONE]");
+}
+
+#[tokio::test]
+async fn unary_chat_fans_in_choices_and_usage() {
+    let (choice0, tx0) = chat_submitted(0, "r0");
+    let (choice1, tx1) = chat_submitted(1, "r1");
+    tx0.send(chunk("r0", "Paris", true)).await.unwrap();
+    tx1.send(chunk("r1", "Paris", true)).await.unwrap();
+
+    let response = unary_chat(
+        vec![choice0, choice1],
+        AbortGuard::new_empty(senders()),
+        "chatcmpl-test".into(),
+        "model".into(),
+        1,
+        false,
+        None,
+        None,
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(value["choices"][0]["message"]["content"], "Paris");
+    assert_eq!(value["choices"][1]["index"], 1);
+    assert_eq!(value["usage"]["prompt_tokens"], 5);
+    assert_eq!(value["usage"]["completion_tokens"], 2);
+}
+
+#[tokio::test]
+async fn streaming_chat_emits_role_deltas_usage_and_done() {
+    let (choice, tx) = chat_submitted(0, "r0");
+    tx.send(chunk("r0", "Par", false)).await.unwrap();
+    tx.send(chunk("r0", "is", true)).await.unwrap();
+
+    let stream = chat_event_stream(
+        vec![choice],
+        AbortGuard::new_empty(senders()),
+        "chatcmpl-test".into(),
+        "model".into(),
+        1,
+        false,
+        true,
+        None,
+        None,
+        None,
+        false,
+        true,
+        None,
+    );
+    futures::pin_mut!(stream);
+    let frames: Vec<String> = stream.collect().await;
+    assert_eq!(frames.len(), 5);
+    let role: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+    let delta: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+    let terminal: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
+    let usage: serde_json::Value = serde_json::from_str(&frames[3]).unwrap();
+    assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
+    assert!(role["choices"][0]["delta"]["reasoning_content"].is_null());
+    assert_eq!(delta["choices"][0]["delta"]["content"], "Par");
+    assert!(delta["choices"][0]["delta"]["reasoning_content"].is_null());
+    assert_eq!(terminal["choices"][0]["delta"]["content"], "is");
+    assert!(terminal["choices"][0]["delta"]["reasoning_content"].is_null());
+    assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
+    assert_eq!(usage["usage"]["completion_tokens"], 2);
+    assert_eq!(frames[4], "[DONE]");
+}
+
+#[tokio::test]
+async fn streaming_chat_buffers_and_parses_function_calls() {
+    let (choice, tx) = chat_submitted(0, "r0");
+    tx.send(chunk(
+        "r0",
+        r#"<|python_tag|>{"name":"get_weather","parameters":{"location":"Paris"}}"#,
+        true,
+    ))
+    .await
+    .unwrap();
+
+    let stream = chat_event_stream(
+        vec![choice],
+        AbortGuard::new_empty(senders()),
+        "chatcmpl-test".into(),
+        "model".into(),
+        1,
+        false,
+        false,
+        Some("llama3".into()),
+        None,
+        None,
+        false,
+        true,
+        None,
+    );
+    futures::pin_mut!(stream);
+    let frames: Vec<String> = stream.collect().await;
+    assert_eq!(frames.len(), 3);
+    let terminal: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+    assert!(terminal["choices"][0]["delta"]["reasoning_content"].is_null());
+    assert_eq!(terminal["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(
+        terminal["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+        "get_weather"
+    );
+    assert_eq!(frames[2], "[DONE]");
+}
+
+#[tokio::test]
+async fn streaming_chat_with_tools_does_not_buffer_normal_text() {
+    let (choice, tx) = chat_submitted(0, "r0");
+    tx.send(chunk("r0", "Par", false)).await.unwrap();
+    tx.send(chunk("r0", "is", true)).await.unwrap();
+
+    let stream = chat_event_stream(
+        vec![choice],
+        AbortGuard::new_empty(senders()),
+        "chatcmpl-test".into(),
+        "model".into(),
+        1,
+        false,
+        false,
+        Some("llama3".into()),
+        None,
+        None,
+        false,
+        true,
+        None,
+    );
+    futures::pin_mut!(stream);
+    let frames: Vec<String> = stream.collect().await;
+    let deltas = frames
+        .iter()
+        .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+        .filter_map(|frame| {
+            frame["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(deltas, ["Par", "is"]);
+}
+
+#[tokio::test]
+async fn streaming_chat_holds_only_a_split_tool_marker() {
+    let (choice, tx) = chat_submitted(0, "r0");
+    tx.send(chunk("r0", "Before <|python_", false))
+        .await
+        .unwrap();
+    tx.send(chunk(
+        "r0",
+        r#"tag|>{"name":"get_weather","parameters":{"city":"Paris"}}"#,
+        true,
+    ))
+    .await
+    .unwrap();
+
+    let stream = chat_event_stream(
+        vec![choice],
+        AbortGuard::new_empty(senders()),
+        "chatcmpl-test".into(),
+        "model".into(),
+        1,
+        false,
+        false,
+        Some("llama3".into()),
+        None,
+        None,
+        false,
+        true,
+        None,
+    );
+    futures::pin_mut!(stream);
+    let frames: Vec<String> = stream.collect().await;
+    let values = frames
+        .iter()
+        .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+        .collect::<Vec<_>>();
+    assert!(
+        values
+            .iter()
+            .any(|frame| { frame["choices"][0]["delta"]["content"].as_str() == Some("Before ") })
+    );
+    assert!(values.iter().any(|frame| {
+        frame["choices"][0]["delta"]["tool_calls"][0]["function"]["name"].as_str()
+            == Some("get_weather")
+    }));
+}
+
+#[tokio::test]
+async fn streaming_chat_releases_an_incomplete_marker_at_done() {
+    let (choice, tx) = chat_submitted(0, "r0");
+    tx.send(chunk("r0", "Before <|python_", false))
+        .await
+        .unwrap();
+    tx.send(chunk("r0", "", true)).await.unwrap();
+
+    let stream = chat_event_stream(
+        vec![choice],
+        AbortGuard::new_empty(senders()),
+        "chatcmpl-test".into(),
+        "model".into(),
+        1,
+        false,
+        false,
+        Some("llama3".into()),
+        None,
+        None,
+        false,
+        true,
+        None,
+    );
+    futures::pin_mut!(stream);
+    let frames: Vec<String> = stream.collect().await;
+    let text = frames
+        .iter()
+        .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+        .filter_map(|frame| {
+            frame["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect::<String>();
+    assert_eq!(text, "Before <|python_");
+}
+
+#[tokio::test]
+async fn streaming_chat_emits_a_complete_tool_call_before_done() {
+    let (choice, tx) = chat_submitted(0, "r0");
+    tx.send(chunk(
+        "r0",
+        r#"<|python_tag|>{"name":"get_weather","parameters":{"city":"Paris"}}"#,
+        false,
+    ))
+    .await
+    .unwrap();
+    tx.send(chunk("r0", "", true)).await.unwrap();
+
+    let stream = chat_event_stream(
+        vec![choice],
+        AbortGuard::new_empty(senders()),
+        "chatcmpl-test".into(),
+        "model".into(),
+        1,
+        false,
+        false,
+        Some("llama3".into()),
+        None,
+        None,
+        false,
+        true,
+        None,
+    );
+    futures::pin_mut!(stream);
+    let frames: Vec<String> = stream.collect().await;
+    let tool_position = frames
+        .iter()
+        .position(|frame| frame.contains("\"tool_calls\":[{"))
+        .expect("tool call chunk");
+    let terminal_position = frames
+        .iter()
+        .position(|frame| frame.contains("\"finish_reason\":\"tool_calls\""))
+        .expect("terminal chunk");
+    assert!(tool_position < terminal_position);
+}
+
+#[test]
+fn required_tool_choice_builds_python_compatible_constraint() {
+    let tools = vec![ToolDefinition {
+        name: "get_weather".into(),
+        parameters: Some(serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+        })),
+        strict: Some(true),
+    }];
+    let mut sampling = SamplingParams::default();
+    apply_tool_constraint(
+        &mut sampling,
+        "llama3",
+        &DynamoToolChoice::Required,
+        &tools,
+        Some(false),
+    )
+    .unwrap();
+    let schema: serde_json::Value =
+        serde_json::from_str(sampling.json_schema.as_deref().unwrap()).unwrap();
+    assert_eq!(schema["type"], "array");
+    assert_eq!(schema["minItems"], 1);
+    assert_eq!(schema["maxItems"], 1);
+    assert_eq!(
+        schema["items"]["properties"]["name"]["enum"][0],
+        "get_weather"
+    );
+}
+
+#[test]
+fn chat_without_a_token_limit_stays_unbounded() {
+    let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hello"}]
+    }))
+    .unwrap();
+    assert_eq!(chat_sampling_params(&request).unwrap().max_new_tokens, None);
+}
+
+#[test]
+fn strict_auto_llama_tool_uses_python_compatible_constraint() {
+    let tools = vec![ToolDefinition {
+        name: "get_weather".into(),
+        parameters: Some(serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+        })),
+        strict: Some(true),
+    }];
+    let mut sampling = SamplingParams::default();
+    apply_tool_constraint(
+        &mut sampling,
+        "llama3",
+        &DynamoToolChoice::Auto,
+        &tools,
+        None,
+    )
+    .unwrap();
+    let schema: serde_json::Value =
+        serde_json::from_str(sampling.structural_tag.as_deref().unwrap()).unwrap();
+    assert_eq!(schema["type"], "structural_tag");
+    assert_eq!(schema["format"]["type"], "triggered_tags");
+    assert_eq!(schema["format"]["at_least_one"], false);
+    assert_eq!(
+        schema["format"]["tags"][0]["content"]["json_schema"]["required"][0],
+        "city"
+    );
+}
+
+#[tokio::test]
+async fn canonical_qwen_parser_name_uses_dynamo_qwen25() {
+    let (content, calls) = parse_chat_tool_calls(
+        r#"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#.into(),
+        Some("qwen"),
+        None,
+        true,
+    )
+    .await;
+    assert!(content.is_empty());
+    assert_eq!(calls.unwrap()[0].function.name, "get_weather");
+}
+
+#[test]
+fn structured_responses_input_reuses_chat_history_and_function_tools() {
+    let request: CreateResponse = serde_json::from_value(serde_json::json!({
+        "model": "model",
+        "input": [
+            {"role": "user", "content": "What is the weather?"},
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Paris\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "sunny"
+            }
+        ],
+        "tools": [{
+            "type": "function",
+            "name": "get_weather",
+            "parameters": {"type": "object"}
+        }],
+        "tool_choice": "required"
+    }))
+    .unwrap();
+    let chat = responses_chat_request(&request, "model").unwrap();
+    assert_eq!(chat.messages.len(), 3);
+    assert!(matches!(
+        chat.messages[0],
+        ChatCompletionRequestMessage::User(_)
+    ));
+    assert!(matches!(
+        chat.messages[1],
+        ChatCompletionRequestMessage::Assistant(_)
+    ));
+    assert!(matches!(
+        chat.messages[2],
+        ChatCompletionRequestMessage::Tool(_)
+    ));
+    assert_eq!(chat.tools.unwrap()[0].function.name, "get_weather");
+    assert!(matches!(
+        chat.tool_choice,
+        Some(ChatCompletionToolChoiceOption::Required)
+    ));
+}
+
+fn response_request(stream: bool) -> CreateResponse {
+    serde_json::from_value(serde_json::json!({
+        "model": "model",
+        "input": "The capital of France is",
+        "stream": stream,
+        "temperature": 0.0,
+        "max_output_tokens": 8
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn unary_responses_uses_standard_output_items() {
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(chunk("r0", "Paris", true)).await.unwrap();
+    let response = unary_responses(
+        rx,
+        AbortGuard::new_empty(senders()),
+        "r0".into(),
+        "resp_test".into(),
+        1_234_567_890,
+        "model".into(),
+        response_request(false),
+        None,
+        None,
+        new_response_store(),
+        vec![],
+    )
+    .await;
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["object"], "response");
+    assert_eq!(value["created_at"], 1_234_567_890);
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["output"][0]["type"], "message");
+    assert_eq!(value["output"][0]["content"][0]["text"], "Paris");
+    assert_eq!(value["usage"]["input_tokens"], 5);
+    assert_eq!(value["usage"]["output_tokens"], 1);
+    assert_eq!(value["usage"]["prompt_tokens"], 5);
+    assert_eq!(value["usage"]["completion_tokens"], 1);
+}
+
+#[tokio::test]
+async fn streaming_responses_emits_lifecycle_and_text_deltas() {
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(chunk("r0", "Par", false)).await.unwrap();
+    tx.send(chunk("r0", "is", true)).await.unwrap();
+    let stream = responses_event_stream(
+        rx,
+        AbortGuard::new_empty(senders()),
+        "r0".into(),
+        "resp_test".into(),
+        1_234_567_890,
+        "model".into(),
+        response_request(true),
+        None,
+        None,
+        None,
+        false,
+        new_response_store(),
+        vec![],
+    );
+    futures::pin_mut!(stream);
+    let frames: Vec<String> = stream.collect().await;
+    let event_types = frames[..frames.len() - 1]
+        .iter()
+        .map(|frame| {
+            serde_json::from_str::<serde_json::Value>(frame).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(event_types[0], "response.created");
+    assert_eq!(event_types[1], "response.in_progress");
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event| *event == "response.output_text.delta")
+            .count(),
+        2
+    );
+    assert_eq!(event_types.last().unwrap(), "response.completed");
+    let created: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+    let completed: serde_json::Value = serde_json::from_str(&frames[frames.len() - 2]).unwrap();
+    assert_eq!(created["response"]["created_at"], 1_234_567_890);
+    assert_eq!(completed["response"]["created_at"], 1_234_567_890);
+    assert_eq!(completed["response"]["usage"]["output_tokens"], 2);
+    assert_eq!(frames.last().unwrap(), "[DONE]");
+}
+
+#[tokio::test]
+async fn streaming_responses_with_tools_emits_normal_text_deltas() {
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(chunk("r0", "Par", false)).await.unwrap();
+    tx.send(chunk("r0", "is", true)).await.unwrap();
+    let stream = responses_event_stream(
+        rx,
+        AbortGuard::new_empty(senders()),
+        "r0".into(),
+        "resp_test".into(),
+        1_234_567_890,
+        "model".into(),
+        response_request(true),
+        Some("llama3".into()),
+        None,
+        None,
+        false,
+        new_response_store(),
+        vec![],
+    );
+    futures::pin_mut!(stream);
+    let frames: Vec<String> = stream.collect().await;
+    let deltas = frames
+        .iter()
+        .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+        .filter(|frame| frame["type"] == "response.output_text.delta")
+        .filter_map(|frame| frame["delta"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert_eq!(deltas, ["Par", "is"]);
+}
+
+#[tokio::test]
+async fn streaming_responses_emits_function_call_events() {
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(chunk(
+        "r0",
+        r#"<|python_tag|>{"name":"get_weather","parameters":{"city":"Paris"}}"#,
+        true,
+    ))
+    .await
+    .unwrap();
+    let stream = responses_event_stream(
+        rx,
+        AbortGuard::new_empty(senders()),
+        "r0".into(),
+        "resp_test".into(),
+        1_234_567_890,
+        "model".into(),
+        response_request(true),
+        Some("llama3".into()),
+        None,
+        None,
+        false,
+        new_response_store(),
+        vec![],
+    );
+    futures::pin_mut!(stream);
+    let frames = stream.collect::<Vec<_>>().await;
+    let event_types = frames
+        .iter()
+        .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+        .filter_map(|event| event["type"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert!(event_types.contains(&"response.output_item.added".into()));
+    assert!(event_types.contains(&"response.function_call_arguments.delta".into()));
+    assert!(event_types.contains(&"response.function_call_arguments.done".into()));
+    assert!(event_types.contains(&"response.output_item.done".into()));
+    assert!(event_types.contains(&"response.completed".into()));
+}
