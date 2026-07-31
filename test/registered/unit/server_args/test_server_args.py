@@ -1866,7 +1866,7 @@ class TestSharedEpConstraints(CustomTestCase):
     def _args(self, **overrides):
         args = ServerArgs(model_path="dummy")
         args.moe_a2a_backend = "shared_ep"
-        args.moe_runner_backend = "deep_gemm"
+        args.moe_runner_backend = "auto"
         args.tp_size = 8
         args.dp_size = 8
         args.enable_dp_attention = True
@@ -1880,6 +1880,7 @@ class TestSharedEpConstraints(CustomTestCase):
         args.speculative_num_steps = None
         args.speculative_eagle_topk = None
         args.speculative_num_draft_tokens = None
+        args.chunked_prefill_size = 1024
         args.cuda_graph_config = CudaGraphConfig(
             decode=PhaseConfig(
                 backend=Backend.FULL, max_bs=32, bs=[1, 2, 4, 8, 16, 32]
@@ -1925,16 +1926,27 @@ class TestSharedEpConstraints(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "LoRA"):
                     validate_shared_ep_server_args(self._args(**overrides))
 
-    def test_auto_target_runner_resolves_to_deep_gemm(self):
+    def test_auto_target_runner_remains_auto(self):
         args = self._args(moe_runner_backend="auto")
 
         validate_shared_ep_server_args(args)
 
-        self.assertEqual(args.moe_runner_backend, "deep_gemm")
+        self.assertEqual(args.moe_runner_backend, "auto")
 
-    def test_conflicting_target_runner_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "moe-runner-backend deep_gemm"):
-            validate_shared_ep_server_args(self._args(moe_runner_backend="triton"))
+    def test_explicit_triton_target_runner_is_admitted(self):
+        validate_shared_ep_server_args(self._args(moe_runner_backend="triton"))
+
+    def test_explicit_deep_gemm_target_runner_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "auto or triton"):
+            validate_shared_ep_server_args(self._args(moe_runner_backend="deep_gemm"))
+
+    def test_prefill_chunk_must_fit_standalone_capacity(self):
+        for chunked_prefill_size in (None, -1, 0, 1025):
+            with self.subTest(chunked_prefill_size=chunked_prefill_size):
+                with self.assertRaisesRegex(ValueError, "chunked-prefill-size"):
+                    validate_shared_ep_server_args(
+                        self._args(chunked_prefill_size=chunked_prefill_size)
+                    )
 
     def test_overlap_is_rejected(self):
         for field in ("enable_two_batch_overlap", "enable_single_batch_overlap"):
@@ -1961,6 +1973,25 @@ class TestSharedEpConstraints(CustomTestCase):
                             bs=[1, 32, 64],
                         ),
                         prefill=PhaseConfig(backend=Backend.DISABLED),
+                    )
+                )
+            )
+
+    def test_prefill_cuda_graph_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "prefill CUDA Graph"):
+            validate_shared_ep_server_args(
+                self._args(
+                    cuda_graph_config=CudaGraphConfig(
+                        decode=PhaseConfig(
+                            backend=Backend.FULL,
+                            max_bs=32,
+                            bs=[1, 2, 4, 8, 16, 32],
+                        ),
+                        prefill=PhaseConfig(
+                            backend=Backend.FULL,
+                            max_bs=32,
+                            bs=[1, 2, 4, 8, 16, 32],
+                        ),
                     )
                 )
             )

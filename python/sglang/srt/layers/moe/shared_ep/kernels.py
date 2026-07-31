@@ -102,7 +102,7 @@ def quantize_pack_input(
     source_weights: torch.Tensor,
     group_size: int,
 ) -> None:
-    """Quantize decode activations directly into the shared input object."""
+    """Quantize activations and routes directly into the shared input object."""
 
     if source.ndim != 2:
         raise ValueError("SharedEP activations must be two-dimensional")
@@ -127,9 +127,9 @@ def quantize_pack_input(
     if target.scales.shape[1] != hidden_size // group_size:
         raise ValueError("SharedEP activation scale shape does not match storage")
     if source.dtype != torch.bfloat16:
-        raise TypeError("SharedEP decode activations must use bfloat16")
+        raise TypeError("SharedEP activations must use bfloat16")
     if not source.is_contiguous():
-        raise ValueError("SharedEP decode activations must be contiguous")
+        raise ValueError("SharedEP activations must be contiguous")
     if source_ids.dtype not in (torch.int32, torch.int64):
         raise TypeError("SharedEP route ids must use int32 or int64")
     if source_weights.dtype != torch.float32:

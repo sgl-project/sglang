@@ -1,6 +1,6 @@
 import os
-import unittest
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -12,13 +12,13 @@ from sglang.test.kernels.utils import multigpu_pytest_main
 register_cuda_ci(est_time=40, stage="extra-b", runner_config="8-gpu-h200")
 
 
-@unittest.skipUnless(
-    torch.cuda.is_available() and "RANK" in os.environ,
-    "run with torchrun on a CUDA node",
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and "RANK" in os.environ),
+    reason="run with torchrun on a CUDA node",
 )
-class TestSharedEpVmmEp8(unittest.TestCase):
+class TestSharedEpVmmEp8:
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         cls.rank = int(os.environ["RANK"])
         cls.world_size = int(os.environ["WORLD_SIZE"])
         cls.local_rank = int(os.environ["LOCAL_RANK"])
@@ -28,7 +28,7 @@ class TestSharedEpVmmEp8(unittest.TestCase):
         dist.init_process_group("gloo")
 
     @classmethod
-    def tearDownClass(cls):
+    def teardown_class(cls):
         if dist.is_initialized():
             dist.barrier()
             dist.destroy_process_group()
@@ -52,10 +52,9 @@ class TestSharedEpVmmEp8(unittest.TestCase):
                     allocation.rank_offset(owner),
                     logical_rank_bytes,
                 )
-                self.assertTrue(
-                    torch.all(segment == owner + 1).item(),
-                    f"rank {self.rank} observed wrong data for owner {owner}",
-                )
+                assert torch.all(
+                    segment == owner + 1
+                ).item(), f"rank {self.rank} observed wrong data for owner {owner}"
             dist.barrier()
         finally:
             if allocation is not None:
@@ -96,10 +95,9 @@ class TestSharedEpVmmEp8(unittest.TestCase):
                         allocation.rank_offset(owner),
                         logical_rank_bytes,
                     )
-                    self.assertTrue(
-                        torch.all(segment == generation * 16 + owner).item(),
+                    assert torch.all(segment == generation * 16 + owner).item(), (
                         f"rank {self.rank} expected {generation * 16 + owner} for "
-                        f"owner {owner}, observed {torch.unique(segment).tolist()}",
+                        f"owner {owner}, observed {torch.unique(segment).tolist()}"
                     )
                 completion_epoch.publish()
                 completion_epoch.wait_all()

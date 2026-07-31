@@ -113,10 +113,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     if a2a_backend.is_shared_ep():
         from sglang.srt.layers.moe.shared_ep import create_shared_ep_dispatcher
 
-        return create_shared_ep_dispatcher(
-            moe_runner_config,
-            group=_get_deepep_comm_group(a2a_backend),
-        )
+        return create_shared_ep_dispatcher(moe_runner_config)
 
     if (
         a2a_backend.is_none()

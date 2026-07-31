@@ -12,13 +12,14 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import create_moe_dispatcher
 from sglang.srt.layers.moe.moe_runner.base import FusedOpPool, MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.shared_ep.backend import (
     SharedEpDispatcher,
-    _run_deep_gemm_fallback,
+    SharedEpDispatchOutput,
     compact_intermediate_capacity,
     create_shared_ep_dispatcher,
-    decode_intermediate_capacity,
+    intermediate_capacity,
+    run_shared_ep,
 )
 from sglang.srt.layers.moe.shared_ep.kernels import (
     quantize_pack_input,
@@ -27,16 +28,22 @@ from sglang.srt.layers.moe.shared_ep.layout import (
     SharedEpLayout,
     align_output_layout,
 )
-from sglang.srt.layers.moe.shared_ep.profiles import select_profile
-from sglang.srt.layers.moe.token_dispatcher.base import CombineInputFormat
+from sglang.srt.layers.moe.shared_ep.profiles import (
+    GLM52,
+    make_pull_cache_prefill_profile,
+    select_profile,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import (
-    DeepEPMode,
     MoeA2ABackend,
     MoeRunnerBackend,
     is_deepep_class_backend,
 )
+from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8_moe import (
+    CompressedTensorsW8A8Fp8MoE,
+)
+from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.server_args import MOE_A2A_BACKEND_CHOICES
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -48,6 +55,17 @@ def _config() -> MoeRunnerConfig:
         hidden_size=4096,
         intermediate_size_per_partition=2048,
         top_k=6,
+        num_experts=256,
+        num_local_experts=32,
+        params_dtype=torch.bfloat16,
+    )
+
+
+def _glm_config() -> MoeRunnerConfig:
+    return MoeRunnerConfig(
+        hidden_size=6144,
+        intermediate_size_per_partition=2048,
+        top_k=8,
         num_experts=256,
         num_local_experts=32,
         params_dtype=torch.bfloat16,
@@ -79,10 +97,10 @@ from sglang.srt.layers.moe.moe_runner.base import FusedOpPool
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 
-assert FusedOpPool.get_fused_func("shared_ep", "deep_gemm") is None
+assert FusedOpPool.get_fused_func("shared_ep", "triton") is None
 runner_module.get_moe_a2a_backend = lambda: MoeA2ABackend.SHARED_EP
 runner = runner_module.MoeRunner(
-    MoeRunnerBackend.DEEP_GEMM,
+    MoeRunnerBackend.TRITON,
     MoeRunnerConfig(
         hidden_size=4096,
         intermediate_size_per_partition=2048,
@@ -116,7 +134,7 @@ from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 runner_module.get_moe_a2a_backend = lambda: MoeA2ABackend.SHARED_EP
 try:
     runner_module.MoeRunner(
-        MoeRunnerBackend.DEEP_GEMM,
+        MoeRunnerBackend.TRITON,
         MoeRunnerConfig(
             hidden_size=4096,
             intermediate_size_per_partition=2048,
@@ -138,37 +156,19 @@ else:
             capture_output=True,
         )
 
-    @patch(
-        "sglang.srt.layers.moe.shared_ep.backend.get_deepep_mode",
-        return_value=DeepEPMode.AUTO,
-    )
-    @patch(
-        "sglang.srt.layers.moe.shared_ep.backend.get_moe_runner_backend",
-        return_value=MoeRunnerBackend.DEEP_GEMM,
-    )
-    @patch("sglang.srt.layers.moe.shared_ep.backend.DeepEPDispatcher")
     @patch("sglang.srt.layers.moe.shared_ep.backend.SharedEpDispatcher")
-    def test_prefill_factory_builds_direct_deepep_fallback(
+    def test_factory_builds_standalone_shared_dispatcher(
         self,
         shared_dispatcher,
-        deep_ep_dispatcher,
-        _get_runner_backend,
-        _get_mode,
     ):
-        fallback = object()
         result = object()
-        deep_ep_dispatcher.return_value = fallback
         shared_dispatcher.return_value = result
 
         self.assertIs(
-            create_shared_ep_dispatcher(_config(), group="ep_group"),
+            create_shared_ep_dispatcher(_config()),
             result,
         )
-        deep_ep_dispatcher.assert_called_once_with(**_deepep_kwargs(DeepEPMode.AUTO))
-        shared_dispatcher.assert_called_once_with(
-            _config(),
-            fallback_dispatcher=fallback,
-        )
+        shared_dispatcher.assert_called_once_with(_config())
 
     def test_shared_backend_identity(self):
         backend = MoeA2ABackend("shared_ep")
@@ -176,10 +176,49 @@ else:
         self.assertEqual(backend, MoeA2ABackend.SHARED_EP)
         self.assertTrue(backend.is_shared_ep())
         self.assertIn("shared_ep", MOE_A2A_BACKEND_CHOICES)
-        self.assertIsNotNone(FusedOpPool.get_fused_func("shared_ep", "deep_gemm"))
-        self.assertIsNone(FusedOpPool.get_fused_func("shared_ep", "triton"))
+        self.assertIsNone(FusedOpPool.get_fused_func("shared_ep", "deep_gemm"))
+        self.assertIsNotNone(FusedOpPool.get_fused_func("shared_ep", "triton"))
         with self.assertRaises(ValueError):
             MoeA2ABackend("shared_moe")
+
+    @patch(
+        "sglang.srt.layers.quantization.fp8.get_moe_a2a_backend",
+        return_value=MoeA2ABackend.SHARED_EP,
+    )
+    @patch(
+        "sglang.srt.layers.quantization.fp8.get_moe_runner_backend",
+        return_value=MoeRunnerBackend.AUTO,
+    )
+    @patch("sglang.srt.layers.quantization.fp8.MoeRunner")
+    def test_fp8_auto_runner_resolves_to_triton_for_shared_ep(
+        self,
+        runner,
+        _runner_backend,
+        _a2a_backend,
+    ):
+        method = object.__new__(Fp8MoEMethod)
+
+        method.create_moe_runner(object(), _config())
+
+        runner.assert_called_once_with(MoeRunnerBackend.TRITON, _config())
+
+    @patch(
+        "sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8_moe.get_moe_runner_backend",
+        return_value=MoeRunnerBackend.AUTO,
+    )
+    @patch(
+        "sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8_moe.MoeRunner"
+    )
+    def test_compressed_fp8_auto_runner_resolves_to_triton_for_shared_ep(
+        self,
+        runner,
+        _runner_backend,
+    ):
+        method = object.__new__(CompressedTensorsW8A8Fp8MoE)
+
+        method.create_moe_runner(object(), _config())
+
+        runner.assert_called_once_with(MoeRunnerBackend.TRITON, _config())
 
     def test_output_rows_absorb_vmm_granularity_without_owner_gaps(self):
         dsv4 = SharedEpLayout.build(
@@ -244,7 +283,7 @@ else:
             block_shape=(128, 128),
             max_tokens_per_rank=32,
         )
-        self.assertEqual(decode_intermediate_capacity(dsv4), 2016)
+        self.assertEqual(intermediate_capacity(dsv4), 2016)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_quantize_pack_input_matches_reference_layout(self):
@@ -326,10 +365,6 @@ else:
         side_effect=AssertionError("SharedEP must not construct the TBO wrapper"),
     )
     @patch(
-        "sglang.srt.layers.moe.fused_moe_triton.layer._get_deepep_comm_group",
-        return_value="ep_group",
-    )
-    @patch(
         "sglang.srt.layers.moe.fused_moe_triton.layer.get_moe_a2a_backend",
         return_value=MoeA2ABackend.SHARED_EP,
     )
@@ -338,17 +373,13 @@ else:
         self,
         shared_factory,
         _get_a2a_backend,
-        _get_group,
         _tbo_dispatcher,
     ):
         result = object()
         shared_factory.return_value = result
 
         self.assertIs(create_moe_dispatcher(_config()), result)
-        shared_factory.assert_called_once_with(
-            _config(),
-            group="ep_group",
-        )
+        shared_factory.assert_called_once_with(_config())
 
     @patch("sglang.srt.layers.moe.fused_moe_triton.layer.StandardDispatcher")
     @patch(
@@ -399,46 +430,224 @@ else:
         "sglang.srt.layers.moe.shared_ep.backend.get_parallel",
         return_value=SimpleNamespace(moe_ep_size=8, moe_ep_rank=0),
     )
+    @patch("sglang.srt.layers.moe.shared_ep.backend._get_shared_pull_cache")
     @patch("sglang.srt.layers.moe.shared_ep.backend._get_shared_state")
-    def test_dispatcher_initializes_vmm_before_forward(
+    @patch(
+        "sglang.srt.layers.moe.shared_ep.backend.get_schedule",
+        return_value=SimpleNamespace(chunked_prefill_size=64),
+    )
+    def test_dsv4_dispatcher_initializes_decode_and_prefill_vmm(
         self,
+        _get_schedule,
         get_shared_state,
+        get_shared_pull_cache,
         _get_parallel,
     ):
-        state = object()
-        get_shared_state.return_value = state
+        decode_state = object()
+        prefill_state = object()
+        pull_cache = object()
+        get_shared_state.side_effect = (decode_state, prefill_state)
+        get_shared_pull_cache.return_value = pull_cache
 
         dispatcher = SharedEpDispatcher(_config())
 
-        self.assertIs(dispatcher.state, state)
-        get_shared_state.assert_called_once_with(dispatcher.config, dispatcher.profile)
+        self.assertIs(dispatcher.state, decode_state)
+        self.assertIs(dispatcher.prefill_state, prefill_state)
+        self.assertIs(dispatcher.prefill_cache, pull_cache)
+        self.assertEqual(dispatcher.prefill_profile.max_tokens_per_rank, 64)
+        self.assertEqual(dispatcher.prefill_profile.hidden_size, 4096)
+        self.assertEqual(dispatcher.prefill_profile.top_k, 6)
+        self.assertEqual(get_shared_state.call_count, 2)
+        get_shared_pull_cache.assert_called_once_with(dispatcher.prefill_profile)
+
+    @patch(
+        "sglang.srt.layers.moe.shared_ep.backend.get_schedule",
+        return_value=SimpleNamespace(chunked_prefill_size=64),
+    )
+    @patch(
+        "sglang.srt.layers.moe.shared_ep.backend.get_parallel",
+        return_value=SimpleNamespace(moe_ep_size=8, moe_ep_rank=0),
+    )
+    @patch("sglang.srt.layers.moe.shared_ep.backend._get_shared_pull_cache")
+    @patch("sglang.srt.layers.moe.shared_ep.backend._get_shared_state")
+    def test_glm_dispatcher_initializes_decode_and_prefill_vmm(
+        self,
+        get_shared_state,
+        get_shared_pull_cache,
+        _get_parallel,
+        _get_schedule,
+    ):
+        decode_state = object()
+        prefill_state = object()
+        pull_cache = object()
+        get_shared_state.side_effect = (decode_state, prefill_state)
+        get_shared_pull_cache.return_value = pull_cache
+
+        dispatcher = SharedEpDispatcher(_glm_config())
+
+        self.assertIs(dispatcher.state, decode_state)
+        self.assertIs(dispatcher.prefill_state, prefill_state)
+        self.assertIs(dispatcher.prefill_cache, pull_cache)
+        self.assertEqual(dispatcher.prefill_profile.max_tokens_per_rank, 64)
+        self.assertEqual(dispatcher.prefill_profile.block_size_m, 64)
+        self.assertEqual(
+            dispatcher.prefill_profile.w13_kernel_config(64)["BLOCK_SIZE_M"],
+            64,
+        )
+        self.assertEqual(
+            dispatcher.prefill_profile.w2_kernel_config(64)["BLOCK_SIZE_M"],
+            64,
+        )
+        self.assertEqual(get_shared_state.call_count, 2)
+        get_shared_pull_cache.assert_called_once_with(dispatcher.prefill_profile)
+
+    def test_prefill_route_w13_and_w2_share_one_m_block(self):
+        profile = make_pull_cache_prefill_profile(GLM52, 1024)
+
+        self.assertIsNotNone(profile)
+        self.assertEqual(
+            {
+                profile.block_size_m,
+                profile.w13_kernel_config(1024)["BLOCK_SIZE_M"],
+                profile.w2_kernel_config(1024)["BLOCK_SIZE_M"],
+            },
+            {64},
+        )
+
+    @patch("sglang.srt.layers.moe.shared_ep.backend._validate_weights")
+    @patch(
+        "sglang.srt.layers.moe.shared_ep.backend.intermediate_capacity",
+        return_value=64,
+    )
+    @patch("sglang.srt.layers.moe.shared_ep.backend.prepare_routes")
+    @patch("sglang.srt.layers.moe.shared_ep.backend.silu_and_mul_contig_post_quant")
+    @patch("sglang.srt.layers.moe.shared_ep.backend.pull_cache_rows")
+    @patch("sglang.srt.layers.moe.shared_ep.backend.invoke_pull_cache_w13")
+    @patch("sglang.srt.layers.moe.shared_ep.backend.invoke_fused_moe_kernel")
+    def test_prefill_pulls_w13_rows_while_decode_consumes_directly(
+        self,
+        fused_moe,
+        pull_w13,
+        pull_rows,
+        _silu_and_mul,
+        prepare_routes,
+        _capacity,
+        _validate_weights,
+    ):
+        routes = SimpleNamespace(
+            local_ids=torch.zeros((8, 8), dtype=torch.int32),
+            local_weights=torch.ones((8, 8), dtype=torch.float32),
+            sorted_token_ids=torch.zeros(64, dtype=torch.int32),
+            expert_ids=torch.zeros(1, dtype=torch.int32),
+            num_tokens_post_padded=torch.ones(1, dtype=torch.int32),
+        )
+        prepare_routes.return_value = routes
+        input_epoch = Mock()
+        input_epoch.allocation.local_storage = torch.zeros(1, dtype=torch.uint8)
+        input_epoch.epoch = torch.ones(1, dtype=torch.int32)
+        state = SimpleNamespace(
+            global_input=SimpleNamespace(
+                topk_ids=torch.zeros((8, 1, 8), dtype=torch.int32),
+                topk_weights=torch.ones((8, 1, 8), dtype=torch.float32),
+            ),
+            input_epoch=input_epoch,
+            global_output=torch.empty((64, 6144), dtype=torch.bfloat16),
+            local_output=torch.zeros((8, 8, 6144), dtype=torch.bfloat16),
+            output_epoch=Mock(),
+        )
+        quant_info = SimpleNamespace(
+            w13_weight=torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn),
+            w13_scale=torch.ones((1, 1, 1), dtype=torch.float32),
+            w2_weight=torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn),
+            w2_scale=torch.ones((1, 1, 1), dtype=torch.float32),
+        )
+
+        prefill_profile = make_pull_cache_prefill_profile(GLM52, 1024)
+        self.assertIsNotNone(prefill_profile)
+        pull_cache = SimpleNamespace(active_rows=64)
+        prefill = SharedEpDispatchOutput(
+            hidden_states=torch.empty((8, 6144), dtype=torch.float8_e4m3fn),
+            hidden_states_scale=torch.empty((8, 48), dtype=torch.float32),
+            topk_output=object(),
+            state=state,
+            profile=prefill_profile,
+            num_tokens=8,
+            local_expert_start=0,
+            phase="prefill",
+            pull_cache=pull_cache,
+        )
+
+        run_shared_ep(prefill, quant_info, SimpleNamespace(swiglu_limit=None))
+
+        pull_rows.assert_called_once()
+        pull_w13.assert_called_once()
+        self.assertEqual(fused_moe.call_count, 1)
+
+        pull_rows.reset_mock()
+        pull_w13.reset_mock()
+        fused_moe.reset_mock()
+        decode = SharedEpDispatchOutput(
+            hidden_states=torch.empty((8, 6144), dtype=torch.float8_e4m3fn),
+            hidden_states_scale=torch.empty((8, 48), dtype=torch.float32),
+            topk_output=object(),
+            state=state,
+            profile=GLM52,
+            num_tokens=8,
+            local_expert_start=0,
+            phase="decode",
+            pull_cache=None,
+        )
+
+        run_shared_ep(decode, quant_info, SimpleNamespace(swiglu_limit=None))
+
+        pull_rows.assert_not_called()
+        pull_w13.assert_not_called()
+        self.assertEqual(fused_moe.call_count, 2)
 
     @patch(
         "sglang.srt.layers.moe.shared_ep.backend.get_is_extend_in_batch",
         return_value=True,
     )
-    def test_prefill_delegates_dispatch_and_combine(self, _is_extend):
-        fallback = Mock()
-        dispatched = object()
-        combined = torch.ones((33, 4))
-        fallback.dispatch.return_value = dispatched
-        fallback.combine.return_value = combined
+    @patch(
+        "sglang.srt.layers.moe.shared_ep.backend.get_dp_global_num_tokens",
+        return_value=[16, 33, 8, 8, 8, 8, 8, 8],
+    )
+    @patch("sglang.srt.layers.moe.shared_ep.backend.quantize_pack_input")
+    def test_prefill_rejects_peer_capacity_overflow_before_publish(
+        self,
+        quantize_pack,
+        _global_num_tokens,
+        _is_extend,
+    ):
         dispatcher = SharedEpDispatcher.__new__(SharedEpDispatcher)
-        dispatcher.fallback_dispatcher = fallback
-        hidden_states = torch.zeros((33, 4))
+        profile = SimpleNamespace(
+            max_tokens_per_rank=32,
+            ep_size=8,
+            supports_pull_cache_prefill=True,
+        )
+        dispatcher.profile = profile
+        dispatcher.prefill_profile = profile
+        state = SimpleNamespace(
+            local_input=object(),
+            input_epoch=Mock(),
+        )
+        dispatcher.prefill_state = state
+        dispatcher.prefill_cache = object()
+        hidden_states = torch.zeros((16, 4))
         topk_output = StandardTopKOutput(
-            topk_weights=torch.ones((33, 1)),
-            topk_ids=torch.zeros((33, 1), dtype=torch.int32),
+            topk_weights=torch.ones((16, 1)),
+            topk_ids=torch.zeros((16, 1), dtype=torch.int32),
             router_logits=None,
         )
 
-        self.assertIs(dispatcher.dispatch(hidden_states, topk_output), dispatched)
-        fallback.dispatch.assert_called_once_with(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
-        fallback_input = SimpleNamespace(format=CombineInputFormat.DEEPEP_LL)
-        self.assertIs(dispatcher.combine(fallback_input), combined)
+        with self.assertRaisesRegex(
+            ValueError,
+            "SharedEP prefill capacity exceeded.*33 > 32",
+        ):
+            dispatcher.dispatch(hidden_states, topk_output)
+
+        quantize_pack.assert_not_called()
+        state.input_epoch.publish.assert_not_called()
 
     @patch(
         "sglang.srt.layers.moe.shared_ep.backend.get_is_extend_in_batch",
@@ -459,6 +668,7 @@ else:
             max_tokens_per_rank=32,
             ep_size=8,
             block_shape=(128, 128),
+            supports_pull_cache_prefill=False,
         )
         state = SimpleNamespace(
             local_input=object(),
@@ -470,9 +680,9 @@ else:
         )
         dispatcher = SharedEpDispatcher.__new__(SharedEpDispatcher)
         dispatcher.profile = profile
+        dispatcher.prefill_profile = profile
         dispatcher.state = state
         dispatcher.local_expert_start = 0
-        dispatcher.fallback_dispatcher = Mock()
         hidden_states = torch.zeros((16, 4))
         topk_output = StandardTopKOutput(
             topk_weights=torch.ones((16, 1)),
@@ -504,11 +714,11 @@ else:
         _global_num_tokens,
         _is_extend,
     ):
-        fallback = Mock()
         profile = SimpleNamespace(
             max_tokens_per_rank=32,
             ep_size=8,
             block_shape=(128, 128),
+            supports_pull_cache_prefill=False,
         )
         state = SimpleNamespace(
             local_input=object(),
@@ -520,9 +730,9 @@ else:
         )
         dispatcher = SharedEpDispatcher.__new__(SharedEpDispatcher)
         dispatcher.profile = profile
+        dispatcher.prefill_profile = profile
         dispatcher.state = state
         dispatcher.local_expert_start = 0
-        dispatcher.fallback_dispatcher = fallback
         hidden_states = torch.zeros((16, 4))
         topk_output = StandardTopKOutput(
             topk_weights=torch.ones((16, 1)),
@@ -543,19 +753,15 @@ else:
         )
         state.input_epoch.publish.assert_called_once_with()
         state.input_epoch.wait_all.assert_not_called()
-        fallback.dispatch.assert_not_called()
 
     def test_decode_combine_does_not_depend_on_mutable_dispatch_state(self):
-        fallback = Mock()
         dispatcher = SharedEpDispatcher.__new__(SharedEpDispatcher)
-        dispatcher.fallback_dispatcher = fallback
         hidden_states = torch.ones((32, 4))
 
         self.assertIs(
             dispatcher.combine(StandardCombineInput(hidden_states=hidden_states)),
             hidden_states,
         )
-        fallback.combine.assert_not_called()
 
     def test_backend_reuses_ep_sharded_model_contract(self):
         with patch(
@@ -569,49 +775,14 @@ else:
         ):
             self.assertIs(get_moe_impl_class(quant_config=None), DeepEPMoE)
 
-    @patch("sglang.srt.layers.moe.shared_ep.backend.DeepGemmRunnerCore")
-    @patch("sglang.srt.layers.moe.shared_ep.backend.PermuteMethodPool.get_post_permute")
-    @patch("sglang.srt.layers.moe.shared_ep.backend.PermuteMethodPool.get_pre_permute")
-    def test_prefill_runs_existing_deep_gemm_pipeline(
-        self,
-        get_pre_permute,
-        get_post_permute,
-        deep_gemm_runner_core,
-    ):
-        pre_permute = Mock(return_value="runner_input")
-        post_permute = Mock(return_value="combined")
-        runner = deep_gemm_runner_core.return_value
-        runner.run.return_value = "runner_output"
-        get_pre_permute.return_value = pre_permute
-        get_post_permute.return_value = post_permute
-        dispatch_output = SimpleNamespace(format=SimpleNamespace(value="deepep_normal"))
-        quant_info = DeepGemmMoeQuantInfo(
+    def test_run_rejects_non_shared_dispatch_output_without_fallback(self):
+        quant_info = TritonMoeQuantInfo(
             w13_weight=torch.empty((1, 2, 3)),
             w2_weight=torch.empty((1, 3, 1)),
-            use_fp8=True,
+            use_fp8_w8a8=True,
         )
-        config = MoeRunnerConfig()
-
-        result = _run_deep_gemm_fallback(
-            dispatch_output,
-            quant_info,
-            config,
-        )
-
-        self.assertEqual(result, "combined")
-        pre_permute.assert_called_once_with(
-            dispatch_output,
-            quant_info,
-            config,
-            {},
-        )
-        runner.run.assert_called_once_with("runner_input", quant_info, {})
-        post_permute.assert_called_once_with(
-            "runner_output",
-            quant_info,
-            config,
-            {},
-        )
+        with self.assertRaisesRegex(TypeError, "SharedEpDispatchOutput"):
+            run_shared_ep(object(), quant_info, MoeRunnerConfig())
 
 
 if __name__ == "__main__":

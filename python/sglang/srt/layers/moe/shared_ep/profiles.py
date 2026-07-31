@@ -36,8 +36,57 @@ _GLM_W2_KERNEL_CONFIG = {
     **_DEFAULT_KERNEL_CONFIG,
     "num_warps": 4,
 }
+_GLM_PREFILL_KERNEL_CONFIG = {
+    **_DEFAULT_KERNEL_CONFIG,
+    "BLOCK_SIZE_M": 64,
+}
+_GLM_PREFILL_W13_KERNEL_CONFIG = {
+    **_GLM_LARGE_W13_KERNEL_CONFIG,
+    "BLOCK_SIZE_M": 64,
+}
+_GLM_PREFILL_W2_KERNEL_CONFIG = {
+    **_GLM_W2_KERNEL_CONFIG,
+    "BLOCK_SIZE_M": 64,
+}
+_DSV4_PREFILL_KERNEL_CONFIG = {
+    **_DEFAULT_KERNEL_CONFIG,
+    "BLOCK_SIZE_M": 64,
+}
+_DSV4_PREFILL_W13_KERNEL_CONFIG = {
+    **_DSV4_LARGE_W13_KERNEL_CONFIG,
+    "BLOCK_SIZE_M": 64,
+}
+_DSV4_PREFILL_W2_KERNEL_CONFIG = {
+    **_DSV4_SMALL_KERNEL_CONFIG,
+    "BLOCK_SIZE_M": 64,
+}
 _ROUTE_KERNEL_CONFIG = {"num_threads": 1024}
 RELEASE_MAX_TOKENS_PER_RANK = 32
+RELEASE_MAX_PREFILL_TOKENS_PER_RANK = 1024
+
+
+def resolve_prefill_capacity(
+    chunked_prefill_size: int | None,
+    *,
+    release_max_tokens: int,
+) -> int:
+    """Validate and return the scheduler's resolved per-rank prefill chunk."""
+
+    if release_max_tokens <= 0:
+        raise ValueError(
+            f"release_max_tokens must be positive, got {release_max_tokens}"
+        )
+    if chunked_prefill_size is None or chunked_prefill_size <= 0:
+        raise ValueError(
+            "SharedEP requires a positive DP-adjusted prefill chunk, got "
+            f"{chunked_prefill_size}"
+        )
+    if chunked_prefill_size > release_max_tokens:
+        raise ValueError(
+            "SharedEP DP-adjusted prefill chunk exceeds release capacity: "
+            f"{chunked_prefill_size} > {release_max_tokens}"
+        )
+    return chunked_prefill_size
 
 
 class SharedEpProfile(msgspec.Struct, frozen=True, kw_only=True):
@@ -55,10 +104,14 @@ class SharedEpProfile(msgspec.Struct, frozen=True, kw_only=True):
     small_kernel_config: dict[str, int] | None
     small_kernel_max_tokens: int
     route_kernel_config: dict[str, int]
+    supports_pull_cache_prefill: bool = False
     default_w13_kernel_config: dict[str, int] | None = None
     default_w2_kernel_config: dict[str, int] | None = None
     small_w13_kernel_config: dict[str, int] | None = None
     small_w2_kernel_config: dict[str, int] | None = None
+    prefill_kernel_config: dict[str, int] | None = None
+    prefill_w13_kernel_config: dict[str, int] | None = None
+    prefill_w2_kernel_config: dict[str, int] | None = None
 
     @property
     def block_size_m(self) -> int:
@@ -140,10 +193,14 @@ GLM52 = SharedEpProfile(
     small_kernel_config=None,
     small_kernel_max_tokens=4,
     route_kernel_config=_ROUTE_KERNEL_CONFIG,
+    supports_pull_cache_prefill=True,
     default_w13_kernel_config=_GLM_LARGE_W13_KERNEL_CONFIG,
     default_w2_kernel_config=_GLM_W2_KERNEL_CONFIG,
     small_w13_kernel_config=_GLM_SMALL_W13_KERNEL_CONFIG,
     small_w2_kernel_config=_GLM_W2_KERNEL_CONFIG,
+    prefill_kernel_config=_GLM_PREFILL_KERNEL_CONFIG,
+    prefill_w13_kernel_config=_GLM_PREFILL_W13_KERNEL_CONFIG,
+    prefill_w2_kernel_config=_GLM_PREFILL_W2_KERNEL_CONFIG,
 )
 
 DSV4_FLASH = SharedEpProfile(
@@ -163,7 +220,46 @@ DSV4_FLASH = SharedEpProfile(
     route_kernel_config=_ROUTE_KERNEL_CONFIG,
     default_w13_kernel_config=_DSV4_LARGE_W13_KERNEL_CONFIG,
     default_w2_kernel_config=_DSV4_SMALL_KERNEL_CONFIG,
+    supports_pull_cache_prefill=True,
+    prefill_kernel_config=_DSV4_PREFILL_KERNEL_CONFIG,
+    prefill_w13_kernel_config=_DSV4_PREFILL_W13_KERNEL_CONFIG,
+    prefill_w2_kernel_config=_DSV4_PREFILL_W2_KERNEL_CONFIG,
 )
+
+
+def make_pull_cache_prefill_profile(
+    profile: SharedEpProfile,
+    max_tokens_per_rank: int,
+) -> SharedEpProfile | None:
+    """Build a pull-cache profile without changing decode admission."""
+
+    if max_tokens_per_rank <= 0:
+        raise ValueError(
+            f"max_tokens_per_rank must be positive, got {max_tokens_per_rank}"
+        )
+    if not profile.supports_pull_cache_prefill:
+        return None
+    if (
+        profile.prefill_kernel_config is None
+        or profile.prefill_w13_kernel_config is None
+        or profile.prefill_w2_kernel_config is None
+    ):
+        raise ValueError(
+            f"SharedEP profile {profile.name} has incomplete prefill kernel configs"
+        )
+    return msgspec.structs.replace(
+        profile,
+        name=f"{profile.name}_prefill_pull",
+        max_tokens_per_rank=max_tokens_per_rank,
+        default_kernel_config=profile.prefill_kernel_config,
+        small_kernel_config=None,
+        small_kernel_max_tokens=0,
+        default_w13_kernel_config=profile.prefill_w13_kernel_config,
+        default_w2_kernel_config=profile.prefill_w2_kernel_config,
+        small_w13_kernel_config=None,
+        small_w2_kernel_config=None,
+    )
+
 
 _PROFILES = (GLM52, DSV4_FLASH)
 

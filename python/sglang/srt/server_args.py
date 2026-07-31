@@ -2261,8 +2261,9 @@ class ServerArgs:
         ],
         Arg(
             help=(
-                "Choose the backend for MoE A2A. shared_ep is a composite "
-                "backend that uses SharedEP for decode and DeepEP for prefill."
+                "Choose the backend for MoE A2A. shared_ep uses a direct "
+                "shared-object consumer for decode, a pull-cache consumer for "
+                "admitted prefill shapes, and the Triton FusedMoE runner."
             ),
             choices=MOE_A2A_BACKEND_CHOICES,
             resolvable=True,

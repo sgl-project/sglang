@@ -148,7 +148,7 @@ class MoeRunner:
         if get_moe_a2a_backend().is_shared_ep() and self.fused_func is None:
             raise RuntimeError(
                 "SharedEP requires its registered fused execution path; "
-                "the generic runner cannot consume SharedEP decode objects."
+                "the generic runner cannot consume SharedEP objects."
             )
 
     def run(

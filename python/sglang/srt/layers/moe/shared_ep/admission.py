@@ -1,6 +1,7 @@
 """Release admission checks for the SharedEP backend."""
 
 from sglang.srt.layers.moe.shared_ep.profiles import (
+    RELEASE_MAX_PREFILL_TOKENS_PER_RANK,
     RELEASE_MAX_TOKENS_PER_RANK,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -26,16 +27,20 @@ def validate_shared_ep_server_args(server_args) -> None:
     if server_args.enable_lora or server_args.lora_paths:
         raise ValueError("SharedEP release does not support LoRA.")
 
-    if server_args.moe_runner_backend == "auto":
-        server_args.override(
-            "validate_shared_ep_server_args",
-            moe_runner_backend="deep_gemm",
-        )
-    elif server_args.moe_runner_backend != "deep_gemm":
+    prefill_chunk = server_args.chunked_prefill_size
+    if (
+        prefill_chunk is None
+        or prefill_chunk <= 0
+        or prefill_chunk > RELEASE_MAX_PREFILL_TOKENS_PER_RANK
+    ):
         raise ValueError(
-            "SharedEP requires --moe-runner-backend deep_gemm for its "
-            "composite decode and prefill path."
+            "SharedEP requires the DP-adjusted --chunked-prefill-size to be "
+            f"in [1, {RELEASE_MAX_PREFILL_TOKENS_PER_RANK}], got "
+            f"{prefill_chunk}."
         )
+
+    if server_args.moe_runner_backend not in ("auto", "triton"):
+        raise ValueError("SharedEP requires --moe-runner-backend auto or triton.")
 
     for enabled, option in (
         (server_args.enable_two_batch_overlap, "--enable-two-batch-overlap"),
@@ -43,13 +48,19 @@ def validate_shared_ep_server_args(server_args) -> None:
     ):
         if enabled:
             raise ValueError(
-                f"SharedEP does not support {option}; its single shared "
-                "epoch state is not staged for overlapping batches."
+                f"SharedEP does not support {option}; its phase-local epoch "
+                "states are not staged for overlapping batches."
             )
 
     if server_args.speculative_algorithm is not None:
         raise ValueError(
             "SharedEP initial release does not support speculative decoding."
+        )
+
+    if server_args.cuda_graph_config.prefill.backend != Backend.DISABLED:
+        raise ValueError(
+            "SharedEP prefill CUDA Graph is not supported; disable prefill "
+            "CUDA Graph so the pull-cache consumer is selected at runtime."
         )
 
     decode = server_args.cuda_graph_config.decode
