@@ -72,28 +72,27 @@ def _helion_fused_recurrent_kda_packed_decode_body(
     H = hl.specialize((mixed_qkv.size(1) - HV * V) // (2 * K))
     heads_per_q = HV // H
 
-    # Explicit stride specialization requires a newer Helion release.
-    # hl.specialize(
-    #     (
-    #         mixed_qkv.stride(0),
-    #         mixed_qkv.stride(1),
-    #         a.stride(0),
-    #         a.stride(1),
-    #         b.stride(0),
-    #         b.stride(1),
-    #         A_log.stride(0),
-    #         dt_bias.stride(0),
-    #         initial_state.stride(0),
-    #         initial_state.stride(1),
-    #         initial_state.stride(2),
-    #         initial_state.stride(3),
-    #         out.stride(0),
-    #         out.stride(1),
-    #         out.stride(2),
-    #         out.stride(3),
-    #         ssm_state_indices.stride(0),
-    #     )
-    # )
+    hl.specialize(
+        (
+            mixed_qkv.stride(0),
+            mixed_qkv.stride(1),
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            A_log.stride(0),
+            dt_bias.stride(0),
+            initial_state.stride(0),
+            initial_state.stride(1),
+            initial_state.stride(2),
+            initial_state.stride(3),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            ssm_state_indices.stride(0),
+        )
+    )
 
     block_v = hl.register_block_size(1, V)
 

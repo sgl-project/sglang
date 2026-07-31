@@ -48,17 +48,16 @@ def _l2norm_qk(
     T = q.size(1)
     H = hl.specialize(q.size(2))
     K = hl.specialize(q.size(3))
-    # Explicit stride specialization requires a newer Helion release.
-    # hl.specialize(
-    #     (
-    #         q.stride(1),
-    #         q.stride(2),
-    #         q.stride(3),
-    #         k.stride(1),
-    #         k.stride(2),
-    #         k.stride(3),
-    #     )
-    # )
+    hl.specialize(
+        (
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+        )
+    )
 
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
@@ -146,24 +145,23 @@ def _gate_cumsum_operands_fixed(
     H = hl.specialize(g.size(2))
     K = hl.specialize(g.size(3))
     chunks = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
-    # Explicit stride specialization requires a newer Helion release.
-    # hl.specialize(
-    #     (
-    #         g.stride(1),
-    #         g.stride(2),
-    #         g.stride(3),
-    #         q.stride(1),
-    #         q.stride(2),
-    #         q.stride(3),
-    #         k.stride(1),
-    #         k.stride(2),
-    #         k.stride(3),
-    #         beta.stride(1),
-    #         beta.stride(2),
-    #         a_log.stride(0),
-    #         dt_bias.stride(0),
-    #     )
-    # )
+    hl.specialize(
+        (
+            g.stride(1),
+            g.stride(2),
+            g.stride(3),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            beta.stride(1),
+            beta.stride(2),
+            a_log.stride(0),
+            dt_bias.stride(0),
+        )
+    )
 
     out = torch.empty_like(g, dtype=torch.float32)
     qg = torch.empty_like(q)
@@ -287,27 +285,26 @@ def _gate_cumsum_operands_varlen(
     H = hl.specialize(g.size(2))
     K = hl.specialize(g.size(3))
     chunks = chunk_indices.size(0)
-    # Explicit stride specialization requires a newer Helion release.
-    # hl.specialize(
-    #     (
-    #         g.stride(1),
-    #         g.stride(2),
-    #         g.stride(3),
-    #         q.stride(1),
-    #         q.stride(2),
-    #         q.stride(3),
-    #         k.stride(1),
-    #         k.stride(2),
-    #         k.stride(3),
-    #         beta.stride(1),
-    #         beta.stride(2),
-    #         a_log.stride(0),
-    #         dt_bias.stride(0),
-    #         cu_seqlens.stride(0),
-    #         chunk_indices.stride(0),
-    #         chunk_indices.stride(1),
-    #     )
-    # )
+    hl.specialize(
+        (
+            g.stride(1),
+            g.stride(2),
+            g.stride(3),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            beta.stride(1),
+            beta.stride(2),
+            a_log.stride(0),
+            dt_bias.stride(0),
+            cu_seqlens.stride(0),
+            chunk_indices.stride(0),
+            chunk_indices.stride(1),
+        )
+    )
 
     out = torch.empty_like(g, dtype=torch.float32)
     qg = torch.empty_like(q)
@@ -507,22 +504,21 @@ def _intra_matrices_wide(
     K = hl.specialize(q.size(3))
     chunks_per_batch = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
     total_chunks = chunk_indices.size(0) if is_varlen else B * chunks_per_batch
-    # Explicit stride specialization requires a newer Helion release.
-    # hl.specialize(
-    #     (
-    #         q.stride(1),
-    #         q.stride(2),
-    #         q.stride(3),
-    #         k.stride(1),
-    #         k.stride(2),
-    #         k.stride(3),
-    #         g.stride(1),
-    #         g.stride(2),
-    #         g.stride(3),
-    #         beta.stride(1),
-    #         beta.stride(2),
-    #     )
-    # )
+    hl.specialize(
+        (
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            g.stride(1),
+            g.stride(2),
+            g.stride(3),
+            beta.stride(1),
+            beta.stride(2),
+        )
+    )
 
     aqk = torch.empty([B, T, H, CHUNK_SIZE], dtype=q.dtype, device=q.device)
     akk = torch.empty([B, T, H, CHUNK_SIZE], dtype=torch.float32, device=q.device)
@@ -1139,28 +1135,27 @@ def _chunk_state(
     N = cu_seqlens.size(0) - 1 if is_varlen else B
     chunks_per_batch = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
     total_chunks = chunk_indices.size(0) if is_varlen else chunks_per_batch
-    # Explicit stride specialization requires a newer Helion release.
-    # hl.specialize(
-    #     (
-    #         kg.stride(1),
-    #         kg.stride(2),
-    #         kg.stride(3),
-    #         w.stride(1),
-    #         w.stride(2),
-    #         w.stride(3),
-    #         u.stride(1),
-    #         u.stride(2),
-    #         u.stride(3),
-    #         chunk_decay.stride(0),
-    #         chunk_decay.stride(1),
-    #         chunk_decay.stride(2),
-    #         initial_state.stride(0),
-    #         initial_state.stride(1),
-    #         initial_state.stride(2),
-    #         initial_state.stride(3),
-    #         initial_state_indices.stride(0),
-    #     )
-    # )
+    hl.specialize(
+        (
+            kg.stride(1),
+            kg.stride(2),
+            kg.stride(3),
+            w.stride(1),
+            w.stride(2),
+            w.stride(3),
+            u.stride(1),
+            u.stride(2),
+            u.stride(3),
+            chunk_decay.stride(0),
+            chunk_decay.stride(1),
+            chunk_decay.stride(2),
+            initial_state.stride(0),
+            initial_state.stride(1),
+            initial_state.stride(2),
+            initial_state.stride(3),
+            initial_state_indices.stride(0),
+        )
+    )
 
     h = torch.empty(
         [B, total_chunks, H, V, K],
@@ -1282,27 +1277,26 @@ def _chunk_output(
     chunks_per_batch = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
     total_chunks = chunk_indices.size(0) if is_varlen else B * chunks_per_batch
     h_chunks = h.size(1)
-    # Explicit stride specialization requires a newer Helion release.
-    # hl.specialize(
-    #     (
-    #         qg.stride(1),
-    #         qg.stride(2),
-    #         qg.stride(3),
-    #         v_new.stride(1),
-    #         v_new.stride(2),
-    #         v_new.stride(3),
-    #         aqk.stride(1),
-    #         aqk.stride(2),
-    #         aqk.stride(3),
-    #         h.stride(1),
-    #         h.stride(2),
-    #         h.stride(3),
-    #         h.stride(4),
-    #         out.stride(1),
-    #         out.stride(2),
-    #         out.stride(3),
-    #     )
-    # )
+    hl.specialize(
+        (
+            qg.stride(1),
+            qg.stride(2),
+            qg.stride(3),
+            v_new.stride(1),
+            v_new.stride(2),
+            v_new.stride(3),
+            aqk.stride(1),
+            aqk.stride(2),
+            aqk.stride(3),
+            h.stride(1),
+            h.stride(2),
+            h.stride(3),
+            h.stride(4),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+        )
+    )
 
     qg_rows = qg.view(B * T * H, K)
     v_rows = v_new.view(B * T * H, V)
