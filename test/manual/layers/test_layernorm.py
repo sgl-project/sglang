@@ -85,11 +85,14 @@ class TestGemmaRMSNorm(CustomTestCase):
             ref_out = layer.forward_native(x, residual)
             out = layer(x, residual)
 
+        # bf16's 7-bit mantissa can't meet 1e-3 against the fused CUDA kernel;
+        # keep the tighter bound for the higher-precision fp16 path.
+        atol = rtol = 1e-2 if dtype == torch.bfloat16 else 1e-3
         if add_residual:
-            self.assertTrue(torch.allclose(out[0], ref_out[0], atol=1e-3, rtol=1e-3))
-            self.assertTrue(torch.allclose(out[1], ref_out[1], atol=1e-3, rtol=1e-3))
+            self.assertTrue(torch.allclose(out[0], ref_out[0], atol=atol, rtol=rtol))
+            self.assertTrue(torch.allclose(out[1], ref_out[1], atol=atol, rtol=rtol))
         else:
-            self.assertTrue(torch.allclose(out, ref_out, atol=1e-3, rtol=1e-3))
+            self.assertTrue(torch.allclose(out, ref_out, atol=atol, rtol=rtol))
 
     def test_gemma_rms_norm(self):
         for params in itertools.product(
