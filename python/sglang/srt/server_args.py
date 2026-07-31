@@ -4203,27 +4203,13 @@ class ServerArgs:
         ):
             self.cuda_graph_backend_prefill = Backend.FULL
 
-    def _apply_kimi_hybrid_symm_mem_guard(self):
-        """Kimi hybrid archs drop --enable-symm-mem unless capture is off everywhere."""
-        if (
-            not self.enable_symm_mem
-            or parse_connector_type(self.model_path) == ConnectorType.INSTANCE
-        ):
-            return
-        arch = self.get_model_config().hf_config.architectures[0]
-        if arch in (
-            "KimiLinearForCausalLM",
-            "KimiK3ForConditionalGeneration",
-        ):
-            from sglang.srt.arg_groups.kimi_k3_hook import disable_kimi_k3_symm_mem
-
-            disable_kimi_k3_symm_mem(self)
-
     def _handle_cuda_graph_config(self):
+        from sglang.srt.arg_groups.kimi_k3_hook import disable_kimi_k3_symm_mem
+
         self._parse_cuda_graph_config()
         # Reads the resolved per-phase backends; must precede the compat rules
         # below and _handle_gpu_memory_settings, which key off enable_symm_mem.
-        self._apply_kimi_hybrid_symm_mem_guard()
+        disable_kimi_k3_symm_mem(self)
         self._apply_cuda_graph_compatibility()
         self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()

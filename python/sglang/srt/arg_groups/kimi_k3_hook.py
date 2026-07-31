@@ -49,10 +49,22 @@ def disable_kimi_k3_symm_mem(server_args: ServerArgs) -> None:
     capture that corrupts spec decode: accept collapses to 1.000, or the server
     silently emits garbage with accept pinned at the ceiling. Prefill counts too --
     the same allocation sits in any captured RowParallelLinear.
+
+    Gates on the arch itself: this runs from cuda-graph resolution, which is earlier
+    than the model-specific hook block.
     """
+    from sglang.srt.connector import ConnectorType
     from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.utils import parse_connector_type
 
     if not server_args.enable_symm_mem:
+        return
+    if parse_connector_type(server_args.model_path) == ConnectorType.INSTANCE:
+        return
+    if server_args.get_model_config().hf_config.architectures[0] not in (
+        "KimiLinearForCausalLM",
+        "KimiK3ForConditionalGeneration",
+    ):
         return
     graph = server_args.cuda_graph_config
     if (
