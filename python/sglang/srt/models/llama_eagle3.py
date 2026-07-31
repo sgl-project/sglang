@@ -158,6 +158,21 @@ class LlamaModel(nn.Module):
             bias=getattr(config, "bias", False),
         )
 
+        eagle_config = getattr(config, "eagle_config", None) or {}
+        # Normalize the concatenated target-model features once before the FC
+        # projection. This differs from fc_norm, which normalizes each feature
+        # chunk independently before concatenation.
+        self.norm_before_fc = bool(
+            eagle_config.get("norm_before_fc", getattr(config, "norm_before_fc", False))
+        )
+        if self.norm_before_fc:
+            self.input_norm = RMSNorm(
+                self.hidden_size_in * self.num_aux_hidden_states,
+                eps=config.rms_norm_eps,
+            )
+        else:
+            self.input_norm = None
+
         # Per-aux RMSNorm before fc; enabled via `fc_norm` or legacy `use_aux_norm` flag.
         use_fc_norm = getattr(config, "fc_norm", None) or getattr(
             config, "use_aux_norm", False
@@ -212,6 +227,8 @@ class LlamaModel(nn.Module):
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
+            if self.input_norm is not None:
+                hidden_states = self.input_norm(hidden_states)
             if self.fc_norm is not None:
                 chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
                 hidden_states = torch.cat(

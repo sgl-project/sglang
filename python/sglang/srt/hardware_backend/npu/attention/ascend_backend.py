@@ -397,14 +397,6 @@ class AscendAttnBackend(AttentionBackend):
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        """
-        Return buffers for verify attention kernels that needs to be filled after draft.
-
-        Typically, these are tree mask and position buffers.
-        """
-        return [None, None]
-
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
@@ -496,6 +488,31 @@ class AscendAttnBackend(AttentionBackend):
             and forward_batch.spec_info is not None
         ):
             self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
+
+        # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
+        # indexer reads a value consistent with actual_seq_lengths_kv /
+        # block_tables (which are also built from the pre-pad batch here).
+        # Without this, eager decode under DP attention pads q to the global
+        # max while kv stays local, causing a shape mismatch in
+        # npu_lightning_indexer.
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            self.forward_metadata.actual_seq_lengths_q = torch.arange(
+                self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens
+                + forward_batch.seq_lens.shape[0] * self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        elif forward_batch.forward_mode.is_decode_or_idle():
+            self.forward_metadata.actual_seq_lengths_q = torch.tensor(
+                [1 + i for i in range(forward_batch.seq_lens.shape[0])],
+                dtype=torch.int32,
+                device=self.device,
+            )
 
         if (
             self.use_mla
@@ -720,6 +737,27 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata = metadata
 
         self.graph_mode = True
+
+    def _pad_topk_indices(
+        self, topk_indices: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        current_tokens = topk_indices.shape[0]
+        if current_tokens == num_tokens:
+            return topk_indices
+
+        assert current_tokens <= num_tokens, (
+            f"topk_indices rows ({current_tokens}) > num_tokens ({num_tokens}); "
+            "this indicates a mismatch between indexer output and q layout."
+        )
+
+        pad_size = num_tokens - current_tokens
+        padding = torch.full(
+            (pad_size, topk_indices.shape[1]),
+            -1,
+            dtype=topk_indices.dtype,
+            device=topk_indices.device,
+        )
+        return torch.cat([topk_indices, padding], dim=0)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 0
@@ -1072,6 +1110,8 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
+            if topk_indices is not None:
+                topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
             attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,

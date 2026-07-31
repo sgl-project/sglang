@@ -37,6 +37,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
 
 import fastapi
+import numpy as np
 import pybase64
 import torch
 import uvloop
@@ -93,7 +94,10 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
-from sglang.srt.managers.utils import is_health_check_generate_req
+from sglang.srt.managers.utils import (
+    compute_num_reserved_tokens,
+    is_health_check_generate_req,
+)
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -116,7 +120,6 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_tokenizer,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -263,6 +266,7 @@ def _build_flat_input_top_logprobs_fields(
     input_top_logprobs_val: List[Optional[List[float]]],
     input_top_logprobs_idx: List[Optional[List[int]]],
     top_logprobs_num: int,
+    return_b64: bool = False,
 ) -> Dict[str, Any]:
     """Build the flat raw prompt top logprob response fields.
 
@@ -270,7 +274,9 @@ def _build_flat_input_top_logprobs_fields(
     arrays. The leading null positions (counted by
     `input_top_logprobs_null_prefix`) precede the arrays, so covered position
     i, entry j lives at flat[(i - null_prefix) * k + j] and the covered range
-    spans null_prefix + rows positions.
+    spans null_prefix + rows positions. With ``return_b64``, the arrays are
+    base64 contiguous little-endian binary; the dtype marker fields let the
+    widths change later without a wire break.
     """
     num_rows = len(input_top_logprobs_val)
     null_prefix = 0
@@ -289,8 +295,20 @@ def _build_flat_input_top_logprobs_fields(
             )
 
     fields: Dict[str, Any] = {}
-    fields["input_top_logprobs_val_flat"] = [v for row in val_rows for v in row]
-    fields["input_top_logprobs_idx_flat"] = [i for row in idx_rows for i in row]
+    if return_b64:
+        val_arr = np.asarray(val_rows, dtype=np.float32)
+        idx_arr = np.asarray(idx_rows, dtype=np.int32)
+        fields["input_top_logprobs_val_flat_b64"] = pybase64.b64encode(
+            val_arr.tobytes()
+        ).decode("utf-8")
+        fields["input_top_logprobs_idx_flat_b64"] = pybase64.b64encode(
+            idx_arr.tobytes()
+        ).decode("utf-8")
+        fields["input_top_logprobs_val_flat_b64_dtype"] = "float32"
+        fields["input_top_logprobs_idx_flat_b64_dtype"] = "int32"
+    else:
+        fields["input_top_logprobs_val_flat"] = [v for row in val_rows for v in row]
+        fields["input_top_logprobs_idx_flat"] = [i for row in idx_rows for i in row]
     fields["input_top_logprobs_shape"] = [len(val_rows), k]
     fields["input_top_logprobs_null_prefix"] = null_prefix
     return fields
@@ -384,18 +402,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.max_req_input_len = None  # Will be set later in engine.py
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.default_priority_value = server_args.default_priority_value
-        speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
-        if speculative_algorithm.is_eagle():
-            # In the current eagle implementation, we store the draft tokens in the output token slots,
-            # so we need to reserve the space for the draft tokens.
-            self.num_reserved_tokens = max(
-                server_args.speculative_eagle_topk * server_args.speculative_num_steps,
-                server_args.max_speculative_num_draft_tokens,
-            )
-        else:
-            self.num_reserved_tokens = 0
+        self.num_reserved_tokens = compute_num_reserved_tokens(server_args)
         self.validate_total_tokens = True
 
     def init_tokenizer_and_processor(self):
@@ -2301,6 +2308,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                                 state.input_top_logprobs_val,
                                 state.input_top_logprobs_idx,
                                 top_logprobs_num,
+                                return_b64=state.obj.return_flat_raw_top_logprobs_b64,
                             )
                         )
                     except ValueError as e:
