@@ -44,27 +44,11 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
 def disable_kimi_k3_symm_mem(server_args: ServerArgs) -> None:
     """Turn `--enable-symm-mem` back off unless every phase runs eager.
 
-    The NCCL symmetric-memory pool hands out per-forward allocations, and an address
-    taken from it during capture is neither reserved for the graph's lifetime nor
-    guaranteed to sit at the same offset on every rank. Under capture that corrupts
-    speculative decoding, measured under TP8:
-
-      - with --enable-linear-replayssm-spec: accept collapses to 1.000 every run, so
-        spec dies and throughput falls below non-spec (81 vs 423 tok/s). Output stays
-        correct.
-      - without it: 4 of 7 server starts silently emit garbage ("Janet!!!!!!!...")
-        while reporting accept pinned at the 8.000 ceiling and a *higher* throughput
-        than a healthy run. Nothing errors. This is the dangerous one.
-
-    Only capture is affected, hence the all-eager escape hatch. The condition reads the
-    resolved cuda_graph_config rather than the deprecated disable_cuda_graph field,
-    which no longer covers --cuda-graph-backend-{decode,prefill}=disabled. Decode is the
-    measured path; prefill is included because the same per-forward allocation sits
-    inside any captured RowParallelLinear.
-
-    Nothing is lost by dropping the flag: the K3 fused all-reduce (auto-probed, and
-    skipped precisely when this flag is set) is both faster than the symmetric-memory
-    path and correct under capture.
+    Symm-mem allocations are per-forward, so an address captured into a graph is
+    neither reserved for its lifetime nor at the same offset on every rank. Under
+    capture that corrupts spec decode: accept collapses to 1.000, or the server
+    silently emits garbage with accept pinned at the ceiling. Prefill counts too --
+    the same allocation sits in any captured RowParallelLinear.
     """
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
