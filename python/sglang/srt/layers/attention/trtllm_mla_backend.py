@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -150,6 +151,7 @@ class TRTLLMMLADecodeMetadata:
     cu_seqlens_q: Optional[torch.Tensor] = None
     seq_lens_q: Optional[torch.Tensor] = None
     seq_lens_k: Optional[torch.Tensor] = None
+    global_seq_lens_k: Optional[torch.Tensor] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -240,7 +242,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
-        self.cuda_graph_custom_mask = None
+        self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
@@ -355,19 +357,24 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
-        if self.num_draft_tokens and not self.skip_prefill and not self.is_draft_runner:
-            # Worst-case FULL_MASK tree-mask scratch (bool); build_tree writes it
-            # in-place so the gpu_only path needs no seq_lens_sum.
-            self.cuda_graph_custom_mask = torch.zeros(
-                max_num_tokens * (self.max_context_len + self.num_draft_tokens),
-                dtype=torch.bool,
-                device=self.device,
-            )
+        # Target verify never reaches the parent's mask read: it is excluded from
+        # every super() dispatch (init_forward_metadata, _out_graph, forward_extend)
+        # and runs the trtllm-gen kernel, which takes no mask.
+        self._verify_mask = maybe_create_verify_mask(
+            is_draft_runner=self.is_draft_runner,
+            skip_prefill=self.skip_prefill,
+            max_bs=max_bs,
+            max_context_len=self.max_context_len,
+            num_draft_tokens=self.num_draft_tokens,
+            device=self.device,
+            is_read=False,
+        )
 
         super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        return [self.cuda_graph_custom_mask, None]
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     def _init_cuda_graph_metadata(
         self,
@@ -382,6 +389,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if forward_mode.is_target_verify():
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
+            metadata.global_seq_lens_k = torch.zeros(
+                (bs,), dtype=torch.int32, device=device
+            )
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.num_draft_tokens
             metadata.max_seq_len_q = num_tokens_per_req
@@ -423,7 +433,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if forward_mode.is_target_verify():
             # Intentional int64 -> int32 same-kind out= downcast.
-            torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
+            torch.add(
+                seq_lens[:bs],
+                self.num_draft_tokens,
+                out=metadata.global_seq_lens_k,
+            )
+            metadata.seq_lens_k.copy_(metadata.global_seq_lens_k)
             seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.num_draft_tokens
@@ -569,6 +584,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq = max_seq + self.num_draft_tokens
                 seq_lens = seq_lens + self.num_draft_tokens
                 self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
+                self.forward_decode_metadata.global_seq_lens_k = (
+                    self.forward_decode_metadata.seq_lens_k
+                )
             elif forward_batch.forward_mode.is_draft_extend_v2():
                 sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
                 max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
@@ -951,8 +969,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q = q.to(self.data_type)
 
             if forward_batch.forward_mode.is_target_verify():
-                max_seq_len = (
-                    metadata.max_seq_len_k + forward_batch.spec_info.draft_token_num
+                draft_token_num = forward_batch.spec_info.draft_token_num
+                dcp_enabled = get_parallel().dcp_enabled
+                max_seq_len = metadata.max_seq_len_k + (
+                    0 if dcp_enabled else draft_token_num
                 )
                 # For target_verify, all sequences have the same number of draft tokens
                 q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
@@ -1005,6 +1025,44 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     unpad_sum_seq_lens_q = total_tokens
 
             assert kv_cache.dtype == self.data_type
+
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and get_parallel().dcp_enabled
+            ):
+                raw_out, lse = self._run_decode_kernel(
+                    query=q,
+                    kv_cache=kv_cache,
+                    block_tables=metadata.block_kv_indices,
+                    seq_lens=metadata.seq_lens_k,
+                    max_seq_len=max_seq_len,
+                    layer=layer,
+                    causal_seqs=metadata.global_seq_lens_k,
+                    cp_world=get_parallel().dcp_size,
+                    cp_rank=get_parallel().dcp_rank,
+                    return_lse=True,
+                )
+                output = raw_out.view(
+                    bs * draft_token_num,
+                    layer.tp_q_head_num,
+                    layer.v_head_dim,
+                )
+                lse = lse.view(bs * draft_token_num, layer.tp_q_head_num)
+                dense_q_indptr = torch.arange(
+                    0,
+                    (bs + 1) * draft_token_num,
+                    draft_token_num,
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                fixup_zero_kv_rows(
+                    output,
+                    lse,
+                    metadata.seq_lens_k,
+                    dense_q_indptr,
+                    draft_token_num,
+                )
+                return output.flatten(1), lse
 
             raw_out = self._run_decode_kernel(
                 query=q,
