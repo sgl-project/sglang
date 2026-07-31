@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 class LinearAttnKernelBackend(Enum):
     TRITON = "triton"
+    HIP = "hip"
     CUTEDSL = "cutedsl"
     FLASHINFER = "flashinfer"
     FLASHKDA = "flashkda"
@@ -25,6 +26,9 @@ class LinearAttnKernelBackend(Enum):
 
     def is_triton(self):
         return self == LinearAttnKernelBackend.TRITON
+
+    def is_hip(self):
+        return self == LinearAttnKernelBackend.HIP
 
     def is_cutedsl(self):
         return self == LinearAttnKernelBackend.CUTEDSL
@@ -43,13 +47,28 @@ LINEAR_ATTN_DECODE_BACKEND: Optional[LinearAttnKernelBackend] = None
 LINEAR_ATTN_PREFILL_BACKEND: Optional[LinearAttnKernelBackend] = None
 
 
-def initialize_linear_attn_config(server_args: ServerArgs):
+def initialize_linear_attn_config(server_args: ServerArgs, *, is_gdn: bool = False):
     global LINEAR_ATTN_DECODE_BACKEND
     global LINEAR_ATTN_PREFILL_BACKEND
 
     base = server_args.linear_attn_backend
     decode = server_args.linear_attn_decode_backend or base
     prefill = server_args.linear_attn_prefill_backend or base
+
+    if base == "hip":
+        raise ValueError(
+            "--linear-attn-backend hip is not supported: HIP is GDN decode-only. "
+            "Use --linear-attn-decode-backend hip instead."
+        )
+    if prefill == "hip":
+        raise ValueError(
+            "--linear-attn-prefill-backend hip is not supported: HIP is "
+            "GDN decode-only."
+        )
+    if decode == "hip" and not is_gdn:
+        raise ValueError(
+            "--linear-attn-decode-backend hip is supported only for GDN models."
+        )
 
     LINEAR_ATTN_DECODE_BACKEND = LinearAttnKernelBackend(decode)
     LINEAR_ATTN_PREFILL_BACKEND = LinearAttnKernelBackend(prefill)

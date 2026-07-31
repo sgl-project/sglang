@@ -19,7 +19,14 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
@@ -119,6 +126,21 @@ class GDNKernelDispatcher:
         cutedsl_kernel = None
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
+        elif decode_backend.is_hip():
+            if not is_hip():
+                raise ValueError("GDN HIP backend requires ROCm")
+            if not is_gfx95_supported():
+                self.decode_kernel = triton_kernel
+                rank0_log(
+                    "GDN HIP decode backend requires ROCm gfx95; "
+                    "falling back to Triton decode."
+                )
+            else:
+                from sglang.srt.layers.attention.linear.kernels.gdn_hip import (
+                    HipGDNKernel,
+                )
+
+                self.decode_kernel = HipGDNKernel()
         elif decode_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("GDN CuTe DSL backend requires CUDA")
