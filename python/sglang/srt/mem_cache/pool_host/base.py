@@ -9,15 +9,12 @@ from typing import Optional
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.mem_cache.mmap_allocator import (
-    HICACHE_HOST_MEMORY_RESERVE_BYTES as HICACHE_HOST_MEMORY_RESERVE_BYTES,
-)
-from sglang.srt.mem_cache.mmap_allocator import (
-    memory_available_bytes,
-)
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
+)
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+    memory_available_bytes,
 )
 from sglang.srt.utils import is_cuda, is_hip
 

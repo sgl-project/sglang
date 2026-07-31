@@ -20,7 +20,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 )
 from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MambaPool
-from sglang.srt.mem_cache.mmap_allocator import memory_available_bytes
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import memory_available_bytes
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()

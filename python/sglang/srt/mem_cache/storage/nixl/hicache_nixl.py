@@ -19,12 +19,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.pool_host import HostKVCache
+from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
     MEM_BACKEND_HUGEPAGE,
-    alloc_mmap,
     tensor_mem_backend,
 )
-from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import HiCacheL3Cleaner
 
 from .nixl_registry import NixlRegistry

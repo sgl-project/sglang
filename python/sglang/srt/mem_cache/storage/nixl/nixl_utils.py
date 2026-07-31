@@ -167,7 +167,7 @@ class NixlBackendSelection:
                 return False
 
             if self.backend_name == "DOCA_MEMOS":
-                from sglang.srt.mem_cache.mmap_allocator import (
+                from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
                     HUGEPAGE_BYTES_2MB,
                     HUGEPAGE_MODE_REQUIRED,
                     hugepage_mode,

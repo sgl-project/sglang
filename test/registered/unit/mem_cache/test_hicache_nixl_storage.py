@@ -915,7 +915,9 @@ class TestDocaMemosNixl(unittest.TestCase):
     def test_register_mem_pool_host_doca_memos(self):
         from unittest.mock import patch
 
-        from sglang.srt.mem_cache.mmap_allocator import MEM_BACKEND_HUGEPAGE
+        from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+            MEM_BACKEND_HUGEPAGE,
+        )
 
         dummy = self._make_registration_target()
         host = MockMemPoolHost(is_zero_copy_mode=False)
@@ -941,7 +943,9 @@ class TestDocaMemosNixl(unittest.TestCase):
     def test_register_mem_host_pool_v2_doca_memos(self):
         from unittest.mock import patch
 
-        from sglang.srt.mem_cache.mmap_allocator import MEM_BACKEND_HUGEPAGE
+        from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+            MEM_BACKEND_HUGEPAGE,
+        )
 
         dummy = self._make_registration_target()
         host = self._make_hybrid_pool(expose_zero_copy=False)
@@ -1033,8 +1037,8 @@ class TestDocaMemosNixl(unittest.TestCase):
         import torch
 
         from sglang.srt.environ import envs
-        from sglang.srt.mem_cache import mmap_allocator
-        from sglang.srt.mem_cache.mmap_allocator import (
+        from sglang.srt.mem_cache.storage.mmap import mmap_allocator
+        from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
             MEM_BACKEND_HUGEPAGE,
             MEM_BACKEND_MMAP,
             tensor_mem_backend,
@@ -1089,8 +1093,8 @@ class TestHiCacheHostMemoryPreflight(unittest.TestCase):
         from unittest.mock import MagicMock, patch
 
         from sglang.srt.environ import envs
-        from sglang.srt.mem_cache import mmap_allocator
-        from sglang.srt.mem_cache.mmap_allocator import (
+        from sglang.srt.mem_cache.storage.mmap import mmap_allocator
+        from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
             HICACHE_HOST_MEMORY_RESERVE_BYTES,
             HUGEPAGE_BYTES_2MB,
             memory_available_bytes,
