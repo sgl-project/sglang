@@ -290,6 +290,16 @@ export const benchmarks = [
     ],
   },
   {
+    match: { hw: "b300", variant: "27b", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 1057860, tpot_ms: 91.17, tokens_per_sec_per_gpu: 7666 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 4765554, tpot_ms: 93.51, tokens_per_sec_per_gpu: 7667 },
+    ],
+  },
+  {
     match: { hw: "b300", variant: "27b", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.16",
     speed: [
