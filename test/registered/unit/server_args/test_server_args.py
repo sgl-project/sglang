@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
+from sglang.srt.arg_groups.argparse_actions import DeprecatedAliasStoreAction
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
@@ -62,6 +63,56 @@ class TestPrepareServerArgs(CustomTestCase):
 
             self.assertEqual(json.loads(value), {"image": {"resize": 128}})
             self.assertEqual(parsed.mm_process_config, {"image": {"resize": 128}})
+        finally:
+            os.unlink(config_file)
+
+    def test_config_accepts_options_with_deprecated_aliases(self):
+        """Canonical YAML options stay valid when deprecated aliases share
+        their destination."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("dsa-prefill-backend: trtllm\ndsa-decode-backend: trtllm\n")
+            config_file = f.name
+
+        try:
+            parser = server_args_module.argparse.ArgumentParser()
+            ServerArgs.add_cli_args(parser)
+            merged = ConfigArgumentMerger(parser).merge_config_with_args(
+                [
+                    "--config",
+                    config_file,
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                ]
+            )
+            parsed = parser.parse_args(merged)
+
+            self.assertEqual(parsed.dsa_prefill_backend, "trtllm")
+            self.assertEqual(parsed.dsa_decode_backend, "trtllm")
+        finally:
+            os.unlink(config_file)
+
+    def test_config_rejects_destination_with_only_unsupported_action(self):
+        """YAML rejects destinations exposed only through unsupported custom
+        actions."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("legacy-only: value\n")
+            config_file = f.name
+
+        try:
+            parser = server_args_module.argparse.ArgumentParser()
+            parser.add_argument(
+                "--legacy-only",
+                action=DeprecatedAliasStoreAction,
+                new_flag="--replacement",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "Unsupported config option 'legacy_only'",
+            ):
+                ConfigArgumentMerger(parser).merge_config_with_args(
+                    ["--config", config_file]
+                )
         finally:
             os.unlink(config_file)
 
