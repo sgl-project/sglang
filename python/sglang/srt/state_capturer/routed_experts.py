@@ -12,7 +12,12 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_schedule,
+    get_server_args,
+)
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 
@@ -36,9 +41,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         device: str,
     ) -> Optional["RoutedExpertsCapturer"]:
         server_args = get_server_args()
-        if not server_args.enable_return_routed_experts:
+        if not get_exec().features.enable_return_routed_experts:
             return None
-        if not server_args.disable_shared_experts_fusion and hasattr(
+        if not get_exec().moe.disable_shared_experts_fusion and hasattr(
             model, "num_fused_shared_experts"
         ):
             num_fused_shared_experts = model.num_fused_shared_experts
@@ -71,7 +76,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         # chunked_prefill_size.
         # FIXME: spec decoding's num_verify_tokens is still not accounted for.
         max_batch_size = max(
-            server_args.chunked_prefill_size * server_args.dp_size,
+            get_schedule().chunked_prefill_size * server_args.dp_size,
             max_running_requests * server_args.dp_size,
         )
 

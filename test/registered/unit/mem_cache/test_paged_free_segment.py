@@ -123,12 +123,14 @@ class TestFreeSegment(unittest.TestCase):
         before = len(alloc.free_pages)
         alloc.free_group_begin()
         alloc.free_segment(row[PAGE_SIZE : PAGE_SIZE + 1], start_pos=PAGE_SIZE)
-        with patch(
-            "sglang.srt.mem_cache.common.get_server_args",
-            return_value=SimpleNamespace(
-                page_size=1,
-                speculative_algorithm="DSPARK",
-                strip_thinking_cache=False,
+        with (
+            patch(
+                "sglang.srt.mem_cache.common.get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="DSPARK"),
+            ),
+            patch(
+                "sglang.srt.mem_cache.common.get_serving",
+                return_value=SimpleNamespace(strip_thinking_cache=False),
             ),
         ):
             _release_overallocated_kv_indices(

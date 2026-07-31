@@ -792,6 +792,7 @@ export const Playground = ({ config }) => {
               || head === "--speculative-num-steps"
               || head === "--speculative-eagle-topk"
               || head === "--speculative-num-draft-tokens"
+              || head === "--speculative-dspark-block-size"
               || head === "--speculative-ngram-max-bfs-breadth";
         });
         if (baseSpec.length === 0) return "off";
@@ -803,18 +804,21 @@ export const Playground = ({ config }) => {
         return "current";
       },
 
-      apply: ({ flags, env, value, fc, h, derived }) => {
+      apply: ({ flags, env, value, fc, sel, h, derived }) => {
         if (value === "current") return { flags, env };
         // No-op when the pick already matches base (preserves flag position).
         if (derived && value === derived) return { flags, env };
         const picked = (fc.options || []).find((p) => p.id === value);
-        if (picked && h.evaluateChip(picked,
-            { dpAttnOn: h.hasFlag(flags, "--enable-dp-attention") }).disabled) {
+        if (picked && h.evaluateChip(picked, {
+          ...sel,
+          dpAttnOn: h.hasFlag(flags, "--enable-dp-attention"),
+        }).disabled) {
           return { flags, env };
         }
         flags = h.stripFlagsByFirstToken(flags, [
           "--speculative-algorithm", "--speculative-num-steps",
           "--speculative-eagle-topk", "--speculative-num-draft-tokens",
+          "--speculative-dspark-block-size",
           "--speculative-ngram-max-bfs-breadth",
         ]);
         const preset = (fc.options || []).find((p) => p.id === value);
@@ -873,6 +877,10 @@ export const Playground = ({ config }) => {
           "--disaggregation-mode", "--disaggregation-transfer-backend",
           "--disaggregation-ib-device", "--disaggregation-bootstrap-port",
         ]);
+        const specAlgorithm = (h.findFlagArg(flags, "--speculative-algorithm") || "").toUpperCase();
+        if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
+          return { flags, env };
+        }
         const backends = fc.transferBackends || [];
         // A config that omits `modes` has the role on the Deploy panel instead;
         // this card then only tunes the transport for whatever role is selected.
@@ -922,7 +930,12 @@ export const Playground = ({ config }) => {
         return { flags, env };
       },
 
-      getRenderHints: (value) => {
+      getRenderHints: (value, fc, context) => {
+        const specAlgorithm = (context.h.findFlagArg(
+          context.flags, "--speculative-algorithm") || "").toUpperCase();
+        if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
+          return null;
+        }
         if (value.mode === "prefill" || value.mode === "decode") {
           return { pdMode: value.mode };
         }
@@ -1318,11 +1331,15 @@ export const Playground = ({ config }) => {
       const value = allDeltas[axisId];
       if (value === undefined) continue;
       const derived = derivedMap ? derivedMap[axisId] : null;
-      const out = handler.apply({ flags, env, value, fc, sel, h: helpers, derived });
+      const specAlgorithm = (findFlagArg(
+        flags, "--speculative-algorithm") || "").toUpperCase() || null;
+      const liveSel = { ...sel, specAlgorithm };
+      const out = handler.apply({ flags, env, value, fc, sel: liveSel, h: helpers, derived });
       flags = out.flags;
       env = out.env;
       if (handler.getRenderHints) {
-        const hints = handler.getRenderHints(value, fc) || {};
+        const hints = handler.getRenderHints(
+          value, fc, { flags, env, sel: liveSel, h: helpers }) || {};
         if (hints.pdMode) pdMode = hints.pdMode;
       }
     }
@@ -2005,12 +2022,20 @@ export const Playground = ({ config }) => {
     ? attnDelta.cpStrategy
     : (attnDerived.cpStrategy !== undefined ? attnDerived.cpStrategy : null))
     || "interleave";
+  const constraintEffective = baseCell
+    ? applyAllDeltas(baseCell.flags, baseCell.env, deltas, base, derivedMap)
+    : null;
   const pdCardOwnsMode = ((pgFeatures.pdDisagg && pgFeatures.pdDisagg.modes) || []).length > 0;
   const pdMode = pdCardOwnsMode
-    ? ((deltas.pdDisagg && deltas.pdDisagg.mode) || "off")
+    ? ((constraintEffective && constraintEffective.pdMode) || "off")
     : (base.pdMode || "off");
+  const specAlgorithm = constraintEffective
+    ? ((findFlagArg(constraintEffective.flags,
+        "--speculative-algorithm") || "").toUpperCase() || null)
+    : null;
   const constraintBase = {
     ...base, dpAttnOn, cpOn, cpStrategy, cpSizeTarget, effTp, pdMode,
+    specAlgorithm,
   };
 
   let baseCommand = "";
@@ -2069,12 +2094,20 @@ export const Playground = ({ config }) => {
   const matchedSiblingCell = (matchedCell
     && DIMENSIONS.some((d) => matchedCell.match[d] !== base[d]))
     ? matchedCell : null;
-  // MTP hint on the EFFECTIVE (post-override) command — fires when the user
-  // toggles speculative decoding on without setting --max-running-requests
-  // (NOT keyed on strategy). Mirrors the Deploy panel's hint.
-  const pgMtpHint =
-    pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--speculative-algorithm") &&
+  const pgSpecAlgoFlag = pgFlagsLatest.find(
+    (f) => f.split(/[\s=]/)[0] === "--speculative-algorithm");
+  const pgSpecHint =
+    !!pgSpecAlgoFlag &&
     !pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
+  const specAlgoLabels = {
+    EAGLE: "MTP", EAGLE3: "MTP", FROZEN_KV_MTP: "MTP",
+    DSPARK: "DSpark", DFLASH: "DFlash", NGRAM: "N-gram",
+    STANDALONE: "standalone draft",
+  };
+  const pgSpecAlgoValue = pgSpecAlgoFlag
+    ? (pgSpecAlgoFlag.split(/[\s=]/).filter(Boolean)[1] || "") : "";
+  const pgSpecAlgoName = specAlgoLabels[pgSpecAlgoValue.toUpperCase()]
+    || pgSpecAlgoValue || "MTP";
 
   // Interleave prefill-CP + DP-Attention hint on the EFFECTIVE command:
   // deliberately allowed (combined support is planned upstream), but current
@@ -2348,9 +2381,9 @@ export const Playground = ({ config }) => {
               </span>
             )) : "# No verified base cell at the current Deployment selection.\n# Pick a supported hardware/variant in the Deployment panel to populate the playground base."}
           </pre>
-          {pgMtpHint && (
+          {pgSpecHint && (
             <div style={s.mtpWarn}>
-              ⚠️ Speculative decoding (MTP) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+              ⚠️ Speculative decoding ({pgSpecAlgoName}) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
             </div>
           )}
           {pgCpDpHint && (
