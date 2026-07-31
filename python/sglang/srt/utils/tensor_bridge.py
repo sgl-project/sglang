@@ -70,7 +70,7 @@ def torch_to_mlx(tensor: torch.Tensor) -> mx.array:
     """Convert a PyTorch tensor to an independent MLX array.
 
     MPS inputs are copied inside the unified Metal device.  Use ``mlx_call``
-    when a zero-copy Torch-to-MLX-to-Torch operation is required; it owns the
+    when a complete operation needs zero-copy MPS input imports; it owns the
     borrowed MLX arrays for the complete lazy operation.
 
     Args:
@@ -81,8 +81,8 @@ def torch_to_mlx(tensor: torch.Tensor) -> mx.array:
     """
     array = _torch_to_mlx(tensor, copy=True)
     if tensor.device.type == "mps":
-        # Complete the ownership transfer before the caller may mutate or
-        # release the Torch source.
+        # Materialize the owned copy before the caller may mutate or release
+        # the Torch source.
         _mlx_core().eval(array)
     return array
 
@@ -92,12 +92,13 @@ def mlx_call(
     *tensors: torch.Tensor,
     device: torch.device | Literal["mps", "cpu"] | None = None,
 ) -> torch.Tensor:
-    """Run one MLX operation with zero-copy Torch MPS inputs.
+    """Run one MLX operation with zero-copy Torch MPS input imports.
 
     The imported MLX arrays remain strongly referenced until
     :func:`mlx_to_torch` evaluates and exports ``operation``'s result.  Keep
     the operation inside this call; returning a lazy MLX result for later use
-    would outlive the borrow scope.
+    or stashing a borrowed input through a callback side effect would escape
+    the borrow scope.  The operation may allocate its own output normally.
     """
     detached = tuple(tensor.detach() for tensor in tensors)
     if any(tensor.device.type == "mps" for tensor in detached):
@@ -121,7 +122,8 @@ def mlx_to_torch(
 
     MLX arrays share their unified-memory allocation with PyTorch through
     DLPack, including explicit CPU views. MLX is evaluated before the handoff
-    because the frameworks do not share stream state. Other target devices copy.
+    because the frameworks do not share stream state. Only CPU and MPS targets
+    are supported; other target devices are rejected.
 
     Args:
         array: MLX array
