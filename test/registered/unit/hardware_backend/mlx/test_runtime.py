@@ -23,8 +23,10 @@ import sys
 from sglang.kernels.ops.diffusion.triton.norm import norm_infer
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.server_args import ServerArgs
 assert norm_infer is not None and RMSNorm is not None
 assert use_mlx() is False
+ServerArgs(model_path="dummy")
 assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
 """
         env = os.environ.copy()
@@ -55,13 +57,26 @@ assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
         and torch.backends.mps.is_available(),
         "requires MLX and MPS",
     )
-    def test_torch_212_is_rejected_at_backend_boundary(self):
+    def test_incompatible_runtime_aborts_server_args_before_dummy_shortcut(self):
+        import mlx.core as mx
+
+        runtime.use_mlx.cache_clear()
         runtime._validate_runtime.cache_clear()
         try:
-            with mock.patch.object(torch, "__version__", "2.12.1"):
-                with self.assertRaisesRegex(RuntimeError, "Torch >= 2.13.0"):
-                    runtime._validate_runtime()
+            with mock.patch.dict(os.environ, {"SGLANG_USE_MLX": "1"}):
+                with mock.patch.object(torch, "__version__", "2.12.1"):
+                    with self.assertRaisesRegex(RuntimeError, "Torch >= 2.13.0"):
+                        from sglang.srt.server_args import ServerArgs
+
+                        ServerArgs(model_path="dummy")
+
+                runtime.use_mlx.cache_clear()
+                runtime._validate_runtime.cache_clear()
+                with mock.patch.object(mx, "__version__", "0.31.0"):
+                    with self.assertRaisesRegex(RuntimeError, "MLX >= 0.32.0"):
+                        ServerArgs(model_path="dummy")
         finally:
+            runtime.use_mlx.cache_clear()
             runtime._validate_runtime.cache_clear()
 
     @unittest.skipUnless(
