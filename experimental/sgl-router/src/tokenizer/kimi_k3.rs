@@ -245,10 +245,28 @@ pub fn resolve_render_opts(request: &serde_json::Value) -> RenderOpts {
         }),
     };
 
-    let tool_choice = match request.get("tool_choice").and_then(|v| v.as_str()) {
-        Some("required") => ToolChoice::Required,
-        Some("none") => ToolChoice::None,
-        _ => ToolChoice::Unset,
+    // An ABSENT `tool_choice` is not `auto`: the engine's protocol layer fills it
+    // in before the template ever runs (`ChatCompletionRequest`'s
+    // `set_tool_choice_default`), picking `none` for a request that declares no
+    // tools and `auto` otherwise. Reading the field literally therefore renders
+    // 38 tokens short of the engine on every plain chat request that omits it —
+    // which is nearly all of them — and because those ids are forwarded as
+    // `input_ids`, the prompt actually generated from loses the
+    // `tool_choice=none` block entirely. Mirror the default here so the router's
+    // render is the engine's render.
+    let tool_choice = match request.get("tool_choice") {
+        None | Some(serde_json::Value::Null) => {
+            if declares_tools(request) {
+                ToolChoice::Unset
+            } else {
+                ToolChoice::None
+            }
+        }
+        Some(v) => match v.as_str() {
+            Some("required") => ToolChoice::Required,
+            Some("none") => ToolChoice::None,
+            _ => ToolChoice::Unset,
+        },
     };
 
     RenderOpts {
@@ -258,6 +276,42 @@ pub fn resolve_render_opts(request: &serde_json::Value) -> RenderOpts {
         response_format: request.get("response_format").cloned(),
         add_generation_prompt: true,
     }
+}
+
+/// Whether the request declares any tools, deciding what an absent `tool_choice`
+/// defaults to.
+///
+/// Mirrors the engine's `set_tool_choice_default` predicate, which is
+/// `values.get("tools") is None and not _has_message_level_tools(...)`. Two
+/// details of that are load-bearing and easy to get wrong:
+///
+/// - The top-level test is `is None`, NOT truthiness. An explicit `tools: []` is
+///   not `None` in Python, so it yields `auto` (no preamble) even though it
+///   declares nothing renderable. Testing emptiness here would emit a
+///   `tool_choice=none` block the engine never emits.
+/// - Message-level `tools` count, but only on a `system` / `developer` message,
+///   and there by TRUTHINESS (`bool(msg.get("tools"))`), so an empty list on such
+///   a message does not count. Missing this half leaves the router short exactly
+///   on tool-carrying agent traffic, where the prompt divergence costs the most.
+fn declares_tools(request: &serde_json::Value) -> bool {
+    if !matches!(request.get("tools"), None | Some(serde_json::Value::Null)) {
+        return true;
+    }
+    request
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .is_some_and(|role| {
+                        role.eq_ignore_ascii_case("system")
+                            || role.eq_ignore_ascii_case("developer")
+                    })
+                    && message.get("tools").is_some_and(json_truthy)
+            })
+        })
 }
 
 /// Python-truthiness of a JSON value, matching [`super::dsv4`]'s treatment of
@@ -1798,5 +1852,99 @@ mod tests {
         // A named-function tool_choice object renders nothing, like `auto`.
         let opts = resolve_render_opts(&json!({"tool_choice": {"type": "function"}}));
         assert_eq!(opts.tool_choice, ToolChoice::Unset);
+    }
+
+    /// An OMITTED `tool_choice` follows the engine's protocol default, not `auto`.
+    ///
+    /// The engine fills the field in before the template runs, so a toolless
+    /// request renders a `tool_choice=none` block. The router used to read the
+    /// field literally and skip it, leaving its ids 38 tokens short of the
+    /// engine's on essentially every plain chat request — and since the router
+    /// forwards those ids as `input_ids`, that shortened prompt is what the
+    /// engine generated from.
+    ///
+    /// The fixture-driven parity tests cannot catch this: they build `RenderOpts`
+    /// from `FixtureOpts`, which mirrors the REFERENCE ENCODER, and the reference
+    /// never sees the protocol layer's defaults. Only a request-level assertion
+    /// pins it.
+    #[test]
+    fn absent_tool_choice_mirrors_the_engine_protocol_default() {
+        let toolless = json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(
+            resolve_render_opts(&toolless).tool_choice,
+            ToolChoice::None,
+            "no tools declared => the engine defaults tool_choice to `none`"
+        );
+        // Explicitly null is the same as absent (`values.get(...) is None`).
+        let mut null_choice = toolless.clone();
+        null_choice["tool_choice"] = serde_json::Value::Null;
+        assert_eq!(
+            resolve_render_opts(&null_choice).tool_choice,
+            ToolChoice::None
+        );
+
+        // Declared tools flip the default to `auto`, which renders nothing.
+        let mut with_tools = toolless.clone();
+        with_tools["tools"] = json!([{"type": "function", "function": {"name": "f"}}]);
+        assert_eq!(
+            resolve_render_opts(&with_tools).tool_choice,
+            ToolChoice::Unset,
+            "tools declared => `auto`, so no tool-choice preamble"
+        );
+
+        // `tools: []` is not None in Python, so it too yields `auto`. Testing
+        // emptiness instead of presence would emit a block the engine does not.
+        let mut empty_tools = toolless.clone();
+        empty_tools["tools"] = json!([]);
+        assert_eq!(
+            resolve_render_opts(&empty_tools).tool_choice,
+            ToolChoice::Unset,
+            "an explicit empty `tools` is still not None"
+        );
+
+        // Message-level tools count, but only on system/developer, and only when
+        // truthy.
+        let sys_tools = json!({"messages": [
+            {"role": "system", "content": "s", "tools": [{"name": "f"}]},
+            {"role": "user", "content": "hi"},
+        ]});
+        assert_eq!(
+            resolve_render_opts(&sys_tools).tool_choice,
+            ToolChoice::Unset,
+            "message-level tools on a system message declare tools"
+        );
+        let dev_tools = json!({"messages": [
+            {"role": "Developer", "content": "d", "tools": [{"name": "f"}]},
+        ]});
+        assert_eq!(
+            resolve_render_opts(&dev_tools).tool_choice,
+            ToolChoice::Unset,
+            "the role match is case-insensitive, like Python's .lower()"
+        );
+        let user_tools = json!({"messages": [
+            {"role": "user", "content": "hi", "tools": [{"name": "f"}]},
+        ]});
+        assert_eq!(
+            resolve_render_opts(&user_tools).tool_choice,
+            ToolChoice::None,
+            "tools on a USER message do not count for the engine's predicate"
+        );
+        let empty_sys_tools = json!({"messages": [
+            {"role": "system", "content": "s", "tools": []},
+        ]});
+        assert_eq!(
+            resolve_render_opts(&empty_sys_tools).tool_choice,
+            ToolChoice::None,
+            "message-level tools are tested by truthiness, so [] does not count"
+        );
+
+        // An explicit choice still wins over the default in both directions.
+        let mut explicit_auto = toolless.clone();
+        explicit_auto["tool_choice"] = json!("auto");
+        assert_eq!(
+            resolve_render_opts(&explicit_auto).tool_choice,
+            ToolChoice::Unset,
+            "an explicit `auto` must NOT acquire the toolless default"
+        );
     }
 }
