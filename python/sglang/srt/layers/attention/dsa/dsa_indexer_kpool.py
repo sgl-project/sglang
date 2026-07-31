@@ -1586,7 +1586,8 @@ class IndexerKPool(MultiPlatformOp):
             return None
 
         assert forward_batch.seq_lens_cpu is not None
-        if len(forward_batch.seq_lens_cpu) == 0:
+        mode = forward_batch.forward_mode
+        if mode.is_idle() or len(forward_batch.seq_lens_cpu) == 0:
             return torch.full(
                 (x.shape[0], self.index_topk + self.index_kpool - 1),
                 -1,
