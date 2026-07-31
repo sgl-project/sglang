@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import logging
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -25,6 +27,9 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.verify_mask import VerifyMask
 
 logger = logging.getLogger(__name__)
 
@@ -566,12 +571,15 @@ class MambaAttnBackendBase(AttentionBackend):
             self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
+        # Hand out only the refreshed [:bs] prefix — Mamba2's track-save slices
+        # [-num_decodes:], which on the full max_bs buffer binds the stale tail.
         track_buf = None
         if mamba_track_indices is not None:
-            track_buf = self.mamba_track_indices_buf
-            track_buf[: len(mamba_track_indices)].copy_(
-                self._translate_mamba_indices(mamba_track_indices)
-            )
+            assert (
+                len(mamba_track_indices) >= bs
+            ), f"{len(mamba_track_indices)=} < {bs=}"
+            track_buf = self.mamba_track_indices_buf[:bs]
+            track_buf.copy_(self._translate_mamba_indices(mamba_track_indices[:bs]))
         # Refresh the static write cursor in-place (mirrors the eager
         # snapshot-then-advance). Skip the advance during capture: dummy slots
         # would corrupt real ring positions.
@@ -724,16 +732,18 @@ class MambaAttnBackendBase(AttentionBackend):
     def _track_mamba_state_extend(
         self,
         forward_batch: ForwardBatch,
-        h: torch.Tensor,
+        h: Optional[torch.Tensor],
         ssm_states: torch.Tensor,
         forward_metadata: ForwardMetadata,
     ):
         """Copy extend SSM state at the last chunk boundary to track slots (source
         depends on chunk alignment; see `_init_track_ssm_indices`)."""
         if forward_metadata.has_mamba_track_mask:
-            h = h.squeeze(0)
-
+            # Triton always returns h; FlashInfer returns it only when checkpoints
+            # were requested. Aligned-only tracking reads the final state below.
             if forward_metadata.track_ssm_h_src.numel() > 0:
+                assert h is not None
+                h = h.squeeze(0)
                 ssm_states[forward_metadata.track_ssm_h_dst] = h[
                     forward_metadata.track_ssm_h_src
                 ].to(ssm_states.dtype, copy=False)
@@ -915,12 +925,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.on_after_cuda_graph_warmup()
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        # Verify tree-mask / position buffers live on the full-attn child (the
-        # linear side consumes no mask). Handing them out lets the draft stage
-        # write straight into the captured verify buffers instead of allocating
-        # a fresh mask every step.
-        return self.full_attn_backend.get_verify_buffers_to_fill_after_draft()
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        # The mask lives on the full-attn child; the linear side reads none.
+        return self.full_attn_backend.verify_mask
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
