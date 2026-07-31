@@ -541,7 +541,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         if residual.numel() == 0 or x.numel() == 0:
             return self.forward_native(residual, x, gate, shift, scale)
 
-        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
+        if x.shape[-1] % 256 != 0 or x.shape[-1] > 8192:
             import warnings
 
             warnings.warn(
@@ -719,7 +719,7 @@ class _NormScaleShift(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
+        if x.shape[-1] % 256 != 0 or x.shape[-1] > 8192:
             import warnings
 
             warnings.warn(
@@ -807,81 +807,6 @@ class LayerNormScaleShift(_NormScaleShift):
 
 
 class RMSNormScaleShift(_NormScaleShift):
-    norm_type = "rms"
-
-
-################################################################################
-# NormTanhMulAdd
-# y = norm(x) * tanh(scale) + shift (where norm is layernorm or rmsnorm)
-# See details in norm_tanh_mul_add_norm_scale.py
-################################################################################
-class _NormTanhMulAdd(CustomOp):
-    norm_type: str
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-        affine: bool = False,
-        dtype: torch.dtype = torch.float32,
-    ):
-        super().__init__()
-        self.eps = eps
-        if self.norm_type == "rms":
-            self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
-        elif self.norm_type == "layer":
-            self.norm = FP32LayerNorm(
-                hidden_size, elementwise_affine=affine, eps=eps, dtype=dtype
-            )
-        else:
-            raise NotImplementedError(f"Norm type {self.norm_type} not implemented")
-
-    def forward_cuda(
-        self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
-    ) -> torch.Tensor:
-        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
-            import warnings
-
-            warnings.warn(
-                "FusedNormScaleShift cuda not available, using native fallback",
-                stacklevel=2,
-            )
-            return self.forward_native(x, scale, shift)
-
-        from sglang.kernels.ops.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
-            fused_norm_tanh_mul_add,
-        )
-
-        x, scale, shift = x.contiguous(), scale.contiguous(), shift.contiguous()
-        weight = _ensure_contiguous(getattr(self.norm, "weight", None))
-        bias = _ensure_contiguous(getattr(self.norm, "bias", None))
-        return fused_norm_tanh_mul_add(
-            x,
-            weight,
-            bias,
-            scale,
-            shift,
-            self.norm_type,
-            self.eps,
-        )
-
-    def forward_hip(self, *args, **kwargs):
-        # Fallback to native because ROCm does not support CuTeDSL.
-        return self.forward_native(*args, **kwargs)
-
-    @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
-    def forward_native(
-        self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
-    ) -> torch.Tensor:
-        y = self.norm(x) * torch.tanh(scale) + shift
-        return y.to(x.dtype)
-
-
-class LayerNormTanhMulAdd(_NormTanhMulAdd):
-    norm_type = "layer"
-
-
-class RMSNormTanhMulAdd(_NormTanhMulAdd):
     norm_type = "rms"
 
 
@@ -1076,34 +1001,6 @@ def apply_qk_norm_rope(
         is_neox=is_neox,
         positions=positions,
     )
-
-
-def apply_rmsnorm_tanh_mul_add(
-    x: torch.Tensor,
-    gate: torch.Tensor,
-    residual: torch.Tensor,
-    norm: "RMSNorm",
-) -> torch.Tensor:
-    """Compute residual + tanh(gate) * rmsnorm(x), with a fused CUDA fast path."""
-    if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
-        return residual + torch.tanh(gate) * norm(x)
-
-    if _is_cuda and x.is_cuda and x.shape[-1] % 256 == 0 and x.shape[-1] <= 8192:
-        from sglang.kernels.ops.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
-            fused_norm_tanh_mul_add,
-        )
-
-        return fused_norm_tanh_mul_add(
-            x.contiguous(),
-            norm.weight.data.contiguous(),
-            None,
-            gate.contiguous(),
-            residual.contiguous(),
-            "rms",
-            norm.variance_epsilon,
-        )
-
-    return residual + torch.tanh(gate) * norm(x)
 
 
 def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:

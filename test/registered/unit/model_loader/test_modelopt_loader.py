@@ -14,8 +14,10 @@ import torch.nn as nn
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
@@ -23,6 +25,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptNvFp4A16LinearMethod,
 )
 from sglang.srt.model_loader.loader import ModelOptModelLoader
+from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -518,6 +521,66 @@ class TestParseQuantHfConfig(CustomTestCase):
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
+    def test_minimax_mixed_precision_resolves_runtime_names_and_mxfp8(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "weight_block_size": [1, 32],
+                "exclude_modules": ["language_model.lm_head"],
+                "quantized_layers": {
+                    "language_model.model.layers.3.self_attn.q_proj": {
+                        "quant_algo": "MXFP8"
+                    },
+                    "language_model.model.layers.3.self_attn.k_proj": {
+                        "quant_algo": "MXFP8"
+                    },
+                    "language_model.model.layers.3.self_attn.v_proj": {
+                        "quant_algo": "MXFP8"
+                    },
+                    "language_model.model.layers.3.block_sparse_moe.experts.0.w1": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    },
+                    "language_model.model.layers.3.block_sparse_moe.shared_experts.gate_proj": {
+                        "quant_algo": "MXFP8"
+                    },
+                },
+                "packed_modules_mapping": {
+                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                    "gate_up_proj": ["gate_proj", "up_proj"],
+                },
+            }
+        )
+        quant_config.apply_weight_name_mapper(
+            MiniMaxM3SparseForCausalLM.hf_to_sglang_mapper
+        )
+
+        self.assertEqual(
+            quant_config._resolve_quant_algo(
+                "language_model.model.layers.3.mlp.experts"
+            ),
+            "NVFP4",
+        )
+        self.assertEqual(
+            quant_config._resolve_quant_algo(
+                "language_model.model.layers.3.mlp.shared_experts.gate_up_proj"
+            ),
+            "MXFP8",
+        )
+
+        # Type dispatch only needs a LinearBase instance; skip GPU weight setup.
+        linear = ReplicatedLinear.__new__(ReplicatedLinear)
+        method = quant_config.get_quant_method(
+            linear, "language_model.model.layers.3.self_attn.qkv_proj"
+        )
+        self.assertIsInstance(method, Fp8LinearMethod)
+        self.assertTrue(method.use_mxfp8)
+        self.assertEqual(quant_config.mxfp8_config.weight_block_size, [1, 32])
+        self.assertEqual(
+            quant_config.exclude_modules,
+            ["language_model.lm_head", "lm_head"],
+        )
+
     def test_nemotron_mixed_precision_with_nvfp4_layers_uses_modelopt_mixed(self):
         model_config = ModelConfig.__new__(ModelConfig)
         model_config.hf_config = MagicMock()

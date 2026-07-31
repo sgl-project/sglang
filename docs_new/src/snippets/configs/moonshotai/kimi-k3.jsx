@@ -11,14 +11,16 @@ export const config = {
   modelName: "Kimi-K3",
 
   // B300 (1×8 TP8), GB300 (2×4 TP8 MNNVL), B200 (2×8 TP16, or TP8/PP2 for
-  // Long-Context), GB200 (4×4 TP16 MNNVL), H200 (2×8 TP16/EP16), H100
-  // (4×8 TP32/EP32), and MI350X/MI355X (1×8 TP8) have serving recipes.
+  // Long-Context), GB200 (4×4 TP16 MNNVL), H200 (2×8 TP16/EP16, or 4×8 TP32/EP32
+  // for High-Throughput), H100 (4×8 TP32/EP32), and MI350X/MI355X (1×8 TP8) have
+  // serving recipes.
   supportedHardware: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x"],
 
   // Single checkpoint and a single shipped quantization (MXFP4), so neither is a
   // reader-facing axis. Node count is fixed by the hardware recipe (B200 2x8,
-  // H100 4x8, B300 1x8, H200 2x8, GB200 4x4, GB300 2x4,
-  // MI350X/MI355X 1x8), so it rides on the cell rather than on a selector.
+  // H100 4x8, B300 1x8, H200 2x8 — 4x8 on Unified High-Throughput, GB200 4x4,
+  // GB300 2x4, MI350X/MI355X 1x8), so it rides on the cell rather than on a
+  // selector.
   matchDims: [
     {
       id: "pdMode",
@@ -658,12 +660,11 @@ export const config = {
       verified: false,
       verificationStatus: "in-progress",
       env: [],
+      // No --enable-symm-mem: it makes the fused all-reduce auto-probe skip.
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
-        "--disable-custom-all-reduce",
-        "--enable-symm-mem",
         "--mem-fraction-static 0.85",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
@@ -1005,26 +1006,35 @@ export const config = {
       ],
     },
     {
-      // Throughput-tuned (perf-command: mem-frac 0.90, graph-bs 256, extra_buffer_lazy → max_running 98).
+      // The one H200 cell that widens past a single pair of nodes. As run — with
+      // DSPARK and HiCache L1+L2 layered on, at ratio 0.058 — the static
+      // allocation leaves 12.54 GB free per GPU and 1940352 KV tokens.
       match: { hw: "h200", pdMode: "unified", strategy: "high-throughput" },
-      nnodes: 2,
+      nnodes: 4,
       verified: false,
       verificationStatus: "in-progress",
       env: [
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
+        "SGLANG_K3_ATTN_RES_MODE=jit",
+        "SGLANG_MOE_FUSED_GATE_RADIX=1",
+        "SGLANG_HOST_IP={{LOCAL_IP}}",
+        "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
+        "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp-size 16",
-        "--ep-size 16",
+        "--tp-size 32",
+        "--ep-size 32",
         "--moe-runner-backend marlin",
         "--decode-attention-backend flashmla",
         "--enable-symm-mem",
         "--mem-fraction-static 0.90",
         "--mamba-radix-cache-strategy extra_buffer_lazy",
+        "--dist-timeout 3600",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
         "--host {{HOST_IP}}",
@@ -1275,8 +1285,81 @@ export const config = {
       ],
     },
 
+    {
+      // PP16 x TP1 spans all 16 ranks. Prefill tok/s/GPU at ISL 8192,
+      // concurrency 32: 4550 here vs 3596 (PP8 x TP2), 2407 (TEP16), 1652 (TP16);
+      // flat past 32. Below concurrency ~8 the pipeline cannot fill and TEP16
+      // leads instead (1947 vs 1227) — use `--tp-size 16 --ep-size 16` there.
+      // That four-way comparison was measured aggregated at OSL 1; the shape
+      // itself is as-run in this PD role. Pairs with the Balanced and
+      // High-Throughput decode cells; the Low-Latency decode cell runs pp=2 and
+      // needs a PP2 x TP8 prefill instead.
+      match: { hw: "gb200", pdMode: "prefill", strategy: "default" },
+      nnodes: 4,
+      verified: false,
+      verificationStatus: "in-progress",
+      env: [
+        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 1",
+        "--pp-size 16",
+        "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 16384",
+        "--max-prefill-tokens 16384",
+        "--disable-flashinfer-autotune",
+        "--weight-loader-prefetch-checkpoints",
+        "--reasoning-parser kimi_k3",
+        "--tool-call-parser kimi_k3",
+        "--disaggregation-mode prefill",
+        "--disaggregation-transfer-backend nixl",
+        "--disaggregation-bootstrap-port 8998",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // Same chunked-PP shape as the Default cell, with mem-fraction raised to
+      // 0.90 for KV headroom — the B300/GB300 Long-Context recipes make the same
+      // trade. Keeping TP at 1 is what buys the context length here: with TP > 1
+      // the MLA KV is replicated across the TP ranks, so TP2 x PP8 would hold
+      // roughly half the tokens of TP1 x PP16 for the same memory.
+      // Not yet benchmarked on long-context workloads.
+      match: { hw: "gb200", pdMode: "prefill", strategy: "long-context" },
+      nnodes: 4,
+      verified: false,
+      verificationStatus: "in-progress",
+      env: [
+        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 1",
+        "--pp-size 16",
+        "--mem-fraction-static 0.90",
+        "--chunked-prefill-size 16384",
+        "--max-prefill-tokens 16384",
+        "--disable-flashinfer-autotune",
+        "--weight-loader-prefetch-checkpoints",
+        "--reasoning-parser kimi_k3",
+        "--tool-call-parser kimi_k3",
+        "--disaggregation-mode prefill",
+        "--disaggregation-transfer-backend nixl",
+        "--disaggregation-bootstrap-port 8998",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
     // ----- Decode role: the unified cell for the same hw and strategy, plus
     // the PD role and transport flags, and re-sized KDA state.
+    //
+    // GB200 decode figures below: ISL 8192 / OSL 1024, 16 GPU decode, behind a
+    // shared PP2 x TP8 prefill. Comparisons hold; absolutes would be higher
+    // behind the PP16 x TP1 prefill cell above.
     //
     // Decode runs the KV cache as a chunk cache, so the unified 5-slots-per-
     // request reservation (1 state + ping-pong copies for radix reuse) drops to
@@ -1723,18 +1806,25 @@ export const config = {
       ],
     },
     {
+      // PP2 x TP8 is the fastest decode shape below concurrency ~100:
+      // 13.3 out tok/s/GPU @ 57.7 out tok/s/user at concurrency 8, against
+      // 9.5 @ 40.7 (TP16), 9.3 @ 39.9 (DCP16) and 9.3 @ 39.7 (DCP16+EP16) —
+      // +40% throughput and +45% interactivity over the best pp=1 shape. It
+      // stays ahead through concurrency 64 and is overtaken by DCP16+EP16 at 128.
+      // Measured without --enable-symm-mem.
       match: { hw: "gb200", pdMode: "decode", strategy: "low-latency" },
       nnodes: 4,
       verified: false,
       verificationStatus: "in-progress",
+      warn: "SGLang requires `decode pp_size == prefill pp_size or 1`, so this cell must be paired with a PP2 x TP8 prefill (`--tp-size 8 --pp-size 2`) rather than the PP16 x TP1 Prefill recipe. That prefill delivers 2919 prefill tok/s/GPU against PP16's 4550, which is the trade for the decode-side latency.",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp-size 16",
-        "--enable-symm-mem",
+        "--tp-size 8",
+        "--pp-size 2",
         "--mem-fraction-static 0.85",
         "--disaggregation-decode-extra-slots 16",
         "--reasoning-parser kimi_k3",
@@ -1746,6 +1836,9 @@ export const config = {
       ],
     },
     {
+      // EP16 on top of DCP16 is +6% to +10% out tok/s/GPU at every concurrency
+      // measured, at the same batch size: 56.2 vs 52.4 (c64), 92.7 vs 84.5
+      // (c128), 136.1 vs 126.1 (c256), 153.5 vs 144.2 (c512).
       match: { hw: "gb200", pdMode: "decode", strategy: "balanced" },
       nnodes: 4,
       verified: false,
@@ -1758,6 +1851,7 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--tp-size 16",
         "--dcp-size 16",
+        "--ep-size 16",
         "--mem-fraction-static 0.85",
         "--disaggregation-decode-extra-slots 16",
         "--reasoning-parser kimi_k3",
@@ -1769,6 +1863,16 @@ export const config = {
       ],
     },
     {
+      // Grouping DCP as 8 x dp2 rather than a flat DCP16 is what makes MegaMoE
+      // pay off here. out tok/s/GPU @ out tok/s/user, concurrency 256 / 512:
+      //   DCP8 x dp2 + EP16   145.5 @ 25.4   157.5 @ 25.2   <- this cell
+      //   DCP16 + EP16        136.1 @ 20.6   153.5 @ 17.5
+      //   DCP16               126.1 @ 18.7   144.2 @ 16.1
+      //   TP16                 87.4 @ 23.9    90.2 @ 23.9   (batch caps at ~125)
+      // Pair this cell with MegaMoE in the MoE Parallelism card: +8.3% / +10.0% /
+      // +11.0% over FlashInfer MXFP4 at concurrency 64 / 128 / 256, and the
+      // combination validated to concurrency 512. The gain needs dp > 1 — on the
+      // flat DCP16 cell MegaMoE is the slower of the two below concurrency 256.
       match: { hw: "gb200", pdMode: "decode", strategy: "high-throughput" },
       nnodes: 4,
       verified: false,
@@ -1780,8 +1884,11 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 16",
-        "--dcp-size 16",
-        "--mem-fraction-static 0.92",
+        "--dcp-size 8",
+        "--dp-size 2",
+        "--enable-dp-attention",
+        "--ep-size 16",
+        "--mem-fraction-static 0.85",
         "--disaggregation-decode-extra-slots 16",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
@@ -1803,11 +1910,21 @@ export const config = {
       "  SGLANG_HOST_IP=<this-node-ip>",
       "  NCCL_IB_HCA=<hca0,hca1,...>     # RDMA fabrics only",
     ],
+    gb200: [
+      "Allocate all four nodes within a single NVL72 domain.",
+      "MNNVL is off by default — set on every rank:",
+      "  NCCL_MNNVL_ENABLE=1",
+      "  NCCL_CUMEM_ENABLE=1",
+      "Point the JIT caches at GB200-only paths; GB200 is SM100 and GB300 is SM103,",
+      "so the two architectures need separate caches:",
+      "  TORCH_EXTENSIONS_DIR / TRITON_CACHE_DIR / TVM_FFI_CACHE_DIR",
+    ],
     h100: [
       "Set This node IP separately on each node; use the same cross-node NIC name on all four nodes.",
     ],
     h200: [
-      "Multi-node K3 needs the cross-node NIC pinned on BOTH ranks:",
+      "Low-Latency and Balanced run TP16/EP16 across 2 nodes; Unified High-Throughput widens to TP32/EP32 across 4.",
+      "Multi-node K3 needs the cross-node NIC pinned on EVERY node:",
       "  GLOO_SOCKET_IFNAME=<your-nic>   # e.g. bond0",
       "  NCCL_SOCKET_IFNAME=<your-nic>   # force NCCL off kube-ipvs0",
       "  SGLANG_HOST_IP=<this-node-ip>",
