@@ -559,6 +559,7 @@ class ModelRunner:
             update_model_fields=self.update_model_fields,
             recapture_cuda_graph=self.init_decode_cuda_graph,
             get_model_runner=lambda: self,
+            post_update_weights=self._refresh_replicated_q_proj_weights,
         )
 
     def init_spec_aux_hidden_state(self):
@@ -971,6 +972,10 @@ class ModelRunner:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
         # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the
         # MLA decode path can skip the per-layer Q all-gather. bf16/fp16 only.
+        from sglang.srt.layers.dcp.query_weights import (
+            bind_parameter_to_replicated_rank_slice_,
+            replicated_rank_slice,
+        )
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
@@ -997,15 +1002,81 @@ class ModelRunner:
                     "(bf16/fp16 only); this layer keeps the Q all-gather."
                 )
                 continue
+            local_w_kc_shape = m.w_kc.shape
             m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
+            # Decode keeps the existing standard-contiguous full-head layout.
+            # In qrep mode the local tensor is used only by prefill/extend, so
+            # make it a rank slice of the full storage instead of retaining a
+            # second K-contiguous allocation.
+            m.w_kc = replicated_rank_slice(
+                m.w_kc_qrep,
+                local_shape=local_w_kc_shape,
+                rank=dcp_group.rank_in_group,
+                world_size=dcp_group.world_size,
+            )
             m.q_b_proj_qrep_weight = dcp_group.all_gather(
                 qp.weight.data.contiguous(), dim=0
             )
+            bind_parameter_to_replicated_rank_slice_(
+                qp.weight,
+                m.q_b_proj_qrep_weight,
+                rank=dcp_group.rank_in_group,
+                world_size=dcp_group.world_size,
+            )
             n_prepared += 1
         logger.info(
-            "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
+            "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA "
+            "layers; local q-proj parameters share the replicated storage",
             n_prepared,
         )
+
+    def _refresh_replicated_q_proj_weights(self) -> None:
+        """Refresh graph-stable qrep buffers after online weight updates."""
+        from sglang.srt.layers.dcp.query_weights import (
+            refresh_replicated_weight_,
+            replicated_rank_slice,
+        )
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+        dcp_group = get_parallel().dcp_group
+        if dcp_group.world_size <= 1:
+            return
+
+        n_refreshed = 0
+        for m in self.model.modules():
+            if not isinstance(m, DeepseekV2AttentionMLA):
+                continue
+            if m.q_b_proj_qrep_weight is None or m.w_kc_qrep is None:
+                continue
+
+            qp = m.q_b_proj if m.has_q_b_proj else m.q_proj
+            refresh_replicated_weight_(
+                qp.weight.data,
+                m.q_b_proj_qrep_weight,
+                group=dcp_group,
+            )
+            refresh_replicated_weight_(
+                m.w_kc,
+                m.w_kc_qrep,
+                group=dcp_group,
+            )
+            # Kimi-K3 post_load_weights reconstructs a temporary local w_kc.
+            # Rebind it after refreshing the persistent full-head buffer so an
+            # online reload preserves the startup storage saving.
+            m.w_kc = replicated_rank_slice(
+                m.w_kc_qrep,
+                local_shape=m.w_kc.shape,
+                rank=dcp_group.rank_in_group,
+                world_size=dcp_group.world_size,
+            )
+            n_refreshed += 1
+
+        if n_refreshed:
+            logger.info(
+                "dcp_replicate_q_proj: refreshed graph-stable full-head Q "
+                "weights for %d MLA layers after online weight update",
+                n_refreshed,
+            )
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         capture = capture_cuda_graphs(
