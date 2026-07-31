@@ -34,6 +34,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
+    unified_mla_hooks,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -250,18 +251,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # kv-index kernels gather virtual->physical page through `_v2p_page_table`
         # then scale by `_kernel_page_multiplier` (= num MLA layers). See
         # build_dense_mla_views / create_flashmla_kv_indices_triton.
-        alloc = model_runner.token_to_kv_pool_allocator
-        self._kernel_page_multiplier = getattr(alloc, "kernel_page_multiplier", 1)
-        self._unified_mla = self._kernel_page_multiplier > 1
-        self._v2p_page_table = (
-            getattr(alloc, "full_v2p_page_table", None) if self._unified_mla else None
-        )
+        _hooks = unified_mla_hooks(model_runner.token_to_kv_pool_allocator)
+        self._v2p_page_table = _hooks.v2p_page_table
+        self._kernel_page_multiplier = _hooks.kernel_page_multiplier
+        self._unified_mla = _hooks.enabled
         # virtual token id -> DENSE kernel-facing id, for the KV write loc.
-        self._translate_kv_loc_dense = (
-            getattr(alloc, "translate_kv_loc_dense", None)
-            if self._unified_mla
-            else None
-        )
+        self._translate_kv_loc_dense = _hooks.translate_kv_loc_dense
         # Per-forward dense write loc ([:n] view of a capture-stable buffer),
         # set by the cuda-graph out-graph hook; None on the eager path (where the
         # write translates through the pool's _full_translate hook instead).
