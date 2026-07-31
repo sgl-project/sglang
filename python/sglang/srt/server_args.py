@@ -7705,13 +7705,33 @@ class ServerArgs:
         if not self.enable_page_major_kv_layout:
             return
         # Only the Triton attention kernels read the strided 4-D envelope K/V
-        # views; FA3 / FlashInfer do not.
+        # views; FA3 / FlashInfer do not. EXCEPTION: the unified-memory MLA pool
+        # exposes each layer as a DENSE contiguous per-layer view
+        # (build_dense_mla_views), which the paged MLA kernels consume directly,
+        # with their kv_indices / block tables remapped to dense ids. Names below
+        # are the RESOLVED ids from _resolved_attention_backends: "flashinfer" is
+        # FlashInferMLAAttnBackend for an MLA model, "trtllm_mla" the trtllm
+        # decode kernel; "cutedsl_mla" and "tokenspeed_mla" subclass
+        # TRTLLMMLABackend and inherit its dense read/write path.
+        # flashmla / cutlass_mla share the create_flashmla block-table path and
+        # can be added the same way once exercised.
+        if self.enable_unified_memory and self.use_mla_backend():
+            allowed_full = {
+                "triton",
+                "trtllm_mla",
+                "flashinfer",
+                "cutedsl_mla",
+                "tokenspeed_mla",
+            }
+        else:
+            allowed_full = {"triton"}
         backends = set(self._resolved_attention_backends())
         backends.discard(None)
-        assert backends <= {"triton"}, (
+        assert backends <= allowed_full, (
             "--enable-page-major-kv-layout requires the Triton attention backend "
-            f"for the full-attention layers; got {sorted(backends)}. Pass "
-            "--attention-backend triton."
+            "for the full-attention layers (unified-memory MLA also allows the "
+            f"paged MLA backends); got {sorted(backends)}, allowed "
+            f"{sorted(allowed_full)}. Pass a compatible --attention-backend."
         )
         # The Mamba state is stored in envelope-strided views; only the
         # stride-aware Triton causal-conv / SSM kernels read them correctly.

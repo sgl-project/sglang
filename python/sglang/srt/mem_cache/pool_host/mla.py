@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     device_pool: MLATokenToKVPool
+    mtp_draft_device_pools: tuple[MLATokenToKVPool, ...] = ()
 
     def __init__(
         self,
@@ -402,13 +403,24 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             return
 
+        device_data_ptrs = (
+            self.packed_device_data_ptrs
+            if self.mtp_draft_device_pools
+            else device_pool.data_ptrs
+        )
+        device_kv_buffers = (
+            self.packed_device_kv_buffers
+            if self.mtp_draft_device_pools
+            else device_pool.kv_buffer
+        )
+
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_all_layer_mla(
                         ptr_dst=self.data_ptrs,
                         indices_dst=host_indices,
-                        ptr_src=self.packed_device_data_ptrs,
+                        ptr_src=device_data_ptrs,
                         indices_src=device_indices,
                         cache_dst_stride_bytes=self.token_stride_size,
                         cache_src_stride_bytes=self.token_stride_size,
@@ -416,7 +428,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
                 else:
                     transfer_kv_all_layer_mla(
-                        src_layers=self.packed_device_data_ptrs,
+                        src_layers=device_data_ptrs,
                         dst_layers=self.data_ptrs,
                         src_indices=device_indices,
                         dst_indices=host_indices,
@@ -426,7 +438,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             elif self.layout == "page_first":
                 if self.can_use_write_back_jit:
                     jit_transfer_hicache_all_layer_mla_staged_lf_pf(
-                        ptr_src=self.packed_device_data_ptrs,
+                        ptr_src=device_data_ptrs,
                         src_indices=device_indices,
                         dst_indices=host_indices,
                         staging=self.staging_buffer,
@@ -435,7 +447,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
                 else:
                     transfer_kv_all_layer_mla_lf_pf(
-                        src_layers=self.packed_device_data_ptrs,
+                        src_layers=device_data_ptrs,
                         dst=self.kv_buffer,
                         src_indices=device_indices,
                         dst_indices=host_indices,
@@ -448,7 +460,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
-                    src_layers=self.packed_device_kv_buffers,
+                    src_layers=device_kv_buffers,
                     dst_layers=self.data_refs,
                     src_indices=device_indices,
                     dst_indices=host_indices,
@@ -456,7 +468,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             elif self.layout == "page_first_direct":
                 transfer_kv_all_layer_direct_lf_pf(
-                    src_ptrs=self.packed_device_kv_buffers,
+                    src_ptrs=device_kv_buffers,
                     dst_ptrs=[self.kv_buffer],
                     src_indices=device_indices,
                     dst_indices=host_indices,
