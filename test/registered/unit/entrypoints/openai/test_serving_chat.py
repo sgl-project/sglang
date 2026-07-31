@@ -41,6 +41,7 @@ class _MockTokenizerManager:
     def __init__(self):
         self.model_config = Mock(is_multimodal=False)
         self.server_args = Mock(
+            model_path="test/model",
             enable_cache_report=False,
             tool_call_parser="hermes",
             reasoning_parser=None,
@@ -718,6 +719,9 @@ class ServingChatTestCase(unittest.TestCase):
         for chat_encoding_spec in ("dsv4", "dsv32"):
             with self.subTest(chat_encoding_spec=chat_encoding_spec):
                 self.chat.chat_encoding_spec = chat_encoding_spec
+                self.chat._dsv4_reasoning_effort_profile = (
+                    "legacy" if chat_encoding_spec == "dsv4" else None
+                )
                 req = ChatCompletionRequest(
                     model="x",
                     messages=[
@@ -755,6 +759,9 @@ class ServingChatTestCase(unittest.TestCase):
         for chat_encoding_spec in ("dsv4", "dsv32"):
             with self.subTest(chat_encoding_spec=chat_encoding_spec):
                 self.chat.chat_encoding_spec = chat_encoding_spec
+                self.chat._dsv4_reasoning_effort_profile = (
+                    "legacy" if chat_encoding_spec == "dsv4" else None
+                )
                 req = ChatCompletionRequest(
                     model="x",
                     messages=[
@@ -1248,6 +1255,7 @@ class ServingChatTestCase(unittest.TestCase):
         # Case 4: DeepseekV4 arch -> always dsv4, even with chat_template
         # (release ships a stale V3 jinja we deliberately override).
         mock_hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        tm.server_args.model_path = "deepseek-ai/DeepSeek-V4-Flash"
         tm.tokenizer.chat_template = "stale v3 jinja"
         serving_chat = OpenAIServingChat(tm, TemplateManager())
         self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
@@ -1405,6 +1413,66 @@ class ServingChatTestCase(unittest.TestCase):
             out.index("<｜User｜>"),
         )
         self.assertIn("<｜Assistant｜>", out)
+
+    def test_dsv4_reasoning_effort_profiles(self):
+        """Pin legacy and 0731 effort prefixes and their None defaults."""
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        messages = [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": "Solve this."},
+        ]
+        absolute_maximum = (
+            "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+            "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+            "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+        )
+        beyond_maximum = (
+            "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
+            "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+            "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
+        )
+
+        def encode(profile, effort):
+            return encoding_dsv4.encode_messages(
+                messages,
+                thinking_mode="thinking",
+                reasoning_effort=effort,
+                reasoning_effort_profile=profile,
+            )
+
+        legacy_high = encode("legacy", "high")
+        legacy_max = encode("legacy", "max")
+        release_low = encode("0731", "low")
+        release_high = encode("0731", "high")
+        release_max = encode("0731", "max")
+
+        self.assertNotIn("Reasoning Effort:", legacy_high)
+        self.assertTrue(
+            legacy_max.startswith(encoding_dsv4.bos_token + absolute_maximum)
+        )
+        self.assertNotIn("Reasoning Effort:", release_low)
+        self.assertTrue(
+            release_high.startswith(encoding_dsv4.bos_token + absolute_maximum)
+        )
+        self.assertTrue(
+            release_max.startswith(encoding_dsv4.bos_token + beyond_maximum)
+        )
+        self.assertEqual(encode("legacy", None), legacy_high)
+        self.assertEqual(encode("0731", None), release_low)
+        self.assertEqual(len({release_low, release_high, release_max}), 3)
+
+        with self.assertRaises(AssertionError):
+            encode("legacy", "low")
+
+    def test_dsv4_reasoning_effort_profile_resolution(self):
+        """Select the 0731 mapping without changing legacy V4 behavior."""
+        resolve = OpenAIServingChat._resolve_dsv4_reasoning_effort_profile
+        self.assertEqual(
+            resolve("deepseek-ai/DeepSeek-V4-Flash"),
+            "legacy",
+        )
+        self.assertEqual(resolve("deepseek-ai/DeepSeek-V4-Flash-0731"), "0731")
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""

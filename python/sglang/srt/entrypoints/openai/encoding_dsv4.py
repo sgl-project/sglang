@@ -60,11 +60,29 @@ tool_calls_block_name: str = "tool_calls"
 
 tool_output_template: str = "<tool_result>{content}</tool_result>"
 
-REASONING_EFFORT_MAX = (
+REASONING_EFFORT_LEGACY_MAX = (
     "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
     "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
     "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
 )
+
+REASONING_EFFORT_0731_MAX = (
+    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
+    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
+)
+
+REASONING_EFFORT_PROFILES = {
+    "legacy": {
+        "high": "",
+        "max": REASONING_EFFORT_LEGACY_MAX,
+    },
+    "0731": {
+        "low": "",
+        "high": REASONING_EFFORT_LEGACY_MAX,
+        "max": REASONING_EFFORT_0731_MAX,
+    },
+}
 
 TOOLS_TEMPLATE = """## Tools
 
@@ -250,6 +268,7 @@ def render_message(
     thinking_mode: str,
     drop_thinking: bool = True,
     reasoning_effort: Optional[str] = None,
+    reasoning_effort_profile: str = "legacy",
 ) -> str:
     """
     Render a single message at the given index into its encoded string form.
@@ -262,7 +281,9 @@ def render_message(
         messages: Full list of messages in the conversation.
         thinking_mode: Either "chat" or "thinking".
         drop_thinking: Whether to drop reasoning content from earlier turns.
-        reasoning_effort: Optional reasoning effort level ("max", "high", or None).
+        reasoning_effort: Optional reasoning effort level. The legacy profile accepts
+            "high" and "max"; the 0731 profile accepts "low", "high", and "max".
+        reasoning_effort_profile: DeepSeek-V4 effort mapping ("legacy" or "0731").
 
     Returns:
         Encoded string for this message.
@@ -290,14 +311,18 @@ def render_message(
     if tool_calls:
         tool_calls = tool_calls_from_openai_format(tool_calls)
 
-    # Reasoning effort prefix (only at index 0 in thinking mode with max effort)
-    assert reasoning_effort in [
-        "max",
-        None,
-        "high",
-    ], f"Invalid reasoning effort: {reasoning_effort}"
-    if index == 0 and thinking_mode == "thinking" and reasoning_effort == "max":
-        prompt += REASONING_EFFORT_MAX
+    assert (
+        reasoning_effort_profile in REASONING_EFFORT_PROFILES
+    ), f"Invalid reasoning effort profile: {reasoning_effort_profile}"
+    effort_prompts = REASONING_EFFORT_PROFILES[reasoning_effort_profile]
+    if reasoning_effort is None:
+        reasoning_effort = "low" if reasoning_effort_profile == "0731" else "high"
+    assert reasoning_effort in effort_prompts, (
+        f"Invalid reasoning effort {reasoning_effort!r} for profile "
+        f"{reasoning_effort_profile!r}; expected one of {list(effort_prompts)}"
+    )
+    if index == 0 and thinking_mode == "thinking":
+        prompt += effort_prompts[reasoning_effort]
 
     if role == "system":
         prompt += system_msg_template.format(content=content or "")
@@ -583,6 +608,7 @@ def encode_messages(
     drop_thinking: bool = True,
     add_default_bos_token: bool = True,
     reasoning_effort: Optional[str] = None,
+    reasoning_effort_profile: str = "legacy",
 ) -> str:
     """
     Encode a list of messages into the DeepSeek-V4 prompt format.
@@ -600,7 +626,9 @@ def encode_messages(
         drop_thinking: If True, drop reasoning_content from earlier assistant turns
                       (only keep reasoning for messages after the last user message).
         add_default_bos_token: Whether to prepend BOS token at conversation start.
-        reasoning_effort: Optional reasoning effort level ("max", "high", or None).
+        reasoning_effort: Optional reasoning effort level. The legacy profile accepts
+            "high" and "max"; the 0731 profile accepts "low", "high", and "max".
+        reasoning_effort_profile: DeepSeek-V4 effort mapping ("legacy" or "0731").
 
     Returns:
         The encoded prompt string.
@@ -640,6 +668,7 @@ def encode_messages(
             thinking_mode=thinking_mode,
             drop_thinking=effective_drop_thinking,
             reasoning_effort=reasoning_effort,
+            reasoning_effort_profile=reasoning_effort_profile,
         )
 
     return prompt
