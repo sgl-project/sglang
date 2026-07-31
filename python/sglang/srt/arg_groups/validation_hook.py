@@ -411,6 +411,11 @@ def check_two_batch_overlap(server_args: Any):
     # the other ubatch's compute), which requires DP attention. Enabling it
     # there needs no extra opt-in env flag.
     cfg = resolving_view(server_args)
+    if cfg.enable_two_batch_overlap and cfg.dllm_algorithm is not None:
+        raise ValueError(
+            "--enable-two-batch-overlap is not supported with diffusion LLM "
+            "inference (--dllm-algorithm)."
+        )
 
     cp_tbo = (
         get_platform().is_hip

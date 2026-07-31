@@ -69,6 +69,20 @@ class TestTboFilterBatchMarker(CustomTestCase):
         self.assertIsNone(child.forward_metadata_planned_bs)
         self.assertIsNone(child.forward_metadata_planned_num_tokens)
         self.assertFalse(child.forward_metadata_replan_equivalent)
+        # A default ``False`` is still a valued dataclass field and must be
+        # explicitly propagated through TBO filtering.
+        self.assertFalse(child.is_dllm_prefill)
+
+    def test_dllm_fields_are_propagated_to_children(self):
+        parent = _make_target_verify_batch(8)
+        dllm_config = object()
+        parent.dllm_config = dllm_config
+        parent.is_dllm_prefill = True
+
+        child = _filter(parent, lo=0, hi=4)
+
+        self.assertIs(child.dllm_config, dllm_config)
+        self.assertTrue(child.is_dllm_prefill)
 
     def test_pre_planned_parent_does_not_leak_ready_into_children(self):
         parent = _make_target_verify_batch(8)

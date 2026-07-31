@@ -295,7 +295,19 @@ class TestPrefillAdder(CustomTestCase):
     def test_dllm_scheduler_selects_decode_after_preparing_incoming_reqs(self):
         req = MagicMock()
         manager = MagicMock()
-        manager.get_prefill_requests.return_value = []
+        round_initialized = False
+
+        def init_next_round(_tree_cache):
+            nonlocal round_initialized
+            round_initialized = True
+
+        manager.init_next_round.side_effect = init_next_round
+        # The request must be observed as decode only after init_next_round()
+        # updates its phase. If phase selection moves before initialization,
+        # this returns the request as a prefill request and the test fails.
+        manager.get_prefill_requests.side_effect = lambda: (
+            [] if round_initialized else [req]
+        )
         manager.get_decode_requests.return_value = [req]
         running_batch = SimpleNamespace(batch_is_full=False, reqs=[])
         scheduler = SimpleNamespace(

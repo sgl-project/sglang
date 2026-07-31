@@ -1176,7 +1176,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if not isinstance(self.backend, BreakableCudaGraphBackend):
                 return False
             device_type = torch.device(self.device).type
-            if device_type != "cuda" or _is_hip or is_npu():
+            if device_type != "cuda" or is_hip() or is_npu():
                 return False
             if not _is_flashinfer_attention_backend(self.model_runner.attn_backend):
                 return False
