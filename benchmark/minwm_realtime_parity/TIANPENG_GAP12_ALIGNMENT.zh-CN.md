@@ -372,8 +372,10 @@ Phoenix Local Zone 不能直接作为区域 NLB 的 target。把 Local Zone subn
 - 天鹏镜像固定 Transformers 4.56.0，而当前 SGLang pin 是 5.12.1。原先
   diffusion quantization registry 会在 import 时加载所有量化 backend，
   继而把未使用的 SRT/LLM 配置和 Transformers 5 专属配置带入无量化 MinWM。
-  现在 registry 只在真正选中某个量化方法时加载对应 backend。parity lane
-  因此无需 patch Transformers，也不升级它；非数值依赖由
+  现在 registry 只在真正选中某个量化方法时加载对应 backend；未启用
+  `SGLANG_CACHE_DIT_ENABLED` 时也不 import `cache_dit`，避免它要求较新的
+  Diffusers。parity lane 因此无需 patch Transformers/Diffusers，也不安装
+  会改变 Transformers 4.56 import 路径的 LLM-only `kernels` 包；其余非数值依赖由
   `install_parity_dependencies.py` 递归补齐，并在启动 server 前再次比较
   Torch、Transformers、Diffusers、FlashAttention 和 TorchVision 版本。
 

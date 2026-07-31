@@ -17,11 +17,17 @@ except ImportError:
     import tomli as tomllib
 
 
-NUMERICAL_PACKAGES = {
+# Packages that must remain exactly as supplied by the baseline image. Most are
+# numerical; ``kernels`` is also preserved because its SGLang-pinned release
+# targets Transformers 5 and changes the import path of baseline Transformers
+# 4.56 even though MinWM never uses that LLM integration.
+PRESERVED_PACKAGES = {
     "diffusers",
     "flash-attn-4",
     "flashinfer-cubin",
     "flashinfer-python",
+    "kernels",
+    "kernels-data",
     "sgl-deep-gemm",
     "sglang-kernel",
     "st-attn",
@@ -42,7 +48,7 @@ def normalize(name: str) -> str:
 
 
 def is_missing(requirement: Requirement) -> bool:
-    if normalize(requirement.name) in NUMERICAL_PACKAGES:
+    if normalize(requirement.name) in PRESERVED_PACKAGES:
         return False
     if requirement.marker and not requirement.marker.evaluate():
         return False
@@ -87,7 +93,7 @@ def install_missing(pyproject_path: Path) -> None:
     while pending:
         package = pending.pop()
         normalized = normalize(package)
-        if normalized in visited or normalized in NUMERICAL_PACKAGES:
+        if normalized in visited or normalized in PRESERVED_PACKAGES:
             continue
         visited.add(normalized)
         try:

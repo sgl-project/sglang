@@ -6,6 +6,9 @@ This module provides helper functions to enable cache-dit acceleration
 on transformer modules in SGLang's modular pipeline architecture.
 """
 
+from __future__ import annotations
+
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -21,17 +24,22 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-import cache_dit
-from cache_dit import (
-    BlockAdapter,
-    DBCacheConfig,
-    ForwardPattern,
-    ParamsModifier,
-    TaylorSeerCalibratorConfig,
-    steps_mask,
+_CACHE_DIT_ENABLED = os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() in (
+    "1",
+    "true",
 )
-from cache_dit.caching.block_adapters import BlockAdapterRegister
-from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
+if _CACHE_DIT_ENABLED:
+    import cache_dit
+    from cache_dit import (
+        BlockAdapter,
+        DBCacheConfig,
+        ForwardPattern,
+        ParamsModifier,
+        TaylorSeerCalibratorConfig,
+        steps_mask,
+    )
+    from cache_dit.caching.block_adapters import BlockAdapterRegister
+    from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_group
 
@@ -228,10 +236,14 @@ class CacheDitConfig:
 # uses Pattern_3). has_separate_cfg follows the run (passed by
 # enable_cache_on_transformer); cache-dit auto-resolves the remaining
 # fields.
-_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, tuple[str, ForwardPattern]] = {
-    "ErnieImageTransformer2DModel": ("layers", ForwardPattern.Pattern_3),
-    "Krea2Transformer2DModel": ("transformer_blocks", ForwardPattern.Pattern_3),
-}
+_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, tuple[str, ForwardPattern]] = (
+    {
+        "ErnieImageTransformer2DModel": ("layers", ForwardPattern.Pattern_3),
+        "Krea2Transformer2DModel": ("transformer_blocks", ForwardPattern.Pattern_3),
+    }
+    if _CACHE_DIT_ENABLED
+    else {}
+)
 
 
 def _build_custom_block_adapter(
