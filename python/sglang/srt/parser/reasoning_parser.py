@@ -759,12 +759,14 @@ class InklingDetector(BaseReasoningFormatDetector):
         self._kind: str | None = None
         self._pending_header = ""
         self._pending_reasoning = ""
+        self.saw_content_block = False
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         self._buffer = ""
         self._kind = None
         self._pending_header = ""
         self._pending_reasoning = ""
+        self.saw_content_block = False
         ret = self._parse_blocks(text)
         if self._kind == "reasoning" and not self.stream_reasoning:
             ret.reasoning_text += self._pending_reasoning
@@ -873,6 +875,8 @@ class InklingDetector(BaseReasoningFormatDetector):
                 flush_reasoning()
                 self._pending_header = ""
                 self._kind = _INKLING_CONTENT_KINDS[token]
+                if token == CONTENT_TEXT:
+                    self.saw_content_block = True
             elif token in _INKLING_END_TOKENS:
                 flush_reasoning()
                 self._pending_header = ""

@@ -112,8 +112,7 @@ def render_inkling_messages(
             )
             continue
 
-        parts = list(_iter_render_parts(message.get("content", "")))
-        turn_start = len(input_ids)
+        parts = list(_iter_render_parts(message.get("content")))
         if role == "assistant":
             reasoning_content = message.get("reasoning_content")
             if reasoning_content:
@@ -152,10 +151,7 @@ def render_inkling_messages(
                     _tool_call_json(name, args),
                     author_name=name,
                 )
-            if len(input_ids) > turn_start:
-                # Close the historical model turn — but never emit a bare
-                # terminator for an assistant message that rendered no blocks.
-                input_ids.append(tokenizer.encode_special(CONTENT_MODEL_END_SAMPLING))
+            input_ids.append(tokenizer.encode_special(CONTENT_MODEL_END_SAMPLING))
 
     if leading_system_count == len(message_list):
         append_effort()
@@ -208,8 +204,7 @@ def _iter_render_parts(content: Any):
     if content is None:
         return
     if isinstance(content, str):
-        if content:
-            yield ("text", content)
+        yield ("text", content)
         return
     if not isinstance(content, Sequence) or isinstance(content, (bytes, bytearray)):
         raise TypeError("message content must be a string or a sequence of parts")
