@@ -363,10 +363,19 @@ Phoenix Local Zone 不能直接作为区域 NLB 的 target。把 Local Zone subn
 
 <http://k8s-default-minwmtia-1301c44132-e45be86dd5db2100.elb.us-west-2.amazonaws.com/>
 
-首个公网 WebSocket smoke 使用 832×480、24 FPS、T2V 两个 chunk，共返回
-17 帧。第一块包含首次运行开销，scheduler forward 为 8.178 秒；第二块
-16 帧为 1.289 秒，即该短样例的稳态模型块约 12.4 输出帧/秒。这个数字不等价
-于完整 45 秒长序列吞吐，最终应以 69-block 运行统计为准。
+完成 parity 后，公网实例已经滚动到 SGLang
+`8a4e94992e2d3a4ea4b9a30cfc60873830314482`，Deployment annotation 也从
+provisional 改成 `numerical-parity-h200-20260731`。WebUI 默认值已核验为
+832×480、24 FPS、sink 8、window 32。
+
+最终公网 WebSocket smoke 使用 WebUI 相同的 WebP preview 路径、T2V 两个
+chunk，共返回 17 帧；经过 NLB 的端到端 wall time 为 5.280 秒。第一块
+scheduler forward 为 0.829 秒，第二块 16 帧为 1.258 秒，即该短样例的稳态
+模型块约 12.7 输出帧/秒；两块总 WebSocket payload 约 0.37 MB。对照 smoke
+也确认 raw RGB 路径的服务器 compute 相同，但 16 帧原始 832×480 RGB 是
+约 19.2 MB，跨公网链路传输明显变慢；因此 WebUI 默认使用 WebP，而离线 parity
+才使用 raw。短样例吞吐不等价于完整 45 秒长序列，最终仍以 69-block 运行统计
+为准。
 
 首次 Phoenix 启动还暴露了三个与 GPU 无关的部署缺口：
 

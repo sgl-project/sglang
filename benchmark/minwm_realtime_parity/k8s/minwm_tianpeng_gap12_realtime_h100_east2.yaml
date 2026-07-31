@@ -46,13 +46,13 @@ metadata:
     seedleap.ai/owner: chenshengdong
     seedleap.ai/task: minwm-realtime-serving
   annotations:
-    seedleap.ai/alignment-status: provisional-not-yet-numerically-aligned
+    seedleap.ai/alignment-status: numerical-parity-h200-20260731
     seedleap.ai/capacity-type: spot-preferred-on-demand-fallback
     seedleap.ai/checkpoint-sha256: 18a48a2709d74b93ce26f0b808f381d191553853aae81dd72d2438430251d379
     seedleap.ai/checkpoint-staged-version-id: yPbAthXMihZVEbfNFK4Ew2AVYs0FGDUq
     seedleap.ai/checkpoint-version-id: sL6CTylRv4QWY98mVTkuLoe5REbKHlvd
     seedleap.ai/minwm-git-ref: 4220c8a
-    seedleap.ai/sglang-git-ref: 9604683ef03d137ed8917f48a3c6e5a762f02c3a
+    seedleap.ai/sglang-git-ref: 8a4e94992e2d3a4ea4b9a30cfc60873830314482
 spec:
   replicas: 1
   revisionHistoryLimit: 2
@@ -69,9 +69,9 @@ spec:
         seedleap.ai/owner: chenshengdong
         seedleap.ai/task: minwm-realtime-serving
       annotations:
-        seedleap.ai/alignment-status: provisional-not-yet-numerically-aligned
+        seedleap.ai/alignment-status: numerical-parity-h200-20260731
         seedleap.ai/checkpoint-version-id: sL6CTylRv4QWY98mVTkuLoe5REbKHlvd
-        seedleap.ai/sglang-git-ref: 9604683ef03d137ed8917f48a3c6e5a762f02c3a
+        seedleap.ai/sglang-git-ref: 8a4e94992e2d3a4ea4b9a30cfc60873830314482
     spec:
       restartPolicy: Always
       terminationGracePeriodSeconds: 90
@@ -100,7 +100,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: SGLANG_GIT_REF
-              value: 9604683ef03d137ed8917f48a3c6e5a762f02c3a
+              value: 8a4e94992e2d3a4ea4b9a30cfc60873830314482
             - name: MINWM_GIT_REF
               value: 4220c8a
             - name: MINWM_CHECKPOINT
@@ -201,15 +201,15 @@ spec:
 
               WEBUI_DIR=/workspace/sglang/python/sglang/multimodal_gen/apps/realtime_webui
               sed -i \
-                -e 's/const DEFAULT_TARGET_FPS = 25;/const DEFAULT_TARGET_FPS = 24;/' \
-                -e 's/fps: 25/fps: 24/g' \
+                -e 's/const DEFAULT_TARGET_FPS = 16;/const DEFAULT_TARGET_FPS = 24;/' \
+                -e 's/fps: 16/fps: 24/g' \
                 -e 's/"0.05\/frame"/"checkpoint-relative"/g' \
                 -e 's/"4deg\/frame"/"checkpoint-relative"/g' \
                 -e 's/"6deg\/frame"/"checkpoint-relative"/g' \
                 "${WEBUI_DIR}/app.js"
               sed -i \
-                -e 's/Realtime Studio/Realtime Studio · MinWM gap12 · temporary/g' \
-                -e 's/id="fps" type="number" value="25"/id="fps" type="number" value="24"/' \
+                -e 's/Realtime Studio/Realtime Studio · MinWM gap12 · H200 Spot/g' \
+                -e 's/id="fps" type="number" value="16"/id="fps" type="number" value="24"/' \
                 -e 's/id="guidance" type="number" value="1"/id="guidance" type="number" value="0"/' \
                 -e 's/id="sinkSize" type="number" value="9"/id="sinkSize" type="number" value="8"/' \
                 -e 's/id="windowFrames" type="number" value="18"/id="windowFrames" type="number" value="32"/' \
