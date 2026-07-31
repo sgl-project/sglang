@@ -281,7 +281,7 @@ Torch 2.11 / Transformers 5.12 / Diffusers 0.37，因此它只能定位“仍有
 ### 8.2 同机、同依赖栈强门
 
 新增一个双容器 Job，固定使用与天鹏运行相同的不可变镜像；两个容器各申请一张
-GPU，并在同一台 8×B200/B300 节点上串行执行：
+GPU，并在同一台 8-GPU 节点上串行执行：
 
 1. MinWM `4220c8a` 原生 `DirectedSession` 重放 69 个 block；
 2. SGLang 使用同一份 checkpoint、donor、Torch、Transformers、Diffusers 和
@@ -337,7 +337,29 @@ CUDA smoke 已确认 Torch 能识别 H200；服务的 MinWM 单测为 84/84 通�
 checkpoint bytes 与 SHA-256 通过。节点有 EKS 报告的少量 PCIe replay 告警，
 所以最终可用性仍以真实 WebSocket 视频请求而不是 Node Ready 为准。
 
-首次 Phoenix 启动还暴露了两个与 GPU 无关的部署缺口：
+Phoenix Local Zone 不能直接作为区域 NLB 的 target。把 Local Zone subnet
+交给 Network Load Balancer 时，AWS 明确返回
+`You cannot have any Local Zone subnets for load balancers of type 'network'`。
+现在使用与 LingBot2 相同的两级拓扑：
+
+```text
+区域 NLB（us-west-2a/2b）
+  -> 区域 c6a.large 上的 Nginx WebSocket gateway
+  -> ClusterIP
+  -> Phoenix Local Zone H200 上的 SGLang MinWM
+```
+
+两个 target group 都已变为 `healthy`，公网 `/health`、`/v1/models`、WebUI
+和真实 WebSocket 请求均已通过。临时产品测试入口：
+
+<http://k8s-default-minwmtia-1301c44132-e45be86dd5db2100.elb.us-west-2.amazonaws.com/>
+
+首个公网 WebSocket smoke 使用 832×480、24 FPS、T2V 两个 chunk，共返回
+17 帧。第一块包含首次运行开销，scheduler forward 为 8.178 秒；第二块
+16 帧为 1.289 秒，即该短样例的稳态模型块约 12.4 输出帧/秒。这个数字不等价
+于完整 45 秒长序列吞吐，最终应以 69-block 运行统计为准。
+
+首次 Phoenix 启动还暴露了三个与 GPU 无关的部署缺口：
 
 - 服务的 50 GiB ephemeral-storage limit 小于 20 GB checkpoint 加 donor
   实际占用，Pod 被 kubelet 以明确的 `Pod ephemeral local storage usage
@@ -347,6 +369,24 @@ checkpoint bytes 与 SHA-256 通过。节点有 EKS 报告的少量 PCIe replay 
   导入它；原生镜像因没有该 WebSocket 依赖而失败。现在
   `decode_frames` 也只在真正发起 WebSocket 请求时导入，并新增无 WebSocket
   依赖的 import 回归测试。
+- 天鹏镜像固定 Transformers 4.56.0，而当前 SGLang pin 是 5.12.1。为保持
+  两路 text encoder 的数值依赖完全相同，parity lane 不升级 Transformers，
+  只给 SGLang 的 `PreTrainedConfig` import 加 4.56 命名兼容别名。非数值依赖
+  由 `install_parity_dependencies.py` 递归补齐，并在启动 server 前再次比较
+  Torch、Transformers、Diffusers、FlashAttention 和 TorchVision 版本。
+
+第一轮 H200 原生 baseline 已完整跑完 69 block：
+
+| 项目 | 结果 |
+| --- | ---: |
+| generation | 867.665 秒 |
+| VAE decode | 27.317 秒 |
+| 1089 帧端到端吞吐 | 1.217 FPS |
+| 第 1 block | 16.333 秒 |
+| 最后 1 block | 17.834 秒 |
+
+原生耗时随历史逐块增长，说明当前 `4220c8a` baseline 的 window attention
+执行仍有需要单独剖析的性能问题；它不影响本轮“同输入、同依赖栈”的数值比较。
 
 部署 overlay：
 
