@@ -192,6 +192,47 @@ class TestTensorBridgeMetalSharing(unittest.TestCase):
         gc.collect()
         self.assertEqual(torch.count_nonzero(tensor).item(), 0)
 
+    def test_negative_stride_views_materialize_without_aborting(self):
+        script = """
+import mlx.core as mx
+import torch
+from sglang.srt.utils.tensor_bridge import mlx_call, mlx_to_torch
+
+expected = torch.arange(15, -1, -1, dtype=torch.float32)
+for target in ("cpu", "mps"):
+    array = mx.arange(16, dtype=mx.float32)[::-1]
+    tensor = mlx_to_torch(array, device=target)
+    torch.testing.assert_close(tensor.cpu(), expected)
+    tensor.zero_()
+    if target == "mps":
+        torch.mps.synchronize()
+    assert mx.array_equal(array, mx.arange(16, dtype=mx.float32)[::-1]).item()
+
+with mx.stream(mx.cpu):
+    array = mx.arange(16).astype(mx.float64)[::-1]
+for target in ("cpu", "mps"):
+    tensor = mlx_to_torch(array, device=target)
+    torch.testing.assert_close(
+        tensor.cpu(), torch.arange(15, -1, -1, dtype=torch.float64)
+    )
+
+source = torch.arange(16, device="mps", dtype=torch.float32)
+result = mlx_call(lambda x: x[::-1], source, device="mps")
+torch.testing.assert_close(result.cpu(), expected)
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"stdout={completed.stdout}\nstderr={completed.stderr}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
