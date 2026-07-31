@@ -17,7 +17,6 @@ from pathlib import Path
 import numpy as np
 
 from common import save_video, sha256_file, write_json
-from run_sglang_api import decode_frames
 
 DEFAULT_ALIGNMENT_URL = (
     "https://leap-world-us-east-2.s3.us-east-2.amazonaws.com/world-model/sft/"
@@ -226,6 +225,7 @@ async def run_request(
 ) -> tuple[np.ndarray, list[dict], dict]:
     import msgspec.msgpack
     import websockets
+    from run_sglang_api import decode_frames
 
     frames = []
     stats = []
