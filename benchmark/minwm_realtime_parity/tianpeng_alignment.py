@@ -47,6 +47,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Validate/download inputs and write request.json without calling SGLang.",
     )
+    parser.add_argument(
+        "--zero-actions",
+        action="store_true",
+        help=(
+            "Replace the published 1088x8 keyboard timeline with all-zero rows "
+            "while preserving prompts, per-block seeds, and every other input."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -180,6 +188,7 @@ def load_contract(base_url: str) -> dict:
         "reference_url": reference_url,
         "request": {
             "type": "init",
+            "generation_mode": "t2v",
             "model": "minwm",
             "prompt": segments[0]["text"],
             "size": f"{output['width']}x{output['height']}",
@@ -293,7 +302,10 @@ def _run_ffmpeg_metric(metric: str, baseline: Path, candidate: Path) -> dict:
     return {"summary": line.strip(), "values": values}
 
 
-def _write_player(path: Path, sample_id: str) -> None:
+def _write_player(path: Path, sample_id: str, *, zero_actions: bool = False) -> None:
+    candidate_label = (
+        "SGLang MinWM（全程不按键）" if zero_actions else "SGLang MinWM（原始 action）"
+    )
     html = f"""<!doctype html>
 <html lang="zh-CN">
 <meta charset="utf-8">
@@ -310,7 +322,7 @@ video{{width:100%;background:#000}} h2{{font-size:18px}}
 <button onclick="resetBoth()">归零</button>
 <div class="grid">
 <section><h2>天鹏 baseline</h2><video id="baseline" controls muted loop src="baseline.mp4"></video></section>
-<section><h2>SGLang MinWM</h2><video id="candidate" controls muted loop src="sglang.mp4"></video></section>
+<section><h2>{candidate_label}</h2><video id="candidate" controls muted loop src="sglang.mp4"></video></section>
 </div>
 <script>
 const videos=[document.getElementById("baseline"),document.getElementById("candidate")];
@@ -328,7 +340,16 @@ async def async_main(args: argparse.Namespace) -> None:
     contract = load_contract(args.alignment_url)
     request = contract["request"]
     request["model"] = args.model
-    write_json(results / "alignment_contract.json", contract["expected"])
+    if args.zero_actions:
+        action_weights = request["condition_inputs"]["action_weights"]
+        request["condition_inputs"]["action_weights"] = [
+            [0] * len(row) for row in action_weights
+        ]
+    action_mode = "all_zero" if args.zero_actions else "published"
+    write_json(
+        results / "alignment_contract.json",
+        {**contract["expected"], "action_mode": action_mode},
+    )
     write_json(results / "request.json", request)
 
     baseline = results / "baseline.mp4"
@@ -365,6 +386,7 @@ async def async_main(args: argparse.Namespace) -> None:
         "ssim": _run_ffmpeg_metric("ssim", baseline, results / "sglang.mp4"),
         "timing": timing,
         "chunk_stats": stats,
+        "action_mode": action_mode,
         "bitwise_claim": (
             "The supplied baseline is an encoded MP4 without latent/cache dumps; "
             "this run can establish decoded-video numerical parity, not latent "
@@ -372,7 +394,11 @@ async def async_main(args: argparse.Namespace) -> None:
         ),
     }
     write_json(results / "comparison.json", comparison)
-    _write_player(results / "index.html", EXPECTED_SAMPLE_ID)
+    _write_player(
+        results / "index.html",
+        EXPECTED_SAMPLE_ID,
+        zero_actions=args.zero_actions,
+    )
     print(
         json.dumps(
             {
