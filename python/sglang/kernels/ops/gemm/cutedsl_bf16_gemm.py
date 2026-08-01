@@ -207,9 +207,6 @@ class TgvGemmCuteExtKernel:
         pdl_count: int = -1,
         has_bias: bool = False,
         split_k: int = 1,
-        # DEBUG timing knobs: 0 = full reduce; 1 = skip exchange entirely
-        # (WRONG results — timing only).
-        _split_k_debug: int = 0,
     ):
         self.acc_dtype = acc_dtype
         self.cta_m = cta_m
@@ -226,7 +223,6 @@ class TgvGemmCuteExtKernel:
         # DSMEM and the leader adds it before the bf16 cast. Requires
         # ceil(K/cta_k) >= 2 so both ranks get at least one k-tile.
         self.split_k = split_k
-        self._split_k_debug = _split_k_debug
         # has_bias: when True, kernel reads a (Gemm_M, Gemm_N, Gemm_L):(1,0,0)
         # bias tensor (M-broadcast over N,L), converts it to fp32 in RMEM, and
         # adds it to the accumulator before the bf16 cast. When False, all
@@ -1087,7 +1083,7 @@ class TgvGemmCuteExtKernel:
         do_store = cutlass.Boolean(True)
         if cutlass.const_expr(self.split_k > 1):
             do_store = split_rank == 0
-        if cutlass.const_expr(self.split_k > 1 and self._split_k_debug != 1):
+        if cutlass.const_expr(self.split_k > 1):
             frag_sz = cute.size(rmem_layout)
             red_layout = cute.make_layout(
                 (self.split_k - 1, 128, frag_sz),
@@ -1568,8 +1564,7 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     if n < 512 or k < 2048 or k > 12288:
         return False
     if n < 1024:
-        # DEBUG: removed the GLM-5.2 mlp.shared_experts.gate_up split-K case
-        # (N=512, K=6144, TP8) from the heuristic for debug purposes.
+        # N<1024 split-K is tracked separately; unchanged from pre-split-K.
         return False
     if k > 6144:
         # Split-K territory (sweep_splitk 2026-07): TGV+split beats cuBLAS by
@@ -1581,8 +1576,6 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
         return m <= (24 if k <= 8192 else 16)
     ragged = m % 16 != 0
     if n <= 1024:
-        # DEBUG: removed the GLM-5.2 mlp.shared_experts.gate_up split-K case
-        # (N=1024, K=6144, TP4) from the heuristic for debug purposes.
         return m <= 512 and (m >= 48 or m % 16 >= 9)
     if n <= 2624:
         if n <= 2048 and k <= 2048:
