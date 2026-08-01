@@ -27,6 +27,7 @@ from sglang.srt.function_call.kimik3_format import (
 from sglang.srt.parser.harmony_parser import HarmonyParser
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_INVOKE_TOOL_JSON,
+    CONTENT_INVOKE_TOOL_TEXT,
     CONTENT_MODEL_END_SAMPLING,
     CONTENT_TEXT,
     CONTENT_THINKING,
@@ -1053,12 +1054,12 @@ class InklingDetector(BaseReasoningFormatDetector):
                     # a real header can only follow an end token. Preserve it
                     # instead of rerouting the rest of the block into a header.
                     emit(token)
-            elif token == CONTENT_INVOKE_TOOL_JSON:
+            elif token in (CONTENT_INVOKE_TOOL_JSON, CONTENT_INVOKE_TOOL_TEXT):
+                # Preserve the tool-invocation framing (json and headerless raw
+                # text) in content so the tool-call detector receives it.
                 flush_reasoning()
                 if self._kind == "header":
-                    content.extend(
-                        (MESSAGE_MODEL, self._pending_header, CONTENT_INVOKE_TOOL_JSON)
-                    )
+                    content.extend((MESSAGE_MODEL, self._pending_header, token))
                     self._pending_header = ""
                 else:
                     content.append(token)
