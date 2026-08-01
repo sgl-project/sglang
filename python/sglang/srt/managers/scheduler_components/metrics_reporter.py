@@ -26,6 +26,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -303,6 +304,8 @@ class SchedulerMetricsReporter:
         decode_q = WelfordAccumulator()
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in self.scheduler.disagg_prefill_bootstrap_queue.queue:
+                prefill_q.add(len(req.origin_input_ids))
+            for req in self.scheduler.waiting_queue:
                 prefill_q.add(len(req.origin_input_ids))
         elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             for req in self.scheduler.disagg_decode_prealloc_queue.queue:
@@ -635,7 +638,17 @@ class SchedulerMetricsReporter:
             )
 
             # Basics
-            self.stats.num_running_reqs = prefill_stats.num_running_reqs
+            if (
+                self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL
+                and batch is not None
+            ):
+                # running_batch is never populated in PD prefill, so count the
+                # current forward batch instead.
+                self.stats.num_running_reqs = QueueCount.from_reqs(
+                    batch.reqs, priority_enabled
+                )
+            else:
+                self.stats.num_running_reqs = prefill_stats.num_running_reqs
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.waiting_queue, priority_enabled
             )
@@ -752,12 +765,10 @@ class SchedulerMetricsReporter:
         else:
             spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
             num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
-            if self.scheduler.server_args.speculative_num_draft_tokens:
-                draft_per_round = (
-                    self.scheduler.server_args.speculative_num_draft_tokens - 1
-                )
+            if get_spec().speculative_num_draft_tokens:
+                draft_per_round = get_spec().speculative_num_draft_tokens - 1
             else:
-                draft_per_round = self.scheduler.server_args.speculative_num_steps or 0
+                draft_per_round = get_spec().speculative_num_steps or 0
             total_draft_tokens = self.spec_num_forward_ct * draft_per_round
             spec_accept_rate = (
                 num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
@@ -1090,9 +1101,18 @@ class SchedulerMetricsReporter:
 
     def _maybe_log_idle_metrics(self):
         """Collect and log metrics every 30 seconds during idle."""
+        if not self.current_scheduler_metrics_enabled:
+            return
+        # The running-reqs gauge holds the last batch report until the next
+        # one (on PD prefill that is the last forward-batch snapshot, which
+        # no later report zeroes). If it disagrees with running_batch -- the
+        # true idle value -- publish now instead of waiting out the window.
+        gauge_stale = self.stats.num_running_reqs.total != len(
+            self.scheduler.running_batch.reqs
+        )
         if (
-            not self.current_scheduler_metrics_enabled
-            or time.perf_counter() <= self.metrics_collector.last_log_time + 30
+            not gauge_stale
+            and time.perf_counter() <= self.metrics_collector.last_log_time + 30
         ):
             return
 

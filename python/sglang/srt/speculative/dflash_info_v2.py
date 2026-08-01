@@ -2,14 +2,14 @@
 
 import contextlib
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.common import is_pin_memory_available
 
@@ -134,7 +134,7 @@ class DFlashDraftInputV2(SpecInput):
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
 
         # For DFLASH, each decode step needs a fixed-size verify block.
-        block_size = int(get_server_args().speculative_num_draft_tokens)
+        block_size = int(get_spec().speculative_num_draft_tokens)
         if block_size <= 0:
             raise ValueError(
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
@@ -212,9 +212,18 @@ class DFlashDraftInputV2(SpecInput):
         self.reserved_seq_lens_cpu = nxt_kv_lens_cpu_t
         self.reserved_seq_lens_sum = reserved_seq_lens_sum
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        new_indices_cpu: Optional[List[int]] = None,
+    ):
         if self.reserved_seq_lens_cpu is not None:
-            self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices.cpu()]
+            if new_indices_cpu is not None:
+                self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices_cpu]
+            else:
+                self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[
+                    new_indices.cpu()
+                ]
             self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
 
         if self.future_indices is not None:

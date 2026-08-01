@@ -40,6 +40,8 @@ class KVArgs:
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
+    kv_layer_ids: List[int]
+    kv_cache_dtype_str: str
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
@@ -47,9 +49,16 @@ class KVArgs:
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
     state_item_lens: List[List[int]]
+    state_layer_ids: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
+    # Number of rows before the slice axis in each per-slot state tensor.
+    state_slice_outer_counts: List[List[int]]
     is_hybrid_mla_backend: bool
+    # Per-tensor conv sub-block dims (GDN: [key_dim, key_dim, value_dim]) so the
+    # scatter transfer can slice each independently head-sharded sub-block; None
+    # per tensor when the single contiguous slice already matches the layout.
+    state_conv_shard_groups: List[List[Optional[List[int]]]]
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
@@ -127,6 +136,7 @@ class BaseKVSender(ABC):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.

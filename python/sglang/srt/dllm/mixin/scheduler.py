@@ -11,6 +11,7 @@ from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.runtime_context import get_exec, get_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ class SchedulerDllmMixin:
     def init_diffusion_llm(self: Scheduler):
         self.dllm_config = (
             DllmConfig.from_server_args(self.server_args)
-            if self.server_args.dllm_algorithm is not None
+            if get_exec().dllm.dllm_algorithm is not None
             else None
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
@@ -78,8 +79,7 @@ class SchedulerDllmMixin:
             not fdfo_mode or result.accept_length_per_req_cpu is not None
         ), "FDFO dLLM result is missing accept lengths."
 
-        # Sync mode emits tokens only once a block fully resolves; FDFO always
-        # commits (resolved blocks decode, unresolved blocks stash + free KV).
+        # FDFO also commits unresolved blocks so their KV can be reused.
         if fdfo_mode or result.next_token_ids:
             block_size = self.dllm_config.block_size
             algo_states = result.dllm_algo_state
@@ -111,20 +111,11 @@ class SchedulerDllmMixin:
                 assert len(next_token_ids) == block_size
 
                 if result.accept_length_per_req_cpu[idx] == 0:
-                    # Block unresolved: stash partial state and free the KV slots
-                    # of the still-masked block so the next FDFO round can
-                    # re-denoise it without leaking the previous allocation.
+                    # Unresolved: keep partial state and KV for the next FDFO round.
                     req.dllm_incomplete_ids = array("q", next_token_ids)
                     req.dllm_algo_state = (
                         algo_states[idx] if algo_states is not None else None
                     )
-                    old_prefix_len = len(req.prefix_indices)
-                    new_fill_len = req.extend_range.end
-                    if new_fill_len > old_prefix_len:
-                        kv_indices_to_free = self.req_to_token_pool.req_to_token[
-                            req.req_pool_idx, old_prefix_len:new_fill_len
-                        ]
-                        self.token_to_kv_pool_allocator.free(kv_indices_to_free)
                     continue
 
                 req.dllm_incomplete_ids = array("q")
@@ -210,7 +201,7 @@ class SchedulerDllmMixin:
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
-            prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_max_requests=get_schedule().prefill_max_requests,
             dllm_config=self.dllm_config,
         )
 
@@ -425,6 +416,25 @@ class DllmManager:
         """Remove finished requests from both queues."""
         self.waiting_queue = [req for req in self.waiting_queue if not req.finished()]
         self.staging_queue = [req for req in self.staging_queue if not req.finished()]
+
+    def pop_aborted_reqs(self, abort_all: bool, rid: str) -> List[Req]:
+        aborted_reqs: List[Req] = []
+        seen: Set[int] = set()
+
+        for queue_name in ("waiting_queue", "staging_queue"):
+            queue = getattr(self, queue_name)
+            kept_queue = []
+            for req in queue:
+                if abort_all or req.rid.startswith(rid):
+                    req_id = id(req)
+                    if req_id not in seen:
+                        aborted_reqs.append(req)
+                        seen.add(req_id)
+                else:
+                    kept_queue.append(req)
+            setattr(self, queue_name, kept_queue)
+
+        return aborted_reqs
 
     def init_next_round(self) -> None:
         """Initialize staging requests for next round and clear staging queue."""

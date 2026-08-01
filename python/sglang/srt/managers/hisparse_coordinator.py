@@ -5,7 +5,7 @@ from typing import List, NamedTuple, Union
 
 import torch
 
-from sglang.jit_kernel.hisparse import (
+from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
 )
@@ -813,7 +813,6 @@ class HiSparseCoordinator:
         num_reqs = req_pool_indices.size(0)
 
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
-        top_k_indices.fill_(-1)
 
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla

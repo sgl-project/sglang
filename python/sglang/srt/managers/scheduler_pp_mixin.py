@@ -24,7 +24,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.overlap_utils import RelayPayload
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
@@ -36,6 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_xpu
@@ -479,7 +480,7 @@ class SchedulerPPMixin:
                     )
                 )
 
-                if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                if get_disagg().disaggregation_decode_enable_offload_kvcache:
                     self.decode_offload_manager.check_offload_progress()
 
                 if rmbs[next_mb_id] is not None:
@@ -549,7 +550,7 @@ class SchedulerPPMixin:
                 + len(self.disagg_decode_transfer_queue.queue)
                 + len(self.disagg_decode_prealloc_queue.queue)
             )
-            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            if get_disagg().disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
             if server_is_idle and queue_size == 0:
@@ -714,12 +715,14 @@ class SchedulerPPMixin:
                 seq_lens.append(len(input_ids))
                 latencies.append(latency_ms)
 
-                # Release KV cache
+                # Release KV and Mamba cache
                 if req.req_pool_idx is not None:
                     kv_indices = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx, : req.extend_range.end
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
+                    if req.mamba_pool_idx is not None:
+                        self.req_to_token_pool.free_mamba_cache(req)
                     self.req_to_token_pool.free(req)
                     req.kv = None
 
@@ -809,8 +812,8 @@ class SchedulerPPMixin:
             good_reqs, failed_reqs = (
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
                     return_failed_reqs=True,
-                    rids_to_check=good_consensus_bootstrapped_rids
-                    + bad_consensus_bootstrapped_rids,
+                    pp_good_rids=good_consensus_bootstrapped_rids,
+                    pp_bad_rids=bad_consensus_bootstrapped_rids,
                 )
             )
             self.waiting_queue.extend(good_reqs)
@@ -845,6 +848,18 @@ class SchedulerPPMixin:
             bad_bootstrapped_rids = list(
                 set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
             )
+        # Route locally-aborted reqs through the bad-union consensus so every PP
+        # rank flushes them in the same consensus round, regardless of when the
+        # AbortReq reaches each rank and regardless of whether
+        # disagg_kv_sender.abort() drives the poll to Failed (it is optional).
+        aborted_rids = {
+            req.rid
+            for req in self.disagg_prefill_bootstrap_queue.queue
+            if isinstance(req.finished_reason, FINISH_ABORT)
+        }
+        good_bootstrapped_rids, bad_bootstrapped_rids = self._route_aborts_to_bad(
+            good_bootstrapped_rids, bad_bootstrapped_rids, aborted_rids
+        )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
@@ -1367,7 +1382,30 @@ class SchedulerPPMixin:
             bad_prealloc_rids = list(
                 set(prev_bad_prealloc_rids) | set(curr_bad_prealloc_rids)
             )
+        # Same abort routing as the prefill bootstrap consensus above.
+        aborted_rids = {
+            decode_req.req.rid
+            for decode_req in self.disagg_decode_prealloc_queue.queue
+            if isinstance(decode_req.req.finished_reason, FINISH_ABORT)
+        }
+        good_prealloc_rids, bad_prealloc_rids = self._route_aborts_to_bad(
+            good_prealloc_rids, bad_prealloc_rids, aborted_rids
+        )
         return [good_prealloc_rids, bad_prealloc_rids]
+
+    @staticmethod
+    def _route_aborts_to_bad(good_rids, bad_rids, aborted_rids):
+        """Move aborted rids out of the good (intersection) set and into the
+        bad (union) set, so PP consensus fails them uniformly on every rank.
+
+        This also flushes aborted reqs that never reached good/bad consensus
+        (e.g. stuck in Bootstrapping with a sender that has no working abort()).
+        """
+        if not aborted_rids:
+            return good_rids, bad_rids
+        good_rids = [rid for rid in good_rids if rid not in aborted_rids]
+        bad_rids = list(set(bad_rids) | set(aborted_rids))
+        return good_rids, bad_rids
 
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
         # get the current stage transfer success
@@ -1415,8 +1453,8 @@ class SchedulerPPMixin:
                 bad_consensus_prealloc_rids,
             ) = prealloc_rids
             good_reqs, failed_reqs = self.disagg_decode_prealloc_queue.pop_preallocated(
-                rids_to_check=good_consensus_prealloc_rids
-                + bad_consensus_prealloc_rids,
+                pp_good_rids=good_consensus_prealloc_rids,
+                pp_bad_rids=bad_consensus_prealloc_rids,
             )
             self.disagg_decode_transfer_queue.extend(good_reqs)
             return [

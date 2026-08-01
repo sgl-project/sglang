@@ -14,6 +14,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.io_struct import UpdateExpertBackupReq, sock_recv, sock_send
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -111,7 +112,7 @@ class ExpertBackupClient:
         global_expert_location_metadata = get_global_expert_location_metadata()
         num_experts = (
             self.model_config.hf_config.n_routed_experts
-            + self.server_args.ep_num_redundant_experts
+            + get_exec().moe.ep_num_redundant_experts
         )
         num_local_experts = num_experts // self.moe_ep_size
         for i in range(self.engine_num):
@@ -159,12 +160,10 @@ class ExpertBackupClient:
                         param = param.narrow(
                             0, param.shape[0] // 2, param.shape[0] // 2
                         )
-                    server_ptr_list.append(weight_info["weight_ptr"])
+                    server_ptr_list.append(weight_info.weight_ptr)
                     local_ptr_list.append(param.data_ptr())
-                    assert (
-                        param.numel() * param.element_size() == weight_info["byte_size"]
-                    )
-                    weight_size_list.append(weight_info["byte_size"])
+                    assert param.numel() * param.element_size() == weight_info.byte_size
+                    weight_size_list.append(weight_info.byte_size)
             before_transfer = time.time()
             ret = self.transfer_engine.engine.batch_transfer_sync_read(
                 self.session_id_list[i],

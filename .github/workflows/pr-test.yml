@@ -99,6 +99,7 @@ jobs:
     if: |
       always() &&
       !cancelled() &&
+      needs.check-changes.result == 'success' &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
@@ -127,6 +128,7 @@ jobs:
     if: |
       always() &&
       !cancelled() &&
+      needs.check-changes.result == 'success' &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
@@ -226,7 +228,7 @@ jobs:
   call-jit-kernel-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     # Run on scheduled/parallel-dispatch runs (same pattern as the base-* stages) so the
-    # jit_kernel suite is exercised on main 3x daily, not only on PRs that touch jit_kernel/**.
+    # jit_kernel suite is exercised on main 3x daily, not only on PRs that touch kernels/**.
     # check-changes already forces jit_kernel='true' on scheduled runs (run_all_tests).
     if: |
       always() &&
@@ -266,6 +268,7 @@ jobs:
     needs: [check-changes, call-gate]
     if: |
       always() &&
+      needs.check-changes.result == 'success' &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
       (needs.check-changes.outputs.main_package == 'true')
     runs-on: ubuntu-latest
@@ -306,10 +309,10 @@ jobs:
         timeout-minutes: 10
         run: bash scripts/ci/utils/install_rust_protoc.sh
 
-      - name: Rust cache (sglang-grpc)
+      - name: Rust cache (rust/ workspace)
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust/sglang-grpc
+          workspaces: rust
           shared-key: "sglang-grpc-cpu"
           save-if: ${{ matrix.partition == 0 }}
 
