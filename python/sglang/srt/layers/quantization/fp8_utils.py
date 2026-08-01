@@ -1292,8 +1292,15 @@ def flashinfer_mxfp8_blockscaled_linear(
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
     weight_scale_fallback: Optional[torch.Tensor] = None,
+    weight_padded: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """MXFP8 dense linear via FlashInfer mm_mxfp8."""
+    """MXFP8 dense linear via FlashInfer mm_mxfp8.
+
+    ``weight_padded`` is the N-padded weight the CUTLASS backend needs when N is
+    not divisible by 32, precomputed at load time; ``None`` when N is aligned.
+    ``weight_scale_fallback`` is unused here and kept only to match the shared
+    ``w8a8_mxfp8_linear`` dispatch signature.
+    """
     input_2d = input.view(-1, input.shape[-1]).contiguous()
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
@@ -1335,46 +1342,9 @@ def flashinfer_mxfp8_blockscaled_linear(
             backend="trtllm",
         )
     elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
-        if n % 32 != 0:
-            if weight_scale_fallback is None:
-                raise ValueError(
-                    "FlashInfer CUTLASS MXFP8 fallback requires canonical weight_scale "
-                    f"when N={n} is not divisible by 32."
-                )
-
-            from flashinfer import block_scale_interleave
-
-            padded_n = ceil_div(n, 32) * 32
-            pad_rows = padded_n - n
-            weight_t = (
-                torch.cat(
-                    [
-                        weight,
-                        torch.zeros(
-                            (pad_rows, k),
-                            device=weight.device,
-                            dtype=weight.dtype,
-                        ),
-                    ],
-                    dim=0,
-                )
-                .contiguous()
-                .t()
-            )
-            weight_scale_2d = weight_scale_fallback.contiguous().view(n, k // 32)
-            weight_scale_t = block_scale_interleave(
-                torch.cat(
-                    [
-                        weight_scale_2d,
-                        torch.zeros(
-                            (pad_rows, k // 32),
-                            device=weight_scale_2d.device,
-                            dtype=weight_scale_2d.dtype,
-                        ),
-                    ],
-                    dim=0,
-                ).contiguous()
-            ).contiguous()
+        if weight_padded is not None:
+            weight_t = weight_padded.t()
+            weight_scale_t = weight_scale.contiguous()
         else:
             weight_scale_t = (
                 weight_scale.contiguous().t()

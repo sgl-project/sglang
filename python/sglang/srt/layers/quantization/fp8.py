@@ -771,7 +771,29 @@ class Fp8LinearMethod(LinearMethodBase):
         elif backend.is_flashinfer_cutlass():
             from flashinfer import block_scale_interleave
 
+            weight = layer.weight.data
             scale_u8 = layer.weight_scale_inv.data
+            n, k = weight.shape
+            sf_vec_size = 32
+            padded_n = ((n + sf_vec_size - 1) // sf_vec_size) * sf_vec_size
+            pad_rows = padded_n - n
+
+            # FlashInfer's CUTLASS MXFP8 GEMM requires N divisible by 32.  Pad
+            # here rather than in apply(): the inputs are constant weights, so
+            # per-forward padding re-materializes the whole padded weight on
+            # every token.
+            layer.weight_mxfp8_padded = None
+            if pad_rows:
+                layer.weight_mxfp8_padded = torch.cat(
+                    [weight, weight.new_zeros((pad_rows, k))], dim=0
+                ).contiguous()
+                scale_u8 = F.pad(
+                    scale_u8.contiguous().view(n, k // sf_vec_size),
+                    (0, 0, 0, pad_rows),
+                    mode="constant",
+                    value=0,
+                )
+
             # block_scale_interleave may pad and/or reshape scales,
             # so store swizzled scales separately to keep weight update working
             copy_or_rebind_param(
@@ -959,7 +981,7 @@ class Fp8LinearMethod(LinearMethodBase):
             extra_kwargs = {}
             if backend.is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
-                extra_kwargs["weight_scale_fallback"] = layer.weight_scale_inv
+                extra_kwargs["weight_padded"] = layer.weight_mxfp8_padded
             elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
                 extra_kwargs["weight_scale_fallback"] = layer.weight_scale_inv
