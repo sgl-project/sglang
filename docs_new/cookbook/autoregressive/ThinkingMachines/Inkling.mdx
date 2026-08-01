@@ -16,11 +16,11 @@ For all install methods and hardware platforms, see the [official SGLang install
 
 <Tab title="Python (pip / uv)">
 
-Inkling support isn't in a `pip` release yet — install from the `inkling-support` branch:
+Inkling has merged to `main` but isn't in a `pip` release yet — install from source:
 
 ```bash Command
 pip install --upgrade pip
-pip install "sglang[all] @ git+https://github.com/sgl-project/sglang.git@inkling-support"
+pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 ```
 
 Then run the **Python** output of the command panel below.
@@ -34,10 +34,9 @@ Then run the **Python** output of the command panel below.
 There are two multi-arch (amd64 / arm64) CUDA builds plus a ROCm build; pick the CUDA build by your CUDA version, not your GPU:
 
 ```bash Command
-docker pull lmsysorg/sglang:inkling-cu13            # CUDA 13
-docker pull lmsysorg/sglang:inkling-cu12            # CUDA 12
-docker pull lmsysorg/sglang:inkling-rocm700-mi35x   # AMD MI350X / MI355X
-docker pull lmsysorg/sglang:dev-cu13-inkling-dspark # CUDA 13 + DSpark support
+docker pull lmsysorg/sglang:dev-inkling-dspark      # CUDA 13
+docker pull lmsysorg/sglang:dev-cu12-inkling-dspark # CUDA 12
+docker pull lmsysorg/sglang-rocm:dev-rocm720-mi35x-inkling-dspark  # AMD MI350X / MI355X
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
@@ -307,4 +306,4 @@ To try it, select the **Long Context** strategy in the Deploy panel above for an
 
 The **DSpark** deploy strategy is the second speculative-decoding path for Inkling. Unlike **MTP**, which drives Inkling's own multi-layer draft head, DSpark runs a **separate draft checkpoint** — `RadixArk/Inkling-DSpark-Preview` — served unquantized alongside the NVFP4 target.
 
-It needs an SGLang build with DSpark support — `lmsysorg/sglang:dev-cu13-inkling-dspark`, which the Deploy panel's **Docker** command uses for this tier; the `inkling-cu13` / `inkling-cu12` images don't carry DSpark yet. Verified end-to-end on B200 (TP=8, NVFP4).
+DSpark support ships in the images listed in §1 (`dev-inkling-dspark` for CUDA 13, `dev-cu12-inkling-dspark` for CUDA 12), so no separate build is needed. Verified end-to-end on B200 (TP=8, NVFP4).

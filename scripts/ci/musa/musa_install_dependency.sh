@@ -84,7 +84,7 @@ else
 
     cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[dev_musa]" --user
 
-    cd "${REPO_ROOT}/sgl-kernel"
+    cd "${REPO_ROOT}/python/sglang/kernels/aot"
     rm -f pyproject.toml && mv pyproject_musa.toml pyproject.toml && MTGPU_TARGET=mp_31 python3 setup_musa.py install --user
     echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 fi
