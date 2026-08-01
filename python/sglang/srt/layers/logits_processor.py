@@ -180,6 +180,11 @@ class LogitsProcessorOutput:
     # truncation/renormalization. Only populated when requested.
     next_token_sampling_mask_idx: Optional[List[Optional[List[int]]]] = None
     next_token_sampling_logprobs: Optional[List[Optional[float]]] = None
+    # Bool mask [#seq] of rows whose logits were entirely NaN before
+    # sanitization; one row per request. Only populated when
+    # SGLANG_ABORT_ON_NAN_LOGITS is set, and consumed by the batch result
+    # processor to abort those requests. See utils/async_probe.py.
+    full_nan_rows: Optional[torch.Tensor] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]

@@ -18,7 +18,7 @@ from sglang.srt.layers.logprob_processor import (
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.utils.async_probe import sanitize_nan_logits
+from sglang.srt.utils.async_probe import detect_full_nan_rows, sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
@@ -118,6 +118,11 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
+
+        # Flag fully-NaN rows on the raw model output, before _preprocess_logits
+        # sanitizes them into a samplable uniform distribution. The scheduler
+        # aborts those requests instead of streaming a random token.
+        logits_output.full_nan_rows = detect_full_nan_rows(logits)
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)

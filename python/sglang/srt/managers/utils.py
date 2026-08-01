@@ -148,6 +148,13 @@ class GenerationBatchResult:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
+        if (
+            self.logits_output is not None
+            and self.logits_output.full_nan_rows is not None
+        ):
+            self.logits_output.full_nan_rows = _async_d2h(
+                self.logits_output.full_nan_rows
+            )
         self.next_token_ids = _async_d2h(self.next_token_ids)
 
         if self.accept_lens is not None:
