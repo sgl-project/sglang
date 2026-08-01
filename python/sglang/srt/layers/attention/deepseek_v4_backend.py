@@ -60,7 +60,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
@@ -537,9 +537,7 @@ class DeepseekV4AttnBackend(
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
         self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens: int = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
+        self.speculative_num_draft_tokens: int = get_spec().speculative_num_draft_tokens
         if self.speculative_num_draft_tokens is not None:
             # Persistent target-verify metadata buffers. Allocated here (not
             # lazily) so they are ordinary tensors: the first touch of a lazy

@@ -186,6 +186,7 @@ constexpr int A_LAST_DIM = 512;
 constexpr int B_LAST_DIM = 64;
 constexpr int OUT_LAST_DIM = A_LAST_DIM + B_LAST_DIM;
 
+template <bool kUsePDL>
 __global__ void concat_mla_absorb_q_kernel(
     bf16_t* a,
     bf16_t* b,
@@ -198,6 +199,8 @@ __global__ void concat_mla_absorb_q_kernel(
     const int b_stride_1,
     const int64_t out_stride_0,
     const int out_stride_1) {
+  device::PDLWaitPrimary<kUsePDL>();
+
   const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
   const int lane_id = get_lane_id();
 
@@ -229,6 +232,8 @@ __global__ void concat_mla_absorb_q_kernel(
     a_buf[i] = *(base_addr + i * 32 + lane_id);
   }
 
+  device::PDLTriggerSecondary<kUsePDL>();
+
   {
     BBufType* base_addr = reinterpret_cast<BBufType*>(out + idx_0 * out_stride_0 + idx_1 * out_stride_1 + A_LAST_DIM);
     *(base_addr + lane_id) = b_buf;
@@ -241,6 +246,7 @@ __global__ void concat_mla_absorb_q_kernel(
   }
 }
 
+template <bool kUsePDL>
 struct ConcatMlaAbsorbQKernel {
   static void run(tvm::ffi::TensorView a, tvm::ffi::TensorView b, tvm::ffi::TensorView out) {
     using namespace host;
@@ -306,19 +312,20 @@ struct ConcatMlaAbsorbQKernel {
     const int grid_size = div_ceil(num_items, num_warps_per_block);
     const int block_size = num_warps_per_block * 32;
 
-    LaunchKernel(grid_size, block_size, device.unwrap())(
-        concat_mla_absorb_q_kernel,
-        static_cast<bf16_t*>(a.data_ptr()),
-        static_cast<bf16_t*>(b.data_ptr()),
-        static_cast<bf16_t*>(out.data_ptr()),
-        num_items,
-        dim_1,
-        S0_a.unwrap(),
-        static_cast<int>(S1_a.unwrap()),
-        S0_b.unwrap(),
-        static_cast<int>(S1_b.unwrap()),
-        S0_out.unwrap(),
-        static_cast<int>(S1_out.unwrap()));
+    LaunchKernel(grid_size, block_size, device.unwrap())
+        .enable_pdl(kUsePDL)(
+            concat_mla_absorb_q_kernel<kUsePDL>,
+            static_cast<bf16_t*>(a.data_ptr()),
+            static_cast<bf16_t*>(b.data_ptr()),
+            static_cast<bf16_t*>(out.data_ptr()),
+            num_items,
+            dim_1,
+            S0_a.unwrap(),
+            static_cast<int>(S1_a.unwrap()),
+            S0_b.unwrap(),
+            static_cast<int>(S1_b.unwrap()),
+            S0_out.unwrap(),
+            static_cast<int>(S1_out.unwrap()));
   }
 };
 
