@@ -21,13 +21,14 @@ _CUDA = frozenset({CapabilityRequirement.CUDA})
 register_kernel(
     KernelSpec(
         op="gemm.fp8_scaled_mm",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel:fp8_scaled_mm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.fp8_per_tensor_gemm:fp8_per_tensor_scaled_mm",
+        capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("float8_e4m3fn",),
             description="C = (A_fp8 @ B_fp8) * scales_a * scales_b (+ bias)",
         ),
-        description="FP8 scaled matmul (sgl_kernel wheel).",
+        description="FP8 per-row/per-column scaled matmul (CUTLASS, SM89/90/100/120).",
     )
 )
 register_kernel(

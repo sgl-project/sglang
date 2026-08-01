@@ -55,7 +55,6 @@ else:
     )
     from sgl_kernel.gemm import (
         awq_dequantize,
-        fp8_scaled_mm,
         gptq_gemm,
         gptq_shuffle,
         int8_scaled_mm,
@@ -170,7 +169,6 @@ else:
         "fast_topk_transform_ragged_fused",
         "fast_topk_v2",
         "fp8_blockwise_scaled_grouped_mm",
-        "fp8_scaled_mm",
         "fused_add_rmsnorm",
         "fused_qk_norm_rope",
         "gelu_and_mul",

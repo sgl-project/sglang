@@ -1,13 +1,25 @@
+"""Accuracy tests for the CUTLASS FP8 per-row/per-column scaled GEMM.
+
+Ported from the deleted AOT sgl-kernel test (python/sglang/kernels/aot/tests/
+test_fp8_gemm.py); the SM90 swap-AB shape list is kept verbatim and the SM120
+M-bucket boundaries are added, since the JIT kernel's SM120 path now dispatches
+on M (16 / 32 / 256 / default) instead of always using one 128x128x128 tile.
+"""
+
 import sys
 
 import pytest
 import torch
-from sgl_kernel import fp8_scaled_mm
+
+from sglang.kernels.ops.gemm.fp8_per_tensor_gemm import fp8_per_tensor_scaled_mm
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def torch_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias):
     o = torch.matmul(a.to(torch.float32), b.to(torch.float32))
-    o = o.to(torch.float32)
     temp1 = o * scale_a.view(-1, 1)
     temp2 = temp1 * scale_b.view(1, -1)
     final = temp2.to(out_dtype)
@@ -25,17 +37,11 @@ def _test_accuracy_once(M, N, K, with_bias, out_dtype, device):
     b_fp8 = b_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
     scale_a = torch.randn((M,), device=device, dtype=torch.float32) * 0.001
     scale_b = torch.randn((N,), device=device, dtype=torch.float32) * 0.001
-    if with_bias:
-        bias = torch.randn((N,), device=device, dtype=out_dtype)
-    else:
-        bias = None
+    bias = torch.randn((N,), device=device, dtype=out_dtype) if with_bias else None
     b_fp8 = b_fp8.t()
     o = torch_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias)
-    o1 = fp8_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias)
-    rtol = 0.02
-    atol = 1
-    torch.testing.assert_close(o, o1, rtol=rtol, atol=atol)
-    print(f"M={M}, N={N}, K={K}, with_bias={with_bias}, out_dtype={out_dtype}: OK")
+    o1 = fp8_per_tensor_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias)
+    torch.testing.assert_close(o, o1, rtol=0.02, atol=1)
 
 
 @pytest.mark.parametrize("M", [1, 128, 512, 1024, 4096])
@@ -89,6 +95,21 @@ SM90_SWAP_AB_MN_SHAPES = [
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 def test_accuracy_sm90_swap_ab(shape_mn, K, with_bias, out_dtype):
     M, N = shape_mn
+    _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
+
+
+# Both sides of every SM120 M-bucket edge. M<=16 and M<=32 use a custom small
+# EpilogueTile, so an off-by-one in the bucketing shows up as a wrong result or
+# a can_implement failure rather than just a slowdown.
+SM120_M_BUCKET_EDGES = [1, 2, 15, 16, 17, 31, 32, 33, 63, 255, 256, 257, 512]
+
+
+@pytest.mark.parametrize("M", SM120_M_BUCKET_EDGES)
+@pytest.mark.parametrize("N", [256, 4608])
+@pytest.mark.parametrize("K", [4096, 6656])
+@pytest.mark.parametrize("with_bias", [True, False])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_accuracy_sm120_m_buckets(M, N, K, with_bias, out_dtype):
     _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
 
 

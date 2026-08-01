@@ -20,17 +20,6 @@ def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     )
 
 
-def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
-    return torch.ops.sgl_kernel.fp8_scaled_mm.default(
-        mat_a,
-        mat_b,
-        scales_a,
-        scales_b,
-        out_dtype,
-        bias,
-    )
-
-
 def sgl_per_token_group_quant_8bit(
     input: torch.Tensor,
     output_q: torch.Tensor,

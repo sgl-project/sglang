@@ -1,0 +1,420 @@
+/* Copyright 2026 SGLang Team. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+// Ported from the AOT cutlass_extensions/gemm/fp8_gemm_sm90_dispatch.cuh, which
+// in turn came from vLLM's SM90 FP8 dispatch plus SGLang's own tile tuning.
+//
+// Kept faithfully, including the swap-AB small-M path and the two N thresholds:
+// the tile table encodes measured wins (see the threshold comments below), so it
+// is not something to re-derive while changing the tensor API underneath it.
+//
+// The scale epilogues here use plain Sm90{Col,Row}Broadcast rather than the
+// vLLM ...OrScalarBroadcast variants: this entry point always receives full
+// [M] / [N] fp32 scale vectors (a per-tensor scale is broadcast by the caller),
+// so the scalar fallback -- and with it the vendored broadcast_load_epilogue_c3x
+// header -- is dead weight.
+
+#pragma once
+
+#include <sgl_kernel/runtime.cuh>  // For runtime::get_sm_count
+#include <sgl_kernel/utils.cuh>    // For alloc_workspace_tensor
+
+#include "fp8_per_tensor_common.cuh"
+
+// clang-format off
+#include "cutlass/cutlass.h"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/util/packed_stride.hpp"
+// clang-format on
+
+using namespace cute;
+
+// Guards the kernel body so it is not compiled for archs that will never run it.
+// __CUDA_ARCH__ is undefined in host code, so the ifdef has to ride inside the
+// device entry point.
+template <typename Kernel>
+struct enable_sm90_or_later : Kernel {
+  template <typename... Args>
+  CUTLASS_DEVICE void operator()(Args&&... args) {
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 900
+    Kernel::operator()(std::forward<Args>(args)...);
+#endif
+  }
+};
+
+namespace sm90_fp8 {
+
+template <typename T, typename TileShape>
+using ColLoad = cutlass::epilogue::fusion::
+    Sm90ColBroadcast<0, TileShape, T, T, Stride<Int<1>, Int<0>, Int<0>>, 128 / sizeof_bits_v<T>, false>;
+
+template <typename T, typename TileShape>
+using RowLoad = cutlass::epilogue::fusion::
+    Sm90RowBroadcast<0, TileShape, T, T, Stride<Int<0>, Int<1>, Int<0>>, 128 / sizeof_bits_v<T>, false>;
+
+// D = scale_a * scale_b * accum
+template <typename ElementAcc, typename ElementD, typename TileShape>
+struct ScaledEpilogue {
+ private:
+  using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
+  using ScaleA = ColLoad<float, TileShape>;
+  using ScaleB = RowLoad<float, TileShape>;
+
+  using Compute0 = cutlass::epilogue::fusion::
+      Sm90Compute<cutlass::multiplies, float, float, cutlass::FloatRoundStyle::round_to_nearest>;
+  using EVTCompute0 = cutlass::epilogue::fusion::Sm90EVT<Compute0, ScaleB, Accum>;
+  using Compute1 = cutlass::epilogue::fusion::
+      Sm90Compute<cutlass::multiplies, ElementD, float, cutlass::FloatRoundStyle::round_to_nearest>;
+
+ public:
+  using EVTCompute = cutlass::epilogue::fusion::Sm90EVT<Compute1, ScaleA, EVTCompute0>;
+  using ArgumentType = typename EVTCompute::Arguments;
+
+  static ArgumentType prepare_args(
+      tvm::ffi::TensorView a_scales, tvm::ffi::TensorView b_scales, tvm::ffi::Optional<tvm::ffi::TensorView> bias) {
+    typename ScaleA::Arguments a_args{static_cast<const float*>(a_scales.data_ptr())};
+    typename ScaleB::Arguments b_args{static_cast<const float*>(b_scales.data_ptr())};
+    typename EVTCompute0::Arguments evt0_args{b_args, {}, {}};
+    return ArgumentType{a_args, evt0_args, {}};
+  }
+};
+
+// D = scale_a * scale_b * accum + bias, bias broadcast along the epilogue's
+// N axis (BiasLoad = RowLoad) or M axis (BiasLoad = ColLoad). Swap-AB configs
+// transpose the output, so their per-output-channel bias becomes a column.
+template <typename ElementAcc, typename ElementD, typename TileShape, template <typename, typename> typename BiasLoad>
+struct ScaledEpilogueWithBias {
+ private:
+  using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
+  using ScaleA = ColLoad<float, TileShape>;
+  using ScaleB = RowLoad<float, TileShape>;
+  using Bias = BiasLoad<ElementD, TileShape>;
+
+  using Compute0 = cutlass::epilogue::fusion::
+      Sm90Compute<cutlass::multiplies, float, float, cutlass::FloatRoundStyle::round_to_nearest>;
+  using EVTCompute0 = cutlass::epilogue::fusion::Sm90EVT<Compute0, ScaleB, Accum>;
+  using Compute1 = cutlass::epilogue::fusion::
+      Sm90Compute<cutlass::homogeneous_multiply_add, ElementD, float, cutlass::FloatRoundStyle::round_to_nearest>;
+
+ public:
+  using EVTCompute = cutlass::epilogue::fusion::Sm90EVT<Compute1, ScaleA, EVTCompute0, Bias>;
+  using ArgumentType = typename EVTCompute::Arguments;
+
+  static ArgumentType prepare_args(
+      tvm::ffi::TensorView a_scales, tvm::ffi::TensorView b_scales, tvm::ffi::Optional<tvm::ffi::TensorView> bias) {
+    typename ScaleA::Arguments a_args{static_cast<const float*>(a_scales.data_ptr())};
+    typename ScaleB::Arguments b_args{static_cast<const float*>(b_scales.data_ptr())};
+    typename Bias::Arguments bias_args{static_cast<const ElementD*>(bias.value().data_ptr())};
+    typename EVTCompute0::Arguments evt0_args{b_args, {}, {}};
+    return ArgumentType{a_args, evt0_args, bias_args, {}};
+  }
+};
+
+template <typename ElementAcc, typename ElementD, typename TileShape>
+using ScaledEpilogueBias = ScaledEpilogueWithBias<ElementAcc, ElementD, TileShape, RowLoad>;
+
+template <typename ElementAcc, typename ElementD, typename TileShape>
+using ScaledEpilogueColumnBias = ScaledEpilogueWithBias<ElementAcc, ElementD, TileShape, ColLoad>;
+
+template <
+    typename ElementAB_,
+    typename ElementD_,
+    template <typename, typename, typename> typename Epilogue_,
+    typename TileShape,
+    typename ClusterShape,
+    typename KernelSchedule,
+    typename EpilogueSchedule,
+    bool swap_ab_ = false>
+struct Gemm {
+  using ElementAB = ElementAB_;
+  using ElementC = ElementD_;
+  using ElementD = ElementD_;
+  using ElementAcc = float;
+
+  using Epilogue = Epilogue_<ElementAcc, ElementD, TileShape>;
+  using EVTCompute = typename Epilogue::EVTCompute;
+
+  static constexpr int AlignmentAB = 128 / cutlass::sizeof_bits<ElementAB>::value;
+  static constexpr int AlignmentCD = 128 / cutlass::sizeof_bits<ElementD>::value;
+
+  static constexpr bool swap_ab = swap_ab_;
+
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutA_T = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
+
+  using LayoutB = cutlass::layout::ColumnMajor;
+  using LayoutB_T = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
+
+  using LayoutD = cutlass::layout::RowMajor;
+  using LayoutD_Transpose = typename cutlass::layout::LayoutTranspose<LayoutD>::type;
+
+  using LayoutC = LayoutD;
+  using LayoutC_Transpose = LayoutD_Transpose;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Sm90,
+      cutlass::arch::OpClassTensorOp,
+      TileShape,
+      ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAcc,
+      float,
+      ElementC,
+      conditional_t<swap_ab, LayoutC_Transpose, LayoutC>,
+      AlignmentCD,
+      ElementD,
+      conditional_t<swap_ab, LayoutD_Transpose, LayoutD>,
+      AlignmentCD,
+      EpilogueSchedule,
+      EVTCompute>::CollectiveOp;
+
+  using Stages = typename cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+      sizeof(typename CollectiveEpilogue::SharedStorage))>;
+
+  using CollectiveMainloop = conditional_t<
+      swap_ab,
+      typename cutlass::gemm::collective::CollectiveBuilder<
+          cutlass::arch::Sm90,
+          cutlass::arch::OpClassTensorOp,
+          ElementAB,
+          LayoutB_T,
+          AlignmentAB,  // Swapped B (as A)
+          ElementAB,
+          LayoutA_T,
+          AlignmentAB,  // Swapped A (as B)
+          ElementAcc,
+          TileShape,
+          ClusterShape,
+          Stages,
+          KernelSchedule>::CollectiveOp,
+      typename cutlass::gemm::collective::CollectiveBuilder<
+          cutlass::arch::Sm90,
+          cutlass::arch::OpClassTensorOp,
+          ElementAB,
+          LayoutA,
+          AlignmentAB,
+          ElementAB,
+          LayoutB,
+          AlignmentAB,
+          ElementAcc,
+          TileShape,
+          ClusterShape,
+          Stages,
+          KernelSchedule>::CollectiveOp>;
+
+  using KernelType = enable_sm90_or_later<cutlass::gemm::kernel::GemmUniversal<
+      cute::Shape<int, int, int, int>,
+      CollectiveMainloop,
+      CollectiveEpilogue,
+      cutlass::gemm::PersistentScheduler>>;
+
+  struct GemmKernel : public KernelType {};
+};
+
+template <typename GemmType>
+void launch(
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView a,
+    tvm::ffi::TensorView b,
+    tvm::ffi::TensorView a_scales,
+    tvm::ffi::TensorView b_scales,
+    tvm::ffi::Optional<tvm::ffi::TensorView> bias,
+    cudaStream_t stream) {
+  static constexpr bool swap_ab = GemmType::swap_ab;
+  using ElementAB = typename GemmType::ElementAB;
+  using ElementD = typename GemmType::ElementD;
+  using GemmKernel = typename GemmType::GemmKernel;
+
+  using StrideA = typename GemmKernel::StrideA;
+  using StrideB = typename GemmKernel::StrideB;
+  using StrideC = typename GemmKernel::StrideC;
+
+  const int32_t m = a.size(0);
+  const int32_t n = b.size(1);
+  const int32_t k = a.size(1);
+  auto prob_shape = swap_ab ? cute::make_shape(n, m, k, 1) : cute::make_shape(m, n, k, 1);
+
+  StrideA a_stride = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+  StrideB b_stride = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+  StrideC c_stride =
+      cutlass::make_cute_packed_stride(StrideC{}, swap_ab ? cute::make_shape(n, m, 1) : cute::make_shape(m, n, 1));
+
+  auto a_ptr = static_cast<ElementAB*>(a.data_ptr());
+  auto b_ptr = static_cast<ElementAB*>(b.data_ptr());
+  auto c_ptr = static_cast<ElementD*>(out.data_ptr());
+
+  typename GemmKernel::MainloopArguments mainloop_args =
+      swap_ab ? typename GemmKernel::MainloopArguments{b_ptr, b_stride, a_ptr, a_stride}
+              : typename GemmKernel::MainloopArguments{a_ptr, a_stride, b_ptr, b_stride};
+
+  // Swap-AB kernels compute D^T, so the roles of the row/column scale loads
+  // swap with them. Every dispatch site below passes the canonical
+  // (a_scales, b_scales) order and this is the single place that reorders.
+  typename GemmKernel::EpilogueArguments epilogue_args{
+      swap_ab ? GemmType::Epilogue::prepare_args(b_scales, a_scales, bias)
+              : GemmType::Epilogue::prepare_args(a_scales, b_scales, bias),
+      c_ptr,
+      c_stride,
+      c_ptr,
+      c_stride};
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = a.device().device_id;
+  hw_info.sm_count = static_cast<int>(host::runtime::get_sm_count(hw_info.device_id));
+  typename GemmKernel::TileSchedulerArguments scheduler = {};
+
+  typename GemmKernel::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGemm, prob_shape, mainloop_args, epilogue_args, hw_info, scheduler};
+
+  using GemmOp = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  GemmOp gemm_op;
+  CUTLASS_CHECK(gemm_op.can_implement(args));
+
+  const size_t workspace_size = gemm_op.get_workspace_size(args);
+  auto workspace_tensor = host::alloc_workspace_tensor(workspace_size, a.device());
+  void* workspace = (workspace_size == 0) ? nullptr : workspace_tensor.data_ptr();
+
+  CUTLASS_CHECK(gemm_op.run(args, workspace, stream));
+}
+
+}  // namespace sm90_fp8
+
+// One entry of the SM90 tile table. swap_ab configs take a column bias because
+// they compute D^T; the rest take a row bias.
+template <
+    typename OutType,
+    bool WithBias,
+    typename TileShape_,
+    typename ClusterShape_,
+    typename KernelSchedule_,
+    bool SwapAb>
+struct Sm90Fp8Config {
+  template <typename Acc, typename D, typename Tile>
+  using Epilogue = std::conditional_t<
+      !WithBias,
+      sm90_fp8::ScaledEpilogue<Acc, D, Tile>,
+      std::conditional_t<
+          SwapAb,
+          sm90_fp8::ScaledEpilogueColumnBias<Acc, D, Tile>,
+          sm90_fp8::ScaledEpilogueBias<Acc, D, Tile>>>;
+
+  using Gemm = sm90_fp8::Gemm<
+      cutlass::float_e4m3_t,
+      OutType,
+      Epilogue,
+      TileShape_,
+      ClusterShape_,
+      KernelSchedule_,
+      cutlass::epilogue::TmaWarpSpecialized,
+      SwapAb>;
+};
+
+template <typename OutType, bool WithBias>
+void sm90_fp8_pertensor_dispatch_shape_impl(
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView a,
+    tvm::ffi::TensorView b,
+    tvm::ffi::TensorView scales_a,
+    tvm::ffi::TensorView scales_b,
+    tvm::ffi::Optional<tvm::ffi::TensorView> bias,
+    cudaStream_t stream) {
+  using PingpongFastAccum = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
+  using FastAccum = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
+
+  // M in (128, inf)
+  using GemmDefault =
+      typename Sm90Fp8Config<OutType, WithBias, Shape<_128, _128, _128>, Shape<_2, _1, _1>, PingpongFastAccum, false>::
+          Gemm;
+  // M in (64, 128], N > 4096
+  using GemmM128LargeN =
+      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _128, _128>, Shape<_2, _1, _1>, PingpongFastAccum, false>::
+          Gemm;
+  // M in (64, 128], N <= 4096
+  using GemmM128SmallN =
+      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _64, _128>, Shape<_1, _1, _1>, PingpongFastAccum, false>::
+          Gemm;
+  // swap-AB configs below: kernel-N is the original M
+  using GemmM64SmallN =
+      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _16, _256>, Shape<_1, _4, _1>, FastAccum, true>::Gemm;
+  using GemmM64LargeN =
+      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _64, _256>, Shape<_1, _1, _1>, FastAccum, true>::Gemm;
+  using GemmM32LargeN =
+      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _32, _256>, Shape<_1, _1, _1>, FastAccum, true>::Gemm;
+  using GemmM16SmallN =
+      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _16, _256>, Shape<_1, _2, _1>, FastAccum, true>::Gemm;
+  using GemmM16LargeN =
+      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _16, _256>, Shape<_1, _1, _1>, FastAccum, true>::Gemm;
+
+  const uint32_t m = a.size(0);
+  const uint32_t n = b.size(1);
+
+  // Threshold separating "smallN" from "largeN" for the M16 and M64 buckets.
+  // 1280 sits just above N=1024 (attention out-proj / KV-proj N for the
+  // LLaMA-3 / Qwen-2.5 / Mistral families), so those layers take the narrower
+  // kernel-N tile and its wider N-direction cluster for TMA multicast, while
+  // MLP and fused-QKV shapes (N 4096-28672) cross into largeN where denser
+  // N-tile coverage plus a smaller cluster wins. Inherited from the vLLM SM90
+  // dispatch; benched across LLaMA / Qwen / Mistral and robust within +/-256.
+  static constexpr uint32_t kNThreshold = 1280;
+
+  // Splits the M128 bucket. Above 4096 the wide tile<_64,_128,_128> +
+  // cluster<_2,_1,_1> pays off; below it that tile costs 20-25% against the
+  // smaller-tile fallback on H200.
+  static constexpr uint32_t kM128NThreshold = 4096;
+
+  if (m <= 16) {
+    if (n <= kNThreshold) {
+      return sm90_fp8::launch<GemmM16SmallN>(out, a, b, scales_a, scales_b, bias, stream);
+    }
+    return sm90_fp8::launch<GemmM16LargeN>(out, a, b, scales_a, scales_b, bias, stream);
+  }
+  if (m <= 64) {
+    if (n <= kNThreshold) {
+      // kernel-N=16 divides every M in {17..64}, so no N-tile padding.
+      return sm90_fp8::launch<GemmM64SmallN>(out, a, b, scales_a, scales_b, bias, stream);
+    }
+    if (m <= 32) {
+      // M=32 against kernel-N=64 would waste half the N-tile.
+      return sm90_fp8::launch<GemmM32LargeN>(out, a, b, scales_a, scales_b, bias, stream);
+    }
+    return sm90_fp8::launch<GemmM64LargeN>(out, a, b, scales_a, scales_b, bias, stream);
+  }
+  if (m <= 128) {
+    if (n <= kM128NThreshold) {
+      return sm90_fp8::launch<GemmM128SmallN>(out, a, b, scales_a, scales_b, bias, stream);
+    }
+    return sm90_fp8::launch<GemmM128LargeN>(out, a, b, scales_a, scales_b, bias, stream);
+  }
+  return sm90_fp8::launch<GemmDefault>(out, a, b, scales_a, scales_b, bias, stream);
+}
+
+template <typename OutType>
+void sm90_fp8_pertensor_dispatch_shape(
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView a,
+    tvm::ffi::TensorView b,
+    tvm::ffi::TensorView scales_a,
+    tvm::ffi::TensorView scales_b,
+    tvm::ffi::Optional<tvm::ffi::TensorView> bias,
+    cudaStream_t stream) {
+  if (bias.has_value()) {
+    return sm90_fp8_pertensor_dispatch_shape_impl<OutType, true>(out, a, b, scales_a, scales_b, bias, stream);
+  }
+  return sm90_fp8_pertensor_dispatch_shape_impl<OutType, false>(out, a, b, scales_a, scales_b, bias, stream);
+}
