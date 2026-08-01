@@ -109,6 +109,7 @@ this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.h
 | B300 | NVIDIA | 288GB | `lmsysorg/sglang:<ver>` (or `-cu130` when required) |
 | GB200 | NVIDIA | 192GB | `lmsysorg/sglang:<ver>` (or `-cu130`) |
 | GB300 | NVIDIA | 288GB | `lmsysorg/sglang:<ver>` (or `-cu130`) |
+| DGX Spark | NVIDIA | 128GB (unified) | `lmsysorg/sglang:<ver>` — needs a **CUDA 13** build |
 | MI300X | AMD | 192GB | `lmsysorg/sglang:<ver>-rocm720-mi30x` |
 | MI325X | AMD | 256GB | `lmsysorg/sglang:<ver>-rocm720-mi30x` |
 | MI350X | AMD | 288GB | `lmsysorg/sglang:<ver>-rocm720-mi35x` |
@@ -119,8 +120,9 @@ this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.h
   `sglang_version`; the engine falls back to `lmsysorg/sglang:dev` for any unmapped hw.
 - **TP sizing** (sanity-check recipes): `weight_GB / gpu_mem`, round up to a power of 2,
   ~20–30% headroom. BF16 ≈ params×2 GB, FP8 ≈ ×1, FP4 ≈ ×0.5. MoE → **total** weight, not
-  active params. FP4 is Blackwell-only (B200/B300/GB200/GB300). GB200/GB300 single-node
-  hosts are typically **4 GPUs** (TP=4 ceiling).
+  active params. FP4 is Blackwell-only (B200/B300/GB200/GB300/DGX Spark). GB200/GB300
+  single-node hosts are typically **4 GPUs** (TP=4 ceiling); a DGX Spark is **1 GPU**, so
+  its only multi-GPU topology is TP=2 across 2 nodes.
 - **Platform flags**: Blackwell may need `--attention-backend trtllm_mha`; AMD typically
   needs `--attention-backend triton` + env `SGLANG_USE_AITER=1` /
   `SGLANG_ROCM_FUSED_DECODE_MLA=0` (check AITER TP constraints, e.g. `heads_per_gpu % 16 == 0`).
