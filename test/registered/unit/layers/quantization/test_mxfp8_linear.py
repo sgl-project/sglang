@@ -23,9 +23,7 @@ class TestMxfp8LinearMethod(CustomTestCase):
             fp8_gemm_runner_backend="auto", quantization="modelopt_mixed"
         )
         with (
-            get_flags().moe.override(
-                runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM
-            ),
+            get_flags().moe.override(runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM),
             patch.object(fp8_utils, "FP8_GEMM_RUNNER_BACKEND", None),
             patch.object(fp8_utils, "_is_sm100_supported", True),
             patch.object(fp8_utils, "is_flashinfer_available", return_value=True),
