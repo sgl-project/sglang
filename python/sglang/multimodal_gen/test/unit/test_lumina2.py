@@ -613,9 +613,7 @@ class TestLumina2PipelineConfig(CustomTestCase):
         self.assertEqual(config.dit_config.arch_config.num_channels_latents, 16)
 
         batch = SimpleNamespace(height=1024, width=1024)
-        self.assertEqual(
-            config.prepare_latent_shape(batch, 1, 1), (1, 16, 128, 128)
-        )
+        self.assertEqual(config.prepare_latent_shape(batch, 1, 1), (1, 16, 128, 128))
 
     def test_cfg_normalization_stays_off(self):
         """Lumina2SamplingParams pins this to 0.0 against a change to the base
