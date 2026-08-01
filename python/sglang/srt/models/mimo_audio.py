@@ -509,6 +509,7 @@ class AudioEncoderAttention(nn.Module):
             proj_bias=True,
             flatten_batch=True,
             window_size=window_size,
+            causal=causal,
             customized_position_embedding_applier=_audio_rope_applier,
             prefix="attn",
         )
