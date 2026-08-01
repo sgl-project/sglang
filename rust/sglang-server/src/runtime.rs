@@ -94,32 +94,21 @@ impl Drop for Runtime {
 pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // Bind the API server port before spawning any thread, so an unavailable
     // port (EADDRINUSE) is a hard startup error.
-    let listener = std::net::TcpListener::bind(cfg.rust_server_args.http_addr)
-        .map_err(|e| format!("bind {} failed: {e}", cfg.rust_server_args.http_addr))?;
-    // Accepted sockets inherit this rcvbuf. The kernel default (87 KB) is
-    // smaller than one large /generate body; a request burst that overflows
-    // it costs the client a ~200 ms RTO retransmit. 16 MiB covers a
-    // 1M-token body; allocation is lazy, so idle connections pay nothing.
-    // Requests above net.core.rmem_max are silently clamped by the kernel.
-    {
-        use std::os::fd::AsRawFd;
-        let sz: libc::c_int = 1 << 24; // 16 MiB
-        let r = unsafe {
-            libc::setsockopt(
-                listener.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &sz as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&sz) as libc::socklen_t,
-            )
-        };
-        if r != 0 {
-            eprintln!("warning: SO_RCVBUF setsockopt on listener failed");
-        }
+    let addr = cfg.rust_server_args.http_addr;
+    let socket = match addr {
+        std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+        std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
     }
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("listener set_nonblocking failed: {e}"))?;
+    .map_err(|e| format!("socket for {addr} failed: {e}"))?;
+    socket
+        .set_reuseaddr(true)
+        .map_err(|e| format!("set_reuseaddr failed: {e}"))?;
+    if let Err(e) = socket.set_recv_buffer_size(16 * 1024 * 1024) {
+        eprintln!("warning: set_recv_buffer_size on listener failed: {e}");
+    }
+    socket
+        .bind(addr)
+        .map_err(|e| format!("bind {addr} failed: {e}"))?;
 
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
@@ -288,7 +277,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 }
                 let rt = builder.build().expect("build api runtime");
                 rt.block_on(api_server::serve(
-                    listener,
+                    socket,
                     senders,
                     cfg.rust_server_args.channel_cap,
                     cfg.server_args.clone(),

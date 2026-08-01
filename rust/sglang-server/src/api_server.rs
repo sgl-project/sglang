@@ -31,7 +31,7 @@ struct AppState {
 }
 
 pub async fn serve(
-    listener: std::net::TcpListener,
+    socket: tokio::net::TcpSocket,
     senders: Senders,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
@@ -61,12 +61,12 @@ pub async fn serve(
         .with_state(state);
     let app = log::apply(app, &server_args);
 
-    // The listener was already bound synchronously in `runtime::start` (so a port
-    // conflict fails startup); adopt it into the tokio reactor here.
-    let listener = match tokio::net::TcpListener::from_std(listener) {
+    // The socket was already bound synchronously in `runtime::start` (so a port
+    // conflict fails startup); start listening here, on the api runtime.
+    let listener = match socket.listen(1024) {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(error = %e, "failed to adopt pre-bound listener");
+            tracing::error!(error = %e, "listen failed");
             return;
         }
     };
@@ -79,9 +79,8 @@ pub async fn serve(
     // runtime drops → detached handlers cancel → their `AbortGuard`s fire, release
     // `Senders` clones → tok/detok channels close → workers exit. Full drain is
     // deferred (see `request_shutdown`).
-    // Match Python (asyncio sets TCP_NODELAY on every TCP transport);
-    // without it, keep-alive connections pay ~13 ms extra TTFT to
-    // Nagle + delayed-ACK.
+    // Match Python (asyncio sets TCP_NODELAY); avoids a ~13 ms
+    // Nagle/delayed-ACK penalty on keep-alive connections.
     use axum::serve::ListenerExt;
     let listener = listener.tap_io(|io| {
         if let Err(e) = io.set_nodelay(true) {
