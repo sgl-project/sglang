@@ -1,15 +1,21 @@
-"""Session Unified radix cache (``--enable-session-radix-cache``): tag each request's KV
-by session_id for each tree component; ``release_session`` (close) frees a session's tagged KV.
+"""Session ref tracking for UnifiedRadixCache (``--enable-session-radix-cache``):
+tag each request's KV by session_id for each tree component; ``release_radix_session``
+(close) releases a session's tagged reference.
 """
 
 from __future__ import annotations
 
 import logging
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+        TreeComponent,
+    )
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 
 logger = logging.getLogger(__name__)
 
@@ -19,16 +25,24 @@ logger = logging.getLogger(__name__)
 _CLOSED_SESSION_TOMBSTONE_LIMIT = 8192
 
 
-class SessionUnifiedRadixCacheMixin:
-    """Tags radix KV by session id; ``release_session`` (close) releases a session's
-    tagged reference. Each component maintains its own session_ids, session_ref and so
-    on. Used for UnifiedRadixCache."""
+@dataclass(kw_only=True)
+class UnifiedSessionRefTracker:
+    """Tags radix KV by session id; ``release_radix_session`` (close) releases a
+    session's tagged reference. Each component maintains its own session_ids,
+    session_ref and so on."""
 
-    def _reset_session_radix_state(self) -> None:
+    components: tuple[TreeComponent, ...]
+    tree_core: UnifiedTreeCore
+    enable_session_radix_cache: bool
+
+    def __post_init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
         self._closed_session_ids: OrderedDict[str, None] = OrderedDict()
         self._session_incarnation_counter: int = 0
         self._session_generations: dict[str, int] = {}
-        for component in self._components_tuple:
+        for component in self.components:
             component.reset_session_state()
 
     def session_id_for_req(self, req: Req) -> Optional[str]:
@@ -60,7 +74,7 @@ class SessionUnifiedRadixCacheMixin:
         if last_node is self.tree_core.root_node:
             return
 
-        for component in self._components_tuple:
+        for component in self.components:
             leaf = component.resolve_session_leaf(req, last_node)
             component.register_session_leaf(session_id, leaf)
 
@@ -93,7 +107,7 @@ class SessionUnifiedRadixCacheMixin:
         self._session_generations.pop(session_id, None)
 
         indexed = 0
-        for component in self._components_tuple:
+        for component in self.components:
             indexed += component.release_session(session_id)
 
         logger.info(

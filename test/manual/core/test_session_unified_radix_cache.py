@@ -48,12 +48,15 @@ def class_bases(path: Path, class_name: str) -> set[str]:
 
 
 class TestSessionCacheOwnership(unittest.TestCase):
-    def test_only_unified_radix_cache_owns_session_mixin(self):
+    def test_only_unified_radix_cache_owns_session_ref_tracker(self):
         ordinary_mixin = MEM_CACHE_ROOT / "session_radix_cache.py"
         radix_cache = MEM_CACHE_ROOT / "radix_cache.py"
         hiradix_cache = MEM_CACHE_ROOT / "hiradix_cache.py"
         evict_policy = MEM_CACHE_ROOT / "evict_policy.py"
         unified_cache = MEM_CACHE_ROOT / "unified_radix_cache.py"
+        session_ref_tracker = (
+            MEM_CACHE_ROOT / "unified_cache" / "session_ref_tracker.py"
+        )
 
         self.assertFalse(ordinary_mixin.exists())
         ordinary_source = "\n".join(
@@ -73,10 +76,12 @@ class TestSessionCacheOwnership(unittest.TestCase):
         self.assertNotIn(
             "SessionRadixCacheMixin", class_bases(radix_cache, "RadixCache")
         )
-        self.assertIn(
-            "SessionUnifiedRadixCacheMixin",
-            class_bases(unified_cache, "UnifiedRadixCache"),
+        # Session behavior is composed, not mixed in (general-code-style rule).
+        self.assertEqual(
+            class_bases(unified_cache, "UnifiedRadixCache"), {"BasePrefixCache"}
         )
+        self.assertIn("UnifiedSessionRefTracker", session_ref_tracker.read_text())
+        self.assertNotIn("SessionUnifiedRadixCacheMixin", unified_cache.read_text())
 
         for component in (
             "full_component.py",
@@ -156,7 +161,7 @@ def match_len(cache, token_ids) -> int:
 def register(cache, token_ids, session_id, generation=None):
     if generation is None:
         generation = cache.ensure_session_generation(session_id)
-    cache.register_session_ref(
+    cache.session_refs.register_session_ref(
         SimpleNamespace(
             session_id=session_id,
             session_generation=generation,
