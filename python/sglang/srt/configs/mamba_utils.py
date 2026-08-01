@@ -124,31 +124,29 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
-    def replayssm_ring_bytes_per_req(self, cache_len: int, enable_spec: bool) -> int:
-        """Per-req bytes of the ReplaySSM ring (all layers), which are NOT part of
-        ``mamba_cache_per_req`` -- the memory solver must add these so num_slots is
-        not over-provisioned. MUST mirror the allocation in ``MambaPool`` (memory_pool):
-        the d/k/g ring (all modes) plus, for spec-verify, the raw v / pre-norm k /
-        beta rings. d/k (and spec rawv/rawk) use the conv dtype under spec-verify (the
-        ssm dtype for the decode ring); g and beta are fp32. Keep in sync with MambaPool.
-        """
+    def replayssm_ring_bytes_per_req(self, record_len: int) -> int:
+        """Per-slot bytes of the ReplaySSM spec-verify fold window (all
+        layers). Not part of ``mamba_cache_per_req``, so the memory solver
+        must charge it separately. MUST mirror the ``MambaPool`` allocation:
+        raw v/k in the conv dtype + fp32 beta, plus the fp32 gate ring
+        (per-head scalar for GDN, per-K vector for KDA). KDA additionally
+        keeps the chunked d/k rings under spec (its forward_decode routes on
+        their presence), also in the conv dtype."""
         hv, v_dim, k_dim = self.shape.temporal
         h_k = self.shape.num_k_heads_per_tp
-        L = cache_len
         conv_b = self.dtype.conv.itemsize
-        ring_b = conv_b if enable_spec else self.dtype.temporal.itemsize
         fp32_b = 4
-        g_numel = hv * L * (k_dim if self.is_kda else 1)
         per_layer = (
-            hv * L * v_dim * ring_b  # d
-            + h_k * L * k_dim * ring_b  # k
-            + g_numel * fp32_b  # g (fp32)
+            hv * record_len * v_dim * conv_b  # rawv
+            + h_k * record_len * k_dim * conv_b  # rawk
+            + hv * record_len * fp32_b  # beta (fp32)
+            # g (fp32): GDN per-head scalar, KDA per-K vector
+            + hv * record_len * (k_dim if self.is_kda else 1) * fp32_b
         )
-        if enable_spec:
+        if self.is_kda:
             per_layer += (
-                hv * L * v_dim * conv_b  # rawv
-                + h_k * L * k_dim * conv_b  # rawk
-                + hv * L * fp32_b  # beta (fp32)
+                hv * record_len * v_dim * conv_b  # d
+                + h_k * record_len * k_dim * conv_b  # k
             )
         return per_layer * len(self.layers)
 

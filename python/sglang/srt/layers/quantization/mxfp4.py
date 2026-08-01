@@ -47,7 +47,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -337,7 +337,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # activations are quantized to fp8 per-token-group-128.
         self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
         self.flashinfer_mxfp4_moe_precision = (
-            get_server_args().flashinfer_mxfp4_moe_precision
+            get_exec().moe.flashinfer_mxfp4_moe_precision
         )
         # When `flashinfer_mxfp4` is enabled, dispatch to one of three FlashInfer
         # entry points depending on the GPU:

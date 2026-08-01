@@ -1,11 +1,12 @@
-"""ReplaySSM ring per-req byte accounting (BaseLinearStateParams.replayssm_ring_bytes_per_req).
+"""ReplaySSM ring per-slot byte accounting (BaseLinearStateParams.replayssm_ring_bytes_per_req).
 
 The memory solver charges this on top of mamba_cache_per_req so num_slots is not
-over-provisioned (the ring is allocated per slot but is NOT part of the state cache
-cost). This pins the arithmetic against hand-computed byte counts, across both gate
-layouts (KDA per-K vector g vs GDN scalar g) and both rings (spec-verify adds the
-raw v / pre-norm k / beta rings; decode does not). If the MambaPool allocation
-changes shape, update both the allocation and this expectation together.
+over-provisioned (the ring is allocated per slot but is NOT part of the state
+cache cost). Pins the arithmetic against hand-computed byte counts for the
+fold window (raw v / pre-norm k / g / beta) across both gate layouts: GDN
+per-head scalar g vs KDA per-K vector g (KDA also keeps the chunked d/k rings
+under spec, see MambaPool). If the MambaPool allocation changes shape, update
+both the allocation and this expectation together.
 """
 
 import pytest
@@ -23,14 +24,15 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-# temporal = (hv=4, v_dim=8, k_dim=8), num_k_heads_per_tp = 4, L = 8, 2 layers.
-# conv bf16 (2B), ssm/temporal fp32 (4B). Ring tensors (per slot, per layer):
-#   d    hv*L*v_dim,  k    h_k*L*k_dim   -> ring dtype (conv under spec, ssm under decode)
-#   g    hv*L*k_dim (KDA) / hv*L (GDN)   -> fp32
-#   rawv hv*L*v_dim,  rawk h_k*L*k_dim   -> conv dtype (spec only)
-#   beta hv*L                           -> fp32 (spec only)
+# temporal = (hv=4, v_dim=8, k_dim=8), num_k_heads_per_tp = 4, record_len = 8,
+# 2 layers. conv bf16 (2B), fp32 gate/beta (4B). Ring tensors (per slot, per
+# layer):
+#   rawv hv*RL*v_dim, rawk h_k*RL*k_dim  -> conv dtype
+#   g    hv*RL (GDN) / hv*RL*k_dim (KDA) -> fp32
+#   beta hv*RL                           -> fp32
+#   d/k  like rawv/rawk                  -> conv dtype (KDA only)
 DTYPE = Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32)
-L = 8
+RL = 8
 LAYERS = [0, 1]
 
 
@@ -42,8 +44,8 @@ def _kda_params():
 
 
 def _gdn_params():
-    # Only shape.temporal and shape.num_k_heads_per_tp are read here; the rest are
-    # dummy (the accounting does not depend on them).
+    # Only shape.temporal and shape.num_k_heads_per_tp are read here; the rest
+    # are dummy (the accounting does not depend on them).
     shape = Mamba2StateShape(
         conv=[(4, 3)],
         temporal=(4, 8, 8),
@@ -60,32 +62,24 @@ def _gdn_params():
 
 
 class TestReplaySSMRingAccounting(CustomTestCase):
-    def test_kda_spec(self):
-        # per layer: d 512 + k 512 + g(4*8*8*4) 1024 + rawv 512 + rawk 512 + beta 128 = 3200
+    def test_gdn_fold(self):
+        # fold window: rawv 512 + rawk 512 + g(scalar, 4*8*4) 128 + beta 128 = 1280
         self.assertEqual(
-            _kda_params().replayssm_ring_bytes_per_req(cache_len=L, enable_spec=True),
+            _gdn_params().replayssm_ring_bytes_per_req(record_len=RL),
+            1280 * len(LAYERS),
+        )
+
+    def test_kda_fold(self):
+        # rawv 512 + rawk 512 + g(per-K, 4*8*8*4) 1024 + beta 128
+        # + d 512 + k 512 (KDA keeps the chunked rings under spec) = 3200
+        self.assertEqual(
+            _kda_params().replayssm_ring_bytes_per_req(record_len=RL),
             3200 * len(LAYERS),
         )
 
-    def test_kda_decode(self):
-        # decode ring uses the ssm dtype (fp32): d 1024 + k 1024 + g 1024 = 3072; no raw rings
-        self.assertEqual(
-            _kda_params().replayssm_ring_bytes_per_req(cache_len=L, enable_spec=False),
-            3072 * len(LAYERS),
-        )
-
-    def test_gdn_spec_scalar_gate(self):
-        # GDN g is a per-head SCALAR (hv*L*1*4 = 128), not per-K:
-        # d 512 + k 512 + g 128 + rawv 512 + rawk 512 + beta 128 = 2304
-        self.assertEqual(
-            _gdn_params().replayssm_ring_bytes_per_req(cache_len=L, enable_spec=True),
-            2304 * len(LAYERS),
-        )
-
     def test_zero_len_ring(self):
-        self.assertEqual(
-            _kda_params().replayssm_ring_bytes_per_req(cache_len=0, enable_spec=True), 0
-        )
+        self.assertEqual(_gdn_params().replayssm_ring_bytes_per_req(record_len=0), 0)
+        self.assertEqual(_kda_params().replayssm_ring_bytes_per_req(record_len=0), 0)
 
 
 if __name__ == "__main__":

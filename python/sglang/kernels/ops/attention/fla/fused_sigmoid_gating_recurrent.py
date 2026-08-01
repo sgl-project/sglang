@@ -54,8 +54,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
-    # ReplaySSM fused ring-write (KDA verify only). Pointers stay None and
-    # CACHE_RING False for decode / GDN / flag-off -> byte-identical.
+    # ReplaySSM fused ring-write (KDA + GDN spec-verify). Pointers stay None
+    # and CACHE_RING False for decode / flag-off -> byte-identical.
     replayssm_rawv=None,
     replayssm_rawk=None,
     replayssm_g=None,
@@ -200,10 +200,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
         # into the per-slot ring for the commit fold to replay. Must sit here --
-        # b_k is still pre-l2norm, b_v still pre-delta, b_g/b_beta are formed.
-        # Replaces the eager torch ring-write in kda_backend; gate/beta now come
-        # from the kernel itself (bit-identical to the state update). rawk uses the
-        # k-head i_h (shared across a GQA group); rawv/g/beta use the v-head i_hv.
+        # b_k is still pre-l2norm, b_v still pre-delta, b_g/b_beta are formed
+        # (bit-identical to the state update below). rawk uses the k-head i_h
+        # (shared across a GQA group); rawv/g/beta use the v-head i_hv. The g
+        # ring is a per-K vector for KDA and a per-step scalar for GDN.
         # step_idx < MAX_CACHE_LEN: absorb-inflated rows can exceed the ring;
         # the overflow steps are past the committable prefix, so drop them
         # (writing them would smash the next slot's ring).
@@ -229,15 +229,26 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                         b_k.to(replayssm_rawk.dtype.element_ty),
                         mask=mask_k,
                     )
-                    tl.store(
-                        replayssm_g
-                        + ring_slot * stride_g_slot
-                        + i_hv * MAX_CACHE_LEN * K
-                        + step_idx * K
-                        + o_k,
-                        b_g,
-                        mask=mask_k,
-                    )
+                    if IS_KDA:
+                        # per-K vector gate ring: [.., L, K]
+                        tl.store(
+                            replayssm_g
+                            + ring_slot * stride_g_slot
+                            + i_hv * MAX_CACHE_LEN * K
+                            + step_idx * K
+                            + o_k,
+                            b_g,
+                            mask=mask_k,
+                        )
+                    else:
+                        # per-step scalar gate ring: [.., L]
+                        tl.store(
+                            replayssm_g
+                            + ring_slot * stride_g_slot
+                            + i_hv * MAX_CACHE_LEN
+                            + step_idx,
+                            b_g,
+                        )
                     if i_k == 0:
                         tl.store(
                             replayssm_beta
@@ -337,9 +348,9 @@ def fused_sigmoid_gating_delta_rule_update(
         int
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
-    # fused ReplaySSM ring-write (KDA verify). When cache_ring, each draft
-    # step stores pre-norm k / raw v / gate / beta into these per-slot rings,
-    # replacing the eager ring-write. Off by default -> decode/GDN unchanged.
+    # fused ReplaySSM ring-write (KDA + GDN spec-verify). When cache_ring,
+    # each draft step stores pre-norm k / raw v / gate / beta into these
+    # per-slot rings for the commit fold. Off by default -> decode unchanged.
     cache_ring: bool = False,
     replayssm_rawv: Optional[torch.Tensor] = None,
     replayssm_rawk: Optional[torch.Tensor] = None,
@@ -405,6 +416,15 @@ def fused_sigmoid_gating_delta_rule_update(
     # ring strides (per-slot rings are contiguous [num_slots, heads, L, dim];
     # the kernel offsets within a slot with MAX_CACHE_LEN and the dim extents).
     if cache_ring:
+        # stride(0) is used as the slot pitch, so a tensor still carrying the
+        # layer dim would scribble outside its slot. The g ring is per-K for
+        # KDA ([slots, HV, L, K]) and per-step scalar for GDN ([slots, HV, L]).
+        assert (
+            replayssm_rawv.dim() == 4
+            and replayssm_rawk.dim() == 4
+            and replayssm_g.dim() == (4 if is_kda else 3)
+            and replayssm_beta.dim() == 3
+        ), "cache_ring expects per-layer ring views"
         max_cache_len = replayssm_rawv.shape[-2]
         stride_rawv_slot = replayssm_rawv.stride(0)
         stride_rawk_slot = replayssm_rawk.stride(0)

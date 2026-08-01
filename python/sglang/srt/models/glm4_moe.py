@@ -84,6 +84,7 @@ from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
 from sglang.srt.runtime_context import (
+    get_exec,
     get_forward,
     get_parallel,
     get_server_args,
@@ -406,7 +407,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
             0
-            if get_server_args().disable_shared_experts_fusion
+            if get_exec().moe.disable_shared_experts_fusion
             else config.n_shared_experts
         )
 
@@ -526,7 +527,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.n_routed_experts + get_server_args().ep_num_redundant_experts
+                config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -1178,7 +1179,7 @@ class Glm4MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = False
 
     def determine_num_fused_shared_experts(self):
-        if get_server_args().disable_shared_experts_fusion:
+        if get_exec().moe.disable_shared_experts_fusion:
             return
 
         disable_reason = None

@@ -89,9 +89,8 @@ def _get_tokenspeed_workspace(
 ) -> torch.Tensor:
     from sglang.srt.runtime_context import get_resources
 
-    # DCP target verification gathers/project-replicates Q to the full head
-    # count before launching TokenSpeed. Size for that launch shape rather than
-    # the rank-local head count used by ordinary decode.
+    # DCP target verification gathers Q to the full head count before launching
+    # TokenSpeed; size for that launch shape, not the rank-local head count.
     num_heads *= get_parallel().attn_dcp_size
     max_q_len = max(max_q_len, _TOKENSPEED_MAX_Q_LEN)
     needed = (

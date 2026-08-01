@@ -1,4 +1,6 @@
-from typing import Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -7,6 +9,10 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.verify_mask import VerifyMask
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 class HybridAttnBackend(AttentionBackend):
@@ -37,6 +43,7 @@ class HybridAttnBackend(AttentionBackend):
         self.needs_cpu_seq_lens = decode_backend.needs_cpu_seq_lens or (
             self.spec_attn_is_prefill and prefill_backend.needs_cpu_seq_lens
         )
+        self.max_context_len = model_runner.model_config.context_len
 
     @property
     def supports_ragged_verify_graph(self) -> bool:
@@ -127,6 +134,18 @@ class HybridAttnBackend(AttentionBackend):
         init = getattr(self.prefill_backend, "init_mha_chunk_metadata", None)
         if init is not None:
             init(forward_batch, disable_flashinfer_ragged)
+
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._select_backend(ForwardMode.TARGET_VERIFY).verify_mask
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # Plan-stream fixup goes to the same child that handed out the mask.
+        self._select_backend(
+            ForwardMode.TARGET_VERIFY
+        ).update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)
 
     def forward(
         self,

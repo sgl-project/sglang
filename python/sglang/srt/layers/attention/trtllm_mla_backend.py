@@ -49,11 +49,18 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_buffer, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_buffer,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
 
 if is_flashinfer_available():
@@ -261,12 +268,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.forward_prefill_metadata: Optional[TRTLLMMLAPrefillMetadata] = None
         self.forward_decode_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
-        self.disable_chunked_prefix_cache = (
-            get_server_args().disable_chunked_prefix_cache
-        )
+        self.disable_chunked_prefix_cache = get_schedule().disable_chunked_prefix_cache
 
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
-        self.cuda_graph_custom_mask = None
+        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
+        self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
@@ -275,18 +280,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # kv-index kernels gather virtual->physical page through `_v2p_page_table`
         # then scale by `_kernel_page_multiplier` (= num MLA layers). See
         # build_dense_mla_views / create_flashmla_kv_indices_triton.
-        alloc = model_runner.token_to_kv_pool_allocator
-        self._kernel_page_multiplier = getattr(alloc, "kernel_page_multiplier", 1)
-        self._unified_mla = self._kernel_page_multiplier > 1
-        self._v2p_page_table = (
-            getattr(alloc, "full_v2p_page_table", None) if self._unified_mla else None
-        )
+        _hooks = unified_mla_hooks(model_runner.token_to_kv_pool_allocator)
+        self._v2p_page_table = _hooks.v2p_page_table
+        self._kernel_page_multiplier = _hooks.kernel_page_multiplier
+        self._unified_mla = _hooks.enabled
         # virtual token id -> DENSE kernel-facing id, for the KV write loc.
-        self._translate_kv_loc_dense = (
-            getattr(alloc, "translate_kv_loc_dense", None)
-            if self._unified_mla
-            else None
-        )
+        self._translate_kv_loc_dense = _hooks.translate_kv_loc_dense
         # Per-forward dense write loc ([:n] view of a capture-stable buffer),
         # set by the cuda-graph out-graph hook; None on the eager path (where the
         # write translates through the pool's _full_translate hook instead).
@@ -434,19 +433,24 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
-        if self.num_draft_tokens and not self.skip_prefill and not self.is_draft_runner:
-            # Worst-case FULL_MASK tree-mask scratch (bool); build_tree writes it
-            # in-place so the gpu_only path needs no seq_lens_sum.
-            self.cuda_graph_custom_mask = torch.zeros(
-                max_num_tokens * (self.max_context_len + self.num_draft_tokens),
-                dtype=torch.bool,
-                device=self.device,
-            )
+        # Target verify never reaches the parent's mask read: it is excluded from
+        # every super() dispatch (init_forward_metadata, _out_graph, forward_extend)
+        # and runs the trtllm-gen kernel, which takes no mask.
+        self._verify_mask = maybe_create_verify_mask(
+            is_draft_runner=self.is_draft_runner,
+            skip_prefill=self.skip_prefill,
+            max_bs=max_bs,
+            max_context_len=self.max_context_len,
+            num_draft_tokens=self.num_draft_tokens,
+            device=self.device,
+            is_read=False,
+        )
 
         super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        return [self.cuda_graph_custom_mask, None]
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     def _init_cuda_graph_metadata(
         self,
@@ -620,12 +624,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             dst = self.cuda_graph_out_cache_loc_dense[:n]
             self._translate_kv_loc_dense(out_cache_loc, out=dst)
             # Replay-prep receives the RAW (unpadded) out_cache_loc
-            # (build_replay_fb_view), but the captured write kernel consumes
-            # the full captured tier of this buffer. Zero the tail so pad
-            # rows write to the dense sink (row 0) instead of stale dense
-            # locs left by earlier larger replays — a stale tail scatters
-            # pad-row garbage into live KV pages. Mirrors the runner's
-            # PaddingPolicy.ZERO on its own out_cache_loc slot.
+            # (build_replay_fb_view), but the captured write kernel consumes the
+            # full captured tier of this buffer. Zero the tail so pad rows write
+            # to the dense sink (row 0) instead of stale dense locs left by
+            # earlier larger replays — a stale tail scatters pad-row garbage into
+            # live KV pages. Mirrors the runner's PaddingPolicy.ZERO on its own
+            # out_cache_loc slot.
             self.cuda_graph_out_cache_loc_dense[n:].zero_()
             self._decode_dense_loc = dst
         else:
