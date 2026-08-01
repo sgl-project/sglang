@@ -863,8 +863,17 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::test_utils::{chat_submitted, chunk, senders};
+    use super::{
+        SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
+        merge_template_stops, unary_chat,
+    };
+    use crate::api_server::guard::AbortGuard;
+    use crate::message::ChunkExtras;
     use crate::runtime::DefaultSamplingParams;
+    use axum::http::StatusCode;
+    use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
+    use futures::StreamExt;
 
     fn request() -> CreateChatCompletionRequest {
         serde_json::from_value(serde_json::json!({
@@ -1007,5 +1016,203 @@ mod tests {
         assert!(legacy.stop_strs().is_none());
         merge_template_stops(&mut req, &legacy);
         assert_eq!(req.stop, Some(Stop::String("x".into())));
+    }
+
+    /// A request with no `max_tokens`/`max_completion_tokens` stays unbounded —
+    /// no terminal default is imposed.
+    #[test]
+    fn chat_without_a_token_limit_stays_unbounded() {
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            chat_sampling_params(&request, &SamplingDefaults::CHAT)
+                .unwrap()
+                .max_new_tokens,
+            None
+        );
+    }
+
+    #[test]
+    fn chat_logprobs_use_dynamo_wire_types() {
+        let extras = ChunkExtras {
+            out_lp_val: vec![-0.25],
+            out_lp_idx: vec![7],
+            out_lp_txt: vec!["x".into()],
+            out_top_val: vec![-0.25, -1.0],
+            out_top_idx: vec![7, 8],
+            out_top_lens: vec![2],
+            out_top_txt: vec!["x".into(), "y".into()],
+            ..Default::default()
+        };
+        let logprobs = chat_logprobs(Some(&extras));
+        let token = &logprobs.content.unwrap()[0];
+        assert_eq!(token.token, "x");
+        assert_eq!(token.top_logprobs.len(), 2);
+        assert_eq!(token.top_logprobs[1].token, "y");
+    }
+
+    #[tokio::test]
+    async fn unary_chat_fans_in_choices_and_usage() {
+        let (choice0, tx0) = chat_submitted(0, "r0");
+        let (choice1, tx1) = chat_submitted(1, "r1");
+        tx0.send(chunk("r0", "Paris", true)).await.unwrap();
+        tx1.send(chunk("r1", "Paris", true)).await.unwrap();
+
+        let response = unary_chat(
+            vec![choice0, choice1],
+            AbortGuard::new_empty(senders()),
+            "chatcmpl-test".into(),
+            "model".into(),
+            1,
+            false,
+            None,
+            None,
+            None,
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(value["choices"][0]["message"]["content"], "Paris");
+        assert_eq!(value["choices"][1]["index"], 1);
+        assert_eq!(value["usage"]["prompt_tokens"], 5);
+        assert_eq!(value["usage"]["completion_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn unary_chat_separates_reasoning_content_with_parser_configured() {
+        let (choice, tx) = chat_submitted(0, "r0");
+        tx.send(chunk(
+            "r0",
+            "<think>because Paris is famous</think>Paris",
+            true,
+        ))
+        .await
+        .unwrap();
+
+        let response = unary_chat(
+            vec![choice],
+            AbortGuard::new_empty(senders()),
+            "chatcmpl-test".into(),
+            "model".into(),
+            1,
+            false,
+            None,
+            Some("deepseek-r1".into()),
+            None,
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["reasoning_content"],
+            "because Paris is famous"
+        );
+        assert_eq!(value["choices"][0]["message"]["content"], "Paris");
+        assert!(value["choices"][0]["message"]["reasoning_content"].is_string());
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_separates_reasoning_into_own_deltas() {
+        let (choice, tx) = chat_submitted(0, "r0");
+        // Force mode starts in reasoning, so the opener is stripped and the first
+        // reasoning fragment streams immediately.
+        tx.send(chunk("r0", "<think>be", false)).await.unwrap();
+        tx.send(chunk("r0", "cause</think>Par", false))
+            .await
+            .unwrap();
+        tx.send(chunk("r0", "is", true)).await.unwrap();
+
+        let stream = chat_event_stream(
+            vec![choice],
+            AbortGuard::new_empty(senders()),
+            "chatcmpl-test".into(),
+            "model".into(),
+            1,
+            false,
+            true,
+            None,
+            Some("deepseek-r1".into()),
+            None,
+            None,
+            false,
+            true,
+            None,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<String> = stream.collect().await;
+        let role: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+        let first_reasoning: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+        let second_reasoning: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
+        let content: serde_json::Value = serde_json::from_str(&frames[3]).unwrap();
+        let terminal: serde_json::Value = serde_json::from_str(&frames[4]).unwrap();
+        assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(
+            first_reasoning["choices"][0]["delta"]["reasoning_content"],
+            "be"
+        );
+        assert!(first_reasoning["choices"][0]["delta"]["content"].is_null());
+        assert_eq!(
+            second_reasoning["choices"][0]["delta"]["reasoning_content"],
+            "cause"
+        );
+        assert_eq!(content["choices"][0]["delta"]["content"], "Par");
+        assert!(content["choices"][0]["delta"]["reasoning_content"].is_null());
+        assert_eq!(terminal["choices"][0]["delta"]["content"], "is");
+        assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
+        assert_eq!(frames.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_emits_role_deltas_usage_and_done() {
+        let (choice, tx) = chat_submitted(0, "r0");
+        tx.send(chunk("r0", "Par", false)).await.unwrap();
+        tx.send(chunk("r0", "is", true)).await.unwrap();
+
+        let stream = chat_event_stream(
+            vec![choice],
+            AbortGuard::new_empty(senders()),
+            "chatcmpl-test".into(),
+            "model".into(),
+            1,
+            false,
+            true,
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<String> = stream.collect().await;
+        assert_eq!(frames.len(), 5);
+        let role: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+        let delta: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+        let terminal: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
+        let usage: serde_json::Value = serde_json::from_str(&frames[3]).unwrap();
+        assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
+        assert!(role["choices"][0]["delta"]["reasoning_content"].is_null());
+        assert_eq!(delta["choices"][0]["delta"]["content"], "Par");
+        assert!(delta["choices"][0]["delta"]["reasoning_content"].is_null());
+        assert_eq!(terminal["choices"][0]["delta"]["content"], "is");
+        assert!(terminal["choices"][0]["delta"]["reasoning_content"].is_null());
+        assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
+        assert_eq!(usage["usage"]["completion_tokens"], 2);
+        assert_eq!(frames[4], "[DONE]");
     }
 }

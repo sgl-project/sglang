@@ -36,7 +36,7 @@ pub(super) fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrappe
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::build_reasoning_parser;
     use dynamo_parsers::reasoning::ReasoningParser;
 
     #[test]

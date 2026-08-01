@@ -697,3 +697,148 @@ fn append_top_logprobs(
         offset = offset.saturating_add(len);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_utils::{chunk, senders, submitted};
+    use super::{
+        ChoiceExtensions, completion_event_stream, completion_logprobs, completion_response_value,
+        unary_completion,
+    };
+    use crate::api_server::guard::AbortGuard;
+    use crate::message::ChunkExtras;
+    use axum::http::StatusCode;
+    use dynamo_protocols::types::{
+        Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
+    };
+    use futures::StreamExt;
+
+    #[test]
+    fn dynamo_completion_request_deserializes_directly() {
+        let request: CreateCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "prompt": ["a", "b"],
+            "max_tokens": 8,
+            "n": 2,
+            "stream_options": {
+                "include_usage": true,
+                "continuous_usage_stats": true
+            }
+        }))
+        .unwrap();
+        assert!(matches!(request.prompt, Prompt::StringArray(_)));
+        assert_eq!(request.n, Some(2));
+        assert!(request.stream_options.unwrap().continuous_usage_stats);
+    }
+
+    #[test]
+    fn max_tokens_zero_is_rejected_before_submission() {
+        let request: CreateCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "prompt": "hello",
+            "max_tokens": 0
+        }))
+        .unwrap();
+        assert_eq!(request.max_tokens, Some(0));
+    }
+
+    #[test]
+    fn zero_top_logprobs_keeps_selected_token_and_empty_top_map() {
+        let extras = ChunkExtras {
+            out_lp_val: vec![-0.25],
+            out_lp_idx: vec![7],
+            out_lp_txt: vec!["x".into()],
+            out_top_lens: vec![0],
+            ..Default::default()
+        };
+        let logprobs = completion_logprobs(Some(&extras), false);
+        assert_eq!(logprobs.tokens, ["x"]);
+        assert_eq!(logprobs.token_logprobs, [Some(-0.25)]);
+        assert_eq!(logprobs.top_logprobs, [serde_json::Value::Null]);
+
+        let value = completion_response_value(
+            CreateCompletionResponse {
+                id: "cmpl-test".into(),
+                choices: vec![Choice {
+                    text: "x".into(),
+                    index: 0,
+                    logprobs: Some(logprobs),
+                    finish_reason: None,
+                }],
+                created: 1,
+                model: "model".into(),
+                system_fingerprint: None,
+                object: "text_completion".into(),
+                usage: None,
+            },
+            &[ChoiceExtensions::default()],
+        );
+        assert_eq!(
+            value["choices"][0]["logprobs"]["text_offset"],
+            serde_json::json!([-1])
+        );
+    }
+
+    #[tokio::test]
+    async fn unary_fold_orders_choices_and_counts_each_prompt_once() {
+        let (choice0, tx0) = submitted(0, 0, "r0");
+        let (choice1, tx1) = submitted(1, 0, "r1");
+        tx0.send(chunk("r0", "a", false)).await.unwrap();
+        tx0.send(chunk("r0", "b", true)).await.unwrap();
+        tx1.send(chunk("r1", "x", false)).await.unwrap();
+        tx1.send(chunk("r1", "y", true)).await.unwrap();
+
+        let response = unary_completion(
+            vec![choice0, choice1],
+            AbortGuard::new_empty(senders()),
+            "cmpl-test".into(),
+            "model".into(),
+            1,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["choices"][0]["text"], "ab");
+        assert_eq!(value["choices"][1]["text"], "xy");
+        assert_eq!(value["choices"][0]["matched_stop"], "</s>");
+        assert_eq!(value["usage"]["prompt_tokens"], 5);
+        assert_eq!(value["usage"]["completion_tokens"], 4);
+    }
+
+    #[tokio::test]
+    async fn stream_uses_deltas_then_usage_and_done() {
+        let (choice, tx) = submitted(0, 0, "r0");
+        tx.send(chunk("r0", "a", false)).await.unwrap();
+        tx.send(chunk("r0", "b", true)).await.unwrap();
+
+        let stream = completion_event_stream(
+            vec![choice],
+            AbortGuard::new_empty(senders()),
+            "cmpl-test".into(),
+            "model".into(),
+            1,
+            false,
+            false,
+            true,
+            false,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<String> = stream.collect().await;
+        assert_eq!(frames.len(), 4);
+        let first: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+        let terminal: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+        let usage: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
+        assert_eq!(first["choices"][0]["text"], "a");
+        assert_eq!(terminal["choices"][0]["text"], "b");
+        assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
+        assert!(usage["choices"].as_array().unwrap().is_empty());
+        assert_eq!(usage["usage"]["prompt_tokens"], 5);
+        assert_eq!(usage["usage"]["completion_tokens"], 2);
+        assert_eq!(frames[3], "[DONE]");
+    }
+}

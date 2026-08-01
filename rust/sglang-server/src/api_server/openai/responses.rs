@@ -861,3 +861,247 @@ fn unary_response_value(response: OpenAIResponse) -> serde_json::Value {
     }
     value
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_utils::{chunk, response_request, senders};
+    use super::{responses_chat_request, responses_event_stream, sse_frame, unary_responses};
+    use crate::api_server::guard::AbortGuard;
+    use dynamo_protocols::types::responses::CreateResponse;
+    use dynamo_protocols::types::{ChatCompletionRequestMessage, ChatCompletionToolChoiceOption};
+    use futures::StreamExt;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn structured_responses_input_reuses_chat_history_and_function_tools() {
+        let request: CreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "input": [
+                {"role": "user", "content": "What is the weather?"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Paris\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "sunny"
+                }
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {"type": "object"}
+            }],
+            "tool_choice": "required"
+        }))
+        .unwrap();
+        let chat = responses_chat_request(&request, "model").unwrap();
+        assert_eq!(chat.messages.len(), 3);
+        assert!(matches!(
+            chat.messages[0],
+            ChatCompletionRequestMessage::User(_)
+        ));
+        assert!(matches!(
+            chat.messages[1],
+            ChatCompletionRequestMessage::Assistant(_)
+        ));
+        assert!(matches!(
+            chat.messages[2],
+            ChatCompletionRequestMessage::Tool(_)
+        ));
+        assert_eq!(chat.tools.unwrap()[0].function.name, "get_weather");
+        assert!(matches!(
+            chat.tool_choice,
+            Some(ChatCompletionToolChoiceOption::Required)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unary_responses_uses_standard_output_items() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(chunk("r0", "Paris", true)).await.unwrap();
+        let response = unary_responses(
+            rx,
+            AbortGuard::new_empty(senders()),
+            "r0".into(),
+            "resp_test".into(),
+            1_234_567_890,
+            "model".into(),
+            response_request(false),
+            None,
+            None,
+            super::super::new_response_store(),
+            vec![],
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["object"], "response");
+        assert_eq!(value["created_at"], 1_234_567_890);
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["output"][0]["type"], "message");
+        assert_eq!(value["output"][0]["content"][0]["text"], "Paris");
+        assert_eq!(value["usage"]["input_tokens"], 5);
+        assert_eq!(value["usage"]["output_tokens"], 1);
+        assert_eq!(value["usage"]["prompt_tokens"], 5);
+        assert_eq!(value["usage"]["completion_tokens"], 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_responses_emits_lifecycle_and_text_deltas() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(chunk("r0", "Par", false)).await.unwrap();
+        tx.send(chunk("r0", "is", true)).await.unwrap();
+        let stream = responses_event_stream(
+            rx,
+            AbortGuard::new_empty(senders()),
+            "r0".into(),
+            "resp_test".into(),
+            1_234_567_890,
+            "model".into(),
+            response_request(true),
+            None,
+            None,
+            None,
+            false,
+            super::super::new_response_store(),
+            vec![],
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<String> = stream.collect().await;
+        let event_types = frames[..frames.len() - 1]
+            .iter()
+            .map(|frame| {
+                serde_json::from_str::<serde_json::Value>(frame).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(event_types[0], "response.created");
+        assert_eq!(event_types[1], "response.in_progress");
+        assert_eq!(
+            event_types
+                .iter()
+                .filter(|event| *event == "response.output_text.delta")
+                .count(),
+            2
+        );
+        assert_eq!(event_types.last().unwrap(), "response.completed");
+        let created: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+        let completed: serde_json::Value = serde_json::from_str(&frames[frames.len() - 2]).unwrap();
+        assert_eq!(created["response"]["created_at"], 1_234_567_890);
+        assert_eq!(completed["response"]["created_at"], 1_234_567_890);
+        assert_eq!(completed["response"]["usage"]["output_tokens"], 2);
+        assert_eq!(frames.last().unwrap(), "[DONE]");
+    }
+
+    /// Python `_send_event` frames each event as `event: {type}\ndata: {payload}`.
+    /// Assert the actual SSE wire bytes: lifecycle frames carry their event name;
+    /// `[DONE]` and error frames stay data-only.
+    #[tokio::test]
+    async fn responses_sse_frames_carry_event_names() {
+        use axum::response::IntoResponse;
+        use std::convert::Infallible;
+
+        let payload =
+            r#"{"type":"response.created","sequence_number":0,"response":{}}"#.to_string();
+        let stream = futures::stream::iter(vec![
+            Ok::<_, Infallible>(sse_frame(payload)),
+            Ok::<_, Infallible>(sse_frame("[DONE]".into())),
+            Ok::<_, Infallible>(sse_frame(r#"{"error":{"message":"boom"}}"#.into())),
+        ]);
+        let response = axum::response::Sse::new(stream).into_response();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let mut frames = text.split("\n\n");
+        let first = frames.next().unwrap();
+        assert!(
+            first.contains("event: response.created"),
+            "missing event name in {text:?}"
+        );
+        assert!(
+            first.contains("response.created"),
+            "missing payload in {text:?}"
+        );
+        assert!(!frames.next().unwrap().contains("event:"));
+        assert!(!frames.next().unwrap().contains("event:"));
+    }
+
+    #[tokio::test]
+    async fn streaming_responses_with_tools_emits_normal_text_deltas() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(chunk("r0", "Par", false)).await.unwrap();
+        tx.send(chunk("r0", "is", true)).await.unwrap();
+        let stream = responses_event_stream(
+            rx,
+            AbortGuard::new_empty(senders()),
+            "r0".into(),
+            "resp_test".into(),
+            1_234_567_890,
+            "model".into(),
+            response_request(true),
+            Some("llama3".into()),
+            None,
+            None,
+            false,
+            super::super::new_response_store(),
+            vec![],
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<String> = stream.collect().await;
+        let deltas = frames
+            .iter()
+            .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+            .filter(|frame| frame["type"] == "response.output_text.delta")
+            .filter_map(|frame| frame["delta"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, ["Par", "is"]);
+    }
+
+    #[tokio::test]
+    async fn streaming_responses_emits_function_call_events() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(chunk(
+            "r0",
+            r#"<|python_tag|>{"name":"get_weather","parameters":{"city":"Paris"}}"#,
+            true,
+        ))
+        .await
+        .unwrap();
+        let stream = responses_event_stream(
+            rx,
+            AbortGuard::new_empty(senders()),
+            "r0".into(),
+            "resp_test".into(),
+            1_234_567_890,
+            "model".into(),
+            response_request(true),
+            Some("llama3".into()),
+            None,
+            None,
+            false,
+            super::super::new_response_store(),
+            vec![],
+        );
+        futures::pin_mut!(stream);
+        let frames = stream.collect::<Vec<_>>().await;
+        let event_types = frames
+            .iter()
+            .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+            .filter_map(|event| event["type"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"response.output_item.added".into()));
+        assert!(event_types.contains(&"response.function_call_arguments.delta".into()));
+        assert!(event_types.contains(&"response.function_call_arguments.done".into()));
+        assert!(event_types.contains(&"response.output_item.done".into()));
+        assert!(event_types.contains(&"response.completed".into()));
+    }
+}

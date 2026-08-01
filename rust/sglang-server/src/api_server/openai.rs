@@ -272,4 +272,4 @@ fn contains_media(value: &serde_json::Value) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+mod test_utils;
