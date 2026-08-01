@@ -32,7 +32,7 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
 
 try:
     from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
@@ -430,10 +430,9 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
-        from sglang.srt.runtime_context import get_server_args
 
         self.enable_waterfill = (
-            num_fused_shared_experts > 0 and get_server_args().enable_waterfill
+            num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
         )
 
         self.waterfill_balancer = None
@@ -507,9 +506,8 @@ class TopK(MultiPlatformOp):
         # ===== TO BE REFACTORED ====
         elif get_moe_runner_backend().is_experimental_sgl_trtllm():
             try:
-                from sglang.srt.runtime_context import get_server_args
 
-                use_standard_for_lora = bool(get_server_args().enable_lora)
+                use_standard_for_lora = bool(get_lora().enable_lora)
             except ValueError:
                 use_standard_for_lora = False
             output_format = (
@@ -1362,9 +1360,9 @@ def _eplb_remap_enabled() -> bool:
         # there is no EPLB mapping, so the remap must be skipped.
         return False
     return (
-        server_args.enable_eplb
-        or server_args.init_expert_location != "trivial"
-        or server_args.ep_num_redundant_experts > 0
+        get_exec().moe.enable_eplb
+        or get_exec().moe.init_expert_location != "trivial"
+        or get_exec().moe.ep_num_redundant_experts > 0
     )
 
 
