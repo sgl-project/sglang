@@ -125,7 +125,16 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
 
-        self.draft_attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        # For topk > 1 the draft decode is batch-expanded: `expand_for_topk_draft`
+        # turns each request into `topk` independent single-token sequences, so
+        # the attention backend sees `max_bs * topk` sequences, not `max_bs`.
+        # Backends that size their CUDA-graph metadata (page tables, per-sequence
+        # seqlens) off this argument must be told the expanded count or they
+        # index out of bounds during capture.
+        self.draft_attn_backend.init_cuda_graph_state(
+            self.max_bs * self.topk if self.topk > 1 else self.max_bs,
+            self.max_num_token,
+        )
         self.seq_len_fill_value = (
             self.draft_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
