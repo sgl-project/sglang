@@ -499,8 +499,19 @@ class MoriKVManager(CommonKVManager):
     def _register_local_buffers(self) -> None:
         if not hasattr(self, "kv_mem_desc_groups"):
             self.kv_mem_desc_groups = []
+        local_kv_mem_kinds = getattr(self.kv_args, "kv_data_mem_kinds", None)
+        if local_kv_mem_kinds is None:
+            # Fail closed. Defaulting to VRAM would register a HiSparse host
+            # mirror as device memory: neither registration nor transfer errors,
+            # but the RDMA write lands in the wrong memory type and the chunked
+            # host path below is skipped, so a multi-GiB region is registered as
+            # a single MR and later trips the Ionic MR limit far from its cause.
+            raise ValueError(
+                "kv_args.kv_data_mem_kinds must be populated by the KVArgs "
+                "construction site before MoRI registers local buffers"
+            )
         self.kv_args.kv_data_mem_kinds = _normalize_kv_mem_kinds(
-            getattr(self.kv_args, "kv_data_mem_kinds", None),
+            local_kv_mem_kinds,
             len(self.kv_args.kv_data_ptrs),
         )
         chunk_limit = envs.SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES.get()
