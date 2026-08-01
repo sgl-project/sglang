@@ -512,13 +512,15 @@ def _ring_attention_varlen(
 
     `q, k, v` are this rank's full local ring chunk (`ring_chunk_len` rows,
     real rows followed by however many of this chunk's rows are padding).
-    Every rank's KV chunk is gathered once (a pipelined P2P rotation that
-    overlaps transfer with compute is a follow-up once correctness is
-    established); each chunk's *real* prefix is then attended locally and
-    merged via online softmax. Padding rows never contribute to any KV
-    chunk (their output is unused downstream, but must not be corrupted by
-    attending across the padding boundary), and a chunk that is entirely
-    padding is skipped outright.
+    KV is P2P-rotated around the ring one hop per step (send this step's
+    buffer to the next rank, receive the following step's buffer from the
+    previous rank) so the hop for step+1 overlaps this step's attention
+    compute -- unlike a single blocking all_gather, no step waits on the
+    full ring's transfer before its own compute can start. Each hop's
+    *real* prefix is attended locally and merged via online softmax.
+    Padding rows never contribute to any KV chunk (their output is unused
+    downstream, but must not be corrupted by attending across the padding
+    boundary), and a chunk that is entirely padding is skipped outright.
     """
     from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
     from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
@@ -529,45 +531,98 @@ def _ring_attention_varlen(
     ring_pg = get_sp_group().ring_group
     assert ring_pg is not None, "Ring process group is not initialized."
     ring_chunk_len = q.shape[0]
+    _, ring_rank = _ring_ctx()
+
+    # `isend`/`irecv` (unlike collectives) address peers by global rank even
+    # under a sub-group, so resolve this ring's neighbors once up front.
+    next_global_rank = torch.distributed.get_global_rank(
+        ring_pg, (ring_rank + 1) % ring_ws
+    )
+    prev_global_rank = torch.distributed.get_global_rank(
+        ring_pg, (ring_rank - 1) % ring_ws
+    )
 
     k = k.contiguous()
     v = v.contiguous()
-    k_list = [torch.empty_like(k) for _ in range(ring_ws)]
-    v_list = [torch.empty_like(v) for _ in range(ring_ws)]
-    torch.distributed.all_gather(k_list, k, group=ring_pg)
-    torch.distributed.all_gather(v_list, v, group=ring_pg)
+    # double-buffered: index 0 starts as this rank's own local chunk, index 1
+    # is the landing pad for whatever hop is currently in flight.
+    k_bufs = [k, torch.empty_like(k)]
+    v_bufs = [v, torch.empty_like(v)]
+    cur = 0
 
     q_cu = torch.tensor([0, ring_chunk_len], dtype=torch.int32, device=q.device)
     out_acc: torch.Tensor | None = None
     lse_acc: torch.Tensor | None = None
-    for src_rank in range(ring_ws):
+    pending_ops = None
+    for step in range(ring_ws):
+        nxt = 1 - cur
+        if step < ring_ws - 1:
+            # kick off next hop before this step's compute so the transfer
+            # overlaps it; wait for completion only after issuing compute.
+            pending_ops = torch.distributed.batch_isend_irecv(
+                [
+                    torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        k_bufs[cur],
+                        next_global_rank,
+                        group=ring_pg,
+                    ),
+                    torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        v_bufs[cur],
+                        next_global_rank,
+                        group=ring_pg,
+                    ),
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        k_bufs[nxt],
+                        prev_global_rank,
+                        group=ring_pg,
+                    ),
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        v_bufs[nxt],
+                        prev_global_rank,
+                        group=ring_pg,
+                    ),
+                ]
+            )
+
+        src_rank = (ring_rank - step) % ring_ws
         remote_used = min(
             max(real_seq_len - src_rank * ring_chunk_len, 0), ring_chunk_len
         )
-        if remote_used == 0:
-            continue
-        k_cu = torch.tensor([0, remote_used], dtype=torch.int32, device=q.device)
-        result = flash_attn_varlen_func(
-            q,
-            k_list[src_rank][:remote_used],
-            v_list[src_rank][:remote_used],
-            cu_seqlens_q=q_cu,
-            cu_seqlens_k=k_cu,
-            max_seqlen_q=ring_chunk_len,
-            max_seqlen_k=remote_used,
-            softmax_scale=attention.softmax_scale,
-            causal=False,
-            ver=_fa_backend.fa_ver,
-            return_softmax_lse=True,
-        )
-        if not isinstance(result, tuple):
-            raise RuntimeError(
-                "flash_attn_varlen_func did not return softmax_lse; ring "
-                "parallelism requires a backend that supports "
-                "return_softmax_lse=True."
+        if remote_used > 0:
+            k_cu = torch.tensor([0, remote_used], dtype=torch.int32, device=q.device)
+            result = flash_attn_varlen_func(
+                q,
+                k_bufs[cur][:remote_used],
+                v_bufs[cur][:remote_used],
+                cu_seqlens_q=q_cu,
+                cu_seqlens_k=k_cu,
+                max_seqlen_q=ring_chunk_len,
+                max_seqlen_k=remote_used,
+                softmax_scale=attention.softmax_scale,
+                causal=False,
+                ver=_fa_backend.fa_ver,
+                return_softmax_lse=True,
             )
-        step_out, step_lse, *_ = result
-        out_acc, lse_acc = _ring_merge_attention(out_acc, lse_acc, step_out, step_lse)
+            if not isinstance(result, tuple):
+                raise RuntimeError(
+                    "flash_attn_varlen_func did not return softmax_lse; ring "
+                    "parallelism requires a backend that supports "
+                    "return_softmax_lse=True."
+                )
+            step_out, step_lse, *_ = result
+            out_acc, lse_acc = _ring_merge_attention(
+                out_acc, lse_acc, step_out, step_lse
+            )
+
+        if pending_ops is not None:
+            for op in pending_ops:
+                op.wait()
+            pending_ops = None
+            cur = nxt
     return out_acc.to(q.dtype)
 
 
