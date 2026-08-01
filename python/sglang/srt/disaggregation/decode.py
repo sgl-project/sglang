@@ -1783,10 +1783,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         tree_cache: BasePrefixCache,
     ):
         self.queue: List[DecodeRequest] = []
-        # Backends do not currently expose a portable terminal drain fence.
-        # Keep every failed Radix HiSparse lease alive for the process lifetime
-        # so a late RDMA write cannot target a recycled L1 page or request slot.
-        self.quarantined_transfers: List[DecodeRequest] = []
         self.gloo_group = gloo_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
@@ -2011,20 +2007,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         transferred_reqs = []
         indices_to_remove = set()
-        quarantined_indices = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
             hicache_restore_status = decode_req.hicache_restore_status
-            quarantine_transfer = (
-                self.scheduler.enable_hisparse
-                and self.scheduler.hisparse_coordinator.is_radix_hisparse
-                and (
-                    poll == KVPoll.Failed
-                    or hicache_restore_status == HiCacheRestoreResult.FAILED
-                )
-            )
             if (
                 poll == KVPoll.Failed
                 or hicache_restore_status == HiCacheRestoreResult.FAILED
@@ -2034,14 +2021,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 )
                 is_propagated = False
-                if poll == KVPoll.Failed and not quarantine_transfer:
+                if poll == KVPoll.Failed:
                     try:
                         decode_req.kv_receiver.failure_exception()
                     except Exception as e:
                         error_message += f" with exception {e}"
                         is_propagated = getattr(e, "is_from_another_rank", False)
-                if not quarantine_transfer:
-                    self._clean_hicache_prefetch_resources(decode_req)
+                self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
                     logger.debug(error_message)
@@ -2056,29 +2042,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                if quarantine_transfer:
-                    # failure_exception(), abort(), and clear() may all discard
-                    # backend transfer trackers. There is no portable terminal
-                    # drain fence, so retain the untouched receiver plus every
-                    # addressable resource for the process lifetime.
-                    self.quarantined_transfers.append(decode_req)
-                    quarantined_indices.add(i)
-                    logger.error(
-                        "Quarantined failed Radix HiSparse transfer lease: "
-                        "rid=%s req_pool_idx=%s metadata_buffer_index=%s",
-                        decode_req.req.rid,
-                        decode_req.req.req_pool_idx,
-                        decode_req.metadata_buffer_index,
-                    )
-                else:
-                    if self.scheduler.enable_hisparse:
-                        self.scheduler.hisparse_coordinator.request_finished(
-                            decode_req.req
-                        )
-                    # Release pre-allocated KV without inserting a failed request.
-                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-                    decode_req.kv_receiver.clear()
-                    decode_req.kv_receiver = None
+                if self.scheduler.enable_hisparse:
+                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+                # Release pre-allocated kv cache, but don't insert into the tree since it's failed
+                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
                 indices_to_remove.add(i)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -2117,8 +2086,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 raise ValueError(f"Unexpected poll case: {poll}")
 
         for i in indices_to_remove:
-            if i in quarantined_indices:
-                continue
             if self.enable_staging and self.staging_handler.is_staging_room(
                 self.queue[i].req.bootstrap_room
             ):
@@ -2138,18 +2105,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         return transferred_reqs
 
-    def has_quarantined_transfers(self) -> bool:
-        return bool(self.quarantined_transfers)
-
-    def get_quarantined_reqs(self) -> List[Req]:
-        return [decode_req.req for decode_req in self.quarantined_transfers]
-
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
-        if self.quarantined_transfers:
-            raise RuntimeError(
-                "Cannot release memory while failed RDMA leases are quarantined"
-            )
         self.queue.clear()
 
     def resume_memory_occupation(self):
@@ -2191,8 +2148,6 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
-            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.invariant_checker.self_check_during_busy()
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
@@ -2250,8 +2205,6 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
-            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.invariant_checker.self_check_during_busy()
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch

@@ -12,10 +12,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.invariant_checker import (
-    SchedulerInvariantChecker,
-)
-from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -25,18 +21,12 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class FakeReceiver:
     def __init__(self):
         self.clear_called = False
-        self.abort_called = False
-        self.failure_exception_called = False
 
     def clear(self):
         self.clear_called = True
 
     def failure_exception(self):
-        self.failure_exception_called = True
         return None
-
-    def abort(self):
-        self.abort_called = True
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
@@ -198,109 +188,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
             req, queue.tree_cache, is_insert=False
         )
 
-    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
-    @patch("sglang.srt.disaggregation.decode.prepare_abort")
-    @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
-    def test_radix_hisparse_transfer_failure_quarantines_whole_lease(
-        self, mock_poll, mock_prepare_abort, mock_release_kv_cache
-    ):
-        class DestructiveFailureReceiver(FakeReceiver):
-            def failure_exception(self):
-                self.failure_exception_called = True
-                self.clear()
-                raise RuntimeError("backend cleared receiver state")
-
-        receiver = DestructiveFailureReceiver()
-        req = SimpleNamespace(
-            rid="failed-radix-transfer",
-            bootstrap_room=7,
-            return_logprob=False,
-            req_pool_idx=2,
-        )
-        decode_req = SimpleNamespace(
-            req=req,
-            kv_receiver=receiver,
-            metadata_buffer_index=3,
-            hicache_restore_status=HiCacheRestoreResult.READY,
-        )
-
-        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-        queue.queue = [decode_req]
-        queue.quarantined_transfers = []
-        queue.enable_staging = False
-        queue.gloo_group = MagicMock()
-        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
-        queue.tp_rank = 0
-        queue.tree_cache = MagicMock()
-        queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None, None, None, 99])
-        queue.spec_algorithm = MagicMock()
-        queue.spec_algorithm.is_none.return_value = True
-        queue._clean_hicache_prefetch_resources = MagicMock()
-
-        scheduler = MagicMock()
-        scheduler.enable_decode_hicache = False
-        scheduler.enable_hisparse = True
-        scheduler.hisparse_coordinator.is_radix_hisparse = True
-        scheduler.output_streamer = MagicMock()
-        scheduler.metrics_reporter.enable_metrics = False
-        queue.scheduler = scheduler
-        mock_poll.return_value = [KVPoll.Failed]
-
-        transferred = queue.pop_transferred()
-
-        self.assertEqual(transferred, [])
-        self.assertEqual(queue.queue, [])
-        self.assertEqual(queue.quarantined_transfers, [decode_req])
-        self.assertFalse(receiver.failure_exception_called)
-        self.assertFalse(receiver.abort_called)
-        self.assertFalse(receiver.clear_called)
-        self.assertIs(decode_req.kv_receiver, receiver)
-        self.assertEqual(queue.metadata_buffers.bootstrap_room[3], 99)
-        queue.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
-        mock_release_kv_cache.assert_not_called()
-        scheduler.hisparse_coordinator.request_finished.assert_not_called()
-        queue._clean_hicache_prefetch_resources.assert_not_called()
-        self.assertTrue(queue.has_quarantined_transfers())
-        with self.assertRaisesRegex(RuntimeError, "quarantined"):
-            queue.release_memory_occupation()
-
-    def test_quarantine_only_busy_check_detects_reused_req_slot(self):
-        req = SimpleNamespace(
-            rid="quarantined",
-            req_pool_idx=2,
-            kv=SimpleNamespace(kv_allocated_len=2),
-            cache_protected_len=0,
-        )
-        pool_stats = PoolStats(
-            full_num_used=2,
-            full_token_usage=0.5,
-            full_available_size=2,
-            full_evictable_size=0,
-        )
-        checker = SchedulerInvariantChecker(
-            is_hybrid_swa=False,
-            is_hybrid_ssm=False,
-            disaggregation_mode=DisaggregationMode.DECODE,
-            page_size=1,
-            full_tokens_per_layer=None,
-            swa_tokens_per_layer=None,
-            max_total_num_tokens=4,
-            server_args=SimpleNamespace(dcp_size=1),
-            tree_cache=SimpleNamespace(protected_size=lambda: 0),
-            token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
-            req_to_token_pool=SimpleNamespace(free_slots=[1, 2]),
-            pool_stats_observer=SimpleNamespace(
-                get_pool_stats=lambda: pool_stats,
-                session_held_tokens=lambda: 0,
-            ),
-            get_last_batch=lambda: None,
-            get_running_batch=lambda: None,
-            get_quarantined_reqs=lambda: [req],
-        )
-
-        with self.assertRaisesRegex(AssertionError, "req slots"):
-            checker.self_check_during_busy()
-
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.running_batch = MagicMock()
@@ -319,9 +206,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
             queue=[], retracted_queue=[object()]
         )
-        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
-            queue=[], has_quarantined_transfers=lambda: False
-        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
         scheduler.decode_offload_manager = None
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False

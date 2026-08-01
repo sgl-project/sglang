@@ -153,7 +153,6 @@ class SchedulerPoolStatsObserver:
     max_total_num_tokens: int
     get_last_batch: Callable
     get_running_batch: Callable
-    get_quarantined_reqs: Callable
 
     def streaming_session_count(self) -> int:
         return sum(
@@ -175,9 +174,6 @@ class SchedulerPoolStatsObserver:
             for req in batch.reqs:
                 if req.req_pool_idx is not None:
                     idxs.add(req.req_pool_idx)
-        for req in self.get_quarantined_reqs():
-            if req.req_pool_idx is not None:
-                idxs.add(req.req_pool_idx)
         return idxs
 
     def session_held_tokens(self) -> int:

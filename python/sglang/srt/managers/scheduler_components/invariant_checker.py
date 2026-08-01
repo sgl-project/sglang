@@ -56,7 +56,6 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
-    get_quarantined_reqs: Callable
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -238,7 +237,7 @@ class SchedulerInvariantChecker:
         # dataclass __eq__ compares tensor fields and raises on ambiguous bools.
         last_batch = self.get_last_batch()
         running_batch = self.get_running_batch()
-        batches = [] if last_batch is None else [last_batch]
+        batches = [last_batch]
         if (
             running_batch is not None
             and running_batch is not last_batch
@@ -264,22 +263,10 @@ class SchedulerInvariantChecker:
                         req.cache_protected_len, req.kv.swa_evicted_seqlen
                     )
 
-        for req in self.get_quarantined_reqs():
-            if req.kv is None:
-                continue
-            allocated_len = req.kv.kv_allocated_len
-            if self.page_size > 1:
-                allocated_len = ceil_align(allocated_len, self.page_size)
-            full_uncached += allocated_len - req.cache_protected_len
-            if self.is_hybrid_swa:
-                swa_uncached += allocated_len - max(
-                    req.cache_protected_len, req.kv.swa_evicted_seqlen
-                )
-
         return full_uncached, swa_uncached
 
     def self_check_during_busy(self):
-        if self.get_last_batch() is None and not self.get_quarantined_reqs():
+        if self.get_last_batch() is None:
             return
 
         ps = self.pool_stats_observer.get_pool_stats()
@@ -312,19 +299,6 @@ class SchedulerInvariantChecker:
         assert not full_leak, f"Full Pool Mem Leak Detected! {full_msg}"
         assert not swa_leak, f"SWA Pool Mem Leak Detected! {swa_msg}"
 
-        quarantined_req_slots = {
-            req.req_pool_idx
-            for req in self.get_quarantined_reqs()
-            if req.req_pool_idx is not None
-        }
-        reused_req_slots = quarantined_req_slots.intersection(
-            self.req_to_token_pool.free_slots
-        )
-        assert not reused_req_slots, (
-            "Quarantined RDMA req slots were returned to the free pool: "
-            f"{sorted(reused_req_slots)}"
-        )
-
         if envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get():
             self._check_kv_page_invariants()
 
@@ -349,15 +323,6 @@ class SchedulerInvariantChecker:
                 _add_owner(
                     req,
                     f"req {req.rid}",
-                    req.req_pool_idx,
-                    req.kv_committed_len,
-                    req.kv.kv_allocated_len,
-                )
-        for req in self.get_quarantined_reqs():
-            if req.kv is not None:
-                _add_owner(
-                    req,
-                    f"quarantined req {req.rid}",
                     req.req_pool_idx,
                     req.kv_committed_len,
                     req.kv.kv_allocated_len,
@@ -444,24 +409,11 @@ class SchedulerInvariantChecker:
             req_total_size = self.req_to_token_pool.size
 
         session_req_count = self.pool_stats_observer.session_held_req_count()
-        quarantined_req_count = len(
-            {
-                req.req_pool_idx
-                for req in self.get_quarantined_reqs()
-                if req.req_pool_idx is not None
-            }
-        )
-        if (
-            len(self.req_to_token_pool.free_slots)
-            + session_req_count
-            + quarantined_req_count
-            != req_total_size
-        ):
+        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"session_held={session_req_count}, "
-                f"quarantined={quarantined_req_count}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
             raise_error_or_warn(
