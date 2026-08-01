@@ -1084,9 +1084,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_positions = seq_positions.view(batch_size, -1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
-            mrope_delta_tensor = torch.zeros(
-                (batch_size, 1), dtype=torch.int64, device=device
+            # Text-only deltas are all zero: the positions ARE the mrope rows.
+            # A stride-0 expand is enough -- every consumer either copy_()s
+            # into a static graph buffer or indexes rows.
+            self.mrope_positions = (
+                seq_positions.reshape(1, -1).to(torch.int64).expand(3, -1)
             )
+            return
         else:
             mrope_deltas = [
                 (
