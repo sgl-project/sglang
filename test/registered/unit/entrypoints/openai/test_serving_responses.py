@@ -602,11 +602,13 @@ class ChatToolChoiceConversionTestCase(CustomTestCase):
         fn = OpenAIServingResponses._chat_tool_choice
         for s in ("auto", "required", "none"):
             self.assertEqual(fn(s), s)
+        # Input is an effective_tool_choice() result, so the only object form
+        # reaching here is a named function; degrading the rest to "auto"
+        # happens there, once, so the echoed and the honored value agree.
         self.assertEqual(
             fn({"type": "function", "name": "get_weather"}),
             {"type": "function", "function": {"name": "get_weather"}},
         )
-        self.assertEqual(fn({"type": "web_search"}), "auto")  # non-function -> auto
 
 
 class ShouldEmitNormalTextTestCase(CustomTestCase):

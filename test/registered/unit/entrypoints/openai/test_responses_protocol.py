@@ -3,11 +3,27 @@ import unittest
 
 from utils import make_serving  # noqa: F401 — bootstrap import
 
-from sglang.srt.entrypoints.openai.protocol import ResponsesRequest, UsageInfo
+from sglang.srt.entrypoints.openai.protocol import (
+    ResponsesRequest,
+    ResponsesResponse,
+    UsageInfo,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+
+
+def _in_progress_response(request: ResponsesRequest) -> ResponsesResponse:
+    return ResponsesResponse.from_request(
+        request,
+        sampling_params={},
+        model_name="x",
+        created_time=0,
+        output=[],
+        status="in_progress",
+        usage=None,
+    )
 
 
 class ResponsesRequestTestCase(CustomTestCase):
@@ -320,30 +336,27 @@ class ResponsesResponseFromRequestTestCase(CustomTestCase):
         self.assertNotIn("prompt_tokens", usage)
         self.assertNotIn("completion_tokens", usage)
 
-    def test_effort_none_not_echoed_so_streaming_event_validates(self):
+    def test_only_sdk_known_efforts_echoed_so_streaming_event_validates(self):
         import openai.types.responses as ort
 
-        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
-
-        req = ResponsesRequest(
-            model="x", input="hi", store=False, reasoning={"effort": "none"}
-        )
-        resp = ResponsesResponse.from_request(
-            req,
-            sampling_params={},
-            model_name="x",
-            created_time=0,
-            output=[],
-            status="in_progress",
-            usage=None,
-        )
-        # "none" is our request-side extension; OpenAI's Response schema rejects
-        # it, so it must not be echoed (else the typed streaming event below
-        # raises a ValidationError and the stream emits nothing).
-        self.assertIsNone(resp.reasoning["effort"])
-        ort.ResponseCreatedEvent(
-            type="response.created", sequence_number=0, response=resp.model_dump()
-        )
+        # OpenAI's Reasoning.effort literal is narrower than our tier list:
+        # "none" is a request-side extension and xhigh/max postdate it. Echoing
+        # one of those raises a ValidationError in the typed event below, which
+        # the stream generator builds before its try block -- the connection
+        # then dies without a single SSE byte.
+        for effort in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
+            resp = _in_progress_response(
+                ResponsesRequest(
+                    model="x", input="hi", store=False, reasoning={"effort": effort}
+                )
+            )
+            expected = (
+                effort if effort in ("minimal", "low", "medium", "high") else None
+            )
+            self.assertEqual(resp.reasoning["effort"], expected, effort)
+            ort.ResponseCreatedEvent(
+                type="response.created", sequence_number=0, response=resp.model_dump()
+            )
 
 
 class InputItemStringIdTestCase(CustomTestCase):
@@ -390,6 +403,33 @@ class ToolChoiceObjectFormTestCase(CustomTestCase):
             tool_choice={"type": "function", "name": "get_weather"},
         )
         self.assertEqual(req.tool_choice["name"], "get_weather")
+
+    def test_echoed_choice_is_what_the_server_honors(self):
+        import openai.types.responses as ort
+
+        named = {"type": "function", "name": "get_weather"}
+        # Object forms other than a named function cannot be forced through the
+        # tool-call parser, so the response must echo the "auto" we actually
+        # run -- which also keeps it inside the SDK's ToolChoice union that the
+        # typed event below validates against.
+        for tool_choice, expected in (
+            ("auto", "auto"),
+            ("required", "required"),
+            ("none", "none"),
+            (named, named),
+            ({"type": "function", "function": {"name": "get_weather"}}, named),
+            ({"type": "web_search"}, "auto"),
+            ({"type": "mcp", "server_label": "s"}, "auto"),
+        ):
+            req = ResponsesRequest(
+                model="x", input="hi", store=False, tool_choice=tool_choice
+            )
+            self.assertEqual(req.effective_tool_choice(), expected, tool_choice)
+            resp = _in_progress_response(req)
+            self.assertEqual(resp.tool_choice, expected, tool_choice)
+            ort.ResponseCreatedEvent(
+                type="response.created", sequence_number=0, response=resp.model_dump()
+            )
 
 
 if __name__ == "__main__":

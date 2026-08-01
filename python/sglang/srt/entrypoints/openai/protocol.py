@@ -711,6 +711,10 @@ class ToolChoice(BaseModel):
 ReasoningEffortTier = Literal[
     "none", "minimal", "low", "medium", "high", "xhigh", "max"
 ]
+# OpenAI's ``Reasoning.effort`` literal trails the tiers above, and the typed
+# /v1/responses stream events validate a response against it. Only these echo
+# back; the rest report None rather than failing the whole stream.
+ECHOABLE_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
 # Chat Completions and /v1/tokenize additionally accept a fine-grained float in
 # [0.0, 0.99] as an sglang extension (not part of the OpenAI schema, so the
 # /v1/responses surface deliberately keeps the string tiers only). Single-sourced
@@ -1639,6 +1643,24 @@ class ResponsesRequest(BaseModel):
         """Whether ``text.format`` constrains the output to JSON."""
         return self._json_schema_from_text_format(self.text) is not None
 
+    def effective_tool_choice(self) -> Union[str, Dict[str, Any]]:
+        """``tool_choice`` reduced to what the server can actually honor.
+
+        Of the object forms only a named ``function`` survives: the others
+        (web_search, mcp, ...) cannot be forced through the tool-call parser and
+        degrade to "auto". This is also what keeps the echoed value inside the
+        OpenAI SDK's ToolChoice union, which the stream events validate against.
+        """
+        tool_choice = self.tool_choice
+        if not isinstance(tool_choice, dict):
+            return tool_choice
+        name = tool_choice.get("name") or (tool_choice.get("function") or {}).get(
+            "name"
+        )
+        if tool_choice.get("type") == "function" and name:
+            return {"type": "function", "name": name}
+        return "auto"
+
     def to_sampling_params(
         self,
         default_max_tokens: int,
@@ -1859,7 +1881,7 @@ class ResponsesResponse(BaseModel):
                 if request.parallel_tool_calls is not None
                 else True
             ),
-            tool_choice=request.tool_choice,
+            tool_choice=request.effective_tool_choice(),
             tools=request.tools,
             # fields for parity with v1/responses
             error=None,
@@ -1870,11 +1892,10 @@ class ResponsesResponse(BaseModel):
             max_output_tokens=request.max_output_tokens,
             previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store
             reasoning={
-                # "none" is our request-side extension; OpenAI's effort literal
-                # lacks it and the typed stream events reject it, so echo None.
                 "effort": (
                     request.reasoning.effort
-                    if request.reasoning and request.reasoning.effort != "none"
+                    if request.reasoning
+                    and request.reasoning.effort in ECHOABLE_REASONING_EFFORTS
                     else None
                 ),
                 "summary": None,  # unused

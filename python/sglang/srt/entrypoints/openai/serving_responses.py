@@ -580,7 +580,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             stream=request.stream,
             tools=chat_tools or None,
             tool_choice=(
-                self._chat_tool_choice(request.tool_choice) if chat_tools else "none"
+                self._chat_tool_choice(request.effective_tool_choice())
+                if chat_tools
+                else "none"
             ),
             parallel_tool_calls=(
                 request.parallel_tool_calls
@@ -955,23 +957,15 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _chat_tool_choice(tool_choice: Any) -> Any:
-        """Convert a Responses tool_choice to the chat-completions shape.
+        """Reshape an ``effective_tool_choice()`` result for chat completions.
 
         Responses uses the flat object form ``{"type":"function","name":X}``;
         chat expects ``{"type":"function","function":{"name":X}}``. String forms
-        ("auto"/"required"/"none") pass through. Non-function object forms
-        (web_search, mcp, ...) can't be forced via the chat tool parser, so
-        they degrade to "auto".
+        ("auto"/"required"/"none") pass through.
         """
         if not isinstance(tool_choice, dict):
             return tool_choice
-        if tool_choice.get("type") == "function":
-            name = tool_choice.get("name") or (tool_choice.get("function") or {}).get(
-                "name"
-            )
-            if name:
-                return {"type": "function", "function": {"name": name}}
-        return "auto"
+        return {"type": "function", "function": {"name": tool_choice["name"]}}
 
     @staticmethod
     def _response_tools_to_chat_tools(request: ResponsesRequest) -> list[Tool]:
