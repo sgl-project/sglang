@@ -76,9 +76,9 @@ def test_dsv4_direct_cp_kv_store_exact(global_tokens: int) -> None:
     torch.manual_seed(20260801 + global_tokens)
     global_kv = torch.randn((global_tokens, 512), dtype=torch.bfloat16, device=device)
     local_kv = global_kv[state.rank :: state.world_size].contiguous()
-    global_indices = torch.randperm(
-        MAX_TOKENS, dtype=torch.int32, device=device
-    )[:global_tokens]
+    global_indices = torch.randperm(MAX_TOKENS, dtype=torch.int32, device=device)[
+        :global_tokens
+    ]
     local_indices = global_indices[state.rank :: state.world_size].contiguous()
 
     gathered = torch.empty_like(global_kv)
