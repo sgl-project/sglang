@@ -7,6 +7,7 @@ by bare assignment and fail closed until published.
 
 import dataclasses
 import unittest
+from unittest import mock
 
 from sglang.srt import runtime_context as rc
 from sglang.srt.arg_groups.arg_utils import NS, A
@@ -125,6 +126,71 @@ class TestConfigBagTree(CustomTestCase):
     def test_leaf_subgroup_collision_raises(self):
         with self.assertRaises(ValueError):
             rc._build_config_bags(_CollisionFake())
+
+
+class TestRoleNamespaceEnforcement(CustomTestCase):
+    """SGLANG_ROLE_NAMESPACES: off (default) is free; record collects the
+    per-role read audit; enforce fails closed on reads outside the role's
+    declared set."""
+
+    def setUp(self):
+        rc.reset_context()
+
+    def tearDown(self):
+        rc.reset_context()
+
+    def _publish(self, role):
+        rc.publish(ServerArgs(model_path="dummy"), role=role)
+
+    def test_off_mode_ignores_declared_sets(self):
+        self._publish("test")
+        with mock.patch.dict(rc.ROLE_NAMESPACE_SETS, {"test": frozenset({"serving"})}):
+            rc.get_exec()  # off mode: no enforcement despite the narrow set
+
+    def test_enforce_blocks_reads_outside_the_declared_set(self):
+        self._publish("test")
+        with mock.patch.object(rc, "_ROLE_NS_MODE", "enforce"), mock.patch.dict(
+            rc.ROLE_NAMESPACE_SETS, {"test": frozenset({"serving", "schedule"})}
+        ):
+            rc.get_serving()
+            rc.get_schedule()
+            with self.assertRaisesRegex(ValueError, "outside the declared set"):
+                rc.get_exec()
+
+    def test_enforce_full_tree_role_and_roleless_install_are_unrestricted(self):
+        with mock.patch.object(rc, "_ROLE_NS_MODE", "enforce"):
+            self._publish("scheduler")  # None in the table = full tree
+            rc.get_exec()
+            rc.get_mm()
+            # A direct set_server_args install is roleless; enforcement only
+            # keys off a recorded publish role.
+            rc.get_context().set_server_args(ServerArgs(model_path="dummy"))
+            rc.get_exec()
+
+    def test_off_mode_bag_read_traces_under_torch_compile(self):
+        # config_bag runs inside compiled model forwards; the mode gate must
+        # stay a dead-branch-prunable check in the default "off" mode.
+        import torch
+
+        self._publish("test")
+
+        @torch.compile(fullgraph=True, backend="eager", dynamic=False)
+        def probe(x):
+            if rc.get_schedule().max_running_requests is None:
+                return x + 1
+            return x * 2
+
+        self.assertEqual(probe(torch.zeros(())).item(), 1.0)
+
+    def test_record_mode_collects_the_audit(self):
+        self._publish("test")
+        with mock.patch.object(rc, "_ROLE_NS_MODE", "record"), mock.patch.object(
+            rc, "_RECORDED_NS_READS", set()
+        ):
+            rc.get_exec()
+            rc.get_disagg()
+            self.assertIn(("test", "exec"), rc._RECORDED_NS_READS)
+            self.assertIn(("test", "disagg"), rc._RECORDED_NS_READS)
 
 
 if __name__ == "__main__":
