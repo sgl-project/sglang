@@ -23,10 +23,13 @@ from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
-from sglang.kernels.ops.attention.fla.op import exp, log
+from sglang.kernels.ops.attention.fla.op import exp, exp2, log
 from sglang.kernels.ops.attention.fla.utils import (
+    autotune_cache_kwargs,
     check_shared_mem,
     is_intel,
+    is_nvidia,
+    is_tf32_supported,
 )
 
 if is_intel:
@@ -36,6 +39,10 @@ if is_intel:
 
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+
+# Convert natural-log gates to log2 space before the exp2-based chunk kernels.
+# log2(e) rounded to fp32, matching flash-linear-attention.
+RCP_LN2 = 1.4426950216293335
 
 
 def cdiv(a: int, b: int) -> int:
@@ -223,6 +230,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     A,
     Aqk,
     scale,
+    gk_scale,
     cu_seqlens,
     chunk_indices,
     T,
@@ -288,19 +296,22 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
         o_k = i_k * BK + tl.arange(0, BK)
         m_k = o_k < K
         # [BK,]
-        b_gn = tl.load(g + (i_t * BT + i_i * BC) * H * K + o_k, mask=m_k, other=0)
+        b_gn = (
+            tl.load(g + (i_t * BT + i_i * BC) * H * K + o_k, mask=m_k, other=0)
+            * gk_scale
+        )
         # [BC, BK]
-        b_g = tl.load(p_g, boundary_check=(0, 1))
-        b_k = tl.load(p_k, boundary_check=(0, 1)) * exp(b_g - b_gn[None, :])
+        b_g = tl.load(p_g, boundary_check=(0, 1)) * gk_scale
+        b_k = tl.load(p_k, boundary_check=(0, 1)) * exp2(b_g - b_gn[None, :])
         # [BK, BC]
-        b_gk = tl.load(p_gk, boundary_check=(0, 1))
+        b_gk = tl.load(p_gk, boundary_check=(0, 1)) * gk_scale
         b_kt = tl.load(b_kt, boundary_check=(0, 1))
         # [BC, BC]
-        b_ktg = b_kt * exp(b_gn[:, None] - b_gk)
+        b_ktg = b_kt * exp2(b_gn[:, None] - b_gk)
         b_A += tl.dot(b_k, b_ktg)
 
         b_q = tl.load(p_q, boundary_check=(0, 1))
-        b_qg = b_q * exp(b_g - b_gn[None, :]) * scale
+        b_qg = b_q * exp2(b_g - b_gn[None, :]) * scale
         b_Aqk += tl.dot(b_qg, b_ktg)
 
     b_A *= b_b[:, None]
@@ -328,6 +339,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     A,
     Aqk,
     scale,
+    gk_scale,
     cu_seqlens,
     chunk_indices,
     T,
@@ -388,7 +400,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     )
     b_q = tl.load(p_q, boundary_check=(0, 1))
     b_k = tl.load(p_k, boundary_check=(0, 1))
-    b_g = tl.load(p_g, boundary_check=(0, 1))
+    b_g = tl.load(p_g, boundary_check=(0, 1)) * gk_scale
 
     p_b = beta + (bos + i_t * BT + i_i * BC + o_i) * H + i_h
     b_k = b_k * tl.load(p_b, mask=m_A, other=0)[:, None]
@@ -398,8 +410,8 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
 
     for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
         b_kt = tl.load(p_kt, mask=m_k, other=0).to(tl.float32)
-        b_gk = tl.load(p_gk, mask=m_k, other=0).to(tl.float32)
-        b_ktg = b_kt[None, :] * exp(b_g - b_gk[None, :])
+        b_gk = tl.load(p_gk, mask=m_k, other=0).to(tl.float32) * gk_scale
+        b_ktg = b_kt[None, :] * exp2(b_g - b_gk[None, :])
         b_A = tl.sum(b_k * b_ktg, 1)
         b_A = tl.where(o_i > j, b_A, 0.0)
         b_Aqk = tl.sum(b_q * b_ktg, 1)
@@ -416,6 +428,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
     gk: torch.Tensor | None = None,
     beta: torch.Tensor | None = None,
     scale: float | None = None,
+    gk_scale: float = 1.0,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     output_dtype: torch.dtype = torch.float32,
@@ -429,7 +442,13 @@ def chunk_kda_scaled_dot_kkt_fwd(
         beta (torch.Tensor):
             The beta tensor of shape `[B, T, H]`.
         gk (torch.Tensor):
-            The cumulative sum of the gate tensor of shape `[B, T, H, K]` applied to the key tensor. Default: `None`.
+            The cumulative sum of the gate tensor of shape `[B, T, H, K]` applied to the key tensor,
+            in log2 space (the kernels apply `exp2`).
+            Default: `None`.
+        gk_scale (float):
+            Scale multiplied onto `gk` as it is loaded in the kernels. Pass a natural-log
+            cumsum with `gk_scale=RCP_LN2` to convert to log2 space in-kernel without
+            materializing a scaled copy of `gk`. Default: `1.0`.
         cu_seqlens (torch.LongTensor):
             The cumulative sequence lengths of the input tensor.
             Default: None
@@ -463,6 +482,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
         A=A,
         Aqk=Aqk,
         scale=scale,
+        gk_scale=gk_scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
@@ -483,6 +503,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
         A=A,
         Aqk=Aqk,
         scale=scale,
+        gk_scale=gk_scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
@@ -496,21 +517,9 @@ def chunk_kda_scaled_dot_kkt_fwd(
     return A, Aqk
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [64, 128]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["H", "K", "V", "BT", "IS_VARLEN"],
-)
 @triton.jit(do_not_specialize=["T"])
-def recompute_w_u_fwd_kernel(
-    q,
+def _recompute_w_u_fwd_kernel(
     k,
-    qg,
     kg,
     v,
     beta,
@@ -527,7 +536,6 @@ def recompute_w_u_fwd_kernel(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    STORE_QG: tl.constexpr,
     STORE_KG: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
@@ -605,27 +613,7 @@ def recompute_w_u_fwd_kernel(
             (1, 0),
         )
         b_gk = tl.load(p_gk, boundary_check=(0, 1))
-        b_kb *= exp(b_gk)
-        if STORE_QG:
-            p_q = tl.make_block_ptr(
-                q + (bos * H + i_h) * K,
-                (T, K),
-                (H * K, 1),
-                (i_t * BT, i_k * BK),
-                (BT, BK),
-                (1, 0),
-            )
-            p_qg = tl.make_block_ptr(
-                qg + (bos * H + i_h) * K,
-                (T, K),
-                (H * K, 1),
-                (i_t * BT, i_k * BK),
-                (BT, BK),
-                (1, 0),
-            )
-            b_q = tl.load(p_q, boundary_check=(0, 1))
-            b_qg = b_q * exp(b_gk)
-            tl.store(p_qg, b_qg.to(p_qg.dtype.element_ty), boundary_check=(0, 1))
+        b_kb *= exp2(b_gk)
         if STORE_KG:
             last_idx = min(i_t * BT + BT, T) - 1
 
@@ -634,7 +622,7 @@ def recompute_w_u_fwd_kernel(
             b_gn = tl.load(
                 gk + ((bos + last_idx) * H + i_h) * K + o_k, mask=m_k, other=0.0
             )
-            b_kg = b_k * exp(b_gn - b_gk)
+            b_kg = b_k * exp2(b_gn - b_gk)
 
             p_kg = tl.make_block_ptr(
                 kg + (bos * H + i_h) * K,
@@ -650,16 +638,76 @@ def recompute_w_u_fwd_kernel(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 
+_RECOMPUTE_W_U_CONFIGS = [
+    triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+    for BK in [64, 128]
+    for BV in [64, 128]
+    for num_warps in [2, 4, 8]
+    for num_stages in [2, 3, 4]
+]
+
+recompute_w_u_fwd_kernel = triton.autotune(
+    configs=_RECOMPUTE_W_U_CONFIGS,
+    key=["H", "K", "V", "BT", "IS_VARLEN"],
+    **autotune_cache_kwargs,
+)(_recompute_w_u_fwd_kernel)
+
+_K3_RECOMPUTE_W_U_CONFIGS = {
+    (9, 0): {"BK": 128, "BV": 128, "num_warps": 8, "num_stages": 2},
+    (10, 3): {"BK": 64, "BV": 128, "num_warps": 8, "num_stages": 2},
+}
+
+
+@torch.inference_mode()
+def precompile_k3_recompute_w_u_kernel(
+    *, num_heads: int, dtype: torch.dtype, device: torch.device
+) -> bool:
+    device = torch.device(device)
+    if (
+        not is_nvidia
+        or device.type != "cuda"
+        or torch.cuda.get_device_capability(device) not in _K3_RECOMPUTE_W_U_CONFIGS
+    ):
+        return False
+
+    shape = (1, 1, num_heads, 128)
+    k = torch.zeros(shape, dtype=dtype, device=device)
+    v = torch.zeros_like(k)
+    beta = torch.zeros((1, 1, num_heads), dtype=dtype, device=device)
+    A = torch.zeros((1, 1, num_heads, 64), dtype=dtype, device=device)
+    gk = torch.zeros(shape, dtype=torch.float32, device=device)
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    recompute_w_u_fwd(k, v, beta, A, gk=gk, cu_seqlens=cu_seqlens)
+    return True
+
+
+def _get_k3_recompute_w_u_config(
+    k: torch.Tensor,
+    gk: torch.Tensor | None,
+    cu_seqlens: torch.LongTensor | None,
+    K: int,
+    V: int,
+    BT: int,
+) -> dict | None:
+    if (
+        not is_nvidia
+        or gk is None
+        or cu_seqlens is None
+        or (K, V, BT) != (128, 128, 64)
+    ):
+        return None
+    return _K3_RECOMPUTE_W_U_CONFIGS.get(torch.cuda.get_device_capability(k.device))
+
+
 def recompute_w_u_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
     beta: torch.Tensor,
     A: torch.Tensor,
-    q: torch.Tensor | None = None,
     gk: torch.Tensor | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
 
@@ -670,10 +718,14 @@ def recompute_w_u_fwd(
     w = torch.empty_like(k)
     u = torch.empty_like(v)
     kg = torch.empty_like(k) if gk is not None else None
-    recompute_w_u_fwd_kernel[(NT, B * H)](
-        q=q,
+    static_config = _get_k3_recompute_w_u_config(k, gk, cu_seqlens, K, V, BT)
+    kernel = (
+        _recompute_w_u_fwd_kernel
+        if static_config is not None
+        else recompute_w_u_fwd_kernel
+    )
+    kernel[(NT, B * H)](
         k=k,
-        qg=None,
         kg=kg,
         v=v,
         beta=beta,
@@ -688,12 +740,12 @@ def recompute_w_u_fwd(
         K=K,
         V=V,
         BT=BT,
-        STORE_QG=False,
         STORE_KG=kg is not None,
         IS_VARLEN=cu_seqlens is not None,
-        DOT_PRECISION="tf32",
+        DOT_PRECISION="tf32" if is_tf32_supported else "ieee",
+        **(static_config or {}),
     )
-    return w, u, None, kg
+    return w, u, kg
 
 
 @triton.autotune(
@@ -780,7 +832,7 @@ def chunk_gla_fwd_kernel_o(
         # [BT, BK]
         b_g = tl.load(p_g, boundary_check=(0, 1))
         # [BT, BK]
-        b_qg = (b_q * exp(b_g)).to(b_q.dtype)
+        b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
         # [BK, BV]
         b_h = tl.load(p_h, boundary_check=(0, 1))
         # works but dkw, owing to divine benevolence
@@ -1060,6 +1112,7 @@ def chunk_kda_fwd(
             g,
             A_log=A_log,
             chunk_size=chunk_size,
+            scale=RCP_LN2,
             dt_bias=dt_bias,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
@@ -1070,6 +1123,7 @@ def chunk_kda_fwd(
         g = chunk_local_cumsum(
             g,
             chunk_size=chunk_size,
+            scale=RCP_LN2,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
         )
@@ -1114,6 +1168,7 @@ def chunk_kda_fwd(
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        use_exp2=True,
     )
     del w, u, kg
 
@@ -1132,6 +1187,9 @@ def chunk_kda_fwd(
     del Aqk, v_new
 
     if output_intermediate_states:
+        # h holds the recurrent state at every chunk-size boundary
+        # ([1, NT, H, V, K] packed across cu_seqlens) — the mamba radix
+        # track path snapshots per-chunk states from it during extend.
         return o, h
     del h
     return o

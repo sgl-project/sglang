@@ -40,7 +40,7 @@ from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import REQUANTIZATION_METHODS, ModelConfig
 from sglang.srt.distributed import (
     get_world_group,
 )
@@ -276,6 +276,12 @@ def get_quant_config(
         )
         if not modelopt_mixed_config_incomplete:
             hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+            hf_quant_config["hf_config"] = model_config.hf_config
+
+            # This is only used by quantization methods that support requantization (e.g. from fp8 to mxfp4).
+            if model_config.quantization in REQUANTIZATION_METHODS:
+                hf_quant_config["requantization_method"] = model_config.quantization
+
             return quant_cls.from_config(hf_quant_config)
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
@@ -680,6 +686,16 @@ def filter_duplicate_safetensors_files(
     weight_files_in_index = set()
     for weight_name in weight_map:
         weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
+    # Fail fast if the index references shard files that are not on disk (e.g. an
+    # incomplete or interrupted download). Otherwise those shards are silently
+    # dropped and the model loads with uninitialized weights.
+    missing_files = sorted(f for f in weight_files_in_index if not os.path.isfile(f))
+    if missing_files:
+        raise RuntimeError(
+            f"{index_file} references {len(missing_files)} shard file(s) missing "
+            f"from {hf_folder} (incomplete download?): "
+            f"{[os.path.basename(f) for f in missing_files]}"
+        )
     # Filter out any fields that are not found in the index file.
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
@@ -983,6 +999,8 @@ def safetensors_weights_iterator(
 
 def fastsafetensors_weights_iterator(
     hf_weights_files: List[str],
+    enable_gds: bool = True,
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the weights in the model safetensor files
@@ -1020,7 +1038,7 @@ def fastsafetensors_weights_iterator(
         disable=False,
         bar_format=_BAR_FORMAT,
     ):
-        loader = SafeTensorsFileLoader(pg, device)
+        loader = SafeTensorsFileLoader(pg, device, nogds=not enable_gds)
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
         loader.add_filenames(rank_file_map)
         try:
@@ -1034,6 +1052,9 @@ def fastsafetensors_weights_iterator(
                 pass
         finally:
             loader.close()
+        if drop_cache_after_load:
+            for loaded_file in rank_file_map.get(rank, []):
+                _drop_file_cache_after_load(loaded_file)
 
 
 def multi_thread_safetensors_weights_iterator(

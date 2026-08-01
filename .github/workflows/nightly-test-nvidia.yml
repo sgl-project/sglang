@@ -2,7 +2,7 @@ name: Nightly Test (Nvidia)
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 14 */2 * *'
   workflow_dispatch:
     inputs:
       job_filter:
@@ -92,7 +92,7 @@ jobs:
     runs-on: 1-gpu-h100
     timeout-minutes: 60
     env:
-      # Full jit_kernel test grids (see sglang.jit_kernel.utils.should_run_full_tests)
+      # Full jit_kernel test grids (see sglang.kernels.jit.utils.should_run_full_tests)
       SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
       # Match pr-test-jit-kernel workflow for consistent JIT warmup behavior
       SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
