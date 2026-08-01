@@ -138,7 +138,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -620,7 +620,7 @@ class MQALayer(MqaAttentionBase):
             base=self.rope_base,
             rope_scaling=self.rope_scaling,
             is_neox_style=False,
-            device=get_server_args().device,
+            device=get_device().device,
         )
 
         if _is_npu:
@@ -2495,7 +2495,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
         else:
             self.lm_head = PPMissingLayer()
@@ -2546,11 +2546,11 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
-        if get_server_args().disable_shared_experts_fusion:
+        if get_exec().moe.disable_shared_experts_fusion:
             return
 
         disable_reason = None
-        if get_server_args().enforce_shared_experts_fusion:
+        if get_exec().moe.enforce_shared_experts_fusion:
             if self.config.n_shared_experts != 1:
                 raise ValueError(
                     "DeepSeek V4 shared-experts fusion expects exactly one shared "

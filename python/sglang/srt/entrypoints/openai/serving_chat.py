@@ -77,6 +77,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
+
 
 def normalize_tool_content(role: str, content):
     """Normalize tool message content from OpenAI array format to plain string.
@@ -605,6 +607,10 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        media_error = self._validate_media_content(request)
+        if media_error:
+            return media_error
+
         if (
             isinstance(request.tool_choice, str)
             and request.tool_choice.lower() == "required"
@@ -657,6 +663,28 @@ class OpenAIServingChat(OpenAIServingBase):
                 return "schema_ is required for json_schema response format request."
 
         return None
+
+    def _validate_media_content(self, request: ChatCompletionRequest) -> Optional[str]:
+        if self.tokenizer_manager.model_config.is_multimodal:
+            return None
+
+        media_type = next(
+            (
+                part.type
+                for message in request.messages
+                if isinstance(message.content, list)
+                for part in message.content
+                if part.type in _MEDIA_CONTENT_PART_TYPES
+            ),
+            None,
+        )
+        if media_type is None:
+            return None
+
+        return (
+            "Model only supports text input; "
+            f"received unsupported content type '{media_type}'."
+        )
 
     def _convert_to_internal_request(
         self,

@@ -144,6 +144,20 @@ impl Runnable for TokenizerWorker {
                     tracing::error!("tokenizer pool received a non-generate request");
                     continue;
                 };
+                // Size the scheduler's stop-match window in TOKENS, as Python's
+                // `normalize(tokenizer)` does.
+                let stop_tokens = g
+                    .sampling_params
+                    .stop_strs
+                    .iter()
+                    // A stop that won't encode falls back to its byte length rather
+                    // than failing the request: still an over-estimate, never an
+                    // under-estimate, so the scheduler cannot miss that stop.
+                    .map(|s| self.tokenizer.encode(s).map_or(s.len(), |ids| ids.len()))
+                    .max();
+                if let Some(n) = stop_tokens {
+                    g.sampling_params.stop_str_max_len = n;
+                }
                 match self.tokenizer.encode(g.text.as_deref().unwrap_or("")) {
                     Ok(ids) => {
                         g.input_ids = Some(ids);
@@ -158,5 +172,70 @@ impl Runnable for TokenizerWorker {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fsm::RequestState;
+    use crate::message::{EgressSink, GenerateRequest, RequestKind, SamplingParams};
+    use tokio::sync::mpsc;
+
+    /// One token per whitespace-separated word, so a stop's token count differs
+    /// from its byte count and the two units cannot be confused.
+    struct WordTokenizer;
+    impl TextTokenizer for WordTokenizer {
+        fn encode(&self, text: &str) -> Result<TokenIds, Error> {
+            Ok(text.split_whitespace().map(|_| 1i32).collect())
+        }
+    }
+
+    /// The scheduler's stop-match window must reach the wire as a TOKEN count, as
+    /// Python's `normalize(tokenizer)` produces.
+    ///
+    /// `Normalizing` leaves a UTF-8 BYTE count there — a safe over-estimate, but it
+    /// makes the scheduler decode a longer tail on EVERY decode step of EVERY
+    /// request (14 tokens vs 6 for a typical stop set). This stage owns the
+    /// tokenizer, so it is where the exact count is resolved.
+    #[test]
+    fn tokenizing_replaces_the_byte_window_with_a_token_count() {
+        let (req_tx, req_rx) = flume::unbounded::<Request>();
+        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+
+        // 8 bytes vs 3 "tokens" under WordTokenizer — units are distinguishable.
+        let sp = SamplingParams {
+            stop_strs: vec!["a bb ccc".to_string(), "dd".to_string()],
+            stop_str_max_len: 8, // what `normalize_stops` left: max BYTE length
+            ..Default::default()
+        };
+        let (sink_tx, _sink_rx) = mpsc::channel(4);
+        req_tx
+            .send(Request {
+                rid: "1".into(),
+                state: RequestState::Tokenizing,
+                sink: EgressSink::Local(sink_tx),
+                kind: RequestKind::Generate(Box::new(GenerateRequest {
+                    rid: "1".into(),
+                    text: Some("hello world".into()),
+                    sampling_params: sp,
+                    ..Default::default()
+                })),
+            })
+            .expect("send");
+        drop(req_tx); // closes the loop after one request
+
+        TokenizerWorker::new(req_rx, tm_tx, Arc::new(WordTokenizer)).run();
+
+        let TmEvent::Tokenized(req) = tm_rx.try_recv().expect("returned") else {
+            panic!("expected Tokenized");
+        };
+        let RequestKind::Generate(g) = &req.kind else {
+            panic!("expected generate");
+        };
+        assert_eq!(
+            g.sampling_params.stop_str_max_len, 3,
+            "must be the max TOKEN count (3), not the byte count (8)"
+        );
     }
 }

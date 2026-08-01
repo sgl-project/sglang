@@ -197,7 +197,8 @@ class BaseRunner(ABC):
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
         self.tp_size = model_runner.server_args.tp_size
-        self.dp_size = model_runner.server_args.dp_size
+        # elastic-EP scale-up rewrites dp_size on the published config
+        self.dp_size = get_parallel().dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
         self.enable_return_hidden_states = (
@@ -313,7 +314,7 @@ class BaseRunner(ABC):
             hidden_size=mr.model_config.hidden_size,
             vocab_size=mr.model_config.vocab_size,
             dtype=mr.model_config.dtype,
-            dp_size=mr.server_args.dp_size,
+            dp_size=get_parallel().dp_size,
             pp_size=mr.server_args.pp_size,
             is_encoder_decoder=mr.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather(mr.server_args),
@@ -483,7 +484,7 @@ class BaseRunner(ABC):
             assert require_mlp_tp_gather_ or require_attn_tp_gather_
 
         if require_mlp_tp_gather_:
-            global_num_tokens_cpu = [num_tokens] * mr.server_args.dp_size
+            global_num_tokens_cpu = [num_tokens] * get_parallel().dp_size
         elif require_attn_tp_gather_:
             global_num_tokens_cpu = [num_tokens]
         else:

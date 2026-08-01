@@ -91,7 +91,7 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
@@ -246,12 +246,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.is_dllm = self.dllm_config is not None
         self.attn_backend = attn_backend or model_runner.attn_backend
         self.speculative_num_steps = (
-            model_runner.server_args.speculative_num_steps
+            get_spec().speculative_num_steps
             if speculative_num_steps is None
             else speculative_num_steps
         )
         self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
+            get_spec().speculative_num_draft_tokens
             if speculative_num_draft_tokens is None
             else speculative_num_draft_tokens
         )

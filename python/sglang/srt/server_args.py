@@ -41,6 +41,7 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
+from sglang.srt.arg_groups.overrides import resolved_view
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
@@ -2542,14 +2543,13 @@ class ServerArgs:
         NS("exec.mamba"),
     ] = 16
     # ReplaySSM spec-verify (Part B of RFC #28511): GDN linear-chain target-verify
-    # via a per-slot circular (d, k, g) ring + periodic flush instead of per-draft
-    # full-state snapshots. GDN only; linear-chain (topk <= 1) only. Reuses the
-    # `linear_replayssm` ring (replayssm_d/k/g + write_pos) and adds two per-slot
-    # cursors (cache_base, is_flush); the ring length reuses
-    # `linear_replayssm_cache_len`.
+    # via fold-every-commit instead of per-draft full-state snapshots -- the
+    # verify stores each draft step's raw inputs into a per-slot window and the
+    # commit replays the accepted prefix into the fp32 checkpoint. GDN only;
+    # linear-chain (topk <= 1) only.
     enable_gdn_replayssm_spec: A[
         bool,
-        "Enable the ReplaySSM GDN spec-verify kernel (Part B of RFC #28511): a per-slot circular (d, k, g) ring + periodic flush replacing the recurrent verify's per-draft full-state snapshots. GDN only, linear-chain (--speculative-eagle-topk in {None, 1}) only. Reuses --linear-replayssm-cache-len for the ring length.",
+        "Enable the ReplaySSM GDN spec-verify (Part B of RFC #28511): fold-every-commit -- a per-slot raw-input window sized to the draft maximum replaces the recurrent verify's per-draft full-state snapshots. GDN only, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
         NS("exec.mamba"),
     ] = False
 
@@ -3537,7 +3537,6 @@ class ServerArgs:
         handle_speculative_decoding(self)
 
         # Needs the draft-token count derived just above.
-        self._validate_gdn_replayssm_spec_ring()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -4209,6 +4208,7 @@ class ServerArgs:
     def _handle_cuda_graph_config(self):
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
+        self._apply_deepep_adjustments()
         self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()
         # Warn on the final resolved config (not inside the compat cascade —
@@ -4219,6 +4219,30 @@ class ServerArgs:
                 "cuda_graph_config[prefill].backend='full' is experimental. "
                 "Use breakable or tc_piecewise for production workloads."
             )
+
+    def _apply_deepep_adjustments(self):
+        """Config adjustments required by the DeepEP a2a backend."""
+        if resolved_view(self).moe_a2a_backend != "deepep":
+            return
+
+        # Non-multiple-of-8 prefill buckets can hang DeepEP a2a capture under
+        # breakable CUDA graph
+        if self.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
+            bs = self.cuda_graph_config.prefill.bs
+            if bs is None:
+                # 2048 = documented prefill default; max_bs unresolved here.
+                max_bs = self.cuda_graph_config.prefill.max_bs or 2048
+                bs = self._generate_prefill_cuda_graph_batch_sizes(max_bs)
+            aligned = sorted({((b + 7) // 8) * 8 for b in bs})
+            if aligned != sorted(bs):
+                logger.info(
+                    "Breakable prefill CUDA graph with DeepEP requires bucket "
+                    "sizes divisible by 8; aligning %s -> %s.",
+                    sorted(bs),
+                    aligned,
+                )
+                self.cuda_graph_config.prefill.bs = aligned
+                self.cuda_graph_config.prefill.max_bs = aligned[-1]
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
@@ -4323,8 +4347,6 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _disable_tc_piecewise_cudagraph_if_incompatible(self):
-        from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
-
         """TcPiecewise (torch.compile + piecewise) is incompatible with
         these configurations. Most are torch.compile / dynamo limitations.
         """
@@ -4348,7 +4370,7 @@ class ServerArgs:
             ),
             (
                 "MoE A2A backend",
-                lambda: _resolved_view(self).moe_a2a_backend != "none",
+                lambda: resolved_view(self).moe_a2a_backend != "none",
             ),
             # Dynamo blocks LoRA under tc_piecewise (per-batch LoRABatchInfo
             # rebinds break guards); breakable/full support LoRA.
@@ -4361,7 +4383,7 @@ class ServerArgs:
             (
                 "GGUF quantization",
                 lambda: self.load_format == "gguf"
-                or _resolved_view(self).quantization == "gguf"
+                or resolved_view(self).quantization == "gguf"
                 or check_gguf_file(self.model_path),
             ),
             ("DLLM (diffusion LLM)", lambda: self.dllm_algorithm is not None),
@@ -4400,17 +4422,21 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _disable_breakable_cudagraph_if_incompatible(self):
-        from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
-
         """Breakable (segmented capture, no torch.compile). Breakable enforces
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
-        from sglang.srt.configs.model_config import is_deepseek_v4
+        from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
         rules = [
-            # MLA prefill takes a different attn-forward path under BCG.
-            ("MLA attention", lambda: self.use_mla_backend()),
+            # MLA prefill under BCG takes forward_mha, which has no eager
+            # breaks. DSA is exempt: BCG forces the sparse path, whose
+            # indexer already splits eagerly.
+            (
+                "MLA attention (non-DSA)",
+                lambda: self.use_mla_backend()
+                and not is_deepseek_dsa(self.get_model_config().hf_config),
+            ),
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
             (
@@ -4427,10 +4453,15 @@ class ServerArgs:
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
             ),
-            # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
+            # TBO capture is unsupported.
             (
-                "MoE A2A backend",
-                lambda: _resolved_view(self).moe_a2a_backend != "none",
+                "two-batch overlap",
+                lambda: self.enable_two_batch_overlap,
+            ),
+            # Only DeepEP's a2a is validated under BCG.
+            (
+                "non-DeepEP a2a backend",
+                lambda: resolved_view(self).moe_a2a_backend not in ("none", "deepep"),
             ),
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
@@ -4828,12 +4859,19 @@ class ServerArgs:
                 # MLA backend overhead is much higher than expected with fa3.
                 reserved_mem += 1.5 * 1024
 
+            if (
+                prefill_cuda_graph_config.backend == Backend.BREAKABLE
+                and resolved_view(self).moe_a2a_backend == "deepep"
+            ):
+                # Prefill-BCG DeepEP delta (bridge pool + NVL first-touch
+                # during capture); decode-side DeepEP is a baseline cost.
+                reserved_mem += 1 * 1024
+
         return reserved_mem
 
     def reserve_for_deepep_a2a_mb(self) -> float:
         # DeepEP all-to-all buffers captured in the decode graph are real extra
         # allocations, reserved on top of the floor.
-        from sglang.srt.arg_groups.overrides import resolved_view
 
         decode_cuda_graph_config = self.cuda_graph_config.decode
         if (
@@ -4993,7 +5031,6 @@ class ServerArgs:
         # flags tier.
         from sglang.srt.arg_groups.overrides import (
             collect_model_override_declarations,
-            resolved_view,
             validate_declarations,
         )
 
@@ -5526,7 +5563,6 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import (
             _mamba_radix_cache_resolution,
             mamba_extra_buffer_of,
-            resolved_view,
             run_post_process_pass,
         )
 
@@ -5576,7 +5612,6 @@ class ServerArgs:
 
         if not use_mla_backend:
             # MHA architecture
-            from sglang.srt.arg_groups.overrides import resolved_view
 
             if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(
                 resolved_view(self)
@@ -5639,7 +5674,6 @@ class ServerArgs:
             _fa4_page_constraint,
             _intel_xpu_page_constraint,
             _mla_backend_page_constraints,
-            resolved_view,
             run_post_process_pass,
         )
 
@@ -5750,7 +5784,6 @@ class ServerArgs:
 
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
-        from sglang.srt.arg_groups.overrides import resolved_view
 
         if self.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
             return
@@ -6016,7 +6049,6 @@ class ServerArgs:
                 )
             from sglang.srt.arg_groups.overrides import (
                 mamba_extra_buffer_of,
-                resolved_view,
             )
 
             if mamba_extra_buffer_of(resolved_view(self)):
@@ -6061,32 +6093,29 @@ class ServerArgs:
                     "EAGLE tree verify. Got "
                     f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
                 )
-            if decode != "triton":
+            if decode not in ("triton", "flashinfer"):
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec requires the Triton linear-attn "
-                    "decode backend, got "
+                    "--enable-gdn-replayssm-spec requires the triton or "
+                    "flashinfer linear-attn decode backend, got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
-            if self.enable_mamba_extra_buffer():
-                # The spec-verify path does not yet implement the device-side
-                # force-flush needed to keep `temporal` consistent with the ring at
-                # radix mamba-track boundaries, so it is incompatible with
-                # extra_buffer (radix prefix caching).
+            # The auto->extra_buffer strategy resolution is still a declaration
+            # here, so read it through the resolved view.
+            view = self._resolved()
+            if (
+                view.disable_radix_cache is False
+                and view.mamba_radix_cache_strategy == "extra_buffer_lazy"
+            ):
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec is not yet compatible with mamba "
-                    "extra_buffer (radix prefix caching); use --disable-radix-cache "
-                    "or --mamba-radix-cache-strategy no_buffer."
+                    "--enable-gdn-replayssm-spec is not validated with "
+                    "--mamba-radix-cache-strategy extra_buffer_lazy yet; "
+                    "use extra_buffer."
                 )
-            if self.disaggregation_mode != "null":
+            if self.disaggregation_mode == "prefill":
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec is not supported under PD "
-                    "disaggregation yet (follow-up). Got "
-                    f"--disaggregation-mode={self.disaggregation_mode!r}."
-                )
-            if self.linear_replayssm_cache_len < 1:
-                raise ValueError(
-                    "--linear-replayssm-cache-len must be >= 1, got "
-                    f"{self.linear_replayssm_cache_len}."
+                    "--enable-gdn-replayssm-spec is not supported on a PD "
+                    "prefill server: the ring is spec-verify-only scratch and "
+                    "the prefill server never runs spec verify."
                 )
             if self.enable_linear_replayssm:
                 raise ValueError(
@@ -6095,56 +6124,22 @@ class ServerArgs:
                     "with incompatible cursor protocols (per-decode-forward vs "
                     "per-verify-commit advance)."
                 )
-            ring_len = self.linear_replayssm_cache_len
-            if ring_len & (ring_len - 1) != 0:
-                raise ValueError(
-                    "--linear-replayssm-cache-len must be a power of two for the "
-                    f"circular spec-verify ring, got {ring_len}."
-                )
-            # ring_len >= 2 * max drafts is checked in
-            # _validate_gdn_replayssm_spec_ring() (draft tokens not derived yet).
-            # Closed-loop exact fold: the flush replays raw ring inputs through
-            # the recurrent update into the checkpoint, bit-identical to the
-            # recurrent baseline -- which keeps its state in fp32. A 16-bit
-            # checkpoint would re-quantize the exactly-folded state every flush
-            # and become the dominant residual error source, so require fp32.
             if self.mamba_ssm_dtype is None:
                 logger.info(
                     "--enable-gdn-replayssm-spec: setting --mamba-ssm-dtype "
-                    "float32 (the closed-loop exact fold requires the fp32 SSM "
-                    "checkpoint for recurrent-parity)."
+                    "float32 (the closed-loop exact fold keeps the SSM checkpoint "
+                    "bit-identical to the recurrent baseline)."
                 )
                 self.mamba_ssm_dtype = "float32"
             elif self.mamba_ssm_dtype != "float32":
-                raise ValueError(
-                    "--enable-gdn-replayssm-spec requires --mamba-ssm-dtype "
-                    f"float32, got {self.mamba_ssm_dtype!r}. The closed-loop "
-                    "exact fold keeps the committed state bit-identical to the "
-                    "recurrent baseline, which is only meaningful against the "
-                    "fp32 checkpoint; a 16-bit checkpoint would re-quantize it "
-                    "every flush."
+                logger.warning(
+                    "--enable-gdn-replayssm-spec with --mamba-ssm-dtype=%s: the "
+                    "closed-loop fold re-quantizes the committed state each "
+                    "commit/flush (fp32 keeps it bit-exact to the fp32 recurrent "
+                    "baseline), so it may drift over long sequences. Validate "
+                    "accuracy for your model.",
+                    self.mamba_ssm_dtype,
                 )
-
-    def _validate_gdn_replayssm_spec_ring(self):
-        """Enforce ring_len >= 2 * max draft tokens for the spec-verify ring.
-
-        Early-flush margin: write_pos + spec_len <= ring_len must hold on every
-        verify step (see _advance_gdn_spec_cursors_kernel). Runs after
-        handle_speculative_decoding() so the (adaptive-aware) max is final;
-        MambaPool re-checks at ring allocation as a backstop.
-        """
-        if not self.enable_gdn_replayssm_spec:
-            return
-        max_drafts = self.max_speculative_num_draft_tokens
-        if max_drafts is None:
-            return
-        ring_len = self.linear_replayssm_cache_len
-        if ring_len < 2 * max_drafts:
-            raise ValueError(
-                "--linear-replayssm-cache-len must be >= 2 * the maximum "
-                "speculative draft-token count for the spec-verify ring "
-                f"(early-flush margin), got {ring_len} < {2 * max_drafts}."
-            )
 
     def _handle_legacy_cp_arguments(self):
         legacy_mode_to_strategy = {
@@ -6413,7 +6408,6 @@ class ServerArgs:
             _cutlass_moe_env_override,
             _moe_runner_backend_quant_constraints,
             _moe_runner_fusion_disable,
-            resolved_view,
             run_post_process_pass,
         )
 
@@ -6532,7 +6526,6 @@ class ServerArgs:
         """Fail fast if the FlashInfer A2A dispatcher workspace cannot cover the
         largest CuteDSL MoE forward. Runs after speculative decoding is resolved
         so cutedsl_moe_max_num_tokens() sees the final num_tokens_per_req."""
-        from sglang.srt.arg_groups.overrides import resolved_view
 
         view = resolved_view(self)
         if not (
@@ -6575,7 +6568,6 @@ class ServerArgs:
             _a2a_backend_overrides,
             _a2a_ep_size,
             _a2a_fusion_adjustments,
-            resolved_view,
             run_post_process_pass,
         )
 
@@ -6749,10 +6741,29 @@ class ServerArgs:
                 "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
 
+        # Without an a2a backend all EP ranks run the MoE over the same tokens and
+        # sum their partial outputs, so the pick has to agree across ranks.
+        needs_rank_invariant_dispatch = self._resolved().moe_a2a_backend == "none"
+
         if (self.enable_eplb or (self.init_expert_location != "trivial")) and (
             self.ep_dispatch_algorithm is None
         ):
-            self.ep_dispatch_algorithm = "static"
+            self.ep_dispatch_algorithm = (
+                "dynamic" if needs_rank_invariant_dispatch else "static"
+            )
+
+        # `dynamic` / `fake` switch to the row-index pick; `static` reads a
+        # per-rank table and `lp` samples inside its kernel.
+        if needs_rank_invariant_dispatch and self.ep_dispatch_algorithm in (
+            "static",
+            "lp",
+        ):
+            raise ValueError(
+                f"--ep-dispatch-algorithm {self.ep_dispatch_algorithm} picks a "
+                "different physical replica per rank, which only holds up when an "
+                "a2a backend routes each token to a single rank. Use "
+                "--ep-dispatch-algorithm dynamic with --moe-a2a-backend none."
+            )
 
         if self.enable_eplb and self.ep_join_mode != "scale":
             assert self._resolved().ep_size > 1
@@ -7042,7 +7053,6 @@ class ServerArgs:
         still None, backends haven't settled yet and the resolved (prefill,
         decode) pair would be a stale (None, None).
         """
-        from sglang.srt.arg_groups.overrides import resolved_view
 
         if not self.prefill_only_disable_kv_cache:
             return
@@ -7397,7 +7407,7 @@ class ServerArgs:
                 "Please choose one tokenizer batching approach."
             )
 
-        if self.skip_tokenizer_init:
+        if self.skip_tokenizer_init and not envs.SGLANG_RUST_SERVER.get():
             # Tokenizer workers still serve HTTP / state / output work, so
             # their fanout is preserved; detokenizer workers only decode.
             if self.detokenizer_worker_num != 1:
@@ -7615,7 +7625,6 @@ class ServerArgs:
             from sglang.srt.arg_groups.overrides import (
                 _deterministic_attention_backend,
                 _deterministic_sampling_backend,
-                resolved_view,
                 run_post_process_pass,
             )
 
@@ -7725,13 +7734,35 @@ class ServerArgs:
         if not self.enable_page_major_kv_layout:
             return
         # Only the Triton attention kernels read the strided 4-D envelope K/V
-        # views; FA3 / FlashInfer do not.
+        # views; FA3 / FlashInfer do not. EXCEPTION: the unified-memory MLA pool
+        # exposes each layer as a DENSE contiguous per-layer view
+        # (build_dense_mla_views), which the paged MLA kernels consume directly,
+        # with their kv_indices / block tables remapped to dense ids. Names below
+        # are the RESOLVED ids from _resolved_attention_backends: "flashinfer" is
+        # FlashInferMLAAttnBackend for an MLA model, "trtllm_mla" the trtllm
+        # decode kernel; "cutedsl_mla" and "tokenspeed_mla" subclass
+        # TRTLLMMLABackend and inherit its dense read/write path; "fa3" remaps its
+        # page_table (in-kernel for captured decode, one funnel for eager).
+        # flashmla / cutlass_mla share the create_flashmla block-table path and
+        # can be added the same way once exercised.
+        if self.enable_unified_memory and self.use_mla_backend():
+            allowed_full = {
+                "triton",
+                "fa3",
+                "trtllm_mla",
+                "flashinfer",
+                "cutedsl_mla",
+                "tokenspeed_mla",
+            }
+        else:
+            allowed_full = {"triton"}
         backends = set(self._resolved_attention_backends())
         backends.discard(None)
-        assert backends <= {"triton"}, (
+        assert backends <= allowed_full, (
             "--enable-page-major-kv-layout requires the Triton attention backend "
-            f"for the full-attention layers; got {sorted(backends)}. Pass "
-            "--attention-backend triton."
+            "for the full-attention layers (unified-memory MLA also allows the "
+            f"paged MLA backends); got {sorted(backends)}, allowed "
+            f"{sorted(allowed_full)}. Pass a compatible --attention-backend."
         )
         # The Mamba state is stored in envelope-strided views; only the
         # stride-aware Triton causal-conv / SSM kernels read them correctly.
@@ -7839,7 +7870,6 @@ class ServerArgs:
             )
 
     def _handle_other_validations(self):
-        from sglang.srt.arg_groups.overrides import resolved_view
 
         # Handle optimistic prefill validation
         if (
@@ -8274,7 +8304,6 @@ class ServerArgs:
     def _resolved(self):
         """Read-only view of the resolving configuration: declared fields
         resolve from the declaration stash."""
-        from sglang.srt.arg_groups.overrides import resolved_view
 
         return resolved_view(self)
 
@@ -8336,7 +8365,6 @@ class ServerArgs:
         view so declared fields resolve from the declaration stash."""
         from sglang.srt.arg_groups.overrides import (
             attention_backends_of,
-            resolved_view,
         )
 
         return attention_backends_of(resolved_view(self))
@@ -8404,7 +8432,6 @@ class ServerArgs:
         # (or mamba_chunk_size if it is defined in the model's config) and page_size.
         # It is used to determine the caching point in a sequence during prefill.
         if not hasattr(self, "_mamba_cache_chunk_size"):
-            from sglang.srt.arg_groups.overrides import resolved_view
 
             hf_config = self.get_model_config().hf_config
             chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
@@ -8998,6 +9025,28 @@ class ServerArgs:
         }
 
 
+def m3_fp8_attn_gemm_enabled(args) -> bool:
+    """Whether MiniMax-M3 attention GEMMs run in fp8 (no opt-in flag; active
+    whenever possible): fp8_e4m3 main + index KV caches, fp8-cast q, fp8
+    sparse/MSA kernels, with dense layers on trtllm_mha's fp8-q path. Needs
+    kv_cache_dtype fp8_e4m3 (e5m2 would silently mis-dispatch fmha_sm100's
+    e4m3 kernel), the trtllm_mha backend (the only dense backend with fp8-q
+    GEMMs), and SM100 (MSA fp8 variants and trtllm-gen fp8 dense kernels are
+    sm100-only). SGLANG_DISABLE_M3_FP8_ATTN_GEMM=1 is the kill switch:
+    it forces the pre-fp8 numerics (bf16 indexer + widening sparse path,
+    bf16 q) without having to move off trtllm_mha.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.utils.common import is_sm100_supported
+
+    return (
+        args.kv_cache_dtype == "fp8_e4m3"
+        and args.attention_backend == "trtllm_mha"
+        and is_sm100_supported()
+        and not envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get()
+    )
+
+
 # NOTE: The process-wide ServerArgs is owned by the runtime context
 # (sglang.srt.runtime_context). The two functions below are LEGACY shims kept
 # for the existing call-sites; they publish/read the same live object by
@@ -9005,14 +9054,19 @@ class ServerArgs:
 # (decrease-only) by test/registered/unit/test_legacy_global_ratchet.py.
 # Imports are in-function so the two modules stay cycle-free at import time.
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
-    """Legacy publish shim — prefer ``get_context().set_server_args()`` from
-    ``sglang.srt.runtime_context`` in new code."""
-    from sglang.srt.runtime_context import get_context
+    """Legacy publish shim (role=scheduler) — prefer
+    ``runtime_context.publish(server_args, role=...)`` in new code."""
+    from sglang.srt.runtime_context import publish
 
-    get_context().set_server_args(server_args)
+    publish(server_args, role="scheduler")
 
 
-set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler
+def set_global_server_args_for_tokenizer(server_args: ServerArgs):
+    """Legacy publish shim (role=tokenizer). Not aliased to the scheduler shim:
+    the process role differs."""
+    from sglang.srt.runtime_context import publish
+
+    publish(server_args, role="tokenizer")
 
 
 def get_global_server_args() -> ServerArgs:
@@ -9188,14 +9242,13 @@ class PortArgs:
             dist_init_host = na.host
             dist_init_port = na.port
 
-            # We need 5 consecutive ports from port_base for:
-            # port_base, detokenizer, rpc, metrics, scheduler.
-            # In multi-node, all nodes derive ports independently from
-            # dist_init_port, so the derivation must be deterministic
-            # (no availability-based search). If incrementing would
-            # overflow the valid TCP range, decrement instead.
-            NUM_DERIVED_PORTS = 5
-            if server_args.is_ep_joiner:
+            # Reserve port_base+0..NUM_DERIVED_PORTS-1 (6 fixed ports + dp_size
+            # rust-path slots); derive from server_args only (never dp_rank) so
+            # every init_new call agrees, decrementing below dist_init_port on
+            # overflow.
+            is_rust_server = envs.SGLANG_RUST_SERVER.get()
+            NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + server_args.dp_size
+            if server_args.is_ep_scale_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA

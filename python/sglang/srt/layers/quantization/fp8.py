@@ -617,10 +617,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", scale)
             else:
                 layer.register_parameter("input_scale", None)
-        elif use_mxfp8:
-            raise ValueError(
-                "MXFP8 requires fp8-serialized checkpoint for linear layers."
-            )
 
     def create_weights(
         self,

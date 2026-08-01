@@ -303,6 +303,33 @@ class FullResponseUsageTestCase(unittest.TestCase):
 
 
 class MultimodalRequestTestCase(unittest.TestCase):
+    def test_text_only_create_responses_rejects_media_before_generation(self):
+        serving = make_serving()
+        serving._process_messages = Mock()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "describe it"},
+                        {
+                            "type": "input_image",
+                            "image_url": "http://example.com/cat.png",
+                        },
+                    ],
+                }
+            ],
+            store=False,
+        )
+
+        response = asyncio.run(serving.create_responses(request))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"received unsupported content type 'image_url'", response.body)
+        serving._process_messages.assert_not_called()
+        serving.tokenizer_manager.generate_request.assert_not_called()
+
     def test_multimodal_create_responses_sends_text_and_media_to_engine(self):
         serving = make_serving(is_multimodal=True)
         captured = {}
