@@ -39,8 +39,14 @@
 
 // TODO: remove dependency on the custom_all_reduce, move out common utilities
 #include "../../distributed/custom_all_reduce.cuh"
+#include "ptx_sys.cuh"
 
 namespace sglang {
+
+// Same shape as gemm_ag / gemm_ar: pull the ptx_sys helpers in by name so the
+// call sites below stay unqualified.
+using device::distributed::multimem_red_add_relaxed;
+using device::distributed::multimem_red_add_release;
 
 struct FusionParams {
   uint8_t* input;              // tensor pointer (in place)
@@ -146,24 +152,10 @@ __global__ __launch_bounds__(1024, 1) void all_reduce_push_res_kernel(const __gr
 
 // --- deferred-finalize staging (finalize_push_norm) ------------------------
 // The trtllm-gen MoE with do_finalize=False hands back its finalize inputs
-// (see jit_kernel/trtllm_gen_moe.py); the fused kernel computes the finalize
+// (see kernels/ops/moe/trtllm_gen_moe.py); the fused kernel computes the finalize
 // during the push staging pass, so the rank-local latent never materializes.
 
 constexpr uint32_t kFinTopK = 16;
-
-// bf16 x bf16 -> fp32 fused multiply-add (same idiom as gemm/tiny_gemm.cuh).
-// The bf16 product is exact in fp32, so the fallback is bit-identical.
-SGL_DEVICE float fma_f32_bf16(bf16_t a, bf16_t b, float acc) {
-#if SGL_ARCH_BLACKWELL_OR_GREATER
-  const uint16_t a_bits = __bfloat16_as_ushort(a);
-  const uint16_t b_bits = __bfloat16_as_ushort(b);
-  float result;
-  asm("fma.rn.f32.bf16 %0, %1, %2, %3;" : "=f"(result) : "h"(a_bits), "h"(b_bits), "f"(acc));
-  return result;
-#else
-  return fmaf(device::cast<fp32_t>(a), device::cast<fp32_t>(b), acc);
-#endif
-}
 
 // One 16B vector of the deferred MoE finalize (latent width fixed to kNormDim):
 //   local[t] = sum_k fin_weights[t, k] * fin_gemm2[fin_idx[t*16 + k]]
@@ -207,7 +199,7 @@ SGL_DEVICE device::AlignedVector<bf16x2_t, 4> finalize_vec(const FusionParams& p
     const bf16_t w_k = weight[k / kWVecSize][k % kWVecSize];
 #pragma unroll
     for (uint32_t i = 0; i < 8; ++i) {
-      acc[i] = fma_f32_bf16(in[k][i], w_k, acc[i]);
+      acc[i] = device::math::fma_f32_bf16(in[k][i], w_k, acc[i]);
     }
   }
   AlignedVector<bf16x2_t, 4> out;
@@ -394,9 +386,7 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
   }
 }
 
-// ---------------------------------------------------------------------------
 // Pull family: low-SM NVLS, reusing the CustomAllReduceV2 pull semaphores
-// ---------------------------------------------------------------------------
 
 inline constexpr uint32_t kPullBlockSize = 512;
 
@@ -428,22 +418,6 @@ struct PullParams {
 SGL_DEVICE uint32_t* pull_sem_mc_flag(uint8_t* sem_mc, uint32_t block) {
   static_assert(sizeof(Semaphore) == 128);
   return reinterpret_cast<uint32_t*>(sem_mc + block * sizeof(Semaphore));
-}
-
-SGL_DEVICE void multimem_red_add_relaxed(uint32_t* mc_flag) {
-#if SGL_ARCH_HOPPER_OR_GREATER
-  asm volatile("multimem.red.relaxed.sys.global.add.u32 [%0], 1;" ::"l"(mc_flag) : "memory");
-#else
-  assert(false && "multimem red is only supported on Hopper or later architecture");
-#endif
-}
-
-SGL_DEVICE void multimem_red_add_release(uint32_t* mc_flag) {
-#if SGL_ARCH_HOPPER_OR_GREATER
-  asm volatile("multimem.red.release.sys.global.add.u32 [%0], 1;" ::"l"(mc_flag) : "memory");
-#else
-  assert(false && "multimem red is only supported on Hopper or later architecture");
-#endif
 }
 
 // enter barrier (relaxed): reserve this call's flag window, signal arrival
@@ -643,9 +617,7 @@ __launch_bounds__(kNormRowVecs, 1) void all_reduce_pull_norm_kernel(const __grid
 
 using namespace sglang;
 
-// ---------------------------------------------------------------------------
 // Host entry points
-// ---------------------------------------------------------------------------
 
 template <uint32_t kWorldSize, bool kUsePDL>
 struct AllReduceFusionKernel {

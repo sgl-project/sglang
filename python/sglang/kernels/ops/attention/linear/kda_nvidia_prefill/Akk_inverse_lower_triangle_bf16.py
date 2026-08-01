@@ -1,7 +1,7 @@
 # Vendored from the NVIDIA KDA_prefill package (benchmark/ Blackwell path)
 # for the Kimi-K3 chunked prefill forward. Local deltas: fla.* imports
 # re-pointed to sglang's vendored fla subset, flat sibling imports made
-# package-relative, RCP_LN2 inlined. INTERNAL COLLABORATION ONLY.
+# package-relative, RCP_LN2 inlined.
 # ruff: noqa  -- vendored kernel library, minimal local deltas
 """
 Akk 64×64 Lower Triangular Block Inversion — Full BF16.
@@ -39,16 +39,11 @@ Outputs: A_out [B, T, H, BT] bf16
 import cuda.bindings.driver as cuda_drv
 import cutlass
 import cutlass.cute as cute
-import torch
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync
-from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-# ===========================================================================
-# Constants
-# ===========================================================================
 BS = 64
 SB = 16
 THREADS = 128
@@ -59,9 +54,6 @@ AKK_PAD = 4
 AKK_STRIDE = BS // 2 + AKK_PAD  # 36 (in FP32 units = 72 bf16 elements)
 
 
-# ===========================================================================
-# BF16 MMA m16n8k16 with FP32 accumulator
-# ===========================================================================
 @dsl_user_op
 def mma_bf16_m16n8k16(
     a0,
@@ -121,10 +113,7 @@ def mma_bf16_m16n8k16(
     return d0, d1, d2, d3
 
 
-# ===========================================================================
-# movmatrix.sync.aligned.m8n8.trans.b16 — hardware A→B transpose (warp-level)
-# Works on any 16-bit format including BF16.
-# ===========================================================================
+# Warp-level hardware A->B transpose; works on any 16-bit format including BF16.
 @dsl_user_op
 def _movmatrix_trans(src, *, loc=None, ip=None):
     src_b = llvm.bitcast(T.i32(), src.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
@@ -142,9 +131,6 @@ def _movmatrix_trans(src, *, loc=None, ip=None):
     return cutlass.Float32(llvm.bitcast(T.f32(), result, loc=loc, ip=ip))
 
 
-# ===========================================================================
-# BF16x2 pack/unpack helpers
-# ===========================================================================
 @dsl_user_op
 def _pack_bf16x2(lo_f32, hi_f32, *, loc=None, ip=None):
     """Pack two FP32 values into one i32 holding two BF16 values.
@@ -235,14 +221,12 @@ def _unpack_bf16x2_hi(packed, *, loc=None, ip=None):
     return cutlass.Float32(llvm.bitcast(T.f32(), result, loc=loc, ip=ip))
 
 
-# ===========================================================================
 # Neumann diagonal 16×16 inversion using BF16 MMA m16n8k16 + FP32 accum
 #
 # (I+L)⁻¹ = (I-L)(I+L²)(I+L⁴)(I+L⁸)
 #
 # All intermediate values kept in FP32. Pack to bf16x2 only at MMA boundaries.
 # sAkk is packed bf16x2: sAkk[row, pair] = {bf16[row, 2*pair], bf16[row, 2*pair+1]}
-# ===========================================================================
 @dsl_user_op
 def _invert_diag_neumann(sAkk: cute.Tensor, block_idx, lane_id, *, loc=None, ip=None):
     r_off = block_idx * 16
@@ -452,9 +436,7 @@ def _invert_diag_neumann(sAkk: cute.Tensor, block_idx, lane_id, *, loc=None, ip=
     sAkk[r_off + gid + 8, c_off + 4 + tid] = _pack_bf16x2(INV_f6, INV_f7)
 
 
-# ===========================================================================
 # 16×16 matmul: load A & B from packed bf16x2 sAkk, BF16 MMA, return FP32 C
-# ===========================================================================
 @dsl_user_op
 def _matmul_AB(
     sAkk: cute.Tensor, br_A, bc_A, br_B, bc_B, lane_id, *, loc=None, ip=None
@@ -495,10 +477,8 @@ def _matmul_AB(
     return cn0_0, cn0_1, cn0_2, cn0_3, cn1_0, cn1_1, cn1_2, cn1_3
 
 
-# ===========================================================================
 # Chain MMA: pre-loaded A (from C→A pack), load B from sAkk  (Stage 2)
 # A-operand already packed as bf16x2 from previous C result.
-# ===========================================================================
 @dsl_user_op
 def _chain_mma_B(
     sAkk: cute.Tensor, br_B, bc_B, a0, a1, a2, a3, lane_id, *, loc=None, ip=None
@@ -528,12 +508,8 @@ def _chain_mma_B(
     return cn0_0, cn0_1, cn0_2, cn0_3, cn1_0, cn1_1, cn1_2, cn1_3
 
 
-# ===========================================================================
-# Chain MMA: load A from sAkk, pre-loaded B (from C→B shuffle)  (Stages 3-4)
-# B-operand from shuffle is still FP32 TF32-layout → need to convert.
-# Actually in BF16 version we use movmatrix, so B comes from pack+movmatrix.
-# This function takes B already in B-layout (packed bf16x2 after movmatrix).
-# ===========================================================================
+# Chain MMA (stages 3-4): load A from sAkk, B pre-loaded. B must already be in
+# B-layout, i.e. packed bf16x2 after movmatrix -- not the raw FP32 shuffle result.
 @dsl_user_op
 def _chain_mma_A(
     sAkk: cute.Tensor, br_A, bc_A, b0, b1, b2, b3, lane_id, *, loc=None, ip=None
@@ -559,14 +535,12 @@ def _chain_mma_A(
     return cn0_0, cn0_1, cn0_2, cn0_3, cn1_0, cn1_1, cn1_2, cn1_3
 
 
-# ===========================================================================
 # Store negated C result (16×16, FP32 accum) to packed bf16x2 sAkk
 # C-layout for m16n8k16 FP32 accum:
 #   cn0_0 = C[gid, 0..7 left half col0], cn0_1 = C[gid+8, left half col0]
 #   cn0_2 = C[gid, left half col1], cn0_3 = C[gid+8, left half col1]
 #   cn1_* = right half
 # Packing: negate FP32 then pack pairs → bf16x2
-# ===========================================================================
 @dsl_user_op
 def _store_neg_C(
     sAkk: cute.Tensor,
@@ -597,14 +571,12 @@ def _store_neg_C(
     sAkk[r + gid + 8, c + 4 + tid] = _pack_bf16x2(-c6, -c7)
 
 
-# ===========================================================================
 # Pack FP32 C-accum → bf16x2 A-operand for C→A chain
 # C-layout (FP32 accum, m16n8k16): 8 floats → 4 bf16x2 A-regs
 #   c0,c1 → a0 (rows gid/gid+8, left-half k0..7)
 #   c2,c3 → a1
 #   c4,c5 → a2 (right-half k8..15)
 #   c6,c7 → a3
-# ===========================================================================
 @dsl_user_op
 def _pack_C_to_A(c0, c1, c2, c3, c4, c5, c6, c7, *, loc=None, ip=None):
     a0 = _pack_bf16x2(c0, c1)
@@ -614,9 +586,7 @@ def _pack_C_to_A(c0, c1, c2, c3, c4, c5, c6, c7, *, loc=None, ip=None):
     return a0, a1, a2, a3
 
 
-# ===========================================================================
 # Convert FP32 C-accum → bf16x2 B-operand via pack + movmatrix
-# ===========================================================================
 @dsl_user_op
 def _pack_C_to_B(c0, c1, c2, c3, c4, c5, c6, c7, *, loc=None, ip=None):
     a0 = _pack_bf16x2(c0, c1)
@@ -630,9 +600,7 @@ def _pack_C_to_B(c0, c1, c2, c3, c4, c5, c6, c7, *, loc=None, ip=None):
     return b0, b1, b2, b3
 
 
-# ===========================================================================
 # sTemp helpers (FP32, non-swizzled, for inter-warp accumulator exchange)
-# ===========================================================================
 @dsl_user_op
 def _store_C_temp(
     sT: cute.Tensor,
@@ -677,9 +645,6 @@ def _load_C_temp(sT: cute.Tensor, buf, lane_id, *, loc=None, ip=None):
     return c0, c1, c2, c3, c4, c5, c6, c7
 
 
-# ===========================================================================
-# Main kernel
-# ===========================================================================
 @cute.kernel
 def akk_inv_kernel(
     g2s_copy: cute.TiledCopy,
@@ -958,9 +923,6 @@ def akk_inv_kernel(
                 mOut[b_idx, t_row, h_idx, pair] = final
 
 
-# ===========================================================================
-# Host JIT function
-# ===========================================================================
 @cute.jit
 def akk_inv_host(
     A_in: cute.Tensor,
@@ -1004,13 +966,10 @@ def akk_inv_host(
         cutlass.Float32,
         num_bits_per_copy=128,
     )
-    # Source layout: BS rows × BS//2 pairs = 64×32
-    # 128 threads, each copies 4 FP32 (128 bits) per iteration
-    # Need 64*32/128/4 = 4 iterations → but (16,8) × (1,4) = 128 threads × 4 vals = 512 per iter
-    # 64×32 = 2048 elements / 512 = 4 iterations. But SMEM is 64×36, need to handle padding.
-    # Actually: the copy maps source shape to SMEM shape.
-    # Source is (BS, BS//2) = (64, 32), SMEM is (BS, AKK_STRIDE) = (64, 36).
-    # The copy handles the actual data region (64, 32); padding cols 32-35 stay zero.
+    # 128 threads x 4 FP32 (128b) each = 512 elements per iteration, so the
+    # 64x32 source takes 4 iterations. The copy maps the source shape
+    # (BS, BS//2) = (64, 32) onto the SMEM shape (BS, AKK_STRIDE) = (64, 36):
+    # only the (64, 32) data region is written, padding cols 32-35 stay zero.
     g2s_copy = cute.make_tiled_copy_tv(
         copy_atom,
         thr_layout=cute.make_layout((16, 8), stride=(8, 1)),
@@ -1047,196 +1006,3 @@ def akk_inv_host(
         smem=smem_bytes,
         stream=stream,
     )
-
-
-# ===========================================================================
-# Input preparation: block-transpose lower triangle to upper triangle
-# ===========================================================================
-def prepare_input(M):
-    """Take unit lower-triangular M [batch,64,64] and produce the
-    block-transposed layout expected by the kernel."""
-    B = M.shape[0]
-    M_in = torch.zeros_like(M)
-    for i in range(4):
-        r0, r1 = i * SB, (i + 1) * SB
-        M_in[:, r0:r1, r0:r1] = M[:, r0:r1, r0:r1]
-    for i in range(4):
-        for j in range(i):
-            ir0, ir1 = i * SB, (i + 1) * SB
-            jr0, jr1 = j * SB, (j + 1) * SB
-            M_in[:, jr0:jr1, ir0:ir1] = M[:, ir0:ir1, jr0:jr1]
-    return M_in
-
-
-# ===========================================================================
-# Test
-# ===========================================================================
-def test_akk_inv():
-    cutlass.cuda.initialize_cuda_context()
-
-    B_TEST = 1
-    H_TEST = 96
-    NT_TEST = 128
-    T_TEST = NT_TEST * BS
-    inv_batch = B_TEST * NT_TEST * H_TEST
-    WARMUP = 5
-    BENCH = 100
-
-    print("=" * 60)
-    print("Akk 64x64 Inverse — Full BF16 (BF16 MMA + packed bf16x2 SMEM)")
-    print("=" * 60)
-    print(f"  B={B_TEST}, NT={NT_TEST}, H={H_TEST}, T={T_TEST}")
-    print(f"  inv_batch={inv_batch},  Matrix: {BS}x{BS},  Threads: {THREADS}")
-    print(f"  AKK_STRIDE={AKK_STRIDE} (pad={AKK_PAD})")
-
-    torch.manual_seed(42)
-
-    # Generate FP32 test data, convert to BF16 for input
-    L = torch.randn(inv_batch, BS, BS, device="cuda", dtype=torch.float32) * 0.1
-    L = L.tril(-1)
-    M = torch.eye(BS, device="cuda", dtype=torch.float32).unsqueeze(0) + L
-
-    M_bt = prepare_input(M)
-
-    # BF16 input (matching flash attention / KDA precision)
-    M_input = (
-        M_bt.reshape(B_TEST, NT_TEST, H_TEST, BS, BS)
-        .permute(0, 1, 3, 2, 4)
-        .contiguous()
-        .reshape(B_TEST, T_TEST, H_TEST, BS)
-        .to(torch.bfloat16)
-    )
-
-    M_out = torch.zeros(B_TEST, T_TEST, H_TEST, BS, device="cuda", dtype=torch.bfloat16)
-
-    M_in_ct = from_dlpack(M_input, assumed_align=16)
-    M_in_ct.element_type = cutlass.Float32  # viewed as FP32 (packed bf16x2)
-    M_out_ct = from_dlpack(M_out, assumed_align=16)
-    M_out_ct.element_type = cutlass.Float32
-
-    # Beta tensor (per-token, per-head, scalar). For the standalone test we
-    # use beta=1 so the kernel's beta epilogue (which scales the inverse's
-    # diagonal columns by beta) is a no-op and we can compare to the pure
-    # inverse reference below.
-    beta_test = torch.ones(B_TEST, T_TEST, H_TEST, device="cuda", dtype=torch.bfloat16)
-    beta_ct = from_dlpack(beta_test.contiguous(), assumed_align=16)
-    beta_ct.element_type = cutlass.BFloat16
-
-    # Dummy tensors for varlen params
-    dummy_cu = from_dlpack(
-        torch.empty(2, dtype=torch.int64, device="cuda"), assumed_align=16
-    )
-    dummy_cu.element_type = cutlass.Int64
-    dummy_ci = from_dlpack(
-        torch.empty(1, 2, dtype=torch.int64, device="cuda"), assumed_align=16
-    )
-    dummy_ci.element_type = cutlass.Int64
-
-    print("\nCompiling ...")
-    compiled = cute.compile(
-        akk_inv_host,
-        M_in_ct,
-        M_out_ct,
-        beta_ct,
-        B_TEST,
-        NT_TEST,
-        H_TEST,
-        dummy_cu,
-        dummy_ci,
-        0,
-        NT_TEST * BS,
-    )
-    torch.cuda.synchronize()
-    print("Done.")
-
-    print(f"\nWarmup ({WARMUP} iters) ...")
-    for _ in range(WARMUP):
-        compiled(M_in_ct, M_out_ct, beta_ct, dummy_cu, dummy_ci)
-    torch.cuda.synchronize()
-
-    compiled(M_in_ct, M_out_ct, beta_ct, dummy_cu, dummy_ci)
-    torch.cuda.synchronize()
-
-    # --- Correctness ---
-    # Reference: invert the BF16 input (as float) for fair comparison
-    M_bf16_3d = (
-        M_input.reshape(B_TEST, NT_TEST, BS, H_TEST, BS)
-        .permute(0, 1, 3, 2, 4)
-        .contiguous()
-        .reshape(inv_batch, BS, BS)
-        .float()
-    )
-    # Undo block-transpose to get original layout for torch.linalg.inv
-    M_orig = torch.zeros_like(M_bf16_3d)
-    for i in range(4):
-        r0, r1 = i * SB, (i + 1) * SB
-        M_orig[:, r0:r1, r0:r1] = M_bf16_3d[:, r0:r1, r0:r1]
-    for i in range(4):
-        for j in range(i):
-            ir0, ir1 = i * SB, (i + 1) * SB
-            jr0, jr1 = j * SB, (j + 1) * SB
-            M_orig[:, ir0:ir1, jr0:jr1] = M_bf16_3d[:, jr0:jr1, ir0:ir1]
-    M_inv_ref = torch.linalg.inv(M_orig)
-    mask = torch.tril(torch.ones(BS, BS, device="cuda", dtype=torch.bool))
-
-    out_3d = (
-        M_out.reshape(B_TEST, NT_TEST, BS, H_TEST, BS)
-        .permute(0, 1, 3, 2, 4)
-        .contiguous()
-        .reshape(inv_batch, BS, BS)
-    )
-    out_f = out_3d.float()
-    ref_f = M_inv_ref.float()
-    diff = (out_f - ref_f).abs()
-    diff_lower = diff[:, mask]
-
-    n = diff_lower.numel()
-    n_1e2 = (diff_lower < 1e-2).sum().item()
-    n_1e3 = (diff_lower < 1e-3).sum().item()
-    max_d = diff_lower.max().item()
-    mean_d = diff_lower.mean().item()
-
-    print(f"\nCorrectness (lower triangle):")
-    print(f"  max={max_d:.6f}  mean={mean_d:.6f}")
-    print(f"  |diff|<1e-2: {n_1e2 / n * 100:.3f}%  |diff|<1e-3: {n_1e3 / n * 100:.3f}%")
-    print(
-        f"  nan: out={torch.isnan(out_f).sum().item()} ref={torch.isnan(ref_f).sum().item()}"
-    )
-
-    for i in range(4):
-        for j in range(i + 1):
-            blk = diff[:, i * SB : (i + 1) * SB, j * SB : (j + 1) * SB]
-            print(f"  Block({i},{j}): max={blk.max().item():.6e}")
-
-    # --- Benchmark (warm L2) ---
-    print(f"\nBenchmark warm L2 ({BENCH} iters) ...")
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(BENCH):
-        compiled(M_in_ct, M_out_ct, beta_ct, dummy_cu, dummy_ci)
-    end.record()
-    torch.cuda.synchronize()
-    ms = start.elapsed_time(end) / BENCH
-    data_mb = inv_batch * BS * BS * (2 + 2) / 1e6  # BF16 in + BF16 out = 4 bytes/elem
-    bw = data_mb / ms * 1e3 / 1e3
-    print(f"  Time: {ms:.4f} ms   BW: {bw:.1f} GB/s")
-
-    # --- Benchmark (cold L2) ---
-    l2_flush = torch.empty(64 * 1024 * 1024, device="cuda", dtype=torch.int8)
-    print(f"\nBenchmark cold L2 ({BENCH} iters) ...")
-    start.record()
-    for _ in range(BENCH):
-        l2_flush.fill_(0)
-        compiled(M_in_ct, M_out_ct, beta_ct, dummy_cu, dummy_ci)
-    end.record()
-    torch.cuda.synchronize()
-    ms_cold = start.elapsed_time(end) / BENCH
-    bw_cold = data_mb / ms_cold * 1e3 / 1e3
-    print(f"  Time: {ms_cold:.4f} ms   BW: {bw_cold:.1f} GB/s")
-    print(f"\n  Delta (cold - warm): {(ms_cold - ms) * 1000:.1f} us")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    test_akk_inv()

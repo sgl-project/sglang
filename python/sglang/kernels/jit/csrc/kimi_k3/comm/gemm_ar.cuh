@@ -9,6 +9,7 @@
 // one-shot AR below the two-shot threshold, two-shot RS+AG above.
 // Requires SM100+ with full P2P; tuned on GB300 (sm_103a).
 
+#include <sgl_kernel/mbarrier.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <sgl_kernel/distributed/communicator.cuh>
@@ -16,6 +17,7 @@
 #include <cute/arch/cluster_sm90.hpp>
 #include <cutlass/cuda_host_adapter.hpp>
 
+#include "ptx_sys.cuh"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -23,35 +25,16 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-// ============================================================================
 // Local PTX / TMA primitives
-// ============================================================================
 // Only what this kernel issues, kept in-file on purpose: these are raw-ISA
 // shapes (sm_100+ tcgen05, the cta_group::1 multicast TMA load) that no shared
 // sglang header wraps, and splitting them out bought a dozen headers with
 // exactly one consumer. Anything cute already provides goes through cute
 // (`set_block_rank` below, the tensor-map driver wrapper in `w_maps`).
 
-#define CUDA_CHECK(expr)                                                                                             \
-  do {                                                                                                               \
-    cudaError_t _e = (expr);                                                                                         \
-    if (_e != cudaSuccess) {                                                                                         \
-      std::fprintf(                                                                                                  \
-          stderr, "CUDA error %s at %s:%d: %s\n", cudaGetErrorName(_e), __FILE__, __LINE__, cudaGetErrorString(_e)); \
-      std::abort();                                                                                                  \
-    }                                                                                                                \
-  } while (0)
-
 namespace ptx {
 
 // ---- generic → shared address conversion (PTX ISA §10.4) --------------------
-
-// Inline-PTX `.shared` instructions take a 32-bit byte offset in the shared
-// window, not a generic 64-bit pointer.
-template <typename T>
-static SGL_DEVICE uint32_t to_shared(T* ptr) {
-  return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
-}
 
 // ---- cvt: pack 2 fp32 into one bf16x2 (PTX ISA §9.7.9.21) ------------------
 //
@@ -169,30 +152,6 @@ __host__ __device__ static __forceinline__ constexpr uint32_t mma_inst_desc_f16(
   return d;
 }
 
-// ---- mbarrier (PTX ISA §9.7.13.15) -----------------------------------------
-//
-// Only the `try_wait.parity` waiter is wrapped: state-token waits couple
-// arriver and waiter, and mixing state- and parity-tracked codepaths in one
-// kernel is a deadlock risk. The caller owns the phase counter and flips it at
-// the stage wrap (`phase ^= (stage == 0)`).
-//
-// Initial parity, the easy-to-flip part: after `mbar_init` the bar is at
-// parity 0, and each full cycle (count arrivals -> fire -> reset) flips it.
-//   - consumer-first (waits for an external producer's first signal) -> 0.
-//   - producer-first (waits for a consumer to release a slot that no consumer
-//     has touched yet) -> 1, so the first wait is a no-op skip.
-// A consumer-first wait initialized to 1 skips the producer's first signal and
-// blocks forever on the second.
-static SGL_DEVICE void mbar_init(uint64_t* bar, uint32_t count) {
-  asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(to_shared(bar)), "r"(count));
-}
-
-static SGL_DEVICE uint64_t mbar_arrive(uint64_t* bar) {
-  uint64_t state;
-  asm volatile("mbarrier.arrive.shared.b64 %0, [%1];" : "=l"(state) : "r"(to_shared(bar)));
-  return state;
-}
-
 // Cross-CTA arrive with `.release.cta` ordering. A plain cluster arrive carries
 // NO release, so prior memory ops (notably a retired `tcgen05.ld` TMEM drain on
 // the arriving warp) are not guaranteed visible before a peer warp's `.acquire`
@@ -206,23 +165,6 @@ static SGL_DEVICE uint64_t mbar_arrive(uint64_t* bar) {
 static SGL_DEVICE void mbar_arrive_cluster_release(uint64_t* bar, uint32_t cta_rank) {
   const uint32_t mapped = cute::set_block_rank(to_shared(bar), cta_rank);
   asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0], 1;" ::"r"(mapped));
-}
-
-// Combined arrive + set tx-count, for TMA-load completion.
-static SGL_DEVICE void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
-  asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" ::"r"(to_shared(bar)), "r"(bytes));
-}
-
-// Wait for phase `parity` to complete. Looped because the spec allows spurious
-// early wakeups. Default `.acquire` semantics mean prior `cp.async.bulk` writes
-// tracked by this mbarrier are visible to later generic-proxy reads on this
-// thread with no `fence.proxy.async` (spec §9.7.13.15.16 point 3).
-static SGL_DEVICE void mbar_wait_parity(uint64_t* bar, uint32_t parity) {
-  asm volatile(
-      "{\n\t.reg .pred p;\n\t"
-      "WAIT_%=: mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t"
-      "@!p bra WAIT_%=;\n\t}\n" ::"r"(to_shared(bar)),
-      "r"(parity));
 }
 
 // ---- cluster / warp sync (PTX ISA §9.7.13, §9.7.4) -------------------------
@@ -549,11 +491,11 @@ enum class Comm { kNone, kMc, kPeer, kMcPull, kTwoShot, kTwoShotPeer };
 // every bs cell reuses one region). Parity-double-buffered payloads; the flag
 // ring lives on its own 2 MB page. Slot reuse across epochs e / e+2 is safe
 // with 2 parities because each rank's launch e+1 spin-waits epoch e+1 AFTER
-// its own e-reduce (per-rank stream order) — DESIGN §2.
+// its own e-reduce (per-rank stream order).
 // Slots are TILE-MAJOR ([n8-tile][m][8 cols]), NOT [m][n]: a warp's push for
 // one tile is then a CONTIGUOUS 128 B fabric write instead of 32 scattered
 // 4-16 B m-strided writes — lane-scatter runs ~0.26x on this fabric
-// (cross_rank_sync §D) and the scattered form's ack-drain dominated the bs8
+// and the scattered form's ack-drain dominated the bs8
 // boundary (stamped 22 us at idle). The reduce un-transposes locally.
 constexpr size_t kSlotBytes1 = size_t(kMMax) * kN * 2;  // one [M,N] bf16
 constexpr __host__ __device__ size_t slot_off(int parity, int src, int R) {
@@ -674,7 +616,7 @@ __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
   const uint32_t epoch = cta_epoch;
   const int parity = int(epoch & 1);
   const int ring = int(epoch % kRing);
-  // pinned wait-set (§I): flag VA + monotonic targets resolved before any spin
+  // pinned wait-set: flag VA + monotonic targets resolved before any spin
   const size_t foff = flags_off(R) + size_t(prm.fam) * 512;
   const size_t doff2 = done_off(R) + size_t(prm.fam) * kRing * kMaxCTA * 4;
   uint32_t* const flag_local = reinterpret_cast<uint32_t*>(prm.uc_base[prm.my_rank] + foff) + ring;
@@ -845,13 +787,13 @@ __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
     }
   }
 
-  // ---- boundary (§H gather + flag + per-CTA local-replica spin) ----------
+  // ---- boundary (gather + flag + per-CTA local-replica spin) -------------
   __syncthreads();
   if (tid == 0) {
     const uint32_t old = atomic_add_acq_rel_gpu(gather_fam + ring, 1);
     if (old + 1 == gath_target) {
       // ONE completing-CTA fence: publishes every CTA's pushes via the
-      // acq_rel gather chain (§H). Measured 0.9 us better than per-CTA
+      // acq_rel gather chain. Measured 0.9 us better than per-CTA
       // fences at bs1 (11.04 vs 11.97) — the parallel-drain theory lost.
       fence_release_sys();
       {
@@ -1161,7 +1103,7 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
     ptx::tcgen05_relinquish();
   }
 
-  // ---- boundary (§H, fam rings) — verbatim member-1 contract ------------
+  // ---- boundary (fam rings) — verbatim member-1 contract ----------------
   if (tid == 0) {
     const uint32_t old = atomic_add_acq_rel_gpu(gather_fam + ring, 1);
     if (old + 1 == gath_target) {
@@ -1324,9 +1266,9 @@ struct Launcher3 {
   static constexpr int kGrid = kTiles < 152 ? kTiles : 152;
   static constexpr size_t kSmem = size_t(d3_ns(kBN)) * (kD3ABytes + kBN * kD3BK * 2);
   static void set_smem_attr() {
-    CUDA_CHECK(cudaFuncSetAttribute(
+    CHECK_CUDA(cudaFuncSetAttribute(
         oproj_dense_ar_kernel<M, K, R, COMM>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(kSmem)));
-    CUDA_CHECK(cudaFuncSetAttribute(
+    CHECK_CUDA(cudaFuncSetAttribute(
         oproj_dense_ar_kernel<M, K, R, COMM>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
   }
   static void
@@ -1345,7 +1287,7 @@ struct Launcher3 {
     cfg.stream = stream;
     cfg.attrs = attr;
     cfg.numAttrs = unsigned(na);
-    CUDA_CHECK(cudaLaunchKernelEx(&cfg, oproj_dense_ar_kernel<M, K, R, COMM>, x_tmap, w_tmap, prm));
+    CHECK_CUDA(cudaLaunchKernelEx(&cfg, oproj_dense_ar_kernel<M, K, R, COMM>, x_tmap, w_tmap, prm));
   }
 };
 
@@ -1367,12 +1309,12 @@ struct Launcher {
                                       : 4096;  // AR-only path never touches the feed ring
   // once per device, before first launch
   static void set_smem_attr() {
-    CUDA_CHECK(cudaFuncSetAttribute(
+    CHECK_CUDA(cudaFuncSetAttribute(
         oproj_ar_kernel<M, K, R, COMM, GEMM_ON, S, CH, C>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(kSmem)));
     // 100% carveout → the SM smem config fits TWO CTAs (this grid's tail
     // + the next PDL grid's feed); the default config blocks dual
     // residency and with it the whole tail-hiding scheme.
-    CUDA_CHECK(cudaFuncSetAttribute(
+    CHECK_CUDA(cudaFuncSetAttribute(
         oproj_ar_kernel<M, K, R, COMM, GEMM_ON, S, CH, C>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
   }
   // pdl=false = the NON-COOPERATIVE-neighbor regime: no programmatic
@@ -1408,7 +1350,7 @@ struct Launcher {
     cfg.stream = stream;
     cfg.attrs = attr;
     cfg.numAttrs = unsigned(na);
-    CUDA_CHECK(cudaLaunchKernelEx(&cfg, oproj_ar_kernel<M, K, R, COMM, GEMM_ON, S, CH, C>, w_map, x_map, prm));
+    CHECK_CUDA(cudaLaunchKernelEx(&cfg, oproj_ar_kernel<M, K, R, COMM, GEMM_ON, S, CH, C>, w_map, x_map, prm));
   }
 };
 

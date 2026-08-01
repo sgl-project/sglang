@@ -11,6 +11,7 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/extra/stl.h>
 
+#include "ptx_sys.cuh"
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -28,21 +29,7 @@ constexpr uint32_t kVecSize = 32 / sizeof(bf16_t);  // 16 bf16 per 32B vector
 constexpr uint32_t kSpinBlock = 128;                // consumer threads per block
 constexpr uint32_t kSpinVec = 16 / sizeof(bf16_t);  // 8 bf16 (16B) per consumer thread
 
-SGL_DEVICE float fma_f32_bf16(bf16_t a, bf16_t b, float acc) {
-#if SGL_ARCH_BLACKWELL_OR_GREATER
-  const uint16_t a_bits = __bfloat16_as_ushort(a);
-  const uint16_t b_bits = __bfloat16_as_ushort(b);
-  float result;
-  asm("fma.rn.f32.bf16 %0, %1, %2, %3;" : "=f"(result) : "h"(a_bits), "h"(b_bits), "f"(acc));
-  return result;
-#else
-  return fmaf(device::cast<fp32_t>(a), device::cast<fp32_t>(b), acc);
-#endif
-}
-
-// ---------------------------------------------------------------------------
 // Producer: per-rank column-slice GEMV, multicast store with Lamport markers.
-// ---------------------------------------------------------------------------
 
 struct ProducerParams {
   uint8_t* ws_mc;       // multicast VA of the push workspace base
@@ -105,7 +92,7 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
       float acc = 0.0f;
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize; ++i) {
-        acc = fma_f32_bf16(input_vec[m][i], weight_vec[n][i], acc);
+        acc = device::math::fma_f32_bf16(input_vec[m][i], weight_vec[n][i], acc);
       }
       s_acc[warp_id][m * N_SPLIT + n] = warp::reduce_sum(acc);
     }
@@ -135,9 +122,7 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
   PDLTriggerSecondary<kUsePDL>();
 }
 
-// ---------------------------------------------------------------------------
 // Consumer: Lamport spin + add3, one 16B vector (8 bf16) per thread.
-// ---------------------------------------------------------------------------
 
 struct ConsumerParams {
   uint8_t* ws_local;      // LOCAL VA of the push workspace base (poll + reset)
@@ -218,12 +203,10 @@ __global__ void spin_add3_kernel(const __grid_constant__ ConsumerParams params) 
 using namespace sglang;
 using host::distributed::CommunicatorRef;
 
-// ---------------------------------------------------------------------------
 // Host entry point (tiny_gemm style: one GEMV instantiation per M in
 // [1, kMaxM] selected through a constexpr function-pointer table, then the
 // spin consumer launched with PDL right behind it). Any (K, N) that passes
 // the kernels' static_asserts works; Kimi-K3 uses (3584, 7168).
-// ---------------------------------------------------------------------------
 
 template <uint32_t K, uint32_t N, uint32_t kMaxM, bool kUsePDL>
 struct GEMMAGKernel {

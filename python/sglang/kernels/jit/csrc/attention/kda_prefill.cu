@@ -49,10 +49,8 @@
 #include <type_traits>
 #include <vector>
 
-// ---------------------------------------------------------------------------
-// Inlined PTX helpers (subset of the repo's common/ptx_*.cuh actually used by
-// the shipping kernels; bit layouts verified by the repo's gate tests).
-// ---------------------------------------------------------------------------
+// Inlined PTX helpers: only the subset the kernels below use, kept local so this
+// translation unit compiles standalone.
 namespace ptx {
 
 template <typename T>
@@ -376,8 +374,7 @@ mma_smem_desc_k_major(uint32_t addr, uint32_t base_offset = 0) {
 }
 // MN-major operand (inner = N for B) over swizzle-atom-form smem: adjacent
 // K-row groups of 8 at SBO = 8 * SWZ within an MN-chunk, adjacent MN-chunks
-// (one SWZ128 TMA box each) at LBO = BLOCK_K * SWZ (derivation in the
-// repo's common/mma_desc.cuh)
+// (one SWZ128 TMA box each) at LBO = BLOCK_K * SWZ.
 template <typename T, int BLOCK_K, int BLOCK_MN, int SWIZZLE_BYTES>
 __host__ __device__ static __forceinline__ constexpr uint64_t
 mma_smem_desc_mn_major(uint32_t addr, uint32_t base_offset = 0) {
@@ -3068,9 +3065,7 @@ __global__ void __launch_bounds__(512) k2_chain_tc_vl(
         sq->tend);
 }
 
-// ---------------------------------------------------------------------------
 // Host side: tensor-map encoders, cached workspace, torch entry point.
-// ---------------------------------------------------------------------------
 
 #define KDA_CU_CHECK(expr)                                                                             \
   do {                                                                                                 \

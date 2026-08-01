@@ -1,7 +1,9 @@
-import torch
+from __future__ import annotations
 
-from .activation import situ_and_mul
-from .moe import situ_and_mul_masked_post_quant
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    import torch
 
 _K3_N_GEMM_DISPATCH_MAP = {
     (144, 7168): 16,
@@ -12,10 +14,53 @@ _K3_K_GEMM_DISPATCH_MAP = {
 }
 
 
+def situ_and_mul(
+    input: torch.Tensor,
+    out: Optional[torch.Tensor],
+    beta: float,
+    linear_beta: Optional[float],
+) -> torch.Tensor:
+    from .activation import situ_and_mul as impl
+
+    return impl(input, out, beta, linear_beta)
+
+
+def situ_and_mul_masked_post_quant(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    quant_group_size: int,
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: float,
+    scale_ue8m0: bool = False,
+    topk: int = 8,
+    transposed: bool = False,
+    swizzle: bool = False,
+) -> None:
+    from .moe import situ_and_mul_masked_post_quant as impl
+
+    return impl(
+        input,
+        output,
+        output_scale,
+        quant_group_size,
+        masked_m,
+        beta,
+        linear_beta,
+        scale_ue8m0,
+        topk,
+        transposed,
+        swizzle,
+    )
+
+
 def kimi_k3_tiny_gemm(
     x: torch.Tensor,
     w: torch.Tensor,
 ) -> torch.Tensor:
+    import torch
+
     from ..gemm.tiny_gemm import tiny_k_gemm_bf16, tiny_n_gemm_bf16
 
     m, k = x.shape

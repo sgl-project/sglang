@@ -71,9 +71,7 @@ def _jit_module(world_size: int) -> Module:
     )
 
 
-# ---------------------------------------------------------------------------
 # Storage plane: the CustomAllReduceV2 Communicator
-# ---------------------------------------------------------------------------
 
 
 class _CommEntry(NamedTuple):
@@ -91,12 +89,20 @@ def register_comm(comm: Communicator, *, pull_sem_mc_ptr: int = 0) -> None:
     ``pull_sem_mc_ptr`` (``CustomAllReduceV2.pull_sem_mc_ptr``), the
     multicast VA of the pull-semaphore region their barriers reuse.
     """
+    # world_size is the whole key, so at most one communicator per size can be
+    # registered in a process. That matches how these ops are called -- the custom
+    # ops below take world_size and nothing else, so a second group of the same
+    # size would silently inherit the first one's peer pointers and semaphores,
+    # and the symptom would be a hang or corruption rather than an error. Assert
+    # it instead of letting the overwrite happen; widening to per-group handles
+    # means changing the custom-op signatures, which is a separate change.
+    prev = _COMM_MAP.get(comm.world_size)
+    assert prev is None or prev.obj is comm, (
+        f"a different communicator is already registered for world_size="
+        f"{comm.world_size}; these ops key only on world_size, so two groups of "
+        f"the same size cannot coexist in one process"
+    )
     _COMM_MAP[comm.world_size] = _CommEntry(obj=comm, pull_sem_mc_ptr=pull_sem_mc_ptr)
-
-
-# ---------------------------------------------------------------------------
-# Pull launch tuning
-# ---------------------------------------------------------------------------
 
 
 class PullTuning(NamedTuple):
@@ -150,9 +156,7 @@ def _resolve_tuning(
     )
 
 
-# ---------------------------------------------------------------------------
 # Custom ops, one per C++ entry point
-# ---------------------------------------------------------------------------
 
 
 @register_custom_op(mutates_args=["x"])
@@ -249,11 +253,6 @@ def _pull_norm_op(
         num_blocks,
         unroll,
     )
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 
 def all_reduce_push_res(

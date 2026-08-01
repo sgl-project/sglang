@@ -29,7 +29,7 @@ def _jit_situ_mul_quant_varlen_module(
     return load_jit(
         _make_name("situ_mul_quant_varlen"),
         *args,
-        cuda_files=["kimi_k3/situ_and_mul_masked_post_quant.cuh"],
+        cuda_files=["kimi_k3/situ_and_mul.cuh"],
         cuda_wrappers=[("run", f"SituAndMulMaskedPostQuantKernel<{args}>::run")],
         extra_cuda_cflags=["-use_fast_math"],
     )

@@ -1,14 +1,14 @@
 """K3 MoE front: merged gate + routed_expert_down_proj GEMM, and the fp32 router.
 
-`KimiK3MoE._forward_unfused` -- the path every EP-a2a / WideEP deployment takes --
-runs three ops over the same `hidden_states [T, 7168]`:
+The unfused MoE front -- the path every EP-a2a / WideEP deployment takes -- runs
+three ops over the same `hidden_states [T, 7168]`:
 
     router_logits = gate(hidden_states)                     # [896, 7168]  12.85 MB
     topk_output   = topk(hidden_states, router_logits)
     routed_input  = routed_expert_down_proj(hidden_states)   # [3584, 7168] 51.4 MB
 
-Plain [M, 896] fp32 logits go to route_radix (which took fp32 support in #237).
-This module covers what that cannot: the merged front.
+Plain [M, 896] fp32 logits go to route_radix. This module covers what that
+cannot: the merged front.
 
 **fused_front** -- the two GEMMs share their input, so their weights are merged
 and one cuBLAS GEMM emits `[T, 896 + 3584]` fp32; a single epilogue kernel then
@@ -134,7 +134,7 @@ def _jit_module() -> Module:
     return load_jit(
         "moe_front",
         *args,
-        cuda_files=["moe/moe_front.cuh"],
+        cuda_files=["moe/route_radix.cuh"],
         cuda_wrappers=[
             ("front_epilogue", f"FusedFrontEpilogueKernel<{args}>::run"),
         ],
@@ -158,9 +158,7 @@ def available() -> bool:
         return False
 
 
-# --------------------------------------------------------------------------
 # merged front: [gate | down] GEMM -> top-k + routed_input
-# --------------------------------------------------------------------------
 
 
 def fused_front_covered(

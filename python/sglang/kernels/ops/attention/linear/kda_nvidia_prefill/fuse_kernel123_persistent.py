@@ -1,7 +1,7 @@
 # Vendored from the NVIDIA KDA_prefill package (benchmark/ Blackwell path)
 # for the Kimi-K3 chunked prefill forward. Local deltas: fla.* imports
 # re-pointed to sglang's vendored fla subset, flat sibling imports made
-# package-relative, RCP_LN2 inlined. INTERNAL COLLABORATION ONLY.
+# package-relative, RCP_LN2 inlined.
 # ruff: noqa  -- vendored kernel library, minimal local deltas
 """
 Persistent Fused K1+K2+K3 Kernel for KDA.
@@ -94,18 +94,11 @@ AQK_TILE_STRIDE = (
 AKK_PAD = 8
 AKK_STRIDE = BT + AKK_PAD  # 72
 
-# For fused akk_inv: sAkk_pkd viewed as fp32 packed bf16x2, stride = BT/2 + small pad
-AKK_PKD_PAD = 4
-AKK_PKD_STRIDE = BT // 2 + AKK_PKD_PAD  # 36 fp32 units = 72 bf16 elements per row
-AKK_TEMP_PAD = 8
-AKK_TEMP_COLS = 16 + AKK_TEMP_PAD  # 24
-AKK_TEMP_BUFS = 2
 
 K1_ROW_GROUPS = 8
 K1_COL_GROUPS = 2
 ROWS_PER_K1_WARP = BT // K1_ROW_GROUPS  # 8
 K1_COLS_PER_WARP = K_DIM // K1_COL_GROUPS  # 64
-ROWS_PER_STORE_WARP = BT // NUM_STORE_WARPS  # 16
 
 VEC = K1_COLS_PER_WARP // 32  # 2
 K_VEC = K_DIM // VEC  # 64
@@ -233,697 +226,6 @@ def fast_rcp(x, *, loc=None, ip=None):
     return cutlass.Float32(result)
 
 
-# ============================================================
-# Akk inverse helpers (fused from Akk_inverse_lower_triangle_bf16.py)
-# ============================================================
-@dsl_user_op
-def store_internal_barrier(*, loc=None, ip=None):
-    """Named barrier for Store warps (4 warps, 128 threads). barrier_id=3."""
-    llvm.inline_asm(
-        T.i32(),
-        [],
-        "membar.cta; bar.sync 3, 128; mov.u32 $0, 0;",
-        "=r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _ak_pack_bf16x2(lo_f32, hi_f32, *, loc=None, ip=None):
-    """cvt.rn.bf16x2.f32 -- pack two fp32 into bf16x2 (as fp32 bitcast view)."""
-    result = llvm.inline_asm(
-        T.i32(),
-        [lo_f32.ir_value(loc=loc, ip=ip), hi_f32.ir_value(loc=loc, ip=ip)],
-        "cvt.rn.bf16x2.f32 $0, $2, $1;",
-        "=r,f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return cutlass.Float32(llvm.bitcast(T.f32(), result, loc=loc, ip=ip))
-
-
-@dsl_user_op
-def _ak_movmatrix_trans(src, *, loc=None, ip=None):
-    src_b = llvm.bitcast(T.i32(), src.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-    result = llvm.inline_asm(
-        T.i32(),
-        [src_b],
-        "movmatrix.sync.aligned.m8n8.trans.b16 $0, $1;",
-        "=r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return cutlass.Float32(llvm.bitcast(T.f32(), result, loc=loc, ip=ip))
-
-
-@dsl_user_op
-def _ak_mask_packed_ltri(packed, row, pair, *, loc=None, ip=None):
-    """Mask packed bf16x2 to lower-tri: zero elements where row < col."""
-    p = llvm.bitcast(T.i32(), packed.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-    result = llvm.inline_asm(
-        T.i32(),
-        [p, row.ir_value(loc=loc, ip=ip), pair.ir_value(loc=loc, ip=ip)],
-        """{
-            .reg .b32 %c0, %c1, %mlo, %mhi, %mask;
-            .reg .pred %p0, %p1;
-            shl.b32 %c0, $3, 1;
-            add.u32 %c1, %c0, 1;
-            setp.ge.s32 %p0, $2, %c0;
-            setp.ge.s32 %p1, $2, %c1;
-            selp.b32 %mlo, 0xFFFF, 0, %p0;
-            selp.b32 %mhi, 0xFFFF0000, 0, %p1;
-            or.b32 %mask, %mlo, %mhi;
-            and.b32 $0, $1, %mask;
-        }""",
-        "=r,r,r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return cutlass.Float32(llvm.bitcast(T.f32(), result, loc=loc, ip=ip))
-
-
-@dsl_user_op
-def _ak_unpack_bf16x2_lo(packed, *, loc=None, ip=None):
-    p = llvm.bitcast(T.i32(), packed.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-    result = llvm.inline_asm(
-        T.i32(),
-        [p],
-        "shl.b32 $0, $1, 16;",
-        "=r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return cutlass.Float32(llvm.bitcast(T.f32(), result, loc=loc, ip=ip))
-
-
-@dsl_user_op
-def _ak_unpack_bf16x2_hi(packed, *, loc=None, ip=None):
-    p = llvm.bitcast(T.i32(), packed.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-    result = llvm.inline_asm(
-        T.i32(),
-        [p],
-        "and.b32 $0, $1, 0xFFFF0000;",
-        "=r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return cutlass.Float32(llvm.bitcast(T.f32(), result, loc=loc, ip=ip))
-
-
-@dsl_user_op
-def _ak_mma(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=None):
-    """BF16 MMA m16n8k16, args are Float32 (bitcast-viewed as i32 for bf16x2)."""
-    a0b = llvm.bitcast(T.i32(), a0.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-    a1b = llvm.bitcast(T.i32(), a1.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-    a2b = llvm.bitcast(T.i32(), a2.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-    a3b = llvm.bitcast(T.i32(), a3.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-    b0b = llvm.bitcast(T.i32(), b0.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-    b1b = llvm.bitcast(T.i32(), b1.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-    result = llvm.inline_asm(
-        ir.Type.parse("!llvm.struct<(f32, f32, f32, f32)>"),
-        [
-            a0b,
-            a1b,
-            a2b,
-            a3b,
-            b0b,
-            b1b,
-            c0.ir_value(loc=loc, ip=ip),
-            c1.ir_value(loc=loc, ip=ip),
-            c2.ir_value(loc=loc, ip=ip),
-            c3.ir_value(loc=loc, ip=ip),
-        ],
-        """{
-            mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
-                {$0, $1, $2, $3},
-                {$4, $5, $6, $7},
-                {$8, $9},
-                {$10, $11, $12, $13};
-        }""",
-        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    d0 = cutlass.Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip))
-    d1 = cutlass.Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip))
-    d2 = cutlass.Float32(llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip))
-    d3 = cutlass.Float32(llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip))
-    return d0, d1, d2, d3
-
-
-@dsl_user_op
-def _ak_invert_diag_neumann(sAkk, block_idx, lane_id, *, loc=None, ip=None):
-    """Invert 16x16 diag block via Neumann series (I+L)^-1 = (I-L)(I+L^2)(I+L^4)(I+L^8).
-    Reads/writes sAkk as fp32 packed bf16x2 (stride 36). Each block handled by 1 warp.
-    """
-    r_off = block_idx * 16
-    c_off = block_idx * 8  # 16 cols = 8 pairs
-    gid = lane_id // 4
-    tid = lane_id % 4
-
-    packed0 = cutlass.Float32(sAkk[r_off + gid, c_off + tid])
-    packed1 = cutlass.Float32(sAkk[r_off + gid + 8, c_off + tid])
-    packed2 = cutlass.Float32(sAkk[r_off + gid, c_off + 4 + tid])
-    packed3 = cutlass.Float32(sAkk[r_off + gid + 8, c_off + 4 + tid])
-
-    A_f0 = _ak_unpack_bf16x2_lo(packed0)
-    A_f1 = _ak_unpack_bf16x2_hi(packed0)
-    A_f2 = _ak_unpack_bf16x2_lo(packed1)
-    A_f3 = _ak_unpack_bf16x2_hi(packed1)
-    A_f4 = _ak_unpack_bf16x2_lo(packed2)
-    A_f5 = _ak_unpack_bf16x2_hi(packed2)
-    A_f6 = _ak_unpack_bf16x2_lo(packed3)
-    A_f7 = _ak_unpack_bf16x2_hi(packed3)
-
-    _one = cutlass.Float32(1.0)
-    _zero = cutlass.Float32(0.0)
-    I_f0 = _one * cutlass.Float32(gid == 2 * tid) + _zero * cutlass.Float32(
-        gid != 2 * tid
-    )
-    I_f1 = _one * cutlass.Float32(gid == 2 * tid + 1) + _zero * cutlass.Float32(
-        gid != 2 * tid + 1
-    )
-    I_f2 = _one * cutlass.Float32(gid + 8 == 2 * tid) + _zero * cutlass.Float32(
-        gid + 8 != 2 * tid
-    )
-    I_f3 = _one * cutlass.Float32(gid + 8 == 2 * tid + 1) + _zero * cutlass.Float32(
-        gid + 8 != 2 * tid + 1
-    )
-    I_f4 = _one * cutlass.Float32(gid == 8 + 2 * tid) + _zero * cutlass.Float32(
-        gid != 8 + 2 * tid
-    )
-    I_f5 = _one * cutlass.Float32(gid == 8 + 2 * tid + 1) + _zero * cutlass.Float32(
-        gid != 8 + 2 * tid + 1
-    )
-    I_f6 = _one * cutlass.Float32(gid + 8 == 8 + 2 * tid) + _zero * cutlass.Float32(
-        gid + 8 != 8 + 2 * tid
-    )
-    I_f7 = _one * cutlass.Float32(gid + 8 == 8 + 2 * tid + 1) + _zero * cutlass.Float32(
-        gid + 8 != 8 + 2 * tid + 1
-    )
-
-    L_f0 = A_f0 - I_f0
-    L_f1 = A_f1 - I_f1
-    L_f2 = A_f2 - I_f2
-    L_f3 = A_f3 - I_f3
-    L_f4 = A_f4 - I_f4
-    L_f5 = A_f5 - I_f5
-    L_f6 = A_f6 - I_f6
-    L_f7 = A_f7 - I_f7
-    INV_f0 = I_f0 - L_f0
-    INV_f1 = I_f1 - L_f1
-    INV_f2 = I_f2 - L_f2
-    INV_f3 = I_f3 - L_f3
-    INV_f4 = I_f4 - L_f4
-    INV_f5 = I_f5 - L_f5
-    INV_f6 = I_f6 - L_f6
-    INV_f7 = I_f7 - L_f7
-
-    _zf = cutlass.Float32(0.0)
-    L_a0 = _ak_pack_bf16x2(L_f0, L_f1)
-    L_a1 = _ak_pack_bf16x2(L_f2, L_f3)
-    L_a2 = _ak_pack_bf16x2(L_f4, L_f5)
-    L_a3 = _ak_pack_bf16x2(L_f6, L_f7)
-    INV_a0 = _ak_pack_bf16x2(INV_f0, INV_f1)
-    INV_a1 = _ak_pack_bf16x2(INV_f2, INV_f3)
-    INV_a2 = _ak_pack_bf16x2(INV_f4, INV_f5)
-    INV_a3 = _ak_pack_bf16x2(INV_f6, INV_f7)
-
-    # Iter 1: L^2, INV += INV*L^2
-    L_b0 = _ak_movmatrix_trans(L_a0)
-    L_b1 = _ak_movmatrix_trans(L_a1)
-    L_b2 = _ak_movmatrix_trans(L_a2)
-    L_b3 = _ak_movmatrix_trans(L_a3)
-    Lp_c0, Lp_c1, Lp_c2, Lp_c3 = _ak_mma(
-        L_a0, L_a1, L_a2, L_a3, L_b0, L_b1, _zf, _zf, _zf, _zf
-    )
-    Lp_c4, Lp_c5, Lp_c6, Lp_c7 = _ak_mma(
-        L_a0, L_a1, L_a2, L_a3, L_b2, L_b3, _zf, _zf, _zf, _zf
-    )
-    Lp_a0 = _ak_pack_bf16x2(Lp_c0, Lp_c1)
-    Lp_a1 = _ak_pack_bf16x2(Lp_c2, Lp_c3)
-    Lp_a2 = _ak_pack_bf16x2(Lp_c4, Lp_c5)
-    Lp_a3 = _ak_pack_bf16x2(Lp_c6, Lp_c7)
-    Lp_b0 = _ak_movmatrix_trans(Lp_a0)
-    Lp_b1 = _ak_movmatrix_trans(Lp_a1)
-    Lp_b2 = _ak_movmatrix_trans(Lp_a2)
-    Lp_b3 = _ak_movmatrix_trans(Lp_a3)
-    mm_c0, mm_c1, mm_c2, mm_c3 = _ak_mma(
-        INV_a0, INV_a1, INV_a2, INV_a3, Lp_b0, Lp_b1, _zf, _zf, _zf, _zf
-    )
-    mm_c4, mm_c5, mm_c6, mm_c7 = _ak_mma(
-        INV_a0, INV_a1, INV_a2, INV_a3, Lp_b2, Lp_b3, _zf, _zf, _zf, _zf
-    )
-    INV_f0 = INV_f0 + mm_c0
-    INV_f1 = INV_f1 + mm_c1
-    INV_f2 = INV_f2 + mm_c2
-    INV_f3 = INV_f3 + mm_c3
-    INV_f4 = INV_f4 + mm_c4
-    INV_f5 = INV_f5 + mm_c5
-    INV_f6 = INV_f6 + mm_c6
-    INV_f7 = INV_f7 + mm_c7
-    INV_a0 = _ak_pack_bf16x2(INV_f0, INV_f1)
-    INV_a1 = _ak_pack_bf16x2(INV_f2, INV_f3)
-    INV_a2 = _ak_pack_bf16x2(INV_f4, INV_f5)
-    INV_a3 = _ak_pack_bf16x2(INV_f6, INV_f7)
-
-    # Iter 2: L^4, INV += INV*L^4
-    L4_c0, L4_c1, L4_c2, L4_c3 = _ak_mma(
-        Lp_a0, Lp_a1, Lp_a2, Lp_a3, Lp_b0, Lp_b1, _zf, _zf, _zf, _zf
-    )
-    L4_c4, L4_c5, L4_c6, L4_c7 = _ak_mma(
-        Lp_a0, Lp_a1, Lp_a2, Lp_a3, Lp_b2, Lp_b3, _zf, _zf, _zf, _zf
-    )
-    L4_a0 = _ak_pack_bf16x2(L4_c0, L4_c1)
-    L4_a1 = _ak_pack_bf16x2(L4_c2, L4_c3)
-    L4_a2 = _ak_pack_bf16x2(L4_c4, L4_c5)
-    L4_a3 = _ak_pack_bf16x2(L4_c6, L4_c7)
-    L4_b0 = _ak_movmatrix_trans(L4_a0)
-    L4_b1 = _ak_movmatrix_trans(L4_a1)
-    L4_b2 = _ak_movmatrix_trans(L4_a2)
-    L4_b3 = _ak_movmatrix_trans(L4_a3)
-    mm_c0, mm_c1, mm_c2, mm_c3 = _ak_mma(
-        INV_a0, INV_a1, INV_a2, INV_a3, L4_b0, L4_b1, _zf, _zf, _zf, _zf
-    )
-    mm_c4, mm_c5, mm_c6, mm_c7 = _ak_mma(
-        INV_a0, INV_a1, INV_a2, INV_a3, L4_b2, L4_b3, _zf, _zf, _zf, _zf
-    )
-    INV_f0 = INV_f0 + mm_c0
-    INV_f1 = INV_f1 + mm_c1
-    INV_f2 = INV_f2 + mm_c2
-    INV_f3 = INV_f3 + mm_c3
-    INV_f4 = INV_f4 + mm_c4
-    INV_f5 = INV_f5 + mm_c5
-    INV_f6 = INV_f6 + mm_c6
-    INV_f7 = INV_f7 + mm_c7
-    INV_a0 = _ak_pack_bf16x2(INV_f0, INV_f1)
-    INV_a1 = _ak_pack_bf16x2(INV_f2, INV_f3)
-    INV_a2 = _ak_pack_bf16x2(INV_f4, INV_f5)
-    INV_a3 = _ak_pack_bf16x2(INV_f6, INV_f7)
-
-    # Iter 3: L^8, INV += INV*L^8
-    L8_c0, L8_c1, L8_c2, L8_c3 = _ak_mma(
-        L4_a0, L4_a1, L4_a2, L4_a3, L4_b0, L4_b1, _zf, _zf, _zf, _zf
-    )
-    L8_c4, L8_c5, L8_c6, L8_c7 = _ak_mma(
-        L4_a0, L4_a1, L4_a2, L4_a3, L4_b2, L4_b3, _zf, _zf, _zf, _zf
-    )
-    L8_a0 = _ak_pack_bf16x2(L8_c0, L8_c1)
-    L8_a1 = _ak_pack_bf16x2(L8_c2, L8_c3)
-    L8_a2 = _ak_pack_bf16x2(L8_c4, L8_c5)
-    L8_a3 = _ak_pack_bf16x2(L8_c6, L8_c7)
-    L8_b0 = _ak_movmatrix_trans(L8_a0)
-    L8_b1 = _ak_movmatrix_trans(L8_a1)
-    L8_b2 = _ak_movmatrix_trans(L8_a2)
-    L8_b3 = _ak_movmatrix_trans(L8_a3)
-    mm_c0, mm_c1, mm_c2, mm_c3 = _ak_mma(
-        INV_a0, INV_a1, INV_a2, INV_a3, L8_b0, L8_b1, _zf, _zf, _zf, _zf
-    )
-    mm_c4, mm_c5, mm_c6, mm_c7 = _ak_mma(
-        INV_a0, INV_a1, INV_a2, INV_a3, L8_b2, L8_b3, _zf, _zf, _zf, _zf
-    )
-    INV_f0 = INV_f0 + mm_c0
-    INV_f1 = INV_f1 + mm_c1
-    INV_f2 = INV_f2 + mm_c2
-    INV_f3 = INV_f3 + mm_c3
-    INV_f4 = INV_f4 + mm_c4
-    INV_f5 = INV_f5 + mm_c5
-    INV_f6 = INV_f6 + mm_c6
-    INV_f7 = INV_f7 + mm_c7
-
-    sAkk[r_off + gid, c_off + tid] = _ak_pack_bf16x2(INV_f0, INV_f1)
-    sAkk[r_off + gid + 8, c_off + tid] = _ak_pack_bf16x2(INV_f2, INV_f3)
-    sAkk[r_off + gid, c_off + 4 + tid] = _ak_pack_bf16x2(INV_f4, INV_f5)
-    sAkk[r_off + gid + 8, c_off + 4 + tid] = _ak_pack_bf16x2(INV_f6, INV_f7)
-
-
-@dsl_user_op
-def _ak_invert_diag_neumann_inreg(
-    sAkk,
-    block_idx,
-    lane_id,
-    raw_f0,
-    raw_f1,
-    raw_f2,
-    raw_f3,
-    raw_f4,
-    raw_f5,
-    raw_f6,
-    raw_f7,
-    *,
-    loc=None,
-    ip=None,
-):
-    """In-register variant: invert 16x16 diag block from K2 acc fragment values
-    (no SMEM read). Applies I+L mask, runs Neumann iterations, writes INV to sAkk.
-
-    raw_f0..raw_f7 are K2 fp32 acc*beta values in C-fragment layout for m16n8k16:
-      raw_f0,raw_f1 = (gid,   2*tid),   (gid,   2*tid+1)
-      raw_f2,raw_f3 = (gid+8, 2*tid),   (gid+8, 2*tid+1)
-      raw_f4,raw_f5 = (gid,   2*tid+8), (gid,   2*tid+9)
-      raw_f6,raw_f7 = (gid+8, 2*tid+8), (gid+8, 2*tid+9)
-    """
-    r_off = block_idx * 16
-    c_off = block_idx * 8
-    gid = lane_id // 4
-    tid = lane_id % 4
-
-    _one = cutlass.Float32(1.0)
-    _zero = cutlass.Float32(0.0)
-
-    # Identity pattern (matches the SMEM-read variant's I_f computation)
-    I_f0 = _one * cutlass.Float32(gid == 2 * tid) + _zero * cutlass.Float32(
-        gid != 2 * tid
-    )
-    I_f1 = _one * cutlass.Float32(gid == 2 * tid + 1) + _zero * cutlass.Float32(
-        gid != 2 * tid + 1
-    )
-    I_f2 = _one * cutlass.Float32(gid + 8 == 2 * tid) + _zero * cutlass.Float32(
-        gid + 8 != 2 * tid
-    )  # always 0
-    I_f3 = _one * cutlass.Float32(gid + 8 == 2 * tid + 1) + _zero * cutlass.Float32(
-        gid + 8 != 2 * tid + 1
-    )  # always 0
-    I_f4 = _one * cutlass.Float32(gid == 8 + 2 * tid) + _zero * cutlass.Float32(
-        gid != 8 + 2 * tid
-    )  # always 0
-    I_f5 = _one * cutlass.Float32(gid == 8 + 2 * tid + 1) + _zero * cutlass.Float32(
-        gid != 8 + 2 * tid + 1
-    )  # always 0
-    I_f6 = _one * cutlass.Float32(gid + 8 == 8 + 2 * tid) + _zero * cutlass.Float32(
-        gid + 8 != 8 + 2 * tid
-    )
-    I_f7 = _one * cutlass.Float32(gid + 8 == 8 + 2 * tid + 1) + _zero * cutlass.Float32(
-        gid + 8 != 8 + 2 * tid + 1
-    )
-
-    # Apply I+L mask to raw K2 values:
-    #   diag (row==col): replace with 1
-    #   strict upper (row<col within block): replace with 0
-    #   strict lower (row>col within block): keep raw value (= L value)
-    m_gt_a = cutlass.Float32(gid > 2 * tid)  # for cols 2*tid (with row=gid)
-    m_gt_b = cutlass.Float32(gid > 2 * tid + 1)  # for cols 2*tid+1
-    # (gid, 2*tid) and (gid, 2*tid+1): mask conditional
-    A_f0 = m_gt_a * raw_f0 + I_f0
-    A_f1 = m_gt_b * raw_f1 + I_f1
-    # (gid+8, 2*tid) and (gid+8, 2*tid+1): always strict lower (gid+8 > 2*tid+1 always)
-    A_f2 = raw_f2
-    A_f3 = raw_f3
-    # (gid, 2*tid+8) and (gid, 2*tid+9): always strict upper (gid <= 7 < 8 <= 2*tid+8)
-    A_f4 = _zero
-    A_f5 = _zero
-    # (gid+8, 2*tid+8): row-col offset = gid+8 - (2*tid+8) = gid - 2*tid -> same as A_f0 mask
-    # (gid+8, 2*tid+9): similar -> same as A_f1 mask
-    A_f6 = m_gt_a * raw_f6 + I_f6
-    A_f7 = m_gt_b * raw_f7 + I_f7
-
-    # L = A - I, INV = I - L (first two Neumann terms)
-    L_f0 = A_f0 - I_f0
-    L_f1 = A_f1 - I_f1
-    L_f2 = A_f2 - I_f2
-    L_f3 = A_f3 - I_f3
-    L_f4 = A_f4 - I_f4
-    L_f5 = A_f5 - I_f5
-    L_f6 = A_f6 - I_f6
-    L_f7 = A_f7 - I_f7
-    INV_f0 = I_f0 - L_f0
-    INV_f1 = I_f1 - L_f1
-    INV_f2 = I_f2 - L_f2
-    INV_f3 = I_f3 - L_f3
-    INV_f4 = I_f4 - L_f4
-    INV_f5 = I_f5 - L_f5
-    INV_f6 = I_f6 - L_f6
-    INV_f7 = I_f7 - L_f7
-
-    _zf = cutlass.Float32(0.0)
-    L_a0 = _ak_pack_bf16x2(L_f0, L_f1)
-    L_a1 = _ak_pack_bf16x2(L_f2, L_f3)
-    L_a2 = _ak_pack_bf16x2(L_f4, L_f5)
-    L_a3 = _ak_pack_bf16x2(L_f6, L_f7)
-    INV_a0 = _ak_pack_bf16x2(INV_f0, INV_f1)
-    INV_a1 = _ak_pack_bf16x2(INV_f2, INV_f3)
-    INV_a2 = _ak_pack_bf16x2(INV_f4, INV_f5)
-    INV_a3 = _ak_pack_bf16x2(INV_f6, INV_f7)
-
-    # Iter 1: L^2, INV += INV*L^2
-    L_b0 = _ak_movmatrix_trans(L_a0)
-    L_b1 = _ak_movmatrix_trans(L_a1)
-    L_b2 = _ak_movmatrix_trans(L_a2)
-    L_b3 = _ak_movmatrix_trans(L_a3)
-    Lp_c0, Lp_c1, Lp_c2, Lp_c3 = _ak_mma(
-        L_a0, L_a1, L_a2, L_a3, L_b0, L_b1, _zf, _zf, _zf, _zf
-    )
-    Lp_c4, Lp_c5, Lp_c6, Lp_c7 = _ak_mma(
-        L_a0, L_a1, L_a2, L_a3, L_b2, L_b3, _zf, _zf, _zf, _zf
-    )
-    Lp_a0 = _ak_pack_bf16x2(Lp_c0, Lp_c1)
-    Lp_a1 = _ak_pack_bf16x2(Lp_c2, Lp_c3)
-    Lp_a2 = _ak_pack_bf16x2(Lp_c4, Lp_c5)
-    Lp_a3 = _ak_pack_bf16x2(Lp_c6, Lp_c7)
-    Lp_b0 = _ak_movmatrix_trans(Lp_a0)
-    Lp_b1 = _ak_movmatrix_trans(Lp_a1)
-    Lp_b2 = _ak_movmatrix_trans(Lp_a2)
-    Lp_b3 = _ak_movmatrix_trans(Lp_a3)
-    mm_c0, mm_c1, mm_c2, mm_c3 = _ak_mma(
-        INV_a0, INV_a1, INV_a2, INV_a3, Lp_b0, Lp_b1, _zf, _zf, _zf, _zf
-    )
-    mm_c4, mm_c5, mm_c6, mm_c7 = _ak_mma(
-        INV_a0, INV_a1, INV_a2, INV_a3, Lp_b2, Lp_b3, _zf, _zf, _zf, _zf
-    )
-    INV_f0 = INV_f0 + mm_c0
-    INV_f1 = INV_f1 + mm_c1
-    INV_f2 = INV_f2 + mm_c2
-    INV_f3 = INV_f3 + mm_c3
-    INV_f4 = INV_f4 + mm_c4
-    INV_f5 = INV_f5 + mm_c5
-    INV_f6 = INV_f6 + mm_c6
-    INV_f7 = INV_f7 + mm_c7
-    INV_a0 = _ak_pack_bf16x2(INV_f0, INV_f1)
-    INV_a1 = _ak_pack_bf16x2(INV_f2, INV_f3)
-    INV_a2 = _ak_pack_bf16x2(INV_f4, INV_f5)
-    INV_a3 = _ak_pack_bf16x2(INV_f6, INV_f7)
-
-    # Iter 2: L^4, INV += INV*L^4
-    L4_c0, L4_c1, L4_c2, L4_c3 = _ak_mma(
-        Lp_a0, Lp_a1, Lp_a2, Lp_a3, Lp_b0, Lp_b1, _zf, _zf, _zf, _zf
-    )
-    L4_c4, L4_c5, L4_c6, L4_c7 = _ak_mma(
-        Lp_a0, Lp_a1, Lp_a2, Lp_a3, Lp_b2, Lp_b3, _zf, _zf, _zf, _zf
-    )
-    L4_a0 = _ak_pack_bf16x2(L4_c0, L4_c1)
-    L4_a1 = _ak_pack_bf16x2(L4_c2, L4_c3)
-    L4_a2 = _ak_pack_bf16x2(L4_c4, L4_c5)
-    L4_a3 = _ak_pack_bf16x2(L4_c6, L4_c7)
-    L4_b0 = _ak_movmatrix_trans(L4_a0)
-    L4_b1 = _ak_movmatrix_trans(L4_a1)
-    L4_b2 = _ak_movmatrix_trans(L4_a2)
-    L4_b3 = _ak_movmatrix_trans(L4_a3)
-    mm_c0, mm_c1, mm_c2, mm_c3 = _ak_mma(
-        INV_a0, INV_a1, INV_a2, INV_a3, L4_b0, L4_b1, _zf, _zf, _zf, _zf
-    )
-    mm_c4, mm_c5, mm_c6, mm_c7 = _ak_mma(
-        INV_a0, INV_a1, INV_a2, INV_a3, L4_b2, L4_b3, _zf, _zf, _zf, _zf
-    )
-    INV_f0 = INV_f0 + mm_c0
-    INV_f1 = INV_f1 + mm_c1
-    INV_f2 = INV_f2 + mm_c2
-    INV_f3 = INV_f3 + mm_c3
-    INV_f4 = INV_f4 + mm_c4
-    INV_f5 = INV_f5 + mm_c5
-    INV_f6 = INV_f6 + mm_c6
-    INV_f7 = INV_f7 + mm_c7
-    INV_a0 = _ak_pack_bf16x2(INV_f0, INV_f1)
-    INV_a1 = _ak_pack_bf16x2(INV_f2, INV_f3)
-    INV_a2 = _ak_pack_bf16x2(INV_f4, INV_f5)
-    INV_a3 = _ak_pack_bf16x2(INV_f6, INV_f7)
-
-    # Iter 3: L^8, INV += INV*L^8
-    L8_c0, L8_c1, L8_c2, L8_c3 = _ak_mma(
-        L4_a0, L4_a1, L4_a2, L4_a3, L4_b0, L4_b1, _zf, _zf, _zf, _zf
-    )
-    L8_c4, L8_c5, L8_c6, L8_c7 = _ak_mma(
-        L4_a0, L4_a1, L4_a2, L4_a3, L4_b2, L4_b3, _zf, _zf, _zf, _zf
-    )
-    L8_a0 = _ak_pack_bf16x2(L8_c0, L8_c1)
-    L8_a1 = _ak_pack_bf16x2(L8_c2, L8_c3)
-    L8_a2 = _ak_pack_bf16x2(L8_c4, L8_c5)
-    L8_a3 = _ak_pack_bf16x2(L8_c6, L8_c7)
-    L8_b0 = _ak_movmatrix_trans(L8_a0)
-    L8_b1 = _ak_movmatrix_trans(L8_a1)
-    L8_b2 = _ak_movmatrix_trans(L8_a2)
-    L8_b3 = _ak_movmatrix_trans(L8_a3)
-    mm_c0, mm_c1, mm_c2, mm_c3 = _ak_mma(
-        INV_a0, INV_a1, INV_a2, INV_a3, L8_b0, L8_b1, _zf, _zf, _zf, _zf
-    )
-    mm_c4, mm_c5, mm_c6, mm_c7 = _ak_mma(
-        INV_a0, INV_a1, INV_a2, INV_a3, L8_b2, L8_b3, _zf, _zf, _zf, _zf
-    )
-    INV_f0 = INV_f0 + mm_c0
-    INV_f1 = INV_f1 + mm_c1
-    INV_f2 = INV_f2 + mm_c2
-    INV_f3 = INV_f3 + mm_c3
-    INV_f4 = INV_f4 + mm_c4
-    INV_f5 = INV_f5 + mm_c5
-    INV_f6 = INV_f6 + mm_c6
-    INV_f7 = INV_f7 + mm_c7
-
-    sAkk[r_off + gid, c_off + tid] = _ak_pack_bf16x2(INV_f0, INV_f1)
-    sAkk[r_off + gid + 8, c_off + tid] = _ak_pack_bf16x2(INV_f2, INV_f3)
-    sAkk[r_off + gid, c_off + 4 + tid] = _ak_pack_bf16x2(INV_f4, INV_f5)
-    sAkk[r_off + gid + 8, c_off + 4 + tid] = _ak_pack_bf16x2(INV_f6, INV_f7)
-
-
-@dsl_user_op
-def _ak_matmul_AB(sAkk, br_A, bc_A, br_B, bc_B, lane_id, *, loc=None, ip=None):
-    gid = lane_id // 4
-    tid = lane_id % 4
-    _zf = cutlass.Float32(0.0)
-    rA = br_A * 16
-    cA = bc_A * 8
-    rB = br_B * 16
-    cB = bc_B * 8
-    a0 = cutlass.Float32(sAkk[rA + gid, cA + tid])
-    a1 = cutlass.Float32(sAkk[rA + gid + 8, cA + tid])
-    a2 = cutlass.Float32(sAkk[rA + gid, cA + 4 + tid])
-    a3 = cutlass.Float32(sAkk[rA + gid + 8, cA + 4 + tid])
-    bA0 = cutlass.Float32(sAkk[rB + gid, cB + tid])
-    bA1 = cutlass.Float32(sAkk[rB + gid + 8, cB + tid])
-    bA2 = cutlass.Float32(sAkk[rB + gid, cB + 4 + tid])
-    bA3 = cutlass.Float32(sAkk[rB + gid + 8, cB + 4 + tid])
-    b0 = _ak_movmatrix_trans(bA0)
-    b1 = _ak_movmatrix_trans(bA1)
-    b2 = _ak_movmatrix_trans(bA2)
-    b3 = _ak_movmatrix_trans(bA3)
-    cn0_0, cn0_1, cn0_2, cn0_3 = _ak_mma(a0, a1, a2, a3, b0, b1, _zf, _zf, _zf, _zf)
-    cn1_0, cn1_1, cn1_2, cn1_3 = _ak_mma(a0, a1, a2, a3, b2, b3, _zf, _zf, _zf, _zf)
-    return cn0_0, cn0_1, cn0_2, cn0_3, cn1_0, cn1_1, cn1_2, cn1_3
-
-
-@dsl_user_op
-def _ak_chain_mma_B(sAkk, br_B, bc_B, a0, a1, a2, a3, lane_id, *, loc=None, ip=None):
-    gid = lane_id // 4
-    tid = lane_id % 4
-    _zf = cutlass.Float32(0.0)
-    rB = br_B * 16
-    cB = bc_B * 8
-    bA0 = cutlass.Float32(sAkk[rB + gid, cB + tid])
-    bA1 = cutlass.Float32(sAkk[rB + gid + 8, cB + tid])
-    bA2 = cutlass.Float32(sAkk[rB + gid, cB + 4 + tid])
-    bA3 = cutlass.Float32(sAkk[rB + gid + 8, cB + 4 + tid])
-    b0 = _ak_movmatrix_trans(bA0)
-    b1 = _ak_movmatrix_trans(bA1)
-    b2 = _ak_movmatrix_trans(bA2)
-    b3 = _ak_movmatrix_trans(bA3)
-    cn0_0, cn0_1, cn0_2, cn0_3 = _ak_mma(a0, a1, a2, a3, b0, b1, _zf, _zf, _zf, _zf)
-    cn1_0, cn1_1, cn1_2, cn1_3 = _ak_mma(a0, a1, a2, a3, b2, b3, _zf, _zf, _zf, _zf)
-    return cn0_0, cn0_1, cn0_2, cn0_3, cn1_0, cn1_1, cn1_2, cn1_3
-
-
-@dsl_user_op
-def _ak_chain_mma_A(sAkk, br_A, bc_A, b0, b1, b2, b3, lane_id, *, loc=None, ip=None):
-    gid = lane_id // 4
-    tid = lane_id % 4
-    _zf = cutlass.Float32(0.0)
-    rA = br_A * 16
-    cA = bc_A * 8
-    a0 = cutlass.Float32(sAkk[rA + gid, cA + tid])
-    a1 = cutlass.Float32(sAkk[rA + gid + 8, cA + tid])
-    a2 = cutlass.Float32(sAkk[rA + gid, cA + 4 + tid])
-    a3 = cutlass.Float32(sAkk[rA + gid + 8, cA + 4 + tid])
-    cn0_0, cn0_1, cn0_2, cn0_3 = _ak_mma(a0, a1, a2, a3, b0, b1, _zf, _zf, _zf, _zf)
-    cn1_0, cn1_1, cn1_2, cn1_3 = _ak_mma(a0, a1, a2, a3, b2, b3, _zf, _zf, _zf, _zf)
-    return cn0_0, cn0_1, cn0_2, cn0_3, cn1_0, cn1_1, cn1_2, cn1_3
-
-
-@dsl_user_op
-def _ak_store_neg_C(
-    sAkk, br, bc, c0, c1, c2, c3, c4, c5, c6, c7, lane_id, *, loc=None, ip=None
-):
-    gid = lane_id // 4
-    tid = lane_id % 4
-    r = br * 16
-    c = bc * 8
-    sAkk[r + gid, c + tid] = _ak_pack_bf16x2(-c0, -c1)
-    sAkk[r + gid + 8, c + tid] = _ak_pack_bf16x2(-c2, -c3)
-    sAkk[r + gid, c + 4 + tid] = _ak_pack_bf16x2(-c4, -c5)
-    sAkk[r + gid + 8, c + 4 + tid] = _ak_pack_bf16x2(-c6, -c7)
-
-
-@dsl_user_op
-def _ak_pack_C_to_A(c0, c1, c2, c3, c4, c5, c6, c7, *, loc=None, ip=None):
-    a0 = _ak_pack_bf16x2(c0, c1)
-    a1 = _ak_pack_bf16x2(c2, c3)
-    a2 = _ak_pack_bf16x2(c4, c5)
-    a3 = _ak_pack_bf16x2(c6, c7)
-    return a0, a1, a2, a3
-
-
-@dsl_user_op
-def _ak_pack_C_to_B(c0, c1, c2, c3, c4, c5, c6, c7, *, loc=None, ip=None):
-    a0 = _ak_pack_bf16x2(c0, c1)
-    a1 = _ak_pack_bf16x2(c2, c3)
-    a2 = _ak_pack_bf16x2(c4, c5)
-    a3 = _ak_pack_bf16x2(c6, c7)
-    b0 = _ak_movmatrix_trans(a0)
-    b1 = _ak_movmatrix_trans(a1)
-    b2 = _ak_movmatrix_trans(a2)
-    b3 = _ak_movmatrix_trans(a3)
-    return b0, b1, b2, b3
-
-
-@dsl_user_op
-def _ak_store_C_temp(
-    sT, buf, c0, c1, c2, c3, c4, c5, c6, c7, lane_id, *, loc=None, ip=None
-):
-    gid = lane_id // 4
-    tid = lane_id % 4
-    sT[gid, 2 * tid, buf] = c0
-    sT[gid, 2 * tid + 1, buf] = c1
-    sT[gid + 8, 2 * tid, buf] = c2
-    sT[gid + 8, 2 * tid + 1, buf] = c3
-    sT[gid, 8 + 2 * tid, buf] = c4
-    sT[gid, 8 + 2 * tid + 1, buf] = c5
-    sT[gid + 8, 8 + 2 * tid, buf] = c6
-    sT[gid + 8, 8 + 2 * tid + 1, buf] = c7
-
-
-@dsl_user_op
-def _ak_load_C_temp(sT, buf, lane_id, *, loc=None, ip=None):
-    gid = lane_id // 4
-    tid = lane_id % 4
-    c0 = cutlass.Float32(sT[gid, 2 * tid, buf])
-    c1 = cutlass.Float32(sT[gid, 2 * tid + 1, buf])
-    c2 = cutlass.Float32(sT[gid + 8, 2 * tid, buf])
-    c3 = cutlass.Float32(sT[gid + 8, 2 * tid + 1, buf])
-    c4 = cutlass.Float32(sT[gid, 8 + 2 * tid, buf])
-    c5 = cutlass.Float32(sT[gid, 8 + 2 * tid + 1, buf])
-    c6 = cutlass.Float32(sT[gid + 8, 8 + 2 * tid, buf])
-    c7 = cutlass.Float32(sT[gid + 8, 8 + 2 * tid + 1, buf])
-    return c0, c1, c2, c3, c4, c5, c6, c7
-
-
 @dsl_user_op
 def opaque_zero_from_work_id(*, loc=None, ip=None):
     """
@@ -1007,9 +309,6 @@ def fused_kernel123(
         cgs_per_head = num_chunks // CHUNKS_PER_BLOCK
         total_cgs = cgs_per_head * num_heads * batch_size
 
-    # =====================================================================
-    # SMEM allocation
-    # =====================================================================
     smem = cutlass.utils.SmemAllocator()
     sQ = smem.allocate_tensor(
         cutlass.BFloat16, qk_smem_layout.outer, 128, swizzle=qk_smem_layout.inner
@@ -1044,9 +343,7 @@ def fused_kernel123(
     beta_smem_layout = cute.make_layout((BT, NUM_STAGES), stride=(1, BT))
     sBeta = smem.allocate_tensor(cutlass.BFloat16, beta_smem_layout, 128)
 
-    # =====================================================================
     # Mbarrier allocation & init
-    # =====================================================================
     tma_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
     stage_reuse_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
     k1_done_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
@@ -1066,7 +363,6 @@ def fused_kernel123(
     cute.arch.mbarrier_init_fence()
     cute.arch.barrier()
 
-    # =====================================================================
     # SMEM init: zero out sAqk and sAkk valid 64x64 region (cols 64..71 are
     # padding for SMEM bank-conflict avoidance, never read or written by MMA
     # or store warps). Required for downstream row-major store optimizations
@@ -1078,7 +374,6 @@ def fused_kernel123(
     #   - Per lane: 2 stages × 2 rows × 2 buffers × 2 cols = 16 bf16 stores
     #   - Adjacent (lane*2, lane*2+1) bf16 pairs are 4-byte aligned →
     #     ptxas should fuse into STS.32 (8 wide stores per lane).
-    # =====================================================================
     _warp_id_in_cta = tidx >> 5  # tidx // 32, range 0..31
     _lane_id_warp = tidx & 31  # tidx % 32, range 0..31
     _row_base = _warp_id_in_cta * 2  # this warp owns rows [_row_base, _row_base+1]
@@ -1093,11 +388,9 @@ def fused_kernel123(
             sAkk[_row, _col_hi, _s] = cutlass.BFloat16(0.0)
     cute.arch.barrier()
 
-    # =====================================================================
     # Pre-arrive (MMA warps only)
     # stage_reuse_mbars: warp 0 waits before MMA arrives → pre-arrive all 12 MMA warps
     # store_done_mbars:  MMA waits before Store arrives → pre-arrive first 4 MMA warps
-    # =====================================================================
     if (
         warp_idx >= NUM_K1_TMA_WARPS
         and warp_idx < NUM_K1_TMA_WARPS + NUM_MMA_WARPS
@@ -1109,12 +402,10 @@ def fused_kernel123(
             if mma_warp_tmp < NUM_STORE_WARPS:
                 cute.arch.mbarrier_arrive(store_done_mbars + s)
 
-    # =================================================================
     # Persistent outer loop. Single for_generate at top level (required).
     # Opaque asm barrier on work_id prevents MLIR LICM from hoisting
     # get_slice() and scalar layout invariants to the kernel prologue,
     # keeping register pressure < 64 and eliminating prologue spill.
-    # =================================================================
     for work_id in for_generate(block_id, total_cgs, NUM_SMS):
         i_cg = cutlass.Int32(0)
         i_h = cutlass.Int32(0)
@@ -1139,9 +430,7 @@ def fused_kernel123(
         _lane = lane_id + _oz
         _warp = warp_idx + _oz
 
-        # =============================================================
         # Warps 0-15: Fused TMA + K1
-        # =============================================================
         if warp_idx < NUM_K1_TMA_WARPS:
             # Warp-layout invariants (scope-local → no cross-group register spill)
             k1_warp = _warp
@@ -1379,11 +668,9 @@ def fused_kernel123(
                             rGkOut, mGkLast[i_b, chunk_idx, i_h, col_vec_idx, None]
                         )
 
-        # =============================================================
         # Warp 26 (TMA_WARP_ID): dedicated TMA producer.
         # Waits stage_reuse (gated by MMA arrives), issues TMA for Q/K/G,
         # signals tma_mbar. Decouples MMA -> TMA dependency from K1 compute.
-        # =============================================================
         if warp_idx == TMA_WARP_ID:
             gQ_head = tma_tensor_Q[(None, None, i_h)]
             gK_head = tma_tensor_K[(None, None, i_h)]
@@ -1499,9 +786,7 @@ def fused_kernel123(
                 if lane_id == 0:
                     cute.arch.mbarrier_arrive(tma_mbars + next_stage)
 
-        # =============================================================
         # Warps 16-27 (excluding TMA_WARP_ID=26): K2 MMA Compute
-        # =============================================================
         if (
             warp_idx >= NUM_K1_TMA_WARPS
             and warp_idx < NUM_K1_TMA_WARPS + NUM_MMA_WARPS
@@ -2065,9 +1350,7 @@ def fused_kernel123(
 
                 cute.arch.mbarrier_arrive(mma_done_mbars + s)
 
-        # =============================================================
         # Warps 28-31: Store/Inversion warps
-        # =============================================================
         if warp_idx >= NUM_K1_TMA_WARPS + NUM_MMA_WARPS:
             store_warp = warp_idx - (NUM_K1_TMA_WARPS + NUM_MMA_WARPS)
             for chunk_iter in cutlass.range_constexpr(CHUNKS_PER_BLOCK):
@@ -2186,9 +1469,6 @@ def fused_kernel123(
         yield_out()
 
 
-# =========================================================================
-# Host function
-# =========================================================================
 def make_host_function(
     B,
     NT,

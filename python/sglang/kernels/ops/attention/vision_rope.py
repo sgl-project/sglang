@@ -183,7 +183,7 @@ def apply_fused_qk_complex_rope_inplace(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Rotate contiguous Q/K tensors in place with the shared JIT kernel."""
 
-    from sglang.jit_kernel.rope import apply_rope_inplace
+    from sglang.kernels.ops.attention.rope import apply_rope_inplace
 
     cos_sin_cache, positions = prepared_rope
     apply_rope_inplace(

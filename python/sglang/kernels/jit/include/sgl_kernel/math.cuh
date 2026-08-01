@@ -88,4 +88,20 @@ SGL_DEVICE T cos(T a) {
   return DTypeTrait<T>::cos(a);
 }
 
+// bf16 x bf16 -> fp32 fused multiply-add The mixed-precision PTX
+// instruction saves the explicit converts; the fallback is bit-identical (the
+// bf16 -> f32 conversion is exact, both round once). Shared by tiny_gemm,
+// gemm_ag and ar_fusion.
+SGL_DEVICE float fma_f32_bf16(bf16_t a, bf16_t b, float acc) {
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  const uint16_t a_bits = __bfloat16_as_ushort(a);
+  const uint16_t b_bits = __bfloat16_as_ushort(b);
+  float result;
+  asm("fma.rn.f32.bf16 %0, %1, %2, %3;" : "=f"(result) : "h"(a_bits), "h"(b_bits), "f"(acc));
+  return result;
+#else
+  return fmaf(cast<fp32_t>(a), cast<fp32_t>(b), acc);
+#endif
+}
+
 }  // namespace device::math
