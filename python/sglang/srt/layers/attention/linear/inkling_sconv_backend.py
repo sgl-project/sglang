@@ -15,7 +15,8 @@
 
 A :mod:`~sglang.srt.layers.attention.linear.short_conv_backend` sidecar. Four short
 convs per decoder layer keep per-request conv state in the centralized
-``MambaPool``; the model reaches this via :meth:`conv_state_metadata`, never
+``MambaPool``; the model reaches this via :meth:`conv_state_metadata` for the
+step's metadata and :meth:`sconv_state` for a layer's own conv stream, never
 through ``forward_decode`` / ``forward_extend``.
 
 On top of what :class:`ShortConvAttnBackend` owns, Inkling's kernels take a
@@ -496,12 +497,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         return self.sconv_metadata
 
     def sconv_state(self, *, layer_id: int, stream: int) -> torch.Tensor:
-        """``layer_id``'s conv state for one ``SconvType`` stream.
-
-        Indexed straight out of the pool tensor: a ``State`` would slice all six
-        streams (plus the spec windows) to hand back one of them, and the caller
-        always wants exactly one.
-        """
+        """``layer_id``'s conv state for one ``SconvType`` stream."""
         pool_layer = self.req_to_token_pool.mamba2_layer_index(layer_id)
         return self._mamba_cache.conv[stream][pool_layer]
 
@@ -515,8 +511,8 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
     """Full-attention backend plus Inkling's conv-state sidecar.
 
     Inkling has NO linear-attention layers, so every layer routes to the
-    full-attention child and the sidecar is reached only via
-    :meth:`conv_state_metadata`. Four departures from
+    full-attention child and the sidecar is reached only through its metadata and
+    conv-state accessors. Four departures from
     :class:`ShortConvHybridAttnBackend`: every layer is full attention (including
     the draft's, so the base's ``full_attn_layers = [0]`` does not hold);
     DRAFT_EXTEND_V2 still inits the sidecar (the draft runs its own convs, unlike
@@ -524,6 +520,14 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
     capability surface stays visible through the wrapper; and the MTP-verify commit
     is Inkling's own, not the generic mamba scatter.
     """
+
+    def sconv_state(self, *, layer_id: int, stream: int) -> torch.Tensor:
+        return self.short_conv_backend.sconv_state(layer_id=layer_id, stream=stream)
+
+    def sconv_intermediate_window(self, *, layer_id: int, stream: int) -> torch.Tensor:
+        return self.short_conv_backend.sconv_intermediate_window(
+            layer_id=layer_id, stream=stream
+        )
 
     def _is_full_attn(self, layer=None, layer_id: Optional[int] = None) -> bool:
         del layer, layer_id
