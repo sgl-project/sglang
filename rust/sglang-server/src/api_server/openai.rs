@@ -15,7 +15,6 @@ use axum::{
 use dynamo_protocols::types::ChatCompletionRequestMessage;
 use dynamo_protocols::types::responses::Response as OpenAIResponse;
 use futures::StreamExt;
-use serde::Serialize;
 use tokio::sync::{RwLock, mpsc};
 
 mod chat;
@@ -111,16 +110,6 @@ pub(super) fn load_chat_support(
     (None, None)
 }
 
-#[derive(Debug, Serialize)]
-struct ErrorResponse {
-    object: &'static str,
-    message: String,
-    #[serde(rename = "type")]
-    error_type: &'static str,
-    param: Option<String>,
-    code: u16,
-}
-
 fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -132,7 +121,10 @@ fn unix_seconds_u32() -> u32 {
     u32::try_from(unix_seconds()).unwrap_or(u32::MAX)
 }
 
-fn openai_error(code: StatusCode, message: impl Into<String>) -> Response {
+/// The OpenAI `{"error": {...}}` payload: `type` is the SDK-facing error kind
+/// (`AuthenticationError` / `InternalServerError` / `BadRequestError`), and
+/// `code` carries the HTTP status — the shape Python's OpenAI frontend emits.
+fn error_payload(code: StatusCode, message: String) -> serde_json::Value {
     let error_type = if code == StatusCode::UNAUTHORIZED {
         "AuthenticationError"
     } else if code.is_server_error() {
@@ -140,35 +132,45 @@ fn openai_error(code: StatusCode, message: impl Into<String>) -> Response {
     } else {
         "BadRequestError"
     };
-    (
-        code,
-        Json(ErrorResponse {
-            object: "error",
-            message: message.into(),
-            error_type,
-            param: None,
-            code: code.as_u16(),
-        }),
-    )
-        .into_response()
-}
-
-fn streaming_error(code: u16, message: impl Into<String>) -> String {
-    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     serde_json::json!({
-        "error": ErrorResponse {
-            object: "error",
-            message: message.into(),
-            error_type: if status.is_server_error() {
-                "InternalServerError"
-            } else {
-                "BadRequestError"
-            },
-            param: None,
-            code,
+        "error": {
+            "object": "error",
+            "message": message,
+            "type": error_type,
+            "param": null,
+            "code": code.as_u16(),
         }
     })
-    .to_string()
+}
+
+/// Shape a `StatusCode` + message into an OpenAI error response, mirroring
+/// `pre_submit_error`'s rule: unary requests get the JSON error with its
+/// status; a request whose stream is already committed gets 200 + one SSE
+/// error frame + `[DONE]`.
+pub(super) fn openai_error_response(
+    code: StatusCode,
+    message: impl Into<String>,
+    stream: bool,
+) -> Response {
+    let body = error_payload(code, message.into());
+    if !stream {
+        return (code, Json(body)).into_response();
+    }
+    super::submit::sse_error_response(body)
+}
+
+/// Unary OpenAI error — the common pre-submit case (Python validates before
+/// the stream starts and answers 4xx in JSON even for `stream=true`).
+fn openai_error(code: StatusCode, message: impl Into<String>) -> Response {
+    openai_error_response(code, message, false)
+}
+
+/// The OpenAI error frame payload for errors raised *inside* a committed
+/// stream, where only a `data:` frame can be emitted (the status is folded
+/// into the body, since the response status is already 200).
+pub(super) fn streaming_error(code: u16, message: impl Into<String>) -> String {
+    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    error_payload(status, message.into()).to_string()
 }
 
 async fn collect_output(
@@ -224,9 +226,13 @@ async fn submit_generation(
             guard.arm(rid);
             Ok(rx)
         }
-        Err(_) => Err(openai_error(
+        // Same rule as `pre_submit_error`: a committed stream gets 200 plus an
+        // SSE error frame + `[DONE]`, not a unary 503 — but with the OpenAI
+        // error shape, since this is the OpenAI frontend.
+        Err(_) => Err(openai_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "service unavailable",
+            stream,
         )),
     }
 }

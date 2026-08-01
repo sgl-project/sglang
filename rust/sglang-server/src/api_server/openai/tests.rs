@@ -1034,6 +1034,38 @@ async fn body_json(response: Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+/// The common StatusCode→error helper follows `pre_submit_error`'s shape:
+/// unary requests get the JSON error with its status; a committed stream gets
+/// 200 + one SSE error frame + `[DONE]`, and the frame carries the OpenAI
+/// error fields (`type`, `param`, `code`) that the SDKs dispatch on.
+#[tokio::test]
+async fn openai_error_response_covers_unary_and_sse() {
+    let unary = super::openai_error_response(StatusCode::BAD_REQUEST, "bad input", false);
+    assert_eq!(unary.status(), StatusCode::BAD_REQUEST);
+    let value = body_json(unary).await;
+    assert_eq!(value["error"]["message"], "bad input");
+    assert_eq!(value["error"]["type"], "BadRequestError");
+    assert_eq!(value["error"]["code"], 400);
+    assert!(value["error"]["param"].is_null());
+
+    let streamed = super::openai_error_response(StatusCode::BAD_REQUEST, "bad input", true);
+    assert_eq!(streamed.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(streamed.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let frame = text
+        .split("\n\n")
+        .next()
+        .unwrap()
+        .strip_prefix("data: ")
+        .unwrap();
+    let frame: serde_json::Value = serde_json::from_str(frame).unwrap();
+    assert_eq!(frame["error"]["message"], "bad input");
+    assert_eq!(frame["error"]["type"], "BadRequestError");
+    assert!(text.contains("[DONE]"));
+}
+
 #[tokio::test]
 async fn completions_handler_validates_before_submit() {
     let app = routes().with_state(app_state(senders()));
@@ -1179,6 +1211,36 @@ async fn responses_handler_validates_before_submit() {
     // A valid request without a chat template → 400 (template gate).
     let response = post_json(app.clone(), "/v1/responses", json!({"input": "hi"})).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A closed tm inbox with a *streaming* request must answer inside the
+/// committed stream: 200 + one OpenAI-shaped SSE error frame + `[DONE]` (the
+/// same rule `pre_submit_error` applies to the native API), not a unary 503.
+#[tokio::test]
+async fn streaming_submit_failure_answers_inside_the_stream() {
+    let app = routes().with_state(app_state(senders_closed()));
+    let response = post_json(
+        app,
+        "/v1/completions",
+        json!({"model": "model", "prompt": "hi", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let frame = text
+        .split("\n\n")
+        .next()
+        .unwrap()
+        .strip_prefix("data: ")
+        .unwrap();
+    let frame: serde_json::Value = serde_json::from_str(frame).unwrap();
+    assert_eq!(frame["error"]["message"], "service unavailable");
+    assert_eq!(frame["error"]["type"], "InternalServerError");
+    assert_eq!(frame["error"]["code"], 503);
+    assert!(text.contains("[DONE]"));
 }
 
 #[tokio::test]

@@ -79,6 +79,14 @@ pub(super) fn pre_submit_error(code: StatusCode, message: &str, stream: bool) ->
     if !stream {
         return (code, Json(body)).into_response();
     }
+    sse_error_response(body)
+}
+
+/// A 200 SSE response carrying one error frame + `[DONE]` — how a stream the
+/// client is already committed to reading reports a failure. Shared by every
+/// endpoint family: the native API via [`pre_submit_error`] and the OpenAI
+/// frontend's `openai_error_response`.
+pub(super) fn sse_error_response(body: serde_json::Value) -> Response {
     let frames = [body.to_string(), "[DONE]".to_string()];
     Sse::new(futures::stream::iter(
         frames.map(|data| Ok::<_, Infallible>(Event::default().data(data))),
