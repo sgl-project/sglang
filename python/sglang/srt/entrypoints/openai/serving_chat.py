@@ -1066,11 +1066,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 required_parsed_natively = parser.detector.parses_required_natively()
                 if self.chat_encoding_spec == "kimi_k3":
                     tool_call_stop = parser.detector.eot_token
-            # Fallback: use generic JSON schema for required/named tool choice
-            # only when no parser-specific constraint was set
             if (
                 tool_call_constraint is None
                 and not required_parsed_natively
+                and not (
+                    self.chat_encoding_spec == "kimi_k3"
+                    and self.tool_call_parser == "kimi_k3"
+                )
                 and (
                     request.tool_choice == "required"
                     or isinstance(request.tool_choice, ToolChoice)
