@@ -254,5 +254,44 @@ class TestInputIdsBackfill(CustomTestCase):
         tokenizer.decode.assert_not_called()
 
 
+class TestListTruncationBypassRegression(CustomTestCase):
+    """Regression tests for the max_length bypass reported in #33164: a
+    request with large list payloads could emit multi-MB/GB log records even
+    though truncation was enabled."""
+
+    def test_elided_long_list_still_truncates_its_elements(self):
+        """Bug regression (#33164): a list longer than max_length took the
+        elision branch, which sliced head/tail but skipped per-element
+        truncation — so the *bigger* payload got *less* truncation and one
+        log record could reach GBs. Elided survivors must be truncated like
+        short-list elements are."""
+        big = "x" * 5000
+        transformed = _transform_data_for_logging([big] * 11, 10)
+        self.assertEqual(len(transformed), 11)  # 5 head + marker + 5 tail
+        self.assertEqual(transformed[5], "...")
+        for element in transformed[:5] + transformed[6:]:
+            # Same bound as the direct string branch: two halves + ellipsis.
+            self.assertLessEqual(len(element), 13)
+
+    def test_text_format_truncates_list_elements(self):
+        """Bug regression (#33164): the text format stringified list elements
+        raw in both branches, so one multimodal request holding a ~MB base64
+        string in a list logged the entire blob at --log-requests-level >= 2
+        (where nothing is redacted)."""
+        big = "x" * 5000
+        short_rendered = _dataclass_to_string_truncated([big] * 3, 10)
+        self.assertLess(len(short_rendered), 200)
+
+        long_rendered = _dataclass_to_string_truncated([big] * 11, 10)
+        self.assertIn("...", long_rendered)
+        self.assertLess(len(long_rendered), 400)
+
+    def test_text_format_preserves_tuple_parentheses(self):
+        """The text rendering keeps tuple vs list bracket style so operators
+        reading logs can still tell the container type apart."""
+        self.assertEqual(_dataclass_to_string_truncated((1, 2), 10), "(1, 2)")
+        self.assertEqual(_dataclass_to_string_truncated([1, 2], 10), "[1, 2]")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -252,11 +252,27 @@ def _dataclass_to_string_truncated(
         else:
             return f"{repr(data)}"
     elif isinstance(data, (list, tuple)):
+        # Truncate each surviving element as well: without this, one large
+        # element (e.g. a base64 image string) defeats max_length entirely.
         if len(data) > max_length:
             half_length = max_length // 2
-            return str(data[:half_length]) + " ... " + str(data[-half_length:])
+            items = (
+                [
+                    _dataclass_to_string_truncated(v, max_length)
+                    for v in data[:half_length]
+                ]
+                + ["..."]
+                + [
+                    _dataclass_to_string_truncated(v, max_length)
+                    for v in data[-half_length:]
+                ]
+            )
         else:
-            return str(data)
+            items = [_dataclass_to_string_truncated(v, max_length) for v in data]
+        open_bracket, close_bracket = (
+            ("(", ")") if isinstance(data, tuple) else ("[", "]")
+        )
+        return open_bracket + ", ".join(items) + close_bracket
     elif isinstance(data, dict):
         return (
             "{"
@@ -293,9 +309,19 @@ def _transform_data_for_logging(
             return data[:half_length] + "..." + data[-half_length:]
         return data
     elif isinstance(data, (list, tuple)):
+        # Truncate each surviving element as well: the elided branch used to
+        # return raw head/tail slices, so a list of large elements bypassed
+        # max_length entirely (the bigger the payload, the less truncation).
         if len(data) > max_length:
             half_length = max_length // 2
-            return list(data[:half_length]) + ["..."] + list(data[-half_length:])
+            return (
+                [_transform_data_for_logging(v, max_length) for v in data[:half_length]]
+                + ["..."]
+                + [
+                    _transform_data_for_logging(v, max_length)
+                    for v in data[-half_length:]
+                ]
+            )
         return [_transform_data_for_logging(v, max_length) for v in data]
     elif isinstance(data, dict):
         return {
