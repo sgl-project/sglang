@@ -239,6 +239,32 @@ def test_explicit_backend_beats_forced_global(monkeypatch):
     assert op(torch.zeros(1), backend=KernelBackend.JIT) == "jit"  # explicit wins
 
 
+def test_forced_global_falls_back_when_unimplemented(monkeypatch):
+    # The global debug switch must not take down ops that lack the forced
+    # backend (e.g. forcing "torch" on a device-only op like the DSA indexer,
+    # whose forward_native raises NotImplementedError).
+    _mock_platform(monkeypatch, key="cuda", info=_CUDA)
+
+    class _DeviceOnly(BaseFusedOp):
+        op = "test.device_only"
+
+        def forward_native(self, x):
+            raise NotImplementedError
+
+        def forward_cuda(self, x):
+            return "cuda"
+
+    op = _DeviceOnly()
+    fo.set_fused_op_backend(KernelBackend.TORCH)
+    assert op(torch.zeros(1)) == "cuda"  # fell back to normal dispatch
+    fo.set_fused_op_backend(KernelBackend.JIT)
+    assert op(torch.zeros(1)) == "cuda"  # no jit backend -> fall back too
+    # Explicit per-call selection stays strict.
+    fo.set_fused_op_backend(None)
+    with pytest.raises(NotImplementedError):
+        op(torch.zeros(1), backend=KernelBackend.JIT)
+
+
 def test_forced_global_beats_platform_and_oot(monkeypatch):
     _mock_platform(monkeypatch, key="", oot_key="myplat")
     BaseFusedOp.register_oot_forward(
@@ -457,6 +483,30 @@ def test_deprecated_alias_contract(monkeypatch):
     MultiPlatformOp.register_oot_forward(_LegacyOp, lambda self, x: "oot", "aliasplat")
     _mock_platform(monkeypatch, key="", oot_key="aliasplat")
     assert _LegacyOp()(torch.zeros(1)) == "oot"
+
+
+def test_deprecated_alias_keeps_legacy_platform_defaults(monkeypatch):
+    """Old MultiPlatformOp defined per-platform default methods (hip/musa ->
+    cuda, npu/xpu/cpu -> native); plugin code may call them directly, and a
+    subclass without forward_cuda must still raise on CUDA like before."""
+    from sglang.srt.layers.utils import MultiPlatformOp
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+
+        class _NativeOnlyLegacy(MultiPlatformOp):
+            def forward_native(self, x):
+                return "native"
+
+    op = _NativeOnlyLegacy()
+    assert op.forward_cpu(torch.zeros(1)) == "native"
+    assert op.forward_npu(torch.zeros(1)) == "native"
+    with pytest.raises(NotImplementedError):
+        op.forward_hip(torch.zeros(1))  # chains to the raising forward_cuda
+
+    _mock_platform(monkeypatch, key="cuda", info=_CUDA)
+    with pytest.raises(NotImplementedError):
+        _NativeOnlyLegacy()(torch.zeros(1))  # old CUDA behavior preserved
 
 
 # --- migration completeness -------------------------------------------------------

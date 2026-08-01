@@ -20,9 +20,12 @@ from sglang.kernels.fused_op import BaseFusedOp
 class MultiPlatformOp(BaseFusedOp):
     """Deprecated alias of :class:`sglang.kernels.fused_op.BaseFusedOp`.
 
-    Kept lenient like the original class: ``forward_native`` is concrete here
-    (raising ``NotImplementedError``) so existing plugin subclasses that only
-    define platform forwards keep instantiating.
+    Kept attribute-compatible with the original class: ``forward_native`` is
+    concrete here (raising ``NotImplementedError``) so existing plugin
+    subclasses that only define platform forwards keep instantiating, and the
+    old per-platform default methods (``forward_hip`` -> ``forward_cuda``,
+    ``forward_cpu`` -> ``forward_native``, ...) remain callable for plugin
+    code that invokes them directly.
     """
 
     def __init_subclass__(cls, **kwargs):
@@ -36,3 +39,24 @@ class MultiPlatformOp(BaseFusedOp):
 
     def forward_native(self, *args, **kwargs):
         raise NotImplementedError
+
+    def forward_cuda(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def forward_hip(self, *args, **kwargs):
+        return self.forward_cuda(*args, **kwargs)
+
+    def forward_musa(self, *args, **kwargs):
+        return self.forward_cuda(*args, **kwargs)
+
+    def forward_npu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
+    def forward_xpu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
+    def forward_hpu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
+    def forward_cpu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)

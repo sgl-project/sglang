@@ -611,14 +611,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             dispatch_output=dispatch_output,
         )
 
-    def forward_native(self, *args, **kwargs) -> CombineInput:
-        # No eager pure-torch path; under torch.compile the dedicated
-        # fused_moe_forward_native is installed instead (see
-        # _torch_compile_forward).
-        raise NotImplementedError(
-            "UnquantizedFusedMoEMethod has no native (pure-torch) path"
-        )
-
+    # forward_native is aliased to forward_cpu at the end of the class body
+    # (pre-existing behavior); under torch.compile the dedicated
+    # fused_moe_forward_native is installed instead via this hook.
     def _torch_compile_forward(self, num_tokens: int) -> Optional[Callable]:
         # torch.compile on this layer only pays off at bs=1; keep the
         # optimized dispatch otherwise.

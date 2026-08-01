@@ -25,6 +25,9 @@ Dispatch priority (highest first), resolved by :meth:`BaseFusedOp.forward`:
 1. **Explicit backend** — ``forward(..., backend=KernelBackend.X)``.
 2. **Global forced backend** — ``SGLANG_FORCE_FUSED_OP_BACKEND`` /
    :func:`set_fused_op_backend` (e.g. ``native`` to bisect numerical bugs).
+   Best-effort: an op that does not implement the forced backend falls back
+   to normal dispatch with a one-time warning, so the debug switch works on
+   whole models that contain device-only ops.
 3. **OOT platform override** — on an out-of-tree platform, a forward
    registered via :meth:`BaseFusedOp.register_oot_forward`, then a
    ``forward_<dispatch_key>`` method, then ``forward_native``.
@@ -63,6 +66,7 @@ methods and dispatch is resolved on first call.
 from __future__ import annotations
 
 import functools
+import logging
 from abc import ABC, abstractmethod
 from typing import (
     AbstractSet,
@@ -90,6 +94,8 @@ from sglang.kernels.spec import (
     PlatformInfo,
     capabilities_satisfied,
 )
+
+logger = logging.getLogger(__name__)
 
 # backend (provenance) -> forward_<backend> method name. ``forward_torch_npu``
 # (not ``forward_npu``) so the torch_npu *backend* method never collides with
@@ -298,6 +304,21 @@ def _record_trace(op: BaseFusedOp, label: str, args: tuple, kwargs: dict) -> Non
             tensor_args=_describe_tensors(args, kwargs),
         )
     )
+
+
+_warned_forced_fallbacks: set = set()
+
+
+def _warn_forced_backend_unavailable(*, op: BaseFusedOp, backend: KernelBackend):
+    key = (type(op), backend)
+    if key not in _warned_forced_fallbacks:
+        _warned_forced_fallbacks.add(key)
+        logger.warning(
+            "Forced fused-op backend %r is not implemented by %s; "
+            "falling back to normal dispatch for this op.",
+            backend.value,
+            op._op_label(),
+        )
 
 
 # --- the per-operator contract ------------------------------------------------
@@ -598,16 +619,30 @@ class BaseFusedOp(nn.Module, ABC):
     @debug_kernel_api
     def forward(self, *args, backend: Optional[KernelBackend] = None, **kwargs):
         """Run the op on ``backend``, or on the best eligible path when omitted."""
-        if backend is None:
-            forced = _forced_backend
-            if forced is _UNRESOLVED:
-                forced = get_fused_op_backend()
-            backend = forced
         if backend is not None:
+            # Explicit per-call selection is strict: an unimplemented backend
+            # raises so the caller's intent never degrades silently.
             result = getattr(self, BACKEND_METHODS[backend])(*args, **kwargs)
             if _trace_enabled:
                 _record_trace(self, backend.value, args, kwargs)
             return result
+        forced = _forced_backend
+        if forced is _UNRESOLVED:
+            forced = get_fused_op_backend()
+        if forced is not None:
+            # The global debug switch is best-effort: ops that do not
+            # implement the forced backend (e.g. forcing "torch" on an op
+            # whose only paths are device-specific) fall back to normal
+            # dispatch with a one-time warning instead of taking the whole
+            # model down.
+            try:
+                result = getattr(self, BACKEND_METHODS[forced])(*args, **kwargs)
+            except NotImplementedError:
+                _warn_forced_backend_unavailable(op=self, backend=forced)
+            else:
+                if _trace_enabled:
+                    _record_trace(self, forced.value, args, kwargs)
+                return result
         method = self._forward_method
         if method is None:
             method = self._forward_method = self._resolve_forward_method()
