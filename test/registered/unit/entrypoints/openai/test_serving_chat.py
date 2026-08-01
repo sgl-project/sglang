@@ -808,6 +808,61 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(result.prompt_ids, [7, 8, 9])
         self.assertEqual(result.image_data[0].url, "image-1")
 
+    def test_kimi_k3_neutralizes_placeholder_in_reasoning_and_tool_arguments(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Run it"},
+                {
+                    "role": "assistant",
+                    "content": "done",
+                    "reasoning_content": "I saw <|kimi_image_placeholder|> there",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {
+                                "name": "note",
+                                "arguments": '{"text": "<|kimi_image_placeholder|>", '
+                                '"deep": {"inner": ["<|kimi_image_placeholder|>"]}}',
+                            },
+                        }
+                    ],
+                },
+            ],
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        rendered = self.tm.tokenizer.apply_chat_template.call_args.args[0]
+        assistant = rendered[1]
+        self.assertEqual(
+            assistant["reasoning_content"], "I saw <| kimi_image_placeholder |> there"
+        )
+        arguments = assistant["tool_calls"][0]["function"]["arguments"]
+        self.assertEqual(arguments["text"], "<| kimi_image_placeholder |>")
+        self.assertEqual(arguments["deep"]["inner"], ["<| kimi_image_placeholder |>"])
+
+    def test_kimi_k3_omits_image_prompts_when_no_image(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "no image here"}],
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        # An empty list would put the encoder in scan-and-consume mode; absent
+        # means image_prompts=None, so it never scans for the placeholder.
+        self.assertNotIn(
+            "image_prompts", self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        )
+
     def test_kimi_k3_preserves_assistant_history_and_raw_arguments(self):
         self.template_manager.chat_template_name = None
         self.chat.chat_encoding_spec = "kimi_k3"

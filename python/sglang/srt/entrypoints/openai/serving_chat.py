@@ -176,6 +176,22 @@ def neutralize_kimi_k3_image_placeholder(text: str) -> str:
     return text.replace(KIMI_K3_IMAGE_PLACEHOLDER, KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED)
 
 
+def neutralize_kimi_k3_placeholders_deep(value: Any) -> Any:
+    """Neutralize the placeholder in every string leaf of a JSON-ish value.
+
+    Tool call arguments render per value; non-string values go through
+    json.dumps, which leaves the literal intact, so nested strings reach the
+    encoder's placeholder scan too.
+    """
+    if isinstance(value, str):
+        return neutralize_kimi_k3_image_placeholder(value)
+    if isinstance(value, dict):
+        return {k: neutralize_kimi_k3_placeholders_deep(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [neutralize_kimi_k3_placeholders_deep(v) for v in value]
+    return value
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -384,6 +400,18 @@ class OpenAIServingChat(OpenAIServingBase):
             elif content is None:
                 message["content"] = ""
 
+            # Assistant history reaches the encoder's placeholder scan through
+            # reasoning and tool call arguments too, not just content.
+            for key in ("reasoning_content", "reasoning"):
+                if isinstance(message.get(key), str):
+                    message[key] = neutralize_kimi_k3_image_placeholder(message[key])
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") if isinstance(call, dict) else None
+                if isinstance(function, dict) and "arguments" in function:
+                    function["arguments"] = neutralize_kimi_k3_placeholders_deep(
+                        function["arguments"]
+                    )
+
             source = request.messages[index]
             if (
                 isinstance(source, ChatCompletionMessageGenericParam)
@@ -460,7 +488,13 @@ class OpenAIServingChat(OpenAIServingBase):
             template_kwargs = dict(request.chat_template_kwargs or {})
             template_kwargs.pop("tokenize", None)
             template_kwargs.pop("return_dict", None)
-            template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
+            # Absent means image_prompts=None, so the encoder skips placeholder
+            # scanning instead of scanning against an empty slot list. Second layer
+            # only -- neutralization above is what removes the literals; a non-empty
+            # list keeps its exact-count check, so a missed field still fails loudly
+            # rather than binding user text to an image.
+            if image_count:
+                template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
 
             if (
                 request.reasoning_effort in ("low", "high", "max")
