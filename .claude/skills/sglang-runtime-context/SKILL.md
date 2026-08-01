@@ -69,10 +69,10 @@ resolved configuration lives in the namespace bags.**
 - **Per-instance boundaries** — the tokenizer-manager family, everything under
   `entrypoints/`, and the tokenizer-process multimodal processors read
   `self.server_args`: several `Engine`s can share one process, and the process-global
-  bags are last-publish-wins across engines. (The mm-processor boundary is not yet
-  airtight: `BaseMultimodalProcessor.process_mm_data` still reads `base_gpu_id` /
-  `rl_on_policy_target` through `get_server_args()` — a known last-publish-wins gap,
-  not a pattern to copy.)
+  bags are last-publish-wins across engines. `base_gpu_id` also differs per worker
+  (the encode-server DP workers each specialize their own copy), so no process-global
+  value can stand in for it — `BaseMultimodalProcessor._fast_image_processor_device`
+  is the shape to copy.
 - **Whole-object passes** (`f(server_args)` handing the instance along) keep the
   supplied-instance contract; don't rewrite the parameter reads to bag reads unless the
   field is runtime-mutated (see the elastic-EP `ep_size` case in
