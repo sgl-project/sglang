@@ -20,8 +20,8 @@ limitations under the License.
 
 #pragma once
 
-#include <sgl_kernel/runtime.cuh>  // For runtime::get_sm_count
-#include <sgl_kernel/utils.cuh>    // For alloc_workspace_tensor
+#include <sgl_kernel/runtime.cuh>
+#include <sgl_kernel/utils.cuh>
 
 #include "fp8_per_tensor_common.cuh"
 

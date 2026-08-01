@@ -15,7 +15,7 @@ limitations under the License.
 
 #pragma once
 
-#include <sgl_kernel/utils.h>  // For RuntimeCheck
+#include <sgl_kernel/utils.h>
 
 #include "cutlass/cutlass.h"
 #include <algorithm>
@@ -27,7 +27,6 @@ limitations under the License.
     host::RuntimeCheck(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
   }
 
-// Smallest power of two >= n (n > 0). Used by the SM100 M-bucket dispatch.
 inline uint32_t next_pow_2(uint32_t n) {
   if (n <= 1) {
     return 1;

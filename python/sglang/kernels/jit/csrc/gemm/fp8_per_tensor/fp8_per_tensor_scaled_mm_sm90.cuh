@@ -28,8 +28,8 @@ limitations under the License.
 
 #pragma once
 
-#include <sgl_kernel/runtime.cuh>  // For runtime::get_sm_count
-#include <sgl_kernel/utils.cuh>    // For alloc_workspace_tensor
+#include <sgl_kernel/runtime.cuh>
+#include <sgl_kernel/utils.cuh>
 
 #include "fp8_per_tensor_common.cuh"
 
@@ -68,7 +68,6 @@ template <typename T, typename TileShape>
 using RowLoad = cutlass::epilogue::fusion::
     Sm90RowBroadcast<0, TileShape, T, T, Stride<Int<0>, Int<1>, Int<0>>, 128 / sizeof_bits_v<T>, false>;
 
-// D = scale_a * scale_b * accum
 template <typename ElementAcc, typename ElementD, typename TileShape>
 struct ScaledEpilogue {
  private:
@@ -95,9 +94,8 @@ struct ScaledEpilogue {
   }
 };
 
-// D = scale_a * scale_b * accum + bias, bias broadcast along the epilogue's
-// N axis (BiasLoad = RowLoad) or M axis (BiasLoad = ColLoad). Swap-AB configs
-// transpose the output, so their per-output-channel bias becomes a column.
+// Swap-AB configs transpose the output, so their per-output-channel bias becomes
+// a column rather than a row.
 template <typename ElementAcc, typename ElementD, typename TileShape, template <typename, typename> typename BiasLoad>
 struct ScaledEpilogueWithBias {
  private:
@@ -295,8 +293,7 @@ void launch(
 
 }  // namespace sm90_fp8
 
-// One entry of the SM90 tile table. swap_ab configs take a column bias because
-// they compute D^T; the rest take a row bias.
+// swap_ab configs take a column bias because they compute D^T; the rest take a row bias.
 template <
     typename OutType,
     bool WithBias,
@@ -337,15 +334,12 @@ void sm90_fp8_pertensor_dispatch_shape_impl(
   using PingpongFastAccum = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
   using FastAccum = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
 
-  // M in (128, inf)
   using GemmDefault =
       typename Sm90Fp8Config<OutType, WithBias, Shape<_128, _128, _128>, Shape<_2, _1, _1>, PingpongFastAccum, false>::
           Gemm;
-  // M in (64, 128], N > 4096
   using GemmM128LargeN =
       typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _128, _128>, Shape<_2, _1, _1>, PingpongFastAccum, false>::
           Gemm;
-  // M in (64, 128], N <= 4096
   using GemmM128SmallN =
       typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _64, _128>, Shape<_1, _1, _1>, PingpongFastAccum, false>::
           Gemm;

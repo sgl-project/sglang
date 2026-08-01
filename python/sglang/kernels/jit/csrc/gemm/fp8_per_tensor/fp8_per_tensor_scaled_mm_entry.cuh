@@ -23,10 +23,10 @@ limitations under the License.
 
 #pragma once
 
-#include <sgl_kernel/tensor.h>  // For SymbolicDevice
-#include <sgl_kernel/utils.h>   // For RuntimeCheck, Panic
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/utils.cuh>  // For LaunchKernel, fp8_e4m3_t/bf16_t/fp16_t
+#include <sgl_kernel/utils.cuh>
 
 #ifndef SGL_FP8_GEMM_SM
 #error "SGL_FP8_GEMM_SM must be defined by the JIT build (89, 90, 100 or 120)"

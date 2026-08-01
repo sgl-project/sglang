@@ -23,7 +23,7 @@ limitations under the License.
 
 #pragma once
 
-#include <sgl_kernel/utils.cuh>  // For alloc_workspace_tensor
+#include <sgl_kernel/utils.cuh>
 
 #include "fp8_per_tensor_common.cuh"
 
@@ -273,7 +273,6 @@ void sm89_fp8_pertensor_dispatch_shape(
     SGL_SM89_DISPATCH(32, 64, 128, 16, 64, 64, 5);
   }
   if (m <= 16) {
-    // M in (1, 16]
     if (n <= 8192) {
       SGL_SM89_DISPATCH(16, 64, 128, 16, 64, 64, 4);
     }
@@ -283,14 +282,12 @@ void sm89_fp8_pertensor_dispatch_shape(
     SGL_SM89_DISPATCH(16, 64, 128, 16, 64, 64, 7);
   }
   if (m <= 64) {
-    // M in (16, 64]
     if (n <= 16384) {
       SGL_SM89_DISPATCH(32, 64, 128, 16, 64, 64, 7);
     }
     SGL_SM89_DISPATCH(16, 64, 128, 16, 64, 64, 7);
   }
   if (m <= 128) {
-    // M in (64, 128]
     if (n <= 8192) {
       SGL_SM89_DISPATCH(64, 64, 128, 32, 64, 64, 4);
     }
@@ -300,7 +297,6 @@ void sm89_fp8_pertensor_dispatch_shape(
     SGL_SM89_DISPATCH(32, 64, 128, 16, 64, 64, 5);
   }
   if (m <= 256) {
-    // M in (128, 256]
     if (n <= 8192) {
       SGL_SM89_DISPATCH(128, 64, 64, 64, 32, 64, 5);
     }
@@ -310,13 +306,11 @@ void sm89_fp8_pertensor_dispatch_shape(
     SGL_SM89_DISPATCH(128, 64, 128, 64, 32, 128, 4);
   }
   if (m <= 512) {
-    // M in (256, 512]
     if (n <= 16384) {
       SGL_SM89_DISPATCH(128, 128, 64, 64, 32, 64, 2);
     }
     SGL_SM89_DISPATCH(128, 128, 64, 64, 32, 64, 4);
   }
-  // M in (512, inf)
   if (n <= 8192) {
     SGL_SM89_DISPATCH(128, 128, 64, 64, 32, 64, 3);
   }
