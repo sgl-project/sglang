@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use dynamo_protocols::types::ChatCompletionRequestMessage;
@@ -169,26 +169,6 @@ fn streaming_error(code: u16, message: impl Into<String>) -> String {
         }
     })
     .to_string()
-}
-
-fn is_authorized(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(key) = state.server_args.api_key.as_deref() else {
-        return true;
-    };
-    let expected = format!("Bearer {key}");
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        == Some(expected.as_str())
-}
-
-fn authorize(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    (!is_authorized(state, headers)).then(|| {
-        openai_error(
-            StatusCode::UNAUTHORIZED,
-            "Invalid authentication credentials",
-        )
-    })
 }
 
 async fn collect_output(

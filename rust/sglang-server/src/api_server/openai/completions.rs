@@ -6,7 +6,7 @@ use std::convert::Infallible;
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
 use super::{
-    AppState, MAX_OPENAI_CHOICES, authorize, collect_output, indexed_egress_stream, openai_error,
+    AppState, MAX_OPENAI_CHOICES, collect_output, indexed_egress_stream, openai_error,
     streaming_error, submit_generation, unix_seconds_u32,
 };
 use crate::ids::Rid;
@@ -58,12 +58,8 @@ pub(super) struct ChoiceExtensions {
 
 async fn completions(
     State(state): State<AppState>,
-    headers: HeaderMap,
     body: Result<Json<CreateCompletionRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = authorize(&state, &headers) {
-        return response;
-    }
     let request = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {

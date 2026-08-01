@@ -83,9 +83,6 @@ pub struct ServerArgs {
     pub log_level: String,
     #[serde(default)]
     pub log_level_http: Option<String>,
-    /// Shared OpenAI-compatible bearer token. `None` leaves the API ungated.
-    #[serde(default)]
-    pub api_key: Option<String>,
     /// Optional built-in chat-template name or path to a Jinja/legacy JSON
     /// template file. Without an override, uses the tokenizer config template.
     #[serde(default)]

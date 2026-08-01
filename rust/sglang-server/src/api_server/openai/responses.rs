@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use axum::{
     Json, Router,
     extract::{Path, State, rejection::JsonRejection},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -41,8 +41,8 @@ use super::response_stream::{
 };
 use super::tools::{apply_tool_constraint, parse_chat_tool_calls};
 use super::{
-    AppState, ResponseStore, StoredResponse, authorize, collect_output, openai_error,
-    submit_generation, unix_seconds,
+    AppState, ResponseStore, StoredResponse, collect_output, openai_error, submit_generation,
+    unix_seconds,
 };
 use crate::ids::Rid;
 use crate::message::{ChunkEvent, EgressItem, GenerateRequest};
@@ -76,12 +76,8 @@ pub(super) fn sse_frame(data: String) -> Event {
 
 async fn retrieve_response(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(response_id): Path<String>,
 ) -> Response {
-    if let Some(response) = authorize(&state, &headers) {
-        return response;
-    }
     if let Some(message) = invalid_response_id(&response_id) {
         return openai_error(StatusCode::BAD_REQUEST, message);
     }
@@ -102,12 +98,8 @@ async fn retrieve_response(
 
 async fn cancel_response(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(response_id): Path<String>,
 ) -> Response {
-    if let Some(response) = authorize(&state, &headers) {
-        return response;
-    }
     if let Some(message) = invalid_response_id(&response_id) {
         return openai_error(StatusCode::BAD_REQUEST, message);
     }
@@ -403,12 +395,8 @@ pub(super) fn responses_chat_request(
 
 async fn responses(
     State(state): State<AppState>,
-    headers: HeaderMap,
     body: Result<Json<CreateResponse>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = authorize(&state, &headers) {
-        return response;
-    }
     let request = match body {
         Ok(Json(request)) => request,
         Err(rejection) => return openai_error(StatusCode::BAD_REQUEST, rejection.body_text()),

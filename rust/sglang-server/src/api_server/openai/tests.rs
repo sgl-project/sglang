@@ -949,19 +949,18 @@ async fn streaming_responses_emits_function_call_events() {
 // (503) and everything else fails validation before submit.
 // ---------------------------------------------------------------------
 
-fn server_args(api_key: Option<&str>) -> Arc<ServerArgs> {
-    let mut value = serde_json::json!({ "served_model_name": "model" });
-    if let Some(key) = api_key {
-        value["api_key"] = serde_json::json!(key);
-    }
-    Arc::new(serde_json::from_value(value).expect("ServerArgs must deserialize"))
+fn server_args() -> Arc<ServerArgs> {
+    Arc::new(
+        serde_json::from_value(serde_json::json!({ "served_model_name": "model" }))
+            .expect("ServerArgs must deserialize"),
+    )
 }
 
-fn app_state(senders: Senders, api_key: Option<&str>) -> AppState {
+fn app_state(senders: Senders) -> AppState {
     AppState {
         senders,
         egress_buf: 8,
-        server_args: server_args(api_key),
+        server_args: server_args(),
         tokenizer: None,
         chat_formatter: None,
         chat_tokenizer: None,
@@ -1036,61 +1035,8 @@ async fn body_json(response: Response) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn bearer_auth_gates_openai_routes() {
-    let app = routes().with_state(app_state(senders_closed(), Some("sk-test")));
-    // Missing key → 401 on every endpoint, before any body handling.
-    for (method, path) in [
-        ("GET", "/v1/models"),
-        ("GET", "/v1/models/model"),
-        ("POST", "/v1/completions"),
-        ("POST", "/v1/chat/completions"),
-        ("POST", "/v1/responses"),
-        ("GET", "/v1/responses/resp_x"),
-        ("POST", "/v1/responses/resp_x/cancel"),
-    ] {
-        let response = oneshot(app.clone(), request(method, path)).await;
-        assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "{method} {path}"
-        );
-    }
-    // Wrong key → 401.
-    let req = Request::builder()
-        .method("GET")
-        .uri("/v1/models")
-        .header("authorization", "Bearer wrong")
-        .body(Body::empty())
-        .unwrap();
-    let response = oneshot(app.clone(), req).await;
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    // Correct key passes auth: the closed tm inbox turns the submit into a
-    // 503, proving the request got past the gate (not a 401).
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/completions")
-        .header("content-type", "application/json")
-        .header("authorization", "Bearer sk-test")
-        .body(Body::from(r#"{"model":"model","prompt":"hi"}"#))
-        .unwrap();
-    let response = oneshot(app.clone(), req).await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    // /v1/models with the right key is fully served.
-    let req = Request::builder()
-        .method("GET")
-        .uri("/v1/models")
-        .header("authorization", "Bearer sk-test")
-        .body(Body::empty())
-        .unwrap();
-    let response = oneshot(app.clone(), req).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let value = body_json(response).await;
-    assert_eq!(value["data"][0]["id"], "model");
-}
-
-#[tokio::test]
 async fn completions_handler_validates_before_submit() {
-    let app = routes().with_state(app_state(senders(), None));
+    let app = routes().with_state(app_state(senders()));
     let cases = [
         (json!({"model": "other", "prompt": "hi"}), "unknown model"),
         (json!({"model": "model", "prompt": "hi", "n": 0}), "n=0"),
@@ -1126,7 +1072,7 @@ async fn completions_handler_validates_before_submit() {
     let response = oneshot(app.clone(), req).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     // A closed tm inbox (shutdown) surfaces as 503.
-    let app = routes().with_state(app_state(senders_closed(), None));
+    let app = routes().with_state(app_state(senders_closed()));
     let response = post_json(
         app.clone(),
         "/v1/completions",
@@ -1138,7 +1084,7 @@ async fn completions_handler_validates_before_submit() {
 
 #[tokio::test]
 async fn chat_handler_validates_before_submit() {
-    let app = routes().with_state(app_state(senders(), None));
+    let app = routes().with_state(app_state(senders()));
     let cases = [
         (
             json!({"model": "other", "messages": [{"role": "user", "content": "hi"}]}),
@@ -1182,7 +1128,7 @@ async fn chat_handler_validates_before_submit() {
 
 #[tokio::test]
 async fn responses_handler_validates_before_submit() {
-    let app = routes().with_state(app_state(senders(), None));
+    let app = routes().with_state(app_state(senders()));
     let cases = [
         (json!({"model": "other", "input": "hi"}), "unknown model"),
         (
@@ -1238,7 +1184,7 @@ async fn responses_handler_validates_before_submit() {
 #[tokio::test]
 async fn response_retrieve_and_cancel_lifecycle() {
     let (senders, abort_rx) = senders_with_abort_rx();
-    let state = app_state(senders, None);
+    let state = app_state(senders);
     let app = routes().with_state(state.clone());
 
     // Unknown / malformed ids.
