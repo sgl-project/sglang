@@ -58,6 +58,18 @@ def _ulysses_ctx() -> tuple[int, int]:
     return get_ulysses_parallel_world_size(), get_ulysses_parallel_rank()
 
 
+def _ring_ctx() -> tuple[int, int]:
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        get_ring_parallel_rank,
+        get_ring_parallel_world_size,
+        model_parallel_is_initialized,
+    )
+
+    if not model_parallel_is_initialized():
+        return 1, 0
+    return get_ring_parallel_world_size(), get_ring_parallel_rank()
+
+
 def _build_local_embedding_layout(
     *,
     seq_len: int,
@@ -70,8 +82,8 @@ def _build_local_embedding_layout(
 ) -> dict[str, torch.Tensor | int]:
     if seq_len % world_size:
         raise ValueError(
-            f"packed seq_len {seq_len} not divisible by Ulysses world size "
-            f"{world_size}"
+            f"packed seq_len {seq_len} not divisible by the combined "
+            f"sequence-parallel world size {world_size}"
         )
     local_seq_len = seq_len // world_size
     row_start = rank * local_seq_len
@@ -181,9 +193,18 @@ class MiniMaxH3DenoiseBranch:
         )
         text_pos_dev = text_pos.to(device)
         ulysses_world_size, ulysses_rank = _ulysses_ctx()
+        ring_world_size, ring_rank = _ring_ctx()
+        # Combined SP-local rank/world size: the group coordinator lays out
+        # ring as the outer (slower-varying) dimension and Ulysses as the
+        # inner one (see set_seq_parallel_pg_by_sp_groups), so this matches
+        # minimax_h3.py's row_start = ring_rank*ring_chunk_len +
+        # ulysses_rank*local_seq_len exactly -- `_build_local_embedding_layout`
+        # below needs the same combined rank, not just the Ulysses component.
+        sp_world_size = ulysses_world_size * ring_world_size
+        sp_rank = ring_rank * ulysses_world_size + ulysses_rank
         token_tags_host = token_tags.view(-1).to(dtype=torch.long)
-        local_seq_len = seq_len // ulysses_world_size
-        local_row_start = ulysses_rank * local_seq_len
+        local_seq_len = seq_len // sp_world_size
+        local_row_start = sp_rank * local_seq_len
         local_row_stop = local_row_start + local_seq_len
         self.local_row_slice = slice(local_row_start, local_row_stop)
         self.block_token_tags = (
@@ -210,8 +231,8 @@ class MiniMaxH3DenoiseBranch:
                 text_pos=text_pos,
                 img_pos=self.img_pos,
                 audio_pos=self.audio_pos,
-                world_size=ulysses_world_size,
-                rank=ulysses_rank,
+                world_size=sp_world_size,
+                rank=sp_rank,
                 device=device,
             ),
             "packed_seq_params": {
