@@ -19,9 +19,6 @@ Registry: nightly-amd-accuracy-8-gpu-mi35x-qwen35 suite.
 import ast
 import os
 
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -47,7 +44,6 @@ register_amd_ci(
 
 INVALID = -9999999
 
-QWEN35_ATTNFP8_LOCAL_PATH = "/data2/models/Qwen3.5-397B-A17B-MXFP4-AttnFP8"
 QWEN35_ATTNFP8_HF_MODEL_ID = "amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8"
 SERVER_LAUNCH_TIMEOUT = 3600
 # TP=4: TP=8 shards shared_expert.down_proj (K=1024) to K=128, which aiter's fp8
@@ -59,12 +55,9 @@ GSM8K_ACCURACY_THRESHOLD = 0.92
 
 
 def get_model_path() -> str:
-    env_path = os.environ.get("QWEN35_ATTNFP8_MODEL_PATH")
-    if env_path:
-        return env_path
-    if os.path.exists(QWEN35_ATTNFP8_LOCAL_PATH):
-        return QWEN35_ATTNFP8_LOCAL_PATH
-    return QWEN35_ATTNFP8_HF_MODEL_ID
+    # CI resolves the checkpoint from the HF id; local runs can point at a
+    # pre-downloaded checkpoint by exporting QWEN35_ATTNFP8_MODEL_PATH.
+    return os.environ.get("QWEN35_ATTNFP8_MODEL_PATH", QWEN35_ATTNFP8_HF_MODEL_ID)
 
 
 def get_one_example(lines, i, include_answer):
