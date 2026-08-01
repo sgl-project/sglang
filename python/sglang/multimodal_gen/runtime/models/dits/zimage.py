@@ -201,7 +201,6 @@ class FeedForward(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.w2",
         )
-        # None keeps the fused bf16 kernel; Lumina-2 injects FP32SiluAndMul.
         self.act = activation if activation is not None else SiluAndMul()
 
     def forward(self, x):
@@ -230,8 +229,7 @@ class ZImageAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.qk_norm = qk_norm
-        # False only ever disables. Lumina-2 passes it because the fused
-        # norm+RoPE kernel cannot reproduce its q/k norm's cast boundary.
+        # The fused norm+RoPE kernel cannot represent every injected norm policy.
         self.enable_zimage_qk_fusion = allow_fused_qk_norm_rope and quant_config is None
 
         tp_size = get_tp_world_size()
@@ -692,8 +690,7 @@ class RopeEmbedder:
         self.theta = theta
         self.axes_dims = axes_dims
         self.axes_lens = axes_lens
-        # Precision the phase is held at before cos/sin; the tables come back
-        # fp32 either way. Lumina-2 passes fp64 to match diffusers.
+        # Precision used to evaluate the phase before storing fp32 tables.
         self.freqs_dtype = freqs_dtype
         assert len(axes_dims) == len(
             axes_lens
@@ -718,8 +715,6 @@ class RopeEmbedder:
                     ** (torch.arange(0, d, 2, dtype=torch.float64, device="cpu") / d)
                 )
                 timestep = torch.arange(e, device=freqs.device, dtype=torch.float64)
-                # Bit-identical to the old expression at the fp32 default, since
-                # the trailing .float() is then a no-op. Only fp64 changes.
                 freqs = torch.outer(timestep, freqs).to(freqs_dtype)
 
                 cos_list.append(torch.cos(freqs).float())

@@ -34,9 +34,7 @@ LUMINA2_SYSTEM_PROMPT = (
     "You are an assistant designed to generate superior images with the superior "
     "degree of image-text alignment based on textual prompts or user prompts."
 )
-# NOTE: "<Prompt Start>" is part of the trained template -- diffusers
-# pipeline_lumina2.py:288, unchanged since v0.33.0. Dropping the marker
-# conditions the model on a template it never saw, with no error.
+# "<Prompt Start>" is part of Lumina's trained prompt template.
 LUMINA2_PROMPT_SEPARATOR = " <Prompt Start> "
 
 # Gemma-2 caption length Lumina-2 was trained with.
@@ -79,10 +77,7 @@ class Lumina2PipelineConfig(SpatialImagePipelineConfig):
     should_use_guidance: bool = False
     enable_autocast: bool = False
     vae_tiling: bool = False
-    # NOTE: must be pinned alongside vae_tiling. check_pipeline_config() rejects
-    # vae_sp without vae_tiling, and the base defaults both to True, so leaving
-    # this inherited makes every `sglang generate` / `sglang serve` fail
-    # validation before a single weight loads.
+    # VAE sequence parallelism requires tiling, which Lumina disables.
     vae_sp: bool = False
     vae_precision: str = "bf16"
 
@@ -114,11 +109,8 @@ class Lumina2PipelineConfig(SpatialImagePipelineConfig):
         requested = tok_kwargs.pop("max_length", None) or LUMINA2_MAX_TEXT_LEN
         max_rope_caption_len = self.dit_config.arch_config.axes_lens[0] - 1
         effective_max_length = min(requested, max_rope_caption_len)
-        # Caption extents come from encoder_attention_mask.sum(), which only
-        # locates the real tokens under right padding. Lumina-2 inherits the
-        # "right" default, but a fine-tune repackaged from a generation setup
-        # can ship "left" and would mis-position every caption token without
-        # raising. diffusers pins it the same way (pipeline_lumina2.py:189).
+        # Caption extents come from encoder_attention_mask.sum(), so real tokens
+        # must precede padding for RoPE positions to remain aligned.
         tokenizer.padding_side = "right"
         return tokenizer(
             prompts,
@@ -204,12 +196,10 @@ class Lumina2PipelineConfig(SpatialImagePipelineConfig):
         return self._prepare_sigmas(sigmas, num_inference_steps)
 
     def post_denoising_loop(self, latents, batch):
-        # Latents are already (B, C, H', W'); nothing to unpack.
         return latents
 
 
 def _first_mask(mask):
-    # The batch stores per-encoder masks as a list; the DiT wants one tensor.
     if isinstance(mask, (list, tuple)):
         return mask[0] if mask else None
     return mask

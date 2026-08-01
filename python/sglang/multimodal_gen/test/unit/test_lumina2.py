@@ -1,14 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for Lumina-Image-2.0 config/weight plumbing.
-
-These run without a GPU or a checkpoint download. They cover the failure modes
-that are invisible until a real load: architecture fields silently not picked up
-from the checkpoint's config.json, and weight-name mappings that resolve to
-params the model does not have.
-
-LUMINA2_CHECKPOINT_CONFIG below is verbatim
-Alpha-VLLM/Lumina-Image-2.0 transformer/config.json.
-"""
+"""Unit tests for Lumina-Image-2.0 config and weight plumbing."""
 
 import copy
 import unittest
@@ -85,8 +76,6 @@ LUMINA2_CHECKPOINT_CONFIG = {
 
 
 def _global_server_args_or_none():
-    """The installed global, or None. conftest's fixture is a pytest mechanism,
-    so a direct ``python test_lumina2.py`` run has none and the getter raises."""
     try:
         return get_global_server_args()
     except ValueError:
@@ -95,9 +84,6 @@ def _global_server_args_or_none():
 
 def build_meta_model(config: Lumina2Config) -> Lumina2Transformer2DModel:
     """Instantiate the DiT on the meta device (no weights, no GPU)."""
-    # Under pytest, extend the conftest fixture's stub rather than replacing it,
-    # so a layer that starts reading some other ServerArgs field gets fixed once
-    # in the fixture instead of here.
     prev_args = _global_server_args_or_none()
     if prev_args is None:
         overridden = SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
@@ -129,14 +115,6 @@ def build_meta_model(config: Lumina2Config) -> Lumina2Transformer2DModel:
 
 class TestSharedZImagePrimitives(CustomTestCase):
     def test_lumina_reuses_zimage_primitives_rather_than_forking_them(self):
-        """Lumina-2 and Z-Image are the same joint-DiT family, so the shared
-        blocks live in zimage.py -- the elder sibling -- matching this repo's
-        convention (causal_wanvideo <- wanvideo, longlive2 <- causal_wanvideo).
-
-        A local fork of any of these would drift from Z-Image silently, which
-        is how GQA support came to be missing from one of two copies of the
-        masked attention path.
-        """
         import sglang.multimodal_gen.runtime.models.dits.lumina2 as lumina2_mod
         import sglang.multimodal_gen.runtime.models.dits.zimage as zimage_mod
 
@@ -182,9 +160,7 @@ class TestSharedZImagePrimitives(CustomTestCase):
                 self.assertTrue(block.attention.attn.skip_sequence_parallel)
 
     def test_rope_phase_is_evaluated_in_fp64_for_lumina_only(self):
-        """diffusers transformer_lumina2.py:245 builds the phase in fp64 and
-        takes cos/sin there; rounding to fp32 first moves a few table entries by
-        a bf16 ulp. Z-Image shares this embedder and must keep fp32."""
+        """Lumina evaluates phases in fp64 while Z-Image retains fp32."""
         axes_dims, axes_lens = (32, 32, 32), (300, 512, 512)
         theta = 10000.0
 
@@ -198,17 +174,13 @@ class TestSharedZImagePrimitives(CustomTestCase):
             self.assertTrue(torch.equal(sin64[i], phase.sin().float()))
             self.assertEqual(cos64[i].dtype, torch.float32)
 
-        # If the two agreed, Lumina's opt-in would be untested and Z-Image's
-        # default unprotected.
         cos32, _ = ZImageRopeEmbedder.precompute_freqs(
             axes_dims, axes_lens, theta=theta
         )
         self.assertFalse(all(torch.equal(a, b) for a, b in zip(cos32, cos64)))
 
     def test_rms_norm_rounds_before_the_affine_multiply(self):
-        """diffusers normalization.py:553-562 casts to the weight dtype before
-        applying the weight. Hoisting that multiply into fp32 reads as a strict
-        accuracy win and silently drifts from the reference in every block."""
+        """The affine multiply runs after casting to the weight dtype."""
         torch.manual_seed(0)
         dim = 64
         norm = Lumina2RMSNorm(dim).to(torch.bfloat16)
@@ -224,7 +196,6 @@ class TestSharedZImagePrimitives(CustomTestCase):
         self.assertEqual(actual.dtype, torch.bfloat16)
         self.assertTrue(torch.equal(actual, expected))
 
-        # Keeps the assertion above honest: a revert cannot pass by coincidence.
         fp32_affine = (normalized * norm.weight.float()).to(torch.bfloat16)
         self.assertFalse(torch.equal(fp32_affine, expected))
 
@@ -373,19 +344,15 @@ class TestLumina2WeightMapping(CustomTestCase):
 
 class TestLumina2PipelineConfig(CustomTestCase):
     def test_registry_resolves_model_path(self):
-        # get_model_info would fetch model_index.json and, when that fails,
-        # still pass by falling back to these same classes. __wrapped__ skips
-        # lru_cache(maxsize=1) rather than evicting the entry other tests share.
-        # The patch is for the detector path, which pulls model_index.json
-        # before running detectors; the exact-path match returns before that.
+        # Bypass the shared cache while testing both exact and detected paths.
         resolve = _get_config_info.__wrapped__
         with patch(
             "sglang.multimodal_gen.registry.maybe_download_model_index",
             return_value={},
         ):
             for path in (
-                "Alpha-VLLM/Lumina-Image-2.0",  # exact hf_model_paths entry
-                "some-org/lumina2-finetune",  # model_detectors fallback
+                "Alpha-VLLM/Lumina-Image-2.0",
+                "some-org/lumina2-finetune",
             ):
                 info = resolve(path)
                 self.assertIsNotNone(info, path)
@@ -393,8 +360,6 @@ class TestLumina2PipelineConfig(CustomTestCase):
                 self.assertIs(info.sampling_param_cls, Lumina2SamplingParams)
 
     def test_pipeline_name_matches_hf_class_name(self):
-        """_class_name in model_index.json is how a checkpoint finds this
-        pipeline; renaming pipeline_name drops Lumina onto the generic path."""
         _discover_and_register_pipelines()
         self.assertIs(
             _PIPELINE_REGISTRY.get("Lumina2Pipeline"),
@@ -412,8 +377,6 @@ class TestLumina2PipelineConfig(CustomTestCase):
         self.assertIs(config.gather_latents_for_sp(latents), latents)
 
     def test_conditioning_expands_to_the_sample_batch(self):
-        """Conditioning must reach one row per sample, not per prompt; see
-        Lumina2PipelineConfig.expand_conditioning_to_sample_batch."""
         config = Lumina2PipelineConfig()
         batch = SimpleNamespace(
             prompt="a cat",
@@ -452,7 +415,6 @@ class TestLumina2PipelineConfig(CustomTestCase):
         self.assertIs(batch.prompt_embeds, embeds)
 
     def test_tokenizer_is_pinned_to_right_padding(self):
-        """A tokenizer arriving with left padding must be corrected in place."""
         config = Lumina2PipelineConfig()
 
         def fake_tokenizer(prompts, **kwargs):
@@ -483,11 +445,7 @@ class TestLumina2PipelineConfig(CustomTestCase):
         (preprocess,) = config.get_preprocess_text_funcs(is_negative=False)
         (negative_preprocess,) = config.get_preprocess_text_funcs(is_negative=True)
 
-        # Transcribed from diffusers pipeline_lumina2.py:288, identical in
-        # v0.33.0, v0.37.0 (the pinned one) and main:
-        #   prompt = [system_prompt + " <Prompt Start> " + p for p in prompt]
-        # Spelled out, not built from LUMINA2_PROMPT_SEPARATOR, so editing the
-        # separator turns this red instead of agreeing with itself.
+        # Keep the expected separator independent from the constant under test.
         self.assertEqual(
             preprocess("a cat"),
             LUMINA2_SYSTEM_PROMPT + " <Prompt Start> " + "a cat",
@@ -507,16 +465,7 @@ class TestLumina2PipelineConfig(CustomTestCase):
         )
 
     def test_renorm_matches_the_diffusers_formula_bitwise(self):
-        """Transcribed from diffusers pipeline_lumina2.py:750-758:
-
-            cond_norm  = torch.norm(noise_pred_cond, dim=-1, keepdim=True)
-            noise_norm = torch.norm(noise_pred,      dim=-1, keepdim=True)
-            noise_pred = noise_pred * (cond_norm / noise_norm)
-
-        The property test above only pins that the conditional norm is
-        restored; this pins the formula, so a different rescale that happens
-        to preserve the norm would still turn it red.
-        """
+        """Pin Lumina's per-position renormalization formula exactly."""
         config = Lumina2PipelineConfig()
         torch.manual_seed(0)
         cond = torch.randn(2, 1024, 16)
@@ -531,9 +480,6 @@ class TestLumina2PipelineConfig(CustomTestCase):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_renorm_survives_an_all_zero_prediction(self):
-        """clamp_min(1e-12) on the divisor. Bitwise identical to diffusers on
-        real input (verified above); it only differs where diffusers would
-        divide by zero."""
         config = Lumina2PipelineConfig()
         out = config.postprocess_cfg_noise(
             None, torch.zeros(1, 8, 16), torch.randn(1, 8, 16)
@@ -541,15 +487,7 @@ class TestLumina2PipelineConfig(CustomTestCase):
         self.assertTrue(torch.isfinite(out).all())
 
     def test_negating_before_cfg_equals_negating_after(self):
-        """The DiT returns ``-output`` (lumina2.py forward) while diffusers
-        negates in the pipeline *after* CFG and renorm
-        (pipeline_lumina2.py:761). That is only equivalent because both the CFG
-        combination and the renorm are odd in the prediction -- f(-x) = -f(x).
-
-        The equality is exact, not approximate: IEEE negation is exact and
-        round-to-nearest is symmetric under it, and ``torch.norm`` is unchanged
-        by sign. Asserted bitwise so a future non-odd postprocess turns it red.
-        """
+        """CFG and renormalization are odd, so negation may happen first."""
         config = Lumina2PipelineConfig()
         torch.manual_seed(0)
         cond = torch.randn(2, 4096, 16)
@@ -571,15 +509,7 @@ class TestLumina2PipelineConfig(CustomTestCase):
         torch.testing.assert_close(sgl, ref, rtol=0, atol=0)
 
     def test_sigma_grid_matches_the_diffusers_pipeline_linspace(self):
-        """diffusers' pipeline builds the grid itself (pipeline_lumina2.py:698)
-        and passes it into retrieve_timesteps:
-
-            sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
-
-        The scheduler's *own* default grid -- shift=6.0 applied to an internal
-        linspace -- is never used by the pipeline, so comparing against a bare
-        ``set_timesteps(steps)`` compares against code nothing calls.
-        """
+        """Lumina supplies an explicit linear sigma grid to the scheduler."""
         config = Lumina2PipelineConfig()
 
         for steps in (1, 2, 8, 30):
@@ -593,23 +523,17 @@ class TestLumina2PipelineConfig(CustomTestCase):
                 self.assertEqual(len(sigmas), steps)
                 self.assertEqual(list(sigmas), list(expected))
 
-        # An explicitly supplied grid must pass through untouched.
         given = [1.0, 0.7, 0.3]
         self.assertIs(config.prepare_sigmas(given, 3), given)
 
     def test_latent_geometry_derives_from_the_vae(self):
-        """FluxVAEArchConfig declares spatial_compression_ratio=1 and derives
-        the real value in post_init() from block_out_channels, falling back to
-        dim_mult. Reading it before post_init() reports 1 and makes the latent
-        look 8x too large -- that misread cost a false alarm during validation,
-        so both the pre and post values are pinned here."""
+        """The Flux VAE derives its spatial compression during post-init."""
         config = Lumina2PipelineConfig()
 
         self.assertEqual(config.vae_config.arch_config.spatial_compression_ratio, 1)
         config.vae_config.post_init()
         self.assertEqual(config.vae_config.arch_config.spatial_compression_ratio, 8)
 
-        # 16 latent channels, matching the FLUX.1-dev VAE Lumina-2 ships.
         self.assertEqual(config.dit_config.arch_config.num_channels_latents, 16)
 
         batch = SimpleNamespace(height=1024, width=1024)
@@ -622,14 +546,7 @@ class TestLumina2PipelineConfig(CustomTestCase):
         self.assertFalse(Lumina2SamplingParams().cfg_normalization)
 
     def test_pipeline_config_passes_its_own_validator(self):
-        """check_pipeline_config() rejects vae_sp without vae_tiling, and the
-        base class defaults both to True. Lumina sets vae_tiling=False, so
-        leaving vae_sp inherited fails validation before anything loads --
-        i.e. every `sglang generate` / `sglang serve` dies at startup.
-
-        The other Lumina tests build the config and assert on fields; none of
-        them ran it through its own validator, which is why that shipped.
-        """
+        """Lumina disables both VAE tiling and its dependent SP mode."""
         config = Lumina2PipelineConfig()
 
         self.assertFalse(config.vae_tiling)
@@ -637,19 +554,7 @@ class TestLumina2PipelineConfig(CustomTestCase):
         config.check_pipeline_config()
 
     def test_padding_mask_fires_when_the_tensor_is_wider_than_the_caption(self):
-        """Passes before and after the GQA fix; it pins *which path* an
-        ordinary request takes.
-
-        tokenize_prompt pads to max_length=256 while the attention mask carries
-        the caption's true length (~40 tokens with the system prompt). So
-        _padding_mask does not short-circuit, and the caption refiner runs the
-        masked attention path on a *single* prompt -- no batching required.
-        That is why the GQA defect in USPAttention's masked branch was a launch
-        blocker rather than a mixed-length-batch edge case.
-
-        The only case that legitimately skips the mask is a caption that fills
-        its tensor exactly.
-        """
+        """Ordinary padded captions exercise masked GQA attention."""
         device = torch.device("cpu")
 
         mask, meta = Lumina2Transformer2DModel._padding_mask(

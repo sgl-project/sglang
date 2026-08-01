@@ -16,10 +16,6 @@ from sglang.multimodal_gen.configs.models.fsdp import is_lumina2_layer
 
 @dataclass
 class Lumina2ArchConfig(DiTArchConfig):
-    # NOTE: these names must match the checkpoint's transformer/config.json keys.
-    # ArchConfig.__setattr__ routes any key it does not declare into
-    # `extra_attrs`, where nothing reads it, so a mismatched name means
-    # update_model_arch silently drops the checkpoint's value. Do not shorten.
     patch_size: int = 2
     in_channels: int = 16
     out_channels: int | None = None  # checkpoint stores null -> defaults to in_channels
@@ -39,7 +35,6 @@ class Lumina2ArchConfig(DiTArchConfig):
     sample_size: int = 128
     scaling_factor: float = 1.0  # present in config.json; unused by the model
 
-    # --- not checkpoint fields; fixed by the architecture ---
     qk_norm: bool = True
     # Absent from transformer/config.json; diffusers hardcodes theta=10000 at the
     # Lumina2RotaryPosEmbed construction site.
@@ -48,11 +43,6 @@ class Lumina2ArchConfig(DiTArchConfig):
     t_scale: float = 1000.0
 
     _fsdp_shard_conditions: list = field(default_factory=lambda: [is_lumina2_layer])
-
-    # NOTE: no stacked_params_mapping. That mechanism names the *checkpoint*
-    # shards feeding a fused runtime param, and param_names_mapping below
-    # already fuses (linear_1, linear_3) with explicit shard indices. An entry
-    # naming w1/w3 would match nothing: no Lumina key is ever named that.
 
     # diffusers Lumina2Transformer2DModel checkpoint keys -> runtime module
     # names. ffn_norm1 / ffn_norm2 / x_embedder / caption_embedder need no rule.
@@ -104,8 +94,6 @@ class Lumina2ArchConfig(DiTArchConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        # NOTE: re-run by update_model_arch, so this must stay idempotent and
-        # must never overwrite a value the checkpoint supplied.
         self.out_channels = self.out_channels or self.in_channels
         self.num_channels_latents = self.in_channels
 

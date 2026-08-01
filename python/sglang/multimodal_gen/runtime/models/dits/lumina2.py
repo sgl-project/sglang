@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Lumina-Image-2.0 DiT (NextDiT). The attention block, SwiGLU feed-forward,
-# timestep embedder, and axes-RoPE tables are imported from zimage.py rather
-# than forked; Lumina's precision differences are opt-in keyword arguments on
-# those shared classes.
+# Lumina-Image-2.0 DiT (NextDiT).
 #
 # Reference: https://arxiv.org/abs/2503.21758
 # Ported from diffusers Lumina2Transformer2DModel.
@@ -42,7 +39,6 @@ from sglang.multimodal_gen.runtime.models.dits.zimage import (
 # diffusers LuminaRMSNormZero modulates from min(hidden_size, 1024).
 ADALN_EMBED_DIM = 1024
 
-# Only for the class-level weight-mapping attrs; instances use their own config.
 _DEFAULT_ARCH = Lumina2Config().arch_config
 
 
@@ -59,13 +55,7 @@ class FP32SiluAndMul(nn.Module):
 
 
 class Lumina2RMSNorm(nn.Module):
-    """diffusers RMSNorm, cast boundary included (normalization.py:553-562).
-
-    NOTE: the affine multiply runs in the weight's dtype, not fp32. Hoisting it
-    into fp32 rounds once instead of twice and looks strictly more accurate, but
-    it is not what the checkpoint was matched against -- it drifts by up to
-    ~0.03 per element, in every norm of every block.
-    """
+    """RMSNorm with the affine multiply in the weight's dtype."""
 
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -239,8 +229,6 @@ class Lumina2FinalLayer(nn.Module):
 class Lumina2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """Lumina-Image-2.0 NextDiT. Class name matches the diffusers ``_class_name``."""
 
-    # NOTE: no _supports_gradient_checkpointing. forward() has no such branch,
-    # so advertising it would let a caller enable a no-op.
     _no_split_modules = ["Lumina2TransformerBlock"]
     _fsdp_shard_conditions = _DEFAULT_ARCH._fsdp_shard_conditions
     param_names_mapping = _DEFAULT_ARCH.param_names_mapping
@@ -282,8 +270,7 @@ class Lumina2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             theta=arch.rope_theta,
             axes_dims=arch.axes_dim_rope,
             axes_lens=arch.axes_lens,
-            # diffusers builds the phase in fp64 (transformer_lumina2.py:245).
-            # It also rotates in complex128; GQA sends us to a bf16 fallback.
+            # Lumina evaluates RoPE phases in fp64 before storing fp32 tables.
             freqs_dtype=torch.float64,
         )
 
@@ -431,11 +418,7 @@ class Lumina2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     def _padding_mask(
         lengths: List[int], target_len: int, device: torch.device
     ) -> Tuple[Optional[torch.Tensor], Optional[dict]]:
-        """Key-padding mask over a left-packed sequence, or (None, None).
-
-        Uniform lengths need no mask -- the common single-prompt case. diffusers
-        makes the same shortcut via ``use_mask``.
-        """
+        """Key-padding mask over a left-packed sequence, or (None, None)."""
         if all(length == target_len for length in lengths):
             return None, None
         length_key = tuple(int(length) for length in lengths)

@@ -76,13 +76,7 @@ _VARLEN_FA_ENABLED = os.environ.get("SGLANG_VARLEN_FA", "1") != "0"
 
 
 def _same_head_count(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
-    """True when Q/K/V share a head count (MHA), for ``[B, S, H, D]`` inputs.
-
-    The varlen FA fast path calls ``fused_pack_qkv``, which asserts Q/K/V share
-    a full shape, so GQA/MQA must not reach it. The surrounding gates compare
-    ``shape[:2]`` -- (batch, sequence) -- which is equal for GQA too, stopping
-    one index short of the dimension that actually differs.
-    """
+    """True when Q/K/V share a head count, for ``[B, S, H, D]`` inputs."""
     return q.shape[2] == k.shape[2] == v.shape[2]
 
 
@@ -91,9 +85,8 @@ def _expand_kv_for_gqa(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Repeat K/V heads up to Q's head count for kernels without native GQA.
 
-    ``scaled_dot_product_attention`` does not broadcast heads, so a GQA model
-    reaches it with mismatched head counts and raises. ``LocalAttention`` has
-    carried this expansion since it was written; ``USPAttention`` did not.
+    ``scaled_dot_product_attention`` does not broadcast heads, so K/V must be
+    expanded before using it for GQA.
 
     ``dim`` is the head axis: 1 for the ``[B, H, S, D]`` layout SDPA wants.
     Returns ``k, v`` unchanged -- the same objects -- when the counts already
@@ -755,7 +748,6 @@ class USPAttention(nn.Module):
                     and attn_mask.device == q.device
                     and q.dtype in (torch.float16, torch.bfloat16)
                     and q.shape[:2] == attn_mask.shape == k.shape[:2] == v.shape[:2]
-                    # shape[:2] stops before the head dimension.
                     and _same_head_count(q, k, v)
                 ):
                     bs, seq = q.shape[0], q.shape[1]
@@ -927,7 +919,6 @@ class USPAttention(nn.Module):
                 and gathered_mask.device == q.device
                 and q.dtype in (torch.float16, torch.bfloat16)
                 and q.shape[:2] == gathered_mask.shape == k.shape[:2] == v.shape[:2]
-                # shape[:2] stops before the head dimension.
                 and _same_head_count(q, k, v)
             ):
                 bs, seq = q.shape[0], q.shape[1]

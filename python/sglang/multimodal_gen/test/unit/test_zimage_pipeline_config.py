@@ -18,9 +18,7 @@ from sglang.multimodal_gen.runtime.models.dits.zimage import (
 @contextmanager
 def _single_process_parallel():
     """Stub the TP / SP world so parallel-linear modules (ZImageAttention,
-    FeedForward) construct on the 'meta' device without an initialized
-    distributed group. Mirrors the patch set test_lumina2 uses for the same
-    purpose."""
+    FeedForward) construct on the 'meta' device."""
     fake_tp_group = SimpleNamespace(world_size=1, rank_in_group=0)
     with (
         patch(
@@ -40,16 +38,9 @@ def _single_process_parallel():
 
 
 class TestZImageSharedPrimitiveDefaults(unittest.TestCase):
-    """Lumina-2 reuses FeedForward / ZImageAttention / RopeEmbedder and opts into
-    its own precision policy through added keyword arguments. Every one of those
-    defaults to Z-Image's behavior; these pin that, so a future change to the
-    hooks cannot quietly move Z-Image."""
+    """Shared primitive defaults preserve Z-Image behavior."""
 
     def test_rope_default_reproduces_the_pre_hook_fp32_formula_bitwise(self) -> None:
-        """freqs_dtype defaults to fp32, and the .float() moved from before
-        cos()/sin() to after. For an fp32 phase both orderings are the same
-        computation. Written against the *old* expression so a regression
-        cannot pass by agreeing with the new code."""
         axes_dims, axes_lens, theta = (16, 56, 56), (64, 128, 128), 256.0
 
         cos_list, sin_list = RopeEmbedder.precompute_freqs(
@@ -63,7 +54,6 @@ class TestZImageSharedPrimitiveDefaults(unittest.TestCase):
             self.assertTrue(torch.equal(sin_list[i], torch.sin(phase)))
 
     def test_rope_fp64_phase_is_opt_in_and_actually_differs(self) -> None:
-        """The hook must do something, or Lumina silently gets Z-Image's fp32."""
         args = ((16, 56, 56), (64, 128, 128))
         cos32, _ = RopeEmbedder.precompute_freqs(*args)
         cos64, _ = RopeEmbedder.precompute_freqs(*args, freqs_dtype=torch.float64)
@@ -81,8 +71,6 @@ class TestZImageSharedPrimitiveDefaults(unittest.TestCase):
         self.assertTrue(attn.enable_zimage_qk_fusion)
 
     def test_allow_fused_qk_norm_rope_only_ever_disables(self) -> None:
-        """`allow_fused_qk_norm_rope and quant_config is None` must reduce to
-        the old `quant_config is None` whenever the flag is left alone."""
         with _single_process_parallel(), torch.device("meta"):
             off = ZImageAttention(
                 dim=64, num_heads=4, num_kv_heads=4, allow_fused_qk_norm_rope=False

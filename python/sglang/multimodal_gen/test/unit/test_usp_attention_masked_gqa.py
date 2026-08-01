@@ -1,26 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Regression tests for USPAttention's masked path under GQA.
-
-``USPAttention``'s masked branch has two exits, and before this fix both assumed
-Q/K/V share a head count:
-
-* the varlen FA fast path calls ``fused_pack_qkv``, which asserts Q/K/V share a
-  full shape -- but the gate only compared ``shape[:2]``, i.e. (batch, sequence),
-  stopping one index short of the head dimension that GQA actually varies;
-* the SDPA fallback handed unexpanded K/V to
-  ``scaled_dot_product_attention``, which does not broadcast heads.
-
-``LocalAttention`` has carried the K/V expansion since it was written;
-``USPAttention`` did not, because its only consumer until Lumina-Image-2.0
-(24 query heads / 8 KV heads) was Z-Image, which is MHA.
-
-The masked branch is reached whenever a caption is shorter than its padded
-tensor -- ``tokenize_prompt`` pads to ``max_length`` while the attention mask
-carries the true length -- so this was not limited to mixed-length batches.
-
-MHA must be bit-for-bit unaffected; ``test_mha_masked_output_is_unchanged``
-asserts that by object identity, not by tolerance.
-"""
+"""Regression tests for masked GQA in USPAttention."""
 
 import unittest
 from types import SimpleNamespace
@@ -39,12 +18,7 @@ _LAYER = "sglang.multimodal_gen.runtime.layers.attention.layer"
 
 
 def _masked_forward(q, k, v, attn_mask):
-    """Drive USPAttention's masked non-SP branch on CPU.
-
-    ``__init__`` is bypassed (it needs a real backend + distributed setup), so
-    ``forward`` is called unbound -- ``nn.Module.__call__`` would go looking for
-    the state we skipped. Only the attributes that branch actually reads are set.
-    """
+    """Drive the masked non-SP branch without distributed initialization."""
     obj = USPAttention.__new__(USPAttention)
     obj.skip_sequence_parallel = True  # take the non-SP branch
     obj.softmax_scale = None
@@ -87,9 +61,6 @@ class TestUSPAttentionMaskedGQA(unittest.TestCase):
         self.mask = torch.tensor([[True, True, True, True, False, False]])
 
     def test_masked_attention_handles_gqa(self):
-        """4 query heads / 2 KV heads. Pre-fix this raised
-        ``RuntimeError: The size of tensor a (4) must match the size of
-        tensor b (2) at non-singleton dimension 1``."""
         q = torch.randn(1, 6, 4, 8)
         k = torch.randn(1, 6, 2, 8)
         v = torch.randn(1, 6, 2, 8)
@@ -100,7 +71,6 @@ class TestUSPAttentionMaskedGQA(unittest.TestCase):
         torch.testing.assert_close(out, _sdpa_reference(q, k, v, self.mask))
 
     def test_mha_masked_output_is_unchanged(self):
-        """Equal head counts must take exactly the pre-fix code path."""
         q = torch.randn(1, 6, 4, 8)
         k = torch.randn(1, 6, 4, 8)
         v = torch.randn(1, 6, 4, 8)
