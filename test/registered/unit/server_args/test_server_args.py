@@ -324,6 +324,11 @@ class TestLoadBalanceMethod(unittest.TestCase):
     def test_pd_decode_radix_hisparse_rejects_incompatible_features(self):
         cases = [
             (
+                "pipeline parallelism",
+                {"pp_size": 2},
+                "--pp-size > 1",
+            ),
+            (
                 "speculative decoding",
                 {"speculative_algorithm": "EAGLE"},
                 "speculative decoding",

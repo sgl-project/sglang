@@ -176,6 +176,6 @@ prefix reuse; the ownership policy and transfer path are different.
 ## Next steps
 
 - Add a registered small-model 1P1D GPU smoke test and a standard accuracy A/B.
-- Either reject pipeline parallelism initially or add explicit PP coverage.
+- Add explicit pipeline-parallel coverage before lifting the startup guard.
 - Validate a production RDMA/NIXL path and quantify the transport-dependent
   breakeven point.
