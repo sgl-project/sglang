@@ -149,10 +149,7 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
         ),
     )
 
-    # Frozen-KV MTP draft CG runner (chain, topk=1). The topk>1 batch-expansion
-    # path this backend also supports is not covered here: the draft runner
-    # fixture lays branch cache slots out linearly and so is page_size=1 only,
-    # while trtllm_mha requires page_size >= 16. It is covered e2e instead.
+    # Frozen-KV MTP draft CG runner (chain, topk=1).
     FROZEN_KV_MTP_RUNNER_CASES = (
         DenseAttentionCase(
             name="runner_frozen_kv_mtp_decode_trtllm_mha_cuda_graph",
