@@ -1,0 +1,91 @@
+# MI355X Kimi-K2.6 (FP8) 2N 1P1D — force decode nsplit=1 (diagnostic, DO NOT MERGE).
+#
+# Tests whether the decode split-KV online-softmax reduction is the source of
+# the non-MTP GSM8K drop. Transfer + metadata + KV values are already CONFIRMED
+# correct (probe runs 28957394001/28962093651/28963785464), so the only place
+# left is the decode compute: decode uses decode_attention_fwd (split-KV) while
+# verify uses extend_attention_fwd (no split-KV) and is correct at ~0.95. At the
+# gate's bs=1 the MLA floor gives nsplit~130; forcing nsplit=1 removes the
+# cross-split fp reduction.
+#
+#   * accuracy recovers to ~0.94 -> the split-KV reduction is the culprit.
+#   * still ~0.88               -> rule it out; escalate to decode-via-extend.
+#
+# Same as 1p1d-metadump.yaml (probe + eager) plus:
+#   env  += SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS (fill num_kv_splits with max)
+#        += SGLANG_DEBUG_MLA_DECODE_NO_SPLIT_CAP (skip the MLA nsplit floor)
+#   args += --triton-attention-num-kv-splits 1
+# The probe's `nsplit=` field confirms it actually became 1.
+#
+# Trigger (config name = kimik26-fp8-1k1k-1p1d-nsplit1):
+#   gh workflow run "Nightly Test (AMD MI355X 2N 1P1D Disagg)" \
+#     --ref amd/kimik26-disagg-decodemeta \
+#     -f configs=kimik26-fp8-1k1k-1p1d-nsplit1
+
+resources:
+  prefill_workers: 1
+  decode_workers: 1
+
+backend:
+  sglang_config:
+    prefill:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+    decode:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+
+model:
+  env:
+    SGLANG_USE_AITER: 1
+    SGLANG_ROCM_FUSED_DECODE_MLA: 0
+    # Force decode nsplit=1 (see triton_backend _mla_decode_kv_splits_cap).
+    SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS: true
+    SGLANG_DEBUG_MLA_DECODE_NO_SPLIT_CAP: true
+    # Decode-metadata probe (confirms nsplit=1 in the dump).
+    SGLANG_DEBUG_DISAGG_DECODE_META: 1
+    SGLANG_DEBUG_DISAGG_DECODE_META_MINLEN: 128
+    SGLANG_DEBUG_DISAGG_DECODE_META_STEPS: 16
+    SGLANG_DEBUG_DISAGG_DECODE_META_KVNORM: 1
+  server_args:
+    - --model-loader-extra-config
+    - '{"enable_multithread_load": true}'
+    - --watchdog-timeout
+    - 1200
+    - --reasoning-parser
+    - kimi_k2
+    - --tool-call-parser
+    - kimi_k2
+    # Force a single KV split on the decode kernel.
+    - --triton-attention-num-kv-splits
+    - 1
+    # Eager decode so forward_decode runs in Python (probe fires).
+    - --disable-cuda-graph
+
+runtime:
+  image: lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
+  # Kimi uses split attention backends (aiter prefill / triton decode).
+  prefill_attention_backend: aiter
+  decode_attention_backend: triton
+  ib_devices: rdma0,rdma1,rdma2,rdma3
+  prefill_port: 30025
+  decode_port: 30026
+  prefill_bootstrap_port: 8998
+  decode_bootstrap_port: 9001
+  lb_port: 8000
+  mem_fraction_static: 0.90
+  page_size: 256
+  max_running_requests: 256
+  chunked_prefill_size: 8192
+
+bench:
+  concurrencies: [1]
+  num_prompts_factor: 4
+  random_range_ratio: 1.0
+  accuracy:
+    enabled: true
+    num_shots: 8
+    num_questions: 1319
+    threshold: 0.92

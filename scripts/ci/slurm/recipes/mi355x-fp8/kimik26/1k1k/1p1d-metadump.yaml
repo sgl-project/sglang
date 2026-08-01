@@ -1,0 +1,88 @@
+# MI355X Kimi-K2.6 (FP8) 2N 1P1D — DECODE-metadata probe variant (DO NOT MERGE).
+#
+# Same as 1p1d.yaml (non-MTP base) but wired to dump the decode-mode attention
+# metadata for the MORI-transferred prefix, to localize the non-MTP GSM8K drop
+# (~0.88 vs single-node 0.944). Isolates ONE thing vs the base:
+#   * model.env  += SGLANG_DEBUG_DISAGG_DECODE_META (+MINLEN/STEPS) -> the probe
+#     in {triton,aiter} forward_decode logs kv_indptr / kv_indices / seq_lens /
+#     num_kv_splits and the KV-pool row norms at the attended slots.
+#   * server_args += --disable-cuda-graph -> decode runs EAGER so forward_decode
+#     is entered in Python (with HIP graph, decode is replayed and the probe
+#     never fires).
+# MINLEN=128 skips the model warmup AND the short "capital of France" PD probe,
+# so the dump budget lands on real GSM8K decode steps (long transferred prefix).
+# Perf sweep trimmed to conc=1; only the GSM8K gate matters (it aborts at ~0.88).
+#
+# Trigger (config name = kimik26-fp8-1k1k-1p1d-metadump):
+#   gh workflow run "Nightly Test (AMD MI355X 2N 1P1D Disagg)" \
+#     --ref amd/kimik26-disagg-decodemeta \
+#     -f configs=kimik26-fp8-1k1k-1p1d-metadump
+
+resources:
+  prefill_workers: 1
+  decode_workers: 1
+
+backend:
+  sglang_config:
+    prefill:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+    decode:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+
+model:
+  env:
+    SGLANG_USE_AITER: 1
+    SGLANG_ROCM_FUSED_DECODE_MLA: 0
+    # Decode-metadata probe (see debug_utils/disagg_decode_meta_probe.py).
+    SGLANG_DEBUG_DISAGG_DECODE_META: 1
+    SGLANG_DEBUG_DISAGG_DECODE_META_MINLEN: 128
+    SGLANG_DEBUG_DISAGG_DECODE_META_STEPS: 16
+    SGLANG_DEBUG_DISAGG_DECODE_META_KVNORM: 1
+  server_args:
+    - --model-loader-extra-config
+    - '{"enable_multithread_load": true}'
+    - --watchdog-timeout
+    - 1200
+    - --reasoning-parser
+    - kimi_k2
+    - --tool-call-parser
+    - kimi_k2
+    # Force eager decode so forward_decode is entered in Python (probe fires).
+    - --disable-cuda-graph
+
+runtime:
+  image: lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
+  # Kimi uses split attention backends (aiter prefill / triton decode), not a
+  # single --attention-backend.
+  prefill_attention_backend: aiter
+  decode_attention_backend: triton
+  # RoCE HCAs MORI uses for cross-node KV transfer.
+  ib_devices: rdma0,rdma1,rdma2,rdma3
+  prefill_port: 30025
+  decode_port: 30026
+  prefill_bootstrap_port: 8998
+  decode_bootstrap_port: 9001
+  lb_port: 8000
+  mem_fraction_static: 0.90
+  page_size: 256
+  max_running_requests: 256
+  chunked_prefill_size: 8192
+
+bench:
+  # Diagnostic: only the GSM8K gate matters (the probe dumps during it, and the
+  # gate aborts at ~0.88 before the sweep). Trim the sweep to conc=1.
+  concurrencies: [1]
+  num_prompts_factor: 4      # num-prompts = concurrency * factor
+  random_range_ratio: 1.0
+
+  # Correctness gate run through the PD path before the perf sweep. Mirrors the
+  # registered single-node Kimi-K2.6 eval (full GSM8K, 8-shot, accuracy > 0.92).
+  accuracy:
+    enabled: true
+    num_shots: 8
+    num_questions: 1319    # full GSM8K test set
+    threshold: 0.92
