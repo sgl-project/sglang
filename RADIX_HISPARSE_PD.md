@@ -133,6 +133,23 @@ to amortize D2H publication and cache bookkeeping. The expected benefit is for
 large reusable prefixes, repeated conversations, or memory-pressure regimes—not
 for every HiSparse request.
 
+### Post-rebase verification
+
+The submitted tree was rebased onto upstream `00a219f6c9` and rerun on two H100
+80GB GPUs. The focused allocator, decode, dispatch, protocol, and argument suites
+passed 117 pytest cases plus 12 subtests; three platform/condition-specific cases
+were skipped. This included the upstream HiSparse manager lifecycle suite and the
+dedicated SM90 swap-kernel correctness suite.
+
+A small GLM DSA checkpoint then exercised a real Mooncake-TCP 1P1D deployment.
+With the prefill cache flushed between turns, the decode cache matched
+`0 -> 1024 -> 2048` prompt tokens. A conversation carrying 64 generated tokens
+into each next turn matched `0 -> 1088 -> 2112`, directly exercising decode KV
+write-back and later Radix reuse. Full decode CUDA graphs were captured for
+`bs=[1,2,4]`; a sustained four-request run logged `#running-req: 4, cuda graph:
+True`, generated 512 tokens per request, and completed with no retractions or
+CUDA/cache/transfer exceptions.
+
 ## Implementation map
 
 - `python/sglang/srt/mem_cache/allocator/radix_hisparse.py`: facade that exposes
@@ -158,7 +175,6 @@ prefix reuse; the ownership policy and transfer path are different.
 
 ## Next steps
 
-- Rebase onto current SGLang main and rerun the submitted tree.
 - Add a registered small-model 1P1D GPU smoke test and a standard accuracy A/B.
 - Either reject pipeline parallelism initially or add explicit PP coverage.
 - Validate a production RDMA/NIXL path and quantify the transport-dependent
