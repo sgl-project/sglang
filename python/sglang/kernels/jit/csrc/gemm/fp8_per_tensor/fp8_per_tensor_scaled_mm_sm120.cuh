@@ -37,7 +37,7 @@ void sm120_fp8_pertensor_dispatch_shape(
     using GemmM16 = JitGemmFp8RowwiseC3x<
         ArchTag,
         OutType,
-        Shape<_16, _64, _256>,
+        Shape<_16, _64, _128>,
         ClusterShape,
         PingpongSchedule,
         EpilogueScheduleAuto,
