@@ -30,9 +30,11 @@ register_cuda_ci(est_time=1500, stage="extra-b", runner_config="4-gpu-b200")
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 DCP_SIZE = 4
 PAGE_SIZE = 64
-LOADBACK_TRIGGER_MAX_TOTAL_TOKENS = 8192
 WIDENED_PAGE = PAGE_SIZE * DCP_SIZE
 MAX_MAMBA_CACHE_SIZE = 256
+# Bound the host pools directly. Sizing them off the device pool would need
+# --max-total-tokens, which triggers out-of-range KV writes under DCP.
+HICACHE_SIZE_GB = 10
 
 
 class TestUnifiedKimiLinearDcpHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
@@ -82,12 +84,10 @@ class TestUnifiedKimiLinearDcpHiCache(UnifiedRadixTreeTestMixin, CustomTestCase)
                 "--mem-fraction-static",
                 "0.80",
                 "--enable-hierarchical-cache",
-                "--hicache-ratio",
-                "3",
+                "--hicache-size",
+                str(HICACHE_SIZE_GB),
                 "--hicache-write-policy",
                 "write_through",
-                "--max-total-tokens",
-                str(LOADBACK_TRIGGER_MAX_TOTAL_TOKENS),
                 "--max-running-requests",
                 "64",
                 "--max-mamba-cache-size",
