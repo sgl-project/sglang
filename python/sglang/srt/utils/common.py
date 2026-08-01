@@ -3608,6 +3608,31 @@ def require_mlp_sync(server_args: ServerArgs):
     return server_args.enable_dp_attention or require_gathered_buffer(server_args)
 
 
+def get_cuda_graph_batch_size_alignment(server_args: ServerArgs) -> int:
+    alignment = 1
+    if server_args.enable_two_batch_overlap:
+        alignment *= 2
+    if require_gathered_buffer(server_args):
+        alignment *= get_parallel().attn_tp_size
+    if alignment % get_parallel().attn_cp_size != 0:
+        alignment *= get_parallel().attn_cp_size
+    return alignment
+
+
+def get_cuda_graph_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
+    return ceil_align(max_batch_size, get_cuda_graph_batch_size_alignment(server_args))
+
+
+def get_eager_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
+    if not require_mlp_sync(server_args):
+        return max_batch_size
+
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
+    max_batch_size = ceil_align(max_batch_size, get_parallel().attn_tp_size)
+    return ceil_align(max_batch_size, get_cp_padding_align_size())
+
+
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
     import huggingface_hub as hf
 

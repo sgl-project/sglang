@@ -25,7 +25,7 @@ buffers to keep break-point tensors at stable addresses.
 import logging
 import threading
 from contextvars import ContextVar
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -216,7 +216,7 @@ def _copy_output(dst: Any, src: Any) -> Any:
     return src
 
 
-def eager_on_graph(enable: bool):
+def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
     def decorator(inner: Callable):
         if not enable:
             return inner
@@ -231,9 +231,21 @@ def eager_on_graph(enable: bool):
             # End the segment that captured up to this break point.
             capture._end_current_segment()
 
-            # Run the eager function once so it allocates its outputs and
-            # writes real data into them.
-            output = inner(*args, **kwargs)
+            # Re-sync ranks after segment teardown (the slow, variable
+            # step) before break fns with rank-coupled collectives and hard
+            # timeouts (DeepEP NORMAL: 100s). Capture-only; replay bypasses
+            # this wrapper.
+            if capture._barrier_fn is not None:
+                capture._barrier_fn()
+
+            # Run the break once so its outputs are allocated and their
+            # addresses recorded. A capture_stub replaces the body during
+            # capture (contents are never consumed; warmup and replay run
+            # the real inner), letting rank-coupled bodies skip the work.
+            if capture_stub is not None:
+                output = capture_stub(*args, **kwargs)
+            else:
+                output = inner(*args, **kwargs)
 
             # Weak-ref captured inputs produced by graph segments. Their storage
             # is pinned by the segment CUDAGraphs' mempool use-count, so Python
@@ -308,6 +320,7 @@ class BreakableCUDAGraphCapture:
         pool=None,
         stream: torch.Stream | None = None,
         capture_error_mode: str = "global",
+        barrier_fn: Callable[[], None] | None = None,
     ):
         assert isinstance(
             cuda_graph, BreakableCUDAGraph
@@ -316,6 +329,7 @@ class BreakableCUDAGraphCapture:
         self._pool = pool if pool is not None else (0, 0)
         self._stream = stream
         self._capture_error_mode = capture_error_mode
+        self._barrier_fn = barrier_fn
         self._stream_ctx = None
         self._capture_token = None
         self._stream_token = None

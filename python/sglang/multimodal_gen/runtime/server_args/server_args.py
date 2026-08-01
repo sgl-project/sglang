@@ -223,6 +223,11 @@ class ServerArgs(DisaggServerArgsMixin):
     # number of GPUs in each CFG parallel group (None = auto, 1 = disabled, N > 1 = enabled)
     cfg_parallel_degree: Optional[int] = None
 
+    # encoder layout across a multi-rank replica: auto | fold | dp | replicate
+    # (see --encoder-parallel); fold shards the weights at load time, so it is
+    # mutually exclusive with dp/replicate for the lifetime of the model
+    encoder_parallel: str = "auto"
+
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
     dist_timeout: int | None = 3600  # 1 hour
@@ -268,6 +273,8 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
+    # If set, keep this many leading DiT layers resident on GPU
+    dit_layerwise_resident_layers: float = 0.0
     offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -282,6 +289,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Compilation
     enable_torch_compile: bool = False
+    regional_compile: bool = False
 
     # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
     # segments split at attention modules (SP all-to-all / dynamic attention
@@ -578,12 +586,12 @@ class ServerArgs(DisaggServerArgsMixin):
         self.nunchaku_config = resolution.nunchaku_config
 
     def adjust_pipeline_config(self):
-        # 1. adjust for encoder parallel folding
         tp_size = self.tp_size or 1
         dp_size = self.dp_size or 1
         sp_degree = self.sp_degree or 1
         # one replica = all its GPUs
         replica_size = (self.num_gpus or tp_size) // dp_size
+
         fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
 
         if fold_world:
@@ -594,11 +602,9 @@ class ServerArgs(DisaggServerArgsMixin):
         else:
             return
 
-        # Propose the fold group from the parallelism for every encoder. The
-        # loader keeps it only for encoders wide enough to benefit at their real
-        # (post-load) size and whose dims divide the group -- see
-        # finalize_encoder_folding. Deciding on real size (not architecture)
-        # handles the same encoder family at different parameter counts.
+        # propose the fold group from the parallelism alone; the loader keeps it
+        # only for encoders worth folding at their real post-load size
+        # (finalize_encoder_folding)
         encoder_configs = list(self.pipeline_config.text_encoder_configs) + list(
             getattr(self.pipeline_config, "image_encoder_configs", ()) or ()
         )
@@ -1133,8 +1139,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 or self.vae_cpu_offload
             ):
                 logger.warning(
-                    "Disabling component CPU offload on MPS because CPU-to-MPS "
-                    "module relocation can produce invalid diffusion outputs."
+                    "Disabling component CPU offload on MPS because the component "
+                    "residency offload strategy is only validated on CUDA."
                 )
             self.dit_cpu_offload = False
             self.text_encoder_cpu_offload = False
@@ -1441,6 +1447,23 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Ring sequence parallel degree. Used in attention layer.",
         )
         parser.add_argument(
+            "--encoder-parallel",
+            type=str,
+            choices=["auto", "fold", "dp", "replicate"],
+            default=ServerArgs.encoder_parallel,
+            help=(
+                "Text/image encoder parallelism across a multi-rank replica. "
+                "`auto` folds encoders wide enough to benefit (best "
+                "single-request latency) and data-parallels the rest at "
+                "batch>1; `fold` always tensor-parallels the encoder weights; "
+                "`dp` never folds and splits the batch across ranks (best "
+                "batched throughput; also raises --batching-max-size to the "
+                "replica size unless set explicitly); `replicate` disables "
+                "both. `sglang serve` defaults to `dp`; other entrypoints to "
+                "`auto`."
+            ),
+        )
+        parser.add_argument(
             "--enable-cfg-parallel",
             action=StoreBoolean,
             default=None,
@@ -1510,6 +1533,16 @@ class ServerArgs(DisaggServerArgsMixin):
             + "When no warmup mode is configured, this enables server warmup "
             + "so first real requests do not pay compile latency. "
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--regional-compile",
+            action=StoreBoolean,
+            default=ServerArgs.regional_compile,
+            help=(
+                "Compile repeated DiT submodules selected by the model's "
+                "_compile_conditions instead of compiling the whole transformer. "
+                "Requires --enable-torch-compile."
+            ),
         )
         parser.add_argument(
             "--offload-during-compile",
@@ -1637,6 +1670,18 @@ class ServerArgs(DisaggServerArgsMixin):
             type=float,
             default=ServerArgs.dit_offload_prefetch_size,
             help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is >= 1, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
+        )
+        parser.add_argument(
+            "--dit-layerwise-resident-layers",
+            type=float,
+            default=ServerArgs.dit_layerwise_resident_layers,
+            help="With --dit-layerwise-offload, keep this many leading DiT layers "
+            "permanently resident on GPU (retained across denoise steps) and stream "
+            "only the tail with --dit-offload-prefetch-size. 0.0 = off (pure "
+            "streaming). Between 0.0 and 1.0 = ratio of layers; >= 1 = absolute "
+            "count. Unlike raising the prefetch size, resident layers are transferred "
+            "once (not re-streamed every step), so this trades VRAM for lower denoise "
+            "latency when memory is available.",
         )
 
         # offload flags
@@ -2265,6 +2310,30 @@ class ServerArgs(DisaggServerArgsMixin):
         if 0.5 <= self.dit_offload_prefetch_size < 1.0:
             logger.info(
                 "We do not recommend --dit-offload-prefetch-size to be between 0.5 and 1.0"
+            )
+
+        # validate dit_layerwise_resident_layers (same ratio/absolute convention)
+        if self.dit_layerwise_resident_layers < 0.0:
+            raise ValueError("dit_layerwise_resident_layers must be non-negative")
+        if self.dit_layerwise_resident_layers >= 1 and (
+            isinstance(self.dit_layerwise_resident_layers, float)
+            and not self.dit_layerwise_resident_layers.is_integer()
+        ):
+            self.dit_layerwise_resident_layers = int(
+                math.floor(self.dit_layerwise_resident_layers)
+            )
+            logger.info(
+                "Invalid --dit-layerwise-resident-layers value passed, truncated to: "
+                f"{self.dit_layerwise_resident_layers}"
+            )
+        if (
+            self.dit_layerwise_resident_layers > 0
+            and not self.is_dit_layerwise_offload_selected
+        ):
+            logger.warning(
+                "--dit-layerwise-resident-layers has no effect because the DiT is not "
+                "layerwise-offloaded. It only applies together with "
+                "--dit-layerwise-offload (or 'dit' in --layerwise-offload-components)."
             )
 
         # validate layerwise offload conflicts

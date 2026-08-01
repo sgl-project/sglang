@@ -25,8 +25,11 @@ from sglang.kernels.ops.attention.fla.index import (
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sglang.kernels.ops.attention.fla.op import exp, exp2, log
 from sglang.kernels.ops.attention.fla.utils import (
+    autotune_cache_kwargs,
     check_shared_mem,
     is_intel,
+    is_nvidia,
+    is_tf32_supported,
 )
 
 if is_intel:
@@ -514,18 +517,8 @@ def chunk_kda_scaled_dot_kkt_fwd(
     return A, Aqk
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [64, 128]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["H", "K", "V", "BT", "IS_VARLEN"],
-)
 @triton.jit(do_not_specialize=["T"])
-def recompute_w_u_fwd_kernel(
+def _recompute_w_u_fwd_kernel(
     k,
     kg,
     v,
@@ -645,6 +638,67 @@ def recompute_w_u_fwd_kernel(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 
+_RECOMPUTE_W_U_CONFIGS = [
+    triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+    for BK in [64, 128]
+    for BV in [64, 128]
+    for num_warps in [2, 4, 8]
+    for num_stages in [2, 3, 4]
+]
+
+recompute_w_u_fwd_kernel = triton.autotune(
+    configs=_RECOMPUTE_W_U_CONFIGS,
+    key=["H", "K", "V", "BT", "IS_VARLEN"],
+    **autotune_cache_kwargs,
+)(_recompute_w_u_fwd_kernel)
+
+_K3_RECOMPUTE_W_U_CONFIGS = {
+    (9, 0): {"BK": 128, "BV": 128, "num_warps": 8, "num_stages": 2},
+    (10, 3): {"BK": 64, "BV": 128, "num_warps": 8, "num_stages": 2},
+}
+
+
+@torch.inference_mode()
+def precompile_k3_recompute_w_u_kernel(
+    *, num_heads: int, dtype: torch.dtype, device: torch.device
+) -> bool:
+    device = torch.device(device)
+    if (
+        not is_nvidia
+        or device.type != "cuda"
+        or torch.cuda.get_device_capability(device) not in _K3_RECOMPUTE_W_U_CONFIGS
+    ):
+        return False
+
+    shape = (1, 1, num_heads, 128)
+    k = torch.zeros(shape, dtype=dtype, device=device)
+    v = torch.zeros_like(k)
+    beta = torch.zeros((1, 1, num_heads), dtype=dtype, device=device)
+    A = torch.zeros((1, 1, num_heads, 64), dtype=dtype, device=device)
+    gk = torch.zeros(shape, dtype=torch.float32, device=device)
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    recompute_w_u_fwd(k, v, beta, A, gk=gk, cu_seqlens=cu_seqlens)
+    return True
+
+
+def _get_k3_recompute_w_u_config(
+    k: torch.Tensor,
+    gk: torch.Tensor | None,
+    cu_seqlens: torch.LongTensor | None,
+    K: int,
+    V: int,
+    BT: int,
+) -> dict | None:
+    if (
+        not is_nvidia
+        or gk is None
+        or cu_seqlens is None
+        or (K, V, BT) != (128, 128, 64)
+    ):
+        return None
+    return _K3_RECOMPUTE_W_U_CONFIGS.get(torch.cuda.get_device_capability(k.device))
+
+
 def recompute_w_u_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -664,7 +718,13 @@ def recompute_w_u_fwd(
     w = torch.empty_like(k)
     u = torch.empty_like(v)
     kg = torch.empty_like(k) if gk is not None else None
-    recompute_w_u_fwd_kernel[(NT, B * H)](
+    static_config = _get_k3_recompute_w_u_config(k, gk, cu_seqlens, K, V, BT)
+    kernel = (
+        _recompute_w_u_fwd_kernel
+        if static_config is not None
+        else recompute_w_u_fwd_kernel
+    )
+    kernel[(NT, B * H)](
         k=k,
         kg=kg,
         v=v,
@@ -682,7 +742,8 @@ def recompute_w_u_fwd(
         BT=BT,
         STORE_KG=kg is not None,
         IS_VARLEN=cu_seqlens is not None,
-        DOT_PRECISION="tf32",
+        DOT_PRECISION="tf32" if is_tf32_supported else "ieee",
+        **(static_config or {}),
     )
     return w, u, kg
 
@@ -1126,6 +1187,9 @@ def chunk_kda_fwd(
     del Aqk, v_new
 
     if output_intermediate_states:
+        # h holds the recurrent state at every chunk-size boundary
+        # ([1, NT, H, V, K] packed across cu_seqlens) — the mamba radix
+        # track path snapshots per-chunk states from it during extend.
         return o, h
     del h
     return o

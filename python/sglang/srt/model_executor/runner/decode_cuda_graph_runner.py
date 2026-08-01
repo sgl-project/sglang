@@ -91,7 +91,7 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
@@ -99,6 +99,7 @@ from sglang.srt.utils import (
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.profile_utils import export_cuda_graph_capture_trace
 
 try:
@@ -245,12 +246,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.is_dllm = self.dllm_config is not None
         self.attn_backend = attn_backend or model_runner.attn_backend
         self.speculative_num_steps = (
-            model_runner.server_args.speculative_num_steps
+            get_spec().speculative_num_steps
             if speculative_num_steps is None
             else speculative_num_steps
         )
         self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
+            get_spec().speculative_num_draft_tokens
             if speculative_num_draft_tokens is None
             else speculative_num_draft_tokens
         )
@@ -1212,12 +1213,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        timer_ctx = (
-            self.model_runner.device_timer.wrap(
-                metadata={"category": forward_batch.forward_mode.name.lower()}
-            )
-            if self.model_runner.device_timer
-            else contextlib.nullcontext()
+        timer_ctx = device_timer_ctx(
+            self.model_runner.device_timer, forward_batch.forward_mode.name.lower()
         )
         # Publish a read-done event for the WAR barrier: a cuda-graph forward
         # finishes its shared req_to_token / SWA reads at this pre-replay
