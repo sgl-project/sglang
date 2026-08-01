@@ -384,6 +384,317 @@ jobs:
       install_sglang_from_source: false
       prefill_decode_deployment: 'mix'
       transformers_version: ''
+  nightly-1-npu-a2:
+    needs: [set-image-config]
+    if: ${{ !cancelled() }}
+    runs-on: linux-aarch64-a2-1
+    container:
+      image: ${{ needs.set-image-config.outputs.image_a2 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.set-image-config.outputs.ref || github.ref }}
+
+      - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+        run: |
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host "${CACHING_URL}"
+
+          if [ ${{ needs.set-image-config.outputs.skip_install_flag }} != "true" ];then
+            bash scripts/ci/npu/npu_ci_install_dependency.sh 910b
+          fi
+
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+
+      - name: Run test
+        timeout-minutes: 240
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-1-npu-a2 --nightly --continue-on-error --timeout-per-file 3600
+
+  nightly-2-npu-a2:
+    needs: [set-image-config]
+    if: ${{ !cancelled() }}
+    runs-on: linux-aarch64-a2-2
+    container:
+      image: ${{ needs.set-image-config.outputs.image_a2 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.set-image-config.outputs.ref || github.ref }}
+
+      - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+        run: |
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host "${CACHING_URL}"
+
+          if [ ${{ needs.set-image-config.outputs.skip_install_flag }} != "true" ];then
+            bash scripts/ci/npu/npu_ci_install_dependency.sh 910b
+          fi
+
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+
+      - name: Run test
+        timeout-minutes: 240
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-2-npu-a2 --nightly --continue-on-error --timeout-per-file 3600
+
+  nightly-1-npu-a3:
+    needs: [set-image-config]
+    if: ${{ !cancelled() }}
+    runs-on: linux-aarch64-a3-2
+    container:
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.set-image-config.outputs.ref || github.ref }}
+
+      - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+        run: |
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host "${CACHING_URL}"
+
+          if [ ${{ needs.set-image-config.outputs.skip_install_flag }} != "true" ];then
+            bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          fi
+
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+
+      - name: Run test
+        timeout-minutes: 240
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-1-npu-a3 --nightly --continue-on-error --timeout-per-file 3600
+
+  nightly-2-npu-a3:
+    needs: [set-image-config]
+    if: ${{ !cancelled() }}
+    runs-on: linux-aarch64-a3-2
+    container:
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.set-image-config.outputs.ref || github.ref }}
+
+      - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+        run: |
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host "${CACHING_URL}"
+
+          if [ ${{ needs.set-image-config.outputs.skip_install_flag }} != "true" ];then
+            bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          fi
+
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+
+      - name: Run test
+        timeout-minutes: 240
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-2-npu-a3 --nightly --continue-on-error --timeout-per-file 3600
+
+  nightly-4-npu-a3:
+    needs: [set-image-config]
+    if: ${{ !cancelled() }}
+    runs-on: linux-aarch64-a3-4
+    container:
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.set-image-config.outputs.ref || github.ref }}
+
+      - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+        run: |
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host "${CACHING_URL}"
+
+          if [ ${{ needs.set-image-config.outputs.skip_install_flag }} != "true" ];then
+            bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          fi
+
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+
+      - name: Run test
+        timeout-minutes: 240
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          pip install sglang_router
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-4-npu-a3 --nightly --continue-on-error --timeout-per-file 3600
+
+  nightly-8-npu-a3:
+    needs: [set-image-config]
+    if: ${{ !cancelled() }}
+    runs-on: linux-aarch64-a3-8
+    container:
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.set-image-config.outputs.ref || github.ref }}
+
+      - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+        run: |
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host "${CACHING_URL}"
+
+          if [ ${{ needs.set-image-config.outputs.skip_install_flag }} != "true" ];then
+            bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          fi
+
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+
+      - name: Run test
+        timeout-minutes: 240
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-8-npu-a3 --nightly --continue-on-error --timeout-per-file 3600
+
+  nightly-16-npu-a3:
+    needs: [set-image-config]
+    if: ${{ !cancelled() }}
+    runs-on: linux-aarch64-a3-16
+    container:
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.set-image-config.outputs.ref || github.ref }}
+
+      - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+        run: |
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host "${CACHING_URL}"
+
+          if [ ${{ needs.set-image-config.outputs.skip_install_flag }} != "true" ];then
+            bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          fi
+
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+
+      - name: Run test
+        timeout-minutes: 240
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          apt-get install -y libssl-dev
+          pip install sglang_router
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-16-npu-a3 --nightly --continue-on-error --timeout-per-file 3600
+
   check-all-jobs:
     if: ${{ !cancelled() }}
     needs:
@@ -391,6 +702,13 @@ jobs:
       - nightly-poc-single-node-tests
       - nightly-poc-multi-node-tests
       - nightly-poc-multi-node-mix-tests
+      - nightly-1-npu-a2
+      - nightly-2-npu-a2
+      - nightly-1-npu-a3
+      - nightly-2-npu-a3
+      - nightly-4-npu-a3
+      - nightly-8-npu-a3
+      - nightly-16-npu-a3
     runs-on: ubuntu-latest
     steps:
       - name: Download all metrics
@@ -414,6 +732,13 @@ jobs:
           single_result="${{ needs.nightly-poc-single-node-tests.result }}"
           multi_result="${{ needs.nightly-poc-multi-node-tests.result }}"
           mix_result="${{ needs.nightly-poc-multi-node-mix-tests.result }}"
+          nightly_1_a2_result="${{ needs.nightly-1-npu-a2.result }}"
+          nightly_2_a2_result="${{ needs.nightly-2-npu-a2.result }}"
+          nightly_1_result="${{ needs.nightly-1-npu-a3.result }}"
+          nightly_2_result="${{ needs.nightly-2-npu-a3.result }}"
+          nightly_4_result="${{ needs.nightly-4-npu-a3.result }}"
+          nightly_8_result="${{ needs.nightly-8-npu-a3.result }}"
+          nightly_16_result="${{ needs.nightly-16-npu-a3.result }}"
 
           group_icon() {
             case "$1" in
@@ -432,7 +757,14 @@ jobs:
           echo "| single-node-poc-a2 | $(group_icon ${single_result_a2}) ${single_result_a2} |" >> $GITHUB_STEP_SUMMARY
           echo "| single-node-poc | $(group_icon ${single_result}) ${single_result} |" >> $GITHUB_STEP_SUMMARY
           echo "| multi-node-poc | $(group_icon ${multi_result}) ${multi_result} |" >> $GITHUB_STEP_SUMMARY
-          echo "| multi-node-mix-poc | $(group_icon ${mix_result}) ${mix_result} |" >> $GITHUB_STEP_SUMMARY
+          echo "| multi-node-mix-poc | $(group_icon ${mix_result}) ${mix_result} |"
+          echo "| nightly-1-npu-a2 | $(group_icon ${nightly_1_a2_result}) ${nightly_1_a2_result} |"
+          echo "| nightly-2-npu-a2 | $(group_icon ${nightly_2_a2_result}) ${nightly_2_a2_result} |"
+          echo "| nightly-1-npu-a3 | $(group_icon ${nightly_1_result}) ${nightly_1_result} |"
+          echo "| nightly-2-npu-a3 | $(group_icon ${nightly_2_result}) ${nightly_2_result} |"
+          echo "| nightly-4-npu-a3 | $(group_icon ${nightly_4_result}) ${nightly_4_result} |"
+          echo "| nightly-8-npu-a3 | $(group_icon ${nightly_8_result}) ${nightly_8_result} |"
+          echo "| nightly-16-npu-a3 | $(group_icon ${nightly_16_result}) ${nightly_16_result} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           echo "## Per-Test Metrics" >> $GITHUB_STEP_SUMMARY
@@ -470,4 +802,11 @@ jobs:
 
           FAIL=0
           if [ "${single_result}" != "success" ] && [ "${single_result}" != "skipped" ]; then FAIL=1; fi
+          if [ "${nightly_1_a2_result}" != "success" ] && [ "${nightly_1_a2_result}" != "skipped" ]; then FAIL=1; fi
+          if [ "${nightly_2_a2_result}" != "success" ] && [ "${nightly_2_a2_result}" != "skipped" ]; then FAIL=1; fi
+          if [ "${nightly_1_result}" != "success" ] && [ "${nightly_1_result}" != "skipped" ]; then FAIL=1; fi
+          if [ "${nightly_2_result}" != "success" ] && [ "${nightly_2_result}" != "skipped" ]; then FAIL=1; fi
+          if [ "${nightly_4_result}" != "success" ] && [ "${nightly_4_result}" != "skipped" ]; then FAIL=1; fi
+          if [ "${nightly_8_result}" != "success" ] && [ "${nightly_8_result}" != "skipped" ]; then FAIL=1; fi
+          if [ "${nightly_16_result}" != "success" ] && [ "${nightly_16_result}" != "skipped" ]; then FAIL=1; fi
           exit $FAIL
