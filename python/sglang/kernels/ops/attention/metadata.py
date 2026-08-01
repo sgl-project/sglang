@@ -193,6 +193,11 @@ def _fused_metadata_kernel_general(
     use_swa: tl.constexpr,
     SHIFT: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
+    # Unified-memory dense-view path (page-major envelope shared with the mamba
+    # sub-pool). Both default to the identity for the statically-partitioned
+    # pool, where req_to_token already holds physical ids.
+    v2p_ptr=None,
+    PAGE_MULT: tl.constexpr = 1,
 ):
     pid_b = tl.program_id(0)  # batch index
     pid_c = tl.program_id(1)  # column chunk index
@@ -251,6 +256,13 @@ def _fused_metadata_kernel_general(
     else:
         page_table_val = page_index >> SHIFT
 
+    # Unified memory: virtual page -> physical page -> that layer's dense block.
+    # Derived from page_table_val, NOT page_index, which the SWA branch below
+    # still needs in virtual space. Masked so padded lanes never index the table.
+    if v2p_ptr is not None:
+        page_table_val = tl.load(v2p_ptr + page_table_val, mask=mask, other=0)
+    page_table_val = page_table_val * PAGE_MULT
+
     # Store to page_table
     pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
     tl.store(page_table + pt_offsets, page_table_val, mask=mask, cache_modifier=".cg")
@@ -295,6 +307,9 @@ def _fused_metadata_kernel_ps1_no_swa(
     max_seq_pages,
     seq_len_delta: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
+    # Unified-memory dense-view path; identity defaults for the static pool.
+    v2p_ptr=None,
+    PAGE_MULT: tl.constexpr = 1,
 ):
     pid_b = tl.program_id(0)  # batch index
     pid_c = tl.program_id(1)  # column chunk index
@@ -338,6 +353,10 @@ def _fused_metadata_kernel_ps1_no_swa(
     )
 
     # page_table = page_index // 1 = page_index
+    # Unified memory: at page_size 1 the virtual token id IS the virtual page id.
+    if v2p_ptr is not None:
+        page_index = tl.load(v2p_ptr + page_index, mask=mask, other=0)
+    page_index = page_index * PAGE_MULT
     pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
     tl.store(page_table + pt_offsets, page_index, mask=mask, cache_modifier=".cg")
 
@@ -565,6 +584,8 @@ def normal_decode_set_metadata(
     page_size: int,
     swa_page_table: Optional[torch.Tensor] = None,
     token_to_kv_pool: Optional["SWAKVPool"] = None,
+    v2p_page_table: Optional[torch.Tensor] = None,
+    kernel_page_multiplier: int = 1,
 ):
     """
     Fused Triton implementation that replaces 4-5 sequential CUDA kernels with 1-2 kernels:
@@ -572,7 +593,13 @@ def normal_decode_set_metadata(
       2. cu_seqlens_k = cumsum(cache_seqlens) (prefix-sum)
       3. page_indices = req_to_token[pool_idx, stride_idx] (2-D gather)
       4. page_table = page_indices // page_size (floor-divide)
+      4b. (unified memory) page_table = v2p_page_table[page] * kernel_page_multiplier
       5. (optional) swa_page_table for sliding window attention
+
+    Step 4b is folded in rather than applied afterwards so the capture-stable
+    page_table is written already translated: no separate pass a caller could
+    forget, and no temporary to keep pointer-stable across cuda-graph replays.
+    Identity (None / 1) for the statically-partitioned pool.
 
     Achieves ~5.2x speedup on H200 hardware for typical decode workloads.
 
@@ -633,6 +660,8 @@ def normal_decode_set_metadata(
             max_seq_pages,
             seq_len_delta,
             BLOCK_COLS=BLOCK_COLS,
+            v2p_ptr=v2p_page_table,
+            PAGE_MULT=kernel_page_multiplier,
             num_warps=8,
             num_stages=3,
         )
@@ -696,6 +725,8 @@ def normal_decode_set_metadata(
             use_swa,
             shift,
             BLOCK_COLS=BLOCK_COLS,
+            v2p_ptr=v2p_page_table,
+            PAGE_MULT=kernel_page_multiplier,
             num_warps=4,
             num_stages=3,
         )

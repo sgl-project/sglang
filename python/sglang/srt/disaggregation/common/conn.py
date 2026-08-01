@@ -36,7 +36,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
 )
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -148,6 +148,7 @@ class CommonKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
+        self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
@@ -163,10 +164,13 @@ class CommonKVManager(BaseKVManager):
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-        self.attn_cp_size = get_parallel().attn_cp_size
-        self.attn_cp_rank = get_parallel().attn_cp_rank
+        parallel = get_parallel()
+        self.attn_tp_size = parallel.attn_tp_size
+        self.attn_tp_rank = parallel.attn_tp_rank
+        self.attn_cp_size = parallel.attn_cp_size
+        self.attn_cp_rank = parallel.attn_cp_rank
+        self.dcp_size = server_args.dcp_size
+        self.dcp_rank = parallel.dcp_rank if self.dcp_size > 1 else 0
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
         self.system_dp_size = (
@@ -267,6 +271,39 @@ class CommonKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
+        if self.dcp_size == dst_dcp_size:
+            if self.dcp_rank != dst_dcp_rank:
+                raise RuntimeError(
+                    "PD peers must connect matching DCP ranks, got "
+                    f"prefill={self.dcp_rank}, decode={dst_dcp_rank}"
+                )
+            return False
+
+        if (
+            self.dcp_size == 1
+            and dst_dcp_size > 1
+            and (self.is_mla_backend or self.is_hybrid_mla_backend)
+        ):
+            return True
+
+        raise RuntimeError(
+            f"Unsupported PD DCP topology: {self.dcp_size} -> {dst_dcp_size}"
+        )
+
+    def prepare_dcp_token_item_lens(self, dst_page_item_lens: List[int]) -> List[int]:
+        page_size = self.kv_args.page_size
+        src_token_lens = [
+            item_len // page_size for item_len in self.kv_args.kv_item_lens
+        ]
+        dst_token_lens = [item_len // page_size for item_len in dst_page_item_lens]
+        if src_token_lens != dst_token_lens:
+            raise RuntimeError(
+                "PD DCP source/destination KV geometry differs: "
+                f"src={src_token_lens}, dst={dst_token_lens}"
+            )
+        return src_token_lens
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
@@ -469,7 +506,11 @@ class CommonKVManager(BaseKVManager):
 
         info: PrefillServerInfo = None
         try:
-            url = f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
+            url = (
+                f"http://{bootstrap_addr}/route?"
+                f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
+                f"target_tp_rank={-1}&target_pp_rank={-1}"
+            )
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
@@ -493,13 +534,24 @@ class CommonKVManager(BaseKVManager):
 
         if (
             info.kv_cache_dtype is not None
-            and info.kv_cache_dtype != get_model().kv_cache_dtype
+            and info.kv_cache_dtype != self.kv_cache_dtype_str
         ):
             raise RuntimeError(
                 f"KV cache dtype mismatch: prefill server has kv_cache_dtype={info.kv_cache_dtype}, "
-                f"but decode server has kv_cache_dtype={get_model().kv_cache_dtype}. "
+                f"but decode server has kv_cache_dtype={self.kv_cache_dtype_str}. "
                 f"Both servers must use the same --kv-cache-dtype value."
             )
+
+        if self.dcp_size > 1:
+            if not (self.is_mla_backend or self.is_hybrid_mla_backend):
+                raise RuntimeError(
+                    "PD decode DCP requires an MLA or hybrid-MLA KV pool."
+                )
+            if info.attn_cp_size != 1:
+                raise RuntimeError(
+                    "PD decode DCP currently requires prefill attention CP=1, "
+                    f"got {info.attn_cp_size}."
+                )
 
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
@@ -650,7 +702,7 @@ class CommonKVManager(BaseKVManager):
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
-            "kv_cache_dtype": get_model().kv_cache_dtype,
+            "kv_cache_dtype": self.kv_cache_dtype_str,
             "load_balance_method": self.server_args.load_balance_method,
             "enable_dsa_cache_layer_split": getattr(
                 self.server_args, "enable_dsa_cache_layer_split", False
@@ -658,7 +710,7 @@ class CommonKVManager(BaseKVManager):
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
-            "prefill_http_port": self.server_args.port,
+            "prefill_http_port": get_serving().port,
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
@@ -1137,6 +1189,7 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         pass
 

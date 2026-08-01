@@ -22,7 +22,6 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import fast_topk
 
 from ..attention_methods.dense_attention import DEFAULT_DEVICE
 from ..attention_methods.dense_attention import DEFAULT_DEVICE as DENSE_DEFAULT_DEVICE
@@ -388,36 +387,13 @@ def run_mla_draft_extend_v2_cuda_graph_case(
 # etc.) is imported from there.
 
 
-def _assert_draft_extend_outputs_close(actual, expected, settings) -> None:
-    torch.testing.assert_close(
-        actual.next_token_logits,
-        expected.next_token_logits,
-        atol=settings.atol,
-        rtol=settings.rtol,
-    )
-    torch.testing.assert_close(
-        actual.hidden_states,
-        expected.hidden_states,
-        atol=settings.atol,
-        rtol=settings.rtol,
-    )
-    torch.testing.assert_close(
-        actual.topk_p,
-        expected.topk_p,
-        atol=settings.atol,
-        rtol=settings.rtol,
-    )
-    torch.testing.assert_close(actual.topk_index, expected.topk_index)
-
-
 def _assert_draft_extend_v2_outputs_close(actual, expected, settings) -> None:
     # DRAFT_EXTEND_V2 graph runner only anchors the full-row
     # `next_token_logits` / `hidden_states`; the selected-row `topk_p` /
     # `topk_index` are owned by EAGLEWorkerV2 and computed *after* replay (see
-    # `eagle_worker_v2._draft_extend_for_decode` and the early-return in
-    # `EAGLEDraftExtendCudaGraphRunner.replay` for DRAFT_EXTEND_V2). The V2
-    # production runner output therefore carries no topk fields, so the
-    # runner-mode reference must only compare what the graph actually anchors.
+    # `eagle_worker_v2._draft_extend_for_decode`). The graph computes no topk
+    # and `EAGLEDraftExtendCudaGraphRunner.replay` returns no topk fields, so
+    # the runner-mode reference must only compare what the graph anchors.
     torch.testing.assert_close(
         actual.next_token_logits,
         expected.next_token_logits,
@@ -445,7 +421,7 @@ class EagleDraftExtendCudaGraphRunnerAdapter:
         lambda _case, _settings: None
     )
     assert_outputs_close: Callable[[Any, Any, EagleDraftRunnerSettings], None] = (
-        _assert_draft_extend_outputs_close
+        _assert_draft_extend_v2_outputs_close
     )
 
 
@@ -604,19 +580,6 @@ def _run_eagle_draft_extend_eager(
             batch.positions,
             batch,
         )
-    # Mirror the production fast path from
-    # EAGLEDraftExtendCudaGraphRunner.replay (#26397): when topk == 1
-    # production skips the full-vocab softmax and returns
-    # `topk_p = ones_like(topk_index)` (the value is unused downstream).
-    # The eager reference must match this for assert_outputs_close.
-    from sglang.srt.utils import is_hip
-
-    if settings.topk == 1 and not is_hip():
-        ret.topk_index = torch.argmax(ret.next_token_logits, dim=-1, keepdim=True)
-        ret.topk_p = torch.ones_like(ret.topk_index, dtype=torch.float32)
-    else:
-        probs = torch.softmax(ret.next_token_logits, dim=-1)
-        ret.topk_p, ret.topk_index = fast_topk(probs, settings.topk, dim=-1)
     return ret
 
 
