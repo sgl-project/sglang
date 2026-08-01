@@ -154,7 +154,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         // resolves it); empty → no tokenizer, allowed only under
         // `skip_tokenizer_init`.
         (!cfg.server_args.tokenizer_path.is_empty()).then_some(&*cfg.server_args.tokenizer_path),
-        cfg.server_args.revision.as_deref(),
         skip_tokenizer_init,
     )?;
 

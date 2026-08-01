@@ -65,11 +65,13 @@ pub struct ServerArgs {
     /// Model name reported by `/v1/models` and `/server_info`.
     #[serde(default)]
     pub served_model_name: String,
-    /// Tokenizer source (model dir / `tokenizer.json` / HF repo id). Empty only
-    /// in minimal standalone blobs — then boot requires `skip_tokenizer_init`.
+    /// Tokenizer source (local model dir or `tokenizer.json`). Empty only in
+    /// minimal standalone blobs — then boot requires `skip_tokenizer_init`.
+    /// Repo ids are resolved to a local path by the Python launcher.
     #[serde(default)]
     pub tokenizer_path: String,
-    /// HF revision, used only when `tokenizer_path` is a repo id. `None` → main.
+    /// HF revision (kept for server_args parity; tokenizer path is pre-resolved).
+    #[allow(dead_code)]
     #[serde(default)]
     pub revision: Option<String>,
     /// HTTP bind address (see [`Self::bind`]).

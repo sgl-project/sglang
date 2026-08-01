@@ -33,11 +33,9 @@ uuid = { workspace = true }
 
 axum = { version = "0.8.9", features = ["json", "tokio"] }
 core_affinity = "0.8"
-# the dynamo-tokenizers is deps on hf-hub, should bump version together.
 dynamo-tokenizers = "1.7.0"
 flume = "0.12.0"
 itertools = "0.14"
-hf-hub = { version = "0.4", default-features = false }
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
 # Pinned EXACTLY: this crate's accepted grammar defines the

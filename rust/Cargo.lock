@@ -2563,7 +2563,6 @@ dependencies = [
  "dynamo-tokenizers",
  "flume",
  "futures",
- "hf-hub",
  "itertools",
  "pyo3",
  "regex-syntax",
