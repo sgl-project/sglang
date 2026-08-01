@@ -56,7 +56,7 @@ class BooguQwen3VLConfig(Qwen3VLConfig):
     arch_config: Qwen3VLArchConfig = field(default_factory=BooguQwen3VLArchConfig)
 
 
-def boogu_postprocess_text(outputs, _text_inputs):
+def _boogu_postprocess_text(outputs, _text_inputs):
     return outputs.last_hidden_state
 
 
@@ -79,7 +79,7 @@ class BooguImagePipelineConfig(ImagePipelineConfig):
     )
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     postprocess_text_funcs: tuple[Callable, ...] = field(
-        default_factory=lambda: (boogu_postprocess_text,)
+        default_factory=lambda: (_boogu_postprocess_text,)
     )
 
     scheduler_class_override: str = "BooguFlowMatchScheduler"

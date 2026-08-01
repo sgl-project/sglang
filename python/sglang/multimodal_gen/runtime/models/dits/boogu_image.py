@@ -37,6 +37,7 @@ logger = init_logger(__name__)
 
 ADALN_EMBED_DIM = 1024
 TIMESTEP_FREQ_DIM = 256
+NUM_ADALN_MODULATION_PARAMS = 4
 
 
 class BooguRMSNorm(nn.Module):
@@ -429,13 +430,22 @@ class BooguJointAttention(nn.Module):
         instruct_v, _ = p.instruct_to_v(instruct_hidden_states)
 
         query = interleave_instruct_image(
-            instruct_q, img_q, encoder_seq_lengths, seq_lengths
+            instruct=instruct_q,
+            img=img_q,
+            encoder_seq_lengths=encoder_seq_lengths,
+            seq_lengths=seq_lengths,
         )
         key = interleave_instruct_image(
-            instruct_k, img_k, encoder_seq_lengths, seq_lengths
+            instruct=instruct_k,
+            img=img_k,
+            encoder_seq_lengths=encoder_seq_lengths,
+            seq_lengths=seq_lengths,
         )
         value = interleave_instruct_image(
-            instruct_v, img_v, encoder_seq_lengths, seq_lengths
+            instruct=instruct_v,
+            img=img_v,
+            encoder_seq_lengths=encoder_seq_lengths,
+            seq_lengths=seq_lengths,
         )
 
         query = query.view(*query.shape[:-1], self.local_num_heads, self.head_dim)
@@ -467,7 +477,10 @@ class BooguJointAttention(nn.Module):
         img_out, _ = p.img_out(img_out)
 
         joint = interleave_instruct_image(
-            instruct_out, img_out, encoder_seq_lengths, seq_lengths
+            instruct=instruct_out,
+            img=img_out,
+            encoder_seq_lengths=encoder_seq_lengths,
+            seq_lengths=seq_lengths,
         )
         joint, _ = self.to_out[0](joint)
         return split_instruct_image(
@@ -484,7 +497,9 @@ class BooguRMSNormZero(nn.Module):
     def __init__(self, embedding_dim: int, norm_eps: float):
         super().__init__()
         self.linear = ReplicatedLinear(
-            min(embedding_dim, ADALN_EMBED_DIM), 4 * embedding_dim, bias=True
+            min(embedding_dim, ADALN_EMBED_DIM),
+            NUM_ADALN_MODULATION_PARAMS * embedding_dim,
+            bias=True,
         )
         self.norm = BooguRMSNorm(embedding_dim, eps=norm_eps)
 
@@ -492,7 +507,9 @@ class BooguRMSNormZero(nn.Module):
         self, x: torch.Tensor, emb: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         modulation, _ = self.linear(torch.nn.functional.silu(emb))
-        scale_msa, gate_msa, scale_mlp, gate_mlp = modulation.chunk(4, dim=1)
+        scale_msa, gate_msa, scale_mlp, gate_mlp = modulation.chunk(
+            NUM_ADALN_MODULATION_PARAMS, dim=1
+        )
         x = self.norm(x) * (1 + scale_msa[:, None])
         return x, gate_msa, scale_mlp, gate_mlp
 
@@ -577,7 +594,11 @@ class BooguTransformerBlock(nn.Module):
         )
         self.feed_forward = FeedForward(
             dim=dim,
-            hidden_dim=compute_ffn_hidden_dim(dim, multiple_of, ffn_dim_multiplier),
+            hidden_dim=compute_ffn_hidden_dim(
+                dim=dim,
+                multiple_of=multiple_of,
+                ffn_dim_multiplier=ffn_dim_multiplier,
+            ),
             quant_config=quant_config,
             prefix=f"{prefix}.feed_forward",
         )
@@ -638,7 +659,11 @@ class BooguDoubleStreamBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        hidden_dim = compute_ffn_hidden_dim(dim, multiple_of, ffn_dim_multiplier)
+        hidden_dim = compute_ffn_hidden_dim(
+            dim=dim,
+            multiple_of=multiple_of,
+            ffn_dim_multiplier=ffn_dim_multiplier,
+        )
 
         self.img_instruct_attn = BooguJointAttention(
             dim=dim,
@@ -795,6 +820,7 @@ class BooguRopeEmbedder(nn.Module):
         self.axes_dims = axes_dims
         self.axes_lens = axes_lens
         self.patch_size = patch_size
+        self.num_pos_axes = len(axes_dims)
         self._tables: Optional[List[torch.Tensor]] = None
 
     def _axis_tables(self, device: torch.device) -> List[torch.Tensor]:
@@ -838,13 +864,17 @@ class BooguRopeEmbedder(nn.Module):
     ) -> torch.Tensor:
         batch_size = len(seq_lengths)
         position_ids = torch.zeros(
-            batch_size, max(seq_lengths), 3, dtype=torch.int32, device=device
+            batch_size,
+            max(seq_lengths),
+            self.num_pos_axes,
+            dtype=torch.int32,
+            device=device,
         )
         for i, cap_len in enumerate(instruction_seq_lengths):
             position_ids[i, :cap_len] = (
                 torch.arange(cap_len, dtype=torch.int32, device=device)
                 .unsqueeze(-1)
-                .repeat(1, 3)
+                .repeat(1, self.num_pos_axes)
             )
             shift = cap_len
             if ref_img_sizes[i] is not None:
@@ -913,14 +943,18 @@ class BooguRopeEmbedder(nn.Module):
         zeros = [0] * len(seq_lengths)
         return BooguRopeBundle(
             joint=joint,
-            context=_slice_freqs(joint, zeros, instruction_seq_lengths),
+            context=_slice_freqs(
+                freqs=joint, starts=zeros, lengths=instruction_seq_lengths
+            ),
             noise=_slice_freqs(
-                joint,
-                [seq - img for seq, img in zip(seq_lengths, img_lengths)],
-                img_lengths,
+                freqs=joint,
+                starts=[seq - img for seq, img in zip(seq_lengths, img_lengths)],
+                lengths=img_lengths,
             ),
             combined_img=_slice_freqs(
-                joint, instruction_seq_lengths, combined_img_seq_lengths
+                freqs=joint,
+                starts=instruction_seq_lengths,
+                lengths=combined_img_seq_lengths,
             ),
             instruction_seq_lengths=instruction_seq_lengths,
             seq_lengths=seq_lengths,
@@ -1190,9 +1224,9 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
             ]
         )
         ref_freqs = _slice_freqs(
-            rope.combined_img,
-            [0] * len(flat_lengths),
-            flat_lengths,
+            freqs=rope.combined_img,
+            starts=[0] * len(flat_lengths),
+            lengths=flat_lengths,
         )
         ref_mask_meta = build_varlen_mask_meta_from_lengths(
             flat_lengths, max_ref_len, ref_hidden_states.device
@@ -1308,10 +1342,10 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
             )
 
         joint_hidden_states = interleave_instruct_image(
-            instruct_hidden_states,
-            img_hidden_states,
-            rope.instruction_seq_lengths,
-            rope.seq_lengths,
+            instruct=instruct_hidden_states,
+            img=img_hidden_states,
+            encoder_seq_lengths=rope.instruction_seq_lengths,
+            seq_lengths=rope.seq_lengths,
         )
         for layer in self.single_stream_layers:
             joint_hidden_states = layer(
