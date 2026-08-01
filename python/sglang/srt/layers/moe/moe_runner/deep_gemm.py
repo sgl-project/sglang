@@ -780,7 +780,7 @@ def pre_permute_standard_to_deep_gemm(
     if output_dtype == torch.bfloat16:
         packed_input_source = hidden_states
         packed_input_source_scale = None
-        packed_input = torch.zeros(
+        packed_input = torch.empty(
             (all_tokens, k), device=hidden_states_device, dtype=torch.bfloat16
         )
         # ep_scatter ignores scales for BF16, but a real tensor keeps its

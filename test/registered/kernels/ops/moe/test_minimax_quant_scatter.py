@@ -158,8 +158,9 @@ def test_compact_all_tokens_uses_tight_routing_independent_bound(
     )
 
 
-def test_standard_masked_fp8_runner_matches_compact_end_to_end(monkeypatch):
-    """Exercise both production FP8 grouped GEMMs through the standard path."""
+@pytest.mark.parametrize("weight_dtype", ["fp8", "bf16"])
+def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_dtype):
+    """Exercise both production grouped GEMMs through the standard path."""
     arch_major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
     if arch_major <= 9:
         pytest.skip("DeepGEMM UE8M0 is Blackwell-only")
@@ -227,16 +228,23 @@ def test_standard_masked_fp8_runner_matches_compact_end_to_end(monkeypatch):
         )
         * weight_std
     )
-    w13, w13_scale = quant_weight_ue8m0(w13_bf16, [128, 128])
-    w2, w2_scale = quant_weight_ue8m0(w2_bf16, [128, 128])
-    quant_info = DeepGemmMoeQuantInfo(
-        w13_weight=w13,
-        w2_weight=w2,
-        use_fp8=True,
-        w13_scale=transform_scale_ue8m0(w13_scale, mn=w13.shape[-2]),
-        w2_scale=transform_scale_ue8m0(w2_scale, mn=w2.shape[-2]),
-        block_shape=[128, 128],
-    )
+    if weight_dtype == "fp8":
+        w13, w13_scale = quant_weight_ue8m0(w13_bf16, [128, 128])
+        w2, w2_scale = quant_weight_ue8m0(w2_bf16, [128, 128])
+        quant_info = DeepGemmMoeQuantInfo(
+            w13_weight=w13,
+            w2_weight=w2,
+            use_fp8=True,
+            w13_scale=transform_scale_ue8m0(w13_scale, mn=w13.shape[-2]),
+            w2_scale=transform_scale_ue8m0(w2_scale, mn=w2.shape[-2]),
+            block_shape=[128, 128],
+        )
+    else:
+        quant_info = DeepGemmMoeQuantInfo(
+            w13_weight=w13_bf16,
+            w2_weight=w2_bf16,
+            use_fp8=False,
+        )
 
     dispatch_output = StandardDispatchOutput(
         hidden_states=hidden_states,
