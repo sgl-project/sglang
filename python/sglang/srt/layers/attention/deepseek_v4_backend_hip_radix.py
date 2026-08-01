@@ -39,7 +39,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import ceil_align
@@ -456,9 +456,6 @@ class DeepseekV4HipRadixBackend(
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
         self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens: int = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
         self.is_dspark_draft = (
             getattr(model_runner, "is_draft_worker", False)
             and model_runner.spec_algorithm.is_dspark()
@@ -471,6 +468,7 @@ class DeepseekV4HipRadixBackend(
             # CUDA-side convention gamma + 1, so use an explicit effective value
             # instead of mutating speculative_num_draft_tokens in place.
             self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens - 1
+        self.speculative_num_draft_tokens: int = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
             DSV4Metadata,

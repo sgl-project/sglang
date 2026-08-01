@@ -94,7 +94,10 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
-from sglang.srt.managers.utils import is_health_check_generate_req
+from sglang.srt.managers.utils import (
+    compute_num_reserved_tokens,
+    is_health_check_generate_req,
+)
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -117,7 +120,6 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_tokenizer,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -400,18 +402,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.max_req_input_len = None  # Will be set later in engine.py
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.default_priority_value = server_args.default_priority_value
-        speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
-        if speculative_algorithm.is_eagle():
-            # In the current eagle implementation, we store the draft tokens in the output token slots,
-            # so we need to reserve the space for the draft tokens.
-            self.num_reserved_tokens = max(
-                server_args.speculative_eagle_topk * server_args.speculative_num_steps,
-                server_args.max_speculative_num_draft_tokens,
-            )
-        else:
-            self.num_reserved_tokens = 0
+        self.num_reserved_tokens = compute_num_reserved_tokens(server_args)
         self.validate_total_tokens = True
 
     def init_tokenizer_and_processor(self):

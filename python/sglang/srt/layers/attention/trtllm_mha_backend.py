@@ -34,7 +34,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer
+from sglang.srt.runtime_context import get_buffer, get_spec
 from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
     resolve_ragged_verify_layout,
@@ -162,9 +162,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.speculative_step_id = speculative_step_id
         self.target_verify_metadata = {}
 
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         # True iff the model declares ENCODER_ONLY (bidirectional) layers, which
         # need the expanded TARGET_VERIFY metadata (TRTLLMMHAMetadata.encoder_*).
         self.expand_encoder_only_verify = any(
