@@ -6,6 +6,9 @@ import torch
 import torch.nn as nn
 from utils import (
     convert_weight,
+    INT8_MAX,
+    INT8_MIN,
+    INT8_SCALE_FACTOR,
     native_w8a8_per_token_matmul,
     per_token_quant_int8,
     precision,
@@ -150,13 +153,9 @@ class TestGemm(CustomTestCase):
         A = torch.randn((M, K), dtype=dtype) / 10
         Aq, As = per_token_quant_int8(A)
 
-        factor_for_scale = 1e-2
-        int8_max = 127
-        int8_min = -128
-
         B = (torch.rand((N, K), dtype=torch.float32) - 0.5) * 2
-        Bq = (B * int8_max).clamp(min=int8_min, max=int8_max).to(torch.int8)
-        Bs = torch.rand(N) * factor_for_scale
+        Bq = (B * INT8_MAX).clamp(min=INT8_MIN, max=INT8_MAX).to(torch.int8)
+        Bs = torch.rand(N) * INT8_SCALE_FACTOR
 
         bias = torch.randn(N) if has_bias else None
         ref_out = native_w8a8_per_token_matmul(Aq, Bq, As, Bs, bias, dtype)

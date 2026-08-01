@@ -14,9 +14,12 @@ torch.manual_seed(128)
 from utils import (
     BLOCK_K,
     BLOCK_N,
-    factor_for_scale,
-    fp8_max,
-    fp8_min,
+    FP8_MAX,
+    FP8_MIN,
+    FP8_SCALE_FACTOR,
+    INT8_MAX,
+    INT8_MIN,
+    INT8_SCALE_FACTOR,
     native_fp8_fused_moe,
     precision,
     scaled_weight,
@@ -128,25 +131,20 @@ class TestFusedExperts(CustomTestCase):
         dtype = torch.bfloat16
         prepack = True
 
-        # Initialize int8 quantization parameters
-        int8_factor_for_scale = 1e-2
-        int8_max = 127
-        int8_min = -128
-
         # Input tensor
         # M * K
         a = torch.randn((M, K), dtype=dtype) / math.sqrt(K)
 
         # Generate int8 weights
         w1_fp32 = (torch.rand((E, 2 * N, K), dtype=torch.float32) - 0.5) * 2
-        w1 = (w1_fp32 * int8_max).clamp(min=int8_min, max=int8_max).to(torch.int8)
+        w1 = (w1_fp32 * INT8_MAX).clamp(min=INT8_MIN, max=INT8_MAX).to(torch.int8)
 
         w2_fp32 = (torch.rand((E, K, N), dtype=torch.float32) - 0.5) * 2
-        w2 = (w2_fp32 * int8_max).clamp(min=int8_min, max=int8_max).to(torch.int8)
+        w2 = (w2_fp32 * INT8_MAX).clamp(min=INT8_MIN, max=INT8_MAX).to(torch.int8)
 
         # Generate scale for each column (per-column quantization)
-        w1_s = torch.rand(E, 2 * N, device=w1_fp32.device) * int8_factor_for_scale
-        w2_s = torch.rand(E, K, device=w2_fp32.device) * int8_factor_for_scale
+        w1_s = torch.rand(E, 2 * N, device=w1_fp32.device) * INT8_SCALE_FACTOR
+        w2_s = torch.rand(E, K, device=w2_fp32.device) * INT8_SCALE_FACTOR
 
         # Calculate routing
         score = torch.randn((M, E), dtype=dtype)
@@ -205,18 +203,18 @@ class TestFusedExperts(CustomTestCase):
         a = torch.randn(M, K, dtype=dtype) / math.sqrt(K)
 
         w1_fp32 = torch.randn(E, 2 * N, K)
-        w1 = (w1_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+        w1 = (w1_fp32 * FP8_MAX).clamp(min=FP8_MIN, max=FP8_MAX).to(torch.float8_e4m3fn)
 
         w2_fp32 = torch.randn(E, K, N)
-        w2 = (w2_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+        w2 = (w2_fp32 * FP8_MAX).clamp(min=FP8_MIN, max=FP8_MAX).to(torch.float8_e4m3fn)
 
         w1s = (
             torch.randn(E, math.ceil(2 * N / BLOCK_N), math.ceil(K / BLOCK_K))
-            * factor_for_scale
+            * FP8_SCALE_FACTOR
         )
         w2s = (
             torch.randn(E, math.ceil(K / BLOCK_N), math.ceil(N / BLOCK_K))
-            * factor_for_scale
+            * FP8_SCALE_FACTOR
         )
 
         w1_scaled = scaled_weight(w1, w1s)

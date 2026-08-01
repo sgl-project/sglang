@@ -11,9 +11,30 @@ precision = {
 }
 
 
+# ==============================================================================
+# Quantization constants
+# ==============================================================================
+
+# Block sizes for quantization operations
 BLOCK_N, BLOCK_K = 64, 128
-factor_for_scale = 1e-3
-fp8_max, fp8_min = 400, -400
+
+# FP8 (E4M3FN) quantization range. FP8 E4M3FN format supports [-448.0, 448.0].
+# Reference: https://onnx.ai/onnx/technical/float8.html
+FP8_MAX = 448.0
+FP8_MIN = -448.0
+
+# INT8 symmetric quantization range
+INT8_MAX = 127
+INT8_MIN = -128
+
+# Scale factors for different quantization types
+# These control the granularity of scale values in quantized models
+FP8_SCALE_FACTOR = 1e-3
+INT8_SCALE_FACTOR = 1e-2
+
+# Legacy aliases for backward compatibility
+factor_for_scale = FP8_SCALE_FACTOR
+fp8_max, fp8_min = FP8_MAX, FP8_MIN
 
 
 def parametrize(**params):
@@ -43,8 +64,8 @@ def per_token_quant_int8(x):
     x = x.float()
     absmax = x.abs().max(dim=-1).values
     absmax = absmax.clamp_min(1e-10).unsqueeze(-1)
-    scale_x = absmax / 127
-    x_q = x.mul(127 / absmax)
+    scale_x = absmax / INT8_MAX
+    x_q = x.mul(INT8_MAX / absmax)
     x_q = torch.round(x_q).to(torch.int8)
 
     return x_q, scale_x
@@ -52,7 +73,6 @@ def per_token_quant_int8(x):
 
 def convert_weight(weight, scale_block_size, A_dtype):
     N, K = weight.size()
-    fp8_max = 448.0
     scale_block_size_N, scale_block_size_K = scale_block_size  # (128, 128)
 
     pad_N = (scale_block_size_N - (N % scale_block_size_N)) % scale_block_size_N
@@ -71,7 +91,7 @@ def convert_weight(weight, scale_block_size, A_dtype):
 
     # Step 2: compute per-block max abs values → scale
     abs_max = weight_blocks.abs().amax(dim=(-2, -1), keepdim=True)  # (8, 8, 1, 1)
-    scales = abs_max / fp8_max
+    scales = abs_max / FP8_MAX
     scales = torch.where(
         scales == 0, torch.ones_like(scales), scales
     )  # avoid division by zero
