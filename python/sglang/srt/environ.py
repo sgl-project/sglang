@@ -1238,7 +1238,41 @@ class Envs:
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
+    # Low-latency small-batch serving: dequantize fp8 block-quant DENSE linear
+    # weights to bf16 at load time so tiny-M GEMMs run through cuBLAS instead of
+    # the fp8 path plus its per-call activation quant. MoE expert weights are
+    # unaffected. Trades ~2x dense weight memory for decode latency.
+    SGLANG_BS1_BF16_DENSE = EnvBool(False)
+    # Route only profiled GLM-5.2 tiny-M dense shapes from the load-time BF16
+    # path through the Blackwell CuTe-DSL TGV kernel. Default-off and inert
+    # unless SGLANG_BS1_BF16_DENSE is also enabled.
+    SGLANG_BS1_BF16_TGV = EnvBool(False)
+    # Launch the CuTe-DSL TGV bf16 GEMM with programmatic dependent launch.
+    # Round 5/6 GB300 evidence: PDL TGV crashes or regresses under real TP8
+    # serving concurrency; set 0 to run the same tactics without PDL.
+    SGLANG_CUTEDSL_BF16_GEMM_PDL = EnvBool(True)
+
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
+
+    # Route small bf16 TP all-reduces (total bytes at or below this value)
+    # through the FlashInfer all-reduce workspace's plain kAllReduce pattern
+    # instead of NCCL. 0 disables. Targets the per-draft-forward NCCL
+    # all-reduces in speculative decoding, which NCCL RING_LL serves at
+    # ~26 us/call on cross-node MNNVL while the FlashInfer one-shot kernel
+    # serves equivalent shapes at ~8 us in the same graphs.
+    SGLANG_FLASHINFER_SMALL_AR_MAX_BYTES = EnvInt(0)
+
+    # Keep the multimem (symmetric-memory) all-gather enabled when the TP
+    # group spans nodes that form one NVLink clique (MNNVL fabric), where
+    # cross-node multicast works. Default off preserves the conservative
+    # single-node-only behavior.
+    SGLANG_MULTIMEM_AG_CROSS_NODE = EnvBool(False)
+
+    # Issue the FP8 MoE activation quant on the model's alt stream so it
+    # overlaps the router gate GEMM instead of sitting serially between the
+    # gate reduce and the routing kernel (trtllm bypassed path only;
+    # fail-closed: the runner ignores the pre-quant unless block/layout match).
+    SGLANG_MOE_ALT_STREAM_PREQUANT = EnvBool(False)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")

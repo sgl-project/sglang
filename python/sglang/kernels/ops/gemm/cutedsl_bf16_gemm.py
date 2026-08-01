@@ -1333,12 +1333,14 @@ def _tgv_bf16_gemm_run(
     out = torch.empty(
         (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
     )
+    from sglang.srt.environ import envs
+
     return _run_tgv(
         x,
         weight.t(),
         bias,
         out,
-        pdl=True,
+        pdl=envs.SGLANG_CUTEDSL_BF16_GEMM_PDL.get(),
         tactic=_pick_tactic(x.shape[0], weight.shape[0], weight.shape[1]),
     )
 

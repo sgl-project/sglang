@@ -37,7 +37,9 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = int(
+    os.getenv("SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S", "480")
+)
 
 
 class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
