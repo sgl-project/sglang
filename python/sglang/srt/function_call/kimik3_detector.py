@@ -149,8 +149,11 @@ class KimiK3Detector(BaseFormatDetector):
         open_idx = text.find(self.bot_token)
         if open_idx == -1:
             return StreamingParseResult(normal_text=strip_response_wrappers(text))
+        # Computed outside the try so the error path can reuse it instead of
+        # falling back to raw text, which would ship the XTML tools markup to
+        # the client.
+        before = strip_response_wrappers(text[:open_idx])
         try:
-            before = strip_response_wrappers(text[:open_idx])
             section_start = open_idx + len(self.bot_token)
             close_idx = text.find(self.eot_token, section_start)
             section = (
@@ -169,7 +172,7 @@ class KimiK3Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=before, calls=calls)
         except Exception as e:
             logger.error("Error in Kimi K3 detect_and_parse: %s", e, exc_info=True)
-            return StreamingParseResult(normal_text=text)
+            return StreamingParseResult(normal_text=before)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
