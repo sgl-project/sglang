@@ -40,7 +40,11 @@ class SchedulerDllmMixin:
             # resolved, so a prompt row mixed into a denoise round would ride
             # tens of forwards it does not need.
             self.dllm_mixed_batch_enabled = self.dllm_config.first_done_first_out_mode
-            if not self.dllm_mixed_batch_enabled:
+            if self.dllm_mixed_batch_enabled:
+                logger.info(
+                    "dLLM prefill and decode rows are scheduled into one round."
+                )
+            else:
                 logger.warning(
                     "SGLANG_ENABLE_DLLM_MIXED_BATCH needs --dllm-fdfo; "
                     "keeping the prefill-first dLLM rounds."
