@@ -38,7 +38,7 @@ from sglang.srt.models.nemotron_h import (
     NemotronHMoEDecoderLayer,
 )
 from sglang.srt.models.nemotron_h_utils import is_attn_layer
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 
@@ -338,7 +338,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
             self.config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
 
         self.logits_processor = LogitsProcessor(config)
@@ -368,6 +368,11 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
         super().load_weights(weights, is_mtp=True)
+
+    def set_lm_head_from_target(self, target_lm_head: nn.Module) -> None:
+        if self.config.tie_word_embeddings:
+            return
+        self.lm_head = target_lm_head
 
 
 EntryClass = [NemotronHForCausalLMMTP]

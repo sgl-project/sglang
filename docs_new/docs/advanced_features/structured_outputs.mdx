@@ -11,7 +11,7 @@ SGLang supports three grammar backends:
 - [Outlines](https://github.com/dottxt-ai/outlines): Supports JSON schema and regular expression constraints.
 - [Llguidance](https://github.com/guidance-ai/llguidance): Supports JSON schema, regular expression, and EBNF constraints.
 
-We suggest using XGrammar for its better performance and utility. XGrammar currently uses the [GGML BNF format](https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md). For more details, see [XGrammar technical overview](https://blog.mlc.ai/2024/11/22/achieving-efficient-flexible-portable-structured-generation-with-xgrammar).
+We suggest using XGrammar for its better performance and utility. XGrammar currently uses the [GGML BNF format](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md). For more details, see [XGrammar technical overview](https://blog.mlc.ai/2024/11/22/achieving-efficient-flexible-portable-structured-generation-with-xgrammar).
 
 To use Outlines, simply add `--grammar-backend outlines` when launching the server.
 To use llguidance, add `--grammar-backend llguidance`  when launching the server.
@@ -294,7 +294,7 @@ print_highlight(response.choices[0].message.content)
 
 ```python Example
 # Support for XGrammar latest structural tag format
-# https://xgrammar.mlc.ai/docs/tutorials/structural_tag.html
+# https://xgrammar.mlc.ai/docs/api/python/structural_tag.html
 
 response = client.chat.completions.create(
     model="meta-llama/Meta-Llama-3.1-8B-Instruct",
@@ -531,7 +531,7 @@ print_highlight(response.json())
 
 ```python Example
 # Support for XGrammar latest structural tag format
-# https://xgrammar.mlc.ai/docs/tutorials/structural_tag.html
+# https://xgrammar.mlc.ai/docs/api/python/structural_tag.html
 
 payload = {
     "text": text,
@@ -753,7 +753,7 @@ for prompt, output in zip(prompts, outputs):
 
 ```python Example
 # Support for XGrammar latest structural tag format
-# https://xgrammar.mlc.ai/docs/tutorials/structural_tag.html
+# https://xgrammar.mlc.ai/docs/api/python/structural_tag.html
 
 sampling_params = {
     "temperature": 0.8,

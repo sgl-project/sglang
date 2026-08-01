@@ -42,7 +42,7 @@ from sglang.srt.models.bailing_moe_linear import (
     BailingMoeV2_5ForCausalLM,
 )
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator, add_prefix
 
 LoraConfig = None
@@ -208,7 +208,7 @@ class BailingMoeForCausalLMNextN(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         if hasattr(self.config, "model_type") and config.model_type == "bailing_hybrid":

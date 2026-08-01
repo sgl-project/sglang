@@ -5,6 +5,7 @@
 Denoising stage for diffusion pipelines.
 """
 
+import gc
 import inspect
 import math
 import time
@@ -19,7 +20,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from sglang.jit_kernel.nvfp4 import prewarm_nvfp4_jit_modules
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
@@ -109,6 +109,9 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context as precision_autocast_context,
+)
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled as precision_autocast_enabled,
 )
@@ -403,18 +406,22 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             compile_kwargs = build_torch_compile_kwargs(mode=mode)
             logger.info(f"Compiling transformer with mode: {mode}")
 
-        if self._needs_nvfp4_jit_prewarm(module):
-            logger.info(
-                "Prewarming NVFP4 JIT modules before torch.compile to avoid "
-                "Dynamo tracing JIT initialization."
+        if getattr(self.server_args, "regional_compile", False):
+            compiled_count = self._torch_compile_registry.compile_regions_once(
+                module,
+                compile_kwargs=compile_kwargs,
             )
-            prewarm_nvfp4_jit_modules()
-
-        # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        self._torch_compile_registry.compile_once(
-            module,
-            compile_kwargs=compile_kwargs,
-        )
+            logger.info(
+                "Enabled regional torch.compile for %d submodules in %s",
+                compiled_count,
+                type(module).__name__,
+            )
+        else:
+            # TODO(triple-mu): support customized fullgraph and dynamic in the future
+            self._torch_compile_registry.compile_once(
+                module,
+                compile_kwargs=compile_kwargs,
+            )
 
     def _maybe_enable_cache_dit_and_torch_compile(
         self, num_inference_steps: int | tuple[int, int], batch: Req
@@ -423,16 +430,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._maybe_enable_cache_dit(num_inference_steps, batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             self._maybe_torch_compile(transformer)
-
-    @staticmethod
-    def _needs_nvfp4_jit_prewarm(module: nn.Module) -> bool:
-        for submodule in module.modules():
-            quant_method = getattr(submodule, "quant_method", None)
-            if quant_method is None:
-                continue
-            if type(quant_method).__name__ == "ModelOptFp4LinearMethod":
-                return True
-        return False
 
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
@@ -772,6 +769,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         Returns:
             A context object containing the invariant state for the denoising loop.
         """
+        batch = server_args.pipeline_config.expand_conditioning_to_sample_batch(batch)
+
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
         scheduler = batch.scheduler
@@ -1222,13 +1221,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # 5. Advance the scheduler state with the predicted noise.
         with maybe_nvtx_range("scheduler_step", use_nvtx):
-            ctx.latents = ctx.scheduler.step(
+            latents_dtype = ctx.latents.dtype
+            latents = ctx.scheduler.step(
                 model_output=noise_pred,
                 timestep=step.t_device,
                 sample=ctx.latents,
                 **ctx.extra_step_kwargs,
                 return_dict=False,
             )[0]
+            if latents.dtype != latents_dtype and latents.device.type == "mps":
+                latents = latents.to(latents_dtype)
+            ctx.latents = latents
 
         # 6. Re-apply any model-specific latent constraints after the update.
         ctx.latents = self.post_forward_for_ti2v_task(
@@ -1353,10 +1356,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 self._component_residency_manager.remove_nvtx_hooks_for_module(
                     self.transformer
                 )
+                self._component_residency_manager.strategy_for.cache_clear()
             del self.transformer
             if pipeline is not None and "transformer" in pipeline.modules:
                 del pipeline.modules["transformer"]
             server_args.model_loaded["transformer"] = False
+            gc.collect()
+            torch.mps.empty_cache()
             logger.info(
                 "Memory after deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
@@ -1592,9 +1598,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         use_nvtx = self._apply_nvtx_gate(ctx.is_warmup)
 
         with (
-            torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=ctx.target_dtype,
+            precision_autocast_context(
+                ctx.target_dtype,
+                server_args.disable_autocast,
                 enabled=ctx.autocast_enabled,
             ),
             maybe_nvtx_range("denoising_loop", use_nvtx),
@@ -1658,6 +1664,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 (denoising_end_time - denoising_start_time) / len(ctx.timesteps),
             )
 
+        if "step" in locals():
+            del step
         self._finish_active_component_use()
 
         # Rollout postprocessing must run BEFORE _finalize_denoising_loop so

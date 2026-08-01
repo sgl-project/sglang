@@ -6,15 +6,12 @@ crashed TBO cuda-graph capture until reset. CPU-only.
 """
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
-import sglang.srt.batch_overlap.two_batch_overlap as tbo
 from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -37,10 +34,11 @@ def _make_target_verify_batch(bs: int) -> ForwardBatch:
 
 
 def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
-    fake_args = SimpleNamespace(moe_dense_tp_size=None, attention_backend="fa3")
-    with get_parallel().override(attn_tp_size=1), patch.object(
-        tbo, "get_server_args", lambda: fake_args
-    ):
+    # filter_batch reads attention_backend (get_server_args) and
+    # moe_dense_tp_size (get_parallel) from the published config.
+    with get_context().override_server_args(
+        attention_backend="fa3", moe_dense_tp_size=None
+    ), get_parallel().override(attn_tp_size=1):
         return TboForwardBatchPreparer.filter_batch(
             batch,
             start_token_index=lo,
@@ -52,6 +50,18 @@ def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
 
 
 class TestTboFilterBatchMarker(CustomTestCase):
+    def test_filter_batch_clears_mlp_sync_unpad_fields_on_children(self):
+        # MLP-sync padding records _original_batch_size/_original_num_tokens
+        # before TBO splits the batch (prepare_mlp_sync_batch pads first, then
+        # runs TboForwardBatchPreparer); children carry no restore state — the
+        # parent performs the post-forward unpad.
+        parent = _make_target_verify_batch(8)
+        parent._original_batch_size = 8
+        parent._original_num_tokens = 8
+        child = _filter(parent, lo=0, hi=4)
+        self.assertIsNone(child._original_batch_size)
+        self.assertIsNone(child._original_num_tokens)
+
     def test_filter_batch_resets_plan_marker_on_children(self):
         child = _filter(_make_target_verify_batch(8), lo=0, hi=4)
         self.assertEqual(child.batch_size, 4)
