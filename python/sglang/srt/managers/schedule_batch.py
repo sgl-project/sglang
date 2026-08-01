@@ -821,8 +821,7 @@ class Req(ReqDllmMixin):
         # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
         self._is_reasoning_over = False
         self.reasoning_tokens = 0
-        # How much of the think-end marker the output tail matches; the marker
-        # can span several tokens and several decode steps.
+        self._think_end_matcher: Optional[TokenSequenceMatcher] = None
         self._think_end_match_len = 0
 
         # Sampling info
@@ -1705,18 +1704,18 @@ class Req(ReqDllmMixin):
         if not isinstance(token_id, list):
             token_id = [token_id]
 
-        # The marker may span both several tokens and several decode steps, so
-        # the partial match carries over between calls.
-        matcher = TokenSequenceMatcher(think_end_ids)
-        match = self._think_end_match_len
-        for pos, token in enumerate(token_id):
-            match = matcher.advance(match, token)
-            if match == len(matcher):
-                self.reasoning_tokens += pos + 1
+        if self._think_end_matcher is None:
+            self._think_end_matcher = TokenSequenceMatcher(think_end_ids)
+
+        matched = self._think_end_match_len
+        for position, token in enumerate(token_id):
+            matched = self._think_end_matcher.advance(matched, token)
+            if matched == len(self._think_end_matcher):
+                self.reasoning_tokens += position + 1
                 self._is_reasoning_over = True
                 return
 
-        self._think_end_match_len = match
+        self._think_end_match_len = matched
         self.reasoning_tokens += len(token_id)
 
     def __repr__(self):

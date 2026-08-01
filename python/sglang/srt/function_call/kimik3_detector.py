@@ -18,6 +18,8 @@ from sglang.srt.function_call.kimik3_format import (
     RESPONSE_OPEN,
     TOOLS_CLOSE,
     TOOLS_OPEN,
+    partial_suffix_len,
+    strip_response_wrappers,
 )
 from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_auto_tool_call_structural_tag,
@@ -45,29 +47,6 @@ def _unescape_attr(value: str) -> str:
 
 def _parse_attrs(attrs: str) -> dict:
     return {m["k"]: _unescape_attr(m["v"]) for m in _ATTR_RE.finditer(attrs)}
-
-
-def _partial_suffix_len(text: str, markers: List[str]) -> int:
-    best = 0
-    for marker in markers:
-        for n in range(min(len(marker) - 1, len(text)), best, -1):
-            if text.endswith(marker[:n]):
-                best = n
-                break
-    return best
-
-
-def _strip_response_wrappers(text: str) -> str:
-    open_idx = text.find(RESPONSE_OPEN)
-    if open_idx != -1:
-        close_idx = text.find(RESPONSE_CLOSE, open_idx + len(RESPONSE_OPEN))
-        if close_idx != -1:
-            text = text[open_idx + len(RESPONSE_OPEN) : close_idx]
-        else:
-            text = text[open_idx + len(RESPONSE_OPEN) :]
-    else:
-        text = text.replace(RESPONSE_CLOSE, "")
-    return text.replace(MESSAGE_CLOSE, "")
 
 
 class KimiK3Detector(BaseFormatDetector):
@@ -169,9 +148,12 @@ class KimiK3Detector(BaseFormatDetector):
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         open_idx = text.find(self.bot_token)
         if open_idx == -1:
-            return StreamingParseResult(normal_text=_strip_response_wrappers(text))
+            return StreamingParseResult(normal_text=strip_response_wrappers(text))
+        # Computed outside the try so the error path can reuse it instead of
+        # falling back to raw text, which would ship the XTML tools markup to
+        # the client.
+        before = strip_response_wrappers(text[:open_idx])
         try:
-            before = _strip_response_wrappers(text[:open_idx])
             section_start = open_idx + len(self.bot_token)
             close_idx = text.find(self.eot_token, section_start)
             section = (
@@ -190,7 +172,7 @@ class KimiK3Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=before, calls=calls)
         except Exception as e:
             logger.error("Error in Kimi K3 detect_and_parse: %s", e, exc_info=True)
-            return StreamingParseResult(normal_text=text)
+            return StreamingParseResult(normal_text=before)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
@@ -228,12 +210,16 @@ class KimiK3Detector(BaseFormatDetector):
             logger.error(
                 "Error in Kimi K3 parse_streaming_increment: %s", e, exc_info=True
             )
+            # _sent_normal_idx indexes into _buffer, so it must be reset with it;
+            # otherwise every later _emit_normal_text sees limit <= _sent_normal_idx
+            # and silently drops the rest of the response.
             self._buffer = ""
+            self._sent_normal_idx = 0
             return StreamingParseResult()
 
     def _emit_normal_text(self, limit: int | None = None) -> str:
         if limit is None:
-            holdback = _partial_suffix_len(
+            holdback = partial_suffix_len(
                 self._buffer,
                 [self.bot_token, RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE],
             )

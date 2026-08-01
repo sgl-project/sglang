@@ -11,57 +11,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Incremental matching of a token sequence against a generated token stream.
 
-A marker such as a reasoning model's think-end token may span several tokens
-and arrive across several decode steps, so matching has to survive both. The
-match length is carried by the caller, which lets one matcher serve many
-independent streams.
-"""
-
-from typing import List, Sequence
-
-
-def build_border_table(pattern: Sequence[int]) -> List[int]:
-    """Longest proper prefix that is also a suffix, per prefix length (KMP)."""
-    border = [0] * len(pattern)
-    k = 0
-    for i in range(1, len(pattern)):
-        while k > 0 and pattern[i] != pattern[k]:
-            k = border[k - 1]
-        if pattern[i] == pattern[k]:
-            k += 1
-        border[i] = k
-    return border
+from typing import Sequence
 
 
 class TokenSequenceMatcher:
-    """Matches a fixed token sequence incrementally.
-
-    Restarting a failed match from position 0 would miss an occurrence whenever
-    the pattern overlaps itself: with pattern [A, A, B] the stream A A A B ends
-    on a complete match, but a naive restart drops the second A and never
-    reports it. The border table gives the longest prefix still alive after a
-    mismatch, so every occurrence is found regardless of the pattern's shape.
-    """
-
     def __init__(self, pattern: Sequence[int]):
         if not pattern:
-            raise ValueError("Token sequence matcher needs a non-empty pattern.")
-        self.pattern = list(pattern)
-        self._border = build_border_table(self.pattern)
+            raise ValueError("pattern must contain at least one token")
+        self.pattern = tuple(pattern)
+        self.prefix_lengths = self._build_prefix_lengths()
+
+    def _build_prefix_lengths(self) -> tuple[int, ...]:
+        prefix_lengths = [0] * len(self.pattern)
+        matched = 0
+        for index in range(1, len(self.pattern)):
+            while matched > 0 and self.pattern[index] != self.pattern[matched]:
+                matched = prefix_lengths[matched - 1]
+            if self.pattern[index] == self.pattern[matched]:
+                matched += 1
+            prefix_lengths[index] = matched
+        return tuple(prefix_lengths)
 
     def __len__(self) -> int:
         return len(self.pattern)
 
-    def next_token(self, match_len: int) -> int:
-        """The token that would extend a match of the given length."""
-        return self.pattern[match_len]
-
-    def advance(self, match_len: int, token: int) -> int:
-        """Match length after `token`, or len(pattern) when it completes."""
-        while match_len > 0 and token != self.pattern[match_len]:
-            match_len = self._border[match_len - 1]
-        if token == self.pattern[match_len]:
-            match_len += 1
-        return match_len
+    def advance(self, matched: int, token: int) -> int:
+        while matched > 0 and token != self.pattern[matched]:
+            matched = self.prefix_lengths[matched - 1]
+        if token == self.pattern[matched]:
+            matched += 1
+        return matched

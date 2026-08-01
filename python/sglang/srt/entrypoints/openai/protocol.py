@@ -43,7 +43,6 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response import ToolChoice
-from openai.types.responses.tool import Tool
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -597,37 +596,6 @@ class ToolCall(BaseModel):
     function: FunctionResponse
 
 
-class Function(BaseModel):
-    """Function descriptions."""
-
-    description: Optional[str] = Field(default=None, examples=[None])
-    name: str
-    parameters: Optional[object] = None
-    strict: bool = False
-    defer_loading: Optional[bool] = None
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        data = handler(self)
-        if self.defer_loading is None:
-            data.pop("defer_loading", None)
-        return data
-
-
-class Tool(BaseModel):
-    """Function wrapper."""
-
-    type: str = Field(default="function", examples=["function"])
-    function: Function
-    defer_loading: Optional[bool] = None
-
-    @model_validator(mode="after")
-    def _propagate_defer_loading(self) -> Tool:
-        if self.defer_loading is not None and self.function.defer_loading is None:
-            self.function.defer_loading = self.defer_loading
-        return self
-
-
 _GenericMessageRole = Literal[
     "system", "assistant", "tool", "function", "developer", "latest_reminder"
 ]
@@ -687,6 +655,42 @@ ChatCompletionMessageParam = Union[
 ]
 
 
+class Function(BaseModel):
+    """Function descriptions."""
+
+    description: Optional[str] = Field(default=None, examples=[None])
+    name: str
+    parameters: Optional[object] = None
+    strict: bool = False
+    defer_loading: Optional[bool] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.defer_loading is None:
+            data.pop("defer_loading", None)
+        return data
+
+
+class Tool(BaseModel):
+    """Function wrapper."""
+
+    type: str = Field(default="function", examples=["function"])
+    function: Function
+    defer_loading: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _propagate_defer_loading(self) -> Tool:
+        if self.defer_loading is not None and self.function.defer_loading is None:
+            self.function.defer_loading = self.defer_loading
+        return self
+
+
+# Tool is defined after the message params that reference it, so the forward
+# reference has to be resolved explicitly.
+ChatCompletionMessageGenericParam.model_rebuild()
+
+
 class ToolChoiceFuncName(BaseModel):
     """The name of tool choice function."""
 
@@ -721,11 +725,11 @@ def _has_message_level_tools(messages: Any) -> bool:
     if not isinstance(messages, list):
         return False
     return any(
-        isinstance(msg, dict)
-        and isinstance(msg.get("role"), str)
-        and msg["role"].lower() in ("system", "developer")
-        and bool(msg.get("tools"))
-        for msg in messages
+        isinstance(message, dict)
+        and isinstance(message.get("role"), str)
+        and message["role"].lower() in ("system", "developer")
+        and bool(message.get("tools"))
+        for message in messages
     )
 
 
@@ -981,6 +985,7 @@ class ChatCompletionRequest(BaseModel):
         stop: List[str],
         model_generation_config: Dict[str, Any],
         tool_call_constraint: Optional[ToolCallConstraint] = None,
+        renderer_handles_response_format: bool = False,
     ) -> Dict[str, Any]:
         """
         Convert request to sampling parameters.
@@ -1028,7 +1033,12 @@ class ChatCompletionRequest(BaseModel):
         }
 
         if self.response_format and self.response_format.type == "json_schema":
-            if self.response_format.json_schema.strict is not False:
+            # strict=false may only go unconstrained when the renderer forwards
+            # response_format to the model; plain chat templates never see it.
+            if (
+                self.response_format.json_schema.strict is not False
+                or not renderer_handles_response_format
+            ):
                 sampling_params["json_schema"] = convert_json_schema_to_str(
                     self.response_format.json_schema.schema_
                 )
@@ -1795,22 +1805,6 @@ class RequestResponseMetadata(BaseModel):
 
 @dataclass
 class MessageProcessingResult:
-    """Result of processing chat messages and applying templates.
-
-    This dataclass encapsulates all the outputs from message processing including
-    prompt generation, multimodal data extraction, and constraint preparation.
-    Used internally by OpenAIServingChat to pass processed data between methods.
-
-    Args:
-        prompt: The final text prompt after applying chat template
-        prompt_ids: Either the text prompt (str) or tokenized IDs (List[int])
-        image_data: Extracted image data from messages, if any
-        audio_data: Extracted audio data from messages, if any
-        modalities: List of modality types present in the messages
-        stop: Combined stop strings from template and request
-        tool_call_constraint: Optional constraint for structured tool calls
-    """
-
     prompt: str
     prompt_ids: Union[str, List[int]]
     image_data: Optional[Any]
@@ -1819,6 +1813,7 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
+    require_reasoning: bool = False
 
 
 class ToolCallProcessingResult(NamedTuple):

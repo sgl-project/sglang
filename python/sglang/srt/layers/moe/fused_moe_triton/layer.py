@@ -260,12 +260,11 @@ class FusedMoE(torch.nn.Module):
             num_shared_slots = num_fused_shared_experts
 
         self._num_global_routed = num_experts - num_shared_slots
-        server_args = get_server_args()
         if get_exec().moe.ep_join_mode == "scale":
-            storage_ep_size = server_args.elastic_ep_initial_size
+            storage_ep_size = get_parallel().elastic_ep_initial_size
             assert storage_ep_size is not None
             self._expert_storage_rank = (
-                server_args.ep_join_rank_offset + self.moe_ep_rank
+                get_parallel().ep_join_rank_offset + self.moe_ep_rank
             )
         else:
             storage_ep_size = self.moe_ep_size

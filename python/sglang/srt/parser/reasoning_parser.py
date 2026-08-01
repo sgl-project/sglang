@@ -12,10 +12,6 @@ from sglang.srt.entrypoints.openai.encoding_dsv4 import (
 )
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
-from sglang.srt.function_call.kimik3_detector import (
-    _partial_suffix_len,
-    _strip_response_wrappers,
-)
 from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
@@ -23,6 +19,9 @@ from sglang.srt.function_call.kimik3_format import (
     THINK_CLOSE,
     THINK_OPEN,
     TOOLS_OPEN,
+    partial_suffix_len,
+    strip_partial_marker_suffix,
+    strip_response_wrappers,
 )
 from sglang.srt.parser.harmony_parser import HarmonyParser
 from sglang.srt.parser.inkling_tokenizer import (
@@ -431,9 +430,6 @@ class KimiK2Detector(BaseReasoningFormatDetector):
         )
 
 
-_THINK_CLOSE_WITHOUT_SEP = THINK_CLOSE.split("<|sep|>")[0]
-
-
 class KimiK3Detector(BaseReasoningFormatDetector):
     """Detector for the Kimi K3 XTML think channel.
 
@@ -456,6 +452,12 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
     ):
+        # strict-thinking flattens these to single token ids, so the full marker
+        # "<|open|>response<|sep|>" is inexpressible. The bare name works: it
+        # follows <|open|> unspaced, so it tokenizes to the no-space variant, not
+        # the " response"/" message" tokens prose uses -- at the cost of not being
+        # able to start those words unspaced mid-reasoning. tools is left out on
+        # purpose: the model may jump from think straight into that channel.
         think_excluded_tokens = [
             "response",
             "message",
@@ -480,8 +482,8 @@ class KimiK3Detector(BaseReasoningFormatDetector):
     def _clean_content(self, text: str) -> str:
         tools_idx = text.find(TOOLS_OPEN)
         if tools_idx != -1:
-            return _strip_response_wrappers(text[:tools_idx]) + text[tools_idx:]
-        return _strip_response_wrappers(text)
+            return strip_response_wrappers(text[:tools_idx]) + text[tools_idx:]
+        return strip_response_wrappers(text)
 
     def _next_channel_idx(self, text: str, start: int = 0) -> int:
         found = [
@@ -490,10 +492,6 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             if (idx := text.find(token, start)) != -1
         ]
         return min(found) if found else -1
-
-    @staticmethod
-    def _strip_dangling_think_close(text: str) -> str:
-        return text.removesuffix(_THINK_CLOSE_WITHOUT_SEP)
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         in_reasoning = self._in_reasoning or self.think_start_token in text
@@ -507,13 +505,11 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             channel_idx = self._next_channel_idx(text, start)
             if channel_idx != -1:
                 return StreamingParseResult(
-                    reasoning_text=self._strip_dangling_think_close(
-                        text[start:channel_idx]
-                    ),
+                    reasoning_text=strip_partial_marker_suffix(text[start:channel_idx]),
                     normal_text=self._clean_content(text[channel_idx:]),
                 )
             return StreamingParseResult(
-                reasoning_text=self._strip_dangling_think_close(text[start:])
+                reasoning_text=strip_partial_marker_suffix(text[start:])
             )
 
         reasoning_text = text[start:close_idx]
@@ -558,7 +554,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
             channel_idx = self._next_channel_idx(buf)
             if channel_idx != -1:
-                reasoning_text = self._strip_dangling_think_close(buf[:channel_idx])
+                reasoning_text = strip_partial_marker_suffix(buf[:channel_idx])
                 self._buffer = buf[channel_idx:]
                 self._in_reasoning = False
                 self._reasoning_done = True
@@ -575,9 +571,9 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             markers = [self.think_end_token, self.tool_start_token, RESPONSE_OPEN]
             if not self.stripped_think_start:
                 markers.append(self.think_start_token)
-            holdback = _partial_suffix_len(buf, markers)
+            holdback = partial_suffix_len(buf, markers)
             emit = buf[: len(buf) - holdback] if holdback else buf
-            emit = self._strip_dangling_think_close(emit)
+            emit = strip_partial_marker_suffix(emit)
             self._buffer = buf[len(emit) :]
             return StreamingParseResult(reasoning_text=emit)
 
@@ -600,7 +596,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             self._buffer = ""
             return head + buf[tools_idx:]
 
-        holdback = _partial_suffix_len(
+        holdback = partial_suffix_len(
             buf, [RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE, TOOLS_OPEN]
         )
         emit = buf[: len(buf) - holdback] if holdback else buf

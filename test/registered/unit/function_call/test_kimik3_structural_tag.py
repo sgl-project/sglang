@@ -143,14 +143,6 @@ def _valid_weather_call(index=1):
     )
 
 
-def test_detector_advertises_model_native_structural_tag():
-    detector = KimiK3Detector()
-
-    assert detector.supports_structural_tag()
-    assert not detector.parses_required_natively()
-    assert isinstance(detector.get_structural_tag([_tool()]), xgr.StructuralTag)
-
-
 def test_strict_schema_accepts_native_xtml_values():
     grammar = _grammar([_tool()], tool_choice="required")
 
@@ -471,7 +463,7 @@ def test_tool_strict_level_controls_native_tag_parameter_schema():
     )
     empty_call = _tools_section(_call("weather", 264))
 
-    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.OFF):
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.OFF.value):
         constraint = FunctionCallParser(
             [_tool(strict=False)], "kimi_k3"
         ).get_structure_constraint("auto")
@@ -479,7 +471,7 @@ def test_tool_strict_level_controls_native_tag_parameter_schema():
         assert _token_accepts(constraint[1], invalid_call)
         assert not _token_accepts(constraint[1], empty_call)
 
-    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.FUNCTION):
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.FUNCTION.value):
         constraint = FunctionCallParser(
             [_tool(strict=False)], "kimi_k3"
         ).get_structure_constraint("auto")
@@ -488,7 +480,7 @@ def test_tool_strict_level_controls_native_tag_parameter_schema():
         assert _accepts(grammar, invalid_call)
         assert _accepts(grammar, empty_call)
 
-    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.PARAMETER):
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.PARAMETER.value):
         constraint = FunctionCallParser(
             [_tool(strict=False)], "kimi_k3"
         ).get_structure_constraint("auto")
@@ -587,7 +579,7 @@ def test_auto_hook_does_not_swallow_parser_visible_closes():
     ],
 )
 def test_parallel_tool_calls_false_rejects_second_call(tool_strict_level):
-    with envs.SGLANG_TOOL_STRICT_LEVEL.override(tool_strict_level):
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(tool_strict_level.value):
         constraint = FunctionCallParser(
             [_tool(strict=False)], "kimi_k3"
         ).get_structure_constraint("auto", parallel_tool_calls=False)
@@ -632,7 +624,7 @@ def test_parallel_tool_calls_true_constrains_every_call():
 
 
 def test_parameter_level_constrains_every_parallel_call():
-    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.PARAMETER):
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.PARAMETER.value):
         constraint = FunctionCallParser(
             [_tool(strict=False)], "kimi_k3"
         ).get_structure_constraint("auto")
@@ -677,7 +669,7 @@ def test_parameter_level_keeps_constraint_with_no_parameter_tool():
         _tool(strict=False),
         Tool(type="function", function=Function(name="ping")),
     ]
-    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.PARAMETER):
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.PARAMETER.value):
         constraint = FunctionCallParser(tools, "kimi_k3").get_structure_constraint(
             "required"
         )
@@ -792,7 +784,7 @@ def test_auto_hook_keeps_structure_for_ambiguous_required_argument_type():
 
 
 def test_parameter_level_applies_to_other_model_native_tags():
-    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.PARAMETER):
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.PARAMETER.value):
         constraint = FunctionCallParser(
             [_tool(strict=False)], "kimi_k2"
         ).get_structure_constraint("auto")

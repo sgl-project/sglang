@@ -364,19 +364,17 @@ class TestCreateGrammarBackend(unittest.TestCase):
         self.assertIs(result.grammar_backend, mock_backend)
 
     @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
-    def test_no_reasoner_wrapping_without_think_end_id(self, mock_outlines_cls):
-        """Without think_end_ids passed in, no reasoner wrapping."""
+    def test_no_reasoner_wrapping_without_think_end_ids(self, mock_outlines_cls):
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_outlines_cls.return_value = mock_backend
         args = self._make_server_args("outlines", reasoning_parser="deepseek-r1")
-        tokenizer = MagicMock(spec=[])  # No think_end_ids attribute
+        tokenizer = MagicMock(spec=[])
 
         result = create_grammar_backend(args, tokenizer, 32000, think_end_ids=None)
         self.assertIs(result, mock_backend)
 
     @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
     def test_no_reasoner_wrapping_without_reasoning_parser(self, mock_outlines_cls):
-        """Without reasoning_parser, no reasoner wrapping even with think_end_ids."""
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_outlines_cls.return_value = mock_backend
         args = self._make_server_args("outlines", reasoning_parser=None)

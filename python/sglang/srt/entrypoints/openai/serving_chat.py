@@ -72,7 +72,6 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.utils import ImageData
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -122,7 +121,9 @@ def parse_tool_call_arguments(arguments: str) -> Dict[str, Any]:
     return parsed_arguments
 
 
-def normalize_assistant_tool_call_arguments(message: Dict[str, Any]) -> None:
+def normalize_assistant_tool_call_arguments(
+    message: Dict[str, Any], *, strict: bool = True
+) -> None:
     """Normalize assistant history tool call arguments in-place."""
     if message.get("role") != "assistant" or not isinstance(
         message.get("tool_calls"), list
@@ -134,7 +135,11 @@ def normalize_assistant_tool_call_arguments(message: Dict[str, Any]) -> None:
         if not isinstance(function, dict):
             continue
         if "arguments" in function and isinstance(function["arguments"], str):
-            function["arguments"] = parse_tool_call_arguments(function["arguments"])
+            try:
+                function["arguments"] = parse_tool_call_arguments(function["arguments"])
+            except ValueError:
+                if strict:
+                    raise
 
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
@@ -163,15 +168,25 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     return img_max_dynamic_patch, vid_max_dynamic_patch
 
 
-# K3 images reach the encoder out of band, as structured `image_url` parts, so an
-# occurrence of this token in text is ordinary user content. Left as-is it would
-# additionally consume an image slot and make the encoder reject the request.
 KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
 
 
 def neutralize_kimi_k3_image_placeholder(text: str) -> str:
     return text.replace(KIMI_K3_IMAGE_PLACEHOLDER, KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED)
+
+
+def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return neutralize_kimi_k3_image_placeholder(value)
+    if isinstance(value, list):
+        return [neutralize_kimi_k3_image_placeholder_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: neutralize_kimi_k3_image_placeholder_value(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 class OpenAIServingChat(OpenAIServingBase):
@@ -333,43 +348,93 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_parser=self.tool_call_parser,
         )
 
-    def _flatten_kimi_k3_content(
-        self,
-        msg: Dict[str, Any],
-        image_data: list,
-        video_data: list,
-        audio_data: list,
-    ) -> Dict[str, Any]:
-        parts = []
-        for chunk in msg["content"]:
-            if not isinstance(chunk, dict):
-                continue
-            chunk_type = chunk.get("type")
-            if chunk_type in ("text", "input_text"):
-                text = neutralize_kimi_k3_image_placeholder(chunk["text"])
-                parts.append({"type": "text", "text": text})
-            elif chunk_type in ("image_url", "input_image"):
-                image_obj = chunk.get("image_url") or {}
-                if isinstance(image_obj, str):
-                    image_obj = {"url": image_obj, "detail": chunk.get("detail")}
-                image_data.append(
-                    ImageData(
-                        url=image_obj["url"],
-                        detail=image_obj.get("detail") or "auto",
-                        max_dynamic_patch=image_obj.get("max_dynamic_patch"),
-                    )
-                )
-                parts.append({"type": "image_url", "image_url": image_obj})
-            elif chunk_type == "video_url":
-                video_data.append(chunk["video_url"]["url"])
-            elif chunk_type == "audio_url":
-                audio_data.append(chunk["audio_url"]["url"])
-        new_msg = {k: v for k, v in msg.items() if v is not None and k != "content"}
-        new_msg["content"] = parts
-        return new_msg
-
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
+
+    def _effective_tools(self, request: ChatCompletionRequest) -> List[Tool]:
+        tools = list(request.tools or [])
+        for message in request.messages:
+            if (
+                isinstance(message, ChatCompletionMessageGenericParam)
+                and message.role in ("system", "developer")
+                and message.tools
+            ):
+                tools.extend(message.tools)
+        return tools
+
+    def _prepare_kimi_k3_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        request: ChatCompletionRequest,
+    ) -> tuple[List[Dict[str, Any]], int, Optional[str]]:
+        image_count = 0
+        for index, message in enumerate(messages):
+            content = message.get("content")
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = part.get("type")
+                    if part_type in ("text", "input_text"):
+                        parts.append(
+                            {
+                                "type": "text",
+                                "text": neutralize_kimi_k3_image_placeholder(
+                                    part["text"]
+                                ),
+                            }
+                        )
+                    elif part_type in ("image_url", "input_image"):
+                        image = part.get("image_url") or {}
+                        if isinstance(image, str):
+                            image = {"url": image, "detail": part.get("detail")}
+                        parts.append({"type": "image_url", "image_url": image})
+                        image_count += 1
+                message["content"] = parts
+            elif isinstance(content, str):
+                message["content"] = neutralize_kimi_k3_image_placeholder(content)
+            elif content is None:
+                message["content"] = ""
+
+            if message.get("role") == "assistant":
+                for key in ("reasoning_content", "reasoning"):
+                    if key in message:
+                        message[key] = neutralize_kimi_k3_image_placeholder_value(
+                            message[key]
+                        )
+                for tool_call in message.get("tool_calls") or []:
+                    function = (
+                        tool_call.get("function")
+                        if isinstance(tool_call, dict)
+                        else None
+                    )
+                    if isinstance(function, dict) and "arguments" in function:
+                        function["arguments"] = (
+                            neutralize_kimi_k3_image_placeholder_value(
+                                function["arguments"]
+                            )
+                        )
+
+            source = request.messages[index]
+            if (
+                isinstance(source, ChatCompletionMessageGenericParam)
+                and source.role in ("system", "developer")
+                and source.tools
+            ):
+                message["tools"] = [
+                    tool.model_dump(exclude_unset=True, by_alias=True)
+                    for tool in source.tools
+                ]
+            if message.get("role") == "developer":
+                message["role"] = "system"
+
+        assistant_prefix = None
+        if request.continue_final_message:
+            messages, assistant_prefix = self._handle_last_assistant_message(
+                messages, request
+            )
+        return messages, image_count, assistant_prefix
 
     def _encode_messages(
         self,
@@ -419,6 +484,71 @@ class OpenAIServingChat(OpenAIServingBase):
                     inkling_tokenizer.encode_special(CONTENT_TEXT),
                     *inkling_tokenizer.encode_text(assistant_prefix),
                 ]
+            return prompt_ids
+        if self.chat_encoding_spec == "kimi_k3":
+            messages, image_count, assistant_prefix = self._prepare_kimi_k3_messages(
+                messages, request
+            )
+            template_kwargs = dict(request.chat_template_kwargs or {})
+            template_kwargs.pop("tokenize", None)
+            template_kwargs.pop("return_dict", None)
+            template_kwargs.pop("image_prompts", None)
+            if image_count:
+                template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
+
+            if (
+                request.reasoning_effort in ("low", "high", "max")
+                and "thinking_effort" not in template_kwargs
+            ):
+                template_kwargs["thinking_effort"] = request.reasoning_effort
+            elif request.reasoning_effort not in (
+                None,
+                "none",
+                "low",
+                "high",
+                "max",
+            ):
+                logger.warning(
+                    "Kimi K3 does not support reasoning_effort=%r; using the "
+                    "encoder default.",
+                    request.reasoning_effort,
+                )
+
+            effective_tools = self._effective_tools(request)
+            if (
+                effective_tools
+                and isinstance(request.tool_choice, str)
+                and request.tool_choice in ("required", "none")
+            ):
+                template_kwargs.setdefault("tool_choice", request.tool_choice)
+            if request.response_format is not None:
+                template_kwargs.setdefault(
+                    "response_format",
+                    request.response_format.model_dump(
+                        exclude_unset=True, by_alias=True
+                    ),
+                )
+
+            request_tools = (
+                [
+                    tool.model_dump(exclude_unset=True, by_alias=True)
+                    for tool in request.tools
+                ]
+                if request.tools
+                else None
+            )
+            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                tools=request_tools,
+                return_dict=False,
+                **template_kwargs,
+            )
+            if assistant_prefix:
+                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
+                    prompt_ids, assistant_prefix
+                )
             return prompt_ids
         return None
 
@@ -591,8 +721,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle tool calls
         if (
             request.tool_choice != "none"
+            and self._effective_tools(request)
             and self.tool_call_parser
-            and self._collect_tools(request)
         ):
             async for chunk in self._process_tool_call_stream(
                 index,
@@ -673,25 +803,37 @@ class OpenAIServingChat(OpenAIServingBase):
         if media_error:
             return media_error
 
-        all_tools = self._collect_tools(request) or []
-
+        effective_tools = self._effective_tools(request)
+        has_message_tools = any(
+            isinstance(message, ChatCompletionMessageGenericParam)
+            and message.role in ("system", "developer")
+            and message.tools
+            for message in request.messages
+        )
         if (
             isinstance(request.tool_choice, str)
             and request.tool_choice.lower() == "required"
-            and not all_tools
+            and not effective_tools
         ):
             return "Tools cannot be empty if tool choice is set to required."
 
         if request.tool_choice is not None and not isinstance(request.tool_choice, str):
-            if not all_tools:
+            if not effective_tools:
                 return "Tools cannot be empty if tool choice is set to a specific tool."
             tool_name = request.tool_choice.function.name
-            tool_exists = any(tool.function.name == tool_name for tool in all_tools)
+            tool_exists = any(
+                tool.function.name == tool_name for tool in effective_tools
+            )
             if not tool_exists:
                 return f"Tool '{tool_name}' not found in tools list."
 
+        if has_message_tools:
+            names = [tool.function.name for tool in effective_tools]
+            if len(names) != len(set(names)):
+                return "Tool names must be unique across request and message tools."
+
         # Validate tool definitions
-        for i, tool in enumerate(all_tools):
+        for i, tool in enumerate(effective_tools):
             if tool.function.parameters is None:
                 continue
             try:
@@ -795,6 +937,7 @@ class OpenAIServingChat(OpenAIServingBase):
             stop=processed_messages.stop,
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
+            renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
         )
 
         # Handle single vs multiple requests
@@ -835,8 +978,6 @@ class OpenAIServingChat(OpenAIServingBase):
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
             request
         )
-        require_reasoning = self._get_reasoning_from_request(request)
-
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -861,7 +1002,7 @@ class OpenAIServingChat(OpenAIServingBase):
             rid=request.rid,
             session_id=request.session_id,
             extra_key=self._compute_extra_key(request),
-            require_reasoning=require_reasoning,
+            require_reasoning=processed_messages.require_reasoning,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
@@ -876,17 +1017,6 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         return adapted_request, request
-
-    def _collect_tools(self, request: ChatCompletionRequest) -> Optional[List[Tool]]:
-        tools = list(request.tools) if request.tools else []
-        for msg in request.messages:
-            if (
-                isinstance(msg, ChatCompletionMessageGenericParam)
-                and msg.role in ("system", "developer")
-                and msg.tools
-            ):
-                tools.extend(msg.tools)
-        return tools or None
 
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
@@ -918,9 +1048,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Apply chat template and its stop strings
         tools = None
+        tool_call_stop = None
         required_parsed_natively = False
-        all_tools = self._collect_tools(request)
-        if all_tools and request.tool_choice != "none":
+        effective_tools = self._effective_tools(request)
+        if effective_tools and request.tool_choice != "none":
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
                 tools = [
@@ -932,7 +1063,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser:
                 parser = FunctionCallParser(
-                    all_tools,
+                    effective_tools,
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                 )
@@ -942,18 +1073,22 @@ class OpenAIServingChat(OpenAIServingBase):
                     thinking_mode=xgrammar_reasoning,
                 )
                 required_parsed_natively = parser.detector.parses_required_natively()
-            # Fallback: use generic JSON schema for required/named tool choice
-            # only when no parser-specific constraint was set
+                if self.chat_encoding_spec == "kimi_k3":
+                    tool_call_stop = parser.detector.eot_token
             if (
                 tool_call_constraint is None
                 and not required_parsed_natively
+                and not (
+                    self.chat_encoding_spec == "kimi_k3"
+                    and self.tool_call_parser == "kimi_k3"
+                )
                 and (
                     request.tool_choice == "required"
                     or isinstance(request.tool_choice, ToolChoice)
                 )
             ):
                 json_schema = get_json_schema_constraint(
-                    all_tools,
+                    effective_tools,
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
@@ -976,7 +1111,18 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             result = self._apply_conversation_template(request, is_multimodal)
 
+        if tool_call_stop is not None:
+            if isinstance(result.stop, str):
+                result.stop = [result.stop]
+            elif result.stop is None:
+                result.stop = []
+            else:
+                result.stop = list(result.stop)
+            if tool_call_stop not in result.stop:
+                result.stop.append(tool_call_stop)
+
         result.tool_call_constraint = tool_call_constraint
+        result.require_reasoning = thinking_mode
         return result
 
     def _apply_jinja_template(
@@ -1005,7 +1151,9 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         messages = [msg.model_dump() for msg in request.messages]
         for message in messages:
-            normalize_assistant_tool_call_arguments(message)
+            normalize_assistant_tool_call_arguments(
+                message, strict=self.chat_encoding_spec != "kimi_k3"
+            )
 
         prompt_ids = self._encode_messages(
             copy.deepcopy(messages),
@@ -1015,10 +1163,7 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         if prompt_ids is not None:
-            # Custom encoding produced prompt_ids. Text-only encoders (dsv4/dsv32) need
-            # nothing more; Inkling is the only multimodal custom encoder and still needs the
-            # image/audio media harvested from the messages for the MM processor.
-            if self.chat_encoding_spec == "inkling":
+            if self.chat_encoding_spec in ("inkling", "kimi_k3"):
                 for message in request.messages:
                     msg_dict = message.model_dump()
                     if msg_dict.get("content") is None:
@@ -1031,81 +1176,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         audio_data,
                         modalities,
                     )
-        elif self.chat_encoding_spec == "kimi_k3":
-            # K3 ships no Jinja chat template; its tokenizer renders messages
-            # through the Python XTML encoding. Tokenize eagerly so structural
-            # markers keep their special-token ids while user- and
-            # tool-supplied text stays ordinary (re-encoding a rendered string
-            # would lose that distinction).
-            messages = copy.deepcopy(messages)
-            for i, msg in enumerate(messages):
-                if isinstance(msg.get("content"), list):
-                    messages[i] = self._flatten_kimi_k3_content(
-                        msg, image_data, video_data, audio_data
-                    )
-                elif msg.get("content") is None:
-                    msg["content"] = ""
-                elif isinstance(msg.get("content"), str):
-                    # String content (tool results, folded system turns) never
-                    # reaches _flatten_kimi_k3_content, so neutralize here too.
-                    msg["content"] = neutralize_kimi_k3_image_placeholder(
-                        msg["content"]
-                    )
-
-            for msg in messages:
-                if msg.get("role") == "developer":
-                    msg["role"] = "system"
-
-            messages, assistant_prefix = self._handle_last_assistant_message(
-                messages, request
-            )
-
-            template_kwargs = dict(request.chat_template_kwargs or {})
-            template_kwargs.pop("tokenize", None)
-            template_kwargs.pop("return_dict", None)
-            template_kwargs["image_prompts"] = ["<|media_pad|>"] * len(image_data)
-            # encoding_k3 accepts thinking_effort in {low, high, max} and
-            # asserts on anything else; "none" is handled at the protocol
-            # level by disabling thinking.
-            if (
-                request.reasoning_effort is not None
-                and "thinking_effort" not in template_kwargs
-            ):
-                if request.reasoning_effort in ("low", "high", "max"):
-                    template_kwargs["thinking_effort"] = request.reasoning_effort
-                elif request.reasoning_effort != "none":
-                    logger.warning(
-                        "Kimi K3 supports thinking_effort low/high/max; ignoring "
-                        "reasoning_effort=%r.",
-                        request.reasoning_effort,
-                    )
-
-            if isinstance(request.tool_choice, str):
-                template_kwargs.setdefault("tool_choice", request.tool_choice)
-            if request.response_format is not None:
-                template_kwargs.setdefault(
-                    "response_format",
-                    request.response_format.model_dump(by_alias=True),
-                )
-
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                tools=tools,
-                return_dict=False,
-                **template_kwargs,
-            )
-
-            if assistant_prefix:
-                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
-                    prompt_ids, assistant_prefix
-                )
-
-            # The multimodal processor consumes a text prompt and re-encodes
-            # around the media placeholders, so hand it the decoded prompt.
-            if is_multimodal:
-                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
         elif self.chat_encoding_spec is not None:
             # dsv4/dsv32 encoding path
             messages = copy.deepcopy(messages)
@@ -1732,12 +1802,16 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle tool calls
             tool_calls = None
-            all_tools = self._collect_tools(request)
-            if request.tool_choice != "none" and all_tools and self.tool_call_parser:
+            effective_tools = self._effective_tools(request)
+            if (
+                request.tool_choice != "none"
+                and effective_tools
+                and self.tool_call_parser
+            ):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
                 tool_calls, text, finish_reason = self._process_tool_calls(
                     text,
-                    all_tools,
+                    effective_tools,
                     finish_reason,
                     request.tool_choice,
                     history_tool_calls_cnt,
@@ -1875,23 +1949,19 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> str:
         """Process for generating a new and unique `tool_call_id`"""
         if self.tool_call_parser == "kimi_k3":
-            # Align with Kimi-K3 XTML format: {name}:{zero_based_ordinal}.
-            # The ordinal spans the whole conversation, so offset the local
-            # position by the number of history tool calls.
             return f"{call_item.name}:{history_tool_calls_cnt + call_item.tool_index}"
-        elif self.tool_call_parser != "kimi_k2":
-            # A simple uuid is sufficient for all models except for Kimi-K2/K3.
+        if self.tool_call_parser != "kimi_k2":
+            # A simple uuid is sufficient for all models except for Kimi-K2.
             tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
             return tool_call_id
-        else:
-            # Align with Kimi-K2 format: functions.{name}:{index}
-            # Kimi-K2 allows multiple tool_calls in one message; SGLang sets call_item.tool_index to the *local* position inside that message.
-            # Therefore, the index must be corrected by using `history_tool_calls_cnt + call_item.tool_index` to ensure globally unique and properly ordered.
-            tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt+call_item.tool_index}"
-            logger.debug(
-                f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
-            )
-            return tool_call_id
+        tool_call_id = (
+            f"functions.{call_item.name}:"
+            f"{history_tool_calls_cnt + call_item.tool_index}"
+        )
+        logger.debug(
+            f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
+        )
+        return tool_call_id
 
     def _process_tool_calls(
         self,
@@ -2070,7 +2140,6 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if self.reasoning_parser == "apertus2509":
             request.skip_special_tokens = False
-
         if self.reasoning_parser == "kimi_k3" or self.chat_encoding_spec == "kimi_k3":
             request.skip_special_tokens = False
 
@@ -2277,7 +2346,7 @@ class OpenAIServingChat(OpenAIServingBase):
         continuous_usage_stats: bool = False,
     ):
         """Process tool calls in streaming response"""
-        all_tools = self._collect_tools(request)
+        effective_tools = self._effective_tools(request)
         if index not in parser_dict:
             is_required = request.tool_choice == "required" or isinstance(
                 request.tool_choice, ToolChoice
@@ -2291,7 +2360,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 use_native_parser = False
                 if self.tool_call_parser:
                     probe = FunctionCallParser(
-                        tools=all_tools,
+                        tools=effective_tools,
                         tool_call_parser=self.tool_call_parser,
                         tokenizer=self.tokenizer_manager.tokenizer,
                     )
@@ -2305,7 +2374,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     parser_dict[index] = JsonArrayParser()
             else:
                 parser_dict[index] = FunctionCallParser(
-                    tools=all_tools,
+                    tools=effective_tools,
                     tool_call_parser=self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                 )
@@ -2314,7 +2383,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Handle both FunctionCallParser and JsonArrayParser
         if isinstance(parser, JsonArrayParser):
-            result = parser.parse_streaming_increment(delta, all_tools)
+            result = parser.parse_streaming_increment(delta, effective_tools)
             normal_text, calls = result.normal_text, result.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)

@@ -8,6 +8,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_kimi_k3,
 )
+from sglang.srt.runtime_context import get_context, get_exec, get_schedule
 from sglang.srt.server_args import CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
 
 if TYPE_CHECKING:
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 def maybe_disable_chunked_prefix_cache(
-    *, server_args: ServerArgs, use_mla_backend: bool, is_draft_worker: bool
+    *, use_mla_backend: bool, is_draft_worker: bool
 ) -> None:
     # Chunked prefix caching requires an MLA model on a backend whose
     # kernels read that layout. This is a load-time gate, not a
@@ -30,15 +31,15 @@ def maybe_disable_chunked_prefix_cache(
         return
     if (
         not use_mla_backend
-        or server_args.attention_backend
+        or get_exec().kernel.attention_backend
         not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
     ):
-        if not server_args.disable_chunked_prefix_cache:
-            server_args.override(
+        if not get_schedule().disable_chunked_prefix_cache:
+            get_context().override(
                 "model_runner.chunked_prefix_cache_gate",
                 disable_chunked_prefix_cache=True,
             )
-    if not server_args.disable_chunked_prefix_cache:
+    if not get_schedule().disable_chunked_prefix_cache:
         logger.info("Chunked prefix cache is turned on.")
 
 

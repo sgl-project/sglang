@@ -3218,9 +3218,14 @@ class DeepseekSparseAttnBackend(
 
             rope_positions = forward_batch.positions
             if dsa_use_prefill_cp(forward_batch):
-                rope_positions = cp_split_and_rebuild_position(
-                    forward_batch, rope_positions
-                )
+                if is_cp_v2_active(forward_batch):
+                    rope_positions = get_cp_strategy().shard_position_ids(
+                        rope_positions, forward_batch
+                    )
+                else:
+                    rope_positions = cp_split_and_rebuild_position(
+                        forward_batch, rope_positions
+                    )
 
             q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,

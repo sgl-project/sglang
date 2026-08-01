@@ -349,7 +349,7 @@ class DeepseekMLAForwardMixin:
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
         q_replicate_active = (
-            get_server_args().dcp_replicate_q_proj
+            get_parallel().dcp_replicate_q_proj
             and get_parallel().dcp_enabled
             and (
                 forward_batch.forward_mode.is_decode()
@@ -1040,7 +1040,7 @@ class DeepseekMLAForwardMixin:
                     attn_output, self.num_local_heads
                 )
             else:
-                dcp_comm_backend = get_server_args().dcp_comm_backend
+                dcp_comm_backend = get_parallel().dcp_comm_backend
                 if dcp_comm_backend in ("a2a", "fi_a2a"):
                     # A2A exchange of head partials + LSE, then local Triton combine.
                     # MLA decode LSE is base-2 (FlashInfer-MLA/FlashMLA) -> base_on_e=False.

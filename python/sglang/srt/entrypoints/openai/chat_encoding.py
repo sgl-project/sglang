@@ -16,7 +16,7 @@ def resolve_chat_encoding_spec(
     tokenizer: Any,
     tool_call_parser: Optional[str] = None,
 ) -> Optional[str]:
-    """Return the chat encoding spec for a model: "dsv4", "dsv32", "inkling", or None.
+    """Return the chat encoding spec for a model.
 
     None means the default path (HF chat template).
     """
