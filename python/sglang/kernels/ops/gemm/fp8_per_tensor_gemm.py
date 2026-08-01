@@ -6,66 +6,51 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.kernels.jit.utils import cache_once, load_jit, override_jit_cuda_arch
+from sglang.kernels.jit.utils import (
+    cache_once,
+    get_jit_cuda_arch,
+    load_jit,
+    override_jit_cuda_arch,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-_ARCH_SUFFIX = {89: "", 90: "a", 100: "a", 120: "a"}
-
-
-def _resolve_gemm_arch() -> int:
-    major, minor = torch.cuda.get_device_capability()
-    sm = major * 10 + minor
-    if sm >= 120:
-        return 120
-    if sm >= 100:
-        return 100
-    if sm >= 90:
-        return 90
-    if sm == 89:
-        return 89
-    raise RuntimeError(
-        f"fp8_per_tensor_scaled_mm has no implementation for compute capability {major}.{minor}"
-    )
-
-
-def _fp8_per_tensor_cuda_flags(arch: int) -> list[str]:
-    return [
-        "-DNDEBUG",
-        "-DCUTE_USE_PACKED_TUPLE=1",
-        "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
-        "-DCUTLASS_VERSIONS_GENERATED",
-        "-DCUTLASS_TEST_LEVEL=0",
-        "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1",
-        "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
-        f"-DSGL_FP8_GEMM_SM={arch}",
-    ]
+_CUDA_FLAGS = [
+    "-DNDEBUG",
+    "-DCUTE_USE_PACKED_TUPLE=1",
+    "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
+    "-DCUTLASS_VERSIONS_GENERATED",
+    "-DCUTLASS_TEST_LEVEL=0",
+    "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1",
+    "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+]
 
 
 @contextmanager
-def _fp8_per_tensor_arch_env(arch: int):
-    major, minor = torch.cuda.get_device_capability()
-    with override_jit_cuda_arch(major, minor, suffix=_ARCH_SUFFIX[arch]):
+def _cutlass_arch_env():
+    # CUTLASS gates its SM90+ arch macros on the sm_*a target; sm_*f misses them.
+    arch = get_jit_cuda_arch()
+    suffix = "a" if arch.major >= 9 else arch.suffix
+    with override_jit_cuda_arch(arch.major, arch.minor, suffix=suffix):
         yield
 
 
 @cache_once
-def _jit_fp8_per_tensor_module(arch: int) -> Module:
-    with _fp8_per_tensor_arch_env(arch):
+def _jit_fp8_per_tensor_module() -> Module:
+    with _cutlass_arch_env():
         return load_jit(
             "fp8_per_tensor_scaled_mm",
-            str(arch),
             cuda_files=["gemm/fp8_per_tensor/fp8_per_tensor_scaled_mm_entry.cuh"],
             cuda_wrappers=[
                 ("fp8_per_tensor_scaled_mm", "fp8_per_tensor_scaled_mm"),
             ],
             extra_dependencies=["cutlass"],
-            extra_cuda_cflags=_fp8_per_tensor_cuda_flags(arch),
+            extra_cuda_cflags=_CUDA_FLAGS,
         )
 
 
@@ -81,7 +66,7 @@ def _fp8_per_tensor_scaled_mm_custom_op(
     scales_b: torch.Tensor,
     bias: Optional[torch.Tensor],
 ) -> None:
-    module = _jit_fp8_per_tensor_module(_resolve_gemm_arch())
+    module = _jit_fp8_per_tensor_module()
     module.fp8_per_tensor_scaled_mm(out, mat_a, mat_b, scales_a, scales_b, bias)
 
 

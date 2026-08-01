@@ -20,20 +20,16 @@ limitations under the License.
 
 #include <sgl_kernel/utils.cuh>
 
-#ifndef SGL_FP8_GEMM_SM
-#error "SGL_FP8_GEMM_SM must be defined by the JIT build (89, 90, 100 or 120)"
-#endif
-
-#if SGL_FP8_GEMM_SM == 120
+#if SGL_CUDA_ARCH >= 1200
 #include "fp8_per_tensor_scaled_mm_sm120.cuh"
-#elif SGL_FP8_GEMM_SM == 100
+#elif SGL_CUDA_ARCH >= 1000
 #include "fp8_per_tensor_scaled_mm_sm100.cuh"
-#elif SGL_FP8_GEMM_SM == 90
+#elif SGL_CUDA_ARCH >= 900
 #include "fp8_per_tensor_scaled_mm_sm90.cuh"
-#elif SGL_FP8_GEMM_SM == 89
+#elif SGL_CUDA_ARCH >= 890
 #include "fp8_per_tensor_scaled_mm_sm89.cuh"
 #else
-#error "Unsupported SGL_FP8_GEMM_SM"
+#error "fp8_per_tensor_scaled_mm requires SM89 or later"
 #endif
 
 template <typename OutType>
@@ -45,13 +41,13 @@ void fp8_per_tensor_dispatch_arch(
     tvm::ffi::TensorView scales_b,
     tvm::ffi::Optional<tvm::ffi::TensorView> bias,
     cudaStream_t stream) {
-#if SGL_FP8_GEMM_SM == 120
+#if SGL_CUDA_ARCH >= 1200
   sm120_fp8_pertensor_dispatch_bias<OutType>(out, a, b, scales_a, scales_b, bias, stream);
-#elif SGL_FP8_GEMM_SM == 100
+#elif SGL_CUDA_ARCH >= 1000
   sm100_fp8_pertensor_dispatch_bias<OutType>(out, a, b, scales_a, scales_b, bias, stream);
-#elif SGL_FP8_GEMM_SM == 90
+#elif SGL_CUDA_ARCH >= 900
   sm90_fp8_pertensor_dispatch_shape<OutType>(out, a, b, scales_a, scales_b, bias, stream);
-#elif SGL_FP8_GEMM_SM == 89
+#else
   sm89_fp8_pertensor_dispatch_shape<OutType>(out, a, b, scales_a, scales_b, bias, stream);
 #endif
 }
