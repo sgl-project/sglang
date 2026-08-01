@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, List, Literal, Optional, TypeAlias, Union, cast
 
 import torch
-
 from sglang.kernels.jit.utils import is_hip_runtime
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
@@ -11,7 +11,18 @@ from sglang.kernels.ops.attention.dsv4 import (
     compress_forward,
     compress_norm_rope_store,
 )
+from sglang.kernels.ops.attention.dsv4.cp_compress import (
+    CPCompressorState,
+    cp_compress_aligned,
+    create_cp_compressor_state,
+)
+from sglang.srt.distributed.parallel_state import get_attn_cp_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+    is_dsa_prefill_cp_round_robin_split,
+)
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
@@ -26,6 +37,7 @@ CompressMetadata: TypeAlias = Union[CompressorDecodePlan, CompressorPrefillPlan]
 FusedCompressMetadata: TypeAlias = CompressMetadata
 
 _is_hip = is_hip_runtime()
+logger = logging.getLogger(__name__)
 
 
 def _use_online_compress(compress_ratio: int) -> bool:
@@ -130,6 +142,104 @@ class CompressorBackendMixin:
     def __init__(self):
         super().__init__()
         self.forward_metadata: DSV4Metadata
+        # Reused sequentially by all model layers; carries remain layer-local.
+        self._cp_compressor_states: dict[tuple[int, int], CPCompressorState] = {}
+        self._reported_cp_compressor_keys: set[tuple[int, int]] = set()
+
+    def initialize_cp_compressor_states(
+        self, device: torch.device, max_tokens: int
+    ) -> None:
+        """Collectively create stable peer objects before any model forward."""
+        if not envs.SGLANG_OPT_USE_CP_COMPRESS.get():
+            return
+        cp_group = get_attn_cp_group()
+        if cp_group.world_size != 4 or max_tokens <= 0:
+            raise ValueError("CP compressor requires CP4 and bounded chunked prefill")
+        for ratio, head_dim in ((4, 128), (4, 512), (128, 512)):
+            self._cp_compressor_states[(ratio, head_dim)] = create_cp_compressor_state(
+                cp_group.device_group,
+                cp_group.rank_in_group,
+                ratio,
+                head_dim,
+                max_tokens,
+                device,
+            )
+
+    def _cp_compress_context(
+        self,
+        forward_batch: ForwardBatch,
+        compressor: Compressor,
+        local_tokens: int,
+    ) -> Optional[tuple[int, int]]:
+        if (
+            not envs.SGLANG_OPT_USE_CP_COMPRESS.get()
+            or _is_hip
+            or not dsa_use_prefill_cp(forward_batch)
+            or not is_dsa_prefill_cp_round_robin_split()
+            or get_parallel().attn_cp_size != 4
+            or torch.cuda.is_current_stream_capturing()
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return None
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        seq_lens = forward_batch.seq_lens_cpu
+        if extend_lens is None or seq_lens is None or len(extend_lens) != 1:
+            return None
+        global_tokens = int(extend_lens[0])
+        total_tokens = int(seq_lens[0].item())
+        prefix_tokens = total_tokens - global_tokens
+        max_tokens = get_server_args().chunked_prefill_size
+        if (
+            max_tokens is None
+            or max_tokens <= 0
+            or global_tokens != local_tokens * 4
+            or not 0 < global_tokens <= max_tokens
+            or global_tokens % compressor.ratio
+            or prefix_tokens < 0
+            or prefix_tokens % compressor.ratio
+        ):
+            return None
+        plan = self._get_paged_compress_metadata(compressor.ratio)
+        if (
+            plan.is_decode
+            or plan.compress_ratio != compressor.ratio
+            or plan.plan_c.dtype != torch.uint8
+            or not plan.plan_c.is_contiguous()
+            or plan.plan_c.shape != (global_tokens // compressor.ratio, 16)
+        ):
+            return None
+        if compressor.ratio == 4:
+            state_buffer = compressor.get_state_pool(self).kv_score_buffer.kv_score
+            if (
+                plan.plan_w.dtype != torch.uint8
+                or not plan.plan_w.is_contiguous()
+                or plan.plan_w.ndim != 2
+                or plan.plan_w.shape[1] != 8
+                or state_buffer.dtype != torch.float32
+                or not state_buffer.is_contiguous()
+                or state_buffer.ndim != 2
+                or state_buffer.shape[1] != 4 * compressor.head_dim
+            ):
+                return None
+        elif plan.plan_w.shape[0] != 0:
+            return None
+        online_c128_mtp = getattr(self, "online_c128_mtp", None)
+        if online_c128_mtp is not None and online_c128_mtp.enabled():
+            return None
+        return global_tokens, prefix_tokens
+
+    def _get_cp_compressor_state(
+        self, compressor: Compressor, device: torch.device
+    ) -> CPCompressorState:
+        key = (compressor.ratio, compressor.head_dim)
+        state = self._cp_compressor_states.get(key)
+        if state is None:
+            raise RuntimeError(
+                "CP compressor peer objects were not initialized before forward"
+            )
+        if state.partial.device != device:
+            raise RuntimeError("CP compressor state is on the wrong device")
+        return state
 
     def _get_paged_compress_metadata(self, compress_ratio: int) -> CompressMetadata:
         attr_name = f"c{compress_ratio}_compress_metadata"
@@ -156,6 +266,7 @@ class CompressorBackendMixin:
         out_loc: torch.Tensor,
         use_fp4_indexer: bool = False,
         bf16_store: bool = False,
+        kv_compressed: Optional[torch.Tensor] = None,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -165,25 +276,26 @@ class CompressorBackendMixin:
             assert head_dim == 128
 
         plan = self._get_paged_compress_metadata(compress_ratio)
-        is_online = _use_online_compress(compress_ratio)
-        if is_online:
-            kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
-        else:
-            coff = 2 if is_overlap_compress(compress_ratio) else 1
-            last_dim = 2 * head_dim * coff
-            assert kv_score_buffer.shape[-1] == last_dim
-            kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
+        if kv_compressed is None:
+            is_online = _use_online_compress(compress_ratio)
+            if is_online:
+                kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
+            else:
+                coff = 2 if is_overlap_compress(compress_ratio) else 1
+                last_dim = 2 * head_dim * coff
+                assert kv_score_buffer.shape[-1] == last_dim
+                kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
 
-        # Step 1: compress_forward
-        kv_compressed = compress_forward(
-            kv_score_buffer=kv_score_buffer,
-            kv_score_input=kv_score_input,
-            ape=ape.view(-1, head_dim),
-            plan=plan,
-            compress_ratio=compress_ratio,
-            head_dim=head_dim,
-            is_online=is_online,
-        )
+            # Step 1: compress_forward
+            kv_compressed = compress_forward(
+                kv_score_buffer=kv_score_buffer,
+                kv_score_input=kv_score_input,
+                ape=ape.view(-1, head_dim),
+                plan=plan,
+                compress_ratio=compress_ratio,
+                head_dim=head_dim,
+                is_online=is_online,
+            )
 
         # Step 2: norm + rope + store
         compress_norm_rope_store(
@@ -211,7 +323,39 @@ class CompressorBackendMixin:
 
         token_to_kv_pool = self.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
-        kv_score_input = compressor.compute_kv_score(x, forward_batch)
+        cp_context = self._cp_compress_context(forward_batch, compressor, x.shape[0])
+        if cp_context is None:
+            kv_score_input = compressor.compute_kv_score(x, forward_batch)
+            kv_compressed = None
+        else:
+            _, prefix_tokens = cp_context
+            kv_score_input = compressor.compute_kv_score_local(x)
+            cp_state = self._get_cp_compressor_state(compressor, x.device)
+            key = (compressor.ratio, compressor.head_dim)
+            if key not in self._reported_cp_compressor_keys:
+                logger.info(
+                    "using memory-semantic CP compressor: ratio=%d, "
+                    "head_dim=%d, world_size=%d",
+                    compressor.ratio,
+                    compressor.head_dim,
+                    cp_state.world_size,
+                )
+                self._reported_cp_compressor_keys.add(key)
+            plan = self._get_paged_compress_metadata(compressor.ratio)
+            c4_state_buffer = (
+                compressor.get_state_pool(self).kv_score_buffer.kv_score
+                if compressor.ratio == 4
+                else None
+            )
+            kv_compressed = cp_compress_aligned(
+                cp_state,
+                kv_score_input,
+                compressor.ape.view(-1, compressor.head_dim),
+                prefix_tokens=prefix_tokens,
+                c4_plan_c=plan.plan_c if compressor.ratio == 4 else None,
+                c4_plan_w=plan.plan_w if compressor.ratio == 4 else None,
+                c4_state_buffer=c4_state_buffer,
+            )
 
         state_pool = compressor.get_state_pool(self)
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -267,6 +411,7 @@ class CompressorBackendMixin:
                 out_loc=out_loc,
                 use_fp4_indexer=use_fp4_indexer,
                 bf16_store=bf16_store,
+                kv_compressed=kv_compressed,
             )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:

@@ -502,6 +502,10 @@ class DeepseekV4AttnBackend(
         super().__init__()
         self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
+        if envs.SGLANG_OPT_USE_CP_COMPRESS.get():
+            self.initialize_cp_compressor_states(
+                self.device, int(model_runner.server_args.chunked_prefill_size)
+            )
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
         assert (
