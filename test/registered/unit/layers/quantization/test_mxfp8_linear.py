@@ -38,6 +38,25 @@ class TestMxfp8LinearMethod(CustomTestCase):
                 MoeRunnerBackend.FLASHINFER_TRTLLM,
             )
 
+    def test_mxfp8_auto_selects_flashinfer_cutlass_on_sm120(self):
+        for quantization in ("mxfp8", "modelopt_mixed"):
+            with (
+                self.subTest(quantization=quantization),
+                patch.object(fp8_utils, "FP8_GEMM_RUNNER_BACKEND", None),
+                patch.object(fp8_utils, "_is_sm100_supported", False),
+                patch.object(fp8_utils, "is_sm120_supported", return_value=True),
+                patch.object(fp8_utils, "is_flashinfer_available", return_value=True),
+            ):
+                fp8_utils.initialize_fp8_gemm_config(
+                    SimpleNamespace(
+                        fp8_gemm_runner_backend="auto", quantization=quantization
+                    )
+                )
+                self.assertEqual(
+                    fp8_utils.get_fp8_gemm_runner_backend(),
+                    Fp8GemmRunnerBackend.FLASHINFER_CUTLASS,
+                )
+
     def test_modelopt_mixed_explicit_fp8_gemm_backend_is_preserved(self):
         for requested in ("flashinfer_cutlass", "flashinfer_trtllm", "triton"):
             with (
