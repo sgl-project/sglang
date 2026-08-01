@@ -23,11 +23,6 @@ import torch
 import triton
 import triton.language as tl
 
-try:
-    pass
-except:
-    pass
-
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
 from sglang.srt.layers import deep_gemm_wrapper

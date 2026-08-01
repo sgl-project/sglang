@@ -820,8 +820,6 @@ class Fp8LinearMethod(LinearMethodBase):
             else:
                 scale_packed = scale_fp32
             copy_or_rebind_param(layer, "weight_scale_inv_deepgemm", scale_packed)
-        else:
-            return
 
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
