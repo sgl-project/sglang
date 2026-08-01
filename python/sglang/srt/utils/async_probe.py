@@ -87,7 +87,7 @@ def sanitize_nan_logits(
         full_nan_mask = torch.isnan(logits).all(dim=-1)
     maybe_warn_nan(logits, msg)
     torch.nan_to_num_(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
-    return full_nan_mask if return_full_nan_mask else None
+    return full_nan_mask
 
 
 def maybe_detect_nan(tensor: Optional[torch.Tensor], msg: str = ""):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from http import HTTPStatus
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,

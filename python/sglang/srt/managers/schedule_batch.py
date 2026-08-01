@@ -1524,7 +1524,24 @@ class Req(ReqDllmMixin):
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
 
-    def set_finish_with_abort(self, error_msg: str):
+    def set_finish_with_abort(
+        self,
+        error_msg: str,
+        status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+        err_type: str = "BadRequestError",
+        skip_radix_cache_insert: bool = False,
+    ):
+        """Mark the request as finished with an abort.
+
+        Args:
+            error_msg: Human-readable error message.
+            status_code: HTTP status code returned to the client.
+            err_type: Error type string for the response payload.
+            skip_radix_cache_insert: When True, the request's KV is not inserted
+                into the prefix cache. Used for runtime failures (e.g. a
+                fully-NaN logits row) where the corrupted KV must not be shared
+                with other requests.
+        """
         if get_tensor_model_parallel_rank() == 0:
             logger.error(f"{error_msg}, {self.rid=}")
         self.multimodal_inputs = None
@@ -1534,29 +1551,9 @@ class Req(ReqDllmMixin):
         )  # set it to one token to skip the long prefill
         self.return_logprob = False
         self.logprob_start_len = -1
-        self.to_finish = FINISH_ABORT(
-            error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
-        )
-
-    def set_finish_with_internal_error(self, error_msg: str):
-        """Mark the request as finished with a 500-style abort.
-
-        Used for runtime failures that are not the client's fault (e.g. a
-        fully-NaN logits row that would otherwise be sampled as garbage). The
-        request is not inserted into the prefix cache so the poisoned KV cannot
-        be shared with other requests."""
-        if get_tensor_model_parallel_rank() == 0:
-            logger.error(f"{error_msg}, {self.rid=}")
-        self.multimodal_inputs = None
-        self.grammar = None
-        self.origin_input_ids = array("q", [0])
-        self.return_logprob = False
-        self.logprob_start_len = -1
-        # Do not let the corrupted KV be shared via the prefix cache.
-        self.skip_radix_cache_insert = True
-        self.to_finish = FINISH_ABORT(
-            error_msg, HTTPStatus.INTERNAL_SERVER_ERROR, "InternalServerError"
-        )
+        if skip_radix_cache_insert:
+            self.skip_radix_cache_insert = True
+        self.to_finish = FINISH_ABORT(error_msg, status_code, err_type)
 
     def update_reasoning_tokens(self, token_id, think_end_id):
         if self._is_reasoning_over:
