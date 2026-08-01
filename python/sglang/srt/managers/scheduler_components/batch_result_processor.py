@@ -917,10 +917,13 @@ class SchedulerBatchResultProcessor:
         aborted: set = set()
         for i, req in enumerate(batch.reqs):
             if i < mask_cpu.shape[0] and bool(mask_cpu[i]):
-                req.set_finish_with_internal_error(
+                req.set_finish_with_abort(
                     "Aborted: next-token logits were entirely NaN "
                     "(SGLANG_ABORT_ON_FULL_NAN_LOGITS). "
-                    "Sampling would have produced a uniform-random token."
+                    "Sampling would have produced a uniform-random token.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    err_type="InternalServerError",
+                    skip_radix_cache_insert=True,
                 )
                 aborted.add(i)
         if aborted:
