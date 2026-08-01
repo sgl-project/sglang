@@ -250,7 +250,7 @@ async fn drain_unary(
 /// multiplex their streams into one SSE response, each frame carrying its `index`.
 /// One [`AbortGuard`] covers the batch. A failed unary item is its own
 /// `{ "error": … }` entry; the batch response is 200.
-async fn generate_batch(
+pub(super) async fn generate_batch(
     state: &AppState,
     requests: Vec<GenerateRequest>,
     stream: bool,
