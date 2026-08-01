@@ -17,10 +17,10 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
     MambaComponent,
 )
-from sglang.srt.mem_cache.unified_cache_components.tree_component import TreeComponent
+from sglang.srt.mem_cache.unified_cache.components.tree_component import TreeComponent
 
 _CACHE_ATTRS = ("offset", "lengths", "left_padding")
 _MISSING = object()

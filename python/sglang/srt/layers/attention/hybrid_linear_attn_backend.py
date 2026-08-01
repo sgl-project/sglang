@@ -1,9 +1,14 @@
+from __future__ import annotations
+
 import logging
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
+from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
+    fused_replay_state_indices,
+)
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_if_needed,
@@ -19,9 +24,12 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_memory, get_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.verify_mask import VerifyMask
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +44,16 @@ class MambaAttnBackendBase(AttentionBackend):
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_unified_memory = model_runner.server_args.enable_unified_memory
+        # Fused replay-prep state-indices fast path (fused_replay_state_indices):
+        # requires the static hybrid pool whose v2p translate is the identity —
+        # the unified pool overrides translate_mamba_indices with an allocator
+        # lookup that is not a flat table gather.
+        self._fused_state_indices_ok = (
+            str(self.device).startswith("cuda")
+            and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+            and type(self.req_to_token_pool).translate_mamba_indices
+            is HybridReqToTokenPool.translate_mamba_indices
+        )
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place
@@ -242,6 +260,30 @@ class MambaAttnBackendBase(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self._forward_metadata(forward_batch)
 
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # Plan-stream fixup: slot indices / static query_start_loc are
+        # draft-independent, but tree verify (topk > 1) copies the
+        # draft-produced tree links into the captured buffers on the plan
+        # stream, racing the draft — re-copy after the stream join. Eager
+        # verify reads the spec_info tensors directly; parent links are
+        # derived from these buffers at execution time.
+        if self.topk <= 1 or cuda_graph_bs is None:
+            return
+        if (
+            not isinstance(spec_info, EagleVerifyInput)
+            or spec_info.retrieve_next_token is None  # dummy / capture runs
+        ):
+            return
+        bs_without_pad = spec_info.retrieve_next_token.shape[0]
+        self.retrieve_next_token_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
+            spec_info.retrieve_next_token
+        )
+        self.retrieve_next_sibling_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
+            spec_info.retrieve_next_sibling
+        )
+
     def _init_track_conv_indices(
         self, query_start_loc: torch.Tensor, forward_batch: ForwardBatch
     ):
@@ -350,7 +392,7 @@ class MambaAttnBackendBase(AttentionBackend):
         """Per-row (length bs) bool flush mask = the radix track's seq_lens_cpu %
         mamba_track_interval == 0, so force-flush and snapshot fire on the same
         steps (no off-by-one)."""
-        interval = get_server_args().mamba_track_interval
+        interval = get_exec().mamba.mamba_track_interval
         if seq_lens_cpu is None:
             # Should not happen for the supported config; stay safe and never flush.
             return torch.zeros((bs,), dtype=torch.bool)
@@ -507,22 +549,37 @@ class MambaAttnBackendBase(AttentionBackend):
                 num_padding = torch.count_nonzero(
                     seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
                 )
-        # Make sure forward metadata is correctly handled for padding reqs
-        req_pool_indices[bs - num_padding :] = 0
-        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        # Translate using the LIVE v2p table BEFORE the padding sentinel below;
-        # captured Mamba kernels read state_indices_list as PHYSICAL ids.
-        mamba_indices = self._translate_mamba_indices(mamba_indices)
-        mamba_indices[bs - num_padding :] = -1
-        self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        if self._fused_state_indices_ok and self.replayssm_write_pos_list is None:
+            # Single-launch fast path: mapping gather + padding sentinel + store
+            # into the static buffer, plus zeroing padded req_pool_indices rows —
+            # bit-identical to the reference chain below.
+            mamba_indices = fused_replay_state_indices(
+                req_pool_indices=req_pool_indices,
+                mamba_index_mapping=self.req_to_token_pool.req_index_to_mamba_index_mapping,
+                out_state_indices=self.state_indices_list[bs - 1],
+                valid_bs=bs - int(num_padding),
+                total_bs=bs,
+            )
+        else:
+            # Make sure forward metadata is correctly handled for padding reqs
+            req_pool_indices[bs - num_padding :] = 0
+            mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+            # Translate using the LIVE v2p table BEFORE the padding sentinel below;
+            # captured Mamba kernels read state_indices_list as PHYSICAL ids.
+            mamba_indices = self._translate_mamba_indices(mamba_indices)
+            mamba_indices[bs - num_padding :] = -1
+            self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
+        # Hand out only the refreshed [:bs] prefix — Mamba2's track-save slices
+        # [-num_decodes:], which on the full max_bs buffer binds the stale tail.
         track_buf = None
         if mamba_track_indices is not None:
-            track_buf = self.mamba_track_indices_buf
-            track_buf[: len(mamba_track_indices)].copy_(
-                self._translate_mamba_indices(mamba_track_indices)
-            )
+            assert (
+                len(mamba_track_indices) >= bs
+            ), f"{len(mamba_track_indices)=} < {bs=}"
+            track_buf = self.mamba_track_indices_buf[:bs]
+            track_buf.copy_(self._translate_mamba_indices(mamba_track_indices[:bs]))
         # Refresh the static write cursor in-place (mirrors the eager
         # snapshot-then-advance). Skip the advance during capture: dummy slots
         # would corrupt real ring positions.
@@ -675,16 +732,18 @@ class MambaAttnBackendBase(AttentionBackend):
     def _track_mamba_state_extend(
         self,
         forward_batch: ForwardBatch,
-        h: torch.Tensor,
+        h: Optional[torch.Tensor],
         ssm_states: torch.Tensor,
         forward_metadata: ForwardMetadata,
     ):
         """Copy extend SSM state at the last chunk boundary to track slots (source
         depends on chunk alignment; see `_init_track_ssm_indices`)."""
         if forward_metadata.has_mamba_track_mask:
-            h = h.squeeze(0)
-
+            # Triton always returns h; FlashInfer returns it only when checkpoints
+            # were requested. Aligned-only tracking reads the final state below.
             if forward_metadata.track_ssm_h_src.numel() > 0:
+                assert h is not None
+                h = h.squeeze(0)
                 ssm_states[forward_metadata.track_ssm_h_dst] = h[
                     forward_metadata.track_ssm_h_src
                 ].to(ssm_states.dtype, copy=False)
@@ -764,7 +823,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         # Page-major stores state strided; only the stride-aware Triton causal-conv
         # reads it (CUDA causal_conv1d garbles it). A model may also force Triton.
         use_triton_causal_conv = (
-            use_triton_causal_conv or get_server_args().enable_page_major_kv_layout
+            use_triton_causal_conv or get_memory().enable_page_major_kv_layout
         )
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         mixer_out, intermediate_states = mixer.forward(
@@ -865,6 +924,22 @@ class HybridLinearAttnBackend(AttentionBackend):
     def on_after_cuda_graph_warmup(self):
         for attn_backend in self.attn_backend_list:
             attn_backend.on_after_cuda_graph_warmup()
+
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        # The mask lives on the full-attn child; the linear side reads none.
+        return self.full_attn_backend.verify_mask
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # Plan-stream fixup after draft completes: forward to both children.
+        # Sub-backends that cannot run under the plan stream keep the fail-loud
+        # NotImplementedError base behavior.
+        for attn_backend in self.attn_backend_list:
+            attn_backend.update_verify_buffers_to_fill_after_draft(
+                spec_info=spec_info, cuda_graph_bs=cuda_graph_bs
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():
@@ -1033,8 +1108,15 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
+        req_pool_indices: Optional[torch.Tensor] = None,
     ):
-        """Update mamba states after MTP verify via a fused gather-scatter kernel."""
+        """Update mamba states after MTP verify via a fused gather-scatter kernel.
+
+        ``req_pool_indices`` serves implementations that must re-derive the state
+        slot ids instead of reusing this step's ``forward_metadata``; the scatter
+        below reads the metadata it just planned.
+        """
+        del req_pool_indices
         request_number = last_correct_step_indices.shape[0]
 
         state_indices_tensor = (

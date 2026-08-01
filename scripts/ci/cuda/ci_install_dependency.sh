@@ -304,28 +304,28 @@ install_sglang() {
 }
 
 install_sglang_kernel() {
-    SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/pyproject.toml)
+    SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' python/sglang/kernels/aot/pyproject.toml)
     SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sglang-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
     echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNEL_VERSION_FROM_SRT=${SGL_KERNEL_VERSION_FROM_SRT}"
 
-    if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ -d "sgl-kernel/dist" ]; then
-        ls -alh sgl-kernel/dist
+    if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ -d "python/sglang/kernels/aot/dist" ]; then
+        ls -alh python/sglang/kernels/aot/dist
         if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
             WHEEL_ARCH="aarch64"
         else
             WHEEL_ARCH="x86_64"
         fi
-        KERNEL_WHL=$(ls sgl-kernel/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${CU_VERSION}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1 || true)
+        KERNEL_WHL=$(ls python/sglang/kernels/aot/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${CU_VERSION}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1 || true)
         if [ -z "$KERNEL_WHL" ]; then
-            echo "ERROR: No matching sgl-kernel wheel found in sgl-kernel/dist/ for version ${SGL_KERNEL_VERSION_FROM_KERNEL} arch ${WHEEL_ARCH} cuda ${CU_VERSION}"
-            ls -alh sgl-kernel/dist/
+            echo "ERROR: No matching sgl-kernel wheel found in python/sglang/kernels/aot/dist/ for version ${SGL_KERNEL_VERSION_FROM_KERNEL} arch ${WHEEL_ARCH} cuda ${CU_VERSION}"
+            ls -alh python/sglang/kernels/aot/dist/
             exit 1
         fi
         echo "Installing sgl-kernel wheel: $KERNEL_WHL"
         $PIP_CMD install "$KERNEL_WHL" --force-reinstall $PIP_INSTALL_SUFFIX
     else
-        if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ ! -d "sgl-kernel/dist" ]; then
-            echo "ERROR: CUSTOM_BUILD_SGL_KERNEL=true but sgl-kernel/dist not found."
+        if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ ! -d "python/sglang/kernels/aot/dist" ]; then
+            echo "ERROR: CUSTOM_BUILD_SGL_KERNEL=true but python/sglang/kernels/aot/dist not found."
             echo "This usually happens when rerunning a stage without the sgl-kernel-build-wheels job."
             echo "Please re-run the full workflow using /tag-and-rerun-ci to rebuild the kernel."
             exit 1
@@ -469,8 +469,14 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    MOONCAKE_VERSION="0.3.11.post1"
+    MOONCAKE_VERSION="0.3.12.post1"
     NIXL_VERSION="1.3.0"
+    # sgl-eval is git-only and cannot be declared in python/pyproject.toml (see
+    # the note there). The nightly GSM8K eval shells out to the sgl-eval CLI and
+    # fails without it. Bumping the SHA can change zero-shot \boxed{} grading, so
+    # re-baseline MODEL_SCORE_THRESHOLDS in
+    # test/registered/eval/test_text_models_gsm8k_eval.py first.
+    SGL_EVAL_REF="b2a2703c42cae379bbcb8b7ff092df6601a61694"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
@@ -505,6 +511,8 @@ install_extra_deps() {
         $PIP_CMD install "nixl==${NIXL_VERSION}" "${NIXL_BIN_NAME}==${NIXL_VERSION}" \
             --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
     fi
+
+    $PIP_CMD install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@${SGL_EVAL_REF}" $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
