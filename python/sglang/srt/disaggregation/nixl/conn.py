@@ -399,8 +399,17 @@ class NixlKVManager(CommonKVManager):
         self.transfer_source_rank = (
             self.kv_args.pp_rank * self.server_args.tp_size + self.kv_args.engine_rank
         )
+        local_kv_mem_kinds = getattr(self.kv_args, "kv_data_mem_kinds", None)
+        if local_kv_mem_kinds is None:
+            # Fail closed: silently defaulting to VRAM would register a host
+            # buffer with a device mem type, which transfers without erroring
+            # and corrupts the destination KV instead of failing loudly.
+            raise ValueError(
+                "kv_args.kv_data_mem_kinds must be populated by the KVArgs "
+                "construction site before NIXL registers memory"
+            )
         self.kv_args.kv_data_mem_kinds = _normalize_kv_mem_kinds(
-            getattr(self.kv_args, "kv_data_mem_kinds", None),
+            local_kv_mem_kinds,
             len(self.kv_args.kv_data_ptrs),
         )
         self.src_mem_kind = (
