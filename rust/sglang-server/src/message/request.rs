@@ -299,6 +299,9 @@ impl GenerateBody {
                 rid,
                 text,
                 input_ids,
+                // Native text prompts keep the post-processor specials; the
+                // chat flow sets this explicitly.
+                skip_special_tokens: false,
                 sampling_params,
                 stream,
                 // Python `GenerateReqInput` defaults.
@@ -355,6 +358,12 @@ pub struct GenerateRequest {
     pub text: Option<String>,
     /// Client-supplied token ids, or filled by the Tokenizer stage.
     pub input_ids: Option<TokenIds>,
+    /// Template-rendered prompts (chat) already contain their role/special
+    /// tokens, so the tokenizer pool strips the auto-added BOS/EOS prefix —
+    /// the Rust analogue of Python's `add_special_tokens=False` at the
+    /// chat-template encode site (`serving_chat._encode_messages`). Consumed
+    /// by the pool before the header is built; never reaches the scheduler wire.
+    pub skip_special_tokens: bool,
     /// Sampling params (defaults when the client sent none, as in Python);
     /// normalized + verified at ingress, then serialized into the header.
     pub sampling_params: SamplingParams,

@@ -60,54 +60,40 @@ pub(super) fn routes() -> Router<AppState> {
         .merge(responses::routes())
 }
 
-pub(super) fn load_chat_support(
-    server_args: &ServerArgs,
-) -> (Option<ChatFormatter>, Option<dynamo_tokenizers::Tokenizer>) {
+/// Resolve the chat formatter, or `None` to disable the OpenAI chat/responses
+/// endpoints. Tokenization is the tokenizer pool's job (the api server never
+/// encodes); the formatter needs at most `tokenizer_config.json` — a built-in
+/// `--chat-template` name or a model-path-inferred legacy template resolve
+/// without it, so its absence must not disable chat.
+pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatter> {
+    // Chat needs the tokenizer pool behind it: under `skip_tokenizer_init`
+    // there is none (text cannot be submitted), so chat is disabled.
     if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
-        return (None, None);
+        return None;
     }
-    let Some(tokenizer_file) = crate::tokenizer::resolve_model_file(
-        &server_args.tokenizer_path,
-        server_args.revision.as_deref(),
-        "tokenizer.json",
-    ) else {
-        return (None, None);
-    };
-    // `tokenizer_config.json` is only needed for the HF-template sources —
-    // a built-in `--chat-template` name and a model-path-inferred legacy
-    // template resolve without it, so its absence must not disable chat.
     let config_file = crate::tokenizer::resolve_model_file(
         &server_args.tokenizer_path,
         server_args.revision.as_deref(),
         "tokenizer_config.json",
     );
 
-    let formatter = template::load_chat_formatter(
+    match template::load_chat_formatter(
         config_file.as_deref(),
         (!server_args.model_path.is_empty()).then_some(server_args.model_path.as_str()),
         server_args.chat_template.as_deref(),
-    );
-    let tokenizer = dynamo_tokenizers::Tokenizer::from_file_with_options(
-        &tokenizer_file,
-        dynamo_tokenizers::TokenizerOptions {
-            add_special_tokens: false,
-        },
-    )
-    .map_err(|error| error.to_string());
-
-    let error = match (formatter, tokenizer) {
-        (Ok(formatter), Ok(tokenizer)) => {
+    ) {
+        Ok(formatter) => {
             tracing::info!(
                 config = ?config_file.as_deref().unwrap_or("<built-in / inferred>"),
                 "loaded OpenAI chat template"
             );
-            return (Some(formatter), Some(tokenizer));
+            Some(formatter)
         }
-        (Err(error), _) => error.to_string(),
-        (_, Err(error)) => error,
-    };
-    tracing::warn!(%error, "OpenAI chat completions disabled");
-    (None, None)
+        Err(error) => {
+            tracing::warn!(%error, "OpenAI chat completions disabled");
+            None
+        }
+    }
 }
 
 fn unix_seconds() -> u64 {

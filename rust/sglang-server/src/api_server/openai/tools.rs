@@ -45,8 +45,8 @@ use dynamo_parsers::{
 use dynamo_protocols::types::{
     ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCall,
     ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta,
-    CreateChatCompletionStreamResponse, FinishReason as OpenAIFinishReason, FunctionCall,
-    FunctionCallStream, FunctionType, Role,
+    ChatCompletionToolChoiceOption, CreateChatCompletionStreamResponse,
+    FinishReason as OpenAIFinishReason, FunctionCall, FunctionCallStream, FunctionType, Role,
 };
 use futures::StreamExt;
 
@@ -329,10 +329,26 @@ pub(super) fn dynamo_parser_name(parser: &str) -> &str {
     }
 }
 
-/// Turn `tool_choice` into a sampling constraint, mirroring Python's
-/// `serving_chat` logic. Returns an error for a `tool_choice` that disagrees
-/// with `tools` (required/named with nothing to select) or a parser Dynamo
-/// does not know.
+/// Map the OpenAI wire `tool_choice` onto the Dynamo choice. Shared by the
+/// chat and responses handlers; a missing/auto choice reads as `Auto`.
+pub(super) fn dynamo_tool_choice(
+    choice: &Option<ChatCompletionToolChoiceOption>,
+) -> DynamoToolChoice {
+    match choice {
+        Some(ChatCompletionToolChoiceOption::None) => DynamoToolChoice::None,
+        Some(ChatCompletionToolChoiceOption::Required) => DynamoToolChoice::Required,
+        Some(ChatCompletionToolChoiceOption::Named(choice)) => {
+            DynamoToolChoice::Named(choice.function.name.clone())
+        }
+        Some(ChatCompletionToolChoiceOption::Auto) | None => DynamoToolChoice::Auto,
+    }
+}
+
+/// Validate `tool_choice` against `tools`, then — when a tool-call `parser`
+/// is configured — turn it into a sampling constraint, mirroring Python's
+/// `serving_chat` logic. Validation runs even without a parser, so an invalid
+/// choice (required/named with nothing to select) is rejected before
+/// submission in every mode.
 ///
 /// Prefers a structural-tag constraint: the parser's own registered builder,
 /// or — for llama3 with strict tools under `auto` — a triggered-tag builder
@@ -342,7 +358,7 @@ pub(super) fn dynamo_parser_name(parser: &str) -> &str {
 /// `parallel_tool_calls` is false).
 pub(super) fn apply_tool_constraint(
     sampling: &mut SamplingParams,
-    parser: &str,
+    parser: Option<&str>,
     tool_choice: &DynamoToolChoice,
     tools: &[ToolDefinition],
     parallel_tool_calls: Option<bool>,
@@ -361,6 +377,9 @@ pub(super) fn apply_tool_constraint(
         ));
     }
 
+    let Some(parser) = parser else {
+        return Ok(()); // validation only
+    };
     let parser = dynamo_parser_name(parser);
     let config = get_tool_parser_map()
         .get(parser)
@@ -520,7 +539,8 @@ pub(super) fn chat_finish_reason(output: &ChunkEvent) -> Option<OpenAIFinishReas
 mod tests {
     use super::{
         apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name,
-        parse_chat_tool_calls, parse_streaming_tool_calls, partial_marker_suffix_len,
+        dynamo_tool_choice, parse_chat_tool_calls, parse_streaming_tool_calls,
+        partial_marker_suffix_len,
     };
     use crate::message::{ChunkEvent, SamplingParams};
     use dynamo_parsers::tool_calling::jail::Annotated;
@@ -528,7 +548,8 @@ mod tests {
     use dynamo_protocols::types::CreateChatCompletionStreamResponse as StreamResponse;
     use dynamo_protocols::types::{
         ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCallChunk,
-        FinishReason as OpenAIFinishReason, FunctionCallStream, FunctionType, Role,
+        ChatCompletionNamedToolChoice, ChatCompletionToolChoiceOption, ChatCompletionToolType,
+        FinishReason as OpenAIFinishReason, FunctionCallStream, FunctionName, FunctionType, Role,
     };
     use futures::{StreamExt, stream};
 
@@ -644,7 +665,7 @@ mod tests {
         let mut sampling = SamplingParams::default();
         apply_tool_constraint(
             &mut sampling,
-            "llama3",
+            Some("llama3"),
             &DynamoToolChoice::Required,
             &[tool("get_weather", true)],
             Some(false),
@@ -666,7 +687,7 @@ mod tests {
         let mut sampling = SamplingParams::default();
         apply_tool_constraint(
             &mut sampling,
-            "llama3",
+            Some("llama3"),
             &DynamoToolChoice::Required,
             &[tool("get_weather", false)],
             None,
@@ -684,7 +705,7 @@ mod tests {
         let mut sampling = SamplingParams::default();
         apply_tool_constraint(
             &mut sampling,
-            "llama3",
+            Some("llama3"),
             &DynamoToolChoice::Named("get_time".into()),
             &tools,
             None,
@@ -702,7 +723,7 @@ mod tests {
         let mut sampling = SamplingParams::default();
         apply_tool_constraint(
             &mut sampling,
-            "llama3",
+            Some("llama3"),
             &DynamoToolChoice::Auto,
             &[tool("get_weather", true)],
             None,
@@ -724,7 +745,7 @@ mod tests {
         let mut sampling = SamplingParams::default();
         apply_tool_constraint(
             &mut sampling,
-            "llama3",
+            Some("llama3"),
             &DynamoToolChoice::Auto,
             &[tool("get_weather", false)],
             None,
@@ -737,7 +758,14 @@ mod tests {
     #[test]
     fn tool_choice_none_is_a_no_op() {
         let mut sampling = SamplingParams::default();
-        apply_tool_constraint(&mut sampling, "llama3", &DynamoToolChoice::None, &[], None).unwrap();
+        apply_tool_constraint(
+            &mut sampling,
+            Some("llama3"),
+            &DynamoToolChoice::None,
+            &[],
+            None,
+        )
+        .unwrap();
         assert!(sampling.json_schema.is_none());
         assert!(sampling.structural_tag.is_none());
     }
@@ -747,7 +775,7 @@ mod tests {
         let mut sampling = SamplingParams::default();
         let error = apply_tool_constraint(
             &mut sampling,
-            "llama3",
+            Some("llama3"),
             &DynamoToolChoice::Required,
             &[],
             None,
@@ -757,7 +785,7 @@ mod tests {
 
         let error = apply_tool_constraint(
             &mut sampling,
-            "llama3",
+            Some("llama3"),
             &DynamoToolChoice::Named("missing".into()),
             &[tool("get_weather", false)],
             None,
@@ -766,12 +794,72 @@ mod tests {
         assert!(error.contains("missing"));
     }
 
+    /// Validation runs even without a parser (the handler calls this in every
+    /// mode), so an invalid choice is rejected before submission there too.
+    #[test]
+    fn missing_parser_still_validates_the_tool_choice() {
+        let mut sampling = SamplingParams::default();
+        let error =
+            apply_tool_constraint(&mut sampling, None, &DynamoToolChoice::Required, &[], None)
+                .unwrap_err();
+        assert!(error.contains("required"));
+        let error = apply_tool_constraint(
+            &mut sampling,
+            None,
+            &DynamoToolChoice::Named("missing".into()),
+            &[tool("get_weather", false)],
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("missing"));
+        // A valid choice with no parser stays unconstrained.
+        apply_tool_constraint(
+            &mut sampling,
+            None,
+            &DynamoToolChoice::Auto,
+            &[tool("get_weather", false)],
+            None,
+        )
+        .unwrap();
+        assert!(sampling.json_schema.is_none());
+        assert!(sampling.structural_tag.is_none());
+    }
+
+    #[test]
+    fn dynamo_tool_choice_maps_the_openai_wire_values() {
+        let named = |name: &str| {
+            Some(ChatCompletionToolChoiceOption::Named(
+                ChatCompletionNamedToolChoice {
+                    r#type: ChatCompletionToolType::Function,
+                    function: FunctionName { name: name.into() },
+                },
+            ))
+        };
+        assert!(matches!(dynamo_tool_choice(&None), DynamoToolChoice::Auto));
+        assert!(matches!(
+            dynamo_tool_choice(&Some(ChatCompletionToolChoiceOption::Auto)),
+            DynamoToolChoice::Auto
+        ));
+        assert!(matches!(
+            dynamo_tool_choice(&Some(ChatCompletionToolChoiceOption::Required)),
+            DynamoToolChoice::Required
+        ));
+        assert!(matches!(
+            dynamo_tool_choice(&Some(ChatCompletionToolChoiceOption::None)),
+            DynamoToolChoice::None
+        ));
+        assert!(matches!(
+            dynamo_tool_choice(&named("get_weather")),
+            DynamoToolChoice::Named(name) if name == "get_weather"
+        ));
+    }
+
     #[test]
     fn unsupported_parser_is_rejected() {
         let mut sampling = SamplingParams::default();
         let error = apply_tool_constraint(
             &mut sampling,
-            "not-a-parser",
+            Some("not-a-parser"),
             &DynamoToolChoice::Auto,
             &[tool("get_weather", false)],
             None,

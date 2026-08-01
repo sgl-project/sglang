@@ -30,9 +30,6 @@ struct AppState {
     /// workers. OpenAI also uses it for token-ID prompt echo.
     tokenizer: Option<dynamo_tokenizers::Tokenizer>,
     chat_formatter: Option<openai::ChatFormatter>,
-    /// Chat templates already contain their special tokens, so their rendered
-    /// prompts must be encoded without adding another BOS/EOS.
-    chat_tokenizer: Option<dynamo_tokenizers::Tokenizer>,
     response_store: openai::ResponseStore,
     /// Egress heartbeat (bumped per drained ring frame).
     egress_activity: ActivityCounter,
@@ -50,14 +47,13 @@ pub async fn serve(
     // releases.
     shutdown: flume::Receiver<()>,
 ) {
-    let (chat_formatter, chat_tokenizer) = openai::load_chat_support(&server_args);
+    let chat_formatter = openai::load_chat_support(&server_args);
     let state = AppState {
         senders,
         egress_buf,
         server_args: server_args.clone(),
         tokenizer,
         chat_formatter,
-        chat_tokenizer,
         response_store: openai::new_response_store(),
         egress_activity,
     };

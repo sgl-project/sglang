@@ -34,12 +34,12 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
-use super::chat::{SamplingDefaults, chat_sampling_params, prepare_chat_request};
+use super::chat::{SamplingDefaults, chat_sampling, prepare_chat_request};
 use super::response_stream::{
     response_object, response_status, responses_event_stream, responses_usage,
     text_response_message,
 };
-use super::tools::{apply_tool_constraint, parse_chat_tool_calls};
+use super::tools::{dynamo_tool_choice, parse_chat_tool_calls};
 use super::{
     AppState, ResponseStore, StoredResponse, collect_output, openai_error, submit_generation,
     unix_seconds,
@@ -494,22 +494,7 @@ async fn responses(
             })
             .collect::<Vec<_>>()
     });
-    let tool_choice = match &chat_request.tool_choice {
-        Some(ChatCompletionToolChoiceOption::None) => DynamoToolChoice::None,
-        Some(ChatCompletionToolChoiceOption::Required) => DynamoToolChoice::Required,
-        Some(ChatCompletionToolChoiceOption::Named(choice)) => {
-            DynamoToolChoice::Named(choice.function.name.clone())
-        }
-        _ => DynamoToolChoice::Auto,
-    };
-    if tool_choice == DynamoToolChoice::Required
-        && tools.as_ref().is_none_or(|tools| tools.is_empty())
-    {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "tool_choice is \"required\" but tools is empty",
-        );
-    }
+    let tool_choice = dynamo_tool_choice(&chat_request.tool_choice);
     let tools_enabled = tools.as_ref().is_some_and(|tools| !tools.is_empty())
         && tool_choice != DynamoToolChoice::None;
     let parser = tools_enabled
@@ -522,50 +507,24 @@ async fn responses(
         );
     }
 
-    let (Some(formatter), Some(tokenizer)) =
-        (state.chat_formatter.clone(), state.chat_tokenizer.clone())
-    else {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "this model has no usable chat template",
-        );
+    let (chat_request, prompt) = match prepare_chat_request(&state, chat_request).await {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
     };
-    let (chat_request, input_ids) =
-        match prepare_chat_request(chat_request, formatter, tokenizer).await {
-            Ok(prepared) => prepared,
-            Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
-        };
     let response_messages = chat_request.messages.clone();
     let stream_tool_choice = chat_request.tool_choice.clone();
-    let mut sampling = match chat_sampling_params(
+    let sampling = match chat_sampling(
         &chat_request,
-        &SamplingDefaults::RESPONSES
-            .with_model_defaults(&state.server_args.model_config.default_sampling_params),
+        SamplingDefaults::RESPONSES,
+        parser.as_deref(),
+        &tool_choice,
+        tools.as_deref().unwrap_or_default(),
+        request.parallel_tool_calls,
+        &state.server_args,
     ) {
         Ok(sampling) => sampling,
         Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
     };
-    if let Some(parser) = parser.as_deref()
-        && let Err(message) = apply_tool_constraint(
-            &mut sampling,
-            parser,
-            &tool_choice,
-            tools.as_deref().unwrap_or_default(),
-            request.parallel_tool_calls,
-        )
-    {
-        return openai_error(StatusCode::BAD_REQUEST, message);
-    }
-    if let Err(error) = sampling.normalize(
-        state.server_args.skip_tokenizer_init,
-        state
-            .server_args
-            .model_config
-            .vocab_size
-            .unwrap_or(u64::MAX),
-    ) {
-        return openai_error(StatusCode::BAD_REQUEST, error.to_string());
-    }
     let uses_tool_call_structural_tag = sampling.structural_tag.is_some();
 
     let stream = request.stream.unwrap_or(false);
@@ -580,7 +539,10 @@ async fn responses(
     let rid = Rid::from_client(&response_id);
     let native = GenerateRequest {
         rid: rid.clone(),
-        input_ids: Some(input_ids),
+        text: Some(prompt),
+        // Rendered templates own their special tokens — the pool must not
+        // add another BOS/EOS (Python's `add_special_tokens=False`).
+        skip_special_tokens: true,
         sampling_params: sampling,
         stream,
         return_logprob: request.top_logprobs.is_some(),

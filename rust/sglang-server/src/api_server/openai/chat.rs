@@ -30,7 +30,7 @@ use super::super::guard::AbortGuard;
 use super::completions::completion_usage;
 use super::reasoning::build_reasoning_parser;
 use super::tools::{
-    apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name,
+    apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name, dynamo_tool_choice,
     parse_chat_tool_calls, parse_streaming_tool_calls,
 };
 use super::{
@@ -98,14 +98,7 @@ async fn chat_completions(
         );
     }
 
-    let tool_choice = match &request.tool_choice {
-        Some(ChatCompletionToolChoiceOption::None) => DynamoToolChoice::None,
-        Some(ChatCompletionToolChoiceOption::Required) => DynamoToolChoice::Required,
-        Some(ChatCompletionToolChoiceOption::Named(choice)) => {
-            DynamoToolChoice::Named(choice.function.name.clone())
-        }
-        Some(ChatCompletionToolChoiceOption::Auto) | None => DynamoToolChoice::Auto,
-    };
+    let tool_choice = dynamo_tool_choice(&request.tool_choice);
     let tools_enabled = request
         .tools
         .as_ref()
@@ -135,64 +128,24 @@ async fn chat_completions(
             .collect::<Vec<_>>()
     });
     let tools_slice = tools.as_deref().unwrap_or_default();
-    if tool_choice == DynamoToolChoice::Required && tools_slice.is_empty() {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "tool_choice is \"required\" but tools is empty",
-        );
-    }
-    if let DynamoToolChoice::Named(name) = &tool_choice
-        && !tools_slice.iter().any(|tool| &tool.name == name)
-    {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            format!("tool named \"{name}\" in tool_choice is not present in tools"),
-        );
-    }
 
-    let (Some(formatter), Some(tokenizer)) =
-        (state.chat_formatter.clone(), state.chat_tokenizer.clone())
-    else {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "this model has no usable chat template",
-        );
-    };
-    let prepared = prepare_chat_request(request, formatter, tokenizer).await;
-    let (request, input_ids) = match prepared {
+    let (request, prompt) = match prepare_chat_request(&state, request).await {
         Ok(prepared) => prepared,
-        Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
+        Err(response) => return response,
     };
 
-    let mut sampling = match chat_sampling_params(
+    let sampling = match chat_sampling(
         &request,
-        &SamplingDefaults::CHAT
-            .with_model_defaults(&state.server_args.model_config.default_sampling_params),
+        SamplingDefaults::CHAT,
+        parser.as_deref(),
+        &tool_choice,
+        tools_slice,
+        request.parallel_tool_calls,
+        &state.server_args,
     ) {
         Ok(sampling) => sampling,
         Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
     };
-    if let Some(parser) = parser.as_deref()
-        && let Err(message) = apply_tool_constraint(
-            &mut sampling,
-            parser,
-            &tool_choice,
-            tools_slice,
-            request.parallel_tool_calls,
-        )
-    {
-        return openai_error(StatusCode::BAD_REQUEST, message);
-    }
-    if let Err(error) = sampling.normalize(
-        state.server_args.skip_tokenizer_init,
-        state
-            .server_args
-            .model_config
-            .vocab_size
-            .unwrap_or(u64::MAX),
-    ) {
-        return openai_error(StatusCode::BAD_REQUEST, error.to_string());
-    }
 
     let stream = request.stream.unwrap_or(false);
     let n = request.n.unwrap_or(1) as usize;
@@ -211,20 +164,23 @@ async fn chat_completions(
     let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut submitted = Vec::with_capacity(n);
 
-    let mut input_ids = Some(input_ids);
+    let mut prompt = Some(prompt);
     for index in 0..n {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
-        let choice_input_ids = if index + 1 == n {
-            input_ids.take().expect("last chat choice owns the prompt")
+        let choice_prompt = if index + 1 == n {
+            prompt.take().expect("last chat choice owns the prompt")
         } else {
-            input_ids
+            prompt
                 .as_ref()
                 .expect("chat prompt exists until the last choice")
                 .clone()
         };
         let native = GenerateRequest {
             rid: rid.clone(),
-            input_ids: Some(choice_input_ids),
+            text: Some(choice_prompt),
+            // Rendered templates own their special tokens — the pool must not
+            // add another BOS/EOS (Python's `add_special_tokens=False`).
+            skip_special_tokens: true,
             sampling_params: sampling.clone(),
             stream,
             return_logprob: want_logprobs,
@@ -277,32 +233,65 @@ async fn chat_completions(
     }
 }
 
+/// Render the chat template for an OpenAI request, mapping a missing
+/// formatter or a render failure to the standard 400. The rendered prompt is
+/// submitted as text — the tokenizer pool encodes it (with
+/// `skip_special_tokens`, since the template owns its special tokens).
 pub(super) async fn prepare_chat_request(
+    state: &AppState,
     mut request: CreateChatCompletionRequest,
-    formatter: ChatFormatter,
-    tokenizer: dynamo_tokenizers::Tokenizer,
-) -> Result<(CreateChatCompletionRequest, Vec<i32>), String> {
+) -> Result<(CreateChatCompletionRequest, String), Response> {
+    let Some(formatter) = state.chat_formatter.clone() else {
+        return Err(openai_error(
+            StatusCode::BAD_REQUEST,
+            "this model has no usable chat template",
+        ));
+    };
     // Template stops first, then the request's own — Python
     // `_apply_conversation_template` (`conv.stop_str` + `request.stop`). A
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    tokio::task::spawn_blocking(move || {
-        let prompt = formatter
-            .render(&request)
-            .map_err(|error| format!("chat template render failed: {error}"))?;
-        let encoding = tokenizer
-            .encode(&prompt)
-            .map_err(|error| format!("chat prompt tokenization failed: {error}"))?;
-        let input_ids = encoding
-            .token_ids()
-            .iter()
-            .map(|&id| i32::try_from(id).map_err(|_| format!("token ID {id} is out of range")))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok::<_, String>((request, input_ids))
-    })
-    .await
-    .map_err(|error| format!("chat preparation failed: {error}"))?
+    let prompt = formatter.render(&request).map_err(|error| {
+        openai_error(
+            StatusCode::BAD_REQUEST,
+            format!("chat template render failed: {error}"),
+        )
+    })?;
+    Ok((request, prompt))
+}
+
+/// Full sampling resolution for an OpenAI request, mirroring the Python
+/// handler: endpoint defaults → tool-choice validation + constraint → clamp.
+/// Shared by the chat and responses handlers; the tool-choice checks run
+/// regardless of whether a parser is configured (see `apply_tool_constraint`).
+pub(super) fn chat_sampling(
+    request: &CreateChatCompletionRequest,
+    defaults: SamplingDefaults,
+    parser: Option<&str>,
+    tool_choice: &DynamoToolChoice,
+    tools: &[ToolDefinition],
+    parallel_tool_calls: Option<bool>,
+    server_args: &crate::runtime::ServerArgs,
+) -> Result<SamplingParams, String> {
+    let mut sampling = chat_sampling_params(
+        request,
+        &defaults.with_model_defaults(&server_args.model_config.default_sampling_params),
+    )?;
+    apply_tool_constraint(
+        &mut sampling,
+        parser,
+        tool_choice,
+        tools,
+        parallel_tool_calls,
+    )?;
+    sampling
+        .normalize(
+            server_args.skip_tokenizer_init,
+            server_args.model_config.vocab_size.unwrap_or(u64::MAX),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(sampling)
 }
 
 /// Merge the formatter's template stops into the request's `stop`.
