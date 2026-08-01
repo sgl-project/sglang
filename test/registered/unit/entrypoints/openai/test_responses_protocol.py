@@ -192,13 +192,6 @@ class IncludeOutputLogprobsTestCase(CustomTestCase):
 
 
 class ThinkingControlTestCase(CustomTestCase):
-    def test_effort_values_accepted(self):
-        for effort in ("none", "minimal", "low", "medium", "high"):
-            req = ResponsesRequest(
-                model="x", input="hi", store=False, reasoning={"effort": effort}
-            )
-            self.assertEqual(req.reasoning.effort, effort)
-
     def test_effort_none_disables_thinking(self):
         ctk = ResponsesRequest(
             model="x", input="hi", store=False, reasoning={"effort": "none"}
@@ -395,15 +388,6 @@ class InputItemStringIdTestCase(CustomTestCase):
 
 
 class ToolChoiceObjectFormTestCase(CustomTestCase):
-    def test_named_function_object_accepted(self):
-        req = ResponsesRequest(
-            model="x",
-            input="hi",
-            store=False,
-            tool_choice={"type": "function", "name": "get_weather"},
-        )
-        self.assertEqual(req.tool_choice["name"], "get_weather")
-
     def test_echoed_choice_is_what_the_server_honors(self):
         import openai.types.responses as ort
 

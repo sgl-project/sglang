@@ -1,62 +1,19 @@
-import asyncio
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from utils import (
-    collect_stream_events,
+    StreamFixture,
+    engine_chunk,
     event_payloads,
     event_types,
     find_completed_event,
     make_serving,
 )
 
-from sglang.srt.entrypoints.openai.protocol import (
-    RequestResponseMetadata,
-    ResponsesRequest,
-)
+from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
-
-
-class _StreamFixture:
-    def __init__(self, serving, request):
-        self.serving = serving
-        self.request = request
-        self.request_metadata = RequestResponseMetadata(request_id=request.request_id)
-
-    def run(self, chunks):
-        async def gen():
-            for ch in chunks:
-                yield ch
-
-        async def collect():
-            return await collect_stream_events(
-                self.serving.responses_stream_generator_non_harmony(
-                    self.request,
-                    sampling_params={},
-                    result_generator=gen(),
-                    model_name="x",
-                    tokenizer=Mock(),
-                    request_metadata=self.request_metadata,
-                )
-            )
-
-        return asyncio.run(collect())
-
-
-def _engine_chunk(text, completion_tokens, *, finish=False):
-    return {
-        "text": text,
-        "meta_info": {
-            "id": "rid",
-            "prompt_tokens": 5,
-            "completion_tokens": completion_tokens,
-            "cached_tokens": 0,
-            "reasoning_tokens": 0,
-            "finish_reason": {"type": "stop"} if finish else None,
-        },
-    }
 
 
 class NonHarmonyStreamTestCase(unittest.TestCase):
@@ -66,12 +23,12 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
         serving.tool_call_parser = None
 
         request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
-        fixture = _StreamFixture(serving, request)
+        fixture = StreamFixture(serving, request)
         events = fixture.run(
             [
-                _engine_chunk("Hel", 1),
-                _engine_chunk("Hello", 2),
-                _engine_chunk("Hello world", 4, finish=True),
+                engine_chunk("Hel", 1),
+                engine_chunk("Hello", 2),
+                engine_chunk("Hello world", 4, finish=True),
             ]
         )
 
@@ -118,10 +75,10 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
         while sent < len(payload):
             sent += min(8, len(payload) - sent)
             chunks.append(
-                _engine_chunk(payload[:sent], sent, finish=sent == len(payload))
+                engine_chunk(payload[:sent], sent, finish=sent == len(payload))
             )
 
-        fixture = _StreamFixture(serving, request)
+        fixture = StreamFixture(serving, request)
         events = fixture.run(chunks)
         types = event_types(events)
 
@@ -177,9 +134,9 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
             StreamingParseResult(normal_text="It's sunny.", calls=[]),
         ]
         chunks = [
-            _engine_chunk(" " * 3, 3),
-            _engine_chunk(" " * 10, 10),
-            _engine_chunk(" " * 14, 14, finish=True),
+            engine_chunk(" " * 3, 3),
+            engine_chunk(" " * 10, 10),
+            engine_chunk(" " * 14, 14, finish=True),
         ]
 
         script_iter = iter(scripted)
@@ -195,7 +152,7 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
             parser_cls.return_value.parse_stream_chunk.side_effect = (
                 fake_parse_stream_chunk
             )
-            fixture = _StreamFixture(serving, request)
+            fixture = StreamFixture(serving, request)
             events = fixture.run(chunks)
 
         completed = find_completed_event(events)

@@ -8,7 +8,7 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from utils import collect_stream_events, event_payloads, event_types, make_serving
+from utils import StreamFixture, engine_chunk, make_serving
 
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (
@@ -622,9 +622,8 @@ class ShouldEmitNormalTextTestCase(CustomTestCase):
 
 
 class EnginePassthroughTestCase(CustomTestCase):
-    """Both flags reach the engine through hops with no type contract between
-    them, and dropping either fails silently -- reasoning stops deferring the
-    grammar, or tool-call markers get detokenized away and every parse fails."""
+    """Both flags cross hops with no type contract, and dropping either fails
+    silently."""
 
     def _capture(self, serving, request):
         # Let the real _process_messages run: it is the hop that turns
@@ -708,45 +707,26 @@ class EnginePassthroughTestCase(CustomTestCase):
 
 
 class CancelIdempotencyTestCase(CustomTestCase):
-    def test_cancel_terminal_response_returns_it_not_error(self):
+    def test_cancelling_a_terminal_response_returns_it_not_an_error(self):
         from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
 
-        serving = make_serving()
-        resp = ResponsesResponse.from_request(
-            ResponsesRequest(model="x", input="hi", store=False),
-            sampling_params={},
-            model_name="x",
-            created_time=0,
-            output=[],
-            status="cancelled",
-            usage=None,
-        )
-        serving.response_store[resp.id] = resp
-        out = asyncio.run(serving.cancel_responses(resp.id))
-        self.assertIs(out, resp)
-        self.assertEqual(out.status, "cancelled")
+        for status in ("cancelled", "completed"):
+            serving = make_serving()
+            resp = ResponsesResponse.from_request(
+                ResponsesRequest(model="x", input="hi", store=False),
+                sampling_params={},
+                model_name="x",
+                created_time=0,
+                output=[],
+                status=status,
+                usage=None,
+            )
+            serving.response_store[resp.id] = resp
 
-    def test_cancel_completed_response_returns_it_not_error(self):
-        """A completed (never-background) response returns 200 with the response,
-        where it used to be a 400."""
-        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+            out = asyncio.run(serving.cancel_responses(resp.id))
 
-        serving = make_serving()
-        resp = ResponsesResponse.from_request(
-            ResponsesRequest(model="x", input="hi", store=False),
-            sampling_params={},
-            model_name="x",
-            created_time=0,
-            output=[],
-            status="completed",
-            usage=None,
-        )
-        serving.response_store[resp.id] = resp
-
-        out = asyncio.run(serving.cancel_responses(resp.id))
-
-        self.assertIs(out, resp)
-        self.assertEqual(out.status, "completed")
+            self.assertIs(out, resp, status)
+            self.assertEqual(out.status, status)
 
 
 class StreamingLogprobsRejectionTestCase(CustomTestCase):
@@ -768,68 +748,61 @@ class StreamingLogprobsRejectionTestCase(CustomTestCase):
 
 
 class MultiToolCallStreamingOrderTestCase(CustomTestCase):
+    """The wire order of message / function_call items across tool-call deltas."""
+
     def setUp(self):
+        from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+
         self.serving = make_serving()
         self.serving.tool_call_parser = "qwen3_coder"
         self.serving.reasoning_parser = None
-
-    def test_prior_tool_call_done_before_next_added(self):
-        from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
-
-        serving = self.serving
 
         det = Qwen3CoderDetector()
         s, e = det.tool_call_start_token, det.tool_call_end_token
         fp, fe = det.tool_call_prefix, det.function_end_token
         pp, pe = det.parameter_prefix, det.parameter_end_token
-        tool1 = f"{s}{fp}get_weather>{pp}city>Beijing{pe}{fe}{e}"
-        tool2 = f"{s}{fp}get_time>{pp}tz>UTC{pe}{fe}{e}"
-        full = tool1 + "\n" + tool2
+        self.weather = f"{s}{fp}get_weather>{pp}city>Beijing{pe}{fe}{e}"
+        self.time = f"{s}{fp}get_time>{pp}tz>UTC{pe}{fe}{e}"
+        # a prefix of ``weather`` that stops mid-arguments
+        self.weather_head = f"{s}{fp}get_weather>{pp}city>Beij"
 
-        async def fake_gen():
-            yield {"text": tool1, "meta_info": {}}
-            yield {"text": tool1 + "\n", "meta_info": {}}
-            yield {"text": full, "meta_info": {}}
-            yield {
-                "text": full,
-                "meta_info": {
-                    "finish_reason": {"type": "stop"},
-                    "prompt_tokens": 5,
-                    "completion_tokens": 10,
-                },
-            }
-
+    def _seq(self, texts, *names):
+        """Stream cumulative ``texts`` (last one final) and return (type, payload)."""
         request = ResponsesRequest(
             model="x",
             input="weather and time",
             store=False,
             tools=[
-                {
-                    "type": "function",
-                    "name": "get_weather",
-                    "parameters": {"type": "object"},
-                },
-                {
-                    "type": "function",
-                    "name": "get_time",
-                    "parameters": {"type": "object"},
-                },
+                {"type": "function", "name": n, "parameters": {"type": "object"}}
+                for n in names
             ],
         )
+        chunks = [engine_chunk(t) for t in texts]
+        chunks.append(engine_chunk(texts[-1], finish=True))
+        return StreamFixture(self.serving, request).run_seq(chunks)
 
-        async def run():
-            stream = serving.responses_stream_generator_non_harmony(
-                request,
-                {},
-                fake_gen(),
-                "x",
-                Mock(),
-                RequestResponseMetadata(request_id="r"),
-            )
-            return await collect_stream_events(stream)
+    @staticmethod
+    def _added(seq):
+        return [
+            (p["output_index"], p["item"].get("type"))
+            for t, p in seq
+            if t == "response.output_item.added"
+        ]
 
-        events = asyncio.run(run())
-        seq = list(zip(event_types(events), event_payloads(events)))
+    @staticmethod
+    def _done_calls(seq):
+        return [
+            p["item"]
+            for t, p in seq
+            if t == "response.output_item.done"
+            and p["item"].get("type") == "function_call"
+        ]
+
+    def test_prior_tool_call_done_before_next_added(self):
+        full = self.weather + "\n" + self.time
+        seq = self._seq(
+            [self.weather, self.weather + "\n", full], "get_weather", "get_time"
+        )
 
         def position(pred):
             return next(i for i, (t, p) in enumerate(seq) if pred(t, p))
@@ -842,151 +815,40 @@ class MultiToolCallStreamingOrderTestCase(CustomTestCase):
         )
         self.assertLess(done0, added1)
 
-        fc_done_items = [
-            p["item"]
-            for t, p in seq
-            if t == "response.output_item.done"
-            and p["item"].get("type") == "function_call"
-        ]
-        self.assertEqual(len(fc_done_items), 2)
-        names = sorted(item["name"] for item in fc_done_items)
-        self.assertEqual(names, ["get_time", "get_weather"])
+        items = self._done_calls(seq)
+        self.assertEqual(sorted(i["name"] for i in items), ["get_time", "get_weather"])
 
     def test_prose_before_tool_call_keeps_message_first(self):
         """Prose and a tool-call start in one delta: the message item must come
         first, since the prose preceded the call."""
-        from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+        # One delta spanning prose + the whole call, as spec decoding or
+        # --stream-interval > 1 produces.
+        seq = self._seq(["Let me check." + self.weather], "get_weather")
 
-        serving = self.serving
-
-        det = Qwen3CoderDetector()
-        s, e = det.tool_call_start_token, det.tool_call_end_token
-        fp, fe = det.tool_call_prefix, det.function_end_token
-        pp, pe = det.parameter_prefix, det.parameter_end_token
-        prose = "Let me check."
-        tool = f"{s}{fp}get_weather>{pp}city>Beijing{pe}{fe}{e}"
-
-        async def fake_gen():
-            # One delta spanning prose + the whole call, as spec decoding or
-            # --stream-interval > 1 produces.
-            yield {"text": prose + tool, "meta_info": {}}
-            yield {
-                "text": prose + tool,
-                "meta_info": {
-                    "finish_reason": {"type": "stop"},
-                    "prompt_tokens": 5,
-                    "completion_tokens": 10,
-                },
-            }
-
-        request = ResponsesRequest(
-            model="x",
-            input="weather",
-            store=False,
-            tools=[
-                {
-                    "type": "function",
-                    "name": "get_weather",
-                    "parameters": {"type": "object"},
-                }
-            ],
-        )
-
-        async def run():
-            stream = serving.responses_stream_generator_non_harmony(
-                request,
-                {},
-                fake_gen(),
-                "x",
-                Mock(),
-                RequestResponseMetadata(request_id="r"),
-            )
-            return await collect_stream_events(stream)
-
-        events = asyncio.run(run())
-        seq = list(zip(event_types(events), event_payloads(events)))
-
-        added = [
-            (p["output_index"], p["item"].get("type"))
-            for t, p in seq
-            if t == "response.output_item.added"
-        ]
+        added = self._added(seq)
         message_index = next(i for i, kind in added if kind == "message")
         call_index = next(i for i, kind in added if kind == "function_call")
         self.assertLess(message_index, call_index)
 
         # The call must not be split across two items by the reordering.
-        fc_added = [kind for _, kind in added if kind == "function_call"]
-        self.assertEqual(len(fc_added), 1)
+        self.assertEqual(len([k for _, k in added if k == "function_call"]), 1)
 
     def test_call_tail_prose_and_next_call_in_one_delta(self):
         """One delta closing tool1, carrying prose, and opening tool2 needs both
         orders at once: tool1's trailing "}" must be drained before the prose
         closes every open item, and tool2 must land after the message."""
-        from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
-
-        serving = self.serving
-
-        det = Qwen3CoderDetector()
-        s, e = det.tool_call_start_token, det.tool_call_end_token
-        fp, fe = det.tool_call_prefix, det.function_end_token
-        pp, pe = det.parameter_prefix, det.parameter_end_token
-        tool1 = f"{s}{fp}get_weather>{pp}city>Beijing{pe}{fe}{e}"
-        tool2 = f"{s}{fp}get_time>{pp}tz>UTC{pe}{fe}{e}"
-        head = f"{s}{fp}get_weather>{pp}city>Beij"
-
-        async def fake_gen():
-            # First delta opens tool1 mid-arguments; the second closes it, adds
-            # prose, and opens tool2 -- all three in one chunk.
-            yield {"text": head, "meta_info": {}}
-            yield {"text": tool1 + "Here you go." + tool2, "meta_info": {}}
-            yield {
-                "text": tool1 + "Here you go." + tool2,
-                "meta_info": {
-                    "finish_reason": {"type": "stop"},
-                    "prompt_tokens": 5,
-                    "completion_tokens": 10,
-                },
-            }
-
-        request = ResponsesRequest(
-            model="x",
-            input="weather and time",
-            store=False,
-            tools=[
-                {
-                    "type": "function",
-                    "name": n,
-                    "parameters": {"type": "object"},
-                }
-                for n in ("get_weather", "get_time")
-            ],
+        seq = self._seq(
+            [self.weather_head, self.weather + "Here you go." + self.time],
+            "get_weather",
+            "get_time",
         )
 
-        async def run():
-            stream = serving.responses_stream_generator_non_harmony(
-                request,
-                {},
-                fake_gen(),
-                "x",
-                Mock(),
-                RequestResponseMetadata(request_id="r"),
-            )
-            return await collect_stream_events(stream)
-
-        events = asyncio.run(run())
-        seq = list(zip(event_types(events), event_payloads(events)))
-
-        done_items = [
-            p["item"]
-            for t, p in seq
-            if t == "response.output_item.done"
-            and p["item"].get("type") == "function_call"
-        ]
+        items = self._done_calls(seq)
         # No duplicate item invented for the already-closed call, and no call
         # left nameless by being reopened from an args-only fragment.
-        self.assertEqual(len(done_items), 2)
-        self.assertTrue(all(item["name"] for item in done_items))
+        self.assertEqual(len(items), 2)
+        self.assertTrue(all(i["name"] for i in items))
+        self.assertEqual(items[0]["arguments"], '{"city": "Beijing"}')
 
 
 if __name__ == "__main__":
