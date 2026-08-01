@@ -82,12 +82,24 @@ class Sampler(nn.Module):
         self.use_ascend_backend = get_global_server_args().sampling_backend == "ascend"
 
     def _preprocess_logits(
-        self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
+        self,
+        logits: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        logits_output: Optional["LogitsProcessorOutput"] = None,
     ) -> torch.Tensor:
-        """Apply custom logit processors and sanitize non-finite logits."""
+        """Apply custom logit processors and sanitize non-finite logits.
+
+        When logits_output is provided and SGLANG_ABORT_ON_FULL_NAN_LOGITS is
+        set, records a per-row mask of all-NaN logits rows on logits_output so
+        the scheduler can abort those requests instead of sampling a uniform
+        random token (see sanitize_nan_logits)."""
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
-        sanitize_nan_logits(logits, "sampler: next_token_logits")
+        full_nan_mask = sanitize_nan_logits(
+            logits, "sampler: next_token_logits", return_full_nan_mask=True
+        )
+        if logits_output is not None:
+            logits_output.full_nan_logits_mask = full_nan_mask
         return logits
 
     def forward(
@@ -116,7 +128,7 @@ class Sampler(nn.Module):
         logits = logits_output.next_token_logits
 
         # Preprocess logits (custom processors and NaN handling)
-        logits = self._preprocess_logits(logits, sampling_info)
+        logits = self._preprocess_logits(logits, sampling_info, logits_output)
 
         if sampling_info.is_all_greedy:
             if _use_aiter and not _disable_aiter_greedy_sample:
@@ -423,7 +435,7 @@ class Sampler(nn.Module):
             return
 
         # Preprocess logits (custom processors and NaN handling)
-        logits = self._preprocess_logits(logits_output.next_token_logits, sampling_info)
+        logits = self._preprocess_logits(logits_output.next_token_logits, sampling_info, logits_output)
 
         # Compute logprobs
         logprobs = torch.nn.functional.log_softmax(logits, dim=-1)

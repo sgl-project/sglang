@@ -709,6 +709,14 @@ class Envs:
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
+    # When SGLANG_SANITIZE_NAN_LOGITS is on, an all-NaN logits row is sanitized
+    # to a constant and softmax becomes a uniform random sample over the whole
+    # vocab — garbage streamed to the client as a healthy 200 response, and the
+    # corrupted KV poisons every subsequent step of that request. With this flag
+    # on, requests whose next-token logits row is entirely NaN are aborted with
+    # a retriable 5xx instead of being sampled, and their KV is not inserted into
+    # the prefix cache (see sanitize_nan_logits / _nan_row_mask).
+    SGLANG_ABORT_ON_FULL_NAN_LOGITS = EnvBool(False)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)

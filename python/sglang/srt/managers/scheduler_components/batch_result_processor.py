@@ -210,12 +210,22 @@ class SchedulerBatchResultProcessor:
 
             self._validate_pp_skip_output_comm(batch, result)
 
+            # Abort requests whose next-token logits were entirely NaN before
+            # sanitization (would otherwise be sampled as uniform-random
+            # garbage). Skipped rows are filtered out below.
+            aborted_full_nan = self._abort_full_nan_logits_reqs(batch, logits_output)
+
             hidden_state_offset = 0
 
             # Check finish conditions
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                if i in aborted_full_nan:
+                    # Already aborted; release KV without inserting into cache.
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.set_completion_time()
+                    continue
                 if (
                     req.finished() and req.inflight_middle_chunks <= 0
                 ) or req.is_retracted:
@@ -653,6 +663,13 @@ class SchedulerBatchResultProcessor:
             next_token_ids=next_token_ids,
         )
 
+        # Abort requests whose next-token logits were entirely NaN before
+        # sanitization (would otherwise be sampled as uniform-random garbage,
+        # with the corrupted KV poisoning every subsequent step).
+        aborted_full_nan = self._abort_full_nan_logits_reqs(batch, logits_output)
+        if aborted_full_nan:
+            self.metrics_reporter.num_generated_tokens -= len(aborted_full_nan)
+
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
@@ -673,6 +690,13 @@ class SchedulerBatchResultProcessor:
             ):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
+                continue
+
+            if i in aborted_full_nan:
+                # Already aborted with a 5xx; release KV without inserting into
+                # the prefix cache so the poisoned state cannot be shared.
+                release_kv_cache(req, self.tree_cache)
+                req.time_stats.set_completion_time()
                 continue
 
             # next_token_id is a per-req list: 1 token for non-spec, the verified
@@ -865,6 +889,45 @@ class SchedulerBatchResultProcessor:
         think_end_id = self.model_config.think_end_id
         if req.require_reasoning and think_end_id is not None:
             req.update_reasoning_tokens(next_token_id, think_end_id)
+
+    def _abort_full_nan_logits_reqs(
+        self,
+        batch: ScheduleBatch,
+        logits_output: Optional[LogitsProcessorOutput],
+    ) -> set:
+        """Abort requests whose next-token logits row was entirely NaN.
+
+        Returns the set of batch indices that were aborted so callers can skip
+        normal processing for them. A fully-NaN row, after sanitization to a
+        constant, becomes a uniform random sample over the whole vocab —
+        garbage streamed to the client as a healthy 200 response, with the
+        corrupted KV poisoning every subsequent step. Aborting with a 5xx and
+        skipping prefix-cache insertion is strictly safer.
+
+        Only active when SGLANG_ABORT_ON_FULL_NAN_LOGITS is set; the mask is
+        None otherwise.
+        """
+        if logits_output is None:
+            return set()
+        mask = getattr(logits_output, "full_nan_logits_mask", None)
+        if mask is None:
+            return set()
+        mask_cpu = mask.cpu() if mask.is_cuda else mask
+        aborted: set = set()
+        for i, req in enumerate(batch.reqs):
+            if i < mask_cpu.shape[0] and bool(mask_cpu[i]):
+                req.set_finish_with_internal_error(
+                    "Aborted: next-token logits were entirely NaN "
+                    "(SGLANG_ABORT_ON_FULL_NAN_LOGITS). "
+                    "Sampling would have produced a uniform-random token."
+                )
+                aborted.add(i)
+        if aborted:
+            logger.warning(
+                "Aborted %d request(s) with fully-NaN next-token logits.",
+                len(aborted),
+            )
+        return aborted
 
     def _mamba_prefix_cache_update(
         self,

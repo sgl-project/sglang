@@ -63,17 +63,31 @@ def maybe_warn_nan(tensor: Optional[torch.Tensor], msg: str = ""):
     _nan_warner.check(tensor, msg)
 
 
-def sanitize_nan_logits(logits: torch.Tensor, msg: str = ""):
+def sanitize_nan_logits(
+    logits: torch.Tensor, msg: str = "", return_full_nan_mask: bool = False
+):
     """Detect NaN (assert in CI, throttled warning in prod), then sanitize in
     place: NaN logits (e.g. fp16 activation overflow) are undefined behavior
     in sampling kernels and can come back as out-of-vocab token ids. +-1e30
     rather than dtype min/max because callers divide logits by temperature,
-    which would overflow dtype min/max to +-Inf and softmax back to NaN."""
+    which would overflow dtype min/max to +-Inf and softmax back to NaN.
+
+    When return_full_nan_mask is True, returns a boolean tensor of shape
+    [batch] marking rows that were entirely NaN before sanitization. Such rows
+    become a uniform distribution after sanitization (softmax over a constant),
+    so callers can use the mask to abort the request instead of sampling
+    garbage. Returns None when the flag is False or SGLANG_SANITIZE_NAN_LOGITS
+    is off."""
     maybe_detect_nan(logits, msg)
     if not envs.SGLANG_SANITIZE_NAN_LOGITS.get():
-        return
+        return None
+    full_nan_mask = None
+    if return_full_nan_mask and envs.SGLANG_ABORT_ON_FULL_NAN_LOGITS.get():
+        # Capture before nan_to_num_ wipes the NaNs.
+        full_nan_mask = torch.isnan(logits).all(dim=-1)
     maybe_warn_nan(logits, msg)
     torch.nan_to_num_(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
+    return full_nan_mask if return_full_nan_mask else None
 
 
 def maybe_detect_nan(tensor: Optional[torch.Tensor], msg: str = ""):

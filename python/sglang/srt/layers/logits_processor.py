@@ -127,6 +127,12 @@ class LogitsProcessorOutput:
 
     mm_input_embeds: Optional[torch.Tensor] = None
 
+    # Per-row mask (shape [batch]) marking requests whose next-token logits row
+    # was entirely NaN before sanitization. Set by Sampler._preprocess_logits
+    # when SGLANG_ABORT_ON_FULL_NAN_LOGITS is on; the scheduler aborts those
+    # requests instead of sampling a uniform-random token. None otherwise.
+    full_nan_logits_mask: Optional[torch.Tensor] = None
+
 
 @dataclasses.dataclass
 class LogitsMetadata:
