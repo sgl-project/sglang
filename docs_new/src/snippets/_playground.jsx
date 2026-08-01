@@ -1392,10 +1392,19 @@ export const Playground = ({ config }) => {
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
+      // Mirrors `multiNodeDockerFlags` on the _deployment.jsx HARDWARE_CATALOG
+      // (Mintlify strips module state, so the engines cannot share it).
+      const HW_MULTINODE_DOCKER_FLAGS = {
+        "dgx-spark": [
+          "--ulimit memlock=-1:-1", "--cap-add IPC_LOCK", "--device /dev/infiniband",
+        ],
+      };
+      const fabricFlags = HW_MULTINODE_DOCKER_FLAGS[sel.hw] || [];
       const dockerLines = [
         "docker run --gpus all",
         "  --shm-size 32g",
         (multinode || pdMode) ? "  --network host" : `  -p ${servePort}:${servePort}`,
+        ...(multinode ? fabricFlags.map((x) => "  " + x) : []),
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
         ...cellEnv.map((e) => `  --env ${e}`),
