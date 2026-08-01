@@ -13,6 +13,8 @@ from sglang.srt.constrained.reasoner_grammar_backend import (
 from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
+from sglang.srt.function_call.kimik3_format import THINK_CLOSE
+from sglang.srt.parser.reasoning_parser import KimiK3Detector as KimiK3ReasoningDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
@@ -182,6 +184,42 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         self.assertTrue(obj.enable_token_filter)
         self.assertEqual(obj.max_think_tokens, 2)
         self.assertEqual(obj.think_excluded_token_ids, [3, 4])
+
+    def test_kimi_k3_excluded_tokens_spare_the_xtml_control_tokens(self):
+        """Kimi K3 bans bare channel names, never the marker-composing tokens.
+
+        The excluded list is flattened into single token ids, so listing a whole
+        marker such as "<|open|>response<|sep|>" would ban <|open|> and <|sep|>
+        individually -- which also blocks the think-end sequence and the jump
+        into the tools channel, leaving the model unable to stop thinking.
+        """
+        control_ids = {"<|open|>": [1], "<|close|>": [2], "<|sep|>": [3]}
+        think_end_ids = [2, 4, 3]
+        tokenizer = _DummyTokenizer(
+            {
+                THINK_CLOSE: think_end_ids,
+                "response": [10],
+                "message": [11],
+                "<|end_of_msg|>": [12],
+                "[EOS]": [13],
+                "[EOT]": [14],
+                **control_ids,
+            }
+        )
+        reasoner = ReasonerGrammarBackend(
+            _DummyGrammarBackend(support_token_filter=True),
+            SimpleNamespace(detector=KimiK3ReasoningDetector()),
+            tokenizer,
+            enable_strict_thinking=True,
+        )
+
+        excluded = reasoner.think_excluded_token_ids
+
+        self.assertEqual(excluded, [10, 11, 12, 13, 14])
+        for token, ids in control_ids.items():
+            for token_id in ids:
+                self.assertNotIn(token_id, excluded, f"{token} must stay generatable")
+        self.assertEqual(set(think_end_ids) & set(excluded), set())
 
     def test_init_strict_reasoning_grammar_none_when_strict_disabled(self):
         backend = _DummyGrammarBackend(support_token_filter=True)

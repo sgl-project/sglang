@@ -438,6 +438,37 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(name, "VoiceNote")
         self.assertEqual(strict, True)
 
+    def test_schema_derived_strict_false_is_not_a_sampling_constraint(self):
+        """A `strict` field on the user's model doubles as the protocol switch.
+
+        set_json_schema pops `strict` out of the schema's properties and feeds
+        its default into response_format, so a business model that happens to
+        carry `strict: bool = False` silently drops the sampling constraint.
+        Guards the derived path, which no request-level `strict` case reaches.
+        """
+
+        class Note(BaseModel):
+            title: str
+            strict: bool = False
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Return JSON"}],
+            response_format={
+                "type": "json_schema",
+                "schema": Note.model_json_schema(),
+            },
+        )
+
+        self.assertIs(request.response_format.json_schema.strict, False)
+        self.assertNotIn(
+            "strict", request.response_format.json_schema.schema_["properties"]
+        )
+        sampling_params = request.to_sampling_params(
+            stop=[], model_generation_config={}
+        )
+        self.assertNotIn("json_schema", sampling_params)
+
     def test_non_strict_response_format_is_not_a_sampling_constraint(self):
         request = ChatCompletionRequest(
             model="test-model",

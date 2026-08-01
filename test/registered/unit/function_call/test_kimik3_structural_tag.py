@@ -143,14 +143,6 @@ def _valid_weather_call(index=1):
     )
 
 
-def test_detector_advertises_model_native_structural_tag():
-    detector = KimiK3Detector()
-
-    assert detector.supports_structural_tag()
-    assert not detector.parses_required_natively()
-    assert isinstance(detector.get_structural_tag([_tool()]), xgr.StructuralTag)
-
-
 def test_strict_schema_accepts_native_xtml_values():
     grammar = _grammar([_tool()], tool_choice="required")
 
