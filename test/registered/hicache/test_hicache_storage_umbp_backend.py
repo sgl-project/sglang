@@ -20,6 +20,7 @@ import time
 import unittest
 
 import requests
+
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import (

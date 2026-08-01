@@ -1282,7 +1282,7 @@ class UMBPStore(HiCacheStorage):
             if final_pages == 0:
                 break
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
+                keys[:final_pages], transfer
             )
             exists = list(self.client.batch_exists(component_keys))
             if len(exists) != len(component_keys):
@@ -1298,7 +1298,7 @@ class UMBPStore(HiCacheStorage):
             # Collapse per-object results into per-page presence.
             page_exists = [
                 all(exists[i * key_multiplier : (i + 1) * key_multiplier])
-                for i in range(kv_pages)
+                for i in range(final_pages)
             ]
 
             boundary = 0
@@ -1306,10 +1306,10 @@ class UMBPStore(HiCacheStorage):
                 try:
                     boundary = page_exists.index(False)
                 except ValueError:
-                    boundary = kv_pages
+                    boundary = final_pages
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
+                for prefix_len in range(final_pages, 0, -1):
                     if all(
                         page_exists[i]
                         for i in range(max(0, prefix_len - trailing), prefix_len)

@@ -401,6 +401,52 @@ class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
 
         self.assertEqual(result.kv_hit_pages, 0)
 
+    def test_batch_exists_v2_narrows_queries_across_side_pools(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+
+        store = self._make_v2_store()
+        store.register_mem_host_pool_v2(MockHybridSidePool(), PoolName.DEEPSEEK_V4_C128)
+        page_keys = [f"page{i}" for i in range(4)]
+        store.client.batch_exists.side_effect = [
+            [True, True, False, True],
+            [True, False],
+        ]
+        transfers = [
+            PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C4,
+                keys=page_keys,
+                host_indices=[0, 1, 2, 3],
+            ),
+            PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C128,
+                keys=page_keys,
+                host_indices=[0, 1, 2, 3],
+            ),
+        ]
+
+        result = store.batch_exists_v2(page_keys, transfers)
+
+        queried_keys = [
+            invocation.args[0]
+            for invocation in store.client.batch_exists.call_args_list
+        ]
+        self.assertEqual(
+            queried_keys,
+            [
+                [f"{key}__{PoolName.DEEPSEEK_V4_C4}" for key in page_keys],
+                [f"{key}__{PoolName.DEEPSEEK_V4_C128}" for key in page_keys[:2]],
+            ],
+        )
+        self.assertEqual(result.kv_hit_pages, 1)
+        self.assertEqual(
+            result.extra_pool_hit_pages,
+            {
+                PoolName.KV: 4,
+                PoolName.DEEPSEEK_V4_C4: 2,
+                PoolName.DEEPSEEK_V4_C128: 1,
+            },
+        )
+
     def test_short_batch_get_result_marks_every_page_failed(self):
         from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 
