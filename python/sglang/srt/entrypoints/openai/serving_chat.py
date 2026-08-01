@@ -891,6 +891,7 @@ class OpenAIServingChat(OpenAIServingBase):
         thinking_mode = (
             ThinkingMode.THINKING if thinking_requested else ThinkingMode.CHAT
         )
+        drop_thinking = (request.chat_template_kwargs or {}).get("drop_thinking", True)
         messages = [msg.model_dump() for msg in request.messages]
         for message in messages:
             normalize_assistant_tool_call_arguments(message)
@@ -976,12 +977,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 real_input = encoding_dsv4.encode_messages(
                     messages,
                     thinking_mode=thinking_mode,
+                    drop_thinking=drop_thinking,
                     reasoning_effort=v4_reasoning_effort,
                 )
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
             else:
                 real_input = encoding_dsv32.encode_messages(
-                    messages, thinking_mode=thinking_mode
+                    messages,
+                    thinking_mode=thinking_mode,
+                    drop_thinking=drop_thinking,
                 )
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
 
