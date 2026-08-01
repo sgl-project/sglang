@@ -163,6 +163,27 @@ html.dark table tbody tr:nth-child(even) td,
   line-height: 1.45;
 }
 
+.sgd-model-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: -1.5rem 0 0;
+}
+
+.sgd-model-tags .sgd-chip {
+  margin: 0;
+}
+
+.sgd-model-tags + h2 {
+  margin-top: 0.75rem;
+}
+
+.prose:has(.sgd-model-tags) {
+  overflow-x: clip;
+  overflow-y: visible;
+}
+
 .sgd-muted {
   color: rgb(107, 114, 128);
   font-size: 0.85rem;

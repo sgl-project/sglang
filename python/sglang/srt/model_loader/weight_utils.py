@@ -686,6 +686,16 @@ def filter_duplicate_safetensors_files(
     weight_files_in_index = set()
     for weight_name in weight_map:
         weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
+    # Fail fast if the index references shard files that are not on disk (e.g. an
+    # incomplete or interrupted download). Otherwise those shards are silently
+    # dropped and the model loads with uninitialized weights.
+    missing_files = sorted(f for f in weight_files_in_index if not os.path.isfile(f))
+    if missing_files:
+        raise RuntimeError(
+            f"{index_file} references {len(missing_files)} shard file(s) missing "
+            f"from {hf_folder} (incomplete download?): "
+            f"{[os.path.basename(f) for f in missing_files]}"
+        )
     # Filter out any fields that are not found in the index file.
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
@@ -989,6 +999,8 @@ def safetensors_weights_iterator(
 
 def fastsafetensors_weights_iterator(
     hf_weights_files: List[str],
+    enable_gds: bool = True,
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the weights in the model safetensor files
@@ -1026,7 +1038,7 @@ def fastsafetensors_weights_iterator(
         disable=False,
         bar_format=_BAR_FORMAT,
     ):
-        loader = SafeTensorsFileLoader(pg, device)
+        loader = SafeTensorsFileLoader(pg, device, nogds=not enable_gds)
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
         loader.add_filenames(rank_file_map)
         try:
@@ -1040,6 +1052,9 @@ def fastsafetensors_weights_iterator(
                 pass
         finally:
             loader.close()
+        if drop_cache_after_load:
+            for loaded_file in rank_file_map.get(rank, []):
+                _drop_file_cache_after_load(loaded_file)
 
 
 def multi_thread_safetensors_weights_iterator(

@@ -113,7 +113,7 @@ class RMSNormOp(BaseFusedOp):
     ) -> torch.Tensor:
         import torch
 
-        from sglang.kernels.ops.layernorm._jit_norm import rmsnorm as jit_rmsnorm
+        from sglang.kernels.ops.layernorm.norm import rmsnorm as jit_rmsnorm
 
         if out is None:
             out = torch.empty_like(input)
@@ -227,7 +227,7 @@ class FusedAddRMSNormOp(BaseFusedOp):
         eps: float = 1e-6,
         enable_pdl: Optional[bool] = None,
     ) -> None:
-        from sglang.kernels.ops.layernorm._jit_norm import (
+        from sglang.kernels.ops.layernorm.norm import (
             fused_add_rmsnorm as jit_fused_add_rmsnorm,
         )
 
@@ -512,8 +512,6 @@ from sglang.kernels.spec import KernelSpec
 # Triton / TileLang kernels migrated from srt/layers top-level strays
 # (RFC #29630, Phase 2.5); registered for inventory.
 _PHASE25_KERNELS = [
-    ("elementwise", "fused_dual_residual_rmsnorm", "triton"),
-    ("elementwise", "fused_rmsnorm", "triton"),
     ("gemma4_fused_ops", "gemma4_fused_routing", "triton"),
     ("gemma4_fused_ops", "gemma_qkv_rmsnorm", "triton"),
     ("mhc_head", "fused_hc_head", "triton"),
@@ -527,3 +525,15 @@ for _mod, _fn, _bk in _PHASE25_KERNELS:
         )
     )
 del _mod, _fn, _bk
+
+# The fused-rmsnorm variants physically live in the shared fused-pointwise
+# collection (sglang.kernels.ops.elementwise.elementwise) but stay layernorm ops.
+for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.elementwise.elementwise:{_fn}",
+        )
+    )
+del _fn

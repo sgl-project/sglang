@@ -3,6 +3,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
+import torch
+
+from sglang.srt.runtime_context import get_exec, get_schedule
+
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import (
         UpdateWeightFromDiskReqInput,
@@ -13,6 +17,10 @@ if TYPE_CHECKING:
 
 
 class EagleDraftWorkerBase(ABC):
+    # topk=1 chain constants for draft_forward's fast path; None when topk > 1.
+    _topk1_parents_prealloc: Optional[torch.Tensor] = None
+    _topk1_score_indices_prealloc: Optional[torch.Tensor] = None
+
     @abstractmethod
     def draft():
         pass
@@ -40,6 +48,40 @@ class EagleDraftWorkerBase(ABC):
         """Capture draft graphs (decode disabled on the draft TpModelWorker)."""
         self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
         self._capture_cuda_graphs()
+
+    def _rebuild_topk1_chain_buffers(self) -> None:
+        # For topk=1 the draft tree degenerates to a chain, so parent_list and
+        # top_scores_index are runtime-invariant. Must be rebuilt after any
+        # change to speculative_num_steps / speculative_num_draft_tokens.
+        if self.topk != 1:
+            return
+        # _override_worker_state can set both directly, bypassing the hook that
+        # pins this relation; the fast path is only valid when it holds.
+        assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
+            "topk=1 requires speculative_num_draft_tokens == speculative_num_steps + 1, "
+            f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
+        )
+        num_steps = self.speculative_num_steps
+        sa = self.server_args
+        decode_max_bs = (
+            get_exec().graph.cuda_graph_config.decode.max_bs
+            if get_exec().graph.cuda_graph_config is not None
+            else None
+        )
+        max_bs = max(
+            decode_max_bs or 0,
+            get_schedule().max_running_requests or 0,
+            1,
+        )
+        # A single-step chain has no parent entries (slow path drops the last
+        # step). repeat (not expand): the kernel reads these as contiguous.
+        parent_width = num_steps if num_steps > 1 else 0
+        self._topk1_parents_prealloc = torch.arange(
+            -1, parent_width - 1, dtype=torch.long, device=self.device
+        ).repeat(max_bs, 1)
+        self._topk1_score_indices_prealloc = torch.arange(
+            num_steps, dtype=torch.long, device=self.device
+        ).repeat(max_bs, 1)
 
 
 class BaseSpecWorker(ABC):

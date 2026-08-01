@@ -453,7 +453,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         pattern="In-place QK RMSNorm",
         candidate_path=(
             "python/sglang/srt/models/utils.py"
-            "<br>python/sglang/kernels/ops/layernorm/_jit_norm.py"
+            "<br>python/sglang/kernels/ops/layernorm/norm.py"
         ),
         active_keywords=("fused_inplace_qknorm", "minimaxm2rmsnormtp"),
         split_groups=(("apply_qk_norm", "q_norm", "k_norm", "qknorm"),),
@@ -840,7 +840,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         pattern="PR #22392 CUTLASS FP8 scaled MM replacing nvjet",
         candidate_path=(
             "PR #22392"
-            "<br>sgl-kernel/python/sgl_kernel/gemm.py"
+            "<br>python/sglang/kernels/aot/python/sgl_kernel/gemm.py"
             "<br>python/sglang/srt/layers/quantization/fp8_utils.py"
         ),
         active_keywords=("cutlass_scaled_mm", "fp8_scaled_mm"),
@@ -2632,7 +2632,7 @@ def fusion_framework_hints(spec: FusionPatternSpec) -> set[str]:
         hints.add("tokenspeed")
     if "tensorrt_llm/" in text:
         hints.add("trtllm")
-    if any(token in text for token in ("python/sglang/", "sgl-kernel/", "sgl_kernel/")):
+    if any(token in text for token in ("python/sglang/", "sgl_kernel/")):
         hints.add("sglang")
     return hints
 
