@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
+    CPAttentionBackendKind,
     get_cp_strategy,
     get_cp_strategy_kind,
     init_cp_strategy,
@@ -74,6 +75,14 @@ class TestCPStrategyUnit(CustomTestCase):
         )
         self.assertEqual(ContextParallelStrategyKind.ZIGZAG.cli_value, "zigzag")
         self.assertEqual(ContextParallelStrategyKind.INTERLEAVE.cli_value, "interleave")
+        self.assertEqual(
+            CPAttentionBackendKind.from_string("flashinfer"),
+            CPAttentionBackendKind.FLASHINFER,
+        )
+        self.assertEqual(
+            CPAttentionBackendKind.from_string("fa3"),
+            CPAttentionBackendKind.FLASH_ATTENTION,
+        )
 
     def test_init_cp_strategy_binds_zigzag_strategy(self):
         init_cp_strategy(
@@ -815,6 +824,79 @@ class TestCPZigzagStrategy(CustomTestCase):
                 torch.testing.assert_close(
                     combined_out, two_half_out, atol=1e-5, rtol=1e-5
                 )
+
+    def test_zigzag_flashinfer_dispatch_runs_once_and_restores_padding(self):
+        cp_size = 2
+        metadata = self._metadata_for_rank(
+            0,
+            cp_size=cp_size,
+            seq_lens=[8],
+            extend_seq_lens=[8],
+        )
+        fb = SimpleNamespace(attn_cp_metadata=metadata)
+        q = torch.arange(6 * 2).view(6, 2)
+        calls = []
+
+        def attn_fn(logical_q):
+            calls.append(logical_q.clone())
+            return logical_q + 100
+
+        out = ZigzagCPStrategy(cp_size=cp_size).run_attention(
+            q,
+            fb,
+            device=torch.device("cpu"),
+            attn_fn=attn_fn,
+            attention_backend=CPAttentionBackendKind.FLASHINFER,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(torch.equal(calls[0], q[:4]))
+        self.assertTrue(torch.equal(out[:4], q[:4] + 100))
+        self.assertTrue(torch.equal(out[4:], torch.zeros_like(q[4:])))
+
+    def test_zigzag_trtllm_dispatch_preserves_segment_kv_indptrs_and_padding(self):
+        cp_size = 2
+        metadata = self._metadata_for_rank(
+            0,
+            cp_size=cp_size,
+            seq_lens=[8],
+            extend_seq_lens=[8],
+        )
+        fb = SimpleNamespace(attn_cp_metadata=metadata)
+        q = torch.arange(6 * 2).view(6, 2)
+        calls = []
+
+        def attn_fn(
+            q_chunk,
+            cu_seqlens_q,
+            cache_seqlens,
+            max_seqlen_q,
+            cu_seqlens_kv,
+        ):
+            calls.append(
+                (
+                    q_chunk.clone(),
+                    cu_seqlens_q.clone(),
+                    cache_seqlens.clone(),
+                    max_seqlen_q,
+                    cu_seqlens_kv.clone(),
+                )
+            )
+            return q_chunk + 100
+
+        out = ZigzagCPStrategy(cp_size=cp_size).run_attention(
+            q,
+            fb,
+            device=torch.device("cpu"),
+            attn_fn=attn_fn,
+            attention_backend=CPAttentionBackendKind.TRTLLM_MHA,
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(torch.equal(calls[0][4], metadata.cu_seqlens_kv_prev_tensor))
+        self.assertTrue(torch.equal(calls[1][4], metadata.cu_seqlens_kv_next_tensor))
+        self.assertTrue(torch.equal(out[:4], q[:4] + 100))
+        self.assertTrue(torch.equal(out[4:], torch.zeros_like(q[4:])))
 
 
 class TestCPInterleaveStrategy(CustomTestCase):
