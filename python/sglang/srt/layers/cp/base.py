@@ -147,6 +147,10 @@ class ContextParallelStrategy(ABC):
     ) -> Any:
         """Gather rank-local KV payloads back to full token order."""
 
+    @abstractmethod
+    def local_q_indices(self, num_tokens: int, forward_batch: ForwardBatch) -> Any:
+        """Return global flat Q-row indices owned by this CP rank."""
+
     def shard_per_request(
         self,
         extend_seqs_cpu: List[int],

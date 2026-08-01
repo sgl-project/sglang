@@ -134,12 +134,13 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
         dsa_cp_round_robin_split_data,
         is_dsa_prefill_cp_round_robin_split,
     )
+    from sglang.srt.layers.cp.base import get_cp_strategy
+
+    strategy = get_cp_strategy()
+    if strategy is not None and forward_batch.attn_cp_metadata is not None:
+        return strategy.shard_hidden_states(input_, forward_batch)
 
     if is_dsa_prefill_cp_round_robin_split():
-        cp_size = get_parallel().attn_cp_size
-        assert (
-            input_.shape[0] % cp_size == 0
-        ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
         return dsa_cp_round_robin_split_data(input_)
 
     input_list = list(
@@ -147,7 +148,7 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     )
     result = torch.cat(
         [input_list[i] for i in forward_batch.attn_cp_metadata.zigzag_index], dim=0
-    ).view(-1, input_.shape[-1])
+    )
     return result
 
 
@@ -156,13 +157,13 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         dsa_cp_round_robin_split_data,
         is_dsa_prefill_cp_round_robin_split,
     )
+    from sglang.srt.layers.cp.base import get_cp_strategy
+
+    strategy = get_cp_strategy()
+    if strategy is not None and forward_batch.attn_cp_metadata is not None:
+        return strategy.shard_position_ids(positions, forward_batch)
 
     if is_dsa_prefill_cp_round_robin_split():
-        cp_size = get_parallel().attn_cp_size
-        assert positions.shape[0] % cp_size == 0, (
-            f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
-            f"cp size {cp_size}"
-        )
         return dsa_cp_round_robin_split_data(positions)
 
     position_id_list = list(
@@ -193,7 +194,7 @@ def cp_round_robin_input_ids(input_ids):
     cp_size = get_parallel().attn_cp_size
     cp_rank = get_parallel().attn_cp_rank
     if get_moe_a2a_backend().is_none():
-        input_ids = input_ids.reshape(-1, cp_size).T.flatten()
+        input_ids = torch.cat([input_ids[rank::cp_size] for rank in range(cp_size)])
     else:
         input_ids = input_ids[cp_rank::cp_size].contiguous()
     return input_ids
@@ -366,6 +367,11 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     from sglang.srt.layers.attention.dsa.utils import (
         is_dsa_prefill_cp_round_robin_split,
     )
+    from sglang.srt.layers.cp.base import get_cp_strategy
+
+    strategy = get_cp_strategy()
+    if strategy is not None and forward_batch.attn_cp_metadata is not None:
+        return strategy.gather_hidden_states(input_tensor, forward_batch, stream)
 
     if is_dsa_prefill_cp_round_robin_split():
         with use_symmetric_memory(
@@ -387,7 +393,6 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         return output_tensor
 
     # TODO: Do we need to remove the padding here?
-    bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_all_gather_reorganized_into_tensor(
         input_tensor,
         cp_size,
@@ -403,7 +408,6 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         [outputs_list[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index],
         dim=0,
     )
-    output_tensor = output_tensor.view(-1, hidden_size)
     return output_tensor
 
 
@@ -425,6 +429,12 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
     |   +-------------------------+
     """
+    from sglang.srt.layers.cp.base import get_cp_strategy
+
+    strategy = get_cp_strategy()
+    if strategy is not None and forward_batch.attn_cp_metadata is not None:
+        return strategy.gather_kv_cache(input_tensor, forward_batch, stream)
+
     output_tensor = cp_all_gather_reorganized_into_tensor_kv_cache(
         input_tensor,
         cp_size,
@@ -532,7 +542,13 @@ def prepare_context_parallel_metadata(
     )
 
     if is_dsa_prefill_cp_round_robin_split():
-        return ContextParallelMetadata()
+        from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+
+        return InterleaveCPStrategy(cp_size=cp_size).build_metadata(
+            num_tokens=int(kv_len),
+            seqs_len=seqs_len,
+            extend_seqs_len=extend_seqs_len,
+        )
 
     """prepare_input_dp_with_cp_dsa-zigzag index
     Example (DP_ATTENT_TP == CP_SIZE == 4, single sequence):
