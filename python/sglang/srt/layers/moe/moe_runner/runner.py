@@ -162,14 +162,13 @@ class MoeRunner:
         if self.fused_func is not None and not self.lora_enabled:
             if not self.is_shared_ep or getattr(
                 dispatch_output,
-                "is_shared_ep_decode",
-                False,
+                "uses_shared_ep_fused",
+                getattr(dispatch_output, "is_shared_ep_decode", False),
             ):
                 return self.fused_func(dispatch_output, quant_info, self.config)
 
-            # SharedEP is composite: only decode uses the fused shared-object
-            # path. Prefill returns the platform dispatcher's native object and
-            # continues through this already-constructed runner core.
+            # Unsupported SharedEP phases return the platform dispatcher's
+            # native object and continue through this constructed runner core.
             from sglang.srt.layers.moe.moe_runner.shared_ep import (
                 SharedEpQuantInfo,
             )

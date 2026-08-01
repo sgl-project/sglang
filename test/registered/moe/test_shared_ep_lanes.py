@@ -24,6 +24,10 @@ from sglang.srt.layers.moe.shared_ep.runtime import (
     SharedEpRuntimeHooks,
 )
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 def _server_args(**overrides):
@@ -257,7 +261,11 @@ def test_shared_lane_stages_conservative_dispatch_and_combine():
         dispatcher.combine_a(StandardCombineInput(hidden_states=hidden_states))
         assert dispatcher.combine_b() is hidden_states
 
-    dispatcher._dispatch_shared_ep.assert_called_once_with("hidden", "topk")
+    dispatcher._dispatch_shared_ep.assert_called_once_with(
+        "hidden",
+        "topk",
+        phase="decode",
+    )
     dispatcher.fallback_dispatcher.dispatch_a.assert_not_called()
     assert dispatcher._stage == "initial"
 
@@ -309,3 +317,7 @@ def test_same_lane_rejects_a_second_writer_before_combine():
         dispatcher.dispatch_a("hidden", "topk")
         with pytest.raises(RuntimeError, match="Concurrent writers"):
             dispatcher.dispatch_a("other", "other-topk")
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

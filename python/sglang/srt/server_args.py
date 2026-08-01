@@ -2263,8 +2263,9 @@ class ServerArgs:
         Arg(
             help=(
                 "Choose the backend for MoE A2A. shared_ep is a composite "
-                "backend that uses SharedEP for decode, DeepEP + DeepGEMM "
-                "for CUDA prefill, and MoRI + AITER for ROCm prefill."
+                "backend that uses shared objects for decode and admitted "
+                "ROCm block-FP8 eager prefill, with DeepEP + DeepGEMM or "
+                "MoRI + AITER fallbacks for other phases."
             ),
             choices=MOE_A2A_BACKEND_CHOICES,
             resolvable=True,

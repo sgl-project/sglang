@@ -31,10 +31,12 @@ def main() -> None:
     rounds = int(os.environ.get("SGLANG_SHARED_EP_SMOKE_ROUNDS", "1"))
     if rounds < 1:
         raise ValueError("SGLANG_SHARED_EP_SMOKE_ROUNDS must be positive")
-    mem_fraction_static = "0.87" if mtp_steps else "0.85"
+    mem_fraction_static = os.environ.get(
+        "SGLANG_SHARED_EP_MEM_FRACTION_STATIC",
+        "0.87" if mtp_steps else "0.84",
+    )
     os.environ.setdefault("SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "64")
     os.environ.setdefault("AITER_FLYDSL_FORCE", "1")
-    os.environ.setdefault("SGLANG_SHARED_EP_DIRECT_SMALL_BATCH", "1")
     args = [
         "--tp-size",
         "8",

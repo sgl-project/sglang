@@ -28,14 +28,17 @@ from sglang.srt.layers.moe.moe_runner.shared_ep import (
 )
 from sglang.srt.layers.moe.shared_ep.backend import (
     SharedEpDispatcher,
+    SharedEpDispatchOutput,
     SharedEpLaneDispatcher,
     _create_shared_ep_prefill_dispatcher,
     _get_device_profile_capability,
+    _resolve_pull_prefill_profile,
     _synchronize_admission_stage,
     _validate_decode_capacity,
     compact_intermediate_capacity,
     create_shared_ep_dispatcher,
     decode_intermediate_capacity,
+    run_shared_ep,
 )
 from sglang.srt.layers.moe.shared_ep.kernels import (
     quantize_pack_input,
@@ -45,7 +48,10 @@ from sglang.srt.layers.moe.shared_ep.layout import (
     SharedEpLayout,
     align_output_layout,
 )
-from sglang.srt.layers.moe.shared_ep.profiles import select_profile
+from sglang.srt.layers.moe.shared_ep.profiles import (
+    make_pull_cache_prefill_profile,
+    select_profile,
+)
 from sglang.srt.layers.moe.shared_ep.runtime import (
     SharedEpRuntimeCapability,
     SharedEpRuntimeHooks,
@@ -60,10 +66,12 @@ from sglang.srt.layers.moe.utils import (
     is_deepep_class_backend,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.server_args import MOE_A2A_BACKEND_CHOICES
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 def _config() -> MoeRunnerConfig:
@@ -169,7 +177,7 @@ else:
         inners = [Mock(), Mock()]
         for lane_id, inner in enumerate(inners):
             inner.lane_id = lane_id
-        admission = (object(), object(), object())
+        admission = (object(), None, object(), object())
         parallel = object()
         with (
             patch(
@@ -390,6 +398,84 @@ else:
     ):
         _validate_decode_capacity(SimpleNamespace(ep_size=8, max_tokens_per_rank=4))
 
+    @patch(
+        "sglang.srt.layers.moe.shared_ep.backend.get_dp_global_num_tokens",
+        return_value=None,
+    )
+    @patch(
+        "sglang.srt.layers.moe.shared_ep.backend.get_forward",
+        return_value=SimpleNamespace(shared_ep_global_num_tokens=None),
+    )
+    def test_decode_capacity_fails_closed_without_global_counts(
+        self,
+        _get_forward,
+        _get_dp_tokens,
+    ):
+        with self.assertRaisesRegex(RuntimeError, "complete DP token-count vector"):
+            _validate_decode_capacity(
+                SimpleNamespace(ep_size=8, max_tokens_per_rank=32)
+            )
+
+    def test_pull_prefill_profile_requires_single_lane_eager_rocm(self):
+        decode = select_profile(
+            _config(),
+            capability=(9, 5),
+            ep_size=8,
+            block_shape=(128, 128),
+            max_tokens_per_rank=32,
+            platform="rocm",
+        )
+        eager_args = SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.DISABLED)
+            )
+        )
+        with (
+            patch(
+                "sglang.srt.layers.moe.shared_ep.backend.get_server_args",
+                return_value=eager_args,
+            ),
+            patch(
+                "sglang.srt.layers.moe.shared_ep.backend.get_schedule",
+                return_value=SimpleNamespace(chunked_prefill_size=1024),
+            ),
+        ):
+            prefill = _resolve_pull_prefill_profile(
+                decode,
+                SharedEpLaneProtocol(1, 1),
+            )
+            self.assertIsNotNone(prefill)
+            self.assertEqual(prefill.max_tokens_per_rank, 1024)
+            self.assertEqual(prefill.block_size_m, 64)
+            self.assertIsNone(
+                _resolve_pull_prefill_profile(
+                    decode,
+                    SharedEpLaneProtocol(2, 1),
+                )
+            )
+
+        graph_args = SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.FULL)
+            )
+        )
+        with (
+            patch(
+                "sglang.srt.layers.moe.shared_ep.backend.get_server_args",
+                return_value=graph_args,
+            ),
+            patch(
+                "sglang.srt.layers.moe.shared_ep.backend.get_schedule",
+                return_value=SimpleNamespace(chunked_prefill_size=1024),
+            ),
+        ):
+            self.assertIsNone(
+                _resolve_pull_prefill_profile(
+                    decode,
+                    SharedEpLaneProtocol(1, 1),
+                )
+            )
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_quantize_pack_input_matches_reference_layout(self):
         for hidden_size, top_k in ((4096, 6), (6144, 8)):
@@ -588,7 +674,7 @@ else:
             create_state=Mock(),
             capabilities=frozenset(SharedEpRuntimeCapability),
         )
-        admit_framework.return_value = (profile, runtime, "cpu_group")
+        admit_framework.return_value = (profile, None, runtime, "cpu_group")
         get_shared_state.return_value = state
 
         dispatcher = SharedEpDispatcher(_config())
@@ -655,6 +741,7 @@ else:
         )
         state = SimpleNamespace(
             local_input=object(),
+            local_output=torch.ones((16, 1, 4)),
             global_input=SimpleNamespace(
                 activations=object(),
                 scales=object(),
@@ -710,6 +797,7 @@ else:
         )
         state = SimpleNamespace(
             local_input=object(),
+            local_output=torch.ones((16, 1, 4)),
             global_input=SimpleNamespace(
                 activations=object(),
                 scales=object(),
@@ -745,6 +833,83 @@ else:
         )
         state.input_epoch.publish.assert_called_once_with()
         state.input_epoch.wait_all.assert_not_called()
+        self.assertTrue(torch.all(state.local_output == 0))
+        fallback.dispatch.assert_not_called()
+
+    @patch(
+        "sglang.srt.layers.moe.shared_ep.backend.get_forward",
+        return_value=SimpleNamespace(
+            shared_ep_is_decode=False,
+            shared_ep_is_prefill=True,
+        ),
+    )
+    @patch(
+        "sglang.srt.layers.moe.shared_ep.backend.get_dp_global_num_tokens",
+        return_value=[16] * 8,
+    )
+    @patch("sglang.srt.layers.moe.shared_ep.kernels.quantize_pack_input")
+    def test_admitted_prefill_publishes_pull_cache_object(
+        self,
+        quantize_pack,
+        _global_num_tokens,
+        _get_forward,
+    ):
+        fallback = Mock()
+        decode_profile = SimpleNamespace(
+            max_tokens_per_rank=32,
+            ep_size=8,
+            block_shape=(128, 128),
+            quantization=SharedEpQuantization.BLOCK_FP8,
+        )
+        prefill_profile = SimpleNamespace(
+            max_tokens_per_rank=1024,
+            ep_size=8,
+            block_shape=(128, 128),
+            quantization=SharedEpQuantization.BLOCK_FP8,
+        )
+        prefill_state = SimpleNamespace(
+            local_input=object(),
+            local_output=torch.ones((16, 1, 4)),
+            global_input=SimpleNamespace(
+                activations=object(),
+                scales=object(),
+            ),
+            input_epoch=Mock(),
+        )
+        pull_cache = object()
+        dispatcher = SharedEpDispatcher.__new__(SharedEpDispatcher)
+        dispatcher.profile = decode_profile
+        dispatcher.prefill_profile = prefill_profile
+        dispatcher.prefill_state = prefill_state
+        dispatcher.prefill_cache = pull_cache
+        dispatcher.lane_id = 0
+        dispatcher._stage = "initial"
+        dispatcher._active_uses_shared_ep = None
+        dispatcher.local_expert_start = 0
+        dispatcher.fallback_dispatcher = fallback
+        dispatcher._decode_quant_admitted = True
+        hidden_states = torch.zeros((16, 4))
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.ones((16, 1)),
+            topk_ids=torch.zeros((16, 1), dtype=torch.int32),
+            router_logits=None,
+        )
+
+        output = dispatcher.dispatch(hidden_states, topk_output)
+
+        self.assertEqual(output.phase, "prefill")
+        self.assertIs(output.profile, prefill_profile)
+        self.assertIs(output.state, prefill_state)
+        self.assertIs(output.pull_cache, pull_cache)
+        quantize_pack.assert_called_once_with(
+            prefill_state.local_input,
+            source=hidden_states,
+            source_ids=topk_output.topk_ids,
+            source_weights=topk_output.topk_weights,
+            group_size=128,
+        )
+        self.assertTrue(torch.all(prefill_state.local_output == 0))
+        prefill_state.input_epoch.publish.assert_called_once_with()
         fallback.dispatch.assert_not_called()
 
     def test_decode_combine_uses_the_admitted_lane_stage(self):
@@ -833,6 +998,95 @@ else:
             config,
             {},
         )
+
+    @patch("sglang.srt.layers.moe.shared_ep.backend._validate_decode_weights")
+    @patch(
+        "sglang.srt.layers.moe.shared_ep.backend.intermediate_capacity",
+        return_value=64,
+    )
+    @patch("sglang.srt.layers.moe.shared_ep.kernels.prepare_routes")
+    @patch("sglang.kernels.ops.attention.dsv4.silu_and_mul_contig_post_quant")
+    @patch("sglang.srt.layers.moe.shared_ep.backend.pull_cache_rows")
+    @patch("sglang.srt.layers.moe.shared_ep.backend.invoke_pull_cache_w13")
+    @patch("sglang.kernels.ops.moe.fused_moe_triton_kernels.invoke_fused_moe_kernel")
+    def test_fused_prefill_pulls_w13_and_direct_returns_w2(
+        self,
+        fused_moe,
+        pull_w13,
+        pull_rows,
+        _silu_and_mul,
+        prepare_routes,
+        _capacity,
+        _validate_weights,
+    ):
+        decode_profile = select_profile(
+            _config(),
+            platform="rocm",
+            capability=(9, 5),
+            ep_size=8,
+            block_shape=(128, 128),
+            max_tokens_per_rank=32,
+        )
+        profile = make_pull_cache_prefill_profile(decode_profile, 1024)
+        self.assertIsNotNone(profile)
+        routes = SimpleNamespace(
+            local_ids=torch.zeros((8, 1, profile.top_k), dtype=torch.int32),
+            local_weights=torch.ones((8, 1, profile.top_k), dtype=torch.float32),
+            sorted_token_ids=torch.zeros(64, dtype=torch.int32),
+            expert_ids=torch.zeros(1, dtype=torch.int32),
+            num_tokens_post_padded=torch.ones(1, dtype=torch.int32),
+        )
+        prepare_routes.return_value = routes
+        input_epoch = Mock()
+        input_epoch.allocation.local_storage = torch.zeros(1, dtype=torch.uint8)
+        input_epoch.epoch = torch.ones(1, dtype=torch.int32)
+        state = SimpleNamespace(
+            global_input=SimpleNamespace(
+                topk_ids=torch.zeros((8, 1, profile.top_k), dtype=torch.int32),
+                topk_weights=torch.ones((8, 1, profile.top_k), dtype=torch.float32),
+            ),
+            input_epoch=input_epoch,
+            global_output=torch.empty((64, profile.hidden_size), dtype=torch.bfloat16),
+            local_output=torch.zeros(
+                (1, profile.top_k, profile.hidden_size), dtype=torch.bfloat16
+            ),
+            output_epoch=Mock(),
+        )
+        pull_cache = SimpleNamespace(active_rows=64)
+        dispatch_output = SharedEpDispatchOutput(
+            hidden_states=torch.empty(
+                (8, profile.hidden_size), dtype=torch.float8_e4m3fn
+            ),
+            hidden_states_scale=torch.ones(
+                (8, profile.hidden_size // 128), dtype=torch.float32
+            ),
+            topk_output=object(),
+            state=state,
+            profile=profile,
+            num_tokens=1,
+            local_expert_start=0,
+            phase="prefill",
+            pull_cache=pull_cache,
+        )
+        quant_info = SimpleNamespace(
+            w13_weight=torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn),
+            w13_scale=torch.ones((1, 1, 1), dtype=torch.float32),
+            w2_weight=torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn),
+            w2_scale=torch.ones((1, 1, 1), dtype=torch.float32),
+        )
+
+        output = run_shared_ep(
+            dispatch_output,
+            quant_info,
+            SimpleNamespace(swiglu_limit=None),
+        )
+
+        self.assertEqual(output.hidden_states.shape, (1, profile.hidden_size))
+        pull_rows.assert_called_once()
+        pull_w13.assert_called_once()
+        fused_moe.assert_called_once()
+        state.output_epoch.publish.assert_called_once_with()
+        state.output_epoch.wait_all.assert_called_once_with()
 
     def test_quant_metadata_rejects_aiter_shuffled_decode_weights(self):
         w13 = torch.empty((1, 2, 3))

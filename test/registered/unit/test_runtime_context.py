@@ -725,6 +725,7 @@ class TestForwardFlags(_IsolatedServerArgs):
             )
         )
         self.assertTrue(get_forward().shared_ep_is_decode)
+        self.assertFalse(get_forward().shared_ep_is_prefill)
         self.assertEqual(get_forward().shared_ep_generation, 3)
 
         publish_shared_ep_forward_flags(
@@ -735,6 +736,82 @@ class TestForwardFlags(_IsolatedServerArgs):
             )
         )
         self.assertFalse(get_forward().shared_ep_is_decode)
+        self.assertFalse(get_forward().shared_ep_is_prefill)
+
+        publish_shared_ep_forward_flags(
+            SimpleNamespace(
+                forward_mode=ForwardMode.IDLE,
+                global_forward_mode=ForwardMode.EXTEND,
+                shared_ep_generation=0,
+            )
+        )
+        self.assertFalse(get_forward().shared_ep_is_decode)
+        self.assertTrue(get_forward().shared_ep_is_prefill)
+
+    def test_shared_ep_gathers_rank_consistent_counts_before_forward(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.runtime_context import (
+            get_forward,
+            publish_shared_ep_forward_flags,
+        )
+
+        parallel = SimpleNamespace(
+            moe_ep_group=SimpleNamespace(cpu_group="cpu_group"),
+            moe_ep_size=8,
+            attn_dp_size=8,
+            attn_dp_rank=0,
+        )
+
+        def gather_counts(output, value, *, group):
+            self.assertEqual(group, "cpu_group")
+            self.assertEqual(value, (3, int(ForwardMode.DECODE)))
+            output[:] = [
+                (3, int(ForwardMode.DECODE)),
+                (4, int(ForwardMode.IDLE)),
+                (2, int(ForwardMode.IDLE)),
+                (1, int(ForwardMode.IDLE)),
+                (1, int(ForwardMode.IDLE)),
+                (1, int(ForwardMode.IDLE)),
+                (1, int(ForwardMode.IDLE)),
+                (1, int(ForwardMode.IDLE)),
+            ]
+
+        reset_context()
+        with (
+            patch(
+                "sglang.srt.runtime_context.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(moe_a2a_backend="shared_ep")
+                ),
+            ),
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=parallel,
+            ),
+            patch("torch.distributed.get_world_size", return_value=8),
+            patch(
+                "torch.distributed.all_gather_object",
+                side_effect=gather_counts,
+            ),
+        ):
+            publish_shared_ep_forward_flags(
+                SimpleNamespace(
+                    forward_mode=ForwardMode.DECODE,
+                    global_forward_mode=ForwardMode.DECODE,
+                    shared_ep_generation=0,
+                    global_num_tokens_cpu=(3,),
+                )
+            )
+
+        self.assertEqual(
+            get_forward().shared_ep_global_num_tokens,
+            (3, 4, 2, 1, 1, 1, 1, 1),
+        )
+        self.assertTrue(get_forward().shared_ep_counts_synchronized)
+        self.assertTrue(get_forward().shared_ep_is_decode)
+        self.assertFalse(get_forward().shared_ep_is_prefill)
 
     def test_scoped_restores_on_exception_and_validates_keys(self):
         from sglang.srt.runtime_context import get_forward

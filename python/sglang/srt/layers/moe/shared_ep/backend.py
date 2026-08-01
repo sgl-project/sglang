@@ -1,9 +1,9 @@
-"""Composite SharedEP decode backend with platform-native prefill fallback."""
+"""SharedEP direct decode plus ROCm block-FP8 pull-cache prefill."""
 
 from __future__ import annotations
 
-import os
-from typing import Any, NamedTuple
+import logging
+from typing import Any, Literal, NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -33,9 +33,19 @@ from sglang.srt.layers.moe.shared_ep.layout import (
     SharedEpLayout,
 )
 from sglang.srt.layers.moe.shared_ep.profiles import (
+    RELEASE_MAX_PREFILL_TOKENS_PER_RANK,
     RELEASE_MAX_TOKENS_PER_RANK,
     SharedEpProfile,
+    make_pull_cache_prefill_profile,
+    resolve_prefill_capacity,
     select_profile,
+)
+from sglang.srt.layers.moe.shared_ep.pull_cache_prefill import (
+    PullCache,
+    allocate_pull_cache,
+    invoke_pull_cache_w13,
+    make_pull_cache_prefill_plan,
+    pull_cache_rows,
 )
 from sglang.srt.layers.moe.shared_ep.runtime import (
     SharedEpRuntimeHooks,
@@ -54,13 +64,17 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     get_shared_ep_prefill_backend,
 )
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_resources,
+    get_schedule,
     get_server_args,
 )
 from sglang.srt.utils import is_cuda, is_hip
+
+logger = logging.getLogger(__name__)
 
 
 class SharedEpDispatchOutput(NamedTuple):
@@ -71,6 +85,8 @@ class SharedEpDispatchOutput(NamedTuple):
     profile: SharedEpProfile
     num_tokens: int
     local_expert_start: int
+    phase: Literal["decode", "prefill"] = "decode"
+    pull_cache: PullCache | None = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -78,6 +94,10 @@ class SharedEpDispatchOutput(NamedTuple):
 
     @property
     def is_shared_ep_decode(self) -> bool:
+        return self.phase == "decode"
+
+    @property
+    def uses_shared_ep_fused(self) -> bool:
         return True
 
 
@@ -96,8 +116,8 @@ def compact_intermediate_capacity(
     return valid_routes + experts_with_routes * (block_size - 1)
 
 
-def decode_intermediate_capacity(profile: SharedEpProfile) -> int:
-    """Worst-case EP-local route capacity for uneven owner batches."""
+def intermediate_capacity(profile: SharedEpProfile) -> int:
+    """Worst-case EP-local route capacity for the profile's phase."""
 
     return compact_intermediate_capacity(
         num_tokens=profile.max_tokens_per_rank,
@@ -108,27 +128,56 @@ def decode_intermediate_capacity(profile: SharedEpProfile) -> int:
     )
 
 
-def _validate_decode_capacity(profile: SharedEpProfile) -> None:
-    global_num_tokens = get_dp_global_num_tokens()
+def decode_intermediate_capacity(profile: SharedEpProfile) -> int:
+    """Compatibility name for callers that only exercise decode."""
+
+    return intermediate_capacity(profile)
+
+
+def _validate_phase_capacity(
+    profile: SharedEpProfile,
+    *,
+    phase: Literal["decode", "prefill"],
+) -> None:
+    # ForwardBatch carries the scheduler's complete DP vector even when the
+    # legacy gathered-buffer accessor exposes only this rank's local entry.
+    forward = get_forward()
+    global_num_tokens = getattr(
+        forward,
+        "shared_ep_global_num_tokens",
+        None,
+    )
     if global_num_tokens is None:
-        global_num_tokens = get_forward().shared_ep_global_num_tokens
-    if global_num_tokens is None:
-        # Eager DP-attention does not populate the gathered-buffer metadata
-        # when SharedEP bypasses that buffer. Admission caps the global request
-        # count at EP * max_tokens_per_rank and every owner validates its local
-        # row count below, so the fixed-capacity route scan remains safe.
-        return
-    global_num_tokens = tuple(int(value) for value in global_num_tokens)
+        global_num_tokens = get_dp_global_num_tokens()
+    global_num_tokens = (
+        ()
+        if global_num_tokens is None
+        else tuple(int(value) for value in global_num_tokens)
+    )
     if not global_num_tokens:
-        return
+        raise RuntimeError(
+            f"SharedEP {phase} requires the complete DP token-count vector "
+            "before object publication"
+        )
+    if len(global_num_tokens) != profile.ep_size:
+        raise RuntimeError(
+            f"SharedEP {phase} expected {profile.ep_size} DP token counts, "
+            f"got {len(global_num_tokens)}"
+        )
     largest = max(global_num_tokens)
     if largest > profile.max_tokens_per_rank:
         failed_rank = global_num_tokens.index(largest)
         raise ValueError(
-            "SharedEP decode capacity exceeded: "
+            f"SharedEP {phase} capacity exceeded: "
             f"rank {failed_rank} has {largest} local tokens, "
             f"capacity is {profile.max_tokens_per_rank}"
         )
+
+
+def _validate_decode_capacity(profile: SharedEpProfile) -> None:
+    """Compatibility wrapper for decode-only callers."""
+
+    _validate_phase_capacity(profile, phase="decode")
 
 
 def _get_device_profile_capability() -> tuple[tuple[int, int], str]:
@@ -210,12 +259,45 @@ def _synchronize_admission_stage(
         )
 
 
+def _resolve_pull_prefill_profile(
+    profile: SharedEpProfile,
+    lane_protocol: SharedEpLaneProtocol,
+) -> SharedEpProfile | None:
+    """Admit only the initial single-lane ROCm block-FP8 eager path."""
+
+    if (
+        profile.platform != "rocm"
+        or profile.quantization is not SharedEpQuantization.BLOCK_FP8
+        or not profile.supports_pull_cache_prefill
+        or lane_protocol.lane_count != 1
+    ):
+        return None
+    prefill_graph = get_server_args().cuda_graph_config.prefill
+    if prefill_graph.backend != Backend.DISABLED:
+        return None
+    chunked_prefill_size = get_schedule().chunked_prefill_size
+    if (
+        chunked_prefill_size is None
+        or chunked_prefill_size <= 0
+        or chunked_prefill_size > RELEASE_MAX_PREFILL_TOKENS_PER_RANK
+    ):
+        return None
+    capacity = resolve_prefill_capacity(chunked_prefill_size)
+    return make_pull_cache_prefill_profile(profile, capacity)
+
+
 def _admit_shared_ep_framework(
     config: MoeRunnerConfig,
     parallel,
-) -> tuple[SharedEpProfile, SharedEpRuntimeHooks, Any]:
+) -> tuple[
+    SharedEpProfile,
+    SharedEpProfile | None,
+    SharedEpRuntimeHooks,
+    Any,
+]:
     cpu_group = parallel.moe_ep_group.cpu_group
     profile = None
+    prefill_profile = None
     runtime_hooks = None
     descriptor = None
     local_error = None
@@ -236,6 +318,7 @@ def _admit_shared_ep_framework(
         )
         runtime_hooks = get_shared_ep_runtime_hooks()
         lane_protocol = compute_shared_ep_lane_protocol(get_server_args())
+        prefill_profile = _resolve_pull_prefill_profile(profile, lane_protocol)
         model_namespace = validate_shared_ep_model_namespace(
             config.shared_ep_model_namespace
         )
@@ -246,6 +329,7 @@ def _admit_shared_ep_framework(
             model_namespace,
             lane_protocol.tbo_width,
             lane_protocol.generation_width,
+            (None if prefill_profile is None else prefill_profile.admission_tuple()),
         )
     except BaseException as error:
         local_error = error
@@ -257,7 +341,14 @@ def _admit_shared_ep_framework(
         local_error=local_error,
     )
     assert profile is not None and runtime_hooks is not None
-    return profile, runtime_hooks, cpu_group
+    if prefill_profile is not None and dist.get_rank(group=cpu_group) == 0:
+        logger.info_once(
+            "SharedEP ROCm pull-cache prefill admitted: "
+            f"profile={prefill_profile.name}, "
+            f"tokens_per_rank={prefill_profile.max_tokens_per_rank}, "
+            f"block_m={prefill_profile.block_size_m}"
+        )
+    return profile, prefill_profile, runtime_hooks, cpu_group
 
 
 def _get_shared_state(
@@ -322,6 +413,70 @@ def _get_shared_state(
     return state
 
 
+def _get_shared_pull_cache(
+    profile: SharedEpProfile,
+    runtime_hooks: SharedEpRuntimeHooks,
+    *,
+    model_namespace: str,
+    lane_id: int,
+    cpu_group,
+) -> PullCache:
+    resources = get_resources().buffers
+    key = (
+        shared_ep_state_resource_key(
+            runtime_name=runtime_hooks.name,
+            profile_name=profile.name,
+            ep_size=profile.ep_size,
+            model_namespace=model_namespace,
+            lane_id=lane_id,
+        )
+        + ":pull-cache"
+    )
+    cache = resources.get(key)
+    if cache is not None:
+        return cache
+
+    plan = make_pull_cache_prefill_plan(
+        owners=profile.ep_size,
+        source_tokens_per_owner=profile.max_tokens_per_rank,
+        hidden_size=profile.hidden_size,
+        top_k=profile.top_k,
+        num_local_experts=profile.num_local_experts,
+        expert_alignment=profile.block_size_m,
+    )
+    active_rows = intermediate_capacity(profile)
+    if active_rows != plan.cache_rows:
+        raise RuntimeError(
+            "SharedEP pull-cache plan and route capacity disagree: "
+            f"{active_rows} != {plan.cache_rows}"
+        )
+
+    cache = None
+    local_error = None
+    try:
+        cache = allocate_pull_cache(
+            plan,
+            active_rows=active_rows,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+    except Exception as error:
+        local_error = error
+    _synchronize_admission_stage(
+        cpu_group,
+        stage="pull-cache allocation",
+        descriptor=(
+            profile.admission_tuple(),
+            plan.cache_rows,
+            plan.hidden_size,
+            plan.scale_groups,
+        ),
+        local_error=local_error,
+    )
+    assert cache is not None
+    resources[key] = cache
+    return cache
+
+
 class SharedEpDispatcher(BaseDispatcher):
     def __init__(
         self,
@@ -330,11 +485,19 @@ class SharedEpDispatcher(BaseDispatcher):
         *,
         model_namespace: str | None = None,
         lane_id: int = 0,
-        admission: tuple[SharedEpProfile, SharedEpRuntimeHooks, Any] | None = None,
+        admission: (
+            tuple[
+                SharedEpProfile,
+                SharedEpProfile | None,
+                SharedEpRuntimeHooks,
+                Any,
+            ]
+            | None
+        ) = None,
     ):
         super().__init__()
         parallel = get_parallel()
-        self.profile, self.runtime_hooks, self.cpu_group = (
+        self.profile, self.prefill_profile, self.runtime_hooks, self.cpu_group = (
             admission
             if admission is not None
             else _admit_shared_ep_framework(config, parallel)
@@ -357,6 +520,24 @@ class SharedEpDispatcher(BaseDispatcher):
             model_namespace=self.model_namespace,
             lane_id=self.lane_id,
         )
+        if self.prefill_profile is None:
+            self.prefill_state = None
+            self.prefill_cache = None
+        else:
+            self.prefill_state = _get_shared_state(
+                self.config,
+                self.prefill_profile,
+                self.runtime_hooks,
+                model_namespace=self.model_namespace,
+                lane_id=self.lane_id,
+            )
+            self.prefill_cache = _get_shared_pull_cache(
+                self.prefill_profile,
+                self.runtime_hooks,
+                model_namespace=self.model_namespace,
+                lane_id=self.lane_id,
+                cpu_group=self.cpu_group,
+            )
         self.local_expert_start = parallel.moe_ep_rank * self.profile.num_local_experts
         self.fallback_dispatcher = fallback_dispatcher
         self.expert_mask_gpu = getattr(
@@ -389,9 +570,22 @@ class SharedEpDispatcher(BaseDispatcher):
         # This flag is set from ForwardBatch.forward_mode before eager execution
         # and graph capture. Unlike is_extend_in_batch, it remains false for
         # TARGET_VERIFY even when decode-graph capture normalizes DP metadata.
-        return bool(get_forward().shared_ep_is_decode) or (
-            os.environ.get("SGLANG_SHARED_EP_DIRECT_SMALL_BATCH", "0") == "1"
+        return bool(get_forward().shared_ep_is_decode)
+
+    def _use_shared_ep_prefill(self) -> bool:
+        return (
+            getattr(self, "prefill_profile", None) is not None
+            and getattr(self, "prefill_state", None) is not None
+            and getattr(self, "prefill_cache", None) is not None
+            and bool(getattr(get_forward(), "shared_ep_is_prefill", False))
         )
+
+    def _execution_mode(self) -> Literal["decode", "prefill", "fallback"]:
+        if self._use_shared_ep_decode():
+            return "decode"
+        if self._use_shared_ep_prefill():
+            return "prefill"
+        return "fallback"
 
     def _require_fallback(self) -> BaseDispatcher:
         if self.fallback_dispatcher is None:
@@ -407,9 +601,14 @@ class SharedEpDispatcher(BaseDispatcher):
         topk_output: TopKOutput,
     ):
         self._require_stage("initial")
-        use_shared_ep = self._use_shared_ep_decode()
+        mode = self._execution_mode()
+        use_shared_ep = mode != "fallback"
         if use_shared_ep:
-            output = self._dispatch_shared_ep(hidden_states, topk_output)
+            output = self._dispatch_shared_ep(
+                hidden_states,
+                topk_output,
+                phase=mode,
+            )
         else:
             output = self._require_fallback().dispatch(
                 hidden_states=hidden_states,
@@ -423,23 +622,38 @@ class SharedEpDispatcher(BaseDispatcher):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        *,
+        phase: Literal["decode", "prefill"] = "decode",
     ) -> SharedEpDispatchOutput:
         if not TopKOutputChecker.format_is_standard(topk_output):
-            raise TypeError("SharedEP decode requires standard Top-K output")
+            raise TypeError(f"SharedEP {phase} requires standard Top-K output")
         if not self._decode_quant_admitted:
             raise RuntimeError(
-                "SharedEP decode quantization was not admitted during weight setup"
+                "SharedEP quantization was not admitted during weight setup"
             )
 
-        state = self.state
+        if phase == "prefill":
+            if self.prefill_profile is None or self.prefill_state is None:
+                raise RuntimeError("SharedEP pull-cache prefill was not admitted")
+            profile = self.prefill_profile
+            state = self.prefill_state
+            pull_cache = self.prefill_cache
+        else:
+            profile = self.profile
+            state = self.state
+            pull_cache = None
         num_tokens = hidden_states.shape[0]
-        _validate_decode_capacity(self.profile)
-        if num_tokens > self.profile.max_tokens_per_rank:
+        _validate_phase_capacity(profile, phase=phase)
+        if num_tokens > profile.max_tokens_per_rank:
             raise ValueError(
-                "SharedEP decode capacity exceeded: "
-                f"{num_tokens} > {self.profile.max_tokens_per_rank} local tokens"
+                f"SharedEP {phase} capacity exceeded: "
+                f"{num_tokens} > {profile.max_tokens_per_rank} local tokens"
             )
-        if self.profile.quantization is SharedEpQuantization.MXFP4:
+        if profile.quantization is SharedEpQuantization.MXFP4:
+            if phase != "decode":
+                raise RuntimeError(
+                    "SharedEP MXFP4 prefill must use the native fallback"
+                )
             from sglang.srt.layers.moe.shared_ep.fp4 import (
                 publish_bf16_owner_input,
             )
@@ -450,9 +664,6 @@ class SharedEpDispatcher(BaseDispatcher):
                 source_ids=topk_output.topk_ids,
                 source_weights=topk_output.topk_weights,
             )
-            # A missing/invalid route must reduce as zero rather than reusing a
-            # contribution from the previous epoch.
-            state.local_output[:num_tokens].zero_()
         else:
             from sglang.srt.layers.moe.shared_ep.kernels import quantize_pack_input
 
@@ -461,17 +672,22 @@ class SharedEpDispatcher(BaseDispatcher):
                 source=hidden_states,
                 source_ids=topk_output.topk_ids,
                 source_weights=topk_output.topk_weights,
-                group_size=self.profile.block_shape[1],
+                group_size=profile.block_shape[1],
             )
+        # Missing/invalid routes reduce as zero instead of reusing a prior
+        # epoch's owner contribution.
+        state.local_output[:num_tokens].zero_()
         state.input_epoch.publish()
         return SharedEpDispatchOutput(
             hidden_states=state.global_input.activations,
             hidden_states_scale=state.global_input.scales,
             topk_output=topk_output,
             state=state,
-            profile=self.profile,
+            profile=profile,
             num_tokens=num_tokens,
             local_expert_start=self.local_expert_start,
+            phase=phase,
+            pull_cache=pull_cache,
         )
 
     def combine(self, combine_input: CombineInput) -> torch.Tensor:
@@ -496,11 +712,13 @@ class SharedEpDispatcher(BaseDispatcher):
         """Publish/launch dispatch while retaining graph-static lane ownership."""
 
         self._require_stage("initial")
-        use_shared_ep = self._use_shared_ep_decode()
+        mode = self._execution_mode()
+        use_shared_ep = mode != "fallback"
         if use_shared_ep:
             self._staged_dispatch_output = self._dispatch_shared_ep(
                 hidden_states,
                 topk_output,
+                phase=mode,
             )
         else:
             self._fallback_num_tokens = hidden_states.shape[0]
@@ -854,9 +1072,8 @@ def _create_shared_ep_prefill_dispatcher(
         num_local_experts=config.num_local_experts,
         hidden_size=config.hidden_size,
         params_dtype=config.params_dtype,
-        # Prefill, TARGET_VERIFY, and DRAFT_EXTEND require the materialized
-        # dispatcher. Do not let decode-graph capture's normalized
-        # is_extend_in_batch=False select the low-latency implementation.
+        # Unsupported prefill profiles, graph/overlap prefill, TARGET_VERIFY,
+        # and DRAFT_EXTEND require this materialized dispatcher.
         deepep_mode=DeepEPMode.NORMAL,
         async_finish=True,
         return_recv_hook=True,
@@ -959,8 +1176,7 @@ def run_shared_ep(
 ) -> StandardCombineInput:
     if not isinstance(dispatch_output, SharedEpDispatchOutput):
         raise TypeError(
-            "The SharedEP fused path received a prefill dispatch object; "
-            "MoeRunner must route it through the native fallback runner"
+            "The SharedEP fused path received a native fallback dispatch object"
         )
     if dispatch_output.profile.quantization is SharedEpQuantization.MXFP4:
         from sglang.srt.layers.moe.shared_ep.fp4 import run_shared_ep_mxfp4
@@ -990,7 +1206,7 @@ def run_shared_ep(
     )
     route_ids = routes.local_ids.view(-1, profile.top_k)
     route_weights = routes.local_weights.view(-1, profile.top_k)
-    capacity = decode_intermediate_capacity(profile)
+    capacity = intermediate_capacity(profile)
     gate_up = torch.empty(
         (capacity, profile.intermediate_size * 2),
         dtype=torch.bfloat16,
@@ -1000,37 +1216,63 @@ def run_shared_ep(
         -1,
         profile.hidden_size,
     )
+    if dispatch_output.hidden_states_scale is None:
+        raise RuntimeError("SharedEP block-FP8 execution requires activation scales")
     shared_scales = dispatch_output.hidden_states_scale.view(
         -1,
         profile.hidden_size // profile.block_shape[1],
     )
-    invoke_fused_moe_kernel(
-        A=shared_activations,
-        B=quant_info.w13_weight,
-        bias=None,
-        C=gate_up,
-        A_scale=shared_scales,
-        B_scale=quant_info.w13_scale,
-        B_zp=None,
-        topk_weights=route_weights,
-        topk_ids=route_ids,
-        sorted_token_ids=routes.sorted_token_ids,
-        expert_ids=routes.expert_ids,
-        num_tokens_post_padded=routes.num_tokens_post_padded,
-        mul_routed_weight=False,
-        top_k=profile.top_k,
-        config=profile.w13_kernel_config(dispatch_output.num_tokens),
-        compute_type=tl.bfloat16,
-        use_fp8_w8a8=True,
-        use_int8_w8a8=False,
-        use_int8_w8a16=False,
-        use_int4_w4a16=False,
-        per_channel_quant=False,
-        block_shape=list(profile.block_shape),
-        filter_expert=True,
-        c_sorted=True,
-        a_is_prequantized=True,
-    )
+    if dispatch_output.phase == "prefill":
+        pull_cache = dispatch_output.pull_cache
+        if pull_cache is None or pull_cache.active_rows != capacity:
+            raise RuntimeError("SharedEP prefill pull-cache capacity mismatch")
+        pull_cache_rows(
+            source_activations=shared_activations,
+            source_scales=shared_scales,
+            sorted_token_ids=routes.sorted_token_ids,
+            num_tokens_post_padded=routes.num_tokens_post_padded,
+            cache=pull_cache,
+            top_k=profile.top_k,
+            source_route_capacity=shared_activations.shape[0] * profile.top_k,
+        )
+        invoke_pull_cache_w13(
+            cache=pull_cache,
+            weight=quant_info.w13_weight,
+            weight_scale=quant_info.w13_scale,
+            output=gate_up,
+            expert_ids=routes.expert_ids,
+            num_tokens_post_padded=routes.num_tokens_post_padded,
+            config=profile.w13_kernel_config(dispatch_output.num_tokens),
+            block_shape=profile.block_shape,
+        )
+    else:
+        invoke_fused_moe_kernel(
+            A=shared_activations,
+            B=quant_info.w13_weight,
+            bias=None,
+            C=gate_up,
+            A_scale=shared_scales,
+            B_scale=quant_info.w13_scale,
+            B_zp=None,
+            topk_weights=route_weights,
+            topk_ids=route_ids,
+            sorted_token_ids=routes.sorted_token_ids,
+            expert_ids=routes.expert_ids,
+            num_tokens_post_padded=routes.num_tokens_post_padded,
+            mul_routed_weight=False,
+            top_k=profile.top_k,
+            config=profile.w13_kernel_config(dispatch_output.num_tokens),
+            compute_type=tl.bfloat16,
+            use_fp8_w8a8=True,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            per_channel_quant=False,
+            block_shape=list(profile.block_shape),
+            filter_expert=True,
+            c_sorted=True,
+            a_is_prequantized=True,
+        )
 
     down_fp8 = torch.empty(
         (capacity, profile.intermediate_size),

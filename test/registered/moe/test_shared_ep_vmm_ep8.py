@@ -114,4 +114,7 @@ class TestSharedEpVmmEp8(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    multigpu_pytest_main(__name__, __file__, num_gpus=(8,))
+    if "WORLD_SIZE" in os.environ:
+        unittest.main()
+    else:
+        multigpu_pytest_main(__name__, __file__, num_gpus=(8,))

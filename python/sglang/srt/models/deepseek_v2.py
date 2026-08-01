@@ -654,9 +654,7 @@ class DeepseekV2MoE(nn.Module):
             ),
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
-            shared_ep_model_namespace=(
-                "draft-nextn" if is_nextn else "target"
-            ),
+            shared_ep_model_namespace=("draft-nextn" if is_nextn else "target"),
         )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):

@@ -16,11 +16,11 @@ limitations under the License.
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
-#include <cstdint>
-
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
+
+#include <cstdint>
 
 namespace {
 
@@ -125,10 +125,7 @@ struct SharedEpEpochKernel {
   }
 
   static void publish_pointer_table(
-      tvm::ffi::TensorView peer_signal_bases,
-      tvm::ffi::TensorView epoch,
-      int64_t rank,
-      int64_t world_size) {
+      tvm::ffi::TensorView peer_signal_bases, tvm::ffi::TensorView epoch, int64_t rank, int64_t world_size) {
     using namespace host;
     RuntimeCheck(peer_signal_bases.device().device_type == kDLROCM, "SharedEP peer pointer table must be ROCm");
     RuntimeCheck(epoch.device().device_type == kDLROCM, "SharedEP epoch counter must be ROCm");

@@ -479,8 +479,10 @@ class ForwardFlags:
         # must use the materialized fallback. Speculative loops may advance the
         # generation index explicitly; plain target decode stays on lane zero.
         "shared_ep_is_decode": False,
+        "shared_ep_is_prefill": False,
         "shared_ep_generation": 0,
         "shared_ep_global_num_tokens": None,
+        "shared_ep_counts_synchronized": False,
         # Per-layer MLP collective control (set by decoder via scoped()
         # around the MLP / MoE / hybrid mixer call).
         # fuse_mlp_allreduce: next residual+LN absorbs the post-MLP all-reduce.
@@ -501,8 +503,10 @@ class ForwardFlags:
             "attn_inputs",
             "is_extend_in_batch",
             "shared_ep_is_decode",
+            "shared_ep_is_prefill",
             "shared_ep_generation",
             "shared_ep_global_num_tokens",
+            "shared_ep_counts_synchronized",
             "fuse_mlp_allreduce",
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
@@ -1098,20 +1102,82 @@ def publish_shared_ep_forward_flags(forward_batch: Any) -> None:
     local_mode = forward_batch.forward_mode
     mode = global_mode or local_mode
     forward = get_forward()
-    forward.set("shared_ep_is_decode", mode.is_decode())
     forward.set(
         "shared_ep_generation",
         int(getattr(forward_batch, "shared_ep_generation", 0)),
     )
-    global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
+    raw_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
+    global_num_tokens = (
+        None
+        if raw_num_tokens is None
+        else tuple(int(value) for value in raw_num_tokens)
+    )
+    counts_synchronized = False
+    try:
+        use_shared_ep = get_exec().moe.moe_a2a_backend == "shared_ep"
+    except (AttributeError, ValueError):
+        use_shared_ep = False
+    if use_shared_ep:
+        import torch.distributed as dist
+
+        parallel = get_parallel()
+        world_size = dist.get_world_size(group=parallel.moe_ep_group.cpu_group)
+        if world_size != parallel.moe_ep_size:
+            raise RuntimeError(
+                "SharedEP token-count group does not match expert parallel size: "
+                f"{world_size} != {parallel.moe_ep_size}"
+            )
+        if global_num_tokens and len(global_num_tokens) == parallel.attn_dp_size:
+            local_num_tokens = global_num_tokens[parallel.attn_dp_rank]
+        elif global_num_tokens:
+            local_num_tokens = sum(global_num_tokens)
+        else:
+            input_ids = getattr(forward_batch, "input_ids", None)
+            if input_ids is None:
+                raise RuntimeError(
+                    "SharedEP requires local input IDs or DP token counts "
+                    "before model forward"
+                )
+            local_num_tokens = int(input_ids.shape[0])
+        gathered_state: list[tuple[int, int] | None] = [None] * world_size
+        dist.all_gather_object(
+            gathered_state,
+            (int(local_num_tokens), int(mode)),
+            group=parallel.moe_ep_group.cpu_group,
+        )
+        if any(value is None for value in gathered_state):
+            raise RuntimeError("SharedEP failed to gather every DP forward state")
+        gathered = [value for value in gathered_state if value is not None]
+        global_num_tokens = tuple(value[0] for value in gathered)
+        mode_type = type(local_mode)
+        gathered_modes = [mode_type(value[1]) for value in gathered]
+        decode_modes = [value for value in gathered_modes if value.is_decode()]
+        prefill_modes = [
+            value for value in gathered_modes if value.is_extend_without_speculative()
+        ]
+        if decode_modes:
+            if not all(value.is_decode_or_idle() for value in gathered_modes):
+                raise RuntimeError(
+                    f"SharedEP ranks disagree on decode phase: {gathered_modes}"
+                )
+            mode = decode_modes[0]
+        elif prefill_modes:
+            if not all(
+                value.is_extend_without_speculative() or value.is_idle()
+                for value in gathered_modes
+            ):
+                raise RuntimeError(
+                    f"SharedEP ranks disagree on prefill phase: {gathered_modes}"
+                )
+            mode = prefill_modes[0]
+        counts_synchronized = True
+    forward.set("shared_ep_is_decode", mode.is_decode())
+    forward.set("shared_ep_is_prefill", mode.is_extend_without_speculative())
     forward.set(
         "shared_ep_global_num_tokens",
-        (
-            tuple(int(value) for value in global_num_tokens)
-            if global_num_tokens is not None
-            else None
-        ),
+        global_num_tokens,
     )
+    forward.set("shared_ep_counts_synchronized", counts_synchronized)
 
 
 # --- Resolved config namespaces -------------------------

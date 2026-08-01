@@ -52,6 +52,10 @@ _HIP_SMALL_KERNEL_CONFIG = {
     "num_warps": 4,
     "num_stages": 1,
 }
+_HIP_PREFILL_KERNEL_CONFIG = {
+    **_HIP_KERNEL_CONFIG,
+    "BLOCK_SIZE_M": 64,
+}
 _HIP_ROUTE_KERNEL_CONFIG = {"num_threads": 256}
 _GFX950_MXFP4_KERNEL_CONFIG = {
     "BLOCK_SIZE_M": 128,
@@ -65,6 +69,31 @@ _GFX950_MXFP4_KERNEL_CONFIG = {
     "kpack": 1,
 }
 RELEASE_MAX_TOKENS_PER_RANK = 32
+RELEASE_MAX_PREFILL_TOKENS_PER_RANK = 1024
+
+
+def resolve_prefill_capacity(
+    chunked_prefill_size: int | None,
+    *,
+    release_max_tokens: int = RELEASE_MAX_PREFILL_TOKENS_PER_RANK,
+) -> int:
+    """Validate the already DP-adjusted local prefill chunk."""
+
+    if release_max_tokens <= 0:
+        raise ValueError(
+            f"release_max_tokens must be positive, got {release_max_tokens}"
+        )
+    if chunked_prefill_size is None or chunked_prefill_size <= 0:
+        raise ValueError(
+            "SharedEP pull-cache prefill requires a positive DP-adjusted "
+            f"chunk, got {chunked_prefill_size}"
+        )
+    if chunked_prefill_size > release_max_tokens:
+        raise ValueError(
+            "SharedEP DP-adjusted prefill chunk exceeds pull-cache capacity: "
+            f"{chunked_prefill_size} > {release_max_tokens}"
+        )
+    return chunked_prefill_size
 
 
 class SharedEpProfile(msgspec.Struct, frozen=True, kw_only=True):
@@ -83,10 +112,14 @@ class SharedEpProfile(msgspec.Struct, frozen=True, kw_only=True):
     small_kernel_config: dict[str, int] | None
     small_kernel_max_tokens: int
     route_kernel_config: dict[str, int]
+    supports_pull_cache_prefill: bool = False
     default_w13_kernel_config: dict[str, int] | None = None
     default_w2_kernel_config: dict[str, int] | None = None
     small_w13_kernel_config: dict[str, int] | None = None
     small_w2_kernel_config: dict[str, int] | None = None
+    prefill_kernel_config: dict[str, int] | None = None
+    prefill_w13_kernel_config: dict[str, int] | None = None
+    prefill_w2_kernel_config: dict[str, int] | None = None
     platform: str = "cuda"
 
     @property
@@ -218,6 +251,10 @@ GLM52_GFX950 = SharedEpProfile(
     default_w2_kernel_config=_HIP_KERNEL_CONFIG,
     small_w13_kernel_config=_HIP_SMALL_KERNEL_CONFIG,
     small_w2_kernel_config=_HIP_SMALL_KERNEL_CONFIG,
+    supports_pull_cache_prefill=True,
+    prefill_kernel_config=_HIP_PREFILL_KERNEL_CONFIG,
+    prefill_w13_kernel_config=_HIP_PREFILL_KERNEL_CONFIG,
+    prefill_w2_kernel_config=_HIP_PREFILL_KERNEL_CONFIG,
     platform="rocm",
 )
 
@@ -241,6 +278,10 @@ DSV4_FLASH_GFX950 = SharedEpProfile(
     default_w2_kernel_config=_HIP_KERNEL_CONFIG,
     small_w13_kernel_config=_HIP_SMALL_KERNEL_CONFIG,
     small_w2_kernel_config=_HIP_SMALL_KERNEL_CONFIG,
+    supports_pull_cache_prefill=True,
+    prefill_kernel_config=_HIP_PREFILL_KERNEL_CONFIG,
+    prefill_w13_kernel_config=_HIP_PREFILL_KERNEL_CONFIG,
+    prefill_w2_kernel_config=_HIP_PREFILL_KERNEL_CONFIG,
     platform="rocm",
 )
 
@@ -273,6 +314,40 @@ _PROFILES = (
     DSV4_FLASH_GFX950,
     DSV4_PRO_MXFP4_GFX950,
 )
+
+
+def make_pull_cache_prefill_profile(
+    profile: SharedEpProfile,
+    max_tokens_per_rank: int,
+) -> SharedEpProfile | None:
+    """Derive a phase-local profile without changing decode admission."""
+
+    if max_tokens_per_rank <= 0:
+        raise ValueError(
+            f"max_tokens_per_rank must be positive, got {max_tokens_per_rank}"
+        )
+    if not profile.supports_pull_cache_prefill:
+        return None
+    if (
+        profile.prefill_kernel_config is None
+        or profile.prefill_w13_kernel_config is None
+        or profile.prefill_w2_kernel_config is None
+    ):
+        raise ValueError(
+            f"SharedEP profile {profile.name} has incomplete prefill kernel configs"
+        )
+    return msgspec.structs.replace(
+        profile,
+        name=f"{profile.name}_prefill_pull",
+        max_tokens_per_rank=max_tokens_per_rank,
+        default_kernel_config=profile.prefill_kernel_config,
+        small_kernel_config=None,
+        small_kernel_max_tokens=0,
+        default_w13_kernel_config=profile.prefill_w13_kernel_config,
+        default_w2_kernel_config=profile.prefill_w2_kernel_config,
+        small_w13_kernel_config=None,
+        small_w2_kernel_config=None,
+    )
 
 
 def _runtime_platform_key() -> str:

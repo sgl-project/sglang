@@ -5,10 +5,15 @@ import torch
 
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.shared_ep import SharedEpQuantization
-from sglang.srt.layers.moe.shared_ep.profiles import select_profile
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.layers.moe.shared_ep.profiles import (
+    make_pull_cache_prefill_profile,
+    resolve_prefill_capacity,
+    select_profile,
+)
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
 def _config(
@@ -200,6 +205,59 @@ class TestSharedEpProfiles(unittest.TestCase):
                         block_shape=block_shape,
                         max_tokens_per_rank=32,
                     )
+
+    def test_pull_cache_prefill_profiles_are_rocm_block_fp8_only(self):
+        for hidden_size, top_k in ((6144, 8), (4096, 6)):
+            with self.subTest(hidden_size=hidden_size):
+                decode = select_profile(
+                    _config(hidden_size=hidden_size, top_k=top_k),
+                    platform="rocm",
+                    capability=(9, 5),
+                    ep_size=8,
+                    block_shape=(128, 128),
+                    max_tokens_per_rank=32,
+                )
+                prefill = make_pull_cache_prefill_profile(decode, 1024)
+                self.assertIsNotNone(prefill)
+                self.assertEqual(prefill.max_tokens_per_rank, 1024)
+                self.assertEqual(prefill.block_size_m, 64)
+                self.assertEqual(prefill.w13_kernel_config(1024)["BLOCK_SIZE_M"], 64)
+                self.assertEqual(prefill.w2_kernel_config(1024)["BLOCK_SIZE_M"], 64)
+
+        cuda_profile = select_profile(
+            _config(hidden_size=4096, top_k=6),
+            platform="cuda",
+            capability=(9, 0),
+            ep_size=8,
+            block_shape=(128, 128),
+            max_tokens_per_rank=32,
+        )
+        self.assertIsNone(make_pull_cache_prefill_profile(cuda_profile, 1024))
+
+        mxfp4_profile = select_profile(
+            _config(
+                hidden_size=7168,
+                intermediate_size=3072,
+                top_k=6,
+                num_experts=384,
+                num_local_experts=48,
+            ),
+            platform="rocm",
+            capability=(9, 5),
+            ep_size=8,
+            quantization=SharedEpQuantization.MXFP4,
+            block_shape=(1, 32),
+            max_tokens_per_rank=32,
+        )
+        self.assertIsNone(make_pull_cache_prefill_profile(mxfp4_profile, 1024))
+
+    def test_prefill_capacity_is_dp_local_and_bounded(self):
+        self.assertEqual(resolve_prefill_capacity(1), 1)
+        self.assertEqual(resolve_prefill_capacity(1024), 1024)
+        for invalid in (None, -1, 0, 1025):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    resolve_prefill_capacity(invalid)
 
     def test_every_unsupported_admission_dimension_is_rejected(self):
         """A near-match must fail before graph capture instead of misdispatching."""

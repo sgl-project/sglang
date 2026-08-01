@@ -1,6 +1,6 @@
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 import torch.distributed as dist
@@ -15,7 +15,10 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
-from sglang.srt.layers.moe.moe_runner.shared_ep import SharedEpQuantInfo
+from sglang.srt.layers.moe.moe_runner.shared_ep import (
+    SharedEpQuantCapability,
+    SharedEpQuantInfo,
+)
 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
 )
@@ -24,18 +27,29 @@ from sglang.srt.layers.moe.shared_ep.backend import (
     run_shared_ep,
 )
 from sglang.srt.layers.moe.shared_ep.kernels import quantize_pack_input
-from sglang.srt.layers.moe.shared_ep.layout import SharedEpLayout
+from sglang.srt.layers.moe.shared_ep.layout import (
+    SharedEpInputFormat,
+    SharedEpLayout,
+)
 from sglang.srt.layers.moe.shared_ep.profiles import (
+    DSV4_PRO_MXFP4_GFX950,
+    GLM52_GFX950,
     SharedEpProfile,
     SharedEpQuantization,
+    make_pull_cache_prefill_profile,
+)
+from sglang.srt.layers.moe.shared_ep.pull_cache_prefill import (
+    allocate_pull_cache,
+    make_pull_cache_prefill_plan,
 )
 from sglang.srt.layers.moe.shared_ep.state import create_shared_ep_state
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
 register_cuda_ci(est_time=40, stage="extra-b", runner_config="8-gpu-h200")
+register_amd_ci(est_time=120, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 _KERNEL_CONFIG = {
     "BLOCK_SIZE_M": 16,
@@ -102,6 +116,19 @@ class TestSharedEpEp8(unittest.TestCase):
         )
         try:
             self.assertEqual(state.layout.output_row_bytes, 16 * 1024)
+            pull_plan = make_pull_cache_prefill_plan(
+                owners=self.profile.ep_size,
+                source_tokens_per_owner=self.profile.max_tokens_per_rank,
+                hidden_size=self.profile.hidden_size,
+                top_k=self.profile.top_k,
+                num_local_experts=self.profile.num_local_experts,
+                expert_alignment=self.profile.block_size_m,
+            )
+            pull_cache = allocate_pull_cache(
+                pull_plan,
+                active_rows=pull_plan.cache_rows,
+                device=torch.device("cuda", self.local_rank),
+            )
             tokens = self.rank + 1
             topk_ids = torch.stack(
                 [
@@ -205,6 +232,15 @@ class TestSharedEpEp8(unittest.TestCase):
                     skew_output_consumer=generation == 1,
                 )
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                pull_actual = self._run_shared(
+                    state,
+                    hidden,
+                    topk_output,
+                    local_quant,
+                    phase="prefill",
+                    pull_cache=pull_cache,
+                )
+                torch.testing.assert_close(pull_actual, expected, rtol=0, atol=0)
 
             graph_hidden = self._hidden(3, tokens)
             graph_q, graph_scale = per_token_group_quant_fp8(
@@ -238,6 +274,513 @@ class TestSharedEpEp8(unittest.TestCase):
             dist.barrier()
             state.close()
 
+    @unittest.skipUnless(torch.version.hip is not None, "requires ROCm")
+    def test_glm52_pull_cache_matches_direct_ep8(self):
+        arch = torch.cuda.get_device_properties(self.local_rank).gcnArchName.split(
+            ":",
+            1,
+        )[0]
+        if arch != "gfx950":
+            self.skipTest(f"requires gfx950, got {arch}")
+
+        decode_profile = GLM52_GFX950
+        prefill_profile = make_pull_cache_prefill_profile(decode_profile, 64)
+        self.assertIsNotNone(prefill_profile)
+        runner_config = MoeRunnerConfig(
+            num_experts=decode_profile.num_experts,
+            num_local_experts=decode_profile.num_local_experts,
+            hidden_size=decode_profile.hidden_size,
+            intermediate_size_per_partition=decode_profile.intermediate_size,
+            top_k=decode_profile.top_k,
+        )
+
+        def create_state(profile):
+            return create_shared_ep_state(
+                layout=SharedEpLayout.build(
+                    hidden_size=profile.hidden_size,
+                    top_k=profile.top_k,
+                    max_tokens_per_rank=profile.max_tokens_per_rank,
+                ),
+                cpu_group=dist.group.WORLD,
+                device=torch.device("cuda", self.local_rank),
+            )
+
+        decode_state = create_state(decode_profile)
+        prefill_state = create_state(prefill_profile)
+        pull_plan = make_pull_cache_prefill_plan(
+            owners=prefill_profile.ep_size,
+            source_tokens_per_owner=prefill_profile.max_tokens_per_rank,
+            hidden_size=prefill_profile.hidden_size,
+            top_k=prefill_profile.top_k,
+            num_local_experts=prefill_profile.num_local_experts,
+            expert_alignment=prefill_profile.block_size_m,
+        )
+        pull_cache = allocate_pull_cache(
+            pull_plan,
+            active_rows=pull_plan.cache_rows,
+            device=torch.device("cuda", self.local_rank),
+        )
+        w13 = torch.empty(
+            (
+                decode_profile.num_local_experts,
+                2 * decode_profile.intermediate_size,
+                decode_profile.hidden_size,
+            ),
+            dtype=torch.float8_e4m3fn,
+            device="cuda",
+        )
+        w2 = torch.empty(
+            (
+                decode_profile.num_local_experts,
+                decode_profile.hidden_size,
+                decode_profile.intermediate_size,
+            ),
+            dtype=torch.float8_e4m3fn,
+            device="cuda",
+        )
+        local_start = self.rank * decode_profile.num_local_experts
+        for local_expert in range(decode_profile.num_local_experts):
+            value = (local_start + local_expert + 1) / 4096
+            w13[local_expert].fill_(value)
+            w2[local_expert].fill_(value)
+        w13_scale = torch.ones(
+            (
+                decode_profile.num_local_experts,
+                2 * decode_profile.intermediate_size // 128,
+                decode_profile.hidden_size // 128,
+            ),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        w2_scale = torch.ones(
+            (
+                decode_profile.num_local_experts,
+                decode_profile.hidden_size // 128,
+                decode_profile.intermediate_size // 128,
+            ),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        quant_info = SharedEpQuantInfo(
+            w13_weight=w13,
+            w2_weight=w2,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            block_shape=(128, 128),
+            fallback_quant_info=Mock(),
+            fallback_backend=MoeRunnerBackend.AITER,
+        )
+        hidden = (
+            torch.arange(
+                decode_profile.hidden_size,
+                dtype=torch.float32,
+                device="cuda",
+            )
+            .remainder(97)
+            .sub(48)
+            .div_(4096)
+            .to(torch.bfloat16)
+            .view(1, -1)
+        )
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.full(
+                (1, decode_profile.top_k),
+                1 / decode_profile.top_k,
+                dtype=torch.float32,
+                device="cuda",
+            ),
+            topk_ids=torch.tensor(
+                [
+                    [
+                        ((self.rank + slot) % decode_profile.ep_size)
+                        * decode_profile.num_local_experts
+                        + slot
+                        for slot in range(decode_profile.top_k)
+                    ]
+                ],
+                dtype=torch.int32,
+                device="cuda",
+            ),
+            router_logits=None,
+        )
+
+        def run(profile, state, phase, cache=None):
+            quantize_pack_input(
+                state.local_input,
+                source=hidden,
+                source_ids=topk_output.topk_ids,
+                source_weights=topk_output.topk_weights,
+                group_size=128,
+            )
+            state.local_output[:1].zero_()
+            state.input_epoch.publish()
+            return run_shared_ep(
+                SharedEpDispatchOutput(
+                    hidden_states=state.global_input.activations,
+                    hidden_states_scale=state.global_input.scales,
+                    topk_output=topk_output,
+                    state=state,
+                    profile=profile,
+                    num_tokens=1,
+                    local_expert_start=local_start,
+                    phase=phase,
+                    pull_cache=cache,
+                ),
+                quant_info,
+                runner_config,
+            ).hidden_states
+
+        try:
+            direct = run(decode_profile, decode_state, "decode")
+            pulled = run(
+                prefill_profile,
+                prefill_state,
+                "prefill",
+                pull_cache,
+            )
+            torch.testing.assert_close(pulled, direct, rtol=5e-2, atol=2e-2)
+        finally:
+            dist.barrier()
+            prefill_state.close()
+            decode_state.close()
+
+    @unittest.skipUnless(torch.version.hip is not None, "requires ROCm")
+    def test_mxfp4_direct_return_reuses_ep8_epochs(self):
+        arch = torch.cuda.get_device_properties(self.local_rank).gcnArchName.split(
+            ":",
+            1,
+        )[0]
+        if arch != "gfx950":
+            self.skipTest(f"requires gfx950, got {arch}")
+
+        config = {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+            "waves_per_eu": 0,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 1,
+        }
+        profile = SharedEpProfile(
+            name="ep8_mxfp4_test",
+            capability=(9, 5),
+            hidden_size=128,
+            intermediate_size=128,
+            top_k=2,
+            num_experts=8,
+            num_local_experts=1,
+            ep_size=8,
+            max_tokens_per_rank=128,
+            quantization=SharedEpQuantization.MXFP4,
+            block_shape=(1, 32),
+            default_kernel_config=config,
+            small_kernel_config=None,
+            small_kernel_max_tokens=128,
+            route_kernel_config={"num_threads": 256},
+            default_w13_kernel_config=config,
+            default_w2_kernel_config=config,
+            platform="rocm",
+        )
+        runner_config = MoeRunnerConfig(
+            num_experts=8,
+            num_local_experts=1,
+            hidden_size=128,
+            intermediate_size_per_partition=128,
+            top_k=2,
+        )
+        state = create_shared_ep_state(
+            layout=SharedEpLayout.build(
+                hidden_size=profile.hidden_size,
+                top_k=profile.top_k,
+                max_tokens_per_rank=profile.max_tokens_per_rank,
+                input_format=SharedEpInputFormat.BF16,
+                direct_output=True,
+            ),
+            cpu_group=dist.group.WORLD,
+            device=torch.device("cuda", self.local_rank),
+        )
+        w13 = torch.full(
+            (1, 2 * profile.intermediate_size, profile.hidden_size // 2),
+            0x22,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        w2 = torch.full(
+            (1, profile.hidden_size, profile.intermediate_size // 2),
+            0x22,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        w13_scale = torch.full(
+            (1, 2 * profile.intermediate_size, profile.hidden_size // 32),
+            127,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        w2_scale = torch.full(
+            (1, profile.hidden_size, profile.intermediate_size // 32),
+            127,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        quant_info = SharedEpQuantInfo(
+            w13_weight=w13,
+            w2_weight=w2,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            block_shape=(1, 32),
+            fallback_quant_info=Mock(),
+            fallback_backend=MoeRunnerBackend.AITER,
+            quantization=SharedEpQuantization.MXFP4,
+            weight_group_size=32,
+            scale_format="e8m0",
+            capabilities=frozenset({SharedEpQuantCapability.CANONICAL_MXFP4}),
+        )
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.tensor(
+                [[0.6, 0.4]],
+                dtype=torch.float32,
+                device="cuda",
+            ),
+            topk_ids=torch.tensor(
+                [[self.rank, (self.rank + 1) % 8]],
+                dtype=torch.int32,
+                device="cuda",
+            ),
+            router_logits=None,
+        )
+
+        previous = None
+        try:
+            from sglang.srt.layers.moe.shared_ep.fp4 import (
+                publish_bf16_owner_input,
+            )
+
+            for generation in (1, 4):
+                hidden = torch.full(
+                    (1, profile.hidden_size),
+                    (self.rank + 1) * generation / 1024,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                publish_bf16_owner_input(
+                    state.local_input,
+                    source=hidden,
+                    source_ids=topk_output.topk_ids,
+                    source_weights=topk_output.topk_weights,
+                )
+                state.local_output[:1].zero_()
+                state.input_epoch.publish()
+                actual = run_shared_ep(
+                    SharedEpDispatchOutput(
+                        hidden_states=state.global_input.activations,
+                        hidden_states_scale=None,
+                        topk_output=topk_output,
+                        state=state,
+                        profile=profile,
+                        num_tokens=1,
+                        local_expert_start=self.rank,
+                    ),
+                    quant_info,
+                    runner_config,
+                ).hidden_states
+                self.assertEqual(tuple(actual.shape), (1, profile.hidden_size))
+                self.assertTrue(torch.isfinite(actual).all().item())
+                self.assertGreater(actual.abs().max().item(), 0)
+                if previous is not None:
+                    self.assertFalse(torch.equal(actual, previous))
+                previous = actual.clone()
+        finally:
+            dist.barrier()
+            state.close()
+
+    @unittest.skipUnless(torch.version.hip is not None, "requires ROCm")
+    def test_dsv4_pro_mxfp4_production_shape_ep8(self):
+        arch = torch.cuda.get_device_properties(self.local_rank).gcnArchName.split(
+            ":",
+            1,
+        )[0]
+        if arch != "gfx950":
+            self.skipTest(f"requires gfx950, got {arch}")
+
+        profile = DSV4_PRO_MXFP4_GFX950
+        runner_config = MoeRunnerConfig(
+            num_experts=profile.num_experts,
+            num_local_experts=profile.num_local_experts,
+            hidden_size=profile.hidden_size,
+            intermediate_size_per_partition=profile.intermediate_size,
+            top_k=profile.top_k,
+        )
+        state = create_shared_ep_state(
+            layout=SharedEpLayout.build(
+                hidden_size=profile.hidden_size,
+                top_k=profile.top_k,
+                max_tokens_per_rank=profile.max_tokens_per_rank,
+                input_format=SharedEpInputFormat.BF16,
+                direct_output=True,
+            ),
+            cpu_group=dist.group.WORLD,
+            device=torch.device("cuda", self.local_rank),
+        )
+        w13 = torch.full(
+            (
+                profile.num_local_experts,
+                2 * profile.intermediate_size,
+                profile.hidden_size // 2,
+            ),
+            0x22,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        w2 = torch.full(
+            (
+                profile.num_local_experts,
+                profile.hidden_size,
+                profile.intermediate_size // 2,
+            ),
+            0x22,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        w13_scale = torch.full(
+            (
+                profile.num_local_experts,
+                2 * profile.intermediate_size,
+                profile.hidden_size // 32,
+            ),
+            127,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        w2_scale = torch.full(
+            (
+                profile.num_local_experts,
+                profile.hidden_size,
+                profile.intermediate_size // 32,
+            ),
+            127,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        quant_info = SharedEpQuantInfo(
+            w13_weight=w13,
+            w2_weight=w2,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            block_shape=(1, 32),
+            fallback_quant_info=Mock(),
+            fallback_backend=MoeRunnerBackend.AITER,
+            quantization=SharedEpQuantization.MXFP4,
+            weight_group_size=32,
+            scale_format="e8m0",
+            capabilities=frozenset({SharedEpQuantCapability.CANONICAL_MXFP4}),
+        )
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.full(
+                (1, profile.top_k),
+                1 / profile.top_k,
+                dtype=torch.float32,
+                device="cuda",
+            ),
+            topk_ids=torch.tensor(
+                [
+                    [
+                        ((self.rank + slot) % profile.ep_size)
+                        * profile.num_local_experts
+                        for slot in range(profile.top_k)
+                    ]
+                ],
+                dtype=torch.int32,
+                device="cuda",
+            ),
+            router_logits=None,
+        )
+
+        try:
+            from sglang.srt.layers.moe.shared_ep.fp4 import (
+                publish_bf16_owner_input,
+            )
+
+            for generation in range(1, 81):
+                hidden = torch.full(
+                    (1, profile.hidden_size),
+                    (self.rank + 1) * ((generation - 1) % 4 + 1) / 4096,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                publish_bf16_owner_input(
+                    state.local_input,
+                    source=hidden,
+                    source_ids=topk_output.topk_ids,
+                    source_weights=topk_output.topk_weights,
+                )
+                state.local_output[:1].zero_()
+                state.input_epoch.publish()
+                actual = run_shared_ep(
+                    SharedEpDispatchOutput(
+                        hidden_states=state.global_input.activations,
+                        hidden_states_scale=None,
+                        topk_output=topk_output,
+                        state=state,
+                        profile=profile,
+                        num_tokens=1,
+                        local_expert_start=self.rank * profile.num_local_experts,
+                    ),
+                    quant_info,
+                    runner_config,
+                ).hidden_states
+                self.assertEqual(tuple(actual.shape), (1, profile.hidden_size))
+                self.assertTrue(torch.isfinite(actual).all().item())
+                self.assertGreater(actual.abs().max().item(), 0)
+
+            idle_tokens = 1 if self.rank == 0 else 0
+            idle_hidden = torch.full(
+                (idle_tokens, profile.hidden_size),
+                1 / 1024,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            idle_ids = topk_output.topk_ids[:idle_tokens]
+            idle_weights = topk_output.topk_weights[:idle_tokens]
+            idle_topk = StandardTopKOutput(
+                topk_weights=idle_weights,
+                topk_ids=idle_ids,
+                router_logits=None,
+            )
+            publish_bf16_owner_input(
+                state.local_input,
+                source=idle_hidden,
+                source_ids=idle_ids,
+                source_weights=idle_weights,
+            )
+            state.local_output[:idle_tokens].zero_()
+            state.input_epoch.publish()
+            idle_output = run_shared_ep(
+                SharedEpDispatchOutput(
+                    hidden_states=state.global_input.activations,
+                    hidden_states_scale=None,
+                    topk_output=idle_topk,
+                    state=state,
+                    profile=profile,
+                    num_tokens=idle_tokens,
+                    local_expert_start=self.rank * profile.num_local_experts,
+                ),
+                quant_info,
+                runner_config,
+            ).hidden_states
+            self.assertEqual(
+                tuple(idle_output.shape),
+                (idle_tokens, profile.hidden_size),
+            )
+            self.assertTrue(torch.isfinite(idle_output).all().item())
+        finally:
+            del quant_info, w13, w2, w13_scale, w2_scale
+            dist.barrier()
+            state.close()
+
     def _hidden(self, generation: int, tokens: int) -> torch.Tensor:
         values = torch.arange(
             tokens * 128,
@@ -256,6 +799,8 @@ class TestSharedEpEp8(unittest.TestCase):
         *,
         skew_input_writer=False,
         skew_output_consumer=False,
+        phase="decode",
+        pull_cache=None,
     ) -> torch.Tensor:
         if skew_input_writer and self.rank == 0:
             torch.cuda._sleep(250_000_000)
@@ -275,6 +820,8 @@ class TestSharedEpEp8(unittest.TestCase):
             profile=self.profile,
             num_tokens=hidden.shape[0],
             local_expert_start=self.rank,
+            phase=phase,
+            pull_cache=pull_cache,
         )
         if not skew_output_consumer:
             return run_shared_ep(
@@ -397,4 +944,7 @@ class TestSharedEpEp8(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    multigpu_pytest_main(__name__, __file__, num_gpus=(8,))
+    if "WORLD_SIZE" in os.environ:
+        unittest.main()
+    else:
+        multigpu_pytest_main(__name__, __file__, num_gpus=(8,))
