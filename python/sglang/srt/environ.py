@@ -661,6 +661,9 @@ class Envs:
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
+    # Unpacked cubin pool for the JIT-built trtllm-gen fused MoE (cubins + flat
+    # ABI headers + overlay/). Unset means the path is unavailable, not empty.
+    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
@@ -736,6 +739,9 @@ class Envs:
     # NIXL-EP
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+
+    # PPLX-EP (Perplexity pplx-kernels NVSHMEM all-to-all)
+    SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
 
     # DSA Backend (canonical names; fall back to SGLANG_NSA_* with deprecation warning)
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
@@ -815,6 +821,11 @@ class Envs:
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    # MiniMax-M3 on ROCm force-disables custom all-reduce in its model override
+    # (arg_groups/overrides.py) when aiter all-reduce fusion is off. Set this to
+    # opt back in and keep custom/quick all-reduce enabled -- e.g. to run the
+    # INT4 quick-reduce path via ROCM_QUICK_REDUCE_QUANTIZATION={INT4,INT6,INT8}.
+    SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
     # Default per-direction workspace cap for CustomAllReduceV2; explicit
     # constructor sizes take precedence over this.
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
@@ -1145,6 +1156,10 @@ class Envs:
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
     SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
+    # Kill switch for the derived fp8 attention-GEMM mode (m3_fp8_attn_gemm_enabled):
+    # forces the pre-fp8 behavior (bf16 indexer + widening sparse path, bf16 q)
+    # even when kv_cache_dtype fp8_e4m3 + trtllm_mha + SM100 would activate it.
+    SGLANG_DISABLE_M3_FP8_ATTN_GEMM = EnvBool(False)
 
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
@@ -1249,6 +1264,13 @@ class Envs:
     SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
+
+    # ===================================================================
+    # Rust Server specific envs.
+    # ===================================================================
+    SGLANG_RUST_SERVER = EnvBool(False)
+    # Most batched requests one /generate HTTP call may expand into.
+    SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 
 
 envs = Envs()

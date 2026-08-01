@@ -10,6 +10,12 @@
 //! the rest of the pipeline only through `flume` channels: [`TmEvent`] into the
 //! ingress loop, [`Senders`] fanning out to the pools.
 
+mod egress;
+mod ingress;
+
+pub use egress::{ActivityCounter, Egress};
+pub use ingress::{Ingress, Limits};
+
 use crate::ids::Rid;
 use crate::message::{DetokMsg, Request};
 

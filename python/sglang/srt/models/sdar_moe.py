@@ -58,6 +58,7 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_forward,
     get_parallel,
     get_server_args,
@@ -101,7 +102,7 @@ class SDARMoeSparseMoeBlock(nn.Module):
         )
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -123,7 +124,7 @@ class SDARMoeSparseMoeBlock(nn.Module):
         if get_moe_a2a_backend().is_deepep():
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.num_experts + get_server_args().ep_num_redundant_experts
+                config.num_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.top_k = config.num_experts_per_tok
 
@@ -274,7 +275,7 @@ class SDARMoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if get_server_args().rl_on_policy_target is not None:
+        if get_exec().deterministic.rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
         qkv, _ = self.qkv_proj(hidden_states)
@@ -302,7 +303,7 @@ class SDARMoeAttention(nn.Module):
             ),
         )
 
-        if get_server_args().rl_on_policy_target is not None:
+        if get_exec().deterministic.rl_on_policy_target is not None:
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
@@ -338,7 +339,7 @@ class SDARMoeBlock(nn.Module):
                 override_orig_dtype=torch.float32,
                 fp32_residual=True,
             )
-            if get_server_args().rl_on_policy_target is not None
+            if get_exec().deterministic.rl_on_policy_target is not None
             else {}
         )
         self.input_layernorm = RMSNorm(
@@ -478,7 +479,7 @@ class SDARMoeModel(nn.Module):
                     override_orig_dtype=torch.float32,
                     fp32_residual=True,
                 )
-                if get_server_args().rl_on_policy_target is not None
+                if get_exec().deterministic.rl_on_policy_target is not None
                 else {}
             )
             self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps, **norm_kwargs)
