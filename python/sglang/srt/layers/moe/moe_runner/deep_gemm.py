@@ -766,9 +766,10 @@ def pre_permute_standard_to_deep_gemm(
         topk_ids, num_experts, 1
     )
     dispose_tensor(unused_masked_dst)
+    valid_tokens_per_expert = tokens_per_expert
     tokens_per_expert = (ceil_div(tokens_per_expert, block_e) * block_e).to(torch.int32)
-    # Keep graph-static shapes by assigning zero-filled padding rows to the
-    # final expert. src2dst never points to them.
+    # Keep graph-static shapes by appending padding to the final segment.
+    # Its m_indices stay -1, so DeepGEMM skips those rows.
     tokens_per_expert[-1].add_(all_tokens - tokens_per_expert.sum())
 
     k = hidden_states.size(1)
@@ -834,6 +835,7 @@ def pre_permute_standard_to_deep_gemm(
         packed_input_source_scale,
         topk_ids,
         tokens_per_expert,
+        valid_tokens_per_expert,
         expert_start_loc,
         packed_input,
         packed_input_scale,
@@ -1036,6 +1038,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         hidden_states,
         hidden_states_scale,
         topk_ids,
+        num_recv_tokens_per_expert_gpu,
         num_recv_tokens_per_expert_gpu,
         expert_start_loc,
         input_tensor,

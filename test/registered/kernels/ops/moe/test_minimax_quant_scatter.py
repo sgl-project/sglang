@@ -278,6 +278,7 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
         return (
             runner_input.use_masked_gemm,
             running_state.get("all_tokens"),
+            runner_input.m_indices,
             post_permute_deep_gemm_to_standard(
                 runner_output,
                 quant_info,
@@ -286,16 +287,30 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
             ).hidden_states,
         )
 
-    compact_is_masked, compact_all_tokens, compact_output = run_with_num_experts(
-        num_local_experts
+    compact_is_masked, compact_all_tokens, compact_m_indices, compact_output = (
+        run_with_num_experts(num_local_experts)
     )
-    masked_is_masked, masked_all_tokens, masked_output = run_with_num_experts(8)
+    masked_is_masked, masked_all_tokens, masked_m_indices, masked_output = (
+        run_with_num_experts(8)
+    )
     torch.cuda.synchronize()
 
     assert not compact_is_masked
     assert masked_is_masked
     assert compact_all_tokens == 256
     assert masked_all_tokens is None
+    assert masked_m_indices is None
+    valid_assignments = topk_ids[topk_ids >= 0]
+    assert torch.equal(
+        torch.bincount(
+            compact_m_indices[compact_m_indices >= 0],
+            minlength=num_local_experts,
+        ),
+        torch.bincount(valid_assignments, minlength=num_local_experts),
+    )
+    assert (compact_m_indices == -1).sum() == compact_all_tokens - len(
+        valid_assignments
+    )
     torch.testing.assert_close(
         masked_output,
         compact_output,
