@@ -23,9 +23,17 @@ from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.configs.model_config import AttentionArch, is_minimax_sparse
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.cp.base import (
+    CPAttentionBackendKind,
+    get_cp_strategy,
+)
+from sglang.srt.layers.cp.utils import enable_cp_v2
+from sglang.srt.layers.cp.zigzag import ZigzagContextParallelMetadata
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -151,12 +159,22 @@ class DecodeMetadata:
 
 
 @dataclass
+class FlashInferCPPrefillPlan:
+    wrapper: BatchPrefillWithPagedKVCacheWrapper
+    qo_indptr: torch.Tensor
+    paged_kv_indptr: torch.Tensor
+    paged_kv_indices: torch.Tensor
+    paged_kv_last_page_len: torch.Tensor
+
+
+@dataclass
 class PrefillMetadata:
     prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper]
     use_ragged: bool
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    cp_plan: Optional[FlashInferCPPrefillPlan] = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -420,6 +438,13 @@ class FlashInferAttnBackend(AttentionBackend):
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
 
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
+        self.prefill_cp_enabled = bool(
+            prefill_backend == "flashinfer"
+            and model_runner.server_args.enable_prefill_cp
+            and model_runner.server_args.attn_cp_size > 1
+        )
+        if self.prefill_cp_enabled:
+            self._validate_prefill_cp_configuration(model_runner)
 
         # Allocate buffers
         # different from flashinfer zero_init_global_workspace_buffer
@@ -528,6 +553,153 @@ class FlashInferAttnBackend(AttentionBackend):
         self.full_cg_prefill_wrappers: Optional[
             List[BatchPrefillWithPagedKVCacheWrapper]
         ] = None
+
+    def _validate_prefill_cp_configuration(self, model_runner: ModelRunner) -> None:
+        server_args = model_runner.server_args
+        unsupported_reason = None
+        if not enable_cp_v2():
+            unsupported_reason = "CP-v2 must be enabled"
+        elif server_args.cp_strategy != "zigzag":
+            unsupported_reason = "only --cp-strategy zigzag is supported"
+        elif getattr(server_args, "moe_dense_tp_size", None) != 1:
+            unsupported_reason = (
+                "dense MLP weights must be replicated with --moe-dense-tp-size 1"
+            )
+        elif model_runner.model_config.attention_arch != AttentionArch.MHA:
+            unsupported_reason = "only dense MHA/GQA models are supported"
+        elif mambaish_config(model_runner.model_config) is not None:
+            unsupported_reason = "hybrid linear/state-space models are not supported"
+        elif is_minimax_sparse(model_runner.model_config.hf_config):
+            unsupported_reason = "hybrid sparse-attention models are not supported"
+        elif model_runner.spec_algorithm.is_speculative():
+            unsupported_reason = "speculative decoding is not supported"
+        elif self.is_dllm_model:
+            unsupported_reason = "DLLM is not supported"
+        elif self.is_multimodal:
+            unsupported_reason = "multimodal models are not supported"
+        elif self.enable_mis:
+            unsupported_reason = "multi-item scoring is not supported"
+        elif self.prefill_uses_dequant_workspace or self.is_nvfp4_kvcache:
+            unsupported_reason = "FP4/dequant prefill is not supported"
+        elif getattr(model_runner, "kv_cache_dtype_str", None) == "mxfp8":
+            unsupported_reason = "MXFP8 KV cache is not supported"
+        elif model_runner.sliding_window_size is not None:
+            unsupported_reason = "sliding-window attention is not supported"
+        elif model_runner.model_config.is_encoder_decoder:
+            unsupported_reason = "encoder-decoder attention is not supported"
+        elif model_runner.model_config.head_dim != model_runner.model_config.v_head_dim:
+            unsupported_reason = "asymmetric QK/V head dimensions are not supported"
+        elif server_args.cuda_graph_config.prefill.backend != Backend.DISABLED:
+            unsupported_reason = "prefill CUDA graphs must be disabled"
+        elif getattr(self.token_to_kv_pool, "kv_cache_layout", "nhd") != "nhd":
+            unsupported_reason = "only the NHD KV-cache layout is supported"
+
+        if unsupported_reason is not None:
+            raise ValueError(
+                "FlashInfer prefill context parallelism requires eager CP-v2 "
+                f"dense causal self-attention: {unsupported_reason}."
+            )
+
+    def _init_forward_metadata_cp(self, forward_batch: ForwardBatch) -> None:
+        cp_metadata = forward_batch.attn_cp_metadata
+        if not self.prefill_cp_enabled:
+            raise ValueError(
+                "FlashInfer received CP-v2 metadata without a supported "
+                "FlashInfer prefill CP configuration."
+            )
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            raise ValueError(
+                "FlashInfer prefill CP supports only regular EXTEND forwards."
+            )
+        if not isinstance(cp_metadata, ZigzagContextParallelMetadata):
+            raise ValueError(
+                "FlashInfer prefill CP requires zigzag context-parallel metadata."
+            )
+        if forward_batch.spec_info is not None:
+            raise ValueError(
+                "FlashInfer prefill CP does not support speculative metadata."
+            )
+        if forward_batch.cross_attention_custom_mask is not None:
+            raise ValueError(
+                "FlashInfer prefill CP does not support custom attention masks."
+            )
+        if getattr(forward_batch, "multi_item_delimiter_indices", None) is not None:
+            raise ValueError(
+                "FlashInfer prefill CP does not support multi-item metadata."
+            )
+
+        req_pool_indices = forward_batch.req_pool_indices
+        if len(req_pool_indices) != cp_metadata.bs:
+            raise ValueError(
+                "FlashInfer prefill CP request metadata is inconsistent: "
+                f"got {len(req_pool_indices)} requests for batch size {cp_metadata.bs}."
+            )
+
+        q_lens_cpu = (
+            cp_metadata.actual_seq_q_prev_list + cp_metadata.actual_seq_q_next_list
+        )
+        kv_lens_cpu = cp_metadata.kv_len_prev_list + cp_metadata.kv_len_next_list
+        virtual_bs = len(q_lens_cpu)
+        device = req_pool_indices.device
+        q_lens = torch.tensor(q_lens_cpu, dtype=torch.int32, device=device)
+        kv_lens = torch.tensor(kv_lens_cpu, dtype=torch.int32, device=device)
+        virtual_req_pool_indices = torch.cat(
+            [req_pool_indices, req_pool_indices], dim=0
+        )
+
+        qo_indptr = torch.empty(virtual_bs + 1, dtype=torch.int32, device=device)
+        qo_indptr[0] = 0
+        qo_indptr[1:] = torch.cumsum(q_lens, dim=0)
+        paged_kv_indptr = torch.empty(virtual_bs + 1, dtype=torch.int32, device=device)
+        paged_kv_indptr[0] = 0
+        paged_kv_indptr[1:] = torch.cumsum(kv_lens, dim=0)
+        paged_kv_indices = torch.empty(
+            sum(kv_lens_cpu), dtype=torch.int32, device=device
+        )
+        kv_start_idx = torch.zeros_like(kv_lens)
+        create_flashinfer_kv_indices_triton[(virtual_bs,)](
+            self.req_to_token_pool.req_to_token,
+            virtual_req_pool_indices,
+            kv_lens,
+            paged_kv_indptr,
+            kv_start_idx,
+            paged_kv_indices,
+            self.req_to_token_pool.req_to_token.shape[1],
+        )
+        paged_kv_last_page_len = torch.ones(
+            virtual_bs, dtype=torch.int32, device=device
+        )
+
+        wrapper = self.prefill_wrappers_paged[0]
+        updater = self.indices_updater_prefill
+        wrapper.begin_forward(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            updater.num_qo_heads,
+            updater.num_kv_heads,
+            updater.head_dim,
+            1,
+            causal=True,
+            q_data_type=updater.q_data_type,
+            kv_data_type=updater.data_type,
+            non_blocking=True,
+            fixed_split_size=self.prefill_split_tile_size,
+        )
+        cp_plan = FlashInferCPPrefillPlan(
+            wrapper=wrapper,
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+        )
+        self.forward_metadata = PrefillMetadata(
+            prefill_wrappers=[wrapper],
+            use_ragged=False,
+            extend_no_prefix=False,
+            cp_plan=cp_plan,
+        )
 
     def _check_kv_attention_access(self, phase: str, access) -> None:
         if access is not None:
@@ -906,6 +1078,10 @@ class FlashInferAttnBackend(AttentionBackend):
         return layer.k_scale, layer.v_scale
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if forward_batch.attn_cp_metadata is not None:
+            self._init_forward_metadata_cp(forward_batch)
+            return
+
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             assert self._swa_kv_pool is not None
@@ -1250,6 +1426,67 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        cp_plan = self.forward_metadata.cp_plan
+        if cp_plan is not None:
+            if not save_kv_cache:
+                raise ValueError("FlashInfer prefill CP requires save_kv_cache=True.")
+            if k is None or v is None:
+                raise ValueError(
+                    "FlashInfer prefill CP requires current K and V tensors."
+                )
+            if layer.is_cross_attention:
+                raise ValueError(
+                    "FlashInfer prefill CP does not support cross-attention."
+                )
+            if layer.attn_type != AttentionType.DECODER:
+                raise ValueError(
+                    "FlashInfer prefill CP supports only causal decoder attention."
+                )
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                raise ValueError(
+                    "FlashInfer prefill CP does not support sliding-window attention."
+                )
+            if layer.logit_cap > 0:
+                raise ValueError(
+                    "FlashInfer prefill CP does not support attention logit soft caps."
+                )
+            if layer.head_dim != layer.v_head_dim:
+                raise ValueError(
+                    "FlashInfer prefill CP does not support asymmetric QK/V head "
+                    "dimensions."
+                )
+
+            cp_strategy = get_cp_strategy()
+            if cp_strategy is None:
+                raise ValueError(
+                    "FlashInfer prefill CP metadata is present without a CP strategy."
+                )
+            cp_strategy.materialize_full_kv(forward_batch, layer, k, v)
+            kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+            def _flashinfer_cp_attn(logical_q: torch.Tensor) -> torch.Tensor:
+                return cp_plan.wrapper.forward(
+                    logical_q.contiguous().view(
+                        -1, layer.tp_q_head_num, layer.head_dim
+                    ),
+                    kv_cache,
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    window_left=-1,
+                    logits_soft_cap=layer.logit_cap,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
+
+            output = cp_strategy.run_attention(
+                q,
+                forward_batch,
+                q.device,
+                _flashinfer_cp_attn,
+                attention_backend=CPAttentionBackendKind.FLASHINFER,
+            )
+            return output.view(-1, layer.tp_q_head_num * layer.head_dim)
+
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
