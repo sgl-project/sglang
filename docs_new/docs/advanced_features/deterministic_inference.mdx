@@ -1,7 +1,7 @@
 ---
 title: "Deterministic Inference"
 metatags:
-    description: "SGLang deterministic inference: consistent outputs for RL training, testing, and production. Supports FlashInfer, FA3, Triton backends with CUDA Graph."
+    description: "SGLang deterministic inference: consistent outputs for RL training, testing, and production. Supports FA3, FA4, FlashInfer, Triton and Ascend backends with CUDA Graph."
 ---
 ## Why Deterministic Inference Matters
 
@@ -23,7 +23,7 @@ Building on [Thinking Machines Lab's batch-invariant operators](https://github.c
 
 ### Supported Backends
 
-Deterministic inference is only supported with the following three attention backends: **FlashInfer**, **FlashAttention 3 (FA3)**, and **Triton**.
+Deterministic inference is supported on a fixed set of attention backends, declared in `server_args.py` as `DETERMINISTIC_ATTENTION_BACKEND_CHOICES`: **ascend**, **FlashAttention 3 (FA3)**, **FA4**, **FlashInfer**, and **Triton**. Radix cache compatibility covers a narrower set, `RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND`: **ascend**, **FA3**, **FA4**, and **Triton** — when another backend is selected, radix cache is disabled automatically with a warning.
 
 The following table shows feature compatibility for deterministic inference across different attention backends:
 
@@ -69,6 +69,8 @@ The following table shows feature compatibility for deterministic inference acro
   </tbody>
 </table>
 
+The table covers the three most commonly used backends. Two more accept deterministic inference in the current code: `ascend` and `fa4`. For DeepSeek-family models, `fa4` additionally requires SM100/SM110, because it runs absorbed MLA. Deterministic inference is also enabled implicitly when `--rl-on-policy-target` is set.
+
 ## Usage
 
 ### Basic Usage
@@ -106,10 +108,68 @@ python3 -m sglang.launch_server \
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--attention-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>string; default: fa3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Choose attention backend (flashinfer, fa3, or triton)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Choose attention backend (ascend, fa3, fa4, flashinfer, or triton)</td>
     </tr>
   </tbody>
 </table>
+
+### Environment Variables Affecting Numerics
+
+Beyond the server arguments above, several environment variables participate in the numerical configuration of deterministic inference. Two runs that differ in any of these values are each internally deterministic, but are not expected to be bit-identical **to each other**.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "44%"}} />
+    <col style={{width: "12%"}} />
+    <col style={{width: "44%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Effect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4096</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FlashInfer prefill split-tile size.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2048</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FlashInfer decode split-tile size.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4096</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Triton prefill truncation alignment size.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>256</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Triton decode split-tile size.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Use the DeepGEMM path for eligible bf16 matmuls. When set to <code>0</code>, the Triton persistent kernel handles them instead. Both paths are batch-invariant, but they are different kernels.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Allow shapes DeepGEMM cannot run to fall back to <code>torch.einsum</code>. The in-source comment describes this as a batch variant GEMM — leave it off when determinism is required.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Debugging aid: run both the Triton and DeepGEMM paths and assert they agree within <code>calc_diff &lt; 1e-4</code>.</td>
+    </tr>
+  </tbody>
+</table>
+
+The first four are also listed in the [environment variables reference](/docs/references/environment_variables). The three `SGLANG_BATCH_INVARIANT_OPS_*` toggles are read directly in `batch_invariant_ops.py` and are not currently registered in `environ.py`.
 
 ### Example Configurations
 
@@ -196,6 +256,109 @@ This approach ensures that:
 - The same seed always produces the same response across different runs
 - Results are reproducible for debugging and evaluation
 
+
+## Coverage Map
+
+Deterministic inference removes batch-size dependence from a specific, enumerable set of operations. This table is a scope reference: what that set currently covers, and what falls outside it. Every row can be checked against the source without special hardware.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "16%"}} />
+    <col style={{width: "28%"}} />
+    <col style={{width: "14%"}} />
+    <col style={{width: "42%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Area</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Path or condition</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Batch-invariant</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GEMM</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Triton persistent kernel</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Single fp32 accumulator with a sequential K loop; no split-K and no atomics, so the reduction order does not depend on the launch shape.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GEMM</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepGEMM path — taken when both operands are bf16 and contiguous and <code>N &gt;= 16</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enabled by default. This is a different kernel from the Triton path; the built-in comparison test asserts agreement within <code>calc_diff &lt; 1e-4</code>, which is numerical agreement rather than bit equality. Treat the toggle as part of the run configuration.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GEMM</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Variant fallback (<code>..._ENABLE_MM_FALLBACK_VARIANT=1</code>)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌ No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Routes to <code>torch.einsum</code>. Off by default; the source comment labels it a batch variant path.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Other ops</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>addmm</code>, <code>bmm</code>, <code>mm.dtype</code>, <code>_log_softmax</code>, <code>mean.dim</code>, <code>rms_norm</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Together with <code>mm</code>, this is the CUDA override set registered by <code>enable_batch_invariant_mode()</code>. Operations outside this list are unchanged.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Attention</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>fa3</code>, <code>fa4</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>num_splits</code> is pinned to 1 instead of being chosen by the heuristic, so the KV reduction is never split.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Attention</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>flashinfer</code>, <code>triton</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Split sizes are fixed by the tile environment variables above rather than derived from the batch, which makes the tile values part of the numerical configuration.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Attention</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>ascend</code> (NPU)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The NPU build registers its own override set — <code>mm</code>, <code>matmul</code>, <code>mean.dim</code>, <code>_log_softmax</code> — which is not identical to the CUDA one.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Sampling</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Batch is all-greedy</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Uses the <code>argmax</code> path.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Sampling</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Mixed sampling parameters within one batch</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>⚠️ Scope note</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path selection is made for the batch as a whole (<code>sampling_info.is_all_greedy</code>), not per request, so which guarantee applies to a request depends on how the batch it landed in was composed.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quantized GEMM paths</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌ Not covered</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The batch-invariant overrides replace the bf16 <code>mm</code> / <code>addmm</code> / <code>bmm</code> path; quantized GEMM kernels dispatch outside that set. This page does not currently cover quantized models.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Quantization</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Scales computed over the batch (e.g. dynamic per-tensor activation scaling)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌ By construction</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A scale derived from the batch is a function of batch composition, so it cannot be made batch-invariant by fixing reduction order alone.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Tensor parallel</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--tp-size &gt; 1</code> on CUDA</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>NCCL_ALGO</code> is set to <code>allreduce:tree</code> and custom all-reduce is disabled, which fixes the cross-rank reduction order.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Tensor parallel</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--tp-size &gt; 1</code> on AMD/ROCm</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Uses the 1-stage all-reduce kernel, which reduces locally in a fixed order. Aiter all-reduce fusion is force-disabled.</td>
+    </tr>
+  </tbody>
+</table>
+
+A run is reproducible against another run only if both sit at the same point in this table. In practice that means recording the attention backend, the GEMM toggles, the tile sizes and the TP size alongside the model and the seed.
 
 ## Verification
 
