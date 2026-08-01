@@ -311,17 +311,6 @@ class UnifiedRadixCache(BasePrefixCache):
             attach_hybrid_pool_to_unified_cache,
         )
 
-        # Direct IO layout fixup (must happen before pool creation)
-        if server_args.hicache_io_backend == "direct":
-            if server_args.hicache_mem_layout == "page_first":
-                server_args.override(
-                    "hicache.mem_layout_force", hicache_mem_layout="page_first_direct"
-                )
-                logger.warning(
-                    "Page first layout is not supported with direct IO backend, "
-                    "switching to page first direct layout"
-                )
-
         self.load_cache_event = threading.Event()
         self.sidecar_pool_specs.clear()
         self.extra_metric_labels = server_args.extra_metric_labels
