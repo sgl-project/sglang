@@ -993,6 +993,7 @@ STANDALONE_FILES = {
     ],
     "2-gpu": [
         "../single_test_file/test_disagg_server.py",
+        "../single_test_file/test_disagg_ltx2_dag.py",
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
     ],
@@ -1026,6 +1027,8 @@ STANDALONE_FILE_EST_TIMES = {
         # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
         # Raise if CI reports a higher measured time.
         "../single_test_file/test_disagg_server.py": 600.0,
+        # LTX-2 dual-VAE DAG: ~4 min boot+warmup + ~12s per extra request on 2 GPUs.
+        "../single_test_file/test_disagg_ltx2_dag.py": 360.0,
         "../single_test_file/test_ar_models.py": 600.0,
         # no model load; the cost is the one-time JIT build of the sync kernels
         "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,

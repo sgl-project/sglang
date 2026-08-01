@@ -74,6 +74,56 @@ class DisaggServerArgsMixin:
             host, self.scheduler_port + 1, "pool_control_advertised_endpoint"
         )
 
+    def dag_result_endpoint(self, node_index: int) -> str:
+        """Result endpoint for the ``node_index``-th node of a custom DAG.
+
+        Mirrors ``DISAGG_RESULT_PORT_OFFSETS`` for classic roles: node ``i``
+        gets ``base_port + i + 1``, leaving the base port for the frontend.
+
+        Workers learn the base address from ``--disagg-server-addr``; the head
+        node is that address, so it falls back to its own host and scheduler
+        port and both sides derive the same endpoints.
+        """
+        if self.disagg_server_addr:
+            host, base_port = parse_tcp_host_port(
+                self.disagg_server_addr, "disagg_server_addr"
+            )
+        else:
+            host = self.host or "127.0.0.1"
+            base_port = self.scheduler_port
+        return format_tcp_endpoint(
+            host, base_port + node_index + 1, "dag_result_endpoint"
+        )
+
+    def resolve_execution_plan(self):
+        """Compile ``--disagg-dag`` into an ``ExecutionPlan``, or None.
+
+        Returns None for classic three-role deployments, which the runtime
+        treats as an implicit linear DAG.  The compiled plan is cached because
+        both the scheduler and the pipeline builder ask for it.
+        """
+        from sglang.multimodal_gen.runtime.disaggregation.dag import (
+            DagSpec,
+            ExecutionPlan,
+        )
+
+        if not getattr(self, "disagg_dag", None):
+            return None
+
+        cached = getattr(self, "_execution_plan", None)
+        if cached is not None:
+            return cached
+
+        spec = DagSpec.load(self.disagg_dag)
+        for index, role in enumerate(spec.roles):
+            pool = spec.get_pool(role.name)
+            if pool is not None and not pool.result_endpoint:
+                pool.result_endpoint = self.dag_result_endpoint(index)
+
+        plan = ExecutionPlan.compile(spec)
+        self._execution_plan = plan
+        return plan
+
     def resolved_role_device(self) -> Literal["cpu", "cuda"]:
         if self.disagg_role_device == "auto":
             return "cpu" if self.num_gpus <= 0 else "cuda"
@@ -92,6 +142,33 @@ class DisaggServerArgsMixin:
             default=role_default,
             choices=RoleType.choices(),
             help="Role for disaggregated pipeline.",
+        )
+        parser.add_argument(
+            "--disagg-dag",
+            type=str,
+            default=cls.disagg_dag,
+            help=(
+                "Path to a JSON/YAML DAG topology, or an inline JSON object. "
+                "Replaces the fixed encoder/denoiser/decoder roles with named "
+                "nodes, conditional routes, and independently scaled pools."
+            ),
+        )
+        parser.add_argument(
+            "--dag-node",
+            type=str,
+            default=cls.dag_node,
+            help="Which node of --disagg-dag this worker process serves.",
+        )
+        parser.add_argument(
+            "--dag-validate",
+            action="store_true",
+            default=cls.dag_validate,
+            help=(
+                "Compile --disagg-dag, print the execution plan JSON, and exit "
+                "without loading model weights. Plan structure is validated at "
+                "compile time; stage coverage vs the live pipeline is checked "
+                "in unit/E2E tests."
+            ),
         )
         parser.add_argument(
             "--disagg-timeout",

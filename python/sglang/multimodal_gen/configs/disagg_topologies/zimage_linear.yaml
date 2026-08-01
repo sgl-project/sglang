@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The classic encoder -> denoiser -> decoder split for Z-Image, written out as
+# an explicit DAG. Functionally identical to `--disagg-role encoder|denoiser|
+# decoder`, so it is the smallest topology that exercises the DAG path
+# end-to-end and the natural starting point for a custom one.
+#
+# Every stage the pipeline registers must be claimed by exactly one node;
+# startup fails otherwise. Note that stages registered through
+# `add_stage_factory` carry an explicit snake_case name (`denoising_stage`,
+# `decoding_stage`) while the rest default to their class name.
+#
+# `modules` only names role-specific weights. Modules that belong to no role,
+# such as the diffusion scheduler, load on every node regardless.
+
+source: encoder
+
+roles:
+  - name: encoder
+    stages:
+      - InputValidationStage
+      - TextEncodingStage
+      - LatentPreparationStage
+      - TimestepPreparationStage
+    modules: [text_encoder, tokenizer]
+
+  - name: denoiser
+    stages: [denoising_stage]
+    modules: [transformer]
+
+  - name: decoder
+    stages: [decoding_stage]
+    modules: [vae]
+    terminal: true
+    emit: [output]
+
+pools:
+  - {role: encoder, urls: ["tcp://0.0.0.0:35010"], capacity: 4}
+  - {role: denoiser, urls: ["tcp://0.0.0.0:35020"], capacity: 2}
+  - {role: decoder, urls: ["tcp://0.0.0.0:35030"], capacity: 4}
+
+routes:
+  - {src: encoder, dst: denoiser}
+  - {src: denoiser, dst: decoder}

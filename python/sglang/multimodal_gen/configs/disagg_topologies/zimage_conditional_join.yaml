@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Z-Image fan-in smoke topology: mirrors conditional_vsr routing semantics
+# (complementary predicates, one join node with two incoming edges) but joins
+# at the denoiser instead of a post-denoise VSR node.
+#
+# Below 1080p: encoder -> relay (TimestepPreparation) -> denoiser -> decoder
+# Above 1080p: encoder -------------------------> denoiser -> decoder
+#
+# TimestepPreparation lives on relay so the stage set stays a partition of the
+# Z-Image pipeline (no UpsampleStage required).
+
+source: encoder
+
+roles:
+  - name: encoder
+    stages:
+      - InputValidationStage
+      - TextEncodingStage
+      - LatentPreparationStage
+    modules: [text_encoder, tokenizer]
+
+  - name: relay
+    stages: [TimestepPreparationStage]
+
+  - name: denoiser
+    stages: [denoising_stage]
+    modules: [transformer]
+
+  - name: decoder
+    stages: [decoding_stage]
+    modules: [vae]
+    terminal: true
+    emit: [output]
+
+pools:
+  - {role: encoder, urls: ["tcp://0.0.0.0:35010"], capacity: 4}
+  - {role: relay, urls: ["tcp://0.0.0.0:35025"], capacity: 4}
+  - {role: denoiser, urls: ["tcp://0.0.0.0:35020"], capacity: 2}
+  - {role: decoder, urls: ["tcp://0.0.0.0:35040"], capacity: 4}
+
+routes:
+  - {src: encoder, dst: relay, when: "width * height <= 1920 * 1080"}
+  - {src: encoder, dst: denoiser, when: "width * height > 1920 * 1080"}
+  - {src: relay, dst: denoiser}
+  - {src: denoiser, dst: decoder}

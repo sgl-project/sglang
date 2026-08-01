@@ -3,7 +3,9 @@
 """LTX-2-specific pipeline stages"""
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.decoding_av import (
+    LTX2AudioDecodingStage,
     LTX2AVDecodingStage,
+    LTX2VideoDecodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising import (
     LTX2DenoisingStage,
@@ -25,7 +27,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
 )
 
 __all__ = [
+    "LTX2AudioDecodingStage",
     "LTX2AVDecodingStage",
+    "LTX2VideoDecodingStage",
     "LTX2AVDenoisingStage",
     "LTX2AVLatentPreparationStage",
     "LTX2DenoisingStage",

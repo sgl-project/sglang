@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     LTX2ImageEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2 import (
+    LTX2AudioDecodingStage,
     LTX2AVDecodingStage,
     LTX2AVDenoisingStage,
     LTX2AVLatentPreparationStage,
@@ -47,6 +48,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     LTX2RefinementStage,
     LTX2TextConnectorStage,
     LTX2UpsampleStage,
+    LTX2VideoDecodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import (
     LTX2_TWO_STAGE_DEVICE_MODE_CHOICES,
@@ -254,6 +256,25 @@ def _add_ltx2_stage1_generation_stages(
 
 
 def _add_ltx2_decoding_stage(pipeline: ComposedPipelineBase):
+    # A DAG that names the split stages wants the two VAEs on separate pools,
+    # so they can be scaled apart; anything else keeps the fused stage, where
+    # running both decoders in one process avoids a needless transfer.
+    if pipeline.dag_claims(LTX2VideoDecodingStage.__name__):
+        pipeline.add_stage(
+            LTX2VideoDecodingStage(
+                vae=pipeline.get_module("vae"),
+                pipeline=pipeline,
+            )
+        )
+        pipeline.add_stage(
+            LTX2AudioDecodingStage(
+                audio_vae=pipeline.get_module("audio_vae"),
+                vocoder=pipeline.get_module("vocoder"),
+                pipeline=pipeline,
+            )
+        )
+        return
+
     pipeline.add_stage(
         LTX2AVDecodingStage(
             vae=pipeline.get_module("vae"),
