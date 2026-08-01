@@ -878,6 +878,7 @@ class BooguRopeEmbedder(nn.Module):
             cols.view(1, -1).repeat(h_tokens, 1).flatten(),
         )
 
+    @torch.compiler.disable
     def forward(
         self,
         instruction_attention_mask: torch.Tensor,
