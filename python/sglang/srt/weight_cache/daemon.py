@@ -46,6 +46,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import publish
 from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
@@ -208,7 +209,6 @@ class WeightCacheDaemon:
         from sglang.srt.configs.device_config import DeviceConfig
         from sglang.srt.configs.model_config import ModelConfig
         from sglang.srt.model_loader.loader import get_model_loader
-        from sglang.srt.runtime_context import get_context
         from sglang.srt.server_args import ServerArgs
 
         server_args = ServerArgs(
@@ -223,7 +223,7 @@ class WeightCacheDaemon:
             load_format=self.load_format,
             model_loader_extra_config=self.model_loader_extra_config,
         )
-        get_context().set_server_args(server_args)
+        publish(server_args, role="weight_cache_daemon")
 
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)

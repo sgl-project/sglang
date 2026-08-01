@@ -340,6 +340,24 @@ REPLICATED_LINEAR_LORA_NAMES = [
     "fc2_latent_proj",
     *DSA_INDEXER_LORA_NAMES,
 ]
+# Attention-projection LoRA modules shard on the attention-TP group, which
+# under `--enable-dp-attention` is `attn_tp_size = tp_size // dp_size` rather
+# than the outer TP size. in_proj / in_proj_qkvz (linear-attention hybrids)
+# belong here too: their layers are built on the attn-TP group (mamba.py and
+# qwen3_5.py take tp_size/tp_rank from attn_tp when dp attention is enabled).
+ATTN_TP_LORA_MODULE_NAMES = frozenset(
+    {
+        "qkv_proj",
+        "qkvr",
+        "q_b_proj",
+        "kv_b_proj",
+        "o_proj",
+        "out_proj",
+        "wo_ud",
+        "in_proj",
+        "in_proj_qkvz",
+    }
+)
 
 # Normalized module names that the LoRA system fully supports
 # (i.e. get_hidden_dim, init_buffers, and init_lora_modules can handle them).

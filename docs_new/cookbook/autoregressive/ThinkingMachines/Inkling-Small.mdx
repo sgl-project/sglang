@@ -31,11 +31,12 @@ Then run the **Python** output of the command panel below.
 
 <Note>The Inkling-Small images are being published to [`lmsysorg/sglang`](https://hub.docker.com/r/lmsysorg/sglang/tags) — watch the tag list for status.</Note>
 
-There are two multi-arch (amd64 / arm64) CUDA builds plus a ROCm build; pick the CUDA build by your CUDA version, not your GPU:
+There are two multi-arch (amd64 / arm64) CUDA builds plus a ROCm build; pick the CUDA build by your CUDA version, not your GPU. DGX Spark (GB10) uses a dedicated arm64 CUDA 13 image:
 
 ```bash Command
 docker pull lmsysorg/sglang:dev-inkling-dspark      # CUDA 13
 docker pull lmsysorg/sglang:dev-cu12-inkling-dspark # CUDA 12
+docker pull lmsysorg/sglang:dev-inkling-small-dgx-spark # DGX Spark (GB10 / SM121)
 docker pull lmsysorg/sglang-rocm:dev-rocm720-mi35x-inkling-dspark  # AMD MI350X / MI355X
 ```
 
@@ -84,6 +85,8 @@ import { Playground } from "/src/snippets/_playground.jsx";
 ## 2. Configuration Tips
 
 **Multimodal.** The recipes pass `--enable-multimodal` so the server accepts image and audio inputs alongside text — drop it for text-only serving.
+
+**DGX Spark (2× GB10).** The verified cell runs NVFP4 with TP=2 across two Sparks over ConnectX-7 (1 GPU per node). Use the `dev-inkling-small-dgx-spark` image, Triton attention + Marlin FP4/MoE, and `--disable-prefill-cuda-graph`. The Docker command already carries the ConnectX-7 flags `--ulimit memlock=-1:-1 --cap-add IPC_LOCK --device /dev/infiniband`.
 
 **Memory pool ratios.** `--swa-full-tokens-ratio` and `--mamba-full-memory-ratio` (both default `0.1`) size the SWA and Mamba/sconv state pools; tune them to your workload's usage.
 
