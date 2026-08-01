@@ -585,7 +585,7 @@ class CPUGraphRunner:
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.tp_size = model_runner.server_args.tp_size
-        self.dp_size = model_runner.server_args.dp_size
+        self.dp_size = get_parallel().dp_size
         self.pp_size = model_runner.server_args.pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE

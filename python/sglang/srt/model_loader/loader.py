@@ -47,7 +47,12 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
-from sglang.srt.runtime_context import get_exec, get_model, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_model,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import get_available_gpu_memory
 
 # Try to import accelerate (optional dependency)
@@ -1747,9 +1752,9 @@ class PreshardedModelLoader(DefaultModelLoader):
             "dp": _safe(lambda: parallel.moe_dp_size),
             "ep": _safe(lambda: parallel.moe_ep_size),
             "pp": _safe(lambda: parallel.pp_size),
-            "moe_dense_tp_size": server_args.moe_dense_tp_size,
+            "moe_dense_tp_size": parallel.moe_dense_tp_size,
             "moe_dp_size": server_args.moe_dp_size,
-            "enable_dp_lm_head": server_args.enable_dp_lm_head,
+            "enable_dp_lm_head": parallel.enable_dp_lm_head,
             "enable_fp32_lm_head": get_exec().features.enable_fp32_lm_head,
             "quantization": model_config.quantization,
             "model_dtype": str(model_config.dtype),
