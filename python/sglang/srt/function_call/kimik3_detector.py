@@ -207,7 +207,11 @@ class KimiK3Detector(BaseFormatDetector):
             logger.error(
                 "Error in Kimi K3 parse_streaming_increment: %s", e, exc_info=True
             )
+            # _sent_normal_idx indexes into _buffer, so it must be reset with it;
+            # otherwise every later _emit_normal_text sees limit <= _sent_normal_idx
+            # and silently drops the rest of the response.
             self._buffer = ""
+            self._sent_normal_idx = 0
             return StreamingParseResult()
 
     def _emit_normal_text(self, limit: int | None = None) -> str:
