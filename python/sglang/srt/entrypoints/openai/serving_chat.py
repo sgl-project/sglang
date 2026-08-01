@@ -350,9 +350,12 @@ class OpenAIServingChat(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 
-    @staticmethod
-    def _effective_tools(request: ChatCompletionRequest) -> List[Tool]:
+    def _effective_tools(self, request: ChatCompletionRequest) -> List[Tool]:
         tools = list(request.tools or [])
+        # Message-level tools are a Kimi K3 concept; other renderers never
+        # show them to the model, so they must not arm the tool machinery.
+        if self.chat_encoding_spec != "kimi_k3":
+            return tools
         for message in request.messages:
             if (
                 isinstance(message, ChatCompletionMessageGenericParam)
@@ -796,7 +799,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return media_error
 
         effective_tools = self._effective_tools(request)
-        has_message_tools = any(
+        has_message_tools = self.chat_encoding_spec == "kimi_k3" and any(
             isinstance(message, ChatCompletionMessageGenericParam)
             and message.role in ("system", "developer")
             and message.tools
@@ -929,6 +932,7 @@ class OpenAIServingChat(OpenAIServingBase):
             stop=processed_messages.stop,
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
+            renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
         )
 
         # Handle single vs multiple requests

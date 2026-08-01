@@ -985,6 +985,7 @@ class ChatCompletionRequest(BaseModel):
         stop: List[str],
         model_generation_config: Dict[str, Any],
         tool_call_constraint: Optional[ToolCallConstraint] = None,
+        renderer_handles_response_format: bool = False,
     ) -> Dict[str, Any]:
         """
         Convert request to sampling parameters.
@@ -1032,7 +1033,12 @@ class ChatCompletionRequest(BaseModel):
         }
 
         if self.response_format and self.response_format.type == "json_schema":
-            if self.response_format.json_schema.strict is not False:
+            # strict=false may only go unconstrained when the renderer forwards
+            # response_format to the model; plain chat templates never see it.
+            if (
+                self.response_format.json_schema.strict is not False
+                or not renderer_handles_response_format
+            ):
                 sampling_params["json_schema"] = convert_json_schema_to_str(
                     self.response_format.json_schema.schema_
                 )

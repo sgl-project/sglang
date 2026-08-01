@@ -879,6 +879,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertNotIn("image_prompts", kwargs)
 
     def test_message_tools_participate_in_validation(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
         tool = {
             "type": "function",
             "function": {
@@ -907,6 +908,31 @@ class ServingChatTestCase(unittest.TestCase):
             self.chat._validate_request(duplicate),
             "Tool names must be unique across request and message tools.",
         )
+
+    def test_message_tools_ignored_without_kimi_k3_encoding(self):
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {"type": "object"},
+            },
+        }
+        messages = [
+            {"role": "system", "content": "", "tools": [tool]},
+            {"role": "user", "content": "Weather?"},
+        ]
+        required = ChatCompletionRequest(
+            model="x", messages=messages, tool_choice="required"
+        )
+        self.assertEqual(
+            self.chat._validate_request(required),
+            "Tools cannot be empty if tool choice is set to required.",
+        )
+
+        duplicate = ChatCompletionRequest(
+            model="x", messages=messages, tools=[tool], tool_choice="required"
+        )
+        self.assertIsNone(self.chat._validate_request(duplicate))
 
     def test_jinja_rejects_non_object_tool_call_arguments(self):
         """History tool call arguments must parse to a JSON object."""
