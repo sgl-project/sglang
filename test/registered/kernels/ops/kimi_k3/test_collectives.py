@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.kernels.ops.kimi_k3 import (
@@ -42,11 +43,19 @@ def _require_sm100():
 @cache_once
 def _init_world():
     local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="gloo")
+    ps._WORLD = coord = ps.init_world_group(
+        ranks=list(range(world_size)),
+        local_rank=local_rank,
+        backend="nccl",
+    )
     atexit.register(dist.destroy_process_group)
+    cpu_group = coord.cpu_group
+    assert isinstance(cpu_group, dist.ProcessGroup)
     nccl_group = dist.new_group(backend="nccl", device_id=_device())
-    return dist.group.WORLD, nccl_group
+    return cpu_group, nccl_group
 
 
 @cache_once
