@@ -80,17 +80,9 @@ export const config = {
     b300:  "lmsysorg/sglang:dev-inkling-dspark",
     gb200: "lmsysorg/sglang:dev-inkling-dspark",
     gb300: "lmsysorg/sglang:dev-inkling-dspark",
-    "dgx-spark": "lmsysorg/sglang:inkling-small-dgx-spark",
+    "dgx-spark": "lmsysorg/sglang:dev-inkling-small-dgx-spark",
     mi350x: "lmsysorg/sglang-rocm:dev-rocm720-mi35x-inkling-dspark",
     mi355x: "lmsysorg/sglang-rocm:dev-rocm720-mi35x-inkling-dspark",
-  },
-
-  // ConnectX-7 IB flags the shared docker framing doesn't emit.
-  multiNodeHints: {
-    "dgx-spark": [
-      "DGX Spark multi-node over ConnectX-7 — add these docker run flags:",
-      "  --ulimit memlock=-1:-1 --cap-add IPC_LOCK --device /dev/infiniband",
-    ],
   },
 
   github: {
