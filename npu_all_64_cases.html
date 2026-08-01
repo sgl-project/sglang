@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>NPU PR 全量64用例特性覆盖表</title>
+<style>
+body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; margin: 10px; background: #fff; }
+h2 { color: #333; border-bottom: 2px solid #555; padding-bottom: 5px; margin-top: 30px; }
+table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+th { background: #4472C4; color: #fff; padding: 6px 8px; text-align: center; position: sticky; top: 0; z-index: 1; white-space: nowrap; }
+td { padding: 5px 7px; border: 1px solid #ddd; text-align: center; vertical-align: top; }
+td:first-child { text-align: left; font-family: 'Consolas', monospace; font-size: 11px; white-space: nowrap; }
+td:last-child { text-align: left; font-size: 11px; min-width: 180px; }
+tr:nth-child(even) { background: #f2f7fc; }
+tr:hover { background: #d9e6f7; }
+.s1 { background: #e2efda; }  /* 已合入 */
+.s2 { background: #fce4d6; }  /* 待#32392 */
+.s3 { background: #d9e2f3; }  /* 待#31952 */
+.s4 { background: #fff2cc; }  /* 待#801 */
+.yes { color: #006100; font-weight: bold; }
+.no { color: #999; }
+.dis { color: #c55a11; }
+.hl { background: #ffff00; }  /* highlight unique feature */
+.note { color: #888; font-style: italic; font-size: 11px; }
+.c { text-align: center; }
+</style>
+</head>
+<body>
+
+<h1>NPU PR 全量 64 用例特性覆盖总表</h1>
+<p><strong>合计：</strong>已合入 19 + 待合入 PR#32392 17 + 待合入 PR#31952 acc 9 + 待合入 PR#31952 perf 12 + 待合入 PR#801 7 = <strong>64</strong> 个</p>
+
+<!-- ====== 一、已合入 ====== -->
+<h2>一、已合入 basic_function（19个）</h2>
+
+<table>
+<tr>
+  <th>文件名</th><th>来源</th><th>TP</th><th>NPUGraph</th><th>PrefixCache</th><th>量化</th><th>SpecDec</th><th>DP</th><th>EP</th><th>ChunkedPrefill</th><th>PD</th><th>EPLB</th><th>FIA</th><th>TorchCompile</th><th>OverlapSchedule</th><th>DPLMHead</th><th>DeepEP</th><th>LoadBalance</th><th>MultistreamMoE</th><th>MLA</th><th>SpecV2</th><th>dLLM</th><th>测试内容</th>
+</tr>
+
+<tr class="s1">
+<td>HiCache/test_npu_hicache_mha.py</td><td>已合入</td><td>1</td><td class="yes">开启</td><td class="yes">HiCache(ratio=1.2)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.85<br>模型: Qwen2.5-7B</td></tr>
+
+<tr class="s1">
+<td>backends/test_npu_sampling_backend.py</td><td>已合入</td><td>1</td><td class="dis">禁用</td><td class="dis">禁用</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>MMLU 64题 ≥0.65 + greedy一致性(5×单请求+10×批处理)<br>模型: Qwen2.5-7B</td></tr>
+
+<tr class="s1">
+<td>optimization_debug/test_npu_compile_graph_tp1_bf16.py</td><td>已合入</td><td>1</td><td class="yes">compile</td><td class="dis">禁用</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅</td><td class="yes">✅</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.84<br>模型: Qwen2.5-7B</td></tr>
+
+<tr class="s1">
+<td>optimization_debug/test_npu_graph_tp1_bf16.py</td><td>已合入</td><td>1</td><td class="yes">开启</td><td>默认</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.85<br>模型: Qwen2.5-7B</td></tr>
+
+<tr class="s1">
+<td>optimization_debug/test_npu_piecewise_graph_prefill.py</td><td>已合入</td><td>1</td><td class="yes">piecewise</td><td>默认</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.84 + prefill延迟bench<br>模型: Qwen2.5-7B</td></tr>
+
+<tr class="s1">
+<td>quant/test_npu_autoround_dense.py</td><td>已合入</td><td>1</td><td class="yes">开启</td><td>默认</td><td class="yes">autoround</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.85<br>模型: Qwen3-8B-Int4-AutoRound</td></tr>
+
+<tr class="s1">
+<td>quant/test_npu_autoround_moe.py</td><td>已合入</td><td>1</td><td class="yes">开启</td><td>默认</td><td class="yes">autoround</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.85<br>模型: Qwen3-30B-A3B-Int4-AutoRound (MoE)</td></tr>
+
+<tr class="s1">
+<td>quant/test_npu_gptq_moe.py</td><td>已合入</td><td>1</td><td class="yes">开启</td><td>默认</td><td class="yes">gptq</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.85<br>模型: Qwen3-30B-A3B-GPTQ-Int4 (MoE)</td></tr>
+
+<tr class="s1">
+<td>runtime_opts/test_npu_tp1_bf16.py</td><td>已合入</td><td>1</td><td class="dis">禁用</td><td>默认</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.84<br>模型: Qwen2.5-7B</td></tr>
+
+<tr class="s1">
+<td>optimization_debug/test_npu_graph_tp2_bf16.py</td><td>已合入</td><td>2</td><td class="yes">开启</td><td>默认</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.85<br>模型: Qwen2.5-7B</td></tr>
+
+<tr class="s1">
+<td>runtime_opts/test_npu_mla_fia_w8a8int8.py</td><td>已合入</td><td>2</td><td class="dis">禁用</td><td class="dis">禁用</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.34<br>模型: DS-V2-Lite-W8A8 (MLA)</td></tr>
+
+<tr class="s1">
+<td>runtime_opts/test_npu_tp2_bf16.py</td><td>已合入</td><td>2</td><td class="dis">禁用</td><td>默认</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.85<br>模型: Qwen2.5-7B</td></tr>
+
+<tr class="s1">
+<td>runtime_opts/test_npu_tp2_fia_bf16.py</td><td>已合入</td><td>2</td><td class="dis">禁用</td><td class="dis">禁用</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.85<br>模型: Qwen2.5-7B</td></tr>
+
+<tr class="s1">
+<td>HiCache/test_npu_hicache_mla.py</td><td>已合入</td><td>4</td><td class="yes">开启</td><td class="yes">HiCache(ratio=1.2)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.34<br>模型: DS-V2-Lite-W8A8 (MLA)</td></tr>
+
+<tr class="s1">
+<td>dllm/test_npu_llada2_mini.py</td><td>已合入</td><td>1</td><td class="yes">开启</td><td class="dis">禁用</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅</td>
+<td>GSM8K ≥0.88 + bs1 speed ≥130 tok/s<br>模型: LLaDA2.0-Mini (扩散LLM)</td></tr>
+
+<tr class="s1">
+<td>quant/test_npu_w4a4_quantization.py</td><td>已合入</td><td>4</td><td class="yes">开启(bs=64)</td><td class="dis">禁用</td><td class="yes">w4a4(模型)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.80<br>模型: Qwen3-32B-W4A4</td></tr>
+
+<tr class="s1">
+<td>runtime_opts/test_npu_mla_w8a8int8.py</td><td>已合入</td><td>4</td><td class="dis">禁用</td><td class="dis">禁用</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.34<br>模型: DS-V2-Lite-W8A8 (MLA)</td></tr>
+
+<tr class="s1">
+<td>runtime_opts/test_npu_tp4_bf16.py</td><td>已合入</td><td>4</td><td class="yes">开启(bs=32)</td><td class="dis">禁用</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.90<br>模型: Qwen3-30B-A3B (MoE)</td></tr>
+
+<tr class="s1">
+<td>parallel_strategy/expert_parallelism/test_npu_deepep.py</td><td>已合入</td><td>16</td><td class="yes">开启</td><td class="dis">禁用</td><td>—</td><td>—</td><td>DP=1</td><td class="yes">EP=16</td><td class="yes">Chunked=32768</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">deepep(auto)</td><td>—</td><td>—</td><td class="yes">MLA(env)</td><td>—</td><td>—</td>
+<td>GSM8K 500题 ≥0.95<br>模型: DS-R1-0528-W8A8</td></tr>
+</table>
+
+<!-- ====== 二、待合入 PR#32392 ====== -->
+<h2>二、待合入 PR#32392 basic_function（17个）</h2>
+
+<table>
+<tr>
+  <th>文件名</th><th>来源</th><th>TP</th><th>NPUGraph</th><th>PrefixCache</th><th>量化</th><th>SpecDec</th><th>DP</th><th>EP</th><th>ChunkedPrefill</th><th>PD</th><th>EPLB</th><th>FIA</th><th>TorchCompile</th><th>OverlapSchedule</th><th>DPLMHead</th><th>DeepEP</th><th>LoadBalance</th><th>MultistreamMoE</th><th>MLA</th><th>SpecV2</th><th>dLLM</th><th>测试内容</th>
+</tr>
+
+<tr class="s2">
+<td>speculative_inference/test_npu_eagle3.py</td><td>待#32392</td><td>1</td><td class="dis">禁用</td><td class="dis">禁用</td><td>—</td><td class="yes">EAGLE3(4步,topk=1,draft=5,mode=decode)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 1319题 ≥0.81<br>模型: Qwen3-8B + EAGLE3 draft</td></tr>
+
+<tr class="s2">
+<td>speculative_inference/test_npu_basic_sanity.py</td><td>待#32392</td><td>1</td><td class="yes">开启(bs=4)</td><td>默认</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>API Contract + Decode Correctness + Scheduler Stress + HellaSwag<br>模型: Qwen3-8B</td></tr>
+
+<tr class="s2">
+<td>speculative_inference/test_npu_basic_sanity_eagle3.py</td><td>待#32392</td><td>1</td><td class="yes">开启(bs=4,piecewise禁用)</td><td>默认</td><td>—</td><td class="yes">EAGLE3(1步,topk=1,draft=2,dtype=f16)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>API Contract + Decode Correctness + Scheduler Stress + GSM8K 1400题 ≥0.74<br>模型: Qwen3-8B + EAGLE3 draft</td></tr>
+
+<tr class="s2">
+<td>speculative_inference/test_npu_speculative_attention_mode.py</td><td>待#32392</td><td>4</td><td class="dis">禁用</td><td class="dis">禁用</td><td class="yes">modelslim</td><td class="yes">EAGLE3(4步,topk=1,draft=5)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td>
+<td>GSM8K 1319题 ≥0.83 (decode+prefill各一次)<br>模型: Qwen3-32B-W8A8 + EAGLE3 draft</td></tr>
+
+<tr class="s2">
+<td>speculative_inference/test_npu_speculative_draft_attention_backend.py</td><td>待#32392</td><td>16</td><td class="yes">开启</td><td class="dis">禁用</td><td class="yes">modelslim</td><td class="yes">NEXTN(1步,topk=1,draft=2)</td><td>—</td><td>—</td><td class="yes">Chunked=32768</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td class="yes">deepep(auto)</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td>
+<td>GSM8K 1319题 ≥0.90<br>模型: DS-R1-0528-W4A8</td></tr>
+
+<tr class="s2">
+<td>speculative_inference/test_npu_speculative_moe_a2a_backend.py</td><td>待#32392</td><td>16</td><td class="dis">禁用</td><td class="dis">禁用</td><td class="yes">modelslim</td><td class="yes">EAGLE(1步,topk=1,draft=2)</td><td>—</td><td>—</td><td class="yes">Chunked=2048</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td class="yes">ascend_fuseep</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td>
+<td>GSM8K 1319题 ≥0.95<br>模型: DS-R1-0528-W8A8</td></tr>
+
+<tr class="s2">
+<td>speculative_inference/test_npu_speculative_multi_npu.py</td><td>待#32392</td><td>4</td><td class="dis">禁用</td><td class="dis">禁用</td><td class="yes">modelslim</td><td class="yes">EAGLE3(4步,draft=dummy,revision=main)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td>
+<td>功能: server_info校验(load_format/revision) + 生成验证<br>模型: Qwen3-32B-W8A8 + EAGLE3 dummy</td></tr>
+
+<tr class="s2">
+<td>speculative_inference/test_npu_speculative_token_map.py</td><td>待#32392</td><td>4</td><td class="dis">禁用</td><td class="dis">禁用</td><td class="yes">modelslim/无</td><td class="yes">EAGLE3(4步)+EAGLE(5步)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td>
+<td>GSM8K 1319题 EAGLE3≥0.83 + EAGLE≥0.75<br>模型: Qwen3-32B-W8A8+EAGLE3 / Llama3-8B+EAGLE</td></tr>
+
+<tr class="s2">
+<td>dp_attn/test_npu_dp_attention.py</td><td>待#32392</td><td>4/2</td><td class="yes">开启/禁用</td><td>默认</td><td>—</td><td>—</td><td class="yes">DP=2</td><td>—</td><td class="yes">Chunked=256(MixedChunk)</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(DP2TP2)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K(DP2TP2≥0.6,MixedChunk≥0.35) + JSON/EBNF/Regex约束 + Radix retract + VLM生成<br>模型: Qwen3-32B / DSV2-Lite-W8A8 / Kimi-VL-A3B (4个测试类)</td></tr>
+
+<tr class="s2">
+<td>pd_disaggregation/test_npu_pd_disaggregation.py</td><td>待#32392</td><td>2</td><td class="dis">禁用</td><td class="yes">HiCache(file,page_first_direct)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">PD分离(ascend)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>功能: prefill cache hit>700 + multi-turn缓存增长<br>模型: Qwen3-32B</td></tr>
+
+<tr class="s2">
+<td>parallel_strategy/data_parallelism/test_npu_load_balance_method.py</td><td>待#32392</td><td>16</td><td class="dis">禁用</td><td>默认</td><td class="yes">modelslim</td><td>—</td><td class="yes">DP=2</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅</td><td>—</td><td>—</td><td>—</td><td class="yes">round_robin/auto/total_requests/total_tokens</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 200题 ≥0.95 + server_info校验<br>模型: DS-R1-0528-W8A8</td></tr>
+
+<tr class="s2">
+<td>parallel_strategy/data_parallelism/test_npu_load_balance_method_pd_disaggregation.py</td><td>待#32392</td><td>2</td><td class="dis">禁用</td><td>默认</td><td>—</td><td>—</td><td class="yes">DP=2</td><td>—</td><td>—</td><td class="yes">PD分离</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">25种组合</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 200题 ≥0.93<br>模型: Qwen3-30B-A3B</td></tr>
+
+<tr class="s2">
+<td>parallel_strategy/expert_parallelism/test_npu_eplb_min_rebalancing_utilization_threshold.py</td><td>待#32392</td><td>8</td><td class="dis">禁用</td><td>默认</td><td class="yes">modelslim</td><td>—</td><td>—</td><td class="yes">EP(模型自带)</td><td class="yes">Chunked=1024</td><td>—</td><td class="yes">✅(threshold 0.05/0.95)</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">deepep(normal)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 200题 ≥0.86 + rebalance日志(触发/跳过)<br>模型: Qwen3-30B-A3B-W8A8</td></tr>
+
+<tr class="s2">
+<td>parallel_strategy/expert_parallelism/test_npu_expert_distribution_recorder_mode.py</td><td>待#32392</td><td>2</td><td class="dis">禁用</td><td>默认</td><td>—</td><td>—</td><td>—</td><td class="yes">EP=2</td><td>—</td><td>—</td><td class="yes">✅</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">deepep(normal)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>功能: Expert Distribution Recorder start/stop/dump → 生成.pt文件<br>模型: Qwen3-30B-A3B</td></tr>
+
+<tr class="s2">
+<td>parallel_strategy/expert_parallelism/test_npu_moe_dense_tp_size.py</td><td>待#32392</td><td>2</td><td class="dis">禁用</td><td>默认</td><td>—</td><td>—</td><td>—</td><td class="yes">EP=2</td><td>—</td><td>—</td><td class="yes">✅</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">deepep(normal)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K 200题 ≥0.79<br>模型: DS-Coder-V2-Lite</td></tr>
+
+<tr class="s2">
+<td>parallel_strategy/expert_parallelism/test_npu_moe_runner_backend.py</td><td>待#32392</td><td>2</td><td class="dis">禁用</td><td>默认</td><td>—</td><td>—</td><td>—</td><td class="yes">EP=2</td><td>—</td><td>—</td><td class="yes">✅</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">deepep(normal)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>功能: MoE Runner Backend (triton/auto) 推理验证<br>模型: DS-Coder-V2-Lite</td></tr>
+
+<tr class="s2">
+<td>parallel_strategy/test_npu_bucket_adjust_interval_secs_concurrency.py</td><td>待#32392</td><td>16</td><td class="dis">禁用</td><td class="dis">禁用</td><td class="yes">modelslim</td><td>—</td><td class="yes">DP</td><td>—</td><td class="yes">Chunked=262144</td><td class="yes">PD分离</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅</td><td class="yes">deepep(low_latency)</td><td class="yes">round_robin</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>吞吐量 2048并发 request_rate=40<br>模型: DS-R1-W8A8 (多节点PD分离)</td></tr>
+</table>
+
+<!-- ====== 三、待合入 PR#31952 accuracy ====== -->
+<h2>三、待合入 PR#31952 accuracy（9个）<span class="note">— 全部 disabled, suite=""</span></h2>
+
+<table>
+<tr>
+  <th>文件名</th><th>来源</th><th>TP</th><th>NPUGraph</th><th>PrefixCache</th><th>量化</th><th>SpecDec</th><th>DP</th><th>EP</th><th>ChunkedPrefill</th><th>PD</th><th>EPLB</th><th>FIA</th><th>TorchCompile</th><th>OverlapSchedule</th><th>DPLMHead</th><th>DeepEP</th><th>LoadBalance</th><th>MultistreamMoE</th><th>MLA</th><th>SpecV2</th><th>dLLM</th><th>测试内容</th>
+</tr>
+
+<tr class="s3">
+<td>acc/deepseek_v3_2/test_npu_deepseek_v3_2_8p_aime25.py</td><td>待#31952</td><td>16</td><td class="dis">禁用</td><td class="dis">禁用</td><td class="yes">modelslim</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>AIME2025 ≥0.936<br>模型: DS-V3.2-EXP-W8A8</td></tr>
+
+<tr class="s3">
+<td>acc/glm4_6v_flash/test_npu_glm4_6v_flash_1p_mmmu.py</td><td>待#31952</td><td>1</td><td class="yes">开启</td><td>默认</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">Chunked</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>MMMU (VLM)<br>模型: GLM4-6V-Flash</td></tr>
+
+<tr class="s3">
+<td>acc/glm4_7_flash/test_npu_glm4_7_flash_1p_aime25.py</td><td>待#31952</td><td>1</td><td class="yes">开启</td><td>默认</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">Chunked</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>AIME2025<br>模型: GLM4-7B-Flash</td></tr>
+
+<tr class="s3">
+<td>acc/qwen3_32b/test_npu_qwen3_32b_bf16_8p_gpqa.py</td><td>待#31952</td><td>16</td><td class="yes">开启</td><td class="dis">禁用</td><td>—</td><td class="yes">EAGLE3(4步)</td><td>—</td><td>—</td><td class="dis">Chunked=-1</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GPQA<br>模型: Qwen3-32B + EAGLE3</td></tr>
+
+<tr class="s3">
+<td>acc/qwen3_6_27b/test_npu_qwen3_6_27b_1p_gpqa.py</td><td>待#31952</td><td>2</td><td class="yes">开启(bs1-18)</td><td>默认</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">Chunked=32768</td><td>—</td><td>—</td><td class="yes">✅</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GPQA<br>模型: Qwen3.6-27B</td></tr>
+
+<tr class="s3">
+<td>acc/qwen3_6_35b_a3b/test_npu_qwen3_6_35b_a3b_1p_aime26.py</td><td>待#31952</td><td>1</td><td class="yes">开启</td><td class="dis">禁用</td><td>—</td><td class="yes">NEXTN(4步)</td><td>—</td><td>—</td><td class="yes">Chunked</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="dis">❌(env=0)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>AIME2026 (MoE,Multimodal)<br>模型: Qwen3.6-35B-A3B</td></tr>
+
+<tr class="s3">
+<td>acc/qwen3_omni_30b_a3b_thinking/test_npu_*_1p_mmmu.py</td><td>待#31952</td><td>1</td><td class="yes">开启</td><td class="dis">禁用</td><td class="yes">modelslim</td><td>—<br><span class="note">(注释EAGLE3)</span></td><td>—</td><td>—</td><td class="dis">Chunked=-1</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>MMMU (VLM,thinking)<br>模型: Qwen3-Omni-30B-A3B</td></tr>
+
+<tr class="s3">
+<td>acc/qwen3_vl_30b_a3b_thinking/test_npu_*_1p_mmmu.py</td><td>待#31952</td><td>2</td><td class="yes">开启</td><td class="dis">禁用</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="dis">Chunked=-1</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>MMMU (VLM,thinking)<br>模型: Qwen3-VL-30B-A3B-Thinking</td></tr>
+
+<tr class="s3">
+<td>acc/qwen3_vl_8b_thinking/test_npu_*_1p_mmmu.py</td><td>待#31952</td><td>1</td><td class="yes">开启</td><td class="dis">禁用</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="dis">Chunked=-1</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>MMMU (VLM,thinking)<br>模型: Qwen3-VL-8B-Thinking</td></tr>
+</table>
+
+<!-- ====== 四、待合入 PR#31952 performance ====== -->
+<h2>四、待合入 PR#31952 performance（12个）<span class="note">— 全部 disabled, suite=""</span></h2>
+
+<table>
+<tr>
+  <th>文件名</th><th>来源</th><th>TP</th><th>NPUGraph</th><th>PrefixCache</th><th>量化</th><th>SpecDec</th><th>DP</th><th>EP</th><th>ChunkedPrefill</th><th>PD</th><th>EPLB</th><th>FIA</th><th>TorchCompile</th><th>OverlapSchedule</th><th>DPLMHead</th><th>DeepEP</th><th>LoadBalance</th><th>MultistreamMoE</th><th>MLA</th><th>SpecV2</th><th>dLLM</th><th>测试内容</th>
+</tr>
+
+<tr class="s3">
+<td>perf/qwen3_6_27b/test_npu_*_1p_in1024x1024_30_out1024_50ms.py</td><td>待#31952</td><td>2</td><td class="yes">开启</td><td class="dis">禁用</td><td>—</td><td class="yes">NEXTN(3步)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>吞吐50ms (Multimodal)<br>模型: Qwen3.6-27B</td></tr>
+
+<tr class="s3">
+<td>perf/qwen3-8b/test_npu_qwen3_8b_w8a8_1p_in3k5_out1k5_50ms_gpqa.py</td><td>待#31952</td><td>1</td><td class="yes">开启</td><td class="dis">禁用</td><td class="yes">modelslim</td><td>—</td><td>—</td><td>—</td><td class="yes">Chunked</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GPQA + 50ms TPOT<br>模型: Qwen3-8B-W8A8</td></tr>
+
+<tr class="s3">
+<td>perf/qwen3_30b_a3b/test_npu_*_w8a8_1p_in3k5_out1k5_50ms_aime25.py</td><td>待#31952</td><td>2</td><td class="yes">开启</td><td class="dis">禁用</td><td class="yes">modelslim</td><td class="yes">EAGLE3(3步)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>AIME25 + 50ms (MoE)<br>模型: Qwen3-30B-A3B-W8A8</td></tr>
+
+<tr class="s3">
+<td>perf/qwen3_6_35b_a3b/test_npu_*_1p_in64k_out1k_prefix90_50ms_aime26.py</td><td>待#31952</td><td>2</td><td class="yes">开启(bs2-40)</td><td>启用</td><td>—</td><td class="yes">NEXTN(3步)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="dis">❌(env=0)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>AIME26 + 50ms + prefix90 (MoE,Multimodal)<br>模型: Qwen3.6-35B-A3B</td></tr>
+
+<tr class="s3">
+<td>perf/qwen3_32b/test_npu_qwen3_32b_w8a8_2p_in3k5_out1k5_50ms_gpqa.py</td><td>待#31952</td><td>4</td><td class="yes">开启(bs16-101)</td><td class="dis">禁用</td><td class="yes">modelslim</td><td class="yes">EAGLE3(3步)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GPQA + 50ms<br>模型: Qwen3-32B-W8A8</td></tr>
+
+<tr class="s3">
+<td>perf/qwen3_next_80b_a3b_instruct/test_npu_*_w8a8_2p_in6k_out1k5_bs16_aime25.py</td><td>待#31952</td><td>4</td><td class="yes">开启(bs2-8)</td><td class="dis">禁用</td><td class="yes">modelslim</td><td class="yes">NEXTN(3步)</td><td class="yes">DP=2</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td class="yes">✅</td><td>—</td><td>—</td><td class="dis">❌(env=0)</td><td>—</td><td>—</td><td>—</td>
+<td>AIME25 + bs16 (MoE)<br>模型: Qwen3-Next-80B-A3B-W8A8</td></tr>
+
+<tr class="s3">
+<td>perf/minimax_m2_5/test_npu_*_w8a8_4p_in64k_out1k_prefix90_50ms_gpqa.py</td><td>待#31952</td><td>8</td><td class="yes">开启(bs2-26)</td><td>启用</td><td class="yes">modelslim</td><td class="yes">EAGLE3(3步)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GPQA + 50ms + prefix90 (MoE)<br>模型: MiniMax-M2.5-W8A8</td></tr>
+
+<tr class="s3">
+<td>perf/deepseek_v4_flash/test_npu_*_w8a8_8p_in8k_out1k_50ms.py</td><td>待#31952</td><td>16</td><td class="yes">开启(bs1-10)</td><td class="dis">禁用</td><td class="yes">modelslim</td><td class="yes">EAGLE(2步,topk=1,draft=3)</td><td class="yes">DP=16</td><td>—</td><td class="dis">Chunked=-1</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td class="yes">✅</td><td class="yes">deepep(auto)</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td>
+<td>吞吐50ms TPOT<br>模型: DSV4-Flash-W8A8</td></tr>
+
+<tr class="s3">
+<td>perf/kimi_k2_6/test_npu_*_w4a8_8p_in3k5_out1k5_20ms.py</td><td>待#31952</td><td>8</td><td class="yes">开启</td><td class="dis">禁用</td><td class="yes">W4A8</td><td>—</td><td class="yes">DP</td><td>—</td><td class="yes">Chunked</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td class="yes">deepep(env)</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td>
+<td>吞吐20ms (MoE,DeepEP,SpecV2,Multistream)<br>模型: Kimi-K2.6-W4A8</td>
+<td>吞吐20ms (MoE)<br>模型: Kimi-K2.6-W4A8</td></tr>
+
+<tr class="s3">
+<td>perf/qwen3_235b_a22b/test_npu_*_w8a8_8p_in3k5_out1k5_50ms.py</td><td>待#31952</td><td>16</td><td class="yes">开启</td><td class="dis">禁用</td><td class="yes">modelslim</td><td class="yes">EAGLE3(3步,topk=1,draft=4)</td><td>—</td><td>—</td><td class="yes">Chunked=94208</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td class="yes">ascend_fuseep</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td>
+<td>吞吐50ms (MoE,massive)<br>模型: Qwen3-235B-A22B-W8A8</td></tr>
+
+<tr class="s3">
+<td>perf/qwen3_5_397b/test_npu_*_w4a8_8p_in3k5_out1k5_50ms.py</td><td>待#31952</td><td>8</td><td class="yes">开启</td><td class="dis">禁用</td><td class="yes">W4A8</td><td>—</td><td>—</td><td>—</td><td class="yes">Chunked</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td class="note">DeepEP(env)</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td>
+<td>吞吐50ms (MoE, ZBAL)<br>模型: Qwen3.5-397B-W4A8</td>
+<td>吞吐50ms (MoE, massive)<br>模型: Qwen3.5-397B-W4A8</td></tr>
+
+<tr class="s3">
+<td>perf/kimi_k2_6/test_npu_*_w4a8_16p_in64k_out1k_100ms_aime25.py</td><td>待#31952</td><td>32</td><td class="yes">开启</td><td class="dis">禁用</td><td class="yes">W4A8</td><td class="yes">EAGLE3(3步)</td><td class="yes">DP=32</td><td>—</td><td class="yes">Chunked</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td class="note">DeepEP(env)</td><td>—</td><td>—</td><td class="yes">MLA(env)</td><td class="yes">✅(env=1)</td><td>—</td>
+<td>AIME25 + 100ms + 64K input (MoE)<br>模型: Kimi-K2.6-W4A8</td></tr>
+</table>
+
+<!-- ====== 五、待合入 PR#801 accuracy ====== -->
+<h2>五、待合入 PR#801 accuracy（7个）<span class="note">— 全部 disabled, suite="" 或 suite=stage-b-test 但 disabled</span></h2>
+
+<table>
+<tr>
+  <th>文件名</th><th>来源</th><th>TP</th><th>NPUGraph</th><th>PrefixCache</th><th>量化</th><th>SpecDec</th><th>DP</th><th>EP</th><th>ChunkedPrefill</th><th>PD</th><th>EPLB</th><th>FIA</th><th>TorchCompile</th><th>OverlapSchedule</th><th>DPLMHead</th><th>DeepEP</th><th>LoadBalance</th><th>MultistreamMoE</th><th>MLA</th><th>SpecV2</th><th>dLLM</th><th>测试内容</th>
+</tr>
+
+<tr class="s4">
+<td>acc/glm4_7_flash/test_npu_glm4_7_flash_1p_gsm8k.py</td><td>待#801</td><td>2</td><td class="yes">开启(bs1-32)</td><td>默认</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">Chunked=16384</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K ≥0.86 (5-shot, max_tokens=65536)<br>模型: GLM4-7B-Flash</td></tr>
+
+<tr class="s4">
+<td>acc/glm5_top64_pruned/test_npu_glm5_top64_pruned_bf16_8p_gsm8k.py</td><td>待#801</td><td>16</td><td class="yes">开启(bs=16)</td><td class="dis">禁用</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td class="yes">deepep(auto)</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td><td class="yes">✅(env=1)</td><td>—</td>
+<td>GSM8K ≥0.50<br>模型: GLM5-Top64-Pruned (MoE)</td></tr>
+
+<tr class="s4">
+<td>acc/moonshotai_moonlight_16b_a3b/test_npu_*_bf16_1p_gsm8k.py</td><td>待#801</td><td>2</td><td class="yes">开启(bs1-16)</td><td class="dis">禁用</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="yes">Chunked=4096</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K<br>模型: Moonlight-16B-A3B (MoE)</td></tr>
+
+<tr class="s4">
+<td>acc/qwen3_5_9b/test_npu_qwen3_5_9b_bf16_1p_gsm8k.py</td><td>待#801</td><td>2</td><td class="yes">开启(bs=16)</td><td class="dis">禁用</td><td>—</td><td>—</td><td class="yes">DP</td><td>—</td><td class="yes">Chunked=4096</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K (Multimodal)<br>模型: Qwen3.5-9B</td></tr>
+
+<tr class="s4">
+<td>acc/qwen3_vl_30b_a3b/test_npu_*_bf16_2p_gsm8k.py</td><td>待#801</td><td>4</td><td>默认</td><td class="dis">禁用</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="dis">Chunked=-1</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K (VLM)<br>模型: Qwen3-VL-30B-A3B</td></tr>
+
+<tr class="s4">
+<td>acc/qwen3_vl_30b_a3b_thinking/test_npu_*_1p_gsm8k.py</td><td>待#801</td><td>2</td><td>默认</td><td class="dis">禁用</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="dis">Chunked=-1</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K (VLM, thinking)<br>模型: Qwen3-VL-30B-A3B-Thinking</td></tr>
+
+<tr class="s4">
+<td>acc/qwen3_vl_8b/test_npu_qwen3_vl_8b_bf16_2p_gsm8k.py</td><td>待#801</td><td>4</td><td class="yes">开启(bs8-128)</td><td class="dis">禁用</td><td>—</td><td>—</td><td>—</td><td>—</td><td class="dis">Chunked=-1</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+<td>GSM8K (VLM)<br>模型: Qwen3-VL-8B</td></tr>
+</table>
+
+<p style="margin-top:30px; color:#666; font-size:11px;">共计 64 条 | 已合入: 19 | 待 PR#32392: 17 | 待 PR#31952 acc: 9 | 待 PR#31952 perf: 12 | 待 PR#801: 7 | 生成时间: 2026-07-28</p>
+
+</body>
+</html>

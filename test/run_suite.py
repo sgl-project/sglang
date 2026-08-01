@@ -166,8 +166,6 @@ NIGHTLY_SUITES = {
     ],
     HWBackend.CPU: [],
     HWBackend.NPU: [
-        "nightly-1-npu-a2",
-        "nightly-2-npu-a2",
         "nightly-1-npu-a3",
         "nightly-2-npu-a3",
         "nightly-4-npu-a3",
