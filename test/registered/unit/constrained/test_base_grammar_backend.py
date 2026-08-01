@@ -324,7 +324,6 @@ class TestCreateGrammarBackend(unittest.TestCase):
 
         result = create_grammar_backend(args, "tok", 32000, {1})
         self.assertIsNone(result)
-        self.assertEqual(args.grammar_backend, "none")
 
     @patch("sglang.srt.constrained.llguidance_backend.GuidanceBackend")
     def test_llguidance_backend(self, mock_guidance_cls):

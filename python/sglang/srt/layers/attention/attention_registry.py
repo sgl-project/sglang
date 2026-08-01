@@ -353,7 +353,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
             from sglang.srt.layers.attention.linear.gdn_backend import (
                 GDNAttnBackend,
-                maybe_set_default_flashinfer_gdn_prefill,
+                flashinfer_gdn_prefill_default,
             )
         else:
             from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
@@ -367,9 +367,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
 
         check_environments()
+        prefill_default = None
         if hybrid_gdn_config(runner.model_config) is not None and not is_npu():
-            maybe_set_default_flashinfer_gdn_prefill(runner)
-        initialize_linear_attn_config(runner.server_args)
+            prefill_default = flashinfer_gdn_prefill_default(runner)
+        initialize_linear_attn_config(runner.server_args, prefill_default)
         hybrid_backend_cls = HybridLinearAttnBackend
         if hybrid_gdn_config(runner.model_config) is not None:
             if is_blackwell():
