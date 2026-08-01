@@ -14,6 +14,7 @@ set -euo pipefail
 : "${MINWM_RESULTS_ROOT:?set MINWM_RESULTS_ROOT}"
 
 [[ "${MINWM_BENCHMARK_MODE}" == "smoke" \
+  || "${MINWM_BENCHMARK_MODE}" == "setup_only" \
   || "${MINWM_BENCHMARK_MODE}" == "full" \
   || "${MINWM_BENCHMARK_MODE}" == "profiles" \
   || "${MINWM_BENCHMARK_MODE}" == "long720p" \
@@ -218,6 +219,23 @@ export MINWM_CHECKPOINT="${CHECKPOINT}"
 export MINWM_PRETRAINED_DIR="${PRETRAINED}"
 export MINWM_MODEL_DIR="${MODEL_DIR}"
 export MINWM_CONFIG
+
+if [[ "${MINWM_BENCHMARK_MODE}" == "setup_only" ]]; then
+  python3 - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "checkpoint": os.environ["MINWM_CHECKPOINT"],
+    "config": os.environ["MINWM_CONFIG"],
+    "model_dir": os.environ["MINWM_MODEL_DIR"],
+    "pretrained_dir": os.environ["MINWM_PRETRAINED_DIR"],
+    "status": "ready",
+}, sort_keys=True))
+PY
+  echo "MINWM_SETUP_ONLY_COMPLETE run_id=${MINWM_RUN_ID}"
+  exit 0
+fi
 
 wait_for_server() {
   local server_pid="$1" log_path="$2"
