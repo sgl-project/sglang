@@ -176,6 +176,19 @@ def neutralize_kimi_k3_image_placeholder(text: str) -> str:
     return text.replace(KIMI_K3_IMAGE_PLACEHOLDER, KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED)
 
 
+def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return neutralize_kimi_k3_image_placeholder(value)
+    if isinstance(value, list):
+        return [neutralize_kimi_k3_image_placeholder_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: neutralize_kimi_k3_image_placeholder_value(item)
+            for key, item in value.items()
+        }
+    return value
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -384,6 +397,25 @@ class OpenAIServingChat(OpenAIServingBase):
             elif content is None:
                 message["content"] = ""
 
+            if message.get("role") == "assistant":
+                for key in ("reasoning_content", "reasoning"):
+                    if key in message:
+                        message[key] = neutralize_kimi_k3_image_placeholder_value(
+                            message[key]
+                        )
+                for tool_call in message.get("tool_calls") or []:
+                    function = (
+                        tool_call.get("function")
+                        if isinstance(tool_call, dict)
+                        else None
+                    )
+                    if isinstance(function, dict) and "arguments" in function:
+                        function["arguments"] = (
+                            neutralize_kimi_k3_image_placeholder_value(
+                                function["arguments"]
+                            )
+                        )
+
             source = request.messages[index]
             if (
                 isinstance(source, ChatCompletionMessageGenericParam)
@@ -460,7 +492,9 @@ class OpenAIServingChat(OpenAIServingBase):
             template_kwargs = dict(request.chat_template_kwargs or {})
             template_kwargs.pop("tokenize", None)
             template_kwargs.pop("return_dict", None)
-            template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
+            template_kwargs.pop("image_prompts", None)
+            if image_count:
+                template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
 
             if (
                 request.reasoning_effort in ("low", "high", "max")
