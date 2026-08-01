@@ -53,6 +53,7 @@ class SchedulerInternalStateController:
             self._add_disaggregation,
             self._add_elastic_ep,
             self._add_speculative,
+            self._add_dllm,
             self._add_step_times,
             self._add_rust_server,
             self._add_env_vars,
@@ -132,6 +133,11 @@ class SchedulerInternalStateController:
             info_record = scheduler.draft_worker.dump_info_records()
             if info_record is not None:
                 state["dspark_info_record"] = info_record
+
+    def _add_dllm(self, state: Dict[str, Any]) -> None:
+        # Requested via env var but silently downgraded when FDFO is off, so
+        # report what the scheduler actually resolved rather than what was asked.
+        state["dllm_mixed_batch_enabled"] = self.scheduler.dllm_mixed_batch_enabled
 
     def _add_step_times(self, state: Dict[str, Any]) -> None:
         if self.record_step_time:
