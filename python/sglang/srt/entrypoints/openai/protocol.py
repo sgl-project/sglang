@@ -43,7 +43,6 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response import ToolChoice
-from openai.types.responses.tool import Tool
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -213,7 +212,7 @@ class JsonSchemaResponseFormat(BaseModel):
     description: Optional[str] = None
     # use alias to workaround pydantic conflict
     schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    strict: Optional[bool] = False
+    strict: Optional[bool] = None
 
 
 class ResponseFormat(BaseModel):
@@ -687,6 +686,11 @@ class Tool(BaseModel):
         return self
 
 
+# Tool is defined after the message params that reference it, so the forward
+# reference has to be resolved explicitly.
+ChatCompletionMessageGenericParam.model_rebuild()
+
+
 class ToolChoiceFuncName(BaseModel):
     """The name of tool choice function."""
 
@@ -715,6 +719,18 @@ ReasoningEffortType = Optional[
         Annotated[float, Field(ge=0.0, le=0.99, allow_inf_nan=False)],
     ]
 ]
+
+
+def _has_message_level_tools(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return False
+    return any(
+        isinstance(message, dict)
+        and isinstance(message.get("role"), str)
+        and message["role"].lower() in ("system", "developer")
+        and bool(message.get("tools"))
+        for message in messages
+    )
 
 
 class ChatCompletionRequest(BaseModel):
@@ -859,7 +875,9 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def set_tool_choice_default(cls, values):
         if values.get("tool_choice") is None:
-            if values.get("tools") is None:
+            if values.get("tools") is None and not _has_message_level_tools(
+                values.get("messages")
+            ):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
@@ -949,11 +967,10 @@ class ChatCompletionRequest(BaseModel):
 
         if schema:
             name_ = schema.get("title", "Schema")
-            strict_ = False
+            strict_ = None
             if "properties" in schema and "strict" in schema["properties"]:
                 item = schema["properties"].pop("strict", None)
-                if item and item.get("default", False):
-                    strict_ = True
+                strict_ = bool(item and item.get("default", False))
 
             response_format["json_schema"] = {
                 "name": name_,
@@ -968,6 +985,7 @@ class ChatCompletionRequest(BaseModel):
         stop: List[str],
         model_generation_config: Dict[str, Any],
         tool_call_constraint: Optional[ToolCallConstraint] = None,
+        renderer_handles_response_format: bool = False,
     ) -> Dict[str, Any]:
         """
         Convert request to sampling parameters.
@@ -1015,9 +1033,15 @@ class ChatCompletionRequest(BaseModel):
         }
 
         if self.response_format and self.response_format.type == "json_schema":
-            sampling_params["json_schema"] = convert_json_schema_to_str(
-                self.response_format.json_schema.schema_
-            )
+            # strict=false may only go unconstrained when the renderer forwards
+            # response_format to the model; plain chat templates never see it.
+            if (
+                self.response_format.json_schema.strict is not False
+                or not renderer_handles_response_format
+            ):
+                sampling_params["json_schema"] = convert_json_schema_to_str(
+                    self.response_format.json_schema.schema_
+                )
         elif self.response_format and self.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
         elif self.response_format and self.response_format.type == "structural_tag":
@@ -1781,22 +1805,6 @@ class RequestResponseMetadata(BaseModel):
 
 @dataclass
 class MessageProcessingResult:
-    """Result of processing chat messages and applying templates.
-
-    This dataclass encapsulates all the outputs from message processing including
-    prompt generation, multimodal data extraction, and constraint preparation.
-    Used internally by OpenAIServingChat to pass processed data between methods.
-
-    Args:
-        prompt: The final text prompt after applying chat template
-        prompt_ids: Either the text prompt (str) or tokenized IDs (List[int])
-        image_data: Extracted image data from messages, if any
-        audio_data: Extracted audio data from messages, if any
-        modalities: List of modality types present in the messages
-        stop: Combined stop strings from template and request
-        tool_call_constraint: Optional constraint for structured tool calls
-    """
-
     prompt: str
     prompt_ids: Union[str, List[int]]
     image_data: Optional[Any]
@@ -1805,6 +1813,7 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
+    require_reasoning: bool = False
 
 
 class ToolCallProcessingResult(NamedTuple):

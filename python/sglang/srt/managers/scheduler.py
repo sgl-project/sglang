@@ -789,16 +789,23 @@ class Scheduler(
                     "M-RoPE fallback will not be available."
                 )
 
-        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
         if get_serving().reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
                 model_type=get_serving().reasoning_parser,
                 stream_reasoning=False,
                 tokenizer=self.tokenizer,
             )
-            self.model_config.think_end_id = self.tokenizer.encode(
+            think_end_ids = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
-            )[0]
+            )
+            if think_end_ids:
+                self.model_config.think_end_ids = think_end_ids
+            else:
+                logger.warning(
+                    "Reasoning parser think_end_token %r could not be encoded; "
+                    "grammar-gated reasoning is disabled.",
+                    reasoning_parser.detector.think_end_token,
+                )
 
     def init_mamba_backend(self) -> None:
         initialize_mamba_selective_state_update_backend(self.server_args)
