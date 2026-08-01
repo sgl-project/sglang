@@ -3016,6 +3016,8 @@ class KimiK3ForConditionalGeneration(nn.Module):
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
 
+    set_dflash_layers_to_capture = set_dspark_layers_to_capture
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
