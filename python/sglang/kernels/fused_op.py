@@ -569,10 +569,17 @@ class BaseFusedOp(nn.Module, ABC):
         """
         if self.is_torch_compile:
             return
+        # Warm the lazy globals now (still eager) so a compiled trace of
+        # forward() only reads plain module globals / instance attributes and
+        # never graph-breaks on an import inside get_fused_op_backend() or
+        # _resolve_forward_method().
+        get_fused_op_backend()
         self._original_forward_method = self._forward_method
         compile_forward = self._torch_compile_forward(num_tokens=num_tokens)
         if compile_forward is not None:
             self._forward_method = compile_forward
+        elif self._forward_method is None:
+            self._forward_method = self._resolve_forward_method()
         self.is_torch_compile = True
 
     def leave_torch_compile(self) -> None:
