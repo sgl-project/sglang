@@ -191,9 +191,7 @@ class TestRadixHiSparseDecodeAdmission(CustomTestCase):
         scheduler.enable_overlap = False
         scheduler.enable_hisparse = True
         scheduler.spec_algorithm = MagicMock()
-        scheduler.server_args = SimpleNamespace(
-            disaggregation_decode_enable_radix_cache=True
-        )
+        scheduler.server_args = SimpleNamespace()
         scheduler.future_map = MagicMock()
 
         order = []
@@ -210,9 +208,17 @@ class TestRadixHiSparseDecodeAdmission(CustomTestCase):
             "canonicalize"
         )
 
-        with patch(
-            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
-            return_value=new_batch,
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                return_value=new_batch,
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_decode_enable_radix_cache=True
+                ),
+            ),
         ):
             result = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
                 scheduler, running_batch
