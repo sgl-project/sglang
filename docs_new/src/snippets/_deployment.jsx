@@ -9,7 +9,9 @@
 //   hardware           optional — per-model GPUs the shared HARDWARE_CATALOG lacks:
 //                      {id, label, vram, vendor}[] merged into the catalog at render
 //                      (so a model-specific GPU never needs an engine-catalog edit);
-//                      vendor picks the selector group: blackwell | hopper | amd
+//                      vendor picks the selector group: blackwell | hopper | amd.
+//                      `multiNodeDockerFlags: string[]` (either source) adds
+//                      `docker run` flags the platform's fabric needs
 //   variants/quantizations/strategies/nodesOptions  LEGACY 4-dim option lists,
 //                      used when `matchDims` is absent (nodesOptions id is
 //                      `single` or `multi-N` → --nnodes N)
@@ -79,6 +81,12 @@ export const Deployment = ({ config, benchmarks }) => {
       { id: "gb300", label: "GB300", vram: "288GB" },
       { id: "b200",  label: "B200",  vram: "192GB" },
       { id: "gb200", label: "GB200", vram: "192GB" },
+      // GB10 Grace Blackwell — 128 GB coherent unified system memory (not discrete VRAM).
+      // Multi-node runs over ConnectX-7 RDMA (pinned memory + IB passthrough).
+      { id: "dgx-spark", label: "DGX Spark", vram: "128GB",
+        multiNodeDockerFlags: [
+          "--ulimit memlock=-1:-1", "--cap-add IPC_LOCK", "--device /dev/infiniband",
+        ] },
     ],
     hopper: [
       { id: "h200",  label: "H200",  vram: "141GB" },
@@ -690,6 +698,16 @@ export const Deployment = ({ config, benchmarks }) => {
         const extra = (config.hardware || []).find((h) => h.id === hwId);
         return (extra && extra.vendor) || "nvidia";
       };
+      // `config.hardware` overrides by id, as in buildHardwareGroups.
+      const fabricFlagsOf = (hwId) => {
+        const extra = (config.hardware || []).find((h) => h.id === hwId);
+        if (extra) return extra.multiNodeDockerFlags || [];
+        for (const list of Object.values(HARDWARE_CATALOG)) {
+          const hit = list.find((h) => h.id === hwId);
+          if (hit) return hit.multiNodeDockerFlags || [];
+        }
+        return [];
+      };
       const gpuAccessLines = vendorOf(sel.hw) === "amd"
         ? [
             "docker run",
@@ -708,6 +726,7 @@ export const Deployment = ({ config, benchmarks }) => {
         // (--dist-init-addr) and NCCL/GLOO traffic are reachable; single-node
         // just maps the serve port.
         multinode ? "  --network host" : `  -p ${servePort}:${servePort}`,
+        ...(multinode ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
         // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
         ...(config.placeholders && config.placeholders.HF_TOKEN
