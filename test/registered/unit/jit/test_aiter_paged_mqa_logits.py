@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.jit_kernel.dsa.paged_mqa_logits import aiter_paged_mqa_logits
+from sglang.kernels.ops.attention.dsa.paged_mqa_logits import aiter_paged_mqa_logits
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
