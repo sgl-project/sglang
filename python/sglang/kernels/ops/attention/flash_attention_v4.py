@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Callable, Optional, Tuple, Union
 
 import torch
@@ -12,19 +13,73 @@ try:
         # A/B debug escape hatch: route through the pip flash-attn-4 package
         # (dev's stack). rel_bias is vendored-only, so SHEARED must be 0.
         from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
+
+        resolve_runtime_policy = None
+        get_forward_arch = None
+        try_cached_paged_decode = None
     else:
+        from sglang.kernels.ops.attention.fa4_sm120.dispatch import (
+            get_forward_arch,
+            resolve_runtime_policy,
+            try_cached_paged_decode,
+        )
         from sglang.kernels.ops.attention.flash_attn.cute import (
             flash_attn_varlen_func as _flash_attn_varlen_func,
         )
 except Exception as _e:  # pragma: no cover
     _flash_attn_varlen_func = None
+    get_forward_arch = None
+    resolve_runtime_policy = None
+    try_cached_paged_decode = None
     _flash_attn_import_error = _e
 else:
     _flash_attn_import_error = None
 
 
+@dataclass(frozen=True)
+class FlashAttentionV4RuntimePolicy:
+    num_splits: int
+    decode_num_splits: int
+    decode_uses_static_max_seqlen_k: bool
+
+
+def get_flash_attention_v4_runtime_policy(
+    *,
+    device_capability: tuple[int, int],
+    deterministic: bool,
+) -> FlashAttentionV4RuntimePolicy:
+    """Resolve the SGLang-facing FA4 policy without leaking arch details."""
+    if resolve_runtime_policy is None:
+        num_splits = 1 if deterministic or device_capability < (9, 0) else 0
+        return FlashAttentionV4RuntimePolicy(
+            num_splits=num_splits,
+            decode_num_splits=num_splits,
+            decode_uses_static_max_seqlen_k=False,
+        )
+    num_splits, decode_num_splits, decode_uses_static_max_seqlen_k = (
+        resolve_runtime_policy(
+            device_capability=device_capability,
+            deterministic=deterministic,
+        )
+    )
+    return FlashAttentionV4RuntimePolicy(
+        num_splits=num_splits,
+        decode_num_splits=decode_num_splits,
+        decode_uses_static_max_seqlen_k=decode_uses_static_max_seqlen_k,
+    )
+
+
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _validate_out_contract(out: Optional[torch.Tensor]) -> None:
+    if out is None:
+        return
+    if out.requires_grad:
+        raise ValueError("out must not require gradients")
+    if out.stride(-1) != 1:
+        raise ValueError("out must have stride 1 in the last dimension")
 
 
 @debug_kernel_api
@@ -67,6 +122,7 @@ def flash_attn_varlen_func(
     rel_bias: Optional[torch.Tensor] = None,
     rel_bias_prep_cache: Optional[dict] = None,
     return_softmax_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
     **_: object,
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
@@ -76,6 +132,7 @@ def flash_attn_varlen_func(
             "vendored FA4 package is importable."
         ) from _flash_attn_import_error
 
+    _validate_out_contract(out)
     q, k, v, qv = [_maybe_contiguous(t) for t in (q, k, v, qv)]
     cu_seqlens_q, cu_seqlens_k = [
         _maybe_contiguous(t) for t in (cu_seqlens_q, cu_seqlens_k)
@@ -137,6 +194,7 @@ def flash_attn_varlen_func(
         score_mod=score_mod,
         aux_tensors=aux_tensors,
         return_lse=return_softmax_lse,
+        out=out,
         **sf_kwargs,
         **descale_kwargs,
         **rel_bias_kwargs,
@@ -189,8 +247,11 @@ def flash_attn_with_kvcache(
     rel_bias: Optional[torch.Tensor] = None,
     rel_bias_prep_cache: Optional[dict] = None,
     return_softmax_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
+    max_seqlen_k: Optional[int] = None,
     **_: object,
 ):
+    _validate_out_contract(out)
     if k is not None or v is not None:
         raise NotImplementedError("FA4 does not support updating KV cache in-place.")
     if rotary_cos is not None or rotary_sin is not None or rotary_seqlens is not None:
@@ -204,6 +265,56 @@ def flash_attn_with_kvcache(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
 
+    forward_arch = get_forward_arch(q.device) if get_forward_arch is not None else None
+    if (
+        forward_arch is not None
+        and not return_softmax_lse
+        and softcap in (None, 0.0)
+        and all(
+            value is None
+            for value in (
+                qv,
+                score_mod,
+                aux_tensors,
+                q_descale,
+                k_descale,
+                v_descale,
+                sfq,
+                sfk,
+                sfv,
+                rel_bias,
+                rel_bias_prep_cache,
+            )
+        )
+    ):
+        q, k_cache, v_cache = [_maybe_contiguous(t) for t in (q, k_cache, v_cache)]
+        cu_seqlens_q, cache_seqlens, page_table = [
+            _maybe_contiguous(t) for t in (cu_seqlens_q, cache_seqlens, page_table)
+        ]
+        fast_result = try_cached_paged_decode(
+            arch=forward_arch,
+            q=q,
+            k=k_cache,
+            v=v_cache,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=None,
+            seqused_q=None,
+            seqused_k=cache_seqlens,
+            page_table=page_table,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            learnable_sink=sinks,
+            requested_num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            out=out,
+        )
+        if fast_result is not None:
+            return fast_result[0]
+
     result = flash_attn_varlen_func(
         q=q,
         k=k_cache,
@@ -212,6 +323,7 @@ def flash_attn_with_kvcache(
         cu_seqlens_q=cu_seqlens_q,
         seqused_k=cache_seqlens,
         max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
         page_table=page_table,
         softmax_scale=softmax_scale,
         causal=causal,
@@ -230,7 +342,8 @@ def flash_attn_with_kvcache(
         sfv=sfv,
         rel_bias=rel_bias,
         rel_bias_prep_cache=rel_bias_prep_cache,
-        return_softmax_lse=True,
+        return_softmax_lse=return_softmax_lse if forward_arch is not None else True,
+        out=out,
     )
 
     if return_softmax_lse:
