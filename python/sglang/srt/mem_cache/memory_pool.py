@@ -850,21 +850,11 @@ class MambaPool:
         return self.mamba_cache
 
     def mamba2_layer_cache(self, layer_id: int):
-        # The per-layer views are pool-stable (mamba_cache is only bound at
-        # construction), so each layer's State is built once.
-        cached = self._layer_cache_by_id.get(layer_id)
-        if cached is None:
-            cached = self.mamba_cache.at_layer_idx(layer_id)
-            self._layer_cache_by_id[layer_id] = cached
-        return cached
+        return self.mamba_cache.at_layer_idx(layer_id)
 
-    # These properties are pool-stable (conv tensors don't move after allocation)
-    # so they're cached per instance on first use. Defined as cached_property
-    # rather than set in __init__ because UnifiedMambaPool skips super().__init__.
-    @cached_property
-    def _layer_cache_by_id(self) -> dict:
-        return {}
-
+    # Pool-stable (conv tensors don't move after allocation) so cached per instance
+    # on first use. A cached_property rather than set in __init__ because
+    # UnifiedMambaPool skips super().__init__.
     @cached_property
     def _conv_fuse_ok(self) -> bool:
         """Whether clear/copy may use the fused kernel: CUDA bf16 contiguous conv.
@@ -1334,11 +1324,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
         / get_cpu_copy / load_cpu_copy)."""
         return mamba_indices
 
-    def mamba2_layer_cache(self, layer_id: int):
+    def mamba2_layer_index(self, layer_id: int) -> int:
+        """Pool-side index of ``layer_id``'s state, gated on its HiCache transfer.
+
+        For a caller that wants one specific state tensor: it indexes the pool
+        tensor itself instead of taking a ``State`` sliced over every field.
+        """
         assert layer_id in self.mamba_map
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
+        return self.mamba_map[layer_id]
+
+    def mamba2_layer_cache(self, layer_id: int):
+        return self.mamba_pool.mamba2_layer_cache(self.mamba2_layer_index(layer_id))
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
