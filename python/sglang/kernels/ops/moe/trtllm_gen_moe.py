@@ -274,8 +274,8 @@ def _jit_trtllm_gen_moe_module() -> Module:
             "trtllm_gen_moe",
             meta_tag,
             path_tag,
-            cpp_files=cpp_files,
-            cuda_files=cuda_files,
+            external_cpp_files=cpp_files,
+            external_cuda_files=cuda_files,
             header_only=False,  # the launcher exports its own tvm-ffi functions
             extra_cflags=["-fvisibility=hidden"],
             extra_cuda_cflags=[

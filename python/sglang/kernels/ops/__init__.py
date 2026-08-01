@@ -23,6 +23,7 @@ _GROUPS = (
     "embeddings",
     "gemm",
     "grammar",
+    "kimi_k3",
     "kvcache",
     "layernorm",
     "mamba",
