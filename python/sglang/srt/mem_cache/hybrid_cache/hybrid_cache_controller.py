@@ -397,11 +397,18 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
-        # Page-first write-back JIT kernels can keep destination host indices on CPU.
+        # Page-first staged write-back kernels need CPU destination host indices.
+        # A HostPoolGroup may mix staged and non-staged child pools, so let it
+        # normalize indices per child instead of moving the whole operation here.
         if (
             self.io_backend == "kernel"
             and self.mem_pool_host.layout == "page_first"
-            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+            and (
+                getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+                or getattr(
+                    self.mem_pool_host, "supports_per_pool_backup_indices", False
+                )
+            )
         ):
             host_indices = op.host_indices
             device_indices = op.device_indices

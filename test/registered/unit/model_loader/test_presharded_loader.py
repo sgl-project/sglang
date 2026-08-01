@@ -819,6 +819,16 @@ class TestShardConfig(unittest.TestCase):
         ), mock.patch(
             "sglang.srt.model_loader.loader.get_parallel",
             return_value=parallel,
+        ), mock.patch(
+            "sglang.srt.model_loader.loader.get_exec",
+            return_value=SimpleNamespace(
+                features=SimpleNamespace(enable_fp32_lm_head=True),
+                moe=SimpleNamespace(
+                    ep_num_redundant_experts=4,
+                    enable_eplb=True,
+                    init_expert_location="trivial",
+                ),
+            ),
         ), mock.patch.object(
             loader, "_compute_structural_signature", return_value="sig16"
         ):
