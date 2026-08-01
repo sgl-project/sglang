@@ -72,6 +72,8 @@ jobs:
       job_filter: ${{ steps.set-vars.outputs.job_filter }}
       image_a2: ${{ steps.set-vars.outputs.image_a2 }}
       image_a3: ${{ steps.set-vars.outputs.image_a3 }}
+      CANN_image_a3: ${{ steps.set-vars.outputs.CANN_image_a3 }}
+      CANN_image_910b: ${{ steps.set-vars.outputs.CANN_image_910b }}
       skip_install_flag: ${{ steps.set-vars.outputs.skip_install_flag }}
     steps:
       # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
@@ -103,6 +105,8 @@ jobs:
           else
             echo "skip_install_flag=${{ inputs.skip_install_flag }}" >> $GITHUB_OUTPUT
           fi
+          echo "CANN_image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
+          echo "CANN_image_910b=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
   nightly-poc-single-node-a2-tests:
     name: single-node-poc-a2
     if: ${{ !cancelled() }}
@@ -125,7 +129,7 @@ jobs:
       test_type: ${{ matrix.test_config.test_type }}
       test_config_name: ${{ matrix.test_config.name }}
       test_case: ${{ matrix.test_config.test_case }}
-      image: ${{ needs.set-image-config.outputs.image_a2 }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_910b }}
       install_sglang_from_source: false
       transformers_version: ''
 
@@ -300,7 +304,7 @@ jobs:
       test_type: ${{ matrix.test_config.test_type }}
       test_config_name: ${{ matrix.test_config.name }}
       test_case: ${{ matrix.test_config.test_case }}
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_from_source: false
       transformers_version: ''
 
@@ -351,7 +355,7 @@ jobs:
       decode_size: ${{ matrix.test_config.decode_size }}
       router_size: ${{ matrix.test_config.router_size }}
       test_case: ${{ matrix.test_config.test_case }}
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_from_source: false
       prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
       transformers_version: ''
@@ -380,7 +384,7 @@ jobs:
       test_config_name: ${{ matrix.test_config.name }}
       node_size: ${{ matrix.test_config.node_size }}
       test_case: ${{ matrix.test_config.test_case }}
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_from_source: false
       prefill_decode_deployment: 'mix'
       transformers_version: ''
@@ -389,7 +393,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: linux-aarch64-a2-1
     container:
-      image: ${{ needs.set-image-config.outputs.image_a2 }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_910b }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -433,7 +437,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: linux-aarch64-a2-2
     container:
-      image: ${{ needs.set-image-config.outputs.image_a2 }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_910b }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -477,7 +481,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: linux-aarch64-a3-2
     container:
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -521,7 +525,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: linux-aarch64-a3-2
     container:
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -565,7 +569,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: linux-aarch64-a3-4
     container:
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -610,7 +614,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: linux-aarch64-a3-8
     container:
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -654,7 +658,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: linux-aarch64-a3-16
     container:
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
