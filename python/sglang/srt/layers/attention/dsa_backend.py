@@ -15,7 +15,7 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 
 logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
@@ -229,7 +229,7 @@ class DSAMetadata:
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     # Precomputed once per forward batch and reused across layers: the
     # DeepSeek-V4 top-k v2 plan (cluster-threshold metadata) for the folded
-    # decode top-k transform. None unless SGLANG_OPT_USE_TOPK_V2 and decode.
+    # decode top-k transform. None unless the SGL top-k v2 path is enabled.
     topk_v2_plan: Optional[torch.Tensor] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
@@ -329,6 +329,8 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             cu_topk_indices_offset = torch.repeat_interleave(
                 cu_seqlens_q_topk[:-1],
                 cu_seqlens_q,
+                # Avoid reading sum(cu_seqlens_q) back to the host.
+                output_size=logits.shape[0],
             )
         else:
             cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q
@@ -467,9 +469,7 @@ class DeepseekSparseAttnBackend(
         # Speculative decoding
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
         self.use_fused_topk = should_use_dsa_fused_topk(
             model_runner.server_args, seed_dsa_topk_from_draft_extend
@@ -778,8 +778,8 @@ class DeepseekSparseAttnBackend(
         # that dispatches to `_topk_transform_v2_paged` -- decode AND MTP
         # target-verify / draft-extend, whose expanded row count is exactly what v2
         # sees -- otherwise the helper's plan-present assertion fires. None only
-        # when the fold is disabled; such metadata is never dispatched to v2.
-        if not envs.SGLANG_OPT_USE_TOPK_V2.get():
+        # when the SGL v2 path is disabled; such metadata is never dispatched to v2.
+        if not self.dsa_topk_backend.should_use_topk_v2():
             return None
         from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
@@ -1250,12 +1250,12 @@ class DeepseekSparseAttnBackend(
         # page_size=1 table. This MUST match the exact condition under which
         # `DSATopKBackend.topk_transform` dispatches decode PAGED to
         # `_topk_transform_v2_paged` -- otherwise the legacy transform would read a
-        # dropped (None) table. Hence: fused top-k AND v2 enabled AND index_topk in
-        # the kernel's supported range, on CUDA with page_size>1. Excludes HIP (its
-        # indexer reads page_table_1), hisparse (needs page_size=1 loc translation),
-        # and spec decoding (MTP precompute fast-path + target-verify/draft-extend
-        # still consume the wide table). Computed once from stable config; the graph
-        # is captured once per process.
+        # dropped (None) table. Hence: SGL top-k backend AND fused top-k AND v2
+        # enabled AND index_topk in the kernel's supported range, on CUDA with
+        # page_size>1. Excludes HIP (its indexer reads page_table_1), hisparse
+        # (needs page_size=1 loc translation), and spec decoding (MTP precompute
+        # fast-path + target-verify/draft-extend still consume the wide table).
+        # Computed once from stable config; the graph is captured once per process.
         self.dsa_drop_wide_page_table = (
             is_cuda()
             and not _is_hip
@@ -1263,9 +1263,9 @@ class DeepseekSparseAttnBackend(
             and self.hisparse_coordinator is None
             and not self.speculative_num_draft_tokens
             and self.use_fused_topk
-            and envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and self.dsa_topk_backend.should_use_topk_v2()
             and self.dsa_index_topk is not None
-            and self.dsa_index_topk <= 2048
+            and 0 < self.dsa_index_topk <= 2048
         )
 
         max_ctx_len = self.req_to_token.shape[1]
@@ -2203,6 +2203,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                topk_length=metadata.dsa_cache_seqlens_int32,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_rope is not None:
@@ -2359,6 +2360,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                topk_length=metadata.dsa_cache_seqlens_int32,
             )
         elif self.dsa_decode_impl == "flashinfer_sparse_mla":
             if q_all is None:
@@ -2473,6 +2475,7 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        topk_length: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
@@ -2501,12 +2504,25 @@ class DeepseekSparseAttnBackend(
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
+        # topk_length is the per-row count of valid indices
+        # (`dsa_cache_seqlens_int32` = seqlens clipped to `index_topk`). Rows
+        # whose context is shorter than `index_topk` have their indices
+        # tail-padded with -1; passing the valid length lets the kernel skip
+        # the padded tail instead of scanning the full topk width. The output
+        # is unchanged: the kernel masks -1 indices either way.
+        if topk_length is not None and topk_length.shape[0] != num_tokens:
+            # Metadata rows are expected to match q rows (the DP/CP padding
+            # helpers keep them aligned); fall back to full-width compute if
+            # they ever diverge.
+            topk_length = None
+
         o, _, _ = flash_mla_sparse_fwd(
             q=q_input,
             kv=kv_cache,
             indices=indices_input,
             sm_scale=sm_scale,
             d_v=v_head_dim,
+            topk_length=topk_length,
         )
 
         # Trim output back to original num_heads if we padded

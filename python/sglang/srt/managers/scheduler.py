@@ -27,6 +27,21 @@ from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
+from sglang.srt.runtime_context import (
+    get_device,
+    get_disagg,
+    get_exec,
+    get_lora,
+    get_memory,
+    get_mm,
+    get_model,
+    get_observability,
+    get_parallel,
+    get_schedule,
+    get_serving,
+    get_spec,
+)
+
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
@@ -167,6 +182,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
 )
+from sglang.srt.managers.rust_server import RustServer
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -185,7 +201,10 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
-from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
+from sglang.srt.managers.scheduler_components.idle_sleeper import (
+    IdleSleeper,
+    RustServerIdleSleeper,
+)
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
     create_scheduler_watchdog,
@@ -246,11 +265,12 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel, publish
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -478,9 +498,9 @@ class Scheduler(
             attn_tp_cpu_group=self.attn_tp_cpu_group,
             tp_cpu_group=self.tp_cpu_group,
             attn_cp_cpu_group=self.attn_cp_cpu_group,
-            enable_metrics=self.server_args.enable_metrics,
+            enable_metrics=get_observability().enable_metrics,
             enable_kv_cache_events=bool(
-                self.server_args.kv_events_config
+                get_observability().kv_events_config
                 and self.ps.pp_rank == 0
                 and self.ps.attn_tp_rank == 0
                 and self.ps.attn_cp_rank == 0
@@ -522,8 +542,8 @@ class Scheduler(
         self.init_hisparse_coordinator()
 
         if (
-            self.server_args.disaggregation_mode == "decode"
-            and self.server_args.disaggregation_decode_enable_offload_kvcache
+            get_disagg().disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_enable_offload_kvcache
         ):
             self.decode_offload_manager = DecodeKVCacheOffloadManager(
                 req_to_token_pool=self.req_to_token_pool,
@@ -597,6 +617,10 @@ class Scheduler(
 
         self.maybe_init_scripted_scheduler_hook()
 
+        # Start the embedded Rust frontend (rank 0) before the request receiver,
+        # which reads self.rust_ring_recv to pick its ingress transport.
+        self.maybe_init_rust_server()
+
         self.init_request_receiver()
 
         self.init_dp_attn_adapter()
@@ -634,7 +658,7 @@ class Scheduler(
 
             self.dllm_config = (  # For diffusion LLM
                 DllmConfig.from_server_args(self.server_args)
-                if self.server_args.dllm_algorithm is not None
+                if get_exec().dllm.dllm_algorithm is not None
                 else None
             )
 
@@ -663,18 +687,21 @@ class Scheduler(
             port_args=port_args,
             is_rank_zero=is_rank_zero,
             skip_tokenizer_init=self.server_args.skip_tokenizer_init,
-            metrics_enabled=self.server_args.enable_metrics
+            metrics_enabled=get_observability().enable_metrics
             and (
                 self.ps.attn_tp_rank == 0
-                or self.server_args.enable_metrics_for_all_schedulers
+                or get_observability().enable_metrics_for_all_schedulers
             ),
             enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
         )
 
         self.load_snapshot_writer = None
+        self.recv_from_tokenizer = None
+
         if not is_rank_zero:
             return
 
+        self.recv_from_tokenizer = self.ipc_channels.recv_from_tokenizer
         dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
         try:
             self.load_snapshot_writer = create_load_snapshot_writer(
@@ -682,7 +709,7 @@ class Scheduler(
                 port_args,
                 self.ps.dp_size,
                 dp_rank,
-                publish_interval=self.server_args.load_snapshot_publish_interval,
+                publish_interval=get_observability().load_snapshot_publish_interval,
             )
         except Exception as e:
             logger.warning("load snapshot writer init failed: %s", e)
@@ -692,7 +719,7 @@ class Scheduler(
             self.ps.pp_rank == 0
             and self.ps.attn_tp_rank == 0
             and self.ps.attn_cp_rank == 0
-            and self.server_args.sleep_on_idle
+            and get_device().sleep_on_idle
         ):
             self.idle_sleeper = IdleSleeper(
                 sockets=[
@@ -726,22 +753,22 @@ class Scheduler(
         else:
             if self.model_config.is_multimodal:
                 self.processor = get_processor(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                    use_fast=not server_args.disable_fast_image_processor,
-                    tokenizer_backend=server_args.tokenizer_backend,
-                    model_name=server_args.model_path,
+                    get_serving().tokenizer_path,
+                    tokenizer_mode=get_serving().tokenizer_mode,
+                    trust_remote_code=get_model().trust_remote_code,
+                    revision=get_model().revision,
+                    use_fast=not get_mm().disable_fast_image_processor,
+                    tokenizer_backend=get_serving().tokenizer_backend,
+                    model_name=get_model().model_path,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
                 self.tokenizer = get_tokenizer(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                    tokenizer_backend=server_args.tokenizer_backend,
+                    get_serving().tokenizer_path,
+                    tokenizer_mode=get_serving().tokenizer_mode,
+                    trust_remote_code=get_model().trust_remote_code,
+                    revision=get_model().revision,
+                    tokenizer_backend=get_serving().tokenizer_backend,
                 )
 
         # Load multimodal processor for M-RoPE fallback computation.
@@ -763,9 +790,9 @@ class Scheduler(
                 )
 
         # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
-        if self.server_args.reasoning_parser and self.tokenizer:
+        if get_serving().reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
-                model_type=self.server_args.reasoning_parser,
+                model_type=get_serving().reasoning_parser,
                 stream_reasoning=False,
                 tokenizer=self.tokenizer,
             )
@@ -836,7 +863,7 @@ class Scheduler(
             target_worker=self.tp_worker,
         )
 
-        if self.server_args.speculative_draft_load_format is not None:
+        if get_spec().speculative_draft_load_format is not None:
             # Write the draft load_format onto server_args (not just the bag):
             # the draft worker is built from a copy of self.server_args and
             # build_load_config reads server_args.load_format, so a bag-only
@@ -844,10 +871,10 @@ class Scheduler(
             # format.
             self.server_args.override(
                 "scheduler.draft_load_format",
-                load_format=self.server_args.speculative_draft_load_format,
+                load_format=get_spec().speculative_draft_load_format,
             )
             logger.info(
-                f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
+                f"Using draft model load_format: '{get_spec().speculative_draft_load_format}'"
             )
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
@@ -914,8 +941,8 @@ class Scheduler(
             model_runner.post_capture_resize_kv_pool()
 
         if (
-            self.server_args.elastic_ep_backend is not None
-            and self.server_args.ep_join_mode == "recover"
+            get_exec().moe.elastic_ep_backend is not None
+            and get_exec().moe.ep_join_mode == "recover"
         ):
             model_runner.post_capture_elastic_ep_recover()
 
@@ -944,7 +971,7 @@ class Scheduler(
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
         min_free_slots = resolve_min_free_slots(
-            self.server_args.min_free_slots_delay,
+            get_schedule().min_free_slots_delay,
             self.max_running_requests,
             is_dflash_family=self.spec_algorithm.is_dflash_family(),
         )
@@ -990,14 +1017,14 @@ class Scheduler(
         if self.ps.tp_rank == 0:
             logger.info(
                 f"max_total_num_tokens={self.max_total_num_tokens}, "
-                f"chunked_prefill_size={self.server_args.chunked_prefill_size}, "
+                f"chunked_prefill_size={get_schedule().chunked_prefill_size}, "
                 f"max_prefill_tokens={self.max_prefill_tokens}, "
                 f"max_running_requests={self.max_running_requests}, "
                 f"context_len={self.model_config.context_len}, "
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
             )
 
-        if self.server_args.enable_metrics:
+        if get_observability().enable_metrics:
             self.metrics_collector.emit_constants(
                 max_total_num_tokens=self.max_total_num_tokens,
                 # TODO: max_running_requests_under_SLO has no setter — dead chain.
@@ -1044,7 +1071,7 @@ class Scheduler(
         self._engine_paused = False
 
     def init_chunked_prefill(self):
-        self.chunked_prefill_size = self.server_args.chunked_prefill_size
+        self.chunked_prefill_size = get_schedule().chunked_prefill_size
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1064,13 +1091,12 @@ class Scheduler(
         self.chunked_req = None
         self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
-            self.chunked_prefill_size is not None
-            and self.server_args.enable_mixed_chunk
+            self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
-            self.server_args.enable_dynamic_chunking and self.ps.pp_size > 1
+            get_schedule().enable_dynamic_chunking and self.ps.pp_size > 1
         )
         if self.enable_dynamic_chunking:
             try:
@@ -1106,8 +1132,8 @@ class Scheduler(
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.max_prefill_bs: int = 0
-        if self.server_args.enable_prefill_delayer:
-            if self.server_args.disaggregation_mode == "decode":
+        if get_schedule().enable_prefill_delayer:
+            if get_disagg().disaggregation_mode == "decode":
                 logger.info(
                     "Ignoring --enable-prefill-delayer on decode engine "
                     "(no prefill scheduling path; delayer would be a no-op)."
@@ -1124,15 +1150,15 @@ class Scheduler(
                         if self.metrics_reporter.enable_metrics
                         else None
                     ),
-                    max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
-                    token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
+                    max_delay_passes=get_schedule().prefill_delayer_max_delay_passes,
+                    token_usage_low_watermark=get_schedule().prefill_delayer_token_usage_low_watermark,
                     device=self.tp_group.device,
                 )
 
         # NOTE: preemption is enabled by default for priority scheduling.
         self.enable_priority_preemption = (
             self.enable_priority_scheduling
-            and not self.server_args.disable_priority_preemption
+            and not get_schedule().disable_priority_preemption
         )
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_server_args(
@@ -1148,12 +1174,12 @@ class Scheduler(
     def init_watch_dog_memory_saver_input_blocker(self):
         # Start watchdog thread
         self.watchdog = create_scheduler_watchdog(
-            self, watchdog_timeout=self.server_args.watchdog_timeout
+            self, watchdog_timeout=get_device().watchdog_timeout
         )
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=self.server_args.enable_memory_saver
+            enable=get_exec().features.enable_memory_saver
         )
 
         # Init recv skipper and input blocker
@@ -1175,11 +1201,9 @@ class Scheduler(
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
 
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
+        self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         self.transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
+            get_disagg().disaggregation_transfer_backend
         )
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
@@ -1247,12 +1271,12 @@ class Scheduler(
                 gloo_group=self.attn_tp_cpu_group,
                 tp_rank=self.ps.tp_rank,
                 tp_size=self.ps.tp_size,
-                dp_size=self.server_args.dp_size,
+                dp_size=get_parallel().dp_size,
                 gpu_id=self.ps.gpu_id,
-                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
                 pp_rank=self.ps.pp_rank,
-                num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
+                num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
 
@@ -1278,7 +1302,7 @@ class Scheduler(
                 tp_rank=self.ps.tp_rank,
                 tp_size=self.ps.tp_size,
                 gpu_id=self.ps.gpu_id,
-                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 gloo_group=self.attn_tp_cpu_group,
                 max_total_num_tokens=self.max_total_num_tokens,
                 scheduler=self,
@@ -1292,11 +1316,10 @@ class Scheduler(
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         # Init mm receiver for EPD disaggregation mode
-        if (
-            self.server_args.language_only
-            and self.server_args.encoder_transfer_backend
-            in ["zmq_to_scheduler", "mooncake"]
-        ):
+        if get_disagg().language_only and get_disagg().encoder_transfer_backend in [
+            "zmq_to_scheduler",
+            "mooncake",
+        ]:
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
@@ -1377,7 +1400,7 @@ class Scheduler(
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
-        if not self.server_args.enable_deterministic_inference:
+        if not get_exec().deterministic.enable_deterministic_inference:
             self.truncation_align_size = None
             return
 
@@ -1748,11 +1771,16 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if not isinstance(output, RpcReqOutput):
-                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
-                else:
+                if self.rust_server is not None:
+                    # Embedded Rust server: every control-request response goes
+                    # back through the egress ring (the zmq tokenizer socket is
+                    # not consumed); the Rust api_server shapes it per-endpoint.
+                    self.rust_server.push_control_output(recv_req, output)
+                elif isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
+                else:
+                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
@@ -1778,10 +1806,10 @@ class Scheduler(
         )
 
     def init_lora_drainer(self) -> None:
-        if self.server_args.lora_drain_wait_threshold > 0.0:
+        if get_lora().lora_drain_wait_threshold > 0.0:
             self.lora_drainer = LoRADrainer(
-                self.server_args.max_loras_per_batch,
-                self.server_args.lora_drain_wait_threshold,
+                get_lora().max_loras_per_batch,
+                get_lora().lora_drain_wait_threshold,
             )
         else:
             self.lora_drainer = None
@@ -1808,9 +1836,33 @@ class Scheduler(
         else:
             self.scripted_scheduler_hook = None
 
+    def maybe_init_rust_server(self) -> None:
+        """Start the embedded Rust server (rank 0) if ``SGLANG_RUST_SERVER`` is
+        set, and point the ingress receiver at it. All the plumbing lives in
+        ``RustServer`` (scheduler_components/rust_scheduler.py)."""
+
+        is_rank_zero = (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        )
+        if not (envs.SGLANG_RUST_SERVER.get() and is_rank_zero):
+            # Always define the attribute: init_output_streamer and the
+            # process_input_requests hook read self.rust_server unconditionally.
+            self.rust_server = None
+            return
+
+        rust_server = RustServer.launch(self)
+        self.rust_server = rust_server
+        # The rust server *is* the ingress source: SchedulerRequestReceiver
+        # drains its request ring (rust_server_mode) instead of a zmq socket.
+        self.recv_from_tokenizer = rust_server
+        # Park the idle loop on the request ring within the rank-0 rust-server
+        self.idle_sleeper = RustServerIdleSleeper(rust_server)
+
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(
-            recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
+            recv_from_tokenizer=self.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
@@ -1832,7 +1884,15 @@ class Scheduler(
         )
 
     def init_dp_attn_adapter(self) -> None:
+        # Spec workers have no .model_runner of their own; the prefill graph
+        # runner that votes belongs to the target model.
+        target_worker = (
+            self.tp_worker.target_worker
+            if isinstance(self.tp_worker, BaseSpecWorker)
+            else self.tp_worker
+        )
         self.dp_attn_adapter = SchedulerDPAttnAdapter(
+            model_runner=target_worker.model_runner,
             tp_group=self.tp_group,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -1883,7 +1943,7 @@ class Scheduler(
 
     def init_kv_events_publisher(self) -> None:
         self.kv_events_publisher = SchedulerKvEventsPublisher(
-            kv_events_config=self.server_args.kv_events_config,
+            kv_events_config=get_observability().kv_events_config,
             ps=self.ps,
             attn_tp_rank=self.ps.attn_tp_rank,
             attn_cp_rank=self.ps.attn_cp_rank,
@@ -1936,6 +1996,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
+            rust_server=self.rust_server,
         )
 
     def init_batch_result_processor(self) -> None:
@@ -1956,7 +2017,7 @@ class Scheduler(
             draft_worker=self.draft_worker,
             model_worker=self.model_worker,
             logprob_result_processor=SchedulerLogprobResultProcessor(
-                server_args=self.server_args, model_config=self.model_config
+                model_config=self.model_config
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
@@ -2066,7 +2127,7 @@ class Scheduler(
         return image_inputs
 
     def _get_multimodal_inputs(self, mm_inputs_dict):
-        if self.server_args.enable_broadcast_mm_inputs_process:
+        if get_mm().enable_broadcast_mm_inputs_process:
             return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
         else:
             return MultimodalInputs.from_processor_output(mm_inputs_dict)
@@ -2113,7 +2174,7 @@ class Scheduler(
 
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
         if (
-            self.server_args.elastic_ep_backend is None
+            get_exec().moe.elastic_ep_backend is None
             or self.disable_radix_cache
             or not self.tree_cache.is_tree_cache()
         ):
@@ -2159,8 +2220,7 @@ class Scheduler(
         )
         # Radix-native sessions use only the top-level session_id.
         radix_native_session = (
-            recv_req.session_id is not None
-            and self.server_args.enable_session_radix_cache
+            recv_req.session_id is not None and get_memory().enable_session_radix_cache
         )
 
         if session_id is None or radix_native_session:
@@ -2172,7 +2232,7 @@ class Scheduler(
 
             if recv_req.bootstrap_port is None:
                 # Use default bootstrap port
-                recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
+                recv_req.bootstrap_port = get_disagg().disaggregation_bootstrap_port
 
             req = Req(
                 recv_req.rid,
@@ -2183,6 +2243,7 @@ class Scheduler(
                 top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
                 return_sampling_mask=recv_req.return_sampling_mask,
+                return_flat_raw_top_logprobs=recv_req.return_flat_raw_top_logprobs,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 session_id=recv_req.session_id,
@@ -2325,7 +2386,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if req.return_sampling_mask and self.server_args.sampling_backend == "ascend":
+        if req.return_sampling_mask and get_exec().kernel.sampling_backend == "ascend":
             # The ascend backend samples from logits directly and never builds the
             # top-k/top-p support, so it cannot produce a sampling mask.
             error_msg = (
@@ -2374,7 +2435,7 @@ class Scheduler(
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
-            self.server_args.allow_auto_truncate,
+            get_serving().allow_auto_truncate,
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
@@ -2652,7 +2713,7 @@ class Scheduler(
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
-            self.server_args.allow_auto_truncate,
+            get_serving().allow_auto_truncate,
         )
         if error_msg:
             self._add_request_to_queue(req)
@@ -2864,7 +2925,7 @@ class Scheduler(
         if (
             need_mlp_sync
             and not self.spec_algorithm.is_none()
-            and not self.server_args.speculative_skip_dp_mlp_sync
+            and not get_spec().speculative_skip_dp_mlp_sync
         ):
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
             # Before merging the new batch into running batch:
@@ -2938,7 +2999,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
+        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
@@ -3005,7 +3066,7 @@ class Scheduler(
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
-            prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_max_requests=get_schedule().prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
@@ -3578,7 +3639,7 @@ class Scheduler(
 
     def _maybe_report_active_ranks(self) -> None:
         if not (
-            self.enable_dp_attention and self.server_args.elastic_ep_backend is not None
+            self.enable_dp_attention and get_exec().moe.elastic_ep_backend is not None
         ):
             return
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -3883,7 +3944,7 @@ class Scheduler(
             ok, msg = self.tree_cache.attach_storage_backend(
                 storage_backend=recv_req.hicache_storage_backend,
                 storage_backend_extra_config_json=recv_req.hicache_storage_backend_extra_config_json,
-                served_model_name=self.server_args.served_model_name,
+                served_model_name=get_serving().served_model_name,
                 hicache_storage_prefetch_policy=recv_req.hicache_storage_prefetch_policy,
                 hicache_write_policy=recv_req.hicache_write_policy,
             )
@@ -4003,7 +4064,7 @@ class Scheduler(
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
-        if self.server_args.elastic_ep_backend is not None:
+        if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
             ret["is_scaling_elastic_ep"] = ElasticEPStateManager.is_scaling()
@@ -4402,7 +4463,7 @@ class Scheduler(
 
         old_ep_size = ElasticEPStateManager.get_effective_ep_size()
         new_ep_size = recv_req.new_ep_size
-        max_ep_size = self.server_args.max_ep_size or old_ep_size
+        max_ep_size = get_parallel().max_ep_size or old_ep_size
 
         logger.debug(
             "[Elastic EP][scale] request received: new_ep_size=%d "
@@ -4542,10 +4603,10 @@ class Scheduler(
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
-        if self.server_args.enable_session_radix_cache:
+        if get_memory().enable_session_radix_cache:
             self.tree_cache.release_radix_session(recv_req.session_id)
         if recv_req.session_id in self.session_controller or not (
-            self.server_args.enable_session_radix_cache
+            get_memory().enable_session_radix_cache
         ):
             self.session_controller.close(recv_req)
 
@@ -4724,6 +4785,9 @@ def run_scheduler_process(
         display_dp_rank=display_dp_rank,
         display_moe_ep_rank=display_moe_ep_rank,
     )
+    # Scheduler.__init__ reads the config namespaces before the model
+    # worker's own publish.
+    publish(server_args, role="scheduler")
     parent_process = psutil.Process().parent()
 
     # Set up tracing
