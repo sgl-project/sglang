@@ -86,14 +86,12 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
         processor=None,
         **kwargs,
     ) -> Dict[str, torch.Tensor | List[torch.Tensor]]:
-        del videos
-        processor = processor or self._processor
-        outputs = processor(
-            text=input_text,
+        outputs = super().process_mm_data(
+            input_text,
             images=images,
-            audio=audios,
-            padding=True,
-            return_tensors="pt",
+            videos=None,
+            audios=audios,
+            processor=processor,
             **kwargs,
         )
         result = {"input_ids": outputs["input_ids"]}
@@ -107,7 +105,7 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
     def _normalize_image_outputs(outputs: List[Dict]) -> Dict[str, List[torch.Tensor]]:
         pixel_values = []
 
-        # Hugging Face pads images in a multimodal batch to a common size. Crop each
+        # Apertus1p5 input-processor from transformers pads images in a multimodal batch to a common size. Crop each
         # item to its reported dimensions before encoding it.
         for output in outputs:
             pixel_values.extend(
@@ -122,7 +120,7 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
     def _normalize_audio_outputs(outputs: List[Dict]) -> Dict[str, List[torch.Tensor]]:
         input_features = []
 
-        # Hugging Face pads audio features in a multimodal batch to a common length.
+        # Apertus1p5 input-processor from transformers pads audio features in a multimodal batch to a common length.
         # Trim each item to its attention-mask length before encoding it.
         for output in outputs:
             input_features.extend(
