@@ -59,6 +59,12 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
     SWARebuild,
 )
+from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+    CacheTransferPhase,
+    ComponentType,
+    EvictLayer,
+    TreeComponent,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
     DemoteResult,
@@ -66,12 +72,6 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DropSubtreeNoHostResult,
     EvictDeviceLeafResult,
     EvictDeviceNextNodeResult,
-)
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
-    CacheTransferPhase,
-    ComponentType,
-    EvictLayer,
-    TreeComponent,
 )
 from sglang.srt.mem_cache.unified_radix_cache import (
     COMPONENT_REGISTRY,
@@ -5363,8 +5363,8 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         first, second = torch.tensor([4, 5]), torch.tensor([6])
         action = FreeDeviceKV([first, second])
         UnifiedRadixCache._apply_cache_action(cache, action)
-        cache.token_to_kv_pool_allocator.free.assert_has_calls(
-            [mock.call(first), mock.call(second)]
+        cache.token_to_kv_pool_allocator.free_segment.assert_has_calls(
+            [mock.call(first, start_pos=0), mock.call(second, start_pos=0)]
         )
 
     def test_apply_cache_action_routes_free_component_device_kv(self):

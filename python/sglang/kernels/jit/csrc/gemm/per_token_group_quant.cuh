@@ -305,7 +305,7 @@ struct QuantTrait {
     } else {
       // fp32 scale: multiply in fp32 (hmul2 brings too much precision loss)
       scale_inv = raw_scale;
-      const float quant_scale = kMaxValue * __frcp_rn(amax);
+      const float quant_scale = kMaxValue / amax;
       const float2 quant_scale2 = {quant_scale, quant_scale};
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
@@ -408,11 +408,22 @@ QuantHostContext<Trait> build_quant_context( //
     TensorMatcher({E, N, -1}).with_strides({-1, -1, 1}).with_dtype<T>().with_device(device).verify(input);
     TensorMatcher({E, N, H}).with_strides({-1, -1, 1}).with_dtype<Q>().with_device(device).verify(output_q);
     TensorMatcher({E, N, G}).with_strides({-1, -1, -1}).with_dtype<S>().with_device(device).verify(output_s);
+    CHECK_HOST((input.stride(0) * sizeof(T)) % 32 == 0)
+        << "input expert stride must keep rows 32B-aligned for the vectorized loads";
   } else {
     TensorMatcher({N, -1}).with_strides({-1, 1}).with_dtype<T>().with_device(device).verify(input);
     TensorMatcher({N, H}).with_strides({-1, 1}).with_dtype<Q>().with_device(device).verify(output_q);
     TensorMatcher({N, G}).with_strides({-1, -1}).with_dtype<S>().with_device(device).verify(output_s);
   }
+  // The 32B/lane vectorized loads need every input row to start 32B-aligned
+  // (kMaxVecBytes on Blackwell; over-strict but harmless on Hopper, whose
+  // 16B vectors only need 16). Contiguous allocations always satisfy this; it
+  // only bites hand-made row-strided views, which must keep rows aligned --
+  // rejected loudly here rather than densified silently at the call site.
+  CHECK_HOST(reinterpret_cast<uintptr_t>(input.data_ptr()) % 32 == 0)
+      << "input base pointer must be 32B-aligned for the vectorized loads";
+  CHECK_HOST((input.stride(-2) * sizeof(T)) % 32 == 0)
+      << "input token stride must keep rows 32B-aligned for the vectorized loads";
 
   const uint32_t num_tokens = N.unwrap();
   const uint32_t hidden_size = H.unwrap();

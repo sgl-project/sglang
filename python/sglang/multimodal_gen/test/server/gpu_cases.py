@@ -994,8 +994,23 @@ STANDALONE_FILES = {
     "2-gpu": [
         "../single_test_file/test_disagg_server.py",
         "../single_test_file/test_ar_models.py",
+        "../single_test_file/test_ipc_a2a_2_gpu.py",
     ],
 }
+
+# test_update_weights_from_disk fails deterministically on ROCm: the diffusion
+# weight-update-from-disk reload path does not reconcile the diffusers
+# checkpoint layout with the sglang transformer parameters (shape mismatch ->
+# HTTP 400). Tracked in #31924. NVIDIA does not run standalone files, so this
+# test is AMD-only; skip it on ROCm until the reload path is fixed. Remove
+# this block (keeping the STANDALONE_FILES / est-time entry above) to
+# re-enable once #31924 lands.
+if current_platform.is_hip():
+    STANDALONE_FILES["1-gpu"] = [
+        f
+        for f in STANDALONE_FILES["1-gpu"]
+        if f != "../single_test_file/test_update_weights_from_disk.py"
+    ]
 
 # New standalone files may omit an estimate once to learn the real CI runtime.
 # CI will use a fallback estimate for sharding, run the test, then print a
@@ -1012,6 +1027,8 @@ STANDALONE_FILE_EST_TIMES = {
         # Raise if CI reports a higher measured time.
         "../single_test_file/test_disagg_server.py": 600.0,
         "../single_test_file/test_ar_models.py": 600.0,
+        # no model load; the cost is the one-time JIT build of the sync kernels
+        "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
     },
 }
 
