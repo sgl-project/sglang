@@ -21,12 +21,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -354,7 +354,7 @@ def _forward_with_allreduce_fusion_quant_per_group(
     return (bf16_out, fp8_out, scale_out), residual_out
 
 
-class RMSNorm(MultiPlatformOp):
+class RMSNorm(BaseFusedOp):
     def __init__(
         self,
         hidden_size: int,
@@ -770,7 +770,7 @@ class RMSNorm(MultiPlatformOp):
         )
 
 
-class LayerNorm(MultiPlatformOp):
+class LayerNorm(BaseFusedOp):
     def __init__(
         self,
         hidden_size: int,
@@ -854,7 +854,7 @@ class LayerNorm(MultiPlatformOp):
             return self.forward_native(x)
 
 
-class GemmaRMSNorm(MultiPlatformOp):
+class GemmaRMSNorm(BaseFusedOp):
     def __init__(
         self,
         hidden_size: int,
@@ -1051,7 +1051,7 @@ class GemmaRMSNorm(MultiPlatformOp):
         )
 
 
-class Gemma3RMSNorm(MultiPlatformOp):
+class Gemma3RMSNorm(BaseFusedOp):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -1105,7 +1105,7 @@ class Gemma3RMSNorm(MultiPlatformOp):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-class Gemma4RMSNorm(MultiPlatformOp):
+class Gemma4RMSNorm(BaseFusedOp):
     def __init__(
         self,
         dim: int,
@@ -1183,7 +1183,7 @@ class Gemma4RMSNorm(MultiPlatformOp):
         return self.forward_native(x)
 
 
-class RMSNormWithoutScale(MultiPlatformOp):
+class RMSNormWithoutScale(BaseFusedOp):
     def __init__(self, hidden_size: int, eps=1e-6):
         super().__init__()
         self.hidden_size = hidden_size
