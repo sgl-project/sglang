@@ -526,8 +526,15 @@ class _MooncakeShrinkEndToEndBase(CustomTestCase):
         *,
         expected_ep_size: int,
         expected_phase: str,
-        timeout_s: float = 300.0,
+        timeout_s: float = 600.0,
     ) -> None:
+        # Bumped from 300s to 600s to accommodate slow joiner-subprocess
+        # cold-start on scale-up-v1 paths (MC02B / MC14 Half 3). The joiner
+        # loads FP8 model weights + torch.dist inits + Mooncake handshake
+        # from a cold Python interpreter; on busy nodes this occasionally
+        # exceeds 300s. Matches the primary-side admission deadline
+        # (`server_args.elastic_ep_scale_timeout=600` default) so the
+        # harness never fails before the primary would time out.
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             resp = requests.get(
@@ -1100,7 +1107,13 @@ class _MooncakeGrowFromShrunkBase(CustomTestCase):
         # elastic_ep`` interleaved with a cheap ``/generate`` ping to
         # keep the busy path ticking. Symmetric with the shrink-side
         # ``_MooncakeShrinkEndToEndBase._poll_until_serving``.
-        deadline = time.time() + 300.0
+        #
+        # 600s harness deadline matches the primary-side
+        # ``server_args.elastic_ep_scale_timeout`` default and gives the
+        # joiner subprocess enough budget for FP8 weight-load +
+        # torch.dist init + Mooncake handshake from a cold interpreter
+        # (~300s is not enough on busy nodes).
+        deadline = time.time() + 600.0
         while time.time() < deadline:
             resp = requests.get(
                 f"{self.base_url}/is_scaling_elastic_ep", timeout=60
