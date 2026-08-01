@@ -42,12 +42,14 @@ try:
     from .fuse_k4_only_persistent import BYTES_PER_TENSORMAP as _K4P_BTM
     from .fuse_k4_only_persistent import NUM_TENSORMAPS as _K4P_NTM
     from .fuse_k4_only_persistent import make_host_fn as _k4p_make_host
+    from .fuse_kernel123_persistent import CHUNKS_PER_BLOCK as _K123_CHUNKS_PER_BLOCK
     from .fuse_kernel123_persistent import make_host_function as _fused_make_host
 except ImportError:
     from Akk_inverse_lower_triangle_bf16 import akk_inv_host as _akk_inv_host
     from fuse_k4_only_persistent import BYTES_PER_TENSORMAP as _K4P_BTM
     from fuse_k4_only_persistent import NUM_TENSORMAPS as _K4P_NTM
     from fuse_k4_only_persistent import make_host_fn as _k4p_make_host
+    from fuse_kernel123_persistent import CHUNKS_PER_BLOCK as _K123_CHUNKS_PER_BLOCK
     from fuse_kernel123_persistent import make_host_function as _fused_make_host
 
 
@@ -277,7 +279,7 @@ def get_timings():
 # Also caches cute.Tensor wrappers (saves ~7us each call from from_dlpack).
 _buf_cache = {}
 
-# Padded-input scratch cache for the eqlen partial-chunk path. Keyed by
+# Padded-input scratch cache for the eqlen scheduler-alignment path. Keyed by
 # (B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta, device, real_T).
 # real_T is part of the key so the g sentinel tail [real_T:T_padded] = -1e3
 # is set once and reused across calls with the same shape.
@@ -905,26 +907,24 @@ def chunk_kda_fwd(
     device = q.device
     BT = 64
 
-    # Phase 1: handle eqlen with T % 64 != 0 entirely on the eqlen path —
-    # never borrow varlen's mask code. Pad inputs to a CHUNKS_PER_BLOCK*BT
-    # = 256 multiple so the persistent scheduler's `cgs_per_head = NT // 4`
-    # divides cleanly and every chunk has 64 valid rows of (zero-padded /
-    # sentinel-padded) data. K123 eqlen kernel runs unchanged — it doesn't
-    # know partial chunks exist, the boundary is handled at the data
-    # boundary (K4's bounded-TMA principle, just expressed via host pad
-    # since K123 stores via autovec_copy not TMA).
+    # Phase 1: the eqlen persistent scheduler assigns CHUNKS_PER_BLOCK chunks
+    # to each workgroup, so pad T to that scheduling unit even when T is
+    # already a 64-row chunk multiple. This prevents zero-workgroup launches
+    # for short inputs and avoids silently dropping a trailing chunk group.
+    # K123 eqlen runs unchanged and sees only full 64-row chunks; zero/sentinel
+    # padding handles the caller's boundary at the data level.
     #
     # Varlen with non-aligned seq lengths is a separate problem (Phase 2):
     # multi-seq varlen can't be host-padded without repacking memory.
     real_T = T
-    needs_eqlen_pad = (not is_varlen) and (T % BT != 0)
+    CPB_BT = _K123_CHUNKS_PER_BLOCK * BT
+    needs_eqlen_pad = (not is_varlen) and (T % CPB_BT != 0)
     if needs_eqlen_pad:
-        if B != 1:
+        if B != 1 and T % BT != 0:
             raise NotImplementedError(
                 f"eqlen with B>1 and T % {BT} != 0 not supported "
                 f"(got B={B}, T={T})."
             )
-        CPB_BT = 4 * BT  # CHUNKS_PER_BLOCK * BT, the cgs_per_head divisibility unit
         T_padded = ((T + CPB_BT - 1) // CPB_BT) * CPB_BT
         # Pre-allocated padded scratch buffers (per (B,T_padded,H,K,dtype) cache
         # key). torch.cat would reallocate + copy the full 200MB q tensor every
