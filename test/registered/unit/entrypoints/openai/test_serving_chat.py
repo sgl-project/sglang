@@ -661,7 +661,7 @@ class ServingChatTestCase(unittest.TestCase):
                 parser.get_structure_constraint.call_args.kwargs["thinking_mode"]
             )
 
-    def test_kimi_k3_tool_call_stops_at_tools_close(self):
+    def test_kimi_k3_constraint_failure_keeps_native_stop_format(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
         self.chat.chat_encoding_spec = "kimi_k3"
@@ -695,7 +695,7 @@ class ServingChatTestCase(unittest.TestCase):
             ):
                 parser = parser_cls.return_value
                 parser.detector.eot_token = TOOLS_CLOSE
-                parser.detector.parses_required_natively.return_value = True
+                parser.detector.parses_required_natively.return_value = False
                 parser.get_structure_constraint.return_value = None
                 request = ChatCompletionRequest(
                     model="x",
