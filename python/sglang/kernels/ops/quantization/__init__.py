@@ -172,7 +172,6 @@ _TRITON_KERNELS = [
     ("fp8_kernel", "sglang_per_token_quant_fp8"),
     ("fp8_kernel", "static_quant_fp8"),
     ("fp8_kernel", "w8a8_block_fp8_matmul"),
-    ("fp8_kernel", "mxfp8_block_scaled_matmul_triton"),
     ("fp8_kernel", "per_tensor_quant_mla_fp8"),
     ("fp8_kernel", "per_token_group_quant_mla_deep_gemm_masked_fp8"),
     ("fp8_kernel", "per_token_group_quant_fp8_hopper_moe_mn_major"),
