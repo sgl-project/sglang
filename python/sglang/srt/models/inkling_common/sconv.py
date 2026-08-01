@@ -7,7 +7,6 @@ import triton.language as tl
 from einops import rearrange
 from torch.nn.parameter import Parameter
 
-from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.inkling_common.kernels.sconv import (
@@ -123,16 +122,20 @@ class ShortConvolution(nn.Module):
         param_data.copy_(loaded_weight)
 
     def _conv_state(self, forward_batch: ForwardBatch):
-        """This layer's conv-state handle for the current step.
-
-        ``InklingShortConvAttnBackend`` resolved the whole step-global metadata set
-        once during metadata prep, so this is a pure read shared by every conv
-        module in the step.
-        """
+        """The step's conv-state metadata, resolved once by the attention backend."""
         return get_attn_backend().conv_state_metadata(self.layer_id, forward_batch)
 
-    def _sconv_cache(self, meta) -> torch.Tensor:
-        return meta.layer_cache.conv[self.sconv_type.value]
+    def _sconv_cache(self) -> torch.Tensor:
+        """This module's own conv-state stream for this layer."""
+        return get_attn_backend().sconv_state(
+            layer_id=self.layer_id, stream=self.sconv_type.value
+        )
+
+    def _intermediate_window(self) -> torch.Tensor:
+        """This module's per-draft-token conv windows. TARGET_VERIFY only."""
+        return get_attn_backend().sconv_intermediate_window(
+            layer_id=self.layer_id, stream=self.sconv_type.value
+        )
 
     def _weight_2d(self) -> torch.Tensor:
         return rearrange(self.weight, "d 1 w -> d w")
@@ -187,7 +190,6 @@ class ShortConvolution(nn.Module):
     def _save_intermediate_conv_windows(
         self,
         forward_batch: ForwardBatch,
-        cache: MambaPool.SpeculativeState,
         sconv_cache: torch.Tensor,
         cache_indices: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -204,7 +206,7 @@ class ShortConvolution(nn.Module):
             sconv_cache=sconv_cache,
             hidden_states=hidden_states,
             cache_indices=cache_indices,
-            intermediate_out=cache.intermediate_conv_window[self.sconv_type.value],
+            intermediate_out=self._intermediate_window(),
             batch_size=forward_batch.batch_size,
             draft_token_num=forward_batch.spec_info.draft_token_num,
         )
@@ -275,7 +277,7 @@ class ShortConvolution(nn.Module):
         ``(sconv_cache, cache_indices, cache_mask, weight_2d)``."""
         meta = self._conv_state(forward_batch)
         return (
-            self._sconv_cache(meta),
+            self._sconv_cache(),
             meta.cache_indices,
             meta.precomputed["cache_mask"],
             self._weight_2d(),
@@ -289,11 +291,11 @@ class ShortConvolution(nn.Module):
         meta = self._conv_state(forward_batch)
         b = forward_batch.batch_size
         return (
-            self._sconv_cache(meta),
+            self._sconv_cache(),
             meta.cache_indices[:b],
             meta.has_initial_state,
             self._weight_2d(),
-            meta.layer_cache.intermediate_conv_window[self.sconv_type.value],
+            self._intermediate_window(),
         )
 
     def extend_fused_ar_inputs(self, forward_batch: ForwardBatch):
@@ -322,7 +324,7 @@ class ShortConvolution(nn.Module):
             track_mask = torch.empty((0,), dtype=torch.bool, device=dev)
             track_dst = torch.empty((0,), dtype=torch.int64, device=dev)
         return (
-            self._sconv_cache(meta),
+            self._sconv_cache(),
             precomputed["safe_idx"],
             precomputed["cache_mask"].view(-1),
             precomputed["cu"],
@@ -349,8 +351,7 @@ class ShortConvolution(nn.Module):
         meta = self._conv_state(forward_batch)
         self._save_intermediate_conv_windows(
             forward_batch=forward_batch,
-            cache=meta.layer_cache,
-            sconv_cache=self._sconv_cache(meta),
+            sconv_cache=self._sconv_cache(),
             cache_indices=cache_indices,
             hidden_states=x_scratch,
         )
@@ -375,7 +376,7 @@ class ShortConvolution(nn.Module):
 
         meta = self._conv_state(forward_batch)
         cache_indices = meta.cache_indices
-        sconv_cache = self._sconv_cache(meta)
+        sconv_cache = self._sconv_cache()
         precomputed = meta.precomputed
         weight = self._weight_2d()
 
@@ -391,7 +392,6 @@ class ShortConvolution(nn.Module):
             )
             self._save_intermediate_conv_windows(
                 forward_batch=forward_batch,
-                cache=meta.layer_cache,
                 sconv_cache=sconv_cache,
                 cache_indices=cache_indices,
                 hidden_states=hidden_states,
