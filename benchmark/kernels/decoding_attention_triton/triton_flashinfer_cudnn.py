@@ -7,7 +7,7 @@ import torch.utils.benchmark as benchmark
 from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
 from sglang.kernels.ops.attention.decode_attention import decode_attention_fwd
-from sglang.srt.layers.attention.flashinfer_backend import should_use_tensor_core
+from sglang.kernels.ops.attention.flashinfer_backend import should_use_tensor_core
 
 
 def benchmark_forward(

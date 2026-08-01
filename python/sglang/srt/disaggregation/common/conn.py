@@ -36,7 +36,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -45,6 +45,30 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
+# so we don't open a fresh TCP connection per query (that churns short-lived
+# sockets and can exhaust ephemeral ports under high concurrency). Thread-local
+# because requests.Session is not safe for concurrent cross-thread use.
+_bootstrap_sessions = threading.local()
+
+
+def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
+    sessions = getattr(_bootstrap_sessions, "by_addr", None)
+    if sessions is None:
+        sessions = {}
+        _bootstrap_sessions.by_addr = sessions
+    session = sessions.get(bootstrap_addr)
+    if session is None:
+        # Not evicted: the number of bootstrap_addr is bounded (one per prefill
+        # server). Bootstrap is http-only, so only http:// is mounted.
+        session = requests.Session()
+        session.mount(
+            "http://", requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=1)
+        )
+        sessions[bootstrap_addr] = session
+    return session
 
 
 class KVTransferError(Exception):
@@ -127,6 +151,11 @@ class CommonKVManager(BaseKVManager):
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
+        # Per-sender fan-out of a KV copy onto N decode destinations
+        # (MLA under Prefill-CP + Decode-TP, or decode_tp > prefill_tp).
+        # MLA is resolved lazily at bootstrap (see resolve_kv_replica_factor);
+        # MHA never replicates, so it stays pinned at 1.
+        self._kv_replica_factor: Optional[int] = None if is_mla_backend else 1
         self.is_hybrid_mla_backend = getattr(args, "is_hybrid_mla_backend", False)
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
@@ -262,6 +291,30 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def get_kv_replica_factor(self) -> int:
+        if self._kv_replica_factor is None:
+            logger.warning_once(
+                "get_kv_replica_factor called before resolve_kv_replica_factor; "
+                "assuming 1, but the metrics may be inaccurate."
+            )
+            return 1
+        return self._kv_replica_factor
+
+    def resolve_kv_replica_factor(self, transfer_infos: Dict) -> None:
+        if not self.is_mla_backend:
+            # Only MLA replicates its KV across decode ranks; non-MLA head slices are
+            # disjoint and stay pinned at the factor of 1 set in __init__.
+            return
+
+        info = next(iter(transfer_infos.values()), None)
+        if info is None or info.required_dst_info_num is None:
+            logger.warning_once(
+                "resolve_kv_replica_factor: no decode destinations available; "
+                "KV transfer metrics may be inaccurate."
+            )
+            return
+        self._kv_replica_factor = info.required_dst_info_num
 
     def _ensure_prefill_recompute_executor(
         self,
@@ -440,11 +493,11 @@ class CommonKVManager(BaseKVManager):
 
         if (
             info.kv_cache_dtype is not None
-            and info.kv_cache_dtype != self.server_args.kv_cache_dtype
+            and info.kv_cache_dtype != get_model().kv_cache_dtype
         ):
             raise RuntimeError(
                 f"KV cache dtype mismatch: prefill server has kv_cache_dtype={info.kv_cache_dtype}, "
-                f"but decode server has kv_cache_dtype={self.server_args.kv_cache_dtype}. "
+                f"but decode server has kv_cache_dtype={get_model().kv_cache_dtype}. "
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
@@ -597,7 +650,7 @@ class CommonKVManager(BaseKVManager):
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
-            "kv_cache_dtype": self.server_args.kv_cache_dtype,
+            "kv_cache_dtype": get_model().kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
             "enable_dsa_cache_layer_split": getattr(
                 self.server_args, "enable_dsa_cache_layer_split", False
@@ -879,9 +932,6 @@ class CommonKVManager(BaseKVManager):
                             self.heartbeat_failures[bootstrap_addr] = (
                                 self.heartbeat_failures.get(bootstrap_addr, 0) + 1
                             )
-                            with self.session_pool_lock:
-                                if bootstrap_addr in self.session_pool:
-                                    del self.session_pool[bootstrap_addr]
                     except Exception:
                         logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
                         self.heartbeat_failures[bootstrap_addr] = (
@@ -1033,6 +1083,8 @@ class CommonKVSender(BaseKVSender):
         total_bytes += (
             self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
         )
+        # Pinned to 1 for MHA (disjoint slices); only MLA replication makes it > 1.
+        total_bytes *= self.kv_mgr.get_kv_replica_factor()
         self._transfer_metric.transfer_total_bytes = total_bytes
         return self._transfer_metric
 
@@ -1232,10 +1284,13 @@ class CommonKVReceiver(BaseKVReceiver):
                             return
 
                 self.bootstrap_infos = bootstrap_infos
-                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
 
-                # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
-                self._register_kv_args()
+                # Register kv_args only once to prefill KVManager according to the info fetched
+                # from the bootstrap server. Do this before caching in connection_pool so a failed
+                # registration does not leave a stale entry that later requests would reuse.
+                if not self._register_kv_args():
+                    return
+                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
             else:
                 self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
@@ -1250,7 +1305,7 @@ class CommonKVReceiver(BaseKVReceiver):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
             url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
-            response = requests.get(url, timeout=5)
+            response = _get_bootstrap_session(self.bootstrap_addr).get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
                 return bootstrap_info
@@ -1270,7 +1325,7 @@ class CommonKVReceiver(BaseKVReceiver):
         """Batch query prefill dp_ranks for given bootstrap_rooms."""
         try:
             url = f"http://{bootstrap_addr}/query_dp_ranks"
-            response = requests.post(
+            response = _get_bootstrap_session(bootstrap_addr).post(
                 url,
                 json={"bootstrap_rooms": bootstrap_rooms},
                 timeout=5,
@@ -1293,8 +1348,12 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock = cls._ctx.socket(zmq.PUSH)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
-                sock.setsockopt(zmq.RECONNECT_IVL, -1)
                 sock.setsockopt(zmq.LINGER, 0)
+                # Bound send so a dead peer cannot block the scheduler forever.
+                sock.setsockopt(
+                    zmq.SNDTIMEO,
+                    envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT.get() * 1000,
+                )
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
@@ -1321,8 +1380,8 @@ class CommonKVReceiver(BaseKVReceiver):
         sock, lock = cls._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
         return sock, lock
 
-    def _register_kv_args(self):
-        pass
+    def _register_kv_args(self) -> bool:
+        return True
 
     def send_metadata(
         self,

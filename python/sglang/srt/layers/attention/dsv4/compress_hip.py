@@ -6,24 +6,22 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
-import triton
-import triton.language as tl
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
-from sglang.srt.layers.attention.dsv4.compressor import Compressor as _CompressorBase
-from sglang.srt.layers.attention.dsv4.fused_compress_triton import (
-    fused_ape_pool_norm_rope,
-)
-from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
-from sglang.srt.layers.deepseek_v4_rope import (
+from sglang.kernels.ops.attention.deepseek_v4_rope import (
     apply_rotary_emb_triton,
     fused_norm_rope_inplace_triton,
     fused_softmax_pool_triton,
 )
+from sglang.kernels.ops.attention.dsv4.fused_compress_triton import (
+    fused_ape_pool_norm_rope,
+)
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
+from sglang.srt.layers.attention.dsv4.compressor import Compressor as _CompressorBase
+from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 
 try:
-    from sglang.srt.layers.deepseek_v4_rope import fused_softmax_pool_triton
+    from sglang.kernels.ops.attention.deepseek_v4_rope import fused_softmax_pool_triton
 except ImportError:
     fused_softmax_pool_triton = None
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
@@ -39,49 +37,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-
-@triton.jit
-def _rms_normalize_kernel(
-    x_ptr,
-    weight_ptr,
-    eps,
-    stride_row,
-    dim,
-    BLOCK_SIZE: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = offs < dim
-    base = pid * stride_row
-    x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-    mean_sq = tl.sum(x * x, axis=0) / dim
-    rms_inv = tl.rsqrt(mean_sq + eps)
-    out = x * rms_inv
-    if HAS_WEIGHT:
-        weight = tl.load(weight_ptr + offs, mask=mask, other=0.0)
-        out = out * weight
-    tl.store(x_ptr + base + offs, out, mask=mask)
-
-
-def rms_normalize_triton(
-    x: torch.Tensor, eps: float, weight: torch.Tensor = None
-) -> torch.Tensor:
-    dim = x.shape[-1]
-    x_flat = x.view(-1, dim)
-    num_rows = x_flat.shape[0]
-    BLOCK_SIZE = triton.next_power_of_2(dim)
-    grid = (num_rows,)
-    _rms_normalize_kernel[grid](
-        x_flat,
-        weight,
-        eps,
-        x_flat.stride(0),
-        dim,
-        BLOCK_SIZE=BLOCK_SIZE,
-        HAS_WEIGHT=(weight is not None),
-    )
-    return x
+from sglang.kernels.ops.attention.dsv4.rms_normalize_hip import rms_normalize_triton
 
 
 class DeepseekRefRMSNorm(nn.Module):

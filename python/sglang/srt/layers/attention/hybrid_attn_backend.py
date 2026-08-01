@@ -30,6 +30,12 @@ class HybridAttnBackend(AttentionBackend):
         self.spec_attn_is_prefill = (
             model_runner.server_args.speculative_attention_mode == "prefill"
         )
+        # decide_needs_cpu_seq_lens ORs this flag across backends; without the
+        # delegation the base-class default (True) forces a per-step seq_lens
+        # D2H + host sync even when both sub-backends opted out.
+        self.needs_cpu_seq_lens = (
+            prefill_backend.needs_cpu_seq_lens or decode_backend.needs_cpu_seq_lens
+        )
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
@@ -56,6 +62,20 @@ class HybridAttnBackend(AttentionBackend):
             )
         else:
             return self.prefill_backend
+
+    @property
+    def supports_full_cuda_graph_chunked_prefix(self) -> bool:
+        return self.prefill_backend.supports_full_cuda_graph_chunked_prefix
+
+    def prepare_full_cuda_graph_chunked_prefix(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        in_capture: bool,
+    ) -> None:
+        self.prefill_backend.prepare_full_cuda_graph_chunked_prefix(
+            forward_batch, in_capture=in_capture
+        )
 
     def init_forward_metadata_out_graph(
         self,
@@ -85,6 +105,11 @@ class HybridAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
+
+    def target_verify_reads_custom_mask(self) -> bool:
+        return self._select_backend(
+            ForwardMode.TARGET_VERIFY
+        ).target_verify_reads_custom_mask()
 
     def forward(
         self,
