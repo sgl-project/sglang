@@ -179,7 +179,8 @@ def _release_overallocated_kv_indices(
     req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
 ) -> None:
     global_server_args = get_server_args()
-    page_size = global_server_args.page_size
+    allocator = tree_cache.token_to_kv_pool_allocator
+    page_size = allocator.page_size
     spec_algo = global_server_args.speculative_algorithm
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
@@ -196,11 +197,9 @@ def _release_overallocated_kv_indices(
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
-        # start_p is ceil-aligned above: never shares a page with
-        # cache_finished_req's tail frees in the same group.
-        tree_cache.token_to_kv_pool_allocator.free_segment(
-            indices_to_free, start_pos=start_p
-        )
+        # start_p is aligned to the allocator's physical page size above, so it
+        # never shares a page with cache_finished_req's tail free in this group.
+        allocator.free_segment(indices_to_free, start_pos=start_p)
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
