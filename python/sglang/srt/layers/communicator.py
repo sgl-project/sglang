@@ -112,20 +112,23 @@ def _try_fused_allreduce_rmsnorm_quant(
     residual: torch.Tensor,
     layernorm: torch.nn.Module,
     quant_format: str,
-    emit_bf16: bool = True,
+    emit_bf16: bool = False,
+    fuse_quant: bool = False,
 ):
     """Try an AITER fused AR+RMSNorm+quant epilogue.
 
-    Returns None when unsupported so callers can use the existing
-    forward_with_allreduce_fusion fallback. New quant formats should plug in here
-    instead of adding branches inside LayerCommunicator.prepare_attn.
+    Returns None when unsupported, so callers fall back to
+    forward_with_allreduce_fusion. New quant formats plug in here rather than as
+    branches inside LayerCommunicator.prepare_attn.
 
-    When ``emit_bf16=True`` the returned hidden_states is a 3-tuple
-    ``(bf16, fp4, scale)`` so downstream consumers (e.g. DSA indexer, Qwen3.5
-    GDN ``in_proj_ba``) can read the unquantized bf16 without a separate
-    dequant. When ``emit_bf16=False`` the hidden_states is a 2-tuple
-    ``(fp4, scale)`` ready for the next MXFP4 GEMM.
+    ``fuse_quant`` is opt-in per model: enable it only once the model's consumers
+    can ingest the quantized tuple. hidden_states comes back as
+    ``(quant, scale)``, or ``(bf16, quant, scale)`` under ``emit_bf16`` for
+    consumers that also need the unquantized bf16 (Qwen3.5 GDN ``in_proj_ba``).
     """
+    if not fuse_quant:
+        return None
+
     if not (_use_aiter and _is_gfx95_supported):
         return None
 
@@ -610,7 +613,8 @@ class LayerCommunicator:
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_format: str = "",
-        emit_bf16: bool = True,
+        emit_bf16: bool = False,
+        fuse_quant: bool = False,
     ):
         hidden_states, residual = self.prepare_attn(
             hidden_states,
@@ -619,6 +623,7 @@ class LayerCommunicator:
             quant_format=quant_format,
             post_residual_addition=post_residual_addition,
             emit_bf16=emit_bf16,
+            fuse_quant=fuse_quant,
         )
         if captured_last_layer_outputs is not None:
             gathered_last_layer_output = self._communicate_simple_fn(
@@ -666,7 +671,8 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
-        emit_bf16: bool = True,
+        emit_bf16: bool = False,
+        fuse_quant: bool = False,
     ):
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
@@ -691,6 +697,7 @@ class LayerCommunicator:
                         self.input_layernorm,
                         quant_format,
                         emit_bf16=emit_bf16,
+                        fuse_quant=fuse_quant,
                     )
                     # Else per-group FP8 fused path (opt-in via
                     # enable_fused_ar_quant, #24651). Needs a positive per-group

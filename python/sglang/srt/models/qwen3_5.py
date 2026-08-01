@@ -860,6 +860,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 ),
                 quant_format=self._fused_ar_quant_format,
                 emit_bf16=self._emit_bf16_for_ba,
+                fuse_quant=True,
             )
         )
 
@@ -1268,6 +1269,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 captured_last_layer_outputs=captured_last_layer_outputs,
                 quant_format=self._fused_ar_quant_format,
                 emit_bf16=False,
+                fuse_quant=True,
             )
         )
 
