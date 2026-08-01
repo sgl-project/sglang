@@ -276,10 +276,45 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "flashmla_sparse_q8",
     "flashmla_kv",
     "flashinfer_sparse_mla",
+    "triton_sparse_mla",
     "fa3",
     "tilelang",
     "trtllm",
 ]
+
+
+def _validate_triton_sparse_mla_backend(
+    *,
+    device_sm_major: int,
+    num_q_heads: int,
+    union: int,
+) -> None:
+    """Capability check for ``--dsa-prefill-backend triton_sparse_mla``.
+
+    The kernel is CUDA-only (it uses Triton ``tl.dot`` on bf16 with an
+    architecture-tuned tile table for SM90/SM120). It has no head-count
+    requirement — the head dim is padded into a 16-row mma tile, not into the
+    grid — so the only hard constraints are the device family and the union
+    group size dividing the query-token count at call time.
+    """
+    if _is_hip:
+        raise ValueError(
+            "triton_sparse_mla is a CUDA prefill backend; on ROCm use the "
+            "existing tilelang / aiter DSA paths."
+        )
+    if device_sm_major < 9:
+        raise ValueError(
+            "triton_sparse_mla requires SM90 (Hopper) or newer; "
+            f"got sm_major={device_sm_major}."
+        )
+    if union not in (0, 2, 4):
+        raise ValueError(f"--dsa-triton-union must be 0, 2 or 4; got {union}.")
+    if union and num_q_heads * union > 32:
+        raise ValueError(
+            f"--dsa-triton-union {union} needs num_q_heads * union <= 32 "
+            f"(the union mma tile); got num_q_heads={num_q_heads}. "
+            "Lower the union group size or disable it."
+        )
 
 
 class DeepseekSparseAttnBackend(
@@ -333,6 +368,11 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.dsa_prefill_backend
         )
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
+        # Opt-in exact fast paths for the Triton sparse-MLA prefill kernel.
+        self.dsa_triton_union: int = model_runner.server_args.dsa_triton_union
+        self.dsa_triton_dense_prefix: bool = (
+            model_runner.server_args.dsa_triton_dense_prefix
+        )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
@@ -418,6 +458,13 @@ class DeepseekSparseAttnBackend(
                     "--dsa-prefill-backend flashmla_sparse_q8 is SM90-only; got compute "
                     f"capability sm_{self.device_sm_major}x."
                 )
+
+        if self.dsa_prefill_impl == "triton_sparse_mla":
+            _validate_triton_sparse_mla_backend(
+                device_sm_major=self.device_sm_major,
+                num_q_heads=self.num_q_heads,
+                union=self.dsa_triton_union,
+            )
 
         # `flashmla_sparse_q8` is prefill-only (FP8 decode goes through
         # `flashmla_kv`); reject it as a decode backend, since argparse accepts it
@@ -2123,6 +2170,31 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
                 topk_length=metadata.dsa_cache_seqlens_int32,
             )
+        elif dsa_impl == "triton_sparse_mla":
+            # Fused per-token Triton sparse-MLA prefill (CUDA SM90/SM120).
+            # Same input prep as flashmla_sparse: concatenated q, dequantized
+            # bf16 KV, and the top-k list used directly as the slot table.
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if topk_transform_method == TopkTransformMethod.RAGGED:
+                if any(forward_batch.extend_prefix_lens_cpu):
+                    page_table_1_flattened = (
+                        self.forward_metadata.page_table_1_flattened
+                    )
+                    assert page_table_1_flattened is not None
+                    kv_cache = dequantize_k_cache_paged(
+                        kv_cache, page_table_1_flattened
+                    )
+                else:
+                    kv_cache = _cat([k, k_rope], dim=-1)
+                page_table_1 = topk_indices
+            return self._forward_triton_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2760,6 +2832,42 @@ class DeepseekSparseAttnBackend(
             o = o[:, :num_heads, :]
         return o
 
+    def _forward_triton_sparse_mla(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        """Fused Triton sparse-MLA prefill.
+
+        Unlike ``flashmla_sparse`` this kernel does not pad the head dim to 64 /
+        128; it pads into a 16-row mma tile instead, so the ``num_heads`` the
+        model actually has after TP is the work it does.
+        """
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+            sparse_mla_prefill,
+        )
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        # The union path sizes its scratch from the observed index range, which
+        # costs one device-to-host read per call and cannot be graph-captured.
+        # Fall back to the per-token path under capture: same result, no sync.
+        union = 0 if get_is_capture_mode() else self.dsa_triton_union
+
+        return sparse_mla_prefill(
+            q_all,
+            kv_cache,
+            page_table_1,
+            sm_scale,
+            v_head_dim,
+            union=union,
+            dense=self.dsa_triton_dense_prefix,
+        )
+
     def _forward_flashinfer_sparse_mla(
         self,
         q_all: torch.Tensor,
@@ -3367,8 +3475,11 @@ class DeepseekSparseAttnBackend(
             # flashmla_sparse_q8 shares flashmla_sparse's RAGGED prefill routing — the q8
             # dispatch lives inside the RAGGED branch of forward_extend; without this the
             # transform is PAGED, the q8 path is skipped, and the bf16 kernel crashes on
-            # fp8 KV ("kv must have dtype kBFloat16").
-            and self.dsa_prefill_impl in ("flashmla_sparse", "flashmla_sparse_q8")
+            # fp8 KV ("kv must have dtype kBFloat16"). triton_sparse_mla is listed for
+            # the same reason: its dispatch also dequantizes inside the RAGGED branch
+            # and its kernel is bf16-only.
+            and self.dsa_prefill_impl
+            in ("flashmla_sparse", "flashmla_sparse_q8", "triton_sparse_mla")
             and forward_mode == ForwardMode.EXTEND
         ):
             topk_transform_method = TopkTransformMethod.RAGGED

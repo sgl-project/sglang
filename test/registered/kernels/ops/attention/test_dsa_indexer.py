@@ -259,6 +259,8 @@ class MockModelRunner:
                 "dsa_prefill_backend": "flashmla_sparse",
                 "dsa_decode_backend": "fa3",
                 "dsa_topk_backend": "sgl-kernel",
+                "dsa_triton_union": 0,
+                "dsa_triton_dense_prefix": False,
                 "dsa_paged_mqa_logits_backend": "auto",
                 "disaggregation_mode": "null",
                 "enable_two_batch_overlap": False,
