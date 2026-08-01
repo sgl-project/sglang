@@ -370,6 +370,14 @@ class DSparkDraftMixin:
                 "DSpark draft requires markov_rank > 0, "
                 f"got markov_rank={dspark_config.markov_rank}."
             )
+        # speculators-trained checkpoints (dspark_config.speculators_convention)
+        # use a `gamma + 1`-wide draft block with the anchor as a separate
+        # bonus token, rather than DeepSpec's `gamma`-wide anchor-first block.
+        # That width difference is handled downstream in dspark_draft.py's
+        # DraftBlockProposer/DsparkDraftSampler (see `bonus_anchor` there),
+        # not in this model class -- run_markov_block itself is unaffected
+        # either way, since the caller always hands it exactly `gamma` real
+        # draft-hidden slots regardless of which convention produced them.
         self.gamma = int(dspark_config.resolve_gamma(default=self.block_size))
         self.markov_head = build_markov_head(config)
         self.confidence_head = build_confidence_head(config)
