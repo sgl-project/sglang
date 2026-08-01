@@ -1127,9 +1127,7 @@ class DeepseekMLAForwardMixin:
                 if self.o_proj.weight.dtype == torch.uint8:
                     attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
                 elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
-                    _emit_bpre = (
-                        _use_aiter_bpreshuffle_gfx95 and _bmm_buf.shape[0] >= 2
-                    )
+                    _emit_bpre = _use_aiter_bpreshuffle_gfx95 and _bmm_buf.shape[0] >= 2
                     attn_bmm_output = fused_flatten_fp8_group_quant(
                         _bmm_buf,
                         group_size=128,

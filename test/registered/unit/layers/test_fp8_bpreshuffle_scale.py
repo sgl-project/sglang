@@ -3,6 +3,8 @@ import unittest
 import torch
 
 from sglang.srt.layers.quantization.fp8_utils import (
+    bpreshuffle_fp8_scale_nocopy,
+    bpreshuffle_fp8_scale_nocopy_tuple,
     materialize_bpreshuffle_fp8_scale,
     materialize_bpreshuffle_fp8_scale_tuple,
 )
@@ -10,6 +12,19 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def _simulate_transpose_scale_emit(values: torch.Tensor) -> torch.Tensor:
+    """Model the tensor a quant kernel returns when called with
+    ``transpose_scale=True``: the per-group scale is written directly in
+    column-major (``[num_groups, tokens]``) byte order, exposed as a ``[M, G]``
+    tensor. We reproduce that by laying the column-major bytes into contiguous
+    storage and reinterpreting it as ``[M, G]`` -- the logical row-major view is
+    scrambled, but the *storage* holds exactly the bytes the no-copy stride
+    reinterpret is meant to recover."""
+    m, g = values.shape
+    colmajor_bytes = values.t().contiguous()  # [G, M], storage == col-major of values
+    return colmajor_bytes.view(m, g)  # [M, G] over the same (unchanged) storage
 
 
 class TestBpreshuffleScaleMaterialization(CustomTestCase):
@@ -45,6 +60,66 @@ class TestBpreshuffleScaleMaterialization(CustomTestCase):
         self.assertIs(bf16_out, bf16_side)
         self.assertTrue(torch.equal(scale_out, scale))
         self.assertEqual(scale_out.stride(), (1, scale.shape[0]))
+
+
+class TestBpreshuffleScaleNoCopy(CustomTestCase):
+    """The producer sites emit the scale with ``transpose_scale=True`` and then
+    reinterpret its strides instead of relaying it out with a copy. These pin the
+    contract that the zero-copy reinterpret is bit-identical to the materialize
+    (``.t().contiguous().t()``) path while sharing the producer's storage."""
+
+    def test_nocopy_matches_materialized_layout(self):
+        for m, g in ((3, 4), (2, 2), (8, 5), (16, 128)):
+            with self.subTest(m=m, g=g):
+                values = torch.arange(m * g, dtype=torch.float32).reshape(m, g)
+                emitted = _simulate_transpose_scale_emit(values)
+
+                nocopy = bpreshuffle_fp8_scale_nocopy(emitted)
+                # Row-major producer path (transpose_scale=False + materialize).
+                materialized = materialize_bpreshuffle_fp8_scale(values)
+
+                self.assertTrue(torch.equal(nocopy, materialized))
+                self.assertEqual(nocopy.shape, values.shape)
+                self.assertEqual(nocopy.stride(), (1, m))
+                self.assertTrue(nocopy.t().is_contiguous())
+
+    def test_nocopy_shares_storage_no_allocation(self):
+        values = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        emitted = _simulate_transpose_scale_emit(values)
+
+        nocopy = bpreshuffle_fp8_scale_nocopy(emitted)
+
+        # The whole point of the optimization: reinterpret, do not copy.
+        self.assertEqual(nocopy.data_ptr(), emitted.data_ptr())
+        # ...whereas the materialize path it replaces does allocate.
+        materialized = materialize_bpreshuffle_fp8_scale(values)
+        self.assertNotEqual(materialized.data_ptr(), values.data_ptr())
+
+    def test_nocopy_passthrough_for_non_2d_scale(self):
+        for scale in (
+            torch.arange(5, dtype=torch.float32),  # 1-D (per-tensor scale)
+            torch.arange(24, dtype=torch.float32).reshape(2, 3, 4),  # 3-D
+        ):
+            with self.subTest(dim=scale.dim()):
+                self.assertIs(bpreshuffle_fp8_scale_nocopy(scale), scale)
+
+    def test_tuple_helper_reinterprets_only_the_scale_slot(self):
+        q_input = torch.ones((3, 8), dtype=torch.float8_e4m3fn)
+        values = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        emitted = _simulate_transpose_scale_emit(values)
+        bf16_side = torch.ones((3, 8), dtype=torch.bfloat16)
+
+        q_out, scale_out, bf16_out = bpreshuffle_fp8_scale_nocopy_tuple(
+            (q_input, emitted, bf16_side)
+        )
+
+        self.assertIs(q_out, q_input)
+        self.assertIs(bf16_out, bf16_side)
+        self.assertTrue(
+            torch.equal(scale_out, materialize_bpreshuffle_fp8_scale(values))
+        )
+        self.assertEqual(scale_out.stride(), (1, values.shape[0]))
+        self.assertEqual(scale_out.data_ptr(), emitted.data_ptr())
 
 
 if __name__ == "__main__":
