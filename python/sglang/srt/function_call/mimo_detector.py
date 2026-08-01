@@ -203,14 +203,16 @@ class MiMoDetector(BaseFormatDetector):
 
         start = current_text.find(self.bot_token)
         if start == -1:
-            if self.current_tool_id > 0:
-                # Already processing tool calls, keep buffering
-                # (more tool calls might come, don't discard text yet)
-                return StreamingParseResult(normal_text="")
-            else:
-                # No tool calls seen yet, return as normal text
-                self._buffer = ""
-                return StreamingParseResult(normal_text=current_text)
+            # No complete bot token in the buffer. Hold back only a suffix
+            # that could be the start of a split bot token; flush the rest —
+            # unconditionally, so text after the last tool call still reaches
+            # the stream instead of being buffered forever.
+            partial_len = self._ends_with_partial_token(current_text, self.bot_token)
+            if partial_len:
+                self._buffer = current_text[-partial_len:]
+                return StreamingParseResult(normal_text=current_text[:-partial_len])
+            self._buffer = ""
+            return StreamingParseResult(normal_text=current_text)
 
         # Find end token AFTER the start token
         end = current_text.find(self.eot_token, start)
