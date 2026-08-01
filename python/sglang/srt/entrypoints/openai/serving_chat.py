@@ -77,6 +77,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
+
 
 def normalize_tool_content(role: str, content):
     """Normalize tool message content from OpenAI array format to plain string.
@@ -605,6 +607,10 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        media_error = self._validate_media_content(request)
+        if media_error:
+            return media_error
+
         if (
             isinstance(request.tool_choice, str)
             and request.tool_choice.lower() == "required"
@@ -658,6 +664,28 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return None
 
+    def _validate_media_content(self, request: ChatCompletionRequest) -> Optional[str]:
+        if self.tokenizer_manager.model_config.is_multimodal:
+            return None
+
+        media_type = next(
+            (
+                part.type
+                for message in request.messages
+                if isinstance(message.content, list)
+                for part in message.content
+                if part.type in _MEDIA_CONTENT_PART_TYPES
+            ),
+            None,
+        )
+        if media_type is None:
+            return None
+
+        return (
+            "Model only supports text input; "
+            f"received unsupported content type '{media_type}'."
+        )
+
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
@@ -681,6 +709,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 raise ValueError(
                     "return_prompt_token_ids is not supported with streaming. "
                     "Please set stream=false when using return_prompt_token_ids=true."
+                )
+            if request.return_token_ids:
+                raise ValueError(
+                    "return_token_ids is not supported with streaming on "
+                    "/v1/chat/completions. Please set stream=false when using "
+                    "return_token_ids=true."
                 )
             if request.return_meta_info:
                 raise ValueError(
@@ -771,7 +805,8 @@ class OpenAIServingChat(OpenAIServingBase):
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
-            return_prompt_token_ids=request.return_prompt_token_ids,
+            return_prompt_token_ids=request.return_prompt_token_ids
+            or request.return_token_ids,
         )
 
         return adapted_request, request
@@ -1539,8 +1574,11 @@ class OpenAIServingChat(OpenAIServingBase):
             # Extract prompt_token_ids if requested
             choice_prompt_token_ids = (
                 ret_item.get("prompt_token_ids")
-                if request.return_prompt_token_ids
+                if request.return_prompt_token_ids or request.return_token_ids
                 else None
+            )
+            choice_token_ids = (
+                ret_item["output_ids"] if request.return_token_ids else None
             )
 
             choice_meta_info = (
@@ -1568,6 +1606,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
                 hidden_states=hidden_states,
                 prompt_token_ids=choice_prompt_token_ids,
+                token_ids=choice_token_ids,
                 meta_info=choice_meta_info,
             )
             choices.append(choice_data)

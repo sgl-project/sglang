@@ -17,9 +17,18 @@ from sglang.srt.eplb.expert_location import (
 from sglang.test.test_utils import CustomTestCase
 
 
-def _make_server_args(ep_size: int, nnodes: int):
-    """Minimal server_args stub for expert placement tests."""
-    return types.SimpleNamespace(ep_size=ep_size, nnodes=nnodes, ep_join_mode=None)
+def _make_server_args(ep_size: int, nnodes: int, moe_a2a_backend: str = "deepep"):
+    """Minimal server_args stub for expert placement tests.
+
+    `moe_a2a_backend` defaults to an a2a backend because these tests cover the
+    rank-local collapse, which is skipped when there is no a2a backend.
+    """
+    return types.SimpleNamespace(
+        ep_size=ep_size,
+        nnodes=nnodes,
+        ep_join_mode=None,
+        moe_a2a_backend=moe_a2a_backend,
+    )
 
 
 def _make_logical_to_all_physical_map(

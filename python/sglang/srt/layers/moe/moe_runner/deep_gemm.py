@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import einops
 import torch
 
-from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
+from sglang.kernels.ops.attention.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.quantization import per_token_group_quant
+
+logger = logging.getLogger(__name__)
+
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -25,6 +29,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
@@ -56,7 +61,9 @@ _is_musa = is_musa()
 
 # Imported only for the SGLANG_OPT_FIX_MEGA_MOE_MEMORY=False fallback path.
 if not (_is_npu or _is_hip) and _is_cuda:
-    from sglang.jit_kernel.activation import silu_and_mul as _legacy_silu_and_mul
+    from sglang.kernels.ops.activation.activation import (
+        silu_and_mul as _legacy_silu_and_mul,
+    )
 elif _is_musa:
     _silu_and_mul_musa = torch.nn.SwishGLU()
 else:
@@ -183,7 +190,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
+        from sglang.kernels.ops.attention.dsv4 import silu_and_mul_contig_post_quant
         from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
         from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
@@ -445,9 +452,20 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         num_groups, m, k = hidden_states.shape
         n = w13_weight.size(1)
-        gateup_output = torch.empty(
-            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
-        )
+        try:
+            gateup_output = torch.empty(
+                (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+            )
+        except torch.OutOfMemoryError:
+            logger.error(
+                "Masked grouped-GEMM workspace allocation failed "
+                "(num_groups=%d m=%d n=%d). If this happens under saturated "
+                "dp-attention prefill, try SGLANG_OPT_DG_MASKED_M_CAP=1.",
+                num_groups,
+                m,
+                n,
+            )
+            raise
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scale),
@@ -826,7 +844,15 @@ def pre_permute_deepep_normal_to_deep_gemm(
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
 
-    input_tensor = torch.empty(
+    # Deterministic inference zero-fills the scatter buffers: expert-alignment
+    # padding leaves slots that ep_scatter never writes, and pad garbage in
+    # input_tensor would leak batch-dependent values into the grouped GEMM.
+    # The scale buffer only matters for FP8 activations sharing this
+    # pre-permute (ep_scatter skips scales entirely for BF16 dispatch).
+    deterministic = get_exec().deterministic.enable_deterministic_inference
+    buffer_init = torch.zeros if deterministic else torch.empty
+
+    input_tensor = buffer_init(
         (all_tokens, K),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
@@ -839,12 +865,12 @@ def pre_permute_deepep_normal_to_deep_gemm(
             dtype=torch.int,
         ).transpose(0, 1)
     else:
-        input_tensor_scale = torch.empty(
+        input_tensor_scale = buffer_init(
             (all_tokens, K // 128),
             device=hidden_states.device,
             dtype=torch.float32,
         )
-    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
+    m_indices = buffer_init(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
 
     if get_offloader().forbid_copy_engine_usage:

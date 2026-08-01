@@ -51,13 +51,13 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_cuda
 
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.jit_kernel.fused_qknorm_rope import (
+    from sglang.kernels.ops.attention.fused_qknorm_rope import (
         can_use_fused_qk_norm_rope,
         fused_qk_norm_rope,
     )
@@ -231,7 +231,7 @@ class MellumAttention(Qwen3MoeAttention):
         _yarn_factor = self._yarn_params["factor"]
 
         self.use_fused_qk_norm_rope = (
-            get_server_args().enable_fused_qk_norm_rope
+            get_exec().kernel.enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
             and _is_cuda
             and can_use_fused_qk_norm_rope(
