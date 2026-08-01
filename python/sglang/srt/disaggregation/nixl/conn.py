@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
+    build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -40,8 +41,10 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    resolve_dcp_dst_entry_indices,
 )
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.server_args import ServerArgs
 
 try:
@@ -158,6 +161,7 @@ class TransferInfo:
     required_dst_info_num: int
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
+    is_dummy_rank: Optional[bool] = None
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
     staging: Optional[StagingTransferInfo] = None
@@ -167,6 +171,8 @@ class TransferInfo:
         # When dst_kv_indices is empty due to a decode-side radix cache
         # full hit (decode_prefix_len > 0), the transfer is NOT dummy --
         # aux/state data still needs to be sent.
+        if self.is_dummy_rank is not None:
+            return self.is_dummy_rank
         if self.dst_kv_indices.size == 0 and self.decode_prefix_len:
             return False
         return self.dst_kv_indices.size == 0
@@ -189,6 +195,11 @@ class TransferInfo:
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
             ),  # hacky just add it into the message that will be sent
+            is_dummy_rank=(
+                bool(int(msg[9].decode("ascii")))
+                if len(msg) > 9 and msg[9] != b""
+                else None
+            ),
         )
 
 
@@ -211,6 +222,11 @@ class KVArgsRegisterInfo:
     dst_kv_item_len: int
     dst_kv_item_lens: list[int]
     dst_kv_layer_ids: list[int] = dataclasses.field(default_factory=list)
+    dst_dcp_size: int = 1
+    dst_dcp_rank: int = 0
+    requires_dcp_relayout: bool = False
+    dcp_token_item_lens: Optional[List[int]] = None
+    dcp_dst_region_indices: Optional[List[int]] = None
     dst_num_slots: Optional[int] = None
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
@@ -277,6 +293,13 @@ class KVArgsRegisterInfo:
             dst_kv_item_len=dst_kv_item_len,
             dst_kv_item_lens=dst_kv_item_lens,
             dst_kv_layer_ids=dst_kv_layer_ids,
+            # msg[19:21] are the layer-id frames above; DCP trails them.
+            dst_dcp_size=(
+                int(msg[21].decode("ascii")) if len(msg) > 21 and msg[21] != b"" else 1
+            ),
+            dst_dcp_rank=(
+                int(msg[22].decode("ascii")) if len(msg) > 22 and msg[22] != b"" else 0
+            ),
             dst_num_slots=dst_num_slots,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
@@ -516,7 +539,7 @@ class NixlKVManager(CommonKVManager):
             lambda ptr, size: self._register_staging_memory(ptr, size, gpu_id),
             self.kv_args,
             count,
-            self.server_args.chunked_prefill_size,
+            get_schedule().chunked_prefill_size,
         )
 
     def _init_staging_allocator(self):
@@ -648,7 +671,7 @@ class NixlKVManager(CommonKVManager):
             room,
             self.transfer_infos,
             self.kv_buffer_tensors,
-            self.server_args.chunked_prefill_size,
+            get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
         )
@@ -791,12 +814,33 @@ class NixlKVManager(CommonKVManager):
         else:
             # One prefill rank feeds multiple decode ranks: interleave num_groups
             # head-groups in the src dlist so each decode rank picks its slice.
-            dst_tp_rank_in_group = decode_kv_args.decode_tp_rank % decode_tp_size
-            num_groups = decode_tp_size // prefill_tp_size
-            num_heads_to_send = dst_heads_per_rank
-            src_head_start = (
-                dst_tp_rank_in_group * dst_heads_per_rank
-            ) % src_heads_per_rank
+            #
+            # Under GQA the decode side can have MORE attn-TP ranks than there are
+            # KV heads (decode_tp_size > total_kv_heads). In that case consecutive
+            # decode ranks replicate a shared KV head, so the src dlist must
+            # interleave one group per UNIQUE source head-slice, not one per decode
+            # rank -- otherwise it addresses past the registered KV region and
+            # prep_xfer_dlist raises NIXL_ERR_NOT_FOUND.
+            #
+            # Reuse the shared replicated-KV head map (integer division under
+            # replication, not modulo) that the mooncake backend already relies
+            # on, so the two backends stay in sync.
+            from sglang.srt.disaggregation.common.staging_buffer import (
+                compute_head_slice_params,
+            )
+
+            src_head_start, num_heads_to_send, _, _ = compute_head_slice_params(
+                prefill_tp_size,
+                decode_tp_size,
+                self.kv_args.engine_rank,
+                decode_kv_args.decode_tp_rank,
+                total_kv_heads,
+            )
+            # num_groups (distinct head-groups packed in one prefill rank's src
+            # region) and head_group_idx (this peer's group) are NIXL-specific and
+            # not returned by the shared helper, so derive them here.
+            dst_replication = max(1, decode_tp_size // total_kv_heads)
+            num_groups = decode_tp_size // prefill_tp_size // dst_replication
             head_group_idx = src_head_start // dst_heads_per_rank
             dst_head_offset = 0
 
@@ -952,6 +996,27 @@ class NixlKVManager(CommonKVManager):
         assert self.src_mem_kind is not None
         src_mem_kind = self.src_mem_kind
         decode_only_spec_dec = n_dst > n_src
+
+        if peer_info.requires_dcp_relayout:
+            dst_indices = resolve_dcp_dst_entry_indices(
+                self.kv_args.kv_layer_ids,
+                peer_info.dst_kv_layer_ids,
+                n_src,
+                n_dst,
+            )
+            peer_info.dcp_dst_region_indices = dst_indices
+            dst_kv_mem_kinds = [peer_info.dst_kv_mem_kinds[j] for j in dst_indices]
+            dst_kv_item_lens = [peer_info.dst_kv_item_lens[j] for j in dst_indices]
+            dst_mem_kind = _homogeneous_kv_mem_kind(
+                dst_kv_mem_kinds,
+                "PD DCP destination",
+            )
+            peer_info.dst_homogeneous_mem_kind = dst_mem_kind
+            peer_info.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
+                dst_kv_item_lens
+            )
+            return
+
         if (
             self.is_mla_backend
             or self.is_hybrid_mla_backend
@@ -1089,19 +1154,27 @@ class NixlKVManager(CommonKVManager):
                         len(kv_chunk.prefill_kv_indices) > 0
                         and self.kv_args.kv_data_ptrs
                     ):
-                        chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
-
-                        # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                        # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
-                        if len(chunked_dst_kv_indice) < len(
-                            kv_chunk.prefill_kv_indices
-                        ):
-                            logger.warning(
-                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
-                            )
-                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
-                                : len(chunked_dst_kv_indice)
+                        is_dcp_transfer = dst_info.requires_dcp_relayout
+                        if is_dcp_transfer:
+                            chunked_dst_kv_indice = req.dst_kv_indices
+                        else:
+                            chunked_dst_kv_indice = req.dst_kv_indices[
+                                kv_chunk.index_slice
                             ]
+
+                            # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
+                            # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+                            if len(chunked_dst_kv_indice) < len(
+                                kv_chunk.prefill_kv_indices
+                            ):
+                                logger.warning(
+                                    f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                                )
+                                kv_chunk.prefill_kv_indices = (
+                                    kv_chunk.prefill_kv_indices[
+                                        : len(chunked_dst_kv_indice)
+                                    ]
+                                )
 
                         src_prefill_kv_indices = kv_chunk.prefill_kv_indices
 
@@ -1143,7 +1216,18 @@ class NixlKVManager(CommonKVManager):
                                 break
 
                         if kv_xfer_handle is None:
-                            if (
+                            if is_dcp_transfer:
+                                kv_xfer_handle = self.send_kvcache_dcp(
+                                    req.agent_name,
+                                    src_prefill_kv_indices,
+                                    dst_info,
+                                    chunked_dst_kv_indice,
+                                    src_page_offset=kv_chunk.index_slice.start or 0,
+                                    decode_prefix_len=req.decode_prefix_len or 0,
+                                    num_kv_tokens=kv_chunk.num_kv_tokens,
+                                    notif=notif,
+                                )
+                            elif (
                                 self.is_mla_backend
                                 or self.is_hybrid_mla_backend
                                 or decode_tp_size == self.attn_tp_size
@@ -1207,15 +1291,17 @@ class NixlKVManager(CommonKVManager):
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
                         # A no-KV notification still identifies its PP source.
+                        # Empty non-final chunks do not consume chunk IDs, so a
+                        # final no-KV chunk_id equals the prior KV chunk count.
+                        aux_notif = f"{req.room}_aux"
                         if (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
                         ):
-                            aux_notif = (
-                                f"{req.room}_aux_nokv_{self.transfer_source_rank}"
+                            aux_notif += (
+                                f"_nokv_{self.transfer_source_rank}"
+                                f"_{kv_chunk.chunk_id}"
                             )
-                        else:
-                            aux_notif = f"{req.room}_aux"
                         aux_xfer_handle = self.send_aux(
                             req.agent_name,
                             kv_chunk.prefill_aux_index,
@@ -1333,6 +1419,9 @@ class NixlKVManager(CommonKVManager):
         if agent_name in self.decode_kv_args_table:
             logger.info(f"Peer {agent_name} was already registered, ignoring.")
             return
+        decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
+            decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
+        )
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1352,6 +1441,7 @@ class NixlKVManager(CommonKVManager):
         src_mem_kind: str = "VRAM",
         dst_mem_kind: str = "VRAM",
         force_flat: bool = False,
+        bypass_prepped: bool = False,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra.
@@ -1361,7 +1451,8 @@ class NixlKVManager(CommonKVManager):
         index) whose per-layer list must not be half-split into K/V."""
         # Prepped path (KV only; state transfers use the non-prepped path below).
         if (
-            src_data_ptrs is self.kv_args.kv_data_ptrs
+            not bypass_prepped
+            and src_data_ptrs is self.kv_args.kv_data_ptrs
             and "" in self.prep_handles
             and peer_name in self.prep_handles
         ):
@@ -1527,6 +1618,63 @@ class NixlKVManager(CommonKVManager):
             notif=notif,
             src_mem_kind=self.src_mem_kind,
             dst_mem_kind=dst_mem_kind,
+        )
+
+    def send_kvcache_dcp(
+        self,
+        peer_name: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_info: KVArgsRegisterInfo,
+        dst_kv_indices: npt.NDArray[np.int32],
+        *,
+        src_page_offset: int,
+        decode_prefix_len: int,
+        num_kv_tokens: int,
+        notif: str,
+    ):
+        if self.src_mem_kind is None:
+            raise RuntimeError("Missing NIXL source KV memory kind")
+        if dst_info.dst_homogeneous_mem_kind is None:
+            raise RuntimeError("Missing NIXL destination KV memory kind")
+        if num_kv_tokens is None:
+            raise ValueError("PD DCP transfer requires num_kv_tokens")
+
+        physical_page_size = self.kv_args.page_size
+        plan = build_dcp_token_transfer_plan(
+            prefill_kv_indices,
+            dst_kv_indices,
+            physical_page_size=physical_page_size,
+            dcp_size=dst_info.dst_dcp_size,
+            dcp_rank=dst_info.dst_dcp_rank,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            num_kv_tokens=num_kv_tokens,
+        )
+        if plan.src_token_indices.size == 0:
+            self.agent.send_notif(peer_name, notif.encode("ascii"))
+            return None
+
+        token_item_lens = dst_info.dcp_token_item_lens
+        assert token_item_lens is not None
+        dst_kv_ptrs = [
+            dst_info.dst_kv_ptrs[dst_idx] for dst_idx in dst_info.dcp_dst_region_indices
+        ]
+
+        # Prepared handles encode page-level offsets, while DCP relayout needs
+        # flat descriptors for the selected token rows.
+        return self._send_kvcache_generic(
+            peer_name=peer_name,
+            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            dst_data_ptrs=dst_kv_ptrs,
+            item_lens=token_item_lens,
+            prefill_data_indices=plan.src_token_indices,
+            dst_data_indices=plan.dst_token_indices,
+            dst_gpu_id=dst_info.gpu_id,
+            notif=notif,
+            src_mem_kind=self.src_mem_kind,
+            dst_mem_kind=dst_info.dst_homogeneous_mem_kind,
+            force_flat=True,
+            bypass_prepped=True,
         )
 
     def send_kvcache_mixed(
@@ -2222,6 +2370,7 @@ class NixlKVManager(CommonKVManager):
         chunk_id: int,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2233,13 +2382,16 @@ class NixlKVManager(CommonKVManager):
         if self.enable_staging:
             self._prefetch_staging_reqs(bootstrap_room)
 
-        # Transfer is async: just enqueue the chunk; the per-queue worker
-        # (transfer_worker) does the actual gather + RDMA. Routing by
-        # ``room % N`` keeps every chunk of a given room on the same
-        # worker -- and therefore on the same private staging buffer --
-        # which is required for the staging ring's offset/watermark
-        # state machine to advance correctly.
-        shard_idx = bootstrap_room % len(self.transfer_queues)
+        if bootstrap_room not in self.transfer_infos:
+            # Dummy rank or already cleared; nothing to enqueue.
+            return None
+
+        # Shard by destination (mirror mooncake): same dst endpoint(s) -> same
+        # worker, keeping a room's chunks on one private staging buffer.
+        session_port_sum = sum(
+            info.dst_port for info in self.transfer_infos[bootstrap_room].values()
+        )
+        shard_idx = session_port_sum % len(self.transfer_queues)
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -2249,6 +2401,7 @@ class NixlKVManager(CommonKVManager):
                 chunk_id=chunk_id,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                num_kv_tokens=num_kv_tokens,
             )
         )
         return None
@@ -2289,8 +2442,8 @@ class NixlKVManager(CommonKVManager):
                 elif tag == "stg":
                     self._handle_stg_notification(components, room)
                 elif tag == "aux":
-                    # main's "nokv" marker (decode-side radix cache hit):
-                    # mark expected_kvs_per_pp[pp_rank] = 0 for this rank.
+                    # Main's "nokv" marker carries the number of earlier KV
+                    # chunks expected from this PP rank.
                     self._handle_aux_notification(room, components)
                 elif tag == "state":
                     pp_rank = int(components[2]) if len(components) > 2 else 0
@@ -2318,15 +2471,16 @@ class NixlKVManager(CommonKVManager):
 
         Notification tag layouts:
           aux:         {room}_aux                              -> 2 fields
-          aux (nokv):  {room}_aux_nokv_{pp_rank}               -> 4 fields
-                       (decode-side radix cache hit; this pp_rank sent
-                       no KV pages, so expected_kvs_per_pp[pp_rank] = 0)
+          aux (nokv):  {room}_aux_nokv_{pp_rank}_{expected}    -> 5 fields
+                       (the last chunk had no KV pages for this rank;
+                       `expected` is the number of prior KV chunks)
         """
         self.transfer_statuses[room].received_aux = True
         # main's "nokv" marker (decode-side radix cache hit, see #19746).
         if len(components) > 3 and components[2] == "nokv":
             pp_rank = int(components[3])
-            self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = 0
+            expected = int(components[4]) if len(components) > 4 else 0
+            self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = expected
         if self.transfer_statuses[room].num_pp_ranks_expected is None:
             self.transfer_statuses[room].num_pp_ranks_expected = (
                 self.required_prefill_response_num_table.get(room, 1)
@@ -2573,6 +2727,7 @@ class NixlKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         if self._send_failed:
             return
@@ -2596,6 +2751,7 @@ class NixlKVSender(CommonKVSender):
             self.chunk_id,
             self.aux_index,
             state_indices,
+            num_kv_tokens,
         )
         self._record_transfer_indices(kv_indices, state_indices)
         self.chunk_id += 1
@@ -2713,6 +2869,7 @@ class NixlKVReceiver(CommonKVReceiver):
                             str(self.required_dst_info_num).encode("ascii"),
                             packed_state_indices,
                             str(decode_prefix_len or 0).encode("ascii"),
+                            str(int(is_dummy)).encode("ascii"),
                         ]
                     )
             except zmq.ZMQError:
@@ -2841,6 +2998,8 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_kv_item_lens,
                             packed_state_layer_ids,
                             packed_kv_layer_ids,
+                            str(self.kv_mgr.dcp_size).encode("ascii"),
+                            str(self.kv_mgr.dcp_rank).encode("ascii"),
                         ]
                     )
             except zmq.ZMQError:

@@ -82,6 +82,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _MediaInputValidationError(ValueError):
+    pass
+
+
 def _build_output_text_logprobs(meta_info: dict) -> list[Logprob]:
     """Convert SGLang ``meta_info`` logprob arrays into OpenAI Responses
     ``Logprob`` items (token, logprob, bytes, top_logprobs).
@@ -313,6 +317,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                     processed_messages,
                 ) = await self._make_request(request, prev_response, tokenizer)
 
+        except _MediaInputValidationError as e:
+            return self.create_error_response(str(e))
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(f"{e} {e.__cause__}")
@@ -585,6 +591,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             reasoning_effort=(request.reasoning.effort if request.reasoning else None),
             chat_template_kwargs=request.chat_template_kwargs,
         )
+
+        media_error = self._validate_media_content(chat_request)
+        if media_error:
+            raise _MediaInputValidationError(media_error)
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)

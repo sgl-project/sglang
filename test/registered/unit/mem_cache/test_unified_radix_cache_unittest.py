@@ -5363,8 +5363,8 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         first, second = torch.tensor([4, 5]), torch.tensor([6])
         action = FreeDeviceKV([first, second])
         UnifiedRadixCache._apply_cache_action(cache, action)
-        cache.token_to_kv_pool_allocator.free.assert_has_calls(
-            [mock.call(first), mock.call(second)]
+        cache.token_to_kv_pool_allocator.free_segment.assert_has_calls(
+            [mock.call(first, start_pos=0), mock.call(second, start_pos=0)]
         )
 
     def test_apply_cache_action_routes_free_component_device_kv(self):

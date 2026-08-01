@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -35,7 +34,7 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_flags, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
@@ -47,6 +46,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
+from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
@@ -120,7 +120,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.speculative_num_steps = (
-            model_runner.server_args.speculative_num_steps
+            get_spec().speculative_num_steps
             if speculative_num_steps is None
             else speculative_num_steps
         )
@@ -653,12 +653,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Replay via backend
         shape_key = self._make_graph_key(bs)
-        timer_ctx = (
-            self.model_runner.device_timer.wrap(metadata={"category": "eagle_draft"})
-            if self.model_runner.device_timer
-            else contextlib.nullcontext()
-        )
-        with timer_ctx:
+        with device_timer_ctx(self.model_runner.device_timer, "eagle_draft"):
             out = self._replay_graph(shape_key, forward_batch)
         if self.buffers.dsa_seed_topk is not None:
             forward_batch.spec_info.dsa_topk_indices = None
