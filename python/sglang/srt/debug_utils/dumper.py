@@ -23,6 +23,7 @@ import torch.distributed as dist
 import zmq
 
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
+from sglang.srt.runtime_context import get_serving
 
 # -------------------------------------- config base ------------------------------------------
 
@@ -1798,7 +1799,7 @@ class _SGLangPlugin(_FrameworkPlugin):
             if args is None:
                 return None
 
-            return args.tokenizer_path
+            return get_serving().tokenizer_path
         except Exception:
             return None
 

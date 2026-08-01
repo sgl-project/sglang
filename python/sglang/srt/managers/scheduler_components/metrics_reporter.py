@@ -26,6 +26,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -764,12 +765,10 @@ class SchedulerMetricsReporter:
         else:
             spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
             num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
-            if self.scheduler.server_args.speculative_num_draft_tokens:
-                draft_per_round = (
-                    self.scheduler.server_args.speculative_num_draft_tokens - 1
-                )
+            if get_spec().speculative_num_draft_tokens:
+                draft_per_round = get_spec().speculative_num_draft_tokens - 1
             else:
-                draft_per_round = self.scheduler.server_args.speculative_num_steps or 0
+                draft_per_round = get_spec().speculative_num_steps or 0
             total_draft_tokens = self.spec_num_forward_ct * draft_per_round
             spec_accept_rate = (
                 num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
