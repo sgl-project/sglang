@@ -124,6 +124,24 @@ def materialize_bpreshuffle_fp8_scale_tuple(
     )
 
 
+def bpreshuffle_fp8_scale_nocopy(scale: torch.Tensor) -> torch.Tensor:
+    """Zero-copy counterpart of ``materialize_bpreshuffle_fp8_scale`` for scales a
+    quant kernel already emitted with ``transpose_scale=True`` (physical
+    ``[num_groups, tokens]`` byte-order): reinterpret strides to the materialized
+    column-major ``[tokens, num_groups]`` layout the gfx95 bpreshuffle GEMM wants,
+    no copy. Only valid for M(tokens)>=2 (M==1 degenerate; use materialize)."""
+    if scale.dim() == 2:
+        return torch.as_strided(scale, scale.shape, (1, scale.shape[0]))
+    return scale
+
+
+def bpreshuffle_fp8_scale_nocopy_tuple(
+    value: Tuple[torch.Tensor, ...],
+) -> Tuple[torch.Tensor, ...]:
+    """Zero-copy scale reinterpret for FP8 ``(q_input, x_scale, ...)`` tuples."""
+    return (value[0], bpreshuffle_fp8_scale_nocopy(value[1]), *value[2:])
+
+
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
     if _FORCE_CK_W8A8:
         return False

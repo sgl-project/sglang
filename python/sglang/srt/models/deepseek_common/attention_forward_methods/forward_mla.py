@@ -28,6 +28,7 @@ from sglang.srt.layers.dcp import (
     dcp_a2a_lse_reduce,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    bpreshuffle_fp8_scale_nocopy_tuple,
     materialize_bpreshuffle_fp8_scale_tuple,
 )
 from sglang.srt.layers.radix_attention import unified_attention_with_output
@@ -1126,13 +1127,20 @@ class DeepseekMLAForwardMixin:
                 if self.o_proj.weight.dtype == torch.uint8:
                     attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
                 elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+                    _emit_bpre = (
+                        _use_aiter_bpreshuffle_gfx95 and _bmm_buf.shape[0] >= 2
+                    )
                     attn_bmm_output = fused_flatten_fp8_group_quant(
                         _bmm_buf,
                         group_size=128,
                         dtype_quant=torch.float8_e4m3fn,
-                        transpose_scale=False,
+                        transpose_scale=_emit_bpre,
                     )
-                    if _use_aiter_bpreshuffle_gfx95:
+                    if _emit_bpre:
+                        attn_bmm_output = bpreshuffle_fp8_scale_nocopy_tuple(
+                            attn_bmm_output
+                        )
+                    elif _use_aiter_bpreshuffle_gfx95:
                         attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
                             attn_bmm_output
                         )
@@ -1143,13 +1151,20 @@ class DeepseekMLAForwardMixin:
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
             elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
+                _emit_bpre = (
+                    _use_aiter_bpreshuffle_gfx95 and attn_bmm_output.shape[0] >= 2
+                )
                 attn_bmm_output = fused_flatten_fp8_group_quant(
                     attn_bmm_output,
                     group_size=128,
                     dtype_quant=torch.float8_e4m3fn,
-                    transpose_scale=False,
+                    transpose_scale=_emit_bpre,
                 )
-                if _use_aiter_bpreshuffle_gfx95:
+                if _emit_bpre:
+                    attn_bmm_output = bpreshuffle_fp8_scale_nocopy_tuple(
+                        attn_bmm_output
+                    )
+                elif _use_aiter_bpreshuffle_gfx95:
                     attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
                         attn_bmm_output
                     )
