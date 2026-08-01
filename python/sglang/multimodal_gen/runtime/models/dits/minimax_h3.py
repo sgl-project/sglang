@@ -542,12 +542,11 @@ def _ring_attention_varlen(
         ring_pg, (ring_rank - 1) % ring_ws
     )
 
-    k = k.contiguous()
-    v = v.contiguous()
-    # double-buffered: index 0 starts as this rank's own local chunk, index 1
-    # is the landing pad for whatever hop is currently in flight.
-    k_bufs = [k, torch.empty_like(k)]
-    v_bufs = [v, torch.empty_like(v)]
+    # K and V travel as one stacked buffer so each hop is a single P2P
+    # send/recv pair instead of two; stacking also makes the buffer
+    # contiguous, so no separate .contiguous() call is needed.
+    kv0 = torch.stack((k, v))
+    kv_bufs = [kv0, torch.empty_like(kv0)]
     cur = 0
 
     q_cu = torch.tensor([0, ring_chunk_len], dtype=torch.int32, device=q.device)
@@ -563,25 +562,13 @@ def _ring_attention_varlen(
                 [
                     torch.distributed.P2POp(
                         torch.distributed.isend,
-                        k_bufs[cur],
-                        next_global_rank,
-                        group=ring_pg,
-                    ),
-                    torch.distributed.P2POp(
-                        torch.distributed.isend,
-                        v_bufs[cur],
+                        kv_bufs[cur],
                         next_global_rank,
                         group=ring_pg,
                     ),
                     torch.distributed.P2POp(
                         torch.distributed.irecv,
-                        k_bufs[nxt],
-                        prev_global_rank,
-                        group=ring_pg,
-                    ),
-                    torch.distributed.P2POp(
-                        torch.distributed.irecv,
-                        v_bufs[nxt],
+                        kv_bufs[nxt],
                         prev_global_rank,
                         group=ring_pg,
                     ),
@@ -596,8 +583,8 @@ def _ring_attention_varlen(
             k_cu = torch.tensor([0, remote_used], dtype=torch.int32, device=q.device)
             result = flash_attn_varlen_func(
                 q,
-                k_bufs[cur][:remote_used],
-                v_bufs[cur][:remote_used],
+                kv_bufs[cur][0, :remote_used],
+                kv_bufs[cur][1, :remote_used],
                 cu_seqlens_q=q_cu,
                 cu_seqlens_k=k_cu,
                 max_seqlen_q=ring_chunk_len,
