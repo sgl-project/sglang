@@ -1,6 +1,8 @@
 """Tests for session references on UnifiedRadixCache."""
 
-from __future__ import annotations
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import ast
 import unittest
@@ -8,29 +10,22 @@ from array import array
 from pathlib import Path
 from types import SimpleNamespace
 
-try:
-    import torch
-except ModuleNotFoundError:
-    torch = None
+import torch
 
-if torch is not None:
-    # Import before sglang: its triton stub can break torch's lazy import.
-    import torch._inductor.runtime.triton_heuristics  # noqa: F401
+from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.test.test_utils import CustomTestCase
 
-    from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-    from sglang.srt.mem_cache.base_prefix_cache import (
-        EvictParams,
-        InsertParams,
-        MatchPrefixParams,
-    )
-    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-    from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-    from sglang.srt.mem_cache.unified_cache.components import ComponentType
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
-
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 MEM_CACHE_ROOT = REPO_ROOT / "python/sglang/srt/mem_cache"
 
 
@@ -47,7 +42,7 @@ def class_bases(path: Path, class_name: str) -> set[str]:
     }
 
 
-class TestSessionCacheOwnership(unittest.TestCase):
+class TestSessionCacheOwnership(CustomTestCase):
     def test_only_unified_radix_cache_owns_session_ref_tracker(self):
         ordinary_mixin = MEM_CACHE_ROOT / "session_radix_cache.py"
         radix_cache = MEM_CACHE_ROOT / "radix_cache.py"
@@ -177,8 +172,7 @@ def register(cache, token_ids, session_id, generation=None):
     )
 
 
-@unittest.skipIf(torch is None, "PyTorch is required for cache behavior tests")
-class TestRadixCacheSessionRemoval(unittest.TestCase):
+class TestRadixCacheSessionRemoval(CustomTestCase):
     def test_plain_radix_cache_does_not_enable_session_references(self):
         cache = RadixCache(make_params(enable_session=True))
 
@@ -187,8 +181,7 @@ class TestRadixCacheSessionRemoval(unittest.TestCase):
         self.assertFalse(hasattr(cache, "open_radix_session"))
 
 
-@unittest.skipIf(torch is None, "PyTorch is required for cache behavior tests")
-class TestSessionUnifiedRadixCache(unittest.TestCase):
+class TestSessionUnifiedRadixCache(CustomTestCase):
     def setUp(self):
         self.cache = UnifiedRadixCache(make_params(enable_session=True))
         self.full = self.cache.components[ComponentType.FULL]
