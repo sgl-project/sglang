@@ -27,7 +27,6 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     TOOL_ERROR_PREFIX,
     OpenAIServingChat,
     fold_tool_error_into_content,
-    normalize_assistant_tool_call_arguments,
     normalize_tool_content,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -787,11 +786,8 @@ class ServingChatTestCase(unittest.TestCase):
                 self.chat._process_messages(req, is_multimodal=False)
 
     def test_tool_error_marker_reaches_custom_encoders(self):
-        """The dsv4/dsv32 encoders bypass the Jinja branch entirely.
-
-        Folding ``is_error`` only there let those encoders render a failed
-        tool call as an ordinary ``<result>...</result>``.
-        """
+        """The dsv4/dsv32 encoders bypass the Jinja branch entirely, so folding
+        ``is_error`` only there rendered a failure as a normal ``<result>``."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
 
@@ -2578,15 +2574,6 @@ class TestNormalizeToolContent(unittest.TestCase):
 
 
 class TestFoldToolErrorIntoContent(unittest.TestCase):
-    """Unit tests for fold_tool_error_into_content()."""
-
-    def test_marks_string_content(self):
-        """Every encoder renders tool content verbatim, so without an inline
-        marker the model reads a failed call as a normal result."""
-        message = {"role": "tool", "content": "boom", "is_error": True}
-        fold_tool_error_into_content(message)
-        self.assertEqual(message["content"], TOOL_ERROR_PREFIX + "boom")
-
     def test_marks_list_content_as_extra_part(self):
         """An image-bearing tool_result stays a list, so marking only the
         string path would silently drop the failure marker."""
@@ -2604,15 +2591,18 @@ class TestFoldToolErrorIntoContent(unittest.TestCase):
                 fold_tool_error_into_content(message)
                 self.assertNotIn("is_error", message)
 
-    def test_successful_result_is_untouched(self):
-        message = {"role": "tool", "content": "fine", "is_error": False}
-        fold_tool_error_into_content(message)
-        self.assertEqual(message["content"], "fine")
-
-    def test_non_tool_role_is_untouched(self):
-        message = {"role": "user", "content": "hi", "is_error": True}
-        fold_tool_error_into_content(message)
-        self.assertEqual(message["content"], "hi")
+    def test_marker_only_on_failures(self):
+        """A predicate that degraded to always-true would brand every
+        successful tool result, and non-tool roles, as failed."""
+        for message in (
+            {"role": "tool", "content": "fine", "is_error": False},
+            {"role": "tool", "content": "fine"},
+            {"role": "user", "content": "fine", "is_error": True},
+        ):
+            with self.subTest(message=message):
+                fold_tool_error_into_content(dict(message))
+                fold_tool_error_into_content(message)
+                self.assertEqual(message["content"], "fine")
 
 
 class InklingReasoningEffortTest(unittest.TestCase):

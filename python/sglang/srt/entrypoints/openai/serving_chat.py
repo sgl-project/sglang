@@ -84,11 +84,9 @@ TOOL_ERROR_PREFIX = "[Tool execution failed] "
 
 
 def fold_tool_error_into_content(message: Dict[str, Any]) -> None:
-    """Fold ``is_error`` into a tool message's content in-place, then drop it.
-
-    ``is_error`` is an SGLang extension with no OpenAI equivalent, and every
-    encoder renders tool content verbatim, so the failure has to become part
-    of the content itself or the model reads a failed call as a normal result.
+    """``is_error`` is an SGLang extension with no OpenAI equivalent, and every
+    encoder renders tool content verbatim, so the failure has to become part of
+    the content itself or the model reads a failed call as a normal result.
     """
     is_error = message.pop("is_error", None)
     if not is_error or message.get("role") != "tool":
@@ -947,9 +945,8 @@ class OpenAIServingChat(OpenAIServingBase):
         messages = [msg.model_dump() for msg in request.messages]
         for message in messages:
             normalize_assistant_tool_call_arguments(message)
-            # Before encoder dispatch: the custom and dsv4/dsv32 encoders never
-            # reach the Jinja branch below and would render a failed tool call
-            # as an ordinary result.
+            # Must precede encoder dispatch: the custom and dsv4/dsv32 encoders
+            # never reach the Jinja branch below.
             fold_tool_error_into_content(message)
 
         prompt_ids = self._encode_messages(
