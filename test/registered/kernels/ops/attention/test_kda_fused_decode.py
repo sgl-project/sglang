@@ -207,3 +207,9 @@ def test_kda_fused_decode_matches_unfused_chain(heads: int, tp_size: int):
     torch.testing.assert_close(fused, ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(state_fused, state_ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(conv_fused, conv_ref, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
