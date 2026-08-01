@@ -2016,7 +2016,7 @@ class Scheduler(
             draft_worker=self.draft_worker,
             model_worker=self.model_worker,
             logprob_result_processor=SchedulerLogprobResultProcessor(
-                server_args=self.server_args, model_config=self.model_config
+                model_config=self.model_config
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
