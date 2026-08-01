@@ -1018,12 +1018,20 @@ def aiter_w8a8_block_fp8_linear(
             x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
     else:
         materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
+        # OPT (bpreshuffle scale, no-copy): ask the quant kernel to emit the scale
+        # already in bpreshuffle byte-order (transpose_scale=True) and reinterpret
+        # its strides to the materialized column-major layout via a zero-copy view,
+        # replacing the .t().contiguous().t() relayout copy. Bit-identical for
+        # M>=2 (validated); keep the cheap copy for the degenerate single-row case.
+        _emit_bpreshuffle = materialize_bpreshuffle_scale and input_2d.shape[0] >= 2
         q_input, x_scale = aiter_per1x128_quant(
             input_2d,
             quant_dtype=aiter.dtypes.fp8,
-            transpose_scale=False,
+            transpose_scale=_emit_bpreshuffle,
         )
-        if materialize_bpreshuffle_scale:
+        if _emit_bpreshuffle:
+            x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
+        elif materialize_bpreshuffle_scale:
             x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
 
     if use_triton:
