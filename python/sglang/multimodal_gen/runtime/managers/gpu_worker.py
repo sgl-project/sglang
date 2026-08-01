@@ -23,6 +23,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+    IPC_A2A,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -326,6 +329,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 Used by disaggregated pipelines to access intermediate tensors.
         """
         assert self.pipeline is not None
+        # request boundary: the IPC watchdog flag is a device read, illegal
+        # inside a graph capture and too costly per exchange
+        IPC_A2A.check_timeout()
         if len(batch) > 1:
             if return_req:
                 raise ValueError(

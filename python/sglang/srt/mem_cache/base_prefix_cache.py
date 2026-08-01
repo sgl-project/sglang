@@ -23,6 +23,7 @@ from sglang.srt.observability.metrics_collector import (
     RadixCacheMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.runtime_context import get_observability
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -31,7 +32,7 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+    from sglang.srt.mem_cache.unified_cache.components.tree_component import (
         ComponentType,
     )
 
@@ -238,8 +239,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
         server_args = get_server_args()
         labels = {"cache_type": self.__class__.__name__}
-        if server_args.extra_metric_labels:
-            labels.update(server_args.extra_metric_labels)
+        if get_observability().extra_metric_labels:
+            labels.update(get_observability().extra_metric_labels)
         radix_cache_cls = resolve_collector_class(
             server_args,
             STAT_LOGGER_ROLE_RADIX_CACHE,
@@ -363,14 +364,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Notify the cache controller to start the KV cache loading
         """
         raise NotImplementedError()
-
-    def flush_write_through_acks(self) -> None:
-        """Release lock_ref on radix-tree nodes whose write-through has completed.
-
-        Lightweight operation that only processes finished write acks.
-        No-op for caches without hierarchical write-through support.
-        """
-        pass
 
     def check_hicache_events(self) -> Any:
         """

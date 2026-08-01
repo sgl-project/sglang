@@ -56,6 +56,12 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
         return False
 
 
+# Tile size for the indexer FP8 K-cache preshuffle layout. Store and gather
+# kernels reorganize each page into (tile x tile) blocks so the aiter preshuffle
+# paged-MQA gather can consume the cache directly.
+INDEXER_K_CACHE_PRESHUFFLE_TILE = 16
+
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -76,20 +82,30 @@ def should_use_dsa_fused_topk(
 
 
 def is_dsa_enable_prefill_cp():
-    return get_server_args().enable_dsa_prefill_context_parallel
+    if not envs.SGLANG_ENABLE_CP_V2.get():
+        return get_parallel().enable_dsa_prefill_context_parallel
+
+    # Derive from the runtime CP topology + model arch rather than the legacy
+    # flag under CP-v2: DSA prefill CP is active when the CP group is on for a
+    # DeepSeek Sparse Attention model.
+    if get_parallel().attn_cp_size <= 1:
+        return False
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    return is_deepseek_dsa(get_server_args().get_model_config().hf_config)
 
 
 def is_dsa_prefill_cp_in_seq_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_server_args().dsa_prefill_cp_mode == "in-seq-split"
+        and get_parallel().dsa_prefill_cp_mode == "in-seq-split"
     )
 
 
 def is_dsa_prefill_cp_round_robin_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_server_args().dsa_prefill_cp_mode == "round-robin-split"
+        and get_parallel().dsa_prefill_cp_mode == "round-robin-split"
     )
 
 
@@ -154,6 +170,13 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
     from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+    from sglang.srt.layers.cp.utils import is_cp_v2_active
+
+    # CP-v2 already pads each rank-local shard to its physical size
+    if is_cp_v2_active(forward_batch):
+        return forward_batch.attn_cp_metadata.per_rank_actual_token[
+            get_parallel().attn_cp_rank
+        ]
 
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
@@ -200,6 +223,15 @@ def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
 
 
 def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
+    if (
+        cp_size <= 1
+        or not use_dsa
+        or not forward_batch.forward_mode.is_context_parallel_extend()
+        or not is_dsa_enable_prefill_cp()
+        or sum(forward_batch.extend_seq_lens_cpu) < cp_size
+    ):
+        return False
+
     if is_dsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
         assert (
@@ -210,17 +242,7 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
         # the seq data needs to be divided and recombined at twice the size of cp_size.
         cur_cp_seq_len = seq_len // (cp_size * 2)
-    if (
-        cur_cp_seq_len != 0
-        and cp_size > 1
-        and use_dsa
-        and forward_batch.forward_mode.is_context_parallel_extend()
-        and is_dsa_enable_prefill_cp()
-        and sum(forward_batch.extend_seq_lens_cpu) >= cp_size
-    ):
-        return True
-    else:
-        return False
+    return cur_cp_seq_len != 0
 
 
 from sglang.kernels.ops.attention.dsa.cp_split import (
