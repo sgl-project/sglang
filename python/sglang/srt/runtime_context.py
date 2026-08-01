@@ -125,12 +125,19 @@ class ParallelContext:
 
     def __getattr__(self, name):
         # Reached only for names that are neither a live @property nor a slot:
-        # serve parallel config leaves from the published bag.
-        try:
-            config = object.__getattribute__(self, "_config")
-        except AttributeError:
-            config = None
-        if config is not None and name in config:
+        # serve parallel config leaves from the published bag. The body must
+        # stay dynamo-traceable — config-leaf reads such as
+        # ``get_parallel().moe_dense_tp_size`` run inside compiled model
+        # forwards, and ``object.__getattribute__`` graph-breaks.
+        if name.startswith("_"):
+            # No config leaf is underscored; this also breaks the recursion
+            # when the ``_config`` slot itself is still unset (pickle/copy
+            # protocols probe attributes before __init__ runs).
+            raise AttributeError(name)
+        config = self._config
+        # ``_fields`` is a plain ``__dict__`` entry on the bag; ``in`` on the
+        # dict avoids ``_ConfigBag.__contains__`` (not traceable).
+        if config is not None and name in config._fields:
             return getattr(config, name)
         detail = (
             "not a published parallel config leaf"

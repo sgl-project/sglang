@@ -98,14 +98,14 @@ def is_dsa_enable_prefill_cp():
 def is_dsa_prefill_cp_in_seq_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_server_args().dsa_prefill_cp_mode == "in-seq-split"
+        and get_parallel().dsa_prefill_cp_mode == "in-seq-split"
     )
 
 
 def is_dsa_prefill_cp_round_robin_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_server_args().dsa_prefill_cp_mode == "round-robin-split"
+        and get_parallel().dsa_prefill_cp_mode == "round-robin-split"
     )
 
 
