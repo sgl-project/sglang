@@ -87,13 +87,8 @@ class _MediaInputValidationError(ValueError):
 
 
 def _build_output_text_logprobs(meta_info: dict) -> list[Logprob]:
-    """Convert SGLang ``meta_info`` logprob arrays into OpenAI Responses
-    ``Logprob`` items (token, logprob, bytes, top_logprobs).
-
-    Pure: reuses ``to_openai_style_logprobs`` (the shared meta_info decoder) and
-    reshapes its output into the Responses logprob type, which carries the same
-    fields as the chat one. Covers all generated tokens (matching vLLM).
-    """
+    """Reshape decoded ``meta_info`` logprobs into the Responses logprob type,
+    covering every generated token."""
     decoded = to_openai_style_logprobs(
         output_token_logprobs=meta_info.get("output_token_logprobs"),
         output_top_logprobs=meta_info.get("output_top_logprobs"),
@@ -128,11 +123,9 @@ def _should_emit_normal_text_as_message(
 ) -> bool:
     """Whether ``text`` should open / extend a user-visible message item.
 
-    The qwen3-coder tool-call grammar emits ``\\n`` separators between adjacent
-    ``<tool_call>...</tool_call>`` blocks. The streaming detector cannot tell
-    those whitespace bytes apart from genuine message content, so while a tool
-    call is still open the serving layer treats whitespace-only ``normal_text``
-    fragments as inter-call separators and does not open a message item.
+    qwen3-coder separates adjacent tool-call blocks with ``\\n``, which the
+    streaming detector cannot tell from real content -- so whitespace arriving
+    while a call is open is treated as a separator.
     """
     if not text:
         return False
@@ -422,7 +415,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         prompt_kwargs = {"input_ids": engine_prompt}
 
-                    # Engine logprobs only when opted in via include.
                     logprob_kwargs = (
                         {
                             "return_logprob": True,
@@ -491,8 +483,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             if request.store:
                 self.msg_store[request.request_id] = messages
 
-            # only non-streaming background returns "queued" here; the stream path
-            # below handles background+stream itself.
+            # background+stream is handled by the stream path below.
             if request.background and not request.stream:
                 created_time = int(time.time())
                 response = ResponsesResponse.from_request(
@@ -648,7 +639,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         except ValueError as e:
             return self.create_error_response(str(e))
 
-        # Default to completed; the non-harmony path refines from finish_reason.
         status = "completed"
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
@@ -757,13 +747,8 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _status_from_finish_reason(finish_reason: Any) -> str:
-        """Map an engine finish_reason to a Responses status.
-
-        OpenAI reports a length-capped generation as ``incomplete`` (with
-        ``incomplete_details.reason == "max_output_tokens"``); everything else
-        that reached here finished normally. ``finish_reason`` is a dict
-        (``{"type": "length"|"stop"|...}``) in SGLang, but tolerate a bare str.
-        """
+        """Only a length-capped generation is ``incomplete``; anything that got
+        here otherwise finished normally."""
         reason = None
         if isinstance(finish_reason, dict):
             reason = finish_reason.get("type")
@@ -957,12 +942,8 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _chat_tool_choice(tool_choice: Any) -> Any:
-        """Reshape an ``effective_tool_choice()`` result for chat completions.
-
-        Responses uses the flat object form ``{"type":"function","name":X}``;
-        chat expects ``{"type":"function","function":{"name":X}}``. String forms
-        ("auto"/"required"/"none") pass through.
-        """
+        """Nest an ``effective_tool_choice()`` result the way chat expects:
+        ``{"type":"function","name":X}`` -> ``{...,"function":{"name":X}}``."""
         if not isinstance(tool_choice, dict):
             return tool_choice
         return {"type": "function", "function": {"name": tool_choice["name"]}}
@@ -2308,10 +2289,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         tool_index = call.tool_index
                         state = tool_call_states.get(tool_index)
                         if state is None or state.get("done"):
-                            # finalize other open tool calls first so their output_item.done lands
-                            # before the next output_item.added; else they stay open till end-of-stream.
+                            # Close other open calls first, so their
+                            # output_item.done precedes the next added.
                             for other_index in list(tool_call_states):
-                                # _close_tool_call_state is a no-op on already-done state.
                                 if other_index != tool_index:
                                     for ev in _close_tool_call_state(other_index):
                                         yield ev
@@ -2330,8 +2310,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             tool_call_states[tool_index] = state
                         if not state["added"]:
                             state["added"] = True
-                            # Capture ``call.name`` before the ``added`` event so
-                            # the name is set on the first emitted item.
+                            # Name must be set before the ``added`` event.
                             if call.name and not state["name"]:
                                 state["name"] = call.name
                             yield _send_event(
@@ -2362,9 +2341,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
 
                 def _emit_normal_text():
-                    # whitespace-only text while a tool call is open is a separator
-                    # between tool blocks, not content. (the `normal_text and` short-
-                    # circuits the tool-state scan on the common empty deltas.)
+                    # whitespace while a call is open separates tool blocks, not content.
                     if normal_text and _should_emit_normal_text_as_message(
                         normal_text,
                         any_tool_call_in_progress=any(
@@ -2421,14 +2398,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
                         )
 
-                # The parser returns text and calls as an unordered tuple, but
-                # their positions are recoverable: arguments continuing an open
-                # item came before this delta's text, a call opening a new item
-                # after it. One delta can hold both, so no single order works --
-                # emitting text before draining continuations would close the
-                # open item and drop its trailing "}".
-                #
-                # Classify before emitting: emitting mutates tool_call_states.
+                # The parser's (text, calls) tuple is unordered, but positions
+                # are recoverable: continuing arguments precede this delta's
+                # text, a newly opened call follows it. Classify first --
+                # emitting mutates tool_call_states.
                 def _is_continuing(call):
                     state = tool_call_states.get(call.tool_index)
                     return state is not None and not state.get("done")

@@ -711,9 +711,8 @@ class ToolChoice(BaseModel):
 ReasoningEffortTier = Literal[
     "none", "minimal", "low", "medium", "high", "xhigh", "max"
 ]
-# OpenAI's ``Reasoning.effort`` literal trails the tiers above, and the typed
-# /v1/responses stream events validate a response against it. Only these echo
-# back; the rest report None rather than failing the whole stream.
+# The typed /v1/responses stream events validate against OpenAI's narrower
+# ``Reasoning.effort``; echoing a tier outside this set kills the stream.
 ECHOABLE_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
 # Chat Completions and /v1/tokenize additionally accept a fine-grained float in
 # [0.0, 0.99] as an sglang extension (not part of the OpenAI schema, so the
@@ -1538,16 +1537,13 @@ class ResponsesRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_to_thinking(cls, values):
-        """Turn reasoning.effort == "none" into a chat_template_kwargs thinking
-        toggle (mirrors ChatCompletionRequest). Grammar-constrained requests
-        (json output, forced tools) keep thinking on: ReasonerGrammarBackend
-        defers the grammar past </think>, so reasoning and structured output
-        coexist. Both keys are set because families differ ("thinking" for
-        deepseek/kimi, "enable_thinking" for qwen3/glm)."""
+        """Turn reasoning.effort == "none" into a thinking toggle, as
+        ChatCompletionRequest does. Both keys are set: families differ
+        ("thinking" for deepseek/kimi, "enable_thinking" for qwen3/glm)."""
         if not isinstance(values, dict):
             return values
-        # mode="before", so reasoning is still the raw payload: a dict from JSON,
-        # or an already-built param object when constructed in Python.
+        # mode="before", so reasoning is still raw: a dict from JSON, or a
+        # built param object when constructed in Python.
         r = values.get("reasoning")
         effort = None
         if isinstance(r, dict):
@@ -1558,7 +1554,7 @@ class ResponsesRequest(BaseModel):
         if effort == "none":
             existing = values.get("chat_template_kwargs")
             existing = existing if isinstance(existing, dict) else {}
-            # spread existing last so an explicit caller value wins over the default.
+            # existing last: an explicit caller value wins.
             values["chat_template_kwargs"] = {
                 "thinking": False,
                 "enable_thinking": False,
@@ -1621,12 +1617,8 @@ class ResponsesRequest(BaseModel):
     def _json_schema_from_text_format(
         text: Optional[ResponseTextConfig],
     ) -> Optional[str]:
-        """Pure mapping of a Responses ``text.format`` to a SGLang json_schema
-        string, or None when no JSON constraint applies.
-
-        ``json_object`` -> permissive object schema; ``json_schema`` -> the
-        caller's schema; ``text`` (the default) and anything unrecognized -> None.
-        """
+        """Map a Responses ``text.format`` to a json_schema string, or None when
+        no JSON constraint applies (``text`` and anything unrecognized)."""
         response_format = text.format if text is not None else None
         if isinstance(response_format, ResponseFormatJSONObject):
             return '{"type": "object"}'
@@ -1644,13 +1636,9 @@ class ResponsesRequest(BaseModel):
         return self._json_schema_from_text_format(self.text) is not None
 
     def effective_tool_choice(self) -> Union[str, Dict[str, Any]]:
-        """``tool_choice`` reduced to what the server can actually honor.
-
-        Of the object forms only a named ``function`` survives: the others
-        (web_search, mcp, ...) cannot be forced through the tool-call parser and
-        degrade to "auto". This is also what keeps the echoed value inside the
-        OpenAI SDK's ToolChoice union, which the stream events validate against.
-        """
+        """``tool_choice`` reduced to what the server can actually honor: of the
+        object forms only a named ``function`` survives, the rest (web_search,
+        mcp, ...) can't be forced through the tool-call parser."""
         tool_choice = self.tool_choice
         if not isinstance(tool_choice, dict):
             return tool_choice
@@ -1724,9 +1712,7 @@ class ResponsesRequest(BaseModel):
             or params.get("json_schema")
         )
         if tool_call_constraint and has_existing_constraints:
-            # Refuse rather than silently drop the tool-call grammar. ``text.format``
-            # is named first because it is the only client-settable source here;
-            # the rest can only arrive via --preferred-sampling-params.
+            # Refuse rather than silently drop the tool-call grammar.
             raise ValueError(
                 "Cannot combine tool calls with constrained decoding "
                 "(text.format / regex / ebnf / structural_tag / json_schema). "
@@ -1793,9 +1779,7 @@ class ResponsesResponse(BaseModel):
 
     @field_serializer("usage")
     def _serialize_usage(self, usage: Optional[UsageInfo], _info):
-        """Serialize usage in the Responses API shape (input_tokens /
-        output_tokens / *_tokens_details), not the Chat Completions shape
-        (prompt_tokens / completion_tokens) that UsageInfo carries."""
+        """Emit the Responses usage shape, not the chat one UsageInfo carries."""
         if usage is None:
             return None
         cached = (

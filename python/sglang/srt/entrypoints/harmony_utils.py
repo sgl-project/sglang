@@ -52,9 +52,8 @@ REASONING_EFFORT = {
     "high": ReasoningEffort.HIGH,
     "medium": ReasoningEffort.MEDIUM,
     "low": ReasoningEffort.LOW,
-    # harmony only has low/medium/high, so the outer tiers clamp inward. "none"
-    # is absent on purpose: .get() below lets it fall through to the harmony
-    # default rather than forcing a tier.
+    # harmony has only these three, so outer tiers clamp inward. "none" is left
+    # out so it falls through to the harmony default.
     "minimal": ReasoningEffort.LOW,
     "xhigh": ReasoningEffort.HIGH,
     "max": ReasoningEffort.HIGH,
@@ -81,7 +80,6 @@ def get_system_message(
     if model_identity is not None:
         sys_msg_content = sys_msg_content.with_model_identity(model_identity)
     if reasoning_effort is not None:
-        # .get() so "none" falls back to the default instead of raising.
         effort = REASONING_EFFORT.get(reasoning_effort)
         if effort is not None:
             sys_msg_content = sys_msg_content.with_reasoning_effort(effort)
