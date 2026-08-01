@@ -8,7 +8,7 @@ The whole module is skipped unless the ``sgl_kernel`` Metal extension is built
 and loaded, so it is a no-op on non-Apple platforms and in CI without Mac
 runners. Run it directly on Apple Silicon with:
 
-    ~/venvs/sglang/bin/python -m pytest sgl-kernel/tests/test_metal_norm.py -v
+    ~/venvs/sglang/bin/python -m pytest python/sglang/kernels/aot/tests/test_metal_norm.py -v
 """
 
 import pytest

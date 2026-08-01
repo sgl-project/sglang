@@ -4,9 +4,9 @@ Sweeps (dtype, batch, hidden) and prints per-config microseconds and the
 speedup over the MLX baseline. Run on Apple Silicon with the sgl-kernel Metal
 extension installed:
 
-    ~/venvs/sglang/bin/python sgl-kernel/benchmark/bench_metal_rmsnorm.py
+    ~/venvs/sglang/bin/python python/sglang/kernels/aot/benchmark/bench_metal_rmsnorm.py
 
-Unlike sgl-kernel/benchmark/bench_rmsnorm.py (CUDA, torch/triton), timing here
+Unlike bench_rmsnorm.py in this directory (CUDA, torch/triton), timing here
 uses MLX's ``mx.eval`` barrier because MLX is lazy: a kernel call only records a
 graph node and runs nothing until evaluation is forced.
 """
@@ -32,35 +32,6 @@ def rms_norm_ref_fp32(x, w, eps=EPS):
     var = mx.mean(xf * xf, axis=-1, keepdims=True)
     xf = xf * mx.rsqrt(var + eps)
     return (xf * w.astype(mx.float32)).astype(orig)
-
-
-def bench(fn, warmup=10, iters=100):
-    """Return mean seconds per call for the thunk ``fn``.
-
-    ``fn`` must build and return a fresh output array each call (do not reuse a
-    single evaluated array, or the barrier below becomes a no-op).
-
-    MLX is lazy: calling the kernel only records a graph node. You MUST force the
-    GPU to run and finish, or you measure graph construction (roughly nothing).
-    """
-    for _ in range(warmup):
-        mx.eval(fn())
-    start = time.perf_counter()
-    for _ in range(iters):
-        mx.eval(fn())
-    end = time.perf_counter()
-    return (end - start) / iters
-
-
-def bench_chain(step, x0, chain=200, warmup=3):
-    for _ in range(warmup):
-        mx.eval(step(x0))
-    start = time.perf_counter()
-    for _ in range(chain):
-        x0 = step(x0)
-    mx.eval(x0)
-    end = time.perf_counter()
-    return (end - start) / chain
 
 
 def bench_pool(step, x_pool, repeats=7, warmup=3):
@@ -95,7 +66,7 @@ def verify(x, w):
     return mx.max(mx.abs(y.astype(mx.float32) - ref.astype(mx.float32))).item()
 
 
-def run(batch_sizes, hidden_sizes, dtype_names, warmup, iters):
+def run(batch_sizes, hidden_sizes, dtype_names, warmup, repeats):
     header = (
         f"{'dtype':9s} {'batch':>6s} {'hidden':>7s} "
         f"{'metal_us':>10s} {'mxfast_us':>10s} {'speedup':>8s} {'max|diff|':>10s}"
@@ -117,8 +88,18 @@ def run(batch_sizes, hidden_sizes, dtype_names, warmup, iters):
 
             diff = verify(x_pool[0], w)  # sanity gate before we trust the timing
 
-            t_metal = bench_pool(lambda xx: metal.rms_norm(xx, w, eps=EPS), x_pool)
-            t_fast = bench_pool(lambda xx: mx.fast.rms_norm(xx, w, EPS), x_pool)
+            t_metal = bench_pool(
+                lambda xx: metal.rms_norm(xx, w, eps=EPS),
+                x_pool,
+                repeats=repeats,
+                warmup=warmup,
+            )
+            t_fast = bench_pool(
+                lambda xx: mx.fast.rms_norm(xx, w, EPS),
+                x_pool,
+                repeats=repeats,
+                warmup=warmup,
+            )
             speedup = t_fast / t_metal if t_metal > 0 else float("nan")
 
             print(
@@ -141,8 +122,8 @@ if __name__ == "__main__":
     p.add_argument("--batch_sizes", type=_int_list, default=[1, 8, 32, 128, 512, 2048])
     p.add_argument("--hidden_sizes", type=_int_list, default=[1024, 4096])
     p.add_argument("--dtypes", type=_str_list, default=["float16", "bfloat16"])
-    p.add_argument("--warmup", type=int, default=10)
-    p.add_argument("--iters", type=int, default=100)
+    p.add_argument("--warmup", type=int, default=3)
+    p.add_argument("--repeats", type=int, default=7)
     args = p.parse_args()
 
-    run(args.batch_sizes, args.hidden_sizes, args.dtypes, args.warmup, args.iters)
+    run(args.batch_sizes, args.hidden_sizes, args.dtypes, args.warmup, args.repeats)

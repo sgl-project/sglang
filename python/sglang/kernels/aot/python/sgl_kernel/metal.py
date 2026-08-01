@@ -113,11 +113,11 @@ def rope_pool_fused(
 
 
 def rms_norm(
-    x: "mx.array",
-    w: "mx.array",
+    x: mx.array,
+    w: mx.array,
     *,
     eps: float,
-) -> "mx.array":
+) -> mx.array:
     """Apply RMSNorm: ``y = x * rsqrt(mean(x**2, axis=-1) + eps) * w``.
 
     Args:
