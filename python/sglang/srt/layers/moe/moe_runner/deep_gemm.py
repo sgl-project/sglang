@@ -106,6 +106,16 @@ def _should_use_masked_standard_layout(runner_config: MoeRunnerConfig) -> bool:
     )
 
 
+def _get_compact_all_tokens(
+    num_assignments: int, num_experts: int, block_e: int = 128
+) -> int:
+    """Return the maximum padded rows over all routings of the assignments."""
+    max_nonempty_experts = min(num_assignments, num_experts)
+    return block_e * (
+        max_nonempty_experts + (num_assignments - max_nonempty_experts) // block_e
+    )
+
+
 @dataclass
 class DeepGemmRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
@@ -750,9 +760,7 @@ def pre_permute_standard_to_deep_gemm(
     block_e = 128
     num_experts = runner_config.num_local_experts
     num_assignments = topk_ids.numel()
-    all_tokens = (
-        ceil_div(num_assignments + num_experts * (block_e - 1), block_e) * block_e
-    )
+    all_tokens = _get_compact_all_tokens(num_assignments, num_experts, block_e)
 
     tokens_per_expert, unused_masked_dst = fused_moe_dispatch_index(
         topk_ids, num_experts, 1

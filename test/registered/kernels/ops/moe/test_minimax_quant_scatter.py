@@ -138,6 +138,26 @@ def test_standard_deepgemm_preprocess_quantizes_with_ue8m0_scale():
             )
 
 
+@pytest.mark.parametrize(
+    "num_assignments,num_experts,expected",
+    [
+        (14, 2, 256),
+        (10, 512, 1280),
+        (20, 512, 2560),
+        (320, 512, 40960),
+        (640, 512, 65664),
+        (1280, 512, 66304),
+    ],
+)
+def test_compact_all_tokens_uses_tight_routing_independent_bound(
+    num_assignments, num_experts, expected
+):
+    assert (
+        deep_gemm_runner._get_compact_all_tokens(num_assignments, num_experts)
+        == expected
+    )
+
+
 def test_standard_masked_fp8_runner_matches_compact_end_to_end(monkeypatch):
     """Exercise both production FP8 grouped GEMMs through the standard path."""
     arch_major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
@@ -249,6 +269,7 @@ def test_standard_masked_fp8_runner_matches_compact_end_to_end(monkeypatch):
         )
         return (
             runner_input.use_masked_gemm,
+            running_state.get("all_tokens"),
             post_permute_deep_gemm_to_standard(
                 runner_output,
                 quant_info,
@@ -257,12 +278,16 @@ def test_standard_masked_fp8_runner_matches_compact_end_to_end(monkeypatch):
             ).hidden_states,
         )
 
-    compact_is_masked, compact_output = run_with_num_experts(num_local_experts)
-    masked_is_masked, masked_output = run_with_num_experts(8)
+    compact_is_masked, compact_all_tokens, compact_output = run_with_num_experts(
+        num_local_experts
+    )
+    masked_is_masked, masked_all_tokens, masked_output = run_with_num_experts(8)
     torch.cuda.synchronize()
 
     assert not compact_is_masked
     assert masked_is_masked
+    assert compact_all_tokens == 256
+    assert masked_all_tokens is None
     torch.testing.assert_close(
         masked_output,
         compact_output,
