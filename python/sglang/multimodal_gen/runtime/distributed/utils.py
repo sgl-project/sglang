@@ -23,6 +23,72 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Backend routing for the in-tree "nccl2" c10d backend.
+#
+# sglang-diffusion owns its own world process group (see
+# ``parallel_state.init_distributed_environment``) and pushes it into srt's
+# globals, so the routing below decides the backend for *both* frameworks in a
+# diffusion-initiated process.
+# ---------------------------------------------------------------------------
+
+# The world PG must be device-qualified: "nccl2" is a CUSTOM backend rather than
+# a device default, so a bare "nccl2" recorded in the parent PG's pg_map cannot
+# be parsed by split_group (_parse_backend_string only resolves bare names via
+# default_device_backend_map). The world also carries "cpu:gloo" so CPU
+# subgroups can be split out of it.
+NCCL2_WORLD_BACKEND = "cpu:gloo,cuda:nccl2"
+
+# Filter for a device (CUDA collective) subgroup split off the world PG.
+NCCL2_DEVICE_BACKEND = "cuda:nccl2"
+
+# Filter for a CPU-coordination subgroup split off the world PG. It has to keep
+# "cuda:nccl2" as well: ProcessGroup::splitGroup requires the deviceTypes filter
+# to include the parent's default backend device type (cuda here), so a pure
+# "cpu:gloo" split is rejected outright. The resulting group is compound, which
+# is fine for CPU collectives/P2P and for dist.monitored_barrier (it checks for
+# a CPU-capable backend via group._device_types, not for the literal "gloo"
+# name).
+NCCL2_CPU_BACKEND = "cpu:gloo,cuda:nccl2"
+
+# Backend for genuinely per-peer P2P groups (pipeline parallel). "nccl-lazy"
+# defers communicator creation until first use so send/recv to different stages
+# can overlap. These groups are built members-only (see below).
+NCCL2_P2P_BACKEND = "nccl-lazy"
+
+
+def route_world_backend(backend: str | None) -> str | None:
+    """Route a requested world backend onto the in-tree nccl2 backend.
+
+    Mirrors ``sglang.srt.distributed.parallel_state.init_distributed_environment``:
+    ``nccl`` yields nccl2, there is no stock-nccl escape hatch. Non-CUDA
+    backends (gloo/hccl/...) are passed through untouched.
+    """
+    if backend in ("nccl", "cuda:nccl"):
+        return NCCL2_WORLD_BACKEND
+    return backend
+
+
+def is_nccl2_world() -> bool:
+    """Whether the default (world) PG is the device-bound nccl2 group.
+
+    Derived from the *live* world PG rather than from the requested backend
+    string: the world may have been initialized by someone else (srt, a test
+    harness, or an embedding trainer) with stock nccl or gloo, and splitting a
+    stock-nccl parent with ``backend="cuda:nccl2"`` fails with a backend
+    mismatch. Those worlds must keep the upstream ``new_group`` path.
+    """
+    if not torch.distributed.is_initialized():
+        return False
+    world_pg = torch.distributed.group.WORLD
+    if world_pg is None:
+        return False
+    # split_group requires an eagerly device-bound parent communicator.
+    if getattr(world_pg, "bound_device_id", None) is None:
+        return False
+    return "nccl2" in torch.distributed.get_backend(world_pg)
+
+
 def ensure_divisibility(numerator, denominator) -> None:
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(

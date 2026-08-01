@@ -47,7 +47,12 @@ import torch.distributed
 from torch.distributed import ProcessGroup
 
 import sglang.multimodal_gen.envs as envs
-from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
+from sglang.multimodal_gen.runtime.distributed.utils import (
+    NCCL2_DEVICE_BACKEND,
+    StatelessProcessGroup,
+    is_nccl2_world,
+    route_world_backend,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from ..utils.distributed import RankGenerator
@@ -140,6 +145,19 @@ def init_world_group(
 
 
 def _sync_srt_world_group() -> None:
+    """Publish our world GroupCoordinator into srt's global state.
+
+    Note on nccl2: srt derives ``is_nccl2_world()`` from the *live* default PG
+    (``torch.distributed.group.WORLD``), not from ``srt_parallel_state._WORLD``
+    and not from a requested backend string. So once we route our world onto
+    ``cpu:gloo,cuda:nccl2`` above, srt's predicate flips to True for
+    diffusion-initiated processes and any srt subgroup created afterwards takes
+    the split_group path -- which is exactly right, because that world *is*
+    splittable (device-qualified and device-bound). Nothing here
+    double-initializes: srt's ``init_distributed_environment`` short-circuits on
+    ``torch.distributed.is_initialized()``, and srt's GroupCoordinator is never
+    constructed from this assignment.
+    """
     import sglang.srt.distributed.parallel_state as srt_parallel_state
 
     if srt_parallel_state._WORLD is None:
@@ -258,8 +276,27 @@ def init_distributed_environment(
             extra_args["timeout"] = datetime.timedelta(seconds=timeout)
             logger.info(f"Setting distributed timeout to {timeout} seconds")
 
+        # Route the world backend onto the in-tree nccl2 backend, device
+        # qualified as "cpu:gloo,cuda:nccl2" (see route_world_backend /
+        # NCCL2_WORLD_BACKEND for why the qualification is mandatory and why the
+        # cpu:gloo leg is needed for the CPU subgroups).
+        world_backend = route_world_backend(backend)
+
+        # Bind the world PG to its CUDA device: split_group requires an eagerly
+        # initialized/device-bound parent communicator. Callers normally pass
+        # device_id already (see maybe_init_distributed_environment_and_model_parallel);
+        # fill it in defensively so a direct caller cannot end up with an
+        # unbound -- and therefore unsplittable -- world.
+        if (
+            world_backend != backend
+            and "device_id" in extra_args
+            and extra_args["device_id"] is None
+        ):
+            bind_local_rank = local_rank if local_rank >= 0 else envs.LOCAL_RANK
+            extra_args["device_id"] = torch.device(f"cuda:{bind_local_rank}")
+
         torch.distributed.init_process_group(
-            backend=backend,
+            backend=world_backend,
             init_method=distributed_init_method,
             world_size=world_size,
             rank=rank,
@@ -866,9 +903,18 @@ def init_dit_group(
 ) -> None:
     global _DIT
     assert _DIT is None, "DIT group is already initialized"
-    _DIT = torch.distributed.new_group(
-        ranks=list(range(dit_parallel_size)), backend=backend
-    )
+    dit_ranks = list(range(dit_parallel_size))
+    if is_nccl2_world():
+        # Asymmetric membership whenever dit_parallel_size < world_size (i.e.
+        # any VAE-parallel deployment), which an eager new_group() cannot
+        # express over an nccl2 parent. split_group is collective over the
+        # world; ranks outside dit_ranks get NON_GROUP_MEMBER, matching what
+        # new_group returned for them before.
+        _DIT = torch.distributed.split_group(
+            split_ranks=[dit_ranks], backend=NCCL2_DEVICE_BACKEND
+        )
+    else:
+        _DIT = torch.distributed.new_group(ranks=dit_ranks, backend=backend)
 
 
 def get_dit_group() -> ProcessGroup:
@@ -885,7 +931,14 @@ def init_vae_group(
     global _VAE
     assert _VAE is None, "VAE parallel group is already initialized"
     vae_ranks = list(range(dit_parallel_size, dit_parallel_size + vae_parallel_size))
-    _VAE = torch.distributed.new_group(ranks=vae_ranks, backend=backend)
+    if is_nccl2_world():
+        # Always asymmetric (the DiT ranks are never members), so this is one of
+        # the sites that fails immediately on an eager new_group over nccl2.
+        _VAE = torch.distributed.split_group(
+            split_ranks=[vae_ranks], backend=NCCL2_DEVICE_BACKEND
+        )
+    else:
+        _VAE = torch.distributed.new_group(ranks=vae_ranks, backend=backend)
 
 
 def destroy_model_parallel() -> None:

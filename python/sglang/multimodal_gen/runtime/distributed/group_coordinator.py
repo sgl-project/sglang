@@ -24,6 +24,12 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_
 from sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator import (
     CpuCommunicator,
 )
+from sglang.multimodal_gen.runtime.distributed.utils import (
+    NCCL2_CPU_BACKEND,
+    NCCL2_DEVICE_BACKEND,
+    NCCL2_P2P_BACKEND,
+    is_nccl2_world,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
@@ -168,20 +174,52 @@ class GroupCoordinator:
         self.device_group = None
         self.cpu_group = None
 
-        for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
+        # Over an nccl2 world an eager new_group() with asymmetric membership is
+        # fatal: the *non-member* ranks take the no-color-split path in
+        # _new_process_group_helper and call perform_nocolor_split(), which
+        # ProcessGroupNCCL2 does not implement. The hazard is EAGER-vs-
+        # members-only, not the requested backend -- _get_split_source inspects
+        # the parent's CUDA backend, so backend="gloo" does not save you either.
+        # So on the nccl2 path both subgroups are carved off the world PG with
+        # split_group, a single collective over the parent that hands every rank
+        # the split it belongs to (or NON_GROUP_MEMBER).
+        if is_nccl2_world():
+            # group_ranks is a partition (RankGenerator output), so one
+            # split_group call replaces the whole loop. It must NOT be called
+            # per-iteration: each call creates a distinct communicator.
+            device_group = torch.distributed.split_group(
+                split_ranks=group_ranks, backend=NCCL2_DEVICE_BACKEND
             )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
+            # A group carrying a `gloo` CPU backend, to allow direct
+            # coordination between processes through the CPU. The split
+            # necessarily keeps the parent's cuda:nccl2 backend alongside
+            # cpu:gloo (see NCCL2_CPU_BACKEND).
             with suppress_stdout():
-                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
-            if self.rank in ranks:
-                self.ranks = ranks
-                self.world_size = len(ranks)
-                self.rank_in_group = ranks.index(self.rank)
-                self.device_group = device_group
-                self.cpu_group = cpu_group
+                cpu_group = torch.distributed.split_group(
+                    split_ranks=group_ranks, backend=NCCL2_CPU_BACKEND
+                )
+            for ranks in group_ranks:
+                if self.rank in ranks:
+                    self.ranks = ranks
+                    self.world_size = len(ranks)
+                    self.rank_in_group = ranks.index(self.rank)
+                    self.device_group = device_group
+                    self.cpu_group = cpu_group
+        else:
+            for ranks in group_ranks:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
+                )
+                # a group with `gloo` backend, to allow direct coordination between
+                # processes through the CPU.
+                with suppress_stdout():
+                    cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                if self.rank in ranks:
+                    self.ranks = ranks
+                    self.world_size = len(ranks)
+                    self.rank_in_group = ranks.index(self.rank)
+                    self.device_group = device_group
+                    self.cpu_group = cpu_group
 
         assert self.cpu_group is not None, f"{group_ranks=}, {local_rank=}"
         assert self.device_group is not None
@@ -792,17 +830,20 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self) -> None:
+        # Tear the communicators down before the process groups they were
+        # built from: they resolve ranks and buffers against those groups, so
+        # closing them afterwards works on a group that no longer exists.
+        if self.srt_custom_allreduce is not None:
+            self.srt_custom_allreduce.close()
+            self.srt_custom_allreduce = None
+        if self.device_communicator is not None:
+            self.device_communicator.destroy()
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
         if self.cpu_group is not None:
             torch.distributed.destroy_process_group(self.cpu_group)
             self.cpu_group = None
-        if self.device_communicator is not None:
-            self.device_communicator.destroy()
-        if self.srt_custom_allreduce is not None:
-            self.srt_custom_allreduce.close()
-            self.srt_custom_allreduce = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
@@ -845,15 +886,51 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.cpu_group = None
         self.cpu_groups = []
         self.device_groups = []
+        # The pipeline device groups are used exclusively for per-peer P2P
+        # (isend/irecv/batch_isend_irecv), so on the nccl2 path they use the
+        # "nccl-lazy" backend built members-only with
+        # use_local_synchronization=True: lazy per-peer communicators let
+        # send/recv to different stages overlap, and the members-only form
+        # short-circuits non-members before they would reach the eager
+        # no-color-split path that ProcessGroupNCCL2 does not implement.
+        #
+        # The CPU groups stay collective splits off the world PG. Note the
+        # ordering constraint that makes this safe: new_group(
+        # use_local_synchronization=True) returns before _process_group_name(),
+        # so it does NOT advance _world.group_count on non-members, while
+        # split_group advances it on every rank. Because the pipeline
+        # group_ranks partition the ranks, every rank is a member of exactly one
+        # group per loop, so counts re-converge at the end of each loop; the
+        # split_group calls therefore must be hoisted out of the loop (they are
+        # single collectives anyway) rather than interleaved with it.
+        use_nccl2 = is_nccl2_world()
+        p2p_device_id = (
+            torch.device(f"cuda:{local_rank}")
+            if use_nccl2 and current_platform.is_cuda_alike()
+            else None
+        )
         if len(group_ranks[0]) > 2 or len(group_ranks[0]) == 1:
-            for ranks in group_ranks:
-                device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
-                )
-                # a group with `gloo` backend, to allow direct coordination between
-                # processes through the CPU.
+            if use_nccl2:
                 with suppress_stdout():
-                    cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                    cpu_group = torch.distributed.split_group(
+                        split_ranks=group_ranks, backend=NCCL2_CPU_BACKEND
+                    )
+            for ranks in group_ranks:
+                if use_nccl2:
+                    device_group = torch.distributed.new_group(
+                        ranks,
+                        backend=NCCL2_P2P_BACKEND,
+                        use_local_synchronization=True,
+                        device_id=p2p_device_id,
+                    )
+                else:
+                    device_group = torch.distributed.new_group(
+                        ranks, backend=torch_distributed_backend
+                    )
+                    # a group with `gloo` backend, to allow direct coordination between
+                    # processes through the CPU.
+                    with suppress_stdout():
+                        cpu_group = torch.distributed.new_group(ranks, backend="gloo")
                 if self.rank in ranks:
                     self.ranks = ranks
                     self.world_size = len(ranks)
@@ -867,18 +944,53 @@ class PipelineGroupCoordinator(GroupCoordinator):
         # *_group_1_0 represents the group for communication from device 1 to
         #   device 0.
         elif len(group_ranks[0]) == 2:
-            for ranks in group_ranks:
-                device_group_0_1 = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
-                )
-                device_group_1_0 = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
-                )
-                # a group with `gloo` backend, to allow direct coordination between
-                # processes through the CPU.
+            if use_nccl2:
+                # The two groups have IDENTICAL membership; they exist purely so
+                # each direction gets its own communicator. split_group's
+                # split_ranks must partition, but two *separate* split_group
+                # calls over the same partition are fine: each is its own
+                # collective and _process_group_name() salts the hashed group
+                # name with the (collective-consistent) _world.group_count, so
+                # the second call yields a distinct communicator.
                 with suppress_stdout():
-                    cpu_group_0_1 = torch.distributed.new_group(ranks, backend="gloo")
-                    cpu_group_1_0 = torch.distributed.new_group(ranks, backend="gloo")
+                    cpu_group_0_1 = torch.distributed.split_group(
+                        split_ranks=group_ranks, backend=NCCL2_CPU_BACKEND
+                    )
+                    cpu_group_1_0 = torch.distributed.split_group(
+                        split_ranks=group_ranks, backend=NCCL2_CPU_BACKEND
+                    )
+            for ranks in group_ranks:
+                if use_nccl2:
+                    # Two members-only nccl-lazy comms over the same 2 ranks,
+                    # one per direction.
+                    device_group_0_1 = torch.distributed.new_group(
+                        ranks,
+                        backend=NCCL2_P2P_BACKEND,
+                        use_local_synchronization=True,
+                        device_id=p2p_device_id,
+                    )
+                    device_group_1_0 = torch.distributed.new_group(
+                        ranks,
+                        backend=NCCL2_P2P_BACKEND,
+                        use_local_synchronization=True,
+                        device_id=p2p_device_id,
+                    )
+                else:
+                    device_group_0_1 = torch.distributed.new_group(
+                        ranks, backend=torch_distributed_backend
+                    )
+                    device_group_1_0 = torch.distributed.new_group(
+                        ranks, backend=torch_distributed_backend
+                    )
+                    # a group with `gloo` backend, to allow direct coordination between
+                    # processes through the CPU.
+                    with suppress_stdout():
+                        cpu_group_0_1 = torch.distributed.new_group(
+                            ranks, backend="gloo"
+                        )
+                        cpu_group_1_0 = torch.distributed.new_group(
+                            ranks, backend="gloo"
+                        )
                 if self.rank in ranks:
                     self.ranks = ranks
                     self.world_size = len(ranks)
@@ -911,12 +1023,49 @@ class PipelineGroupCoordinator(GroupCoordinator):
         ] = None
         self.skip_device_group = None
         for ranks in group_ranks:
-            skip_device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
+            if use_nccl2:
+                # Also pure P2P (_pipeline_isend_skip / _pipeline_irecv_skip),
+                # so members-only nccl-lazy like the other pipeline device
+                # groups.
+                skip_device_group = torch.distributed.new_group(
+                    ranks,
+                    backend=NCCL2_P2P_BACKEND,
+                    use_local_synchronization=True,
+                    device_id=p2p_device_id,
+                )
+            else:
+                skip_device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
+                )
             if self.rank in ranks:
                 self.skip_device_group = skip_device_group
         assert self.skip_device_group is not None
+
+        if len(self.device_groups) == 2:
+            self._init_dual_direction_comms()
+
+    def _init_dual_direction_comms(self) -> None:
+        """Open both per-direction communicators in a rank-independent order.
+
+        The pipeline-parallel-degree-2 path keeps one group per direction
+        (`device_groups[0]` carries 0->1, `device_groups[1]` carries 1->0) so
+        the two directions do not serialize.  The communicator behind a group
+        is only built on its first send/recv, and the routing is
+        rank-dependent: rank 0 sends on `device_groups[0]` and receives on
+        `device_groups[1]`, rank 1 does the reverse.  A simultaneous
+        bidirectional exchange therefore has rank 0 open group 0 first and
+        rank 1 open group 1 first, and each blocks in the other's
+        communicator rendezvous -- a deadlock, since that rendezvous requires
+        both members.  Open them here instead, walking the groups in index
+        order, which is the same order on every rank.
+        """
+        token = torch.zeros(1, dtype=torch.uint8, device=self.device)
+        for direction, group in enumerate(self.device_groups):
+            # device_groups[i] is the group rank_in_group == i sends on.
+            if self.rank_in_group == direction:
+                torch.distributed.isend(token, dst=self.next_rank, group=group).wait()
+            else:
+                torch.distributed.irecv(token, src=self.prev_rank, group=group).wait()
 
     def reset_buffer(self):
         self.recv_tasks_queue = []
