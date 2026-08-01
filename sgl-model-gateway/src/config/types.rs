@@ -41,11 +41,15 @@ pub struct RouterConfig {
     pub pool_max_idle_per_host: usize,
     #[serde(default = "default_tcp_keepalive_secs")]
     pub tcp_keepalive_secs: u64,
-    /// Set to -1 to disable rate limiting
+    /// Hard in-flight request lifecycle limit per Router Pod.
+    /// Values less than or equal to zero (including -1) disable admission control.
     pub max_concurrent_requests: i32,
+    /// Total number of outstanding requests allowed to wait for admission.
     pub queue_size: usize,
+    /// Per-request deadline, in seconds, for waiting in the admission queue.
     pub queue_timeout_secs: u64,
-    /// If not set, defaults to max_concurrent_requests
+    /// Optional independent local QPS limit.
+    /// Unset or zero disables it; a positive R sets both capacity and refill rate to R.
     pub rate_limit_tokens_per_second: Option<i32>,
     pub cors_allowed_origins: Vec<String>,
     pub retry: RetryConfig,

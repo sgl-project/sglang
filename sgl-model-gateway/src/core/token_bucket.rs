@@ -1,10 +1,7 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
-use tokio::sync::Notify;
+use tokio::{sync::Notify, time::Instant};
 use tracing::{debug, trace};
 
 /// Token bucket for rate limiting.
@@ -34,11 +31,10 @@ impl TokenBucket {
     ///
     /// # Arguments
     /// * `capacity` - Maximum number of tokens (burst capacity)
-    /// * `refill_rate` - Tokens added per second (0 for pure concurrency limiting)
+    /// * `refill_rate` - Tokens added per second (0 disables automatic refill)
     pub fn new(capacity: usize, refill_rate: usize) -> Self {
         let capacity = capacity as f64;
-        // Allow refill_rate=0 for pure concurrency limiting (semaphore behavior)
-        // When refill_rate=0, tokens are only returned via return_tokens()
+        // When refill_rate=0, tokens are only restored via return_tokens().
         let refill_rate = refill_rate as f64;
 
         Self {
@@ -97,8 +93,8 @@ impl TokenBucket {
             return Ok(());
         }
 
-        // When refill_rate=0 (pure concurrency limiting), tokens only come back
-        // via return_tokens(), so we wait on notify signal only.
+        // When refill_rate=0, tokens only come back via return_tokens(), so wait
+        // on the notification signal rather than polling for time-based refill.
         if self.refill_rate == 0.0 {
             debug!(
                 "Token bucket: waiting indefinitely for {} tokens (refill_rate=0)",

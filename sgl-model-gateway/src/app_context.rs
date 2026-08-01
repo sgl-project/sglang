@@ -13,7 +13,10 @@ use tracing::debug;
 
 use crate::{
     config::RouterConfig,
-    core::{steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry, WorkerService},
+    core::{
+        steps::WorkflowEngines, AdmissionLimiter, JobQueue, LoadMonitor, WorkerRegistry,
+        WorkerService,
+    },
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -36,10 +39,42 @@ impl std::fmt::Display for AppContextBuildError {
 
 impl std::error::Error for AppContextBuildError {}
 
+/// Request limiters derived from a router configuration.
+///
+/// This is public so integration fixtures can use the same construction policy
+/// as production without duplicating configuration semantics.
+#[doc(hidden)]
+pub struct RequestLimiters {
+    pub admission_limiter: Option<Arc<AdmissionLimiter>>,
+    pub rate_limiter: Option<Arc<TokenBucket>>,
+}
+
+/// Builds the hard admission and independent local-QPS limiters for a router.
+#[doc(hidden)]
+pub fn request_limiters_from_config(config: &RouterConfig) -> RequestLimiters {
+    let admission_limiter = (config.max_concurrent_requests > 0).then(|| {
+        Arc::new(AdmissionLimiter::new(
+            config.max_concurrent_requests as usize,
+            config.queue_size,
+            Duration::from_secs(config.queue_timeout_secs),
+        ))
+    });
+    let rate_limiter = config
+        .rate_limit_tokens_per_second
+        .filter(|&rate| rate > 0)
+        .map(|rate| Arc::new(TokenBucket::new(rate as usize, rate as usize)));
+
+    RequestLimiters {
+        admission_limiter,
+        rate_limiter,
+    }
+}
+
 #[derive(Clone)]
 pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
+    pub admission_limiter: Option<Arc<AdmissionLimiter>>,
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
@@ -72,6 +107,7 @@ impl std::fmt::Debug for AppContext {
 pub struct AppContextBuilder {
     client: Option<Client>,
     router_config: Option<RouterConfig>,
+    admission_limiter: Option<Arc<AdmissionLimiter>>,
     rate_limiter: Option<Arc<TokenBucket>>,
     tokenizer_registry: Option<Arc<TokenizerRegistry>>,
     reasoning_parser_factory: Option<ReasoningParserFactory>,
@@ -112,6 +148,7 @@ impl AppContextBuilder {
         Self {
             client: None,
             router_config: None,
+            admission_limiter: None,
             rate_limiter: None,
             tokenizer_registry: None,
             reasoning_parser_factory: None,
@@ -142,6 +179,11 @@ impl AppContextBuilder {
 
     pub fn rate_limiter(mut self, rate_limiter: Option<Arc<TokenBucket>>) -> Self {
         self.rate_limiter = rate_limiter;
+        self
+    }
+
+    pub fn admission_limiter(mut self, admission_limiter: Option<Arc<AdmissionLimiter>>) -> Self {
+        self.admission_limiter = admission_limiter;
         self
     }
 
@@ -248,6 +290,7 @@ impl AppContextBuilder {
         Ok(AppContext {
             client: self.client.ok_or(AppContextBuildError("client"))?,
             router_config,
+            admission_limiter: self.admission_limiter,
             rate_limiter: self.rate_limiter,
             tokenizer_registry: self
                 .tokenizer_registry
@@ -290,9 +333,12 @@ impl AppContextBuilder {
         router_config: RouterConfig,
         request_timeout_secs: u64,
     ) -> Result<Self, String> {
+        let request_limiters = request_limiters_from_config(&router_config);
+
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
-            .maybe_rate_limiter(&router_config)
+            .admission_limiter(request_limiters.admission_limiter)
+            .rate_limiter(request_limiters.rate_limiter)
             .with_tokenizer_registry(&router_config)?
             .with_reasoning_parser_factory()
             .with_tool_parser_factory()
@@ -369,24 +415,6 @@ impl AppContextBuilder {
 
         self.client = Some(client);
         Ok(self)
-    }
-
-    /// Create rate limiter based on config
-    fn maybe_rate_limiter(mut self, config: &RouterConfig) -> Self {
-        self.rate_limiter = match config.max_concurrent_requests {
-            n if n <= 0 => None,
-            n => {
-                let rate_limit_tokens = config
-                    .rate_limit_tokens_per_second
-                    .filter(|&t| t > 0)
-                    .unwrap_or(n);
-                Some(Arc::new(TokenBucket::new(
-                    n as usize,
-                    rate_limit_tokens as usize,
-                )))
-            }
-        };
-        self
     }
 
     /// Create reasoning parser factory for gRPC mode or IGW mode

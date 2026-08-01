@@ -171,6 +171,22 @@ pub(crate) fn init_metrics() {
         "smg_http_rate_limit_total",
         "Rate limiting decisions by result (allowed/rejected)"
     );
+    describe_gauge!(
+        "smg_admission_inflight",
+        "Requests currently holding a Router admission lease"
+    );
+    describe_gauge!(
+        "smg_admission_queued",
+        "Requests currently waiting for a Router admission lease"
+    );
+    describe_histogram!(
+        "smg_admission_queue_wait_seconds",
+        "Time requests spend waiting for a Router admission lease"
+    );
+    describe_counter!(
+        "smg_admission_total",
+        "Router admission decisions by low-cardinality decision"
+    );
 
     // Layer 2: Router metrics
     describe_counter!(
@@ -335,8 +351,6 @@ pub(crate) fn init_metrics() {
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
-    init_metrics();
-
     let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
     let duration_bucket: Vec<f64> = config.duration_buckets.unwrap_or_else(|| {
         vec![
@@ -356,8 +370,23 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .upkeep_timeout(Duration::from_secs(5 * 60))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
+        .set_buckets_for_metric(
+            Matcher::Full(String::from("smg_admission_queue_wait_seconds")),
+            &duration_bucket,
+        )
+        .expect("failed to set admission queue wait buckets")
         .install()
         .expect("failed to install Prometheus metrics exporter");
+
+    // Metric descriptions must be registered after the real recorder is installed. Describing
+    // them before installation sends the HELP metadata to the no-op recorder and loses it.
+    init_metrics();
+
+    // Export both admission gauges from process start, including the idle 0/0 state. Without
+    // this initialization Prometheus does not expose a gauge until its first increment, which
+    // makes a healthy, empty admission queue indistinguishable from a missing metric.
+    gauge!("smg_admission_inflight").set(0.0);
+    gauge!("smg_admission_queued").set(0.0);
 }
 
 /// Label constants for consistent metric labeling
@@ -447,6 +476,32 @@ pub mod metrics_labels {
     pub const ERROR_INTERNAL: &str = "internal_error";
 }
 
+/// The only allowed label values for `smg_admission_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionDecision {
+    Admitted,
+    QueueFull,
+    QueueTimeout,
+    RateLimited,
+    GlobalRateLimited,
+    Cancelled,
+    ShuttingDown,
+}
+
+impl AdmissionDecision {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::QueueFull => "queue_full",
+            Self::QueueTimeout => "queue_timeout",
+            Self::RateLimited => "rate_limited",
+            Self::GlobalRateLimited => "global_rate_limited",
+            Self::Cancelled => "cancelled",
+            Self::ShuttingDown => "shutting_down",
+        }
+    }
+}
+
 /// SMG Metrics helper struct for the new layered metrics architecture.
 ///
 /// Design principles for low overhead:
@@ -475,6 +530,30 @@ pub struct StreamingMetricsParams<'a> {
 }
 
 impl Metrics {
+    pub fn record_admission_decision(decision: AdmissionDecision) {
+        counter!("smg_admission_total", "decision" => decision.as_str()).increment(1);
+    }
+
+    pub fn increment_admission_inflight() {
+        gauge!("smg_admission_inflight").increment(1.0);
+    }
+
+    pub fn decrement_admission_inflight() {
+        gauge!("smg_admission_inflight").decrement(1.0);
+    }
+
+    pub fn increment_admission_queued() {
+        gauge!("smg_admission_queued").increment(1.0);
+    }
+
+    pub fn decrement_admission_queued() {
+        gauge!("smg_admission_queued").decrement(1.0);
+    }
+
+    pub fn record_admission_queue_wait(waited: Duration) {
+        histogram!("smg_admission_queue_wait_seconds").record(waited.as_secs_f64());
+    }
+
     /// Record an HTTP request.
     /// Here we want a metric to directly reflect user's experience ("I am sending a request")
     /// when viewing the router as a blackbox, and is bumped immediately when the request arrives.
@@ -1198,6 +1277,23 @@ mod tests {
     use std::net::TcpListener;
 
     use super::*;
+
+    #[test]
+    fn admission_decision_labels_are_stable() {
+        let cases = [
+            (AdmissionDecision::Admitted, "admitted"),
+            (AdmissionDecision::QueueFull, "queue_full"),
+            (AdmissionDecision::QueueTimeout, "queue_timeout"),
+            (AdmissionDecision::RateLimited, "rate_limited"),
+            (AdmissionDecision::GlobalRateLimited, "global_rate_limited"),
+            (AdmissionDecision::Cancelled, "cancelled"),
+            (AdmissionDecision::ShuttingDown, "shutting_down"),
+        ];
+
+        for (decision, label) in cases {
+            assert_eq!(decision.as_str(), label);
+        }
+    }
 
     #[test]
     fn test_prometheus_config_default() {
