@@ -352,10 +352,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _effective_tools(self, request: ChatCompletionRequest) -> List[Tool]:
         tools = list(request.tools or [])
-        # Message-level tools are a Kimi K3 concept; other renderers never
-        # show them to the model, so they must not arm the tool machinery.
-        if self.chat_encoding_spec != "kimi_k3":
-            return tools
         for message in request.messages:
             if (
                 isinstance(message, ChatCompletionMessageGenericParam)
@@ -799,7 +795,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return media_error
 
         effective_tools = self._effective_tools(request)
-        has_message_tools = self.chat_encoding_spec == "kimi_k3" and any(
+        has_message_tools = any(
             isinstance(message, ChatCompletionMessageGenericParam)
             and message.role in ("system", "developer")
             and message.tools
