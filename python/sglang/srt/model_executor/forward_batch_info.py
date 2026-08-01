@@ -51,7 +51,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
@@ -849,6 +849,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            if model_runner.server_args.enable_lora:
+                model_runner.lora_manager.reset_lora_batch()
             return ret
 
         # Override the positions with diffusion LLM or spec_info
@@ -963,7 +965,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # --enable-mis: every request must carry delimiter indices (the score
             # endpoint always produces MIS-structured requests; consumers index
             # without None-checking).
-            if get_server_args().enable_mis and any(
+            if get_exec().features.enable_mis and any(
                 r.multi_item_delimiter_indices is not None for r in batch.reqs
             ):
                 assert all(
@@ -1132,7 +1134,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
-        rl_on_policy_target = get_server_args().rl_on_policy_target
+        rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
