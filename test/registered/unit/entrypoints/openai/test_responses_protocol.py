@@ -142,5 +142,93 @@ class ResponsesResponseFromRequestTestCase(unittest.TestCase):
         self.assertFalse(response.parallel_tool_calls)
 
 
+class ResponsesTextFormatTestCase(unittest.TestCase):
+    def test_text_defaults_to_none(self):
+        request = ResponsesRequest(model="x", input="hi", store=False)
+        self.assertIsNone(request.text)
+
+    def test_text_json_object_format(self):
+        request = ResponsesRequest(
+            model="x",
+            input="return json",
+            text={"format": {"type": "json_object"}},
+            store=False,
+        )
+        self.assertIsNotNone(request.text)
+        self.assertEqual(request.text.format.type, "json_object")
+
+    def test_text_json_schema_format(self):
+        request = ResponsesRequest(
+            model="x",
+            input="return json",
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "event",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"title": {"type": "string"}},
+                        "required": ["title"],
+                    },
+                    "strict": True,
+                }
+            },
+            store=False,
+        )
+        self.assertIsNotNone(request.text)
+        self.assertEqual(request.text.format.type, "json_schema")
+        self.assertEqual(request.text.format.name, "event")
+        self.assertTrue(request.text.format.strict)
+        self.assertIn("title", request.text.format.schema_["properties"])
+
+    def test_text_json_schema_format_minimal(self):
+        """name is required for json_schema; type defaults to 'json_schema'."""
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            text={"format": {"type": "json_schema", "name": "minimal"}},
+            store=False,
+        )
+        self.assertEqual(request.text.format.name, "minimal")
+        self.assertFalse(request.text.format.strict)
+
+    def test_text_invalid_format_type_rejected(self):
+        with self.assertRaises(ValueError):
+            ResponsesRequest(
+                model="x",
+                input="hi",
+                text={"format": {"type": "yaml"}},
+                store=False,
+            )
+
+
+class ResponsesToolChoiceTestCase(unittest.TestCase):
+    def test_string_tool_choice_unchanged(self):
+        for choice in ("auto", "required", "none"):
+            request = ResponsesRequest(
+                model="x", input="hi", tool_choice=choice, store=False
+            )
+            self.assertEqual(request.tool_choice, choice)
+
+    def test_nested_tool_choice_accepted(self):
+        from sglang.srt.entrypoints.openai.protocol import ToolChoice
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            tool_choice={"type": "function", "function": {"name": "f"}},
+            tools=[
+                {
+                    "type": "function",
+                    "name": "f",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            store=False,
+        )
+        self.assertIsInstance(request.tool_choice, ToolChoice)
+        self.assertEqual(request.tool_choice.function.name, "f")
+
+
 if __name__ == "__main__":
     unittest.main()
