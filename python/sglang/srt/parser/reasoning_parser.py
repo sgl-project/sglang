@@ -454,6 +454,12 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
     ):
+        # strict-thinking flattens these to single token ids, so the full marker
+        # "<|open|>response<|sep|>" is inexpressible. The bare name works: it
+        # follows <|open|> unspaced, so it tokenizes to the no-space variant, not
+        # the " response"/" message" tokens prose uses -- at the cost of not being
+        # able to start those words unspaced mid-reasoning. tools is left out on
+        # purpose: the model may jump from think straight into that channel.
         think_excluded_tokens = [
             "response",
             "message",
