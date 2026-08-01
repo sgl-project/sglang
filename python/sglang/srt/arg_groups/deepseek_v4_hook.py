@@ -179,13 +179,13 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     server_args.enable_dp_attention = True
     server_args.moe_dense_tp_size = 1
     server_args.attn_cp_size = server_args.tp_size // server_args.dp_size
-    if server_args.cp_strategy == "interleave":
-        assert (
-            server_args.dp_size == 1
-        ), "For round-robin split mode, dp attention is not supported."
-    assert (
-        server_args.tp_size <= 8
-    ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+    # if server_args.cp_strategy == "interleave":
+    #     assert (
+    #         server_args.dp_size == 1
+    #     ), "For round-robin split mode, dp attention is not supported."
+    # assert (
+    #     server_args.tp_size <= 8
+    # ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
     if server_args.moe_a2a_backend not in ("none", "deepep", "megamoe"):
         raise ValueError(
             "DeepSeekV4 CP supports moe_a2a_backend in "
