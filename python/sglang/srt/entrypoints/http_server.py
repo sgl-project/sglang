@@ -459,33 +459,52 @@ async def lifespan(fast_api_app: FastAPI):
             warmup_thread.join()
 
 
-# Fast API
-app = FastAPI(
-    lifespan=lifespan,
-    openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
-)
-# The module-level app is bound to an engine through the process-global state
-# (`set_global_state`); apps built by `build_app` get a per-app binding via
-# `init_app_state`. `None` means "fall back to the process-global state".
-app.state.global_state = None
-# Apps created by `build_app` set this to True so the lifespan can refuse to
-# start them when no engine was bound, instead of silently falling back to the
-# process-global state.
-app.state.built_by_build_app = False
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def _new_fastapi_app(*, built_by_build_app: bool) -> FastAPI:
+    """Create an empty FastAPI app with the middleware every SGLang app needs.
 
-if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
-    from sglang.srt.entrypoints.http_request_decompression import (
-        RequestDecompressionMiddleware,
+    Shared by the module-level ``app`` below and by ``build_app`` so the
+    standalone server and embedded apps cannot drift apart. Only the
+    ``built_by_build_app`` marker differs between the two.
+
+    Routes, exception handlers and the middleware that depends on
+    ``server_args`` are added afterwards; see ``build_app`` and
+    ``_configure_single_tokenizer_app``.
+    """
+    fast_api_app = FastAPI(
+        lifespan=lifespan,
+        openapi_url=(
+            None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json"
+        ),
+    )
+    # The module-level app is bound to an engine through the process-global
+    # state (`set_global_state`); apps built by `build_app` get a per-app
+    # binding via `init_app_state`. `None` means "fall back to the
+    # process-global state".
+    fast_api_app.state.global_state = None
+    # Apps created by `build_app` set this to True so the lifespan can refuse
+    # to start them when no engine was bound, instead of silently falling back
+    # to the process-global state.
+    fast_api_app.state.built_by_build_app = built_by_build_app
+    fast_api_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
-    app.add_middleware(RequestDecompressionMiddleware)
+    if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
+        from sglang.srt.entrypoints.http_request_decompression import (
+            RequestDecompressionMiddleware,
+        )
+
+        fast_api_app.add_middleware(RequestDecompressionMiddleware)
+
+    return fast_api_app
+
+
+# Fast API
+app = _new_fastapi_app(built_by_build_app=False)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -2494,23 +2513,42 @@ def _configure_single_tokenizer_app(
 def _embedded_app_warmup(server_args: ServerArgs, run_http_warmup: bool) -> None:
     """Warmup thread body for apps built by ``build_app``.
 
-    When ``run_http_warmup`` is False (the default for embedded apps), no HTTP
-    requests are sent and the engine is simply marked ready, exactly as if
-    ``skip_server_warmup`` were set. When it is True, the regular HTTP warmup
-    runs against ``server_args.host`` and ``server_args.port``. Unlike the
-    standalone server path, a warmup failure never kills the process, because
-    the process belongs to the external host that embeds the app.
+    Runs the same startup steps as the standalone server (``_wait_and_warmup``)
+    and only replaces the step that sends the warmup HTTP requests:
+
+    * When ``run_http_warmup`` is False (the default for embedded apps), no
+      HTTP request is sent and the engine is simply marked ready, exactly as if
+      ``skip_server_warmup`` were set. An embedded app is usually not served at
+      ``server_args.host`` and ``server_args.port``, so requests to that
+      address would not reach it.
+    * When ``run_http_warmup`` is True, the regular HTTP warmup runs against
+      ``server_args.host`` and ``server_args.port``, except that a failure
+      never kills the process, because the process belongs to the external
+      host that embeds the app. The failure is logged and the engine stays not
+      ready.
+
+    Everything else stays as on the standalone path: waiting for the weights
+    of a checkpoint engine, skipping warmup for an elastic EP joiner, deleting
+    the checkpoint after loading, and ending the process after a tensor dump
+    run. The only step of ``_wait_and_warmup`` an embedded app never uses is
+    the launch callback, which the standalone path uses to report readiness
+    back to ``launch_server``. An embedded app has no such caller to report
+    to; its host starts the app and sees the ASGI lifespan finish.
     """
-    if run_http_warmup and not server_args.skip_server_warmup:
-        if not _execute_server_warmup(server_args, kill_process_on_failure=False):
-            logger.error(
-                "Warmup of the embedded SGLang app failed. The engine was not "
-                "marked ready. The host process keeps running."
-            )
-            return
-    else:
-        _global_state.tokenizer_manager.server_status = ServerStatus.Up
-    logger.info("The server is fired up and ready to roll!")
+
+    def execute_warmup(server_args: ServerArgs) -> bool:
+        if not run_http_warmup:
+            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            return True
+        if _execute_server_warmup(server_args, kill_process_on_failure=False):
+            return True
+        logger.error(
+            "Warmup of the embedded SGLang app failed. The engine was not "
+            "marked ready. The host process keeps running."
+        )
+        return False
+
+    _wait_and_warmup(server_args, execute_warmup_func=execute_warmup)
 
 
 def build_app(server_args: ServerArgs, warmup: bool = False) -> FastAPI:
@@ -2543,10 +2581,18 @@ def build_app(server_args: ServerArgs, warmup: bool = False) -> FastAPI:
        ``server_args.api_key`` to ``server_args.host`` and
        ``server_args.port``. Only enable it when the app is actually served
        at that address.
-    3. The app installs a CORS policy that allows every origin with
+    3. Apart from those requests, startup runs the same steps as the
+       standalone server; see ``_embedded_app_warmup``. Two of those steps are
+       worth calling out for a host process. Setting
+       ``server_args.debug_tensor_dump_input_file`` still ends the process
+       once the dump is written, and that process is now the host's, so use
+       the flag only in a debug run. And there is no "the engine is ready"
+       callback, because the host starts the app itself and sees the ASGI
+       lifespan finish.
+    4. The app installs a CORS policy that allows every origin with
        credentials, the same as ``launch_server``. When the app is mounted
        inside a host application, that policy applies to the mounted subtree.
-    4. Only single tokenizer mode is supported; multi tokenizer mode requires
+    5. Only single tokenizer mode is supported; multi tokenizer mode requires
        the shared memory bootstrap in ``launch_server``.
     """
     if server_args.tokenizer_worker_num != 1:
@@ -2557,27 +2603,7 @@ def build_app(server_args: ServerArgs, warmup: bool = False) -> FastAPI:
             "launch_server."
         )
 
-    fast_api_app = FastAPI(
-        lifespan=lifespan,
-        openapi_url=(
-            None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json"
-        ),
-    )
-    fast_api_app.state.global_state = None
-    fast_api_app.state.built_by_build_app = True
-    fast_api_app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-    if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
-        from sglang.srt.entrypoints.http_request_decompression import (
-            RequestDecompressionMiddleware,
-        )
-
-        fast_api_app.add_middleware(RequestDecompressionMiddleware)
+    fast_api_app = _new_fastapi_app(built_by_build_app=True)
 
     # Every endpoint in this module is registered on the module-level ``app``;
     # snapshot those route objects onto the fresh app. Plain starlette

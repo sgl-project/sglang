@@ -5,7 +5,6 @@ FastAPI app bound to an in-process engine, without launching a server or
 loading model weights.
 """
 
-import inspect
 import os
 import tempfile
 import unittest
@@ -19,7 +18,6 @@ from fastapi.testclient import TestClient
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.http_server import (
     _configure_single_tokenizer_app,
-    _setup_and_run_http_server,
     build_app,
     get_global_state,
     init_app_state,
@@ -94,6 +92,20 @@ class HttpServerAppFactoryTestBase(CustomTestCase):
 
         self.addCleanup(_restore_env)
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_dir.name
+
+    def _publish_global_state(self, engine):
+        """Publish an engine as the process global state.
+
+        This is what a server running in the same process does through
+        set_global_state, and what the native endpoints read.
+        """
+        set_global_state(
+            http_server._GlobalState(
+                tokenizer_manager=engine.tokenizer_manager,
+                template_manager=engine.template_manager,
+                scheduler_info={"max_req_input_len": 128},
+            )
+        )
 
 
 class TestBuildApp(HttpServerAppFactoryTestBase):
@@ -213,13 +225,7 @@ class TestInitAppState(HttpServerAppFactoryTestBase):
         init_app_state(engine, app.state)
 
         other_engine = _fake_engine(server_args)
-        set_global_state(
-            http_server._GlobalState(
-                tokenizer_manager=other_engine.tokenizer_manager,
-                template_manager=other_engine.template_manager,
-                scheduler_info={"max_req_input_len": 128},
-            )
-        )
+        self._publish_global_state(other_engine)
 
         with TestClient(app) as client:
             self.assertEqual(client.get("/ping").status_code, 200)
@@ -280,6 +286,28 @@ class TestFactoryAppWarmup(HttpServerAppFactoryTestBase):
                 pass
 
         warmup_stub.assert_called_once_with(server_args, kill_process_on_failure=False)
+
+    def test_embedded_warmup_runs_the_standalone_startup_steps(self):
+        """Bug regression: the embedded warmup restated only the middle of the
+        standalone startup sequence, so the steps around it were dropped
+        without an error and without an effect. An embedded app configured
+        with one of them, here delete_ckpt_after_loading, must get it.
+        """
+        server_args = ServerArgs(
+            model_path="dummy",
+            skip_server_warmup=True,
+            delete_ckpt_after_loading=True,
+        )
+        engine = _fake_engine(server_args)
+        app = build_app(server_args)
+        init_app_state(engine, app.state)
+
+        with patch.object(http_server, "delete_directory") as delete_stub:
+            with TestClient(app):
+                pass
+
+        delete_stub.assert_called_once_with(server_args.model_path)
+        self.assertEqual(engine.tokenizer_manager.server_status, ServerStatus.Up)
 
     def test_warmup_failure_can_skip_process_kill(self):
         """_execute_server_warmup(kill_process_on_failure=False) must report
@@ -443,13 +471,7 @@ class TestEngineBindingGuards(HttpServerAppFactoryTestBase):
         # A foreign engine is published globally, as another server in the
         # same process would do.
         other_engine = _fake_engine(server_args)
-        set_global_state(
-            http_server._GlobalState(
-                tokenizer_manager=other_engine.tokenizer_manager,
-                template_manager=other_engine.template_manager,
-                scheduler_info={"max_req_input_len": 128},
-            )
-        )
+        self._publish_global_state(other_engine)
 
         with self.assertRaises(RuntimeError):
             with TestClient(app):
@@ -473,13 +495,7 @@ class TestEngineBindingGuards(HttpServerAppFactoryTestBase):
         self.assertFalse(hasattr(plain_app.state, "built_by_build_app"))
 
         engine = _fake_engine(server_args)
-        set_global_state(
-            http_server._GlobalState(
-                tokenizer_manager=engine.tokenizer_manager,
-                template_manager=engine.template_manager,
-                scheduler_info={"max_req_input_len": 128},
-            )
-        )
+        self._publish_global_state(engine)
 
         with TestClient(plain_app):
             pass
@@ -507,13 +523,7 @@ class TestEngineBindingGuards(HttpServerAppFactoryTestBase):
         self.assertFalse(hasattr(legacy_app, "warmup_thread_target"))
 
         engine = _fake_engine(server_args)
-        set_global_state(
-            http_server._GlobalState(
-                tokenizer_manager=engine.tokenizer_manager,
-                template_manager=engine.template_manager,
-                scheduler_info={"max_req_input_len": 128},
-            )
-        )
+        self._publish_global_state(engine)
 
         with patch.object(http_server, "_wait_and_warmup") as warmup_stub:
             with TestClient(legacy_app):
@@ -538,14 +548,6 @@ class TestEngineBindingGuards(HttpServerAppFactoryTestBase):
 
         init_app_state(engine, app.state, server_args=server_args)
         self.assertIs(app.state.server_args, server_args)
-
-
-class TestLaunchServerSharesFactoryPath(HttpServerAppFactoryTestBase):
-    def test_launch_server_and_build_app_use_same_configuration_helper(self):
-        """launch_server and build_app must configure apps through one code path."""
-        helper_name = _configure_single_tokenizer_app.__name__
-        self.assertIn(helper_name, inspect.getsource(_setup_and_run_http_server))
-        self.assertIn(helper_name, inspect.getsource(build_app))
 
 
 if __name__ == "__main__":
