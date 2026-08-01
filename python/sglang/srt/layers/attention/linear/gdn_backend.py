@@ -186,9 +186,10 @@ class GDNKernelDispatcher:
             decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
         ) and flashinfer_kernel.supports_target_verify:
             self.verify_kernel = flashinfer_kernel
+            self.verify_kernel_is_flashinfer = True
         else:
             self.verify_kernel = triton_kernel
-        self.verify_kernel_is_flashinfer = self.verify_kernel is flashinfer_kernel
+            self.verify_kernel_is_flashinfer = False
 
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False
