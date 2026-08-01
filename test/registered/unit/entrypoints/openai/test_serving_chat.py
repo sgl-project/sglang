@@ -122,6 +122,74 @@ class ServingChatTestCase(unittest.TestCase):
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
 
+    def test_text_only_model_rejects_media_before_generation(self):
+        media_parts = {
+            "image_url": {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/image.png"},
+            },
+            "video_url": {
+                "type": "video_url",
+                "video_url": {"url": "https://example.com/video.mp4"},
+            },
+            "audio_url": {
+                "type": "audio_url",
+                "audio_url": {"url": "https://example.com/audio.wav"},
+            },
+        }
+
+        for media_type, media_part in media_parts.items():
+            with self.subTest(media_type=media_type):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "describe"},
+                                media_part,
+                            ],
+                        }
+                    ],
+                )
+                response = get_or_create_event_loop().run_until_complete(
+                    self.chat.handle_request(request, self.fastapi_request)
+                )
+                error = json.loads(response.body)
+                self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
+                self.assertEqual(error["type"], "BadRequestError")
+                self.assertIn(media_type, error["message"])
+        self.tm.generate_request.assert_not_called()
+
+    def test_media_validation_does_not_reject_supported_content(self):
+        text_request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_reference", "name": "get_weather"}],
+                }
+            ],
+        )
+        self.assertIsNone(self.chat._validate_request(text_request))
+
+        self.tm.model_config.is_multimodal = True
+        multimodal_request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/image.png"},
+                        }
+                    ],
+                }
+            ],
+        )
+        self.assertIsNone(self.chat._validate_request(multimodal_request))
+
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
         with (
@@ -761,6 +829,50 @@ class ServingChatTestCase(unittest.TestCase):
 
                 encoded = self.tm.tokenizer.encode.call_args.args[0]
                 self.assertIn(TOOL_ERROR_PREFIX.strip(), encoded)
+
+    def test_tool_error_marker_reaches_inkling_renderer(self):
+        """Inkling is the third encoder returning through _encode_messages, and
+        it renders tool turns through its own renderer rather than a template."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "inkling"
+        self.chat._inkling_default_reasoning_effort = 0.9
+        self.tm.tokenizer.encode.side_effect = lambda text, **kw: list(text.encode())
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Where is it raining?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Beijing"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "boom",
+                    "is_error": True,
+                },
+            ],
+            reasoning_effort=0.5,
+        )
+
+        result = self.chat._process_messages(req, is_multimodal=False)
+
+        rendered = bytes(b for b in result.prompt_ids if b < 256).decode(
+            errors="ignore"
+        )
+        self.assertIn(TOOL_ERROR_PREFIX.strip(), rendered)
 
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
@@ -2572,55 +2684,6 @@ class InklingReasoningEffortTest(unittest.TestCase):
             thinking_mode=None,
         )
         self.assertEqual(prompt_ids[-1], INKLING_SPECIAL_TOKEN_IDS["<|end_message|>"])
-
-    def test_tool_error_marker_reaches_inkling_renderer(self):
-        """Inkling returns through _encode_messages and never reaches the Jinja
-        branch, so a fold placed there would leave its tool turns unmarked."""
-
-        class Tokenizer:
-            def encode(self, text, add_special_tokens=False):
-                return list(text.encode())
-
-        serving = object.__new__(OpenAIServingChat)
-        serving.chat_encoding_spec = "inkling"
-        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[
-                {"role": "user", "content": "go"},
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {
-                                "name": "get_weather",
-                                "arguments": '{"city": "Beijing"}',
-                            },
-                        }
-                    ],
-                },
-                {
-                    "role": "tool",
-                    "tool_call_id": "call_1",
-                    "content": "boom",
-                    "is_error": True,
-                },
-            ],
-            reasoning_effort=0.5,
-        )
-
-        messages = [message.model_dump() for message in request.messages]
-        for message in messages:
-            normalize_assistant_tool_call_arguments(message)
-            fold_tool_error_into_content(message)
-
-        prompt_ids = serving._encode_messages(messages, request, thinking_mode=None)
-
-        rendered = bytes(b for b in prompt_ids if b < 256).decode(errors="ignore")
-        self.assertIn(TOOL_ERROR_PREFIX.strip(), rendered)
 
     def test_continue_final_message_resumes_open_model_text_block(self):
         """Bug regression: continue_final_message was silently ignored on the

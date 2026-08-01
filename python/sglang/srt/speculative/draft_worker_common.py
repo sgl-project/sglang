@@ -10,7 +10,7 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_context, get_server_args
+from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -97,8 +97,9 @@ def build_draft_tp_worker(
         context_length=target_model_config.context_len,
     )
 
-    saved_server_args = get_server_args()
-    try:
+    # The draft's layers must resolve config from the draft's own bags.
+    with get_context().preserve_config():
+        get_context().set_server_args(draft_server_args)
         draft_worker = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,
@@ -106,8 +107,6 @@ def build_draft_tp_worker(
             nccl_port=nccl_port,
             is_draft_worker=True,
         )
-    finally:
-        get_context().set_server_args(saved_server_args)
 
     draft_model_runner = draft_worker.model_runner
     draft_worker.draft_runner = draft_model_runner

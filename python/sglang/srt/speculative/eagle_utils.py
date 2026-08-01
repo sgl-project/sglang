@@ -103,7 +103,9 @@ def organize_draft_results(
     parents_list: List[torch.Tensor],
     num_draft_token: int,
 ):
+    # b, n, topk; n = 1 + (num_steps-1) * topk
     score_list = torch.cat(score_list, dim=1).flatten(1)
+    # b, (topk + (num_steps-1) * topk)
     ss_token_list = torch.cat(token_list, dim=1)
     top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
     top_scores_index = top_scores.indices
@@ -151,7 +153,7 @@ def build_tree_kernel_efficient(
     num_verify_tokens: int,
     tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
     tree_mask_buf: Optional[torch.Tensor] = None,
-    position_buf: Optional[torch.Tensor] = None,
+    fill_prefix_mask: bool = True,
 ):
     draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
 
@@ -168,7 +170,11 @@ def build_tree_kernel_efficient(
         elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
             tree_mask.fill_(0)
         elif tree_mask_mode == TreeMaskMode.FULL_MASK:
-            tree_mask.fill_(True)
+            # Only the [0, seq_len) prefix columns depend on this fill; the
+            # kernel below writes every tree cell itself. Skip the (up to
+            # 100s of MB) per-step memset when nothing reads the mask.
+            if fill_prefix_mask:
+                tree_mask.fill_(True)
         else:
             raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
     elif tree_mask_mode == TreeMaskMode.QLEN_ONLY:
@@ -187,13 +193,15 @@ def build_tree_kernel_efficient(
             device=device,
         )
     elif tree_mask_mode == TreeMaskMode.FULL_MASK:
-        tree_mask = torch.full(
-            (
-                seq_lens_sum * num_verify_tokens
-                + num_verify_tokens * num_verify_tokens * bs,
-            ),
-            True,
-            device=device,
+        mask_shape = (
+            seq_lens_sum * num_verify_tokens
+            + num_verify_tokens * num_verify_tokens * bs,
+        )
+        # Same reasoning as the preallocated branch above.
+        tree_mask = (
+            torch.full(mask_shape, True, dtype=torch.bool, device=device)
+            if fill_prefix_mask
+            else torch.empty(mask_shape, dtype=torch.bool, device=device)
         )
     else:
         raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
@@ -206,12 +214,7 @@ def build_tree_kernel_efficient(
     # position: where each token belongs to
     # e.g. if depth of each draft token is [0, 1, 1, 2] and the prompt length is 7
     # then, positions = [7, 8, 8, 9]
-    if position_buf is not None:
-        positions = position_buf
-    else:
-        positions = torch.empty(
-            (bs * num_verify_tokens,), device=device, dtype=torch.long
-        )
+    positions = torch.empty((bs * num_verify_tokens,), device=device, dtype=torch.long)
 
     if _is_npu:
         torch.ops.npu.build_tree_kernel_efficient(
@@ -656,7 +659,6 @@ def eagle_sample(
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
-    from sglang.srt.runtime_context import get_server_args
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
@@ -743,7 +745,7 @@ def eagle_sample(
             chain_speculative_sampling_triton,
         )
 
-        use_rejection_sampling = get_server_args().speculative_use_rejection_sampling
+        use_rejection_sampling = get_spec().speculative_use_rejection_sampling
 
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
@@ -916,9 +918,8 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
     # would OOB and free would leak KV. The row is widened to hold it in _init_pools
     # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
-    from sglang.srt.runtime_context import get_server_args
 
-    if page_size > 1 and (get_server_args().speculative_eagle_topk or 1) > 1:
+    if page_size > 1 and (get_spec().speculative_eagle_topk or 1) > 1:
         max_alloc_len = int(nxt_kv_lens_cpu.max())
         row_width = batch.req_to_token_pool.req_to_token.shape[1]
         assert max_alloc_len <= row_width, (
