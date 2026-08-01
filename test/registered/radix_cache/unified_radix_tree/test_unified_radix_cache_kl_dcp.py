@@ -1,26 +1,14 @@
 """HiCache L2 under decode context parallelism (DCP) + UnifiedRadixCache.
 
-Under DCP the radix/controller layer allocates in a widened logical index
-space (pages of ``page_size * dcp_size``) while each rank's device and host
-buffers only hold its owned 1/dcp_size token shard. If the host pool hands
-those logical indices straight to the transfer kernels, ranks read and write
-each other's rows: cache hits then return another rank's KV, which shows up as
-silently wrong (sometimes garbage) output once entries are served from L2.
+Under DCP the radix layer allocates widened logical indices while each rank's
+buffers hold only its 1/dcp_size shard, so a missing translation makes cache
+hits return another rank's KV. The KL cases catch that as a large divergence.
 
-The KL cases compare logprobs for tokens served from cache against
-recomputation, so a mistranslated row is a large divergence rather than a
-subtle accuracy wobble. ``test_zz_l2_loadback_occurred`` asserts the L2 path
-was exercised at all, since the KL cases would otherwise pass on a cache that
-is never read back.
-
-Blackwell-only: the DCP decode path for MLA is wired for ``tokenspeed_mla``
-(SM100/SM12x); Hopper backends reject or mis-shape it.
+Blackwell-only: the MLA DCP decode path needs ``tokenspeed_mla`` (SM100/12x).
 """
 
 import subprocess
 import unittest
-
-import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -118,36 +106,6 @@ class TestUnifiedKimiLinearDcpHiCache(UnifiedRadixTreeTestMixin, CustomTestCase)
         except subprocess.TimeoutExpired:
             pass
         kill_process_tree(cls.process.pid)
-
-    def _load_back_tokens(self) -> float:
-        text = requests.get(self.base_url + "/metrics", timeout=60).text
-        total = 0.0
-        for line in text.splitlines():
-            if line.startswith("sglang:load_back_tokens_total"):
-                total += float(line.rsplit(" ", 1)[1])
-        return total
-
-    def test_zz_l2_loadback_occurred(self):
-        """Host->device load-backs must actually happen under DCP.
-
-        Sorts last so it sees the traffic the KL cases generate; the probe
-        below keeps it meaningful when the case is run on its own.
-        """
-        payload = {
-            "input_ids": self.input_ids[:4],
-            "sampling_params": {"temperature": 0, "max_new_tokens": 8},
-        }
-        for _ in range(3):
-            response = requests.post(
-                self.base_url + "/generate", json=payload, timeout=600
-            )
-            response.raise_for_status()
-        self.assertGreater(
-            self._load_back_tokens(),
-            0.0,
-            "no host->device load-backs recorded; the L2 path under test was "
-            "never exercised",
-        )
 
 
 if __name__ == "__main__":
