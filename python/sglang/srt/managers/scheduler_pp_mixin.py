@@ -36,6 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_xpu
@@ -479,7 +480,7 @@ class SchedulerPPMixin:
                     )
                 )
 
-                if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                if get_disagg().disaggregation_decode_enable_offload_kvcache:
                     self.decode_offload_manager.check_offload_progress()
 
                 if rmbs[next_mb_id] is not None:
@@ -549,7 +550,7 @@ class SchedulerPPMixin:
                 + len(self.disagg_decode_transfer_queue.queue)
                 + len(self.disagg_decode_prealloc_queue.queue)
             )
-            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            if get_disagg().disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
             if server_is_idle and queue_size == 0:

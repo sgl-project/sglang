@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt import runtime_context as rc
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -135,6 +136,17 @@ class TestGetDcpLens(CustomTestCase):
             swa_max_total_num_tokens=None,
         )
         allocators = {}
+
+        # The configurator's bag reads (disaggregation_mode / page_size /
+        # enable_hisparse) come from the published context; the per-iteration
+        # dcp_size stays on the injected instance stand-in.
+        self._sa_override = rc.get_context().override_server_args(
+            disaggregation_mode="null",
+            page_size=physical_page_size,
+            enable_hisparse=False,
+        )
+        self._sa_override.install()
+        self.addCleanup(self._sa_override.restore)
 
         for dcp_size in (1, 4):
             configurator = SimpleNamespace(

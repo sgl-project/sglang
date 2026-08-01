@@ -20,9 +20,12 @@ block table filled with DENSE page ids:
 
     dense_page(virtual_page) = v2p[virtual_page] * layer_num
 
-`create_flashmla_kv_indices_triton` does that in-kernel via `v2p_ptr` / `PAGE_MULT`
-(trtllm_mla / cutedsl_mla / tokenspeed_mla), and the flashinfer_mla updaters do it
-by post-gathering `translate_kv_loc_dense` over the token-level kv_indices.
+Three backend families reach that same formula by different routes:
+  - `create_flashmla_kv_indices_triton` in-kernel via `v2p_ptr` / `PAGE_MULT`
+    (trtllm_mla / cutedsl_mla / tokenspeed_mla);
+  - the flashinfer_mla updaters, post-gathering `translate_kv_loc_dense` over the
+    token-level kv_indices;
+  - `normal_decode_set_metadata` in-kernel, for fa3's captured-decode page table.
 
 Covered here:
   - kernel identity: `v2p_ptr=None, PAGE_MULT=1` is byte-identical to main;
@@ -30,7 +33,10 @@ Covered here:
     ragged sequence lengths and a non-identity v2p permutation;
   - padded block-table lanes never index the v2p table out of bounds;
   - the token-level dense translate the flashinfer updaters apply agrees with the
-    page-level block table the trtllm path builds.
+    page-level block table the trtllm path builds;
+  - fa3's fused metadata kernels agree with the same reference, on both the
+    page_size == 1 fast path (which is what Kimi-Linear takes: fa3 imposes no
+    page-size constraint) and the general path.
 
     python -m pytest test/registered/unit/mem_cache/test_unified_mla_dense_block_table.py -v
 """
@@ -199,6 +205,105 @@ class TestDenseBlockTable(unittest.TestCase):
             )
 
 
+@unittest.skipUnless(_HAS_CUDA, "requires CUDA")
+class TestFa3MetadataDenseBlockTable(unittest.TestCase):
+    """fa3 folds the unified remap into `normal_decode_set_metadata`, the fused
+    gather that writes its captured-decode page table, so the kernel itself has
+    to get the mapping right. Two kernels back it: a page_size == 1 / no-SWA fast
+    path (what Kimi-Linear takes, since fa3 imposes no page-size constraint) and
+    a general one.
+    """
+
+    def _run(self, page_size, *, v2p, mult, bs=5, max_ctx=2048):
+        from sglang.kernels.ops.attention.metadata import normal_decode_set_metadata
+
+        maker = TestDenseBlockTable._make_batch
+        rt, rpi, sl, v2p_full = maker(self, page_size, bs=bs, max_ctx=max_ctx)
+        v2p_arg = v2p_full if v2p else None
+
+        max_pages = (max_ctx + page_size - 1) // page_size
+        page_table = torch.zeros((bs, max_pages), dtype=torch.int32, device=_DEV)
+        cache_seqlens = torch.zeros((bs,), dtype=torch.int32, device=_DEV)
+        cu_seqlens_k = torch.zeros((bs + 1,), dtype=torch.int32, device=_DEV)
+        strided = torch.arange(0, max_ctx, page_size, device=_DEV)
+        max_seq_pages = (int(sl.max().item()) + page_size - 1) // page_size
+
+        normal_decode_set_metadata(
+            cache_seqlens,
+            cu_seqlens_k,
+            page_table,
+            rt,
+            rpi,
+            strided,
+            max_seq_pages,
+            sl.to(torch.int64),
+            0,
+            page_size,
+            v2p_page_table=v2p_arg,
+            kernel_page_multiplier=mult,
+        )
+        torch.cuda.synchronize()
+        want = _reference(rt, rpi, sl, page_size, v2p=v2p_arg, mult=mult)
+        return page_table, want, sl
+
+    def _assert_live_prefix(self, got, want, sl, page_size):
+        """The kernel contract only (re)writes each row's live page prefix; the
+        tail keeps stale values that consumers bound by cache_seqlens."""
+        for r in range(got.shape[0]):
+            n_pages = (int(sl[r].item()) + page_size - 1) // page_size
+            self.assertTrue(
+                torch.equal(got[r, :n_pages].long(), want[r, :n_pages]),
+                f"row {r} (page_size={page_size}):\n"
+                f"got ={got[r, :n_pages]}\nwant={want[r, :n_pages]}",
+            )
+
+    def test_identity_when_hooks_absent(self):
+        """Static pool: no v2p, multiplier 1 -> byte-identical to pre-change."""
+        for page_size in (1, 64):
+            got, want, sl = self._run(page_size, v2p=False, mult=1)
+            self._assert_live_prefix(got, want, sl, page_size)
+
+    def test_dense_mapping_ps1_fast_path(self):
+        got, want, sl = self._run(1, v2p=True, mult=_LAYERS)
+        self._assert_live_prefix(got, want, sl, 1)
+
+    def test_dense_mapping_general_path(self):
+        got, want, sl = self._run(64, v2p=True, mult=_LAYERS)
+        self._assert_live_prefix(got, want, sl, 64)
+
+    def test_single_full_attention_layer(self):
+        """multiplier 1 with a real v2p: the gather alone is the translation."""
+        for page_size in (1, 64):
+            got, want, sl = self._run(page_size, v2p=True, mult=1)
+            self._assert_live_prefix(got, want, sl, page_size)
+            virtual = _reference(
+                *TestDenseBlockTable._make_batch(self, page_size)[:3],
+                page_size,
+                v2p=None,
+                mult=1,
+            )
+            self.assertFalse(
+                torch.equal(want, virtual),
+                "test batch degenerated: v2p is the identity on the pages used",
+            )
+
+    def test_agrees_with_flashmla_block_table(self):
+        """fa3 and trtllm_mla build the same table two different ways; a
+        disagreement means one family is addressing the wrong pages."""
+        for page_size in (1, 64):
+            got, _, sl = self._run(page_size, v2p=True, mult=_LAYERS)
+            rt, rpi, sl2, v2p = TestDenseBlockTable._make_batch(self, page_size)
+            other = _fill_block_table(
+                rt, rpi, sl2, page_size, v2p=v2p, mult=_LAYERS
+            ).long()
+            for r in range(got.shape[0]):
+                n_pages = (int(sl[r].item()) + page_size - 1) // page_size
+                self.assertTrue(
+                    torch.equal(got[r, :n_pages].long(), other[r, :n_pages]),
+                    f"fa3 and flashmla block tables disagree (row {r}, ps={page_size})",
+                )
+
+
 class TestUnifiedMLAHookDetection(unittest.TestCase):
     """`unified_mla_hooks` decides whether the paged MLA backends translate at
     all. Getting the predicate wrong is silent: the block table and KV write loc
@@ -207,7 +312,7 @@ class TestUnifiedMLAHookDetection(unittest.TestCase):
 
     @staticmethod
     def _probe(**attrs):
-        from sglang.srt.layers.attention.flashinfer_mla_backend import (
+        from sglang.srt.layers.attention.unified_mem_hooks import (
             unified_mla_hooks,
         )
 
