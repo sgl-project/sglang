@@ -106,6 +106,11 @@ DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_LDFLAGS = []
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, str, bool, torch.dtype]
 
+# Used when this process cannot get a host name from the operating system.
+# The random part keeps the value unique to this process, and it is computed
+# once so that every build in this process still shares one staging directory.
+_UNKNOWN_HOST_TAG = f"unknown-host_{uuid.uuid4().hex}"
+
 
 class CPPArgList(list[str]):
     def __str__(self) -> str:
@@ -173,12 +178,6 @@ def _jit_build_dir_name(module_name: str) -> str:
     return f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}"
 
 
-# Used when this process cannot get a host name from the operating system.
-# The random part keeps the value unique to this process, and it is computed
-# once so that every build in this process still shares one staging directory.
-_UNKNOWN_HOST_TAG = f"unknown-host_{uuid.uuid4().hex}"
-
-
 def _host_tag() -> str:
     """Filesystem safe per host tag that keeps staging build dirs host private.
 
@@ -190,6 +189,10 @@ def _host_tag() -> str:
     exists to prevent. The price of the unique fallback is one extra compile
     per process on such a host, on a cold cache only, which is far cheaper
     than a failed startup.
+
+    The lookup itself is not cached, so a later call still sees a host name
+    that the operating system starts reporting. The fallback lives in a module
+    constant, so every call in one process gets the same fallback value.
     """
     try:
         hostname = socket.gethostname()
@@ -416,6 +419,10 @@ def load_jit(
     if use_default_cache and not envs.SGLANG_DISABLE_JIT_KERNEL_STAGED_BUILD.get():
         staging_directory = str(pathlib.Path(build_directory) / f"stage__{_host_tag()}")
 
+    # The header only path passes sources as strings, the file based path
+    # passes file names, and everything else about the two calls is the same.
+    # Pick the pair of functions and the source arguments here, then make one
+    # call below so the flag arguments are written once.
     if header_only:
         cpp_wrappers = cpp_wrappers or []
         cuda_wrappers = cuda_wrappers or []
@@ -425,54 +432,31 @@ def load_jit(
         # include cuda files
         cuda_sources = [f'#include "{path}"' for path in cuda_files]
         cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
-        with _jit_compile_context():
-            if staging_directory is None:
-                return load_inline(
-                    module_name,
-                    cpp_sources=cpp_sources,
-                    cuda_sources=cuda_sources,
-                    extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-                    extra_cuda_cflags=get_default_target_flags() + extra_cuda_cflags,
-                    extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
-                    extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-                    build_directory=build_directory,
-                )
-            built_so = build_inline(
-                module_name,
-                cpp_sources=cpp_sources,
-                cuda_sources=cuda_sources,
-                extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-                extra_cuda_cflags=get_default_target_flags() + extra_cuda_cflags,
-                extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
-                extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-                build_directory=staging_directory,
-            )
-            return _publish_and_load(built_so, prebuilt, overwrite=overwrite_bad_target)
+
+        build_in_place, build_in_staging = load_inline, build_inline
+        source_kwargs = {"cpp_sources": cpp_sources, "cuda_sources": cuda_sources}
     else:
         assert cpp_wrappers is None and cuda_wrappers is None
-        with _jit_compile_context():
-            if staging_directory is None:
-                return load(
-                    module_name,
-                    cpp_files=cpp_files,
-                    cuda_files=cuda_files,
-                    extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-                    extra_cuda_cflags=get_default_target_flags() + extra_cuda_cflags,
-                    extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
-                    extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-                    build_directory=build_directory,
-                )
-            built_so = build(
-                module_name,
-                cpp_files=cpp_files,
-                cuda_files=cuda_files,
-                extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-                extra_cuda_cflags=get_default_target_flags() + extra_cuda_cflags,
-                extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
-                extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-                build_directory=staging_directory,
+
+        build_in_place, build_in_staging = load, build
+        source_kwargs = {"cpp_files": cpp_files, "cuda_files": cuda_files}
+
+    with _jit_compile_context():
+        build_kwargs = dict(
+            **source_kwargs,
+            extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+            extra_cuda_cflags=get_default_target_flags() + extra_cuda_cflags,
+            extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+            extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+        )
+        if staging_directory is None:
+            return build_in_place(
+                module_name, **build_kwargs, build_directory=build_directory
             )
-            return _publish_and_load(built_so, prebuilt, overwrite=overwrite_bad_target)
+        built_so = build_in_staging(
+            module_name, **build_kwargs, build_directory=staging_directory
+        )
+        return _publish_and_load(built_so, prebuilt, overwrite=overwrite_bad_target)
 
 
 @contextmanager
