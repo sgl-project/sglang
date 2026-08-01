@@ -39,7 +39,6 @@ from sglang.srt.managers.tokenizer_manager import (
 )
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -320,8 +319,8 @@ class TestB64MetaInfo(CustomTestCase):
 
 
 def _make_logprob_processor() -> SchedulerLogprobResultProcessor:
+    # enable_mis comes from the published exec bag, not from here; see setUp.
     return SchedulerLogprobResultProcessor(
-        server_args=rc.get_context().server_args,
         model_config=SimpleNamespace(vocab_size=1_000_000),
     )
 
@@ -343,10 +342,12 @@ class TestSchedulerFlatAssembly(CustomTestCase):
     """Scheduler-side flat assembly in the logprob result processor."""
 
     def setUp(self):
-        rc.publish(ServerArgs(model_path="dummy"), role="test")
+        super().setUp()
+        self._server_args_override = rc.get_context().override_server_args()
+        self._server_args_override.install()
 
     def tearDown(self):
-        rc.reset_context()
+        self._server_args_override.restore()
 
     def _make_req(self, flat: bool, num_tokens: int = 5) -> Req:
         return Req(
