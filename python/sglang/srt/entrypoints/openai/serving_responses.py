@@ -65,7 +65,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     Tool,
     UsageInfo,
 )
-from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.serving_chat import (
+    OpenAIServingChat,
+    has_usable_prompt_ids,
+    request_carries_media,
+)
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -494,7 +498,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
 
-        if is_multimodal:
+        # A multimodal-capable checkpoint serving a text-only request does not need
+        # the text prompt path: passing text here discards the already-computed
+        # prompt_ids and costs two extra full-context tokenizations downstream (the
+        # max_output_tokens budget below re-encodes the prompt, and TokenizerManager
+        # re-encodes it again). That is O(context) per request and dominates
+        # late-session TTFT on long append-only conversations.
+        if (
+            is_multimodal and request_carries_media(processed_messages)
+        ) or not has_usable_prompt_ids(processed_messages):
             request_prompts = [processed_messages.prompt]
             engine_prompts = [processed_messages.prompt]
         else:

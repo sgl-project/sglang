@@ -160,6 +160,32 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     return img_max_dynamic_patch, vid_max_dynamic_patch
 
 
+def request_carries_media(processed_messages: MessageProcessingResult) -> bool:
+    """Whether this request actually carries multimodal payload.
+
+    ``model_config.is_multimodal`` only says the checkpoint *can* accept media.
+    Text-only requests served by such a checkpoint do not need the text prompt
+    path, which discards the already-computed ``prompt_ids`` and forces extra
+    full-context tokenization downstream.
+    """
+    return bool(
+        processed_messages.image_data
+        or processed_messages.video_data
+        or processed_messages.audio_data
+    )
+
+
+def has_usable_prompt_ids(processed_messages: MessageProcessingResult) -> bool:
+    """Whether message processing actually produced token ids we can forward.
+
+    The conversation-template path leaves ``prompt_ids`` empty for multimodal
+    models, and some paths carry a raw string there; both must keep using the
+    text prompt.
+    """
+    prompt_ids = processed_messages.prompt_ids
+    return isinstance(prompt_ids, list) and bool(prompt_ids)
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -736,7 +762,10 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle single vs multiple requests
         if request.input_ids is not None:
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-        elif is_multimodal:
+        elif is_multimodal and (
+            request_carries_media(processed_messages)
+            or not has_usable_prompt_ids(processed_messages)
+        ):
             # Standard VLMs render a text prompt (with placeholder strings) for the MM
             # processor to tokenize. Inkling's custom encoder instead produces pre-rendered
             # input_ids with single placeholders; pass those through so the MM processor
