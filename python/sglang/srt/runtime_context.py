@@ -574,9 +574,17 @@ class _ConfigBag:
     writers are ``get_context().override(source, ...)`` (permanent) and
     the scoped ``.override(**kw)`` context manager (tests). Sub-namespaces
     (e.g. ``exec.moe``) are nested ``_ConfigBag`` instances reached by attribute.
-    """
 
-    __slots__ = ("_path", "_fields", "_subs")
+    Leaves and sub-bags are stored as **real instance attributes** (in
+    ``__dict__``), so ``bag.leaf`` / ``bag.sub`` is a plain attribute load that
+    ``torch.compile`` / dynamo can trace — config reads inside a compiled model
+    forward (e.g. ``get_exec().comm.enable_symm_mem`` in the embedding layer)
+    must not graph-break. ``_fields`` / ``_subs`` keep the authoritative
+    name→value maps used for override routing, membership, and scoped restore;
+    ``__getattr__`` is only a fallback for genuinely absent names. (Deliberately
+    no ``__slots__``: leaves are dynamic, and the ``__dict__`` is what makes the
+    reads traceable.)
+    """
 
     def __init__(self, path: str):
         object.__setattr__(self, "_path", path)
@@ -584,7 +592,9 @@ class _ConfigBag:
         object.__setattr__(self, "_subs", {})  # {subname: _ConfigBag}
 
     def __getattr__(self, name: str) -> Any:
-        # Reached only when ``name`` is not a real attribute (slot).
+        # Fallback only: real leaves/sub-bags resolve via __dict__ before this
+        # runs. Uses object.__getattribute__ (not self._fields) to stay safe if
+        # invoked before __init__ populates the bookkeeping dicts.
         fields = object.__getattribute__(self, "_fields")
         if name in fields:
             return fields[name]
@@ -601,8 +611,16 @@ class _ConfigBag:
         )
 
     def _set(self, name: str, value: Any) -> None:
-        """Internal write (publish + override) that bypasses the read-only guard."""
+        """Internal write (publish + override) that bypasses the read-only guard.
+        Updates both the bookkeeping map and the real attribute (traceable read)."""
         object.__getattribute__(self, "_fields")[name] = value
+        object.__setattr__(self, name, value)
+
+    def _set_sub(self, name: str, sub: _ConfigBag) -> None:
+        """Register a nested bag as both a bookkeeping entry and a real
+        attribute (so ``bag.sub`` is a plain, traceable attribute load)."""
+        object.__getattribute__(self, "_subs")[name] = sub
+        object.__setattr__(self, name, sub)
 
     def __contains__(self, name: str) -> bool:
         return name in object.__getattribute__(self, "_fields")
@@ -617,11 +635,13 @@ class _ConfigBag:
             path = object.__getattribute__(self, "_path")
             raise ValueError(f"unknown config leaf for {path!r}: {sorted(unknown)}")
         saved = {name: fields[name] for name in kwargs}
-        fields.update(kwargs)
+        for name, value in kwargs.items():
+            self._set(name, value)
         try:
             yield self
         finally:
-            fields.update(saved)
+            for name, value in saved.items():
+                self._set(name, value)
 
 
 def _build_config_bags(server_args: Any) -> dict:
@@ -660,7 +680,8 @@ def _build_config_bags(server_args: Any) -> dict:
             subs = object.__getattribute__(bag, "_subs")
             child = subs.get(name)
             if child is None:
-                child = subs[name] = _ConfigBag(".".join(parts[: depth + 1]))
+                child = _ConfigBag(".".join(parts[: depth + 1]))
+                bag._set_sub(name, child)
             bag = child
         if field in object.__getattribute__(bag, "_subs"):
             raise ValueError(
@@ -669,6 +690,34 @@ def _build_config_bags(server_args: Any) -> dict:
             )
         bag._set(field, value)
     return tops
+
+
+def _snapshot_bag_values(bags: dict | None) -> dict | None:
+    """Per-leaf value snapshot of a config-bag tree (bags are mutated in
+    place by ``override``, so reference snapshots alias live state)."""
+    if bags is None:
+        return None
+    snap: dict = {}
+
+    def walk(prefix: str, bag) -> None:
+        snap[prefix] = dict(object.__getattribute__(bag, "_fields"))
+        for name, sub in object.__getattribute__(bag, "_subs").items():
+            walk(f"{prefix}.{name}", sub)
+
+    for name, bag in bags.items():
+        walk(name, bag)
+    return snap
+
+
+def _restore_bag_values(bags: dict, snap: dict) -> None:
+    def walk(prefix: str, bag) -> None:
+        for key, value in snap[prefix].items():
+            bag._set(key, value)
+        for name, sub in object.__getattribute__(bag, "_subs").items():
+            walk(f"{prefix}.{name}", sub)
+
+    for name, bag in bags.items():
+        walk(name, bag)
 
 
 class RuntimeContext:
@@ -681,6 +730,7 @@ class RuntimeContext:
         "_server_args",
         "_config_bags",
         "_overrides_log",
+        "_publish_role",
         "flags",
         "resources",
         "forward",
@@ -691,6 +741,7 @@ class RuntimeContext:
         self._server_args: ServerArgs | None = None
         self._config_bags: dict | None = None
         self._overrides_log: list = []
+        self._publish_role: str | None = None
         self.flags = Flags()
         self.resources = Resources()
         self.forward = ForwardFlags()
@@ -756,8 +807,9 @@ class RuntimeContext:
         # leaves like pp_max_micro_batch_size are served via ParallelContext
         # __getattr__; live topology properties still win by name).
         self.parallel._config = self._config_bags.get("parallel")
-        # Fresh config lifecycle: prior override provenance no longer applies.
+        # A direct install is roleless; ``publish`` assigns the role afterwards.
         self._overrides_log = []
+        self._publish_role = None
 
     def config_bag(self, name: str) -> _ConfigBag:
         """Return the top-level config namespace bag (``device`` / ``model`` /
@@ -815,8 +867,11 @@ class RuntimeContext:
         self._overrides_log.append((source, dict(fields)))
 
     def overrides_log(self) -> list:
-        """Provenance of post-publish ``override`` calls: ``[(source, {field: value})]``."""
-        return list(self._overrides_log)
+        """Provenance of post-publish ``override`` calls: ``[(source, {field: value})]``.
+
+        Returns deep-ish copies (source, dict(fields)) so callers inspecting the
+        log cannot mutate the recorded provenance in place."""
+        return [(source, dict(fields)) for source, fields in self._overrides_log]
 
     def resolved_server_args_dict(self, base: dict | None = None) -> dict:
         """Serialize the *resolved* config: the pristine ``server_args`` fields
@@ -858,6 +913,33 @@ class RuntimeContext:
         """
         return _ServerArgsOverride(self, fields)
 
+    @contextmanager
+    def preserve_config(self):
+        """Snapshot the full config lifecycle and reinstate it verbatim on exit.
+
+        For nested construction steps that publish a private ``ServerArgs``
+        copy (e.g. a draft-worker build) and must leave the enclosing
+        lifecycle — including its post-publish overrides — untouched.
+        """
+        prev_server_args = self._server_args
+        prev_bags = self._config_bags
+        prev_bag_values = _snapshot_bag_values(prev_bags)
+        prev_overrides_log = list(self._overrides_log)
+        prev_publish_role = self._publish_role
+        prev_parallel_config = self.parallel._config
+        prev_capture = self.flags.capture.enable_torch_compile
+        try:
+            yield
+        finally:
+            self._server_args = prev_server_args
+            self._config_bags = prev_bags
+            if prev_bags is not None:
+                _restore_bag_values(prev_bags, prev_bag_values)
+            self._overrides_log = prev_overrides_log
+            self._publish_role = prev_publish_role
+            self.parallel._config = prev_parallel_config
+            self.flags.capture.enable_torch_compile = prev_capture
+
 
 class _ServerArgsOverride:
     """Scoped config override (see ``RuntimeContext.override_server_args``).
@@ -869,13 +951,21 @@ class _ServerArgsOverride:
     nondeterministic point.
     """
 
-    __slots__ = ("_context", "_fields", "_previous", "_previous_capture", "_installed")
+    __slots__ = (
+        "_context",
+        "_fields",
+        "_prev_server_args",
+        "_prev_bags",
+        "_prev_overrides_log",
+        "_prev_publish_role",
+        "_prev_parallel_config",
+        "_prev_capture",
+        "_installed",
+    )
 
     def __init__(self, context: RuntimeContext, fields: dict):
         self._context = context
         self._fields = fields
-        self._previous: ServerArgs | None = None
-        self._previous_capture = False
         self._installed = False
 
     def install(self) -> ServerArgs:
@@ -885,8 +975,13 @@ class _ServerArgsOverride:
         from sglang.srt.server_args import ServerArgs
 
         assert not self._installed, "override_server_args already installed"
-        self._previous = self._context._server_args
-        self._previous_capture = self._context.flags.capture.enable_torch_compile
+        ctx = self._context
+        self._prev_server_args = ctx._server_args
+        self._prev_bags = ctx._config_bags
+        self._prev_overrides_log = ctx._overrides_log
+        self._prev_publish_role = ctx._publish_role
+        self._prev_parallel_config = ctx.parallel._config
+        self._prev_capture = ctx.flags.capture.enable_torch_compile
         server_args = ServerArgs(model_path="dummy")
         if self._fields:
             server_args.override(source="test-override", **self._fields)
@@ -895,24 +990,26 @@ class _ServerArgsOverride:
         # materialized so bare post-publish writes raise like they do on a
         # fully resolved config.
         object.__setattr__(server_args, "_declarations_materialized", True)
-        self._context.set_server_args(server_args)
+        ctx.set_server_args(server_args)
         self._installed = True
         return server_args
 
     def restore(self) -> None:
-        """Reinstate the previously published config (or the empty slot)."""
+        """Reinstate the exact pre-install lifecycle state (or the empty slot)."""
         if not self._installed:
             return
         self._installed = False
-        previous, self._previous = self._previous, None
-        if previous is None:
-            self._context._server_args = None
-        else:
-            self._context.set_server_args(previous)
-        # set_server_args reseeds the capture tier from the published object
-        # (and the empty-slot path does not touch it at all); the snapshot
-        # puts back the exact pre-install runtime state either way.
-        self._context.flags.capture.enable_torch_compile = self._previous_capture
+        ctx = self._context
+        ctx._server_args = self._prev_server_args
+        ctx._config_bags = self._prev_bags
+        ctx._overrides_log = self._prev_overrides_log
+        ctx._publish_role = self._prev_publish_role
+        ctx.parallel._config = self._prev_parallel_config
+        ctx.flags.capture.enable_torch_compile = self._prev_capture
+        self._prev_server_args = None
+        self._prev_bags = None
+        self._prev_overrides_log = None
+        self._prev_parallel_config = None
 
     def __enter__(self) -> ServerArgs:
         return self.install()
@@ -998,6 +1095,36 @@ def get_observability() -> _ConfigBag:
     return _CONTEXT.config_bag("observability")
 
 
+def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
+    """Install process-wide config for this OS process.
+
+    Records the process ``role`` (``tokenizer`` / ``scheduler`` /
+    ``dp_controller`` / ``encoder`` / ``expert_backup`` /
+    ``weight_cache_daemon`` / ``launcher`` / ``test``) and
+    projects the config bags. Draft workers skip publish (they must not clobber
+    the target). ``role`` is provenance today — per-role namespace projection
+    and fail-closed enforcement is a later unit. ``hf_config`` is accepted for
+    forward-compat and currently unused.
+
+    Normally one call per process, but re-publish is allowed and is
+    **last-publish-wins** (bags re-projected, provenance reset, role
+    overwritten). Two sanctioned multi-publish shapes exist: the in-process
+    Engine builds its ``TokenizerManager`` inside the launcher process (the
+    process ends up with the tokenizer publish), and multiple Engines in one
+    process publish in sequence — which is exactly why per-instance managers
+    must read ``self.server_args`` for anything engine-specific rather than
+    the process-global bags.
+    """
+    _CONTEXT.set_server_args(server_args)
+    _CONTEXT._publish_role = role
+    return _CONTEXT
+
+
+def publish_role() -> str | None:
+    """The role recorded by the last ``publish`` (None for a legacy set)."""
+    return _CONTEXT._publish_role
+
+
 def get_stream(name: str) -> Any:
     return _CONTEXT.get_stream(name)
 
@@ -1031,6 +1158,7 @@ def reset_context() -> None:
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
     _CONTEXT._overrides_log = []
+    _CONTEXT._publish_role = None
     _CONTEXT.parallel._config = None
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()

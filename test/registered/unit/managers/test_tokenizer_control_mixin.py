@@ -41,10 +41,16 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class _FakeTokenizerManager(TokenizerControlMixin):
     """Minimal stand-in exposing only the state the LoRA handlers touch."""
 
-    def __init__(self, tokenizer_worker_num: int):
+    def __init__(
+        self,
+        tokenizer_worker_num: int,
+        dp_size: int = 1,
+        enable_dp_attention: bool = False,
+    ):
         self.server_args = SimpleNamespace(
             enable_lora=True,
-            dp_size=1,
+            dp_size=dp_size,
+            enable_dp_attention=enable_dp_attention,
             tokenizer_worker_num=tokenizer_worker_num,
             max_loaded_loras=None,
         )
@@ -112,6 +118,18 @@ class TestDynamicLoRAMultiTokenizerWorkerGuard(CustomTestCase):
     def test_unload_lora_adapter_rejected(self):
         manager = _FakeTokenizerManager(tokenizer_worker_num=2)
         result = asyncio.run(manager.unload_lora_adapter(_unload_req()))
+        self._assert_rejected(manager, result)
+
+    def test_rejected_even_when_dp_attention_allows_dp_size_above_one(self):
+        """The dp gate next to this guard was widened so that dynamic LoRA is
+        allowed when dp attention is on. That widening says nothing about
+        tokenizer workers, whose registries are still per process, so the
+        guard must still fire in the newly allowed configuration.
+        """
+        manager = _FakeTokenizerManager(
+            tokenizer_worker_num=2, dp_size=2, enable_dp_attention=True
+        )
+        result = asyncio.run(manager.load_lora_adapter(_load_req()))
         self._assert_rejected(manager, result)
 
     def test_all_workers_stay_consistent(self):
