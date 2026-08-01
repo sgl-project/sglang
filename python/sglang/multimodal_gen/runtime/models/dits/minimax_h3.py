@@ -1448,20 +1448,31 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         *,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build request-static RoPE inputs for this Ulysses rank."""
+        """Build request-static RoPE inputs for this rank's row shard.
+
+        Same 2D row split as forward(): ring first (outer, contiguous
+        ring_chunk_len slice), Ulysses second (inner slice within that
+        chunk) -- see forward()'s row_start derivation for the identity
+        this must stay in sync with.
+        """
         if img_position_ids.dim() != 3 or img_position_ids.shape[0] != 1:
             raise ValueError(
                 "img_position_ids must be [1, S, 3], got "
                 f"{list(img_position_ids.shape)}"
             )
         seq_len = int(img_position_ids.shape[1])
-        sp_ws, sp_rank = _ulysses_ctx()
+        ulysses_ws, ulysses_rank = _ulysses_ctx()
+        ring_ws, ring_rank = _ring_ctx()
+        sp_ws = ulysses_ws * ring_ws
         if seq_len % sp_ws:
             raise ValueError(
-                f"packed seq_len {seq_len} not divisible by ulysses world size {sp_ws}"
+                f"packed seq_len {seq_len} not divisible by the combined "
+                f"sequence-parallel world size {sp_ws} "
+                f"(ulysses={ulysses_ws} x ring={ring_ws})"
             )
         local_seq_len = seq_len // sp_ws
-        row_start = sp_rank * local_seq_len
+        ring_chunk_len = local_seq_len * ulysses_ws
+        row_start = ring_rank * ring_chunk_len + ulysses_rank * local_seq_len
         rope_freqs = self.rope(
             img_position_ids[:, row_start : row_start + local_seq_len]
         ).to(device)
