@@ -341,6 +341,78 @@ def _assert_bfloat16_reference_close(
         )
 
 
+def _analytical_ring_endpoints(
+    inp: Inputs,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Return FP32/FP64 gate and beta equations in ReplaySSM ring layout."""
+
+    gate_endpoints = []
+    beta_endpoints = []
+    for compute_dtype in (torch.float32, torch.float64):
+        gate_input = inp.gate.reshape(
+            inp.batch_size,
+            inp.width,
+            inp.heads,
+            K,
+        ).to(compute_dtype)
+        dt = inp.dt_bias.reshape(inp.heads, K).to(compute_dtype)
+        exp_a = torch.exp(inp.A_log.to(compute_dtype)).reshape(inp.heads, 1)
+        log_gate = LOWER_BOUND * torch.sigmoid(
+            exp_a[None, None, :, :] * (gate_input + dt[None, None, :, :])
+        )
+        beta_probability = torch.sigmoid(
+            inp.beta.reshape(inp.batch_size, inp.width, inp.heads).to(compute_dtype)
+        )
+        gate_endpoints.append(log_gate.to(torch.float32))
+        beta_endpoints.append(beta_probability.to(torch.float32))
+
+    slots = inp.cache_indices[: inp.batch_size].to(torch.long)
+    actual_gate = (
+        inp.ring_g.index_select(0, slots)[:, :, : inp.width, :]
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )
+    actual_beta = (
+        inp.ring_beta.index_select(0, slots)[:, :, : inp.width]
+        .permute(0, 2, 1)
+        .contiguous()
+    )
+    return (
+        actual_gate,
+        gate_endpoints[0],
+        gate_endpoints[1],
+        actual_beta,
+        beta_endpoints[0],
+        beta_endpoints[1],
+    )
+
+
+def _assert_within_endpoint_envelope(
+    name: str,
+    actual: torch.Tensor,
+    endpoint_fp32: torch.Tensor,
+    endpoint_fp64: torch.Tensor,
+) -> None:
+    """Require every value to lie between independent FP32/FP64 equations."""
+
+    lower = torch.minimum(endpoint_fp32, endpoint_fp64)
+    upper = torch.maximum(endpoint_fp32, endpoint_fp64)
+    outside = (actual < lower) | (actual > upper)
+    if outside.any():
+        distance = torch.maximum(lower - actual, actual - upper).clamp_min(0)
+        raise AssertionError(
+            f"{outside.sum().item()} {name} values are outside the analytical "
+            f"FP32/FP64 envelope (max_distance={distance.max().item()})"
+        )
+
+
 def check_correctness(args: argparse.Namespace) -> None:
     if args.batch_size != 1 or args.width != 16:
         raise ValueError("split-V correctness checks require --batch-size 1 --width 16")
@@ -402,6 +474,18 @@ def check_correctness(args: argparse.Namespace) -> None:
         conv_rel = _relative_max(
             cute_inp.intermediate_conv, triton_inp.intermediate_conv
         )
+        (
+            actual_gate,
+            gate_fp32,
+            gate_fp64,
+            actual_beta,
+            beta_fp32,
+            beta_fp64,
+        ) = _analytical_ring_endpoints(cute_inp)
+        gate_fp32_rel = _relative_max(actual_gate, gate_fp32)
+        gate_fp64_rel = _relative_max(actual_gate, gate_fp64)
+        beta_fp32_rel = _relative_max(actual_beta, beta_fp32)
+        beta_fp64_rel = _relative_max(actual_beta, beta_fp64)
 
         state_rel = 0.0
         for accepted in range(1, args.width + 1):
@@ -418,8 +502,12 @@ def check_correctness(args: argparse.Namespace) -> None:
             f"split_serial_rel={split_serial_rel:.6g} "
             f"output_abs={output_abs:.6g} output_rel={output_rel:.6g} "
             f"state_rel={state_rel:.6g} rawv_rel={rawv_rel:.6g} "
-            f"rawk_rel={rawk_rel:.6g} gate_rel={gate_rel:.6g} "
-            f"beta_rel={beta_rel:.6g} conv_rel={conv_rel:.6g}"
+            f"rawk_rel={rawk_rel:.6g} gate_triton_rel={gate_rel:.6g} "
+            f"beta_triton_rel={beta_rel:.6g} "
+            f"gate_fp32_rel={gate_fp32_rel:.6g} "
+            f"gate_fp64_rel={gate_fp64_rel:.6g} "
+            f"beta_fp32_rel={beta_fp32_rel:.6g} "
+            f"beta_fp64_rel={beta_fp64_rel:.6g} conv_rel={conv_rel:.6g}"
         )
         torch.testing.assert_close(
             # This tight bound also guards the bf16 materialization boundaries
@@ -439,19 +527,21 @@ def check_correctness(args: argparse.Namespace) -> None:
                 getattr(cute_inp, name),
                 getattr(triton_inp, name),
             )
-        # The transformed FP32 gate can land on opposite sides of the
-        # normal/subnormal boundary. Preserve exactness everywhere else.
-        torch.testing.assert_close(
-            cute_inp.ring_g,
-            triton_inp.ring_g,
-            rtol=0,
-            atol=2 * torch.finfo(torch.float32).tiny,
+        # Gate and beta intentionally use the precise CuTe math path. Compare
+        # them directly with their equations rather than treating the Triton
+        # kernel (which may use different exp/reciprocal approximations) as an
+        # oracle.
+        _assert_within_endpoint_envelope(
+            "log-gate",
+            actual_gate,
+            gate_fp32,
+            gate_fp64,
         )
-        torch.testing.assert_close(
-            cute_inp.ring_beta,
-            triton_inp.ring_beta,
-            rtol=0,
-            atol=0,
+        _assert_within_endpoint_envelope(
+            "beta",
+            actual_beta,
+            beta_fp32,
+            beta_fp64,
         )
         torch.testing.assert_close(
             cute_inp.intermediate_conv,

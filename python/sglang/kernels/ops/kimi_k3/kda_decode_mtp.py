@@ -68,6 +68,32 @@ def _issue_state_tile(
     cute.arch.cp_async_commit_group()
 
 
+def _float_float_add(
+    acc_hi,
+    acc_lo,
+    value_hi,
+    value_lo,
+):
+    """Add two renormalized FP32 pairs and return a renormalized pair."""
+    sum_hi = acc_hi + value_hi
+    delta = sum_hi - acc_hi
+    sum_error = (acc_hi - (sum_hi - delta)) + (value_hi - delta)
+    correction = acc_lo + value_lo + sum_error
+    renormalized = sum_hi + correction
+    renormalized_delta = renormalized - sum_hi
+    residual = (sum_hi - (renormalized - renormalized_delta)) + (
+        correction - renormalized_delta
+    )
+    return renormalized, residual
+
+
+def _float_float_add_product(acc_hi, acc_lo, lhs, rhs):
+    """Accumulate one FP32 product without discarding its FMA residual."""
+    product = lhs * rhs
+    product_error = cute.fma(lhs, rhs, -product)
+    return _float_float_add(acc_hi, acc_lo, product, product_error)
+
+
 @cute.kernel
 def kda_decode_mtp_kernel(
     state_g2s_copy: cute.TiledCopy,
@@ -274,7 +300,7 @@ def kda_decode_mtp_kernel(
             )
         )
     if warp_idx < P1_QKG_WARPS and p1_job == 2:
-        r_exp_A = cute.math.exp(cutlass.Float32(A_log[i_hv]), fastmath=True)
+        r_exp_A = cute.math.exp(cutlass.Float32(A_log[i_hv]), fastmath=False)
         for i_t in cutlass.range(p1_par, T_LOOP, P1_G_WARPS):
             token = bos + cutlass.min(i_t, n_tok - 1)
             for i in range(VEC_SIZE):
@@ -282,11 +308,11 @@ def kda_decode_mtp_kernel(
                 r_g_raw = cutlass.Float32(g[0, token, i_hv, k_idx])
                 r_g_raw = r_g_raw + cutlass.Float32(dt_bias[i_hv * HEAD_DIM + k_idx])
                 exp_A_x = r_exp_A * r_g_raw
-                sigmoid_val = cute.arch.rcp_approx(
-                    cutlass.Float32(1.0) + cute.math.exp(-exp_A_x, fastmath=True)
+                sigmoid_val = cute.math.rcp(
+                    cutlass.Float32(1.0) + cute.math.exp(-exp_A_x, fastmath=False)
                 )
                 r_gk = lower_bound * sigmoid_val
-                sG[i_t, k_idx] = cute.math.exp(r_gk, fastmath=True)
+                sG[i_t, k_idx] = cute.math.exp(r_gk, fastmath=False)
                 if cutlass.const_expr(CACHE_RING):
                     if cutlass.const_expr(not SPLIT_V) or i_z == 0:
                         ring_g[slot, i_hv, i_t, k_idx] = r_gk
@@ -319,21 +345,89 @@ def kda_decode_mtp_kernel(
                     i1 = i_pair * 2 + 1
                     k_idx0 = i0 * 32 + in_warp_tid
                     k_idx1 = i1 * 32 + in_warp_tid
-                    r_conv_0 = 0.0
-                    r_conv_1 = 0.0
+                    # Accumulate the four Q-convolution products as a
+                    # renormalized float-float pair.  TwoProduct recovers each
+                    # multiply residual with FMA and TwoSum recovers each add
+                    # residual.  This preserves the existing FP32/BF16
+                    # materialization boundary while avoiding an observed
+                    # one-ulp Q tie that changed a verify decision.
+                    r_conv_0 = cutlass.Float32(0.0)
+                    r_conv_1 = cutlass.Float32(0.0)
+                    r_conv_err_0 = cutlass.Float32(0.0)
+                    r_conv_err_1 = cutlass.Float32(0.0)
                     for w in range(KERNEL_WIDTH - 1):
-                        r_conv_0 += r_state[w * VEC_SIZE + i0] * r_wq[w * VEC_SIZE + i0]
-                        r_conv_1 += r_state[w * VEC_SIZE + i1] * r_wq[w * VEC_SIZE + i1]
+                        _q_state_0 = r_state[w * VEC_SIZE + i0]
+                        _q_state_1 = r_state[w * VEC_SIZE + i1]
+                        _q_weight_0 = r_wq[w * VEC_SIZE + i0]
+                        _q_weight_1 = r_wq[w * VEC_SIZE + i1]
+                        _q_product_0 = _q_state_0 * _q_weight_0
+                        _q_product_1 = _q_state_1 * _q_weight_1
+                        _q_product_err_0 = cute.fma(
+                            _q_state_0, _q_weight_0, -_q_product_0
+                        )
+                        _q_product_err_1 = cute.fma(
+                            _q_state_1, _q_weight_1, -_q_product_1
+                        )
+                        _q_sum_0 = r_conv_0 + _q_product_0
+                        _q_sum_1 = r_conv_1 + _q_product_1
+                        _q_delta_0 = _q_sum_0 - r_conv_0
+                        _q_delta_1 = _q_sum_1 - r_conv_1
+                        _q_sum_err_0 = (r_conv_0 - (_q_sum_0 - _q_delta_0)) + (
+                            _q_product_0 - _q_delta_0
+                        )
+                        _q_sum_err_1 = (r_conv_1 - (_q_sum_1 - _q_delta_1)) + (
+                            _q_product_1 - _q_delta_1
+                        )
+                        _q_correction_0 = r_conv_err_0 + _q_product_err_0 + _q_sum_err_0
+                        _q_correction_1 = r_conv_err_1 + _q_product_err_1 + _q_sum_err_1
+                        _q_renorm_0 = _q_sum_0 + _q_correction_0
+                        _q_renorm_1 = _q_sum_1 + _q_correction_1
+                        _q_renorm_delta_0 = _q_renorm_0 - _q_sum_0
+                        _q_renorm_delta_1 = _q_renorm_1 - _q_sum_1
+                        r_conv_err_0 = (
+                            _q_sum_0 - (_q_renorm_0 - _q_renorm_delta_0)
+                        ) + (_q_correction_0 - _q_renorm_delta_0)
+                        r_conv_err_1 = (
+                            _q_sum_1 - (_q_renorm_1 - _q_renorm_delta_1)
+                        ) + (_q_correction_1 - _q_renorm_delta_1)
+                        r_conv_0 = _q_renorm_0
+                        r_conv_1 = _q_renorm_1
                     r_xq_0 = cutlass.Float32(x_q[0, token, i_hv, k_idx0])
                     r_xq_1 = cutlass.Float32(x_q[0, token, i_hv, k_idx1])
                     _cwq_last_0 = r_wq[(KERNEL_WIDTH - 1) * VEC_SIZE + i0]
                     _cwq_last_1 = r_wq[(KERNEL_WIDTH - 1) * VEC_SIZE + i1]
-                    r_conv_0 += r_xq_0 * _cwq_last_0
-                    r_conv_1 += r_xq_1 * _cwq_last_1
-                    e0 = cute.math.exp(-r_conv_0, fastmath=True)
-                    e1 = cute.math.exp(-r_conv_1, fastmath=True)
-                    sig_0 = cute.arch.rcp_approx(cutlass.Float32(1.0) + e0)
-                    sig_1 = cute.arch.rcp_approx(cutlass.Float32(1.0) + e1)
+                    _q_product_0 = r_xq_0 * _cwq_last_0
+                    _q_product_1 = r_xq_1 * _cwq_last_1
+                    _q_product_err_0 = cute.fma(r_xq_0, _cwq_last_0, -_q_product_0)
+                    _q_product_err_1 = cute.fma(r_xq_1, _cwq_last_1, -_q_product_1)
+                    _q_sum_0 = r_conv_0 + _q_product_0
+                    _q_sum_1 = r_conv_1 + _q_product_1
+                    _q_delta_0 = _q_sum_0 - r_conv_0
+                    _q_delta_1 = _q_sum_1 - r_conv_1
+                    _q_sum_err_0 = (r_conv_0 - (_q_sum_0 - _q_delta_0)) + (
+                        _q_product_0 - _q_delta_0
+                    )
+                    _q_sum_err_1 = (r_conv_1 - (_q_sum_1 - _q_delta_1)) + (
+                        _q_product_1 - _q_delta_1
+                    )
+                    _q_correction_0 = r_conv_err_0 + _q_product_err_0 + _q_sum_err_0
+                    _q_correction_1 = r_conv_err_1 + _q_product_err_1 + _q_sum_err_1
+                    _q_renorm_0 = _q_sum_0 + _q_correction_0
+                    _q_renorm_1 = _q_sum_1 + _q_correction_1
+                    _q_renorm_delta_0 = _q_renorm_0 - _q_sum_0
+                    _q_renorm_delta_1 = _q_renorm_1 - _q_sum_1
+                    r_conv_err_0 = (_q_sum_0 - (_q_renorm_0 - _q_renorm_delta_0)) + (
+                        _q_correction_0 - _q_renorm_delta_0
+                    )
+                    r_conv_err_1 = (_q_sum_1 - (_q_renorm_1 - _q_renorm_delta_1)) + (
+                        _q_correction_1 - _q_renorm_delta_1
+                    )
+                    r_conv_0 = _q_renorm_0 + r_conv_err_0
+                    r_conv_1 = _q_renorm_1 + r_conv_err_1
+                    e0 = cute.math.exp(-r_conv_0, fastmath=False)
+                    e1 = cute.math.exp(-r_conv_1, fastmath=False)
+                    sig_0 = cute.math.rcp(cutlass.Float32(1.0) + e0)
+                    sig_1 = cute.math.rcp(cutlass.Float32(1.0) + e1)
                     # Preserve the Triton BF16 convolution-to-recurrence boundary.
                     r_q[i0] = cutlass.Float32(cutlass.BFloat16(r_conv_0 * sig_0))
                     r_q[i1] = cutlass.Float32(cutlass.BFloat16(r_conv_1 * sig_1))
@@ -350,7 +444,7 @@ def kda_decode_mtp_kernel(
                     sum_q += cute.arch.shuffle_sync_bfly(
                         sum_q, offset=offset, mask=-1, mask_and_clamp=31
                     )
-                rnorm_q_scaled = cute.math.rsqrt(sum_q + 1e-06, fastmath=True) * scale
+                rnorm_q_scaled = cute.math.rsqrt(sum_q + 1e-06, fastmath=False) * scale
                 for i in range(VEC_SIZE):
                     r_q[i] = r_q[i] * rnorm_q_scaled
                 for i in range(VEC_SIZE):
@@ -379,8 +473,8 @@ def kda_decode_mtp_kernel(
                         r_xk
                         * sConvW[(KERNEL_WIDTH - 1) * HEAD_DIM + i * 32 + in_warp_tid]
                     )
-                    r_conv = r_conv * cute.arch.rcp_approx(
-                        cutlass.Float32(1.0) + cute.math.exp(-r_conv, fastmath=True)
+                    r_conv = r_conv * cute.math.rcp(
+                        cutlass.Float32(1.0) + cute.math.exp(-r_conv, fastmath=False)
                     )
                     r_conv = cutlass.Float32(cutlass.BFloat16(r_conv))
                     r_k[i] = r_conv
@@ -401,15 +495,15 @@ def kda_decode_mtp_kernel(
                     sum_k += cute.arch.shuffle_sync_bfly(
                         sum_k, offset=offset, mask=-1, mask_and_clamp=31
                     )
-                rnorm_k = cute.math.rsqrt(sum_k + 1e-06, fastmath=True)
+                rnorm_k = cute.math.rsqrt(sum_k + 1e-06, fastmath=False)
                 for i in range(VEC_SIZE):
                     r_k[i] = r_k[i] * rnorm_k
                 for i in range(VEC_SIZE):
                     k_idx = i * 32 + in_warp_tid
                     sK[i_t, k_idx] = r_k[i]
                 if in_warp_tid == 0:
-                    sBeta[i_t] = cute.arch.rcp_approx(
-                        cutlass.Float32(1.0) + cute.math.exp(-r_b_raw, fastmath=True)
+                    sBeta[i_t] = cute.math.rcp(
+                        cutlass.Float32(1.0) + cute.math.exp(-r_b_raw, fastmath=False)
                     )
                     if cutlass.const_expr(CACHE_RING):
                         if cutlass.const_expr(not SPLIT_V) or i_z == 0:
@@ -553,9 +647,8 @@ def kda_decode_mtp_kernel(
             _k1 = sK[i_t, k_idx1]
             r_decay[j0] = sG[i_t, k_idx0]
             r_decay[j1] = sG[i_t, k_idx1]
-            r_bk[j0], r_bk[j1] = cute.arch.mul_packed_f32x2(
-                (r_beta_val, r_beta_val), (_k0, _k1)
-            )
+            r_bk[j0] = _k0
+            r_bk[j1] = _k1
             r_k[j0], r_k[j1] = cute.arch.mul_packed_f32x2(
                 (r_decay[j0], r_decay[j1]), (_k0, _k1)
             )
@@ -567,27 +660,32 @@ def kda_decode_mtp_kernel(
                 v_row = warp_idx * NUM_V_ROWS + b * P2_ROWS_LANE + row_grp
                 # Every lane of a group wants the same v; smem broadcasts it.
                 r_v = sVall[i_t * ACTIVE_V_CHANNELS + local_v_base + v_row]
-                shk_1 = 0.0
-                shk_2 = 0.0
-                for jp in range(P2_VEC // 2):
-                    _p = jp * 2
-                    shk_1, shk_2 = cute.arch.fma_packed_f32x2(
-                        src_a=(r_state[_st + _p], r_state[_st + _p + 1]),
-                        src_b=(r_k[_p], r_k[_p + 1]),
-                        src_c=(shk_1, shk_2),
+                shk_hi = cutlass.Float32(0.0)
+                shk_lo = cutlass.Float32(0.0)
+                for j in range(P2_VEC):
+                    shk_hi, shk_lo = _float_float_add_product(
+                        shk_hi,
+                        shk_lo,
+                        r_state[_st + j],
+                        r_k[j],
                     )
-                shk = shk_1 + shk_2
                 for offset in P2_BFLY:
-                    shk += cute.arch.shuffle_sync_bfly(
-                        shk, offset=offset, mask=-1, mask_and_clamp=31
+                    peer_hi = cute.arch.shuffle_sync_bfly(
+                        shk_hi, offset=offset, mask=-1, mask_and_clamp=31
                     )
+                    peer_lo = cute.arch.shuffle_sync_bfly(
+                        shk_lo, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    shk_hi, shk_lo = _float_float_add(shk_hi, shk_lo, peer_hi, peer_lo)
+                shk = shk_hi + shk_lo
                 vn = r_v - shk
-                shq_1 = 0.0
-                shq_2 = 0.0
+                vn_beta = vn * r_beta_val
+                shq_hi = cutlass.Float32(0.0)
+                shq_lo = cutlass.Float32(0.0)
                 for jp in range(P2_VEC // 2):
                     _p = jp * 2
                     vnbk_0, vnbk_1 = cute.arch.mul_packed_f32x2(
-                        (vn, vn), (r_bk[_p], r_bk[_p + 1])
+                        (vn_beta, vn_beta), (r_bk[_p], r_bk[_p + 1])
                     )
                     r_state[_st + _p], r_state[_st + _p + 1] = (
                         cute.arch.fma_packed_f32x2(
@@ -596,16 +694,27 @@ def kda_decode_mtp_kernel(
                             src_c=(vnbk_0, vnbk_1),
                         )
                     )
-                    shq_1, shq_2 = cute.arch.fma_packed_f32x2(
-                        src_a=(r_state[_st + _p], r_state[_st + _p + 1]),
-                        src_b=(r_q[_p], r_q[_p + 1]),
-                        src_c=(shq_1, shq_2),
+                    shq_hi, shq_lo = _float_float_add_product(
+                        shq_hi,
+                        shq_lo,
+                        r_state[_st + _p],
+                        r_q[_p],
                     )
-                shq = shq_1 + shq_2
+                    shq_hi, shq_lo = _float_float_add_product(
+                        shq_hi,
+                        shq_lo,
+                        r_state[_st + _p + 1],
+                        r_q[_p + 1],
+                    )
                 for offset in P2_BFLY:
-                    shq += cute.arch.shuffle_sync_bfly(
-                        shq, offset=offset, mask=-1, mask_and_clamp=31
+                    peer_hi = cute.arch.shuffle_sync_bfly(
+                        shq_hi, offset=offset, mask=-1, mask_and_clamp=31
                     )
+                    peer_lo = cute.arch.shuffle_sync_bfly(
+                        shq_lo, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    shq_hi, shq_lo = _float_float_add(shq_hi, shq_lo, peer_hi, peer_lo)
+                shq = shq_hi + shq_lo
                 if k_grp == 0 and i_t < n_tok:
                     if cutlass.const_expr(APPLY_ONORM):
                         # Preserve the Triton BF16 recurrence-to-RMSNorm boundary.
