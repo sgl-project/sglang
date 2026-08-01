@@ -24,9 +24,11 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
 register_cuda_ci(est_time=240, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=480, suite="nightly-8-gpu-b200", nightly=True)
 
 _HIDDEN_SIZE = 7168
 _GEMM_AR_K_TOTAL = 12288
+_GEMM_AG_WORLD_SIZE = 8
 _MB = 1024 * 1024
 _SP_TUNING = sp_collective.Tuning(num_blocks=1, block_size=256)
 
@@ -214,6 +216,8 @@ def test_sequence_parallel_collectives():
 @torch.inference_mode()
 def test_gemm_all_gather():
     _require_sm100()
+    if int(os.environ["WORLD_SIZE"]) != _GEMM_AG_WORLD_SIZE:
+        pytest.skip("Kimi K3 gemm_ag is compiled for TP8")
     comm = _init_comm()
     generator = torch.Generator().manual_seed(30)
     x = (
@@ -341,7 +345,8 @@ def _precompile(num_gpus):
         all_reduce._jit_module(world_size)
         sp_collective._jit_module(world_size)
         gemm_ar._jit_module(_GEMM_AR_K_TOTAL // world_size, world_size)
-    gemm_ag._jit_module()
+    if _GEMM_AG_WORLD_SIZE in num_gpus:
+        gemm_ag._jit_module()
     attn_res._jit_fused_tma_module(4, 1, 200)
 
 
@@ -349,6 +354,6 @@ if __name__ == "__main__":
     multigpu_pytest_main(
         __name__,
         __file__,
-        num_gpus=(4,),
+        num_gpus=(4, 8),
         pre_launch_fn=_precompile,
     )
