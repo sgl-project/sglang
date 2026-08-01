@@ -93,6 +93,16 @@ class MambaComponent(TreeComponent):
         if old_ancestor is not None:
             self._dec_session_coverage(session_id, old_ancestor)
 
+    def _recede_session_coverage(
+        self,
+        session_id: str,
+        leaf: UnifiedTreeNode,
+        fallback: Optional[UnifiedTreeNode],
+    ) -> None:
+        self._dec_session_coverage(session_id, leaf)
+        if fallback is not None:
+            self._inc_session_coverage(session_id, fallback)
+
     def refresh_lru(
         self,
         phase: LRURefreshPhase,

@@ -56,12 +56,6 @@ class FullComponent(TreeComponent):
                 self.tree_core.eviction_strategy.get_priority
             )
 
-    def _inc_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
-        node = leaf
-        while node is not None and node is not self.tree_core.root_node:
-            node.component_data[self.component_type].session_ref += 1
-            node = node.parent
-
     def _dec_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
         node = leaf
         while node is not None and node is not self.tree_core.root_node:
@@ -84,6 +78,24 @@ class FullComponent(TreeComponent):
             and node is not self.tree_core.root_node
         ):
             node.component_data[self.component_type].session_ref += 1
+            node = node.parent
+
+    def _recede_session_coverage(
+        self,
+        session_id: str,
+        leaf: UnifiedTreeNode,
+        fallback: Optional[UnifiedTreeNode],
+    ) -> None:
+        stop = fallback if fallback is not None else self.tree_core.root_node
+        node = leaf
+        while (
+            node is not None
+            and node is not stop
+            and node is not self.tree_core.root_node
+        ):
+            cd = node.component_data[self.component_type]
+            assert cd.session_ref > 0
+            cd.session_ref -= 1
             node = node.parent
 
     def create_match_validator(

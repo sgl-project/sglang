@@ -90,10 +90,10 @@ class TestSessionCacheOwnership(unittest.TestCase):
                 ).read_text(),
             )
 
-        scheduler = REPO_ROOT / "python/sglang/srt/managers/scheduler.py"
+        registry = MEM_CACHE_ROOT / "registry.py"
         self.assertIn(
-            'getattr(self.tree_cache, "enable_session_radix_cache", False)',
-            scheduler.read_text(),
+            "--enable-session-radix-cache requires UnifiedRadixCache",
+            registry.read_text(),
         )
 
 

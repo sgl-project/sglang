@@ -410,6 +410,7 @@ class Scheduler(
         )
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.enable_session_radix_cache = server_args.enable_session_radix_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.enable_decode_hicache = (
             server_args.disaggregation_decode_enable_radix_cache
@@ -519,7 +520,6 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
-        self.init_session_radix_cache_guard()
 
         if _is_npu and is_deepseek_v4(
             self.tp_worker.model_runner.model_config.hf_config
@@ -1038,19 +1038,6 @@ class Scheduler(
                 num_pages=self.max_total_num_tokens // self.page_size,
                 context_len=self.model_config.context_len,
                 startup_available_gpu_memory_gb=avail_mem,
-            )
-
-    def init_session_radix_cache_guard(self) -> None:
-        self.enable_session_radix_cache = self.server_args.enable_session_radix_cache
-        if not self.enable_session_radix_cache:
-            return
-
-        if not getattr(self.tree_cache, "enable_session_radix_cache", False):
-            raise ValueError(
-                "--enable-session-radix-cache requires UnifiedRadixCache, but "
-                f"tree_cache is {type(self.tree_cache).__name__}. Set "
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 (or remove "
-                "--enable-session-radix-cache)."
             )
 
     def init_hisparse_coordinator(self) -> None:

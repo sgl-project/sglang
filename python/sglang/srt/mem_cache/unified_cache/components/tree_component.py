@@ -115,6 +115,8 @@ class TreeComponent(ABC):
         # Populated when the component passed to TreeCore constructor.
         self.tree_core: Optional[UnifiedTreeCore] = None
         self.is_evict_device_ongoing = False
+        # Per-session frontier nodes (the deepest registered node per cached
+        # path), not physical tree leaves: a frontier node may have children.
         self._session_leaves: dict[str, set[UnifiedTreeNode]] = defaultdict(set)
 
     # Subclasses MUST set this as a class attribute (not @property)
@@ -196,19 +198,30 @@ class TreeComponent(ABC):
             cur = cur.parent
         return None
 
-    def _inc_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
-        raise NotImplementedError
-
+    @abstractmethod
     def _dec_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
-        raise NotImplementedError
+        """Remove one session reference from the coverage anchored at `leaf`."""
+        ...
 
+    @abstractmethod
     def _advance_session_coverage(
         self,
         session_id: str,
         leaf: UnifiedTreeNode,
         old_ancestor: Optional[UnifiedTreeNode],
     ) -> None:
-        raise NotImplementedError
+        """Move the session's coverage from `old_ancestor` forward to `leaf`."""
+        ...
+
+    @abstractmethod
+    def _recede_session_coverage(
+        self,
+        session_id: str,
+        leaf: UnifiedTreeNode,
+        fallback: Optional[UnifiedTreeNode],
+    ) -> None:
+        """Move the session's coverage backward from `leaf` to `fallback`."""
+        ...
 
     def register_session_leaf(
         self, session_id: str, leaf: Optional[UnifiedTreeNode]
@@ -243,12 +256,13 @@ class TreeComponent(ABC):
             leaves = self._session_leaves.get(session_id)
             assert leaves is not None and node in leaves
             fallback = self._find_reusable_session_leaf(node.parent)
-            self._dec_session_coverage(session_id, node)
-            self._unmark_session_leaf(session_id, node)
-            if fallback is not None and fallback not in self._session_leaves.get(
+            if fallback is not None and fallback in self._session_leaves.get(
                 session_id, ()
             ):
-                self._inc_session_coverage(session_id, fallback)
+                fallback = None
+            self._recede_session_coverage(session_id, node, fallback)
+            self._unmark_session_leaf(session_id, node)
+            if fallback is not None:
                 self._mark_session_leaf(session_id, fallback)
 
     def validate_session_state(
