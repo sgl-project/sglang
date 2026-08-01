@@ -1,15 +1,3 @@
-"""CUTLASS per-tensor FP8 GEMM vs flashinfer bmm_fp8, on real projection shapes.
-
-Shapes are the FP8-quantized projections of two MIXED_PRECISION LLM checkpoints
-whose MLPs are NVFP4, so only the attention / linear-attention projections run
-FP8, taken at TP1 and TP2. Two hidden sizes are covered (6656 and 5120) with
-both the fused-QKV and narrow KV-projection extremes.
-
-The M sweep is dense at the low end because the SM120 dispatch buckets on M
-(<=16 / <=32 / <=256 / default); the boundary values are included so a bucket
-regression shows up here.
-"""
-
 import torch
 from flashinfer import bmm_fp8
 
@@ -24,7 +12,6 @@ register_cuda_ci(
 FP8 = torch.float8_e4m3fn
 OUT_DTYPE = torch.bfloat16
 
-# (label, K, N)
 SHAPES = [
     ("h6656-tp1-qkv", 6656, 4608),
     ("h6656-tp1-o", 4096, 6656),
@@ -46,7 +33,6 @@ def _cutlass(a, b, scales_a, scales_b, a_s, b_s):
 
 
 def _bmm_fp8_auto(a, b, scales_a, scales_b, a_s, b_s):
-    # backend="auto" lets the tuner pick across cudnn / cublas / cutlass.
     return bmm_fp8(a.unsqueeze(0), b.unsqueeze(0), a_s, b_s, OUT_DTYPE, backend="auto")
 
 
@@ -60,8 +46,6 @@ def benchmark(shape, m: int, impl: str):
     _, k, n = shape
     a = (torch.randn(m, k, device="cuda") / 8).to(FP8)
     b = (torch.randn(n, k, device="cuda") / 8).to(FP8).t()  # [K, N] column-major
-    # Per-tensor scales; the CUTLASS kernel takes them as the [M] / [N] vectors
-    # apply_fp8_linear materialises, bmm_fp8 takes the scalars directly.
     a_s = torch.tensor(0.02, device="cuda", dtype=torch.float32)
     b_s = torch.tensor(0.015, device="cuda", dtype=torch.float32)
     scales_a = a_s.expand(m).contiguous()
@@ -70,9 +54,7 @@ def benchmark(shape, m: int, impl: str):
     return marker.do_bench(
         FN_MAP[impl],
         input_args=(a, b, scales_a, scales_b, a_s, b_s),
-        # Clone the read tensors per iteration so the weights are not L2-hot.
         graph_clone_args=(0, 1, 2, 3),
-        # Compute-bound: the GB/s column would be misleading here.
         disable_log_bandwidth=True,
     )
 

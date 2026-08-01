@@ -1,11 +1,3 @@
-"""Accuracy tests for the CUTLASS FP8 per-row/per-column scaled GEMM.
-
-Ported from the deleted AOT sgl-kernel test (python/sglang/kernels/aot/tests/
-test_fp8_gemm.py); the SM90 swap-AB shape list is kept verbatim and the SM120
-M-bucket boundaries are added, since the JIT kernel's SM120 path now dispatches
-on M (16 / 32 / 256 / default) instead of always using one 128x128x128 tile.
-"""
-
 import sys
 
 import pytest
@@ -53,8 +45,6 @@ def test_accuracy(M, N, K, with_bias, out_dtype):
     _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
 
 
-# (M, N) shapes that exercise each dispatch bucket / boundary. K is varied
-# separately below so every (M, N) is tested across multiple K values.
 SM90_SWAP_AB_MN_SHAPES = [
     (1, 128),
     (1, 4096),
@@ -71,10 +61,6 @@ SM90_SWAP_AB_MN_SHAPES = [
     (65, 4096),
     (96, 4096),
     (128, 4096),
-    # Cluster-misaligned M_orig in the M64_smallN bucket (TileN=16, cluster_N=4).
-    # For M_orig in {17, 20, 33, 48}, grid_N = ceil(M_orig/16) in {2, 2, 3, 3},
-    # not a multiple of cluster_N=4. Explicit coverage so any can_implement
-    # failure or silent miscompute surfaces here.
     (20, 128),
     (20, 1024),
     (20, 1280),
@@ -98,9 +84,6 @@ def test_accuracy_sm90_swap_ab(shape_mn, K, with_bias, out_dtype):
     _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
 
 
-# Both sides of every SM120 M-bucket edge. M<=16 and M<=32 use a custom small
-# EpilogueTile, so an off-by-one in the bucketing shows up as a wrong result or
-# a can_implement failure rather than just a slowdown.
 SM120_M_BUCKET_EDGES = [1, 2, 15, 16, 17, 31, 32, 33, 63, 255, 256, 257, 512]
 
 

@@ -13,11 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// Shared CUTLASS 3.x rowwise-scaled FP8 GEMM, used by the SM100 and SM120
-// dispatches. The two archs differ only in the arch tag and their tile tables,
-// so the kernel type and launcher live here and each arch file supplies the
-// M-bucketed configs.
-
 #pragma once
 
 #include <sgl_kernel/runtime.cuh>
@@ -37,9 +32,6 @@ limitations under the License.
 
 using namespace cute;
 
-// Per-row (A) / per-column (B) FP8 scaled GEMM. A per-tensor scale is represented
-// by the caller broadcasting the scalar into the [M,1] / [N,1] fp32 shape, matching
-// apply_fp8_linear's convert_to_channelwise usage.
 template <
     typename ArchTag,
     typename OutType,
@@ -193,8 +185,6 @@ void launch_c3x_fp8_rowwise_scaled_mm(
   typename GemmKernel::EpilogueArguments epilogue_args{
       GemmType::prepare_args(scales_a, scales_b, bias), ptr_d, stride_c, ptr_d, stride_d};
 
-  // sm_count must be filled in for the StreamK scheduler to size its
-  // decomposition; the default persistent scheduler ignores it.
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = a.device().device_id;
   hw_info.sm_count = static_cast<int>(host::runtime::get_sm_count(hw_info.device_id));

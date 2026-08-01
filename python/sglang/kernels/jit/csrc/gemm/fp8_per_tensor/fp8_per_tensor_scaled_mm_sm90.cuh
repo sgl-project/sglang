@@ -13,19 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// Ported from the AOT cutlass_extensions/gemm/fp8_gemm_sm90_dispatch.cuh, which
-// in turn came from vLLM's SM90 FP8 dispatch plus SGLang's own tile tuning.
-//
-// Kept faithfully, including the swap-AB small-M path and the two N thresholds:
-// the tile table encodes measured wins (see the threshold comments below), so it
-// is not something to re-derive while changing the tensor API underneath it.
-//
-// The scale epilogues here use plain Sm90{Col,Row}Broadcast rather than the
-// vLLM ...OrScalarBroadcast variants: this entry point always receives full
-// [M] / [N] fp32 scale vectors (a per-tensor scale is broadcast by the caller),
-// so the scalar fallback -- and with it the vendored broadcast_load_epilogue_c3x
-// header -- is dead weight.
-
 #pragma once
 
 #include <sgl_kernel/runtime.cuh>
@@ -45,9 +32,6 @@ limitations under the License.
 
 using namespace cute;
 
-// Guards the kernel body so it is not compiled for archs that will never run it.
-// __CUDA_ARCH__ is undefined in host code, so the ifdef has to ride inside the
-// device entry point.
 template <typename Kernel>
 struct enable_sm90_or_later : Kernel {
   template <typename... Args>
@@ -94,8 +78,6 @@ struct ScaledEpilogue {
   }
 };
 
-// Swap-AB configs transpose the output, so their per-output-channel bias becomes
-// a column rather than a row.
 template <typename ElementAcc, typename ElementD, typename TileShape, template <typename, typename> typename BiasLoad>
 struct ScaledEpilogueWithBias {
  private:
@@ -192,10 +174,10 @@ struct Gemm {
           cutlass::arch::OpClassTensorOp,
           ElementAB,
           LayoutB_T,
-          AlignmentAB,  // Swapped B (as A)
+          AlignmentAB,
           ElementAB,
           LayoutA_T,
-          AlignmentAB,  // Swapped A (as B)
+          AlignmentAB,
           ElementAcc,
           TileShape,
           ClusterShape,
@@ -261,9 +243,6 @@ void launch(
       swap_ab ? typename GemmKernel::MainloopArguments{b_ptr, b_stride, a_ptr, a_stride}
               : typename GemmKernel::MainloopArguments{a_ptr, a_stride, b_ptr, b_stride};
 
-  // Swap-AB kernels compute D^T, so the roles of the row/column scale loads
-  // swap with them. Every dispatch site below passes the canonical
-  // (a_scales, b_scales) order and this is the single place that reorders.
   typename GemmKernel::EpilogueArguments epilogue_args{
       swap_ab ? GemmType::Epilogue::prepare_args(b_scales, a_scales, bias)
               : GemmType::Epilogue::prepare_args(a_scales, b_scales, bias),
@@ -293,7 +272,6 @@ void launch(
 
 }  // namespace sm90_fp8
 
-// swap_ab configs take a column bias because they compute D^T; the rest take a row bias.
 template <
     typename OutType,
     bool WithBias,
@@ -343,7 +321,6 @@ void sm90_fp8_pertensor_dispatch_shape_impl(
   using GemmM128SmallN =
       typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _64, _128>, Shape<_1, _1, _1>, PingpongFastAccum, false>::
           Gemm;
-  // swap-AB configs below: kernel-N is the original M
   using GemmM64SmallN =
       typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _16, _256>, Shape<_1, _4, _1>, FastAccum, true>::Gemm;
   using GemmM64LargeN =
@@ -358,18 +335,8 @@ void sm90_fp8_pertensor_dispatch_shape_impl(
   const uint32_t m = a.size(0);
   const uint32_t n = b.size(1);
 
-  // Threshold separating "smallN" from "largeN" for the M16 and M64 buckets.
-  // 1280 sits just above N=1024 (attention out-proj / KV-proj N for the
-  // LLaMA-3 / Qwen-2.5 / Mistral families), so those layers take the narrower
-  // kernel-N tile and its wider N-direction cluster for TMA multicast, while
-  // MLP and fused-QKV shapes (N 4096-28672) cross into largeN where denser
-  // N-tile coverage plus a smaller cluster wins. Inherited from the vLLM SM90
-  // dispatch; benched across LLaMA / Qwen / Mistral and robust within +/-256.
   static constexpr uint32_t kNThreshold = 1280;
 
-  // Splits the M128 bucket. Above 4096 the wide tile<_64,_128,_128> +
-  // cluster<_2,_1,_1> pays off; below it that tile costs 20-25% against the
-  // smaller-tile fallback on H200.
   static constexpr uint32_t kM128NThreshold = 4096;
 
   if (m <= 16) {
@@ -380,11 +347,9 @@ void sm90_fp8_pertensor_dispatch_shape_impl(
   }
   if (m <= 64) {
     if (n <= kNThreshold) {
-      // kernel-N=16 divides every M in {17..64}, so no N-tile padding.
       return sm90_fp8::launch<GemmM64SmallN>(out, a, b, scales_a, scales_b, bias, stream);
     }
     if (m <= 32) {
-      // M=32 against kernel-N=64 would waste half the N-tile.
       return sm90_fp8::launch<GemmM32LargeN>(out, a, b, scales_a, scales_b, bias, stream);
     }
     return sm90_fp8::launch<GemmM64LargeN>(out, a, b, scales_a, scales_b, bias, stream);

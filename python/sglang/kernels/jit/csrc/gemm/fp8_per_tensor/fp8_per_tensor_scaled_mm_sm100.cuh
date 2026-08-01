@@ -17,8 +17,6 @@ limitations under the License.
 
 #include "fp8_per_tensor_rowwise_c3x.cuh"
 
-// M-bucketed dispatch carried over unchanged from the AOT kernel's
-// sm100_fp8_dispatch_bias.
 template <typename OutType, bool WithBias>
 void sm100_fp8_pertensor_dispatch_shape(
     tvm::ffi::TensorView out,

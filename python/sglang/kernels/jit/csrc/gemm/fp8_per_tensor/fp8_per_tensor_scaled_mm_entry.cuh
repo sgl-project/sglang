@@ -13,14 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// Ported from the AOT sgl-kernel CUTLASS FP8 rowwise GEMM
-// (csrc/gemm/fp8_gemm_kernel.cu, itself adapted from TensorRT-LLM v0.16.0).
-//
-// The AOT kernel compiled every arch into one wheel and picked between them at
-// runtime with getSMVersion(). A JIT module is built for the device it runs on,
-// so the Python wrapper resolves the arch and passes SGL_FP8_GEMM_SM; only that
-// arch's templates are instantiated, which is also what keeps compile time sane.
-
 #pragma once
 
 #include <sgl_kernel/tensor.h>

@@ -13,14 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// Ported from the AOT csrc/gemm/fp8_gemm_kernel.cu SM89 path (adapted from
-// TensorRT-LLM v0.16.0 fp8_rowwise_gemm_kernel_template_sm89.h).
-//
-// Ada has no TMA and no warp-specialised collectives, so this is the CUTLASS
-// 2.x device GEMM with threadblock-level EVT visitors -- structurally unlike
-// the SM90/100/120 paths, which is why it does not share their gemm struct.
-// The (M, N) tile/stage table is carried over verbatim.
-
 #pragma once
 
 #include <sgl_kernel/utils.cuh>
@@ -176,46 +168,34 @@ void launch_sm89_fp8_rowwise_scaled_mm(
   typename Gemm::Arguments args(
       cutlass::gemm::GemmUniversalMode::kGemm,
       {m, n, k},
-      1,   // split-k factor
-      {},  // epilogue args, filled in below
+      1,
+      {},
       ptr_a,
       ptr_b,
-      nullptr,  // c pointer (unused)
-      nullptr,  // d pointer (unused)
-      m * k,    // batch stride a (unused)
-      n * k,    // batch stride b (unused)
-      m * n,    // batch stride c (unused)
-      m * n,    // batch stride d (unused)
+      nullptr,
+      nullptr,
+      m * k,
+      n * k,
+      m * n,
+      m * n,
       lda,
       ldb,
-      ldc,   // stride c (unused)
-      ldc);  // stride d (unused)
+      ldc,
+      ldc);
 
   if constexpr (WithBias) {
     auto ptr_bias = static_cast<const ElementOutput*>(bias.value().data_ptr());
     args.epilogue = {
-        {
-            {
-                {},  // accumulator
-                {ptr_scales_b, ElementComputeEpilogue(0), {_0{}, _1{}, _0{}}},
-                {}  // multiplies
-            },
-            {ptr_scales_a, ElementComputeEpilogue(0), {_1{}, _0{}, _0{}}},
-            {ptr_bias, ElementOutput(0), {_0{}, _1{}, _0{}}},
-            {}  // multiply_add
-        },
+        {{{}, {ptr_scales_b, ElementComputeEpilogue(0), {_0{}, _1{}, _0{}}}, {}},
+         {ptr_scales_a, ElementComputeEpilogue(0), {_1{}, _0{}, _0{}}},
+         {ptr_bias, ElementOutput(0), {_0{}, _1{}, _0{}}},
+         {}},
         {ptr_d, {n, _1{}, _0{}}}};
   } else {
     args.epilogue = {
-        {
-            {
-                {},  // accumulator
-                {ptr_scales_b, ElementComputeEpilogue(0), {_0{}, _1{}, _0{}}},
-                {}  // multiplies
-            },
-            {ptr_scales_a, ElementComputeEpilogue(0), {_1{}, _0{}, _0{}}},
-            {}  // multiplies
-        },
+        {{{}, {ptr_scales_b, ElementComputeEpilogue(0), {_0{}, _1{}, _0{}}}, {}},
+         {ptr_scales_a, ElementComputeEpilogue(0), {_1{}, _0{}, _0{}}},
+         {}},
         {ptr_d, {n, _1{}, _0{}}}};
   }
 
@@ -246,7 +226,6 @@ void sm89_fp8_pertensor_dispatch_bias(
   return launch_sm89_fp8_rowwise_scaled_mm<GemmNoBias, false>(out, a, b, scales_a, scales_b, bias, stream);
 }
 
-// (M, N) tile/stage table carried over verbatim from the AOT sm89_fp8_dispatch_shape.
 template <typename OutType>
 void sm89_fp8_pertensor_dispatch_shape(
     tvm::ffi::TensorView out,

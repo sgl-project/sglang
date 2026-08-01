@@ -13,11 +13,6 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-# CUTLASS arch tag the kernel is built against, per device capability. Mirrors the
-# runtime getSMVersion() ladder the AOT kernel used, except the choice is made once
-# at compile time because a JIT module is built for the device it runs on.
-# sm_90a/100a/120a (not plain sm_90/100/120) are required by the CUTLASS 3.x
-# schedules these paths use; sm_89 is a CUTLASS 2.x path and takes no suffix.
 _ARCH_SUFFIX = {89: "", 90: "a", 100: "a", 120: "a"}
 
 
@@ -61,7 +56,6 @@ def _fp8_per_tensor_arch_env(arch: int):
 
 @cache_once
 def _jit_fp8_per_tensor_module(arch: int) -> Module:
-    """Compile and cache the per-tensor/per-channel fp8 GEMM module (fp16 + bf16)."""
     with _fp8_per_tensor_arch_env(arch):
         return load_jit(
             "fp8_per_tensor_scaled_mm",
@@ -100,14 +94,6 @@ def fp8_per_tensor_scaled_mm(
     out_dtype: torch.dtype,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """FP8 e4m3 per-row/per-column scaled matmul.
-
-    mat_a: [M, K] row-major fp8_e4m3.
-    mat_b: [K, N] column-major fp8_e4m3.
-    scales_a: [M] float32 (per-token; broadcast a per-tensor scale before calling).
-    scales_b: [N] float32 (per-channel; broadcast a per-tensor scale before calling).
-    bias: optional [N] tensor of out_dtype, added after scaling.
-    """
     assert out_dtype in (
         torch.float16,
         torch.bfloat16,
