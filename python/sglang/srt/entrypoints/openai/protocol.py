@@ -596,37 +596,6 @@ class ToolCall(BaseModel):
     function: FunctionResponse
 
 
-class Function(BaseModel):
-    """Function descriptions."""
-
-    description: Optional[str] = Field(default=None, examples=[None])
-    name: str
-    parameters: Optional[object] = None
-    strict: bool = False
-    defer_loading: Optional[bool] = None
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        data = handler(self)
-        if self.defer_loading is None:
-            data.pop("defer_loading", None)
-        return data
-
-
-class Tool(BaseModel):
-    """Function wrapper."""
-
-    type: str = Field(default="function", examples=["function"])
-    function: Function
-    defer_loading: Optional[bool] = None
-
-    @model_validator(mode="after")
-    def _propagate_defer_loading(self) -> Tool:
-        if self.defer_loading is not None and self.function.defer_loading is None:
-            self.function.defer_loading = self.defer_loading
-        return self
-
-
 _GenericMessageRole = Literal[
     "system", "assistant", "tool", "function", "developer", "latest_reminder"
 ]
@@ -684,6 +653,42 @@ class ChatCompletionMessageUserParam(BaseModel):
 ChatCompletionMessageParam = Union[
     ChatCompletionMessageGenericParam, ChatCompletionMessageUserParam
 ]
+
+
+class Function(BaseModel):
+    """Function descriptions."""
+
+    description: Optional[str] = Field(default=None, examples=[None])
+    name: str
+    parameters: Optional[object] = None
+    strict: bool = False
+    defer_loading: Optional[bool] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.defer_loading is None:
+            data.pop("defer_loading", None)
+        return data
+
+
+class Tool(BaseModel):
+    """Function wrapper."""
+
+    type: str = Field(default="function", examples=["function"])
+    function: Function
+    defer_loading: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _propagate_defer_loading(self) -> Tool:
+        if self.defer_loading is not None and self.function.defer_loading is None:
+            self.function.defer_loading = self.defer_loading
+        return self
+
+
+# Tool is defined after the message params that reference it, so the forward
+# reference has to be resolved explicitly.
+ChatCompletionMessageGenericParam.model_rebuild()
 
 
 class ToolChoiceFuncName(BaseModel):
