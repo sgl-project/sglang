@@ -22,7 +22,6 @@ QWEN3_6_27B_64K_PREFIX_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "ASCEND_USE_FIA": "1",
     "GDN_ATTN_BACKEND_TRITON": "1",
@@ -77,6 +76,10 @@ QWEN3_6_27B_64K_PREFIX_OTHER_ARGS = [
     1,
     "--speculative-num-draft-tokens",
     4,
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
 ]
 
 

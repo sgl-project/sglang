@@ -160,11 +160,14 @@ class SchedulerInvariantChecker:
             self.req_to_token_pool.mamba_pool.size,
         )
         if leak:
-            # Page-level leak diagnosis for mamba
-            free_full_pages = set(
-                self.token_to_kv_pool_allocator.free_pages.tolist()
-                + self.token_to_kv_pool_allocator.release_pages.tolist()
-            )
+            # Page-level leak diagnosis for mamba. Allocator flavors without
+            # page free-lists (free_pages is None) skip the page census — the
+            # dump must never crash the watchdog thread that calls it.
+            free_pages = self.token_to_kv_pool_allocator.free_pages
+            release_pages = self.token_to_kv_pool_allocator.release_pages
+            if free_pages is None or release_pages is None:
+                return leak, msg
+            free_full_pages = set(free_pages.tolist() + release_pages.tolist())
             cached_full_pages = set(self.tree_cache.all_values_flatten().tolist())
             expected_full_pages = set(
                 range(1, self.token_to_kv_pool_allocator.size + 1)
@@ -246,11 +249,10 @@ class SchedulerInvariantChecker:
         swa_uncached = 0
         for batch in batches:
             for req in batch.reqs:
-                assert req.kv_committed_freed == req.kv_overallocated_freed
-                if req.kv_committed_freed or req.req_pool_idx is None:
+                if req.kv is None:
                     continue
 
-                allocated_len = req.kv_allocated_len
+                allocated_len = req.kv.kv_allocated_len
                 if self.page_size > 1:
                     allocated_len = ceil_align(allocated_len, self.page_size)
                     assert req.cache_protected_len % self.page_size == 0
@@ -258,7 +260,7 @@ class SchedulerInvariantChecker:
                 full_uncached += allocated_len - req.cache_protected_len
                 if self.is_hybrid_swa:
                     swa_uncached += allocated_len - max(
-                        req.cache_protected_len, req.swa_evicted_seqlen
+                        req.cache_protected_len, req.kv.swa_evicted_seqlen
                     )
 
         return full_uncached, swa_uncached
@@ -316,12 +318,14 @@ class SchedulerInvariantChecker:
         batch = self.get_last_batch()
         if batch is not None:
             for req in batch.reqs:
+                if req.kv is None:
+                    continue
                 _add_owner(
                     req,
                     f"req {req.rid}",
                     req.req_pool_idx,
                     req.kv_committed_len,
-                    req.kv_allocated_len,
+                    req.kv.kv_allocated_len,
                 )
         sess = getattr(self.tree_cache, "slots", None)
         if sess:
@@ -332,7 +336,7 @@ class SchedulerInvariantChecker:
                         f"slot {sid[:8]}",
                         slot.req_pool_idx,
                         slot.kv_committed_len,
-                        slot.kv_allocated_len,
+                        slot.kv.kv_allocated_len,
                     )
 
         active = [

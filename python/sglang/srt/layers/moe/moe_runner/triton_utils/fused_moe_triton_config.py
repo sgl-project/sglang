@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_device_name, is_hip
 
 logger = logging.getLogger(__name__)
@@ -69,7 +69,7 @@ def get_moe_configs(
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
     """
-    if get_server_args().enable_deterministic_inference:
+    if get_exec().deterministic.enable_deterministic_inference:
         logger.warning(
             "Deterministic inference is enabled, using default MoE kernel config."
         )
@@ -139,12 +139,29 @@ def get_moe_configs(
                 # If a configuration has been found, return it
                 return {int(key): val for key, val in json.load(f).items()}
 
-    # If no optimized configuration is available, we will use the default configuration when down_moe is False
-    # When down_moe is True, we will try to use the config for down_moe=False
     if down_moe:
+        # A separate down-projection config enables the TMA path, but it is
+        # optional. Reuse a tuned up-projection config when it is absent so
+        # the second GEMM does not silently fall back to the heuristic.
+        up_configs = get_moe_configs(
+            E,
+            N,
+            dtype,
+            block_n,
+            block_k,
+            per_channel_quant=per_channel_quant,
+            down_moe=False,
+        )
+        if up_configs is not None:
+            logger.warning(
+                "Down MoE config file not found at %s; reusing the tuned "
+                "up-projection config without TMA. Performance might be sub-optimal.",
+                config_file_path,
+            )
+            return up_configs
         logger.warning(
             (
-                "Using MoE kernel config with down_moe=False. Performance might be sub-optimal! "
+                "Using default MoE kernel config. Performance might be sub-optimal! "
                 "Config file not found at %s, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton"
             ),
             config_file_path,
@@ -170,7 +187,7 @@ def get_default_config(
     is_marlin: bool,
     block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
-    if get_server_args().enable_deterministic_inference:
+    if get_exec().deterministic.enable_deterministic_inference:
         config = {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 64,

@@ -4,7 +4,7 @@
 export const config = {
   modelName: "DeepSeek-V4",
 
-  latencyPercentile: "Mean", // temporary; re-measure to P50
+  latencyPercentile: "P50",
 
   supportedHardware: [
     "h100", "h200", "b200", "b300", "gb200", "gb300",
@@ -17,11 +17,12 @@ export const config = {
   // merges these in, so a model-specific GPU is config data, not an engine edit.
   // RTX PRO 6000 (SM120 / Blackwell Desktop) is a workstation card, not datacenter.
   hardware: [
-    { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "nvidia" },
+    { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
   ],
 
   variants: [
     { id: "flash", label: "Flash", subtitle: "284B" },
+    { id: "flash-official", label: "Flash Official", subtitle: "284B · 0731" },
     { id: "pro",   label: "Pro",   subtitle: "1.6T" },
   ],
   quantizations: [
@@ -44,6 +45,7 @@ export const config = {
     "flash|fp4": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|nvfp4": "nvidia/DeepSeek-V4-Flash-NVFP4",
+    "flash-official|fp4": "deepseek-ai/DeepSeek-V4-Flash-0731",
     "pro|fp4":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|fp8":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|nvfp4": "nvidia/DeepSeek-V4-Pro-NVFP4",
@@ -80,7 +82,7 @@ export const config = {
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
-  --warmup-requests 64`,
+  --warmup-requests 64 --flush-cache`,
     accuracy: {
       gsm8k_pct:
 `# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
@@ -89,6 +91,14 @@ sgl-eval run gsm8k \\
   --num-threads 32`,
       gpqa_pct: {
         flash:
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run gpqa \\
+  --model {{MODEL_NAME}} --api-key <api-key> \\
+  --n-repeats 16 --max-tokens 200000 \\
+  --temperature 1.0 --top-p 1.0 --thinking \\
+  --out-dir /sgl-workspace/logs \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
+        "flash-official":
 `# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
 sgl-eval run gpqa \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
@@ -106,6 +116,14 @@ sgl-eval run gpqa \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
       },
       aime25_pct: {
+        "flash-official":
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run aime25 \\
+  --model {{MODEL_NAME}} --api-key <api-key> \\
+  --n-repeats 16 --max-tokens 200000 \\
+  --temperature 1.0 --top-p 1.0 --thinking \\
+  --out-dir /sgl-workspace/logs \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
         flash:
 `# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
 sgl-eval run aime25 \\
@@ -161,7 +179,7 @@ sgl-eval run aime25 \\
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260623",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260710",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
@@ -173,6 +191,12 @@ sgl-eval run aime25 \\
 
     // ----- Card 1: "Attention Parallelism" -----
     // DP-Attention is a combined knob: value is the DP degree AND toggles `--enable-dp-attention`.
+    // CP sizes auto-gate in the engine to the runtime derivation
+    // attn_cp_size = tp/dp (a user-passed --attn-cp-size is overridden).
+    // CP is single-machine only (tp_size <= 8). Interleave CP + DP-Attention
+    // currently fails the runtime's dp_size == 1 assert but is allowed here
+    // with a warning (combined support is planned upstream). No `cpStrategy`
+    // knob: DeepSeek-V4 supports only interleave (the runtime rejects zigzag).
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [
@@ -184,7 +208,12 @@ sgl-eval run aime25 \\
           { value: 16, disable: { nodes: ["single"] },
             disableReason: "TP=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
         ]},
-        { id: "cp",     label: "CP", values: [null, 1, 2, 4] },
+        { id: "cp", label: "CP",
+          values: [null, { value: 1, label: "Off" }, 2, 4, 8],
+          disable: [
+            { when: { nodes: ["multi-2"] },
+              reason: "Prefill Context Parallel is single-machine only (SGLang asserts tp_size <= 8; cross-machine CP has precision issues)." },
+          ] },
         { id: "dpAttn", label: "DP-Attention",
           values: [
             null,
@@ -257,10 +286,21 @@ sgl-eval run aime25 \\
         { id: "off",        label: "Off (greedy)" },
         { id: "mtp-314",    label: "EAGLE / MTP 3-1-4",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
-                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"] },
+                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"],
+          hide: { variant: ["flash-official"] } },
         { id: "mtp-112",    label: "EAGLE / MTP 1-1-2",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
-                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"] },
+                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
+          hide: { variant: ["flash-official"] } },
+        { id: "dspark",     label: "DSpark",
+          flags: ["--speculative-algorithm DSPARK"],
+          hide: { variant: ["flash", "pro"] },
+          disable: [
+            { when: { dpAttnOn: [true] },
+              reason: "DSpark is not compatible with DP Attention on the current release." },
+            { when: { hw: ["mi300x", "mi355x"] },
+              reason: "DSpark currently requires CUDA." },
+          ] },
         { id: "ngram",      label: "NGRAM",
           flags: ["--speculative-algorithm NGRAM",
                   "--speculative-num-draft-tokens 16",
@@ -274,6 +314,8 @@ sgl-eval run aime25 \\
 
     // ----- Card 5: "PD Disaggregation" -----
     pdDisagg: {
+      showWhen: (base) => base.specAlgorithm !== "DSPARK",
+      incompatibleSpeculativeAlgorithms: ["DSPARK"],
       modes: [
         { id: "off",     label: "Off" },
         { id: "prefill", label: "Prefill role" },
@@ -289,6 +331,9 @@ sgl-eval run aime25 \\
           ],
           envWhen: { hw: ["gb200", "gb300"] } },
         { id: "nixl",     label: "NiXL" },
+        // MORI-IO transport is AMD-only — hidden on every non-ROCm platform.
+        { id: "mori",     label: "MORI",
+          hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000"] } },
       ],
       // `auto` is a sentinel (emits no --disaggregation-ib-device flag).
       ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
@@ -309,12 +354,44 @@ sgl-eval run aime25 \\
     // ----- Card 6: "Hierarchical KV Cache" -----
     hicache: {
       excludesHw: ["rtx6000"],
+      // AMD ROCm (MI300X/MI325X/MI350X/MI355X): page_first_direct + direct io.
+      amdIo: { memLayout: "page_first_direct", ioBackend: "direct", ratio: 4 },
+      roleOverrides: [
+        {
+          when: {
+            hw: ["mi355x"], variant: ["pro"], quant: ["fp4"],
+            strategy: ["low-latency"], nodes: ["single"],
+          },
+          mode: "prefill",
+          transferBackend: "mori",
+          memLayout: "page_first",
+          ioBackend: "direct",
+          ratio: 5,
+          writePolicy: "write_through",
+          prefetchPolicy: "best_effort",
+        },
+      ],
+      notices: [
+        {
+          when: {
+            hw: ["mi355x"], variant: ["pro"], quant: ["fp4"],
+            strategy: ["low-latency"], nodes: ["single"],
+          },
+          mode: "decode",
+          transferBackend: "mori",
+          text: "HiCache is not recommended on the decode role with MORI.",
+        },
+      ],
+      amdStorageFileOnly: true,
       backends: [
         { id: null,        label: "Auto" },
         { id: "file",      label: "File" },
-        { id: "mooncake",  label: "Mooncake" },
-        { id: "hf3fs",     label: "HF3FS" },
-        { id: "nixl",      label: "NiXL" },
+        { id: "mooncake",  label: "Mooncake",
+          hide: { hw: ["mi300x", "mi355x"] } },
+        { id: "hf3fs",     label: "HF3FS",
+          hide: { hw: ["mi300x", "mi355x"] } },
+        { id: "nixl",      label: "NiXL",
+          hide: { hw: ["mi300x", "mi355x"] } },
       ],
       writePolicies: [
         { id: "auto",                    label: "Auto" },
@@ -337,12 +414,47 @@ sgl-eval run aime25 \\
       ],
       defaultHostRatio: 10,
     },
+
+    flagSelects: [
+      {
+        id: "dsparkDraftTokens",
+        title: "DSpark Proposed Draft Tokens",
+        showWhen: (base) => base.variant === "flash-official" && base.specAlgorithm === "DSPARK",
+        control: "slider",
+        stripPrefixes: ["--speculative-dspark-block-size"],
+        options: [
+          { id: "auto", label: "Checkpoint default" },
+          { id: "1", label: "1", flags: ["--speculative-dspark-block-size 1"] },
+          { id: "2", label: "2", flags: ["--speculative-dspark-block-size 2"] },
+          { id: "3", label: "3", flags: ["--speculative-dspark-block-size 3"] },
+          { id: "4", label: "4", flags: ["--speculative-dspark-block-size 4"] },
+          { id: "5", label: "5", flags: ["--speculative-dspark-block-size 5"] },
+        ],
+      },
+    ],
   },
 
   cells: [
     // ====================================================================
     // B200 + FP4
     // ====================================================================
+    {
+      match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 4096",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     {
       match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,
@@ -364,6 +476,22 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
@@ -379,6 +507,23 @@ sgl-eval run aime25 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 2",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -424,15 +569,16 @@ sgl-eval run aime25 \\
     {
       match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [],
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096",
+      ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--moe-runner-backend flashinfer_mxfp4",
-        "--disable-flashinfer-autotune",
+        "--moe-a2a-backend megamoe",
         "--chunked-prefill-size 32768",
         "--swa-full-tokens-ratio 0.1",
         "--speculative-algorithm EAGLE",
@@ -441,7 +587,6 @@ sgl-eval run aime25 \\
         "--speculative-num-draft-tokens 2",
         "--mem-fraction-static 0.92",
         "--cuda-graph-max-bs-decode 256",
-        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -471,6 +616,23 @@ sgl-eval run aime25 \\
     },
 
     {
+      match: { hw: "b300", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 4096",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
@@ -491,6 +653,22 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      match: { hw: "b300", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
@@ -506,6 +684,23 @@ sgl-eval run aime25 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 2",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -690,6 +885,23 @@ sgl-eval run aime25 \\
     // GB200 + FP4
     // ====================================================================
     {
+      match: { hw: "gb200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 4096",
+        "--disable-flashinfer-autotune",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
@@ -710,6 +922,22 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      match: { hw: "gb200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
@@ -725,6 +953,23 @@ sgl-eval run aime25 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 2",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -869,6 +1114,23 @@ sgl-eval run aime25 \\
     // GB300 + FP4
     // ====================================================================
     {
+      match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.90",
+        "--chunked-prefill-size 4096",
+        "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
@@ -883,6 +1145,22 @@ sgl-eval run aime25 \\
         "--speculative-num-draft-tokens 4",
         "--chunked-prefill-size 4096",
         "--swa-full-tokens-ratio 0.1",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -903,6 +1181,23 @@ sgl-eval run aime25 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 2",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1171,6 +1466,20 @@ sgl-eval run aime25 \\
     },
 
     {
+      match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend marlin",
+        "--speculative-algorithm DSPARK",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
@@ -1188,6 +1497,20 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--speculative-algorithm DSPARK",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
@@ -1200,6 +1523,19 @@ sgl-eval run aime25 \\
         "--speculative-num-steps 1",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 2",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend marlin",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1230,7 +1566,7 @@ sgl-eval run aime25 \\
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
-        "--mem-fraction-static 0.83",
+        "--mem-fraction-static 0.90",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1272,6 +1608,20 @@ sgl-eval run aime25 \\
     // H100 + FP4 (Marlin runner)
     // ====================================================================
     {
+      match: { hw: "h100", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend marlin",
+        "--speculative-algorithm DSPARK",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
@@ -1289,6 +1639,20 @@ sgl-eval run aime25 \\
       ],
     },
     {
+      match: { hw: "h100", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend marlin",
+        "--speculative-algorithm DSPARK",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "h100", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
@@ -1301,6 +1665,19 @@ sgl-eval run aime25 \\
         "--speculative-num-steps 1",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 2",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h100", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend marlin",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1375,8 +1752,22 @@ sgl-eval run aime25 \\
 
     // ====================================================================
     // RTX PRO 6000 (SM120 / Blackwell Desktop) — Flash + low-latency only
-    // (V4-Pro doesn't fit on 8× 96 GB); TP-only, Marlin MoE runner.
     // ====================================================================
+    {
+      match: { hw: "rtx6000", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--mem-fraction-static 0.92",
+        "--cuda-graph-max-bs-decode 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     {
       match: { hw: "rtx6000", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,
@@ -1384,9 +1775,9 @@ sgl-eval run aime25 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--moe-runner-backend marlin",
-        "--mem-fraction-static 0.70",
+        "--tp 2",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--mem-fraction-static 0.92",
         "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -1492,6 +1883,29 @@ sgl-eval run aime25 \\
 
     // ---------- MI355X (288GB) — Flash FP4 ----------
     {
+      match: { hw: "mi355x", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [
+        "SGLANG_USE_ROCM700A=0",
+        "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
+        "AITER_BF16_FP8_MOE_BOUND=0",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--attention-backend dsv4",
+        "--page-size 256",
+        "--mem-fraction-static 0.90",
+        "--swa-full-tokens-ratio 0.15",
+        "--disable-shared-experts-fusion",
+        "--kv-cache-dtype fp8_e4m3",
+        "--chunked-prefill-size 8192",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [
@@ -1506,7 +1920,7 @@ sgl-eval run aime25 \\
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 8192",
@@ -1519,11 +1933,14 @@ sgl-eval run aime25 \\
       ],
     },
     {
-      match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: true,
+      match: { hw: "mi355x", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1533,12 +1950,41 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
+        "--disable-shared-experts-fusion",
+        "--kv-cache-dtype fp8_e4m3",
+        "--chunked-prefill-size 65536",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [
+        "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
+        "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
+        "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
+        "AITER_BF16_FP8_MOE_BOUND=0",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--enable-two-batch-overlap",
+        "--attention-backend dsv4",
+        "--page-size 256",
+        "--mem-fraction-static 0.90",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
@@ -1551,11 +1997,14 @@ sgl-eval run aime25 \\
       ],
     },
     {
-      match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
-      verified: true,
+      match: { hw: "mi355x", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1565,12 +2014,41 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
+        "--disable-shared-experts-fusion",
+        "--kv-cache-dtype fp8_e4m3",
+        "--chunked-prefill-size 65536",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: [
+        "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
+        "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
+        "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
+        "AITER_BF16_FP8_MOE_BOUND=0",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dp 8",
+        "--enable-dp-attention",
+        "--enable-two-batch-overlap",
+        "--attention-backend dsv4",
+        "--page-size 256",
+        "--mem-fraction-static 0.90",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
@@ -1599,7 +2077,7 @@ sgl-eval run aime25 \\
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 8192",
@@ -1616,7 +2094,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1626,12 +2107,11 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
@@ -1648,7 +2128,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1658,12 +2141,11 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
@@ -1692,7 +2174,7 @@ sgl-eval run aime25 \\
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 8192",
@@ -1709,7 +2191,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1719,12 +2204,11 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
@@ -1741,7 +2225,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1751,12 +2238,11 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
@@ -1785,7 +2271,7 @@ sgl-eval run aime25 \\
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 8192",
@@ -1802,7 +2288,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1812,12 +2301,11 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
@@ -1834,7 +2322,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1844,12 +2335,11 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",

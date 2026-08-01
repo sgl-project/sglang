@@ -23,6 +23,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+    IPC_A2A,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -326,6 +329,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 Used by disaggregated pipelines to access intermediate tensors.
         """
         assert self.pipeline is not None
+        # request boundary: the IPC watchdog flag is a device read, illegal
+        # inside a graph capture and too costly per exchange
+        IPC_A2A.check_timeout()
         if len(batch) > 1:
             if return_req:
                 raise ValueError(
@@ -480,7 +486,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._materialize_raw_frame_transport(output_batch, req)
         elif req.save_output and req.return_file_paths_only:
             self._materialize_file_path_transport(output_batch, save_output_paths)
-        elif req.return_frames:
+        elif getattr(req, "return_frames", False):
             self._materialize_frame_outputs_for_return(output_batch, req)
 
     def _materialize_raw_frame_transport(
@@ -518,7 +524,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self, output_batch: OutputBatch, req: Req
     ) -> None:
         """materialize the output from tensor to numpy frames for faster serialization"""
-        if self.rank != 0 or output_batch.output is None or not req.return_frames:
+        if (
+            self.rank != 0
+            or output_batch.output is None
+            or not getattr(req, "return_frames", False)
+        ):
             return
 
         if (
@@ -692,7 +702,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             mismatched = [
                 field
                 for field in shared_output_fields
-                if getattr(req, field) != getattr(first_req, field)
+                if getattr(req, field, None) != getattr(first_req, field, None)
             ]
             if mismatched:
                 raise ValueError(
