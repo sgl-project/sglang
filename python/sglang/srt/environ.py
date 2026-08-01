@@ -232,6 +232,14 @@ class Envs:
     # must go through ServerArgs.override() (enabled by the test harness).
     SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
 
+    # Per-role config-namespace bookkeeping: off / record / enforce (value is
+    # validated fail-loud in runtime_context, which resolves it once at import
+    # so the read stays dynamo-prunable).
+    SGLANG_ROLE_NAMESPACES = EnvStr("off")
+    # record mode: append each newly observed (role, namespace) pair to this
+    # file so the audit survives signal-killed workers.
+    SGLANG_ROLE_NAMESPACES_OUT = EnvStr(None)
+
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     # Controls weight-file ordering for load-time I/O optimization.
