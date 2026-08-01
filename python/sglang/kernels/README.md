@@ -83,8 +83,9 @@ with interchangeable implementations along **two independent dimensions**:
     in `capabilities` (device support is metadata, not guesswork).
 - **Platforms / devices** — optional composite per-device paths:
   `forward_cuda`, `forward_hip` (falls back to `forward_cuda`),
-  `forward_npu`, `forward_xpu`, `forward_musa` (falls back to
-  `forward_cuda`), `forward_cpu` (AMX CPUs), plus `forward_<key>` /
+  `forward_npu`, `forward_xpu`, `forward_musa` (no implicit CUDA fallback —
+  MUSA ops opt into the CUDA path with an explicit `forward_musa`),
+  `forward_cpu` (AMX CPUs), plus `forward_<key>` /
   `register_oot_forward()` for out-of-tree platform plugins. CUDA / HIP are
   **not** kernel backends.
 

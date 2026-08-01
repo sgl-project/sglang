@@ -38,9 +38,9 @@ Dispatch priority (highest first), resolved by :meth:`BaseFusedOp.forward`:
    per-call shape/dtype gates; overriding it switches this step from a
    statically cached choice to per-call selection.
 5. **Platform-specific forward** — ``forward_cuda`` on CUDA, ``forward_hip``
-   (falling back to ``forward_cuda``) on ROCm, ``forward_musa`` (falling back
-   to ``forward_cuda``) on MUSA, ``forward_npu`` / ``forward_xpu`` on
-   Ascend / XPU, ``forward_cpu`` on AMX-capable CPUs.
+   (falling back to ``forward_cuda``) on ROCm, ``forward_musa`` on MUSA,
+   ``forward_npu`` / ``forward_xpu`` on Ascend / XPU, ``forward_cpu`` on
+   AMX-capable CPUs.
 6. **Native fallback** — ``forward_native``.
 
 Steps 3-6 are static per process, so their outcome is resolved once (lazily,
@@ -136,14 +136,18 @@ DEFAULT_PRIORITY: Tuple[KernelBackend, ...] = (
 # concrete subclass always has it) and forward_torch_compile derives from it.
 _ALWAYS_AVAILABLE = (KernelBackend.TORCH, KernelBackend.TORCH_COMPILE)
 
-# In-tree platform key -> platform forward candidates, best first. This
-# preserves the MultiPlatformOp default chains (HIP and MUSA fall back to the
-# CUDA path). A candidate counts only when the subclass actually overrides it;
-# otherwise dispatch falls through to forward_native.
+# In-tree platform key -> platform forward candidates, best first. A candidate
+# counts only when the subclass actually overrides it; otherwise dispatch
+# falls through to forward_native. Only HIP keeps the implicit CUDA-path
+# fallback (ROCm kernels are hipified CUDA and sgl_kernel builds for both);
+# MUSA deliberately does not chain into forward_cuda — srt module-level
+# kernel imports are gated on is_cuda(), so a CUDA path reached implicitly on
+# a MUSA box can NameError instead of degrading. MUSA ops that want the CUDA
+# path opt in with an explicit forward_musa.
 _PLATFORM_METHODS: Dict[str, Tuple[str, ...]] = {
     "cuda": ("forward_cuda",),
     "hip": ("forward_hip", "forward_cuda"),
-    "musa": ("forward_musa", "forward_cuda"),
+    "musa": ("forward_musa",),
     "npu": ("forward_npu",),
     "xpu": ("forward_xpu",),
     "cpu": ("forward_cpu",),
@@ -513,8 +517,8 @@ class BaseFusedOp(nn.Module, ABC):
     def _platform_method(self, platform_key: str) -> Optional[Callable]:
         """The platform forward for ``platform_key``, or ``None``.
 
-        In-tree keys use :data:`_PLATFORM_METHODS` (with the HIP / MUSA →
-        CUDA fallback chains); OOT keys look up ``forward_<key>`` directly.
+        In-tree keys use :data:`_PLATFORM_METHODS` (with the HIP → CUDA
+        fallback chain); OOT keys look up ``forward_<key>`` directly.
         """
         if not platform_key:
             return None

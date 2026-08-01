@@ -166,8 +166,11 @@ def test_platform_forward_dispatch(monkeypatch, key, expect):
 @pytest.mark.parametrize(
     "key, expect",
     [
-        ("hip", "cuda"),  # HIP falls back to the CUDA path
-        ("musa", "cuda"),  # MUSA falls back to the CUDA path
+        ("hip", "cuda"),  # HIP falls back to the CUDA path (hipified kernels)
+        # MUSA has no implicit CUDA fallback: srt kernel imports are gated on
+        # is_cuda(), so silently entering forward_cuda on a MUSA box can
+        # NameError; ops opt in with an explicit forward_musa instead.
+        ("musa", "native"),
         ("npu", "native"),  # no NPU path -> native
         ("cpu", "native"),
         ("cuda", "cuda"),

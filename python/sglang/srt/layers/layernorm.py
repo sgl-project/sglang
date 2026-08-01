@@ -1014,6 +1014,16 @@ class GemmaRMSNorm(BaseFusedOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self._forward_impl(x, residual, post_residual_addition)
 
+    def forward_musa(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # sgl_kernel's gemma norm ops are built for MUSA (see the import gate
+        # above); opt into the CUDA-path implementation explicitly.
+        return self._forward_impl(x, residual, post_residual_addition)
+
     def forward_with_allreduce_fusion(
         self,
         x: torch.Tensor,
@@ -1089,6 +1099,10 @@ class Gemma3RMSNorm(BaseFusedOp):
         if x.dim() == 2:
             return gemma_rmsnorm(x, self.weight.data, self.eps)
         return self.forward_native(x)
+
+    def forward_musa(self, x, residual: Optional[torch.Tensor] = None):
+        # sgl_kernel's gemma norm ops are built for MUSA; follow the CUDA path.
+        return self.forward_cuda(x, residual)
 
     def forward_hip(self, x, residual: Optional[torch.Tensor] = None):
         # sgl_kernel's gemma_rmsnorm/gemma_fused_add_rmsnorm are not available on
@@ -1176,6 +1190,10 @@ class Gemma4RMSNorm(BaseFusedOp):
         else:
             out = rmsnorm(x, self.weight.data, self.eps)
         return out
+
+    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        # sgl_kernel's gemma norm ops are built for MUSA; follow the CUDA path.
+        return self.forward_cuda(x)
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
         # sgl_kernel's gemma_rmsnorm is not available on ROCm;
