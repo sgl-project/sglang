@@ -771,6 +771,24 @@ class ServingChatTestCase(unittest.TestCase):
                         {"type": "image_url", "image_url": {"url": "image-1"}},
                     ],
                 },
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "Inspect <|kimi_image_placeholder|>",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "inspect",
+                                "arguments": {
+                                    "source": "<|kimi_image_placeholder|>",
+                                    "nested": ["<|kimi_image_placeholder|>"],
+                                },
+                            },
+                        }
+                    ],
+                },
             ],
             tools=[tool],
             tool_choice="required",
@@ -797,6 +815,17 @@ class ServingChatTestCase(unittest.TestCase):
             rendered_messages[1]["content"][0]["text"],
             "Explain <| kimi_image_placeholder |>",
         )
+        self.assertEqual(
+            rendered_messages[2]["reasoning_content"],
+            "Inspect <| kimi_image_placeholder |>",
+        )
+        self.assertEqual(
+            rendered_messages[2]["tool_calls"][0]["function"]["arguments"],
+            {
+                "source": "<| kimi_image_placeholder |>",
+                "nested": ["<| kimi_image_placeholder |>"],
+            },
+        )
         self.assertEqual(call.kwargs["image_prompts"], ["<|media_pad|>"])
         self.assertEqual(call.kwargs["tool_choice"], "required")
         self.assertNotIn("strict", call.kwargs["tools"][0]["function"])
@@ -808,7 +837,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(result.prompt_ids, [7, 8, 9])
         self.assertEqual(result.image_data[0].url, "image-1")
 
-    def test_kimi_k3_preserves_assistant_history_and_raw_arguments(self):
+    def test_kimi_k3_neutralizes_text_only_assistant_history(self):
         self.template_manager.chat_template_name = None
         self.chat.chat_encoding_spec = "kimi_k3"
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
@@ -819,13 +848,14 @@ class ServingChatTestCase(unittest.TestCase):
                 {
                     "role": "assistant",
                     "content": None,
+                    "reasoning_content": "Read <|kimi_image_placeholder|>",
                     "tool_calls": [
                         {
                             "id": "call-1",
                             "type": "function",
                             "function": {
                                 "name": "shell",
-                                "arguments": "not-json",
+                                "arguments": "not-json <|kimi_image_placeholder|>",
                             },
                         }
                     ],
@@ -836,10 +866,17 @@ class ServingChatTestCase(unittest.TestCase):
         self.chat._process_messages(request, is_multimodal=False)
 
         messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertEqual(messages[-1]["role"], "assistant")
         self.assertEqual(
-            messages[-1]["tool_calls"][0]["function"]["arguments"], "not-json"
+            messages[-1]["reasoning_content"],
+            "Read <| kimi_image_placeholder |>",
         )
+        self.assertEqual(
+            messages[-1]["tool_calls"][0]["function"]["arguments"],
+            "not-json <| kimi_image_placeholder |>",
+        )
+        self.assertNotIn("image_prompts", kwargs)
 
     def test_message_tools_participate_in_validation(self):
         tool = {
