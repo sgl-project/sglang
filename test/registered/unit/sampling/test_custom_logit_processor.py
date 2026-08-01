@@ -12,11 +12,17 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.parser.inkling_tokenizer import (
+    CONTENT_THINKING,
+    END_MESSAGE,
+    INKLING_SPECIAL_TOKEN_IDS,
+)
 from sglang.srt.sampling.custom_logit_processor import (
     CustomLogitProcessor,
     DeepseekOCRNoRepeatNGramLogitProcessor,
     DeepSeekR1ThinkingBudgetLogitProcessor,
     DisallowedTokensLogitsProcessor,
+    InklingThinkingBudgetLogitProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
     _cache_from_str,
 )
@@ -239,18 +245,23 @@ class TestThinkingBudgetLogitProcessor(CustomTestCase):
         result = self.processor(logits, params)
         self.assertTrue(torch.equal(result, original))
 
-    def test_end_token_in_prompt_does_not_disable_budget(self):
-        """Test enforcement when THINKING_END also appears in the prompt."""
+    def test_inkling_end_token_in_prompt_does_not_disable_budget(self):
+        proc = InklingThinkingBudgetLogitProcessor()
+        start, end = proc.THINKING_START_TOKEN_ID, proc.THINKING_END_TOKEN_ID
+        self.assertEqual(start, INKLING_SPECIAL_TOKEN_IDS[CONTENT_THINKING])
+        self.assertEqual(end, INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE])
+
         req = _make_req(
-            origin_input_ids=[100, self.END, 101, self.END],  # END also ends a message
-            output_ids=[self.START] + [100] * 5,  # 5 tokens, budget=5 → exceeded
+            origin_input_ids=[100, end, 101, end],
+            output_ids=[start] + [100] * 5,
         )
         params = [{"thinking_budget": 5, "__req__": req}]
-        logits = self._logits()
-        result = self.processor(logits, params)
-        # newline should be the only non-neg-inf token
-        self.assertEqual(result[0, self.NL].item(), 0.0)
-        self.assertTrue(torch.isinf(result[0, 0]) and result[0, 0] < 0)
+        for forced_token in (proc.NEW_LINE_TOKEN_ID, end):
+            result = proc(torch.zeros(1, end + 1), params)
+            self.assertEqual(
+                torch.isfinite(result[0]).nonzero().flatten().tolist(), [forced_token]
+            )
+            req.output_ids.append(forced_token)
 
     def test_deepseek_r1_variant_forces_end(self):
         """Test DeepSeekR1 variant with its own token IDs."""
