@@ -71,10 +71,10 @@ CHUNK_SIZE = 64
 # ---------------------------------------------------------------------------
 # Causal conv1d forward with cache-loaded prefix (Triton).
 #
-# Replaces the former Helion kernel: Helion lowers through torch.fx/dynamo, so the
-# dynamic extend batch B becomes an *unbacked* symint and an `if is_decode` mask
-# branch tripped `GuardOnDataDependentSymNode: Eq(u1, 1)`.  Triton has no symbolic
-# -shape guard machinery: `IS_DECODE: tl.constexpr` resolves the mask branch at JIT
+# Written in Triton rather than any torch.fx/dynamo-lowered DSL: there the dynamic
+# extend batch B becomes an *unbacked* symint and an `if is_decode` mask branch
+# trips `GuardOnDataDependentSymNode: Eq(u1, 1)`.  Triton has no symbolic-shape
+# guard machinery: `IS_DECODE: tl.constexpr` resolves the mask branch at JIT
 # compile time, so the decode specialization compiles with ZERO mask load/multiply
 # and the extend specialization keeps the mask multiply — both guard-free.
 # ---------------------------------------------------------------------------
@@ -236,7 +236,7 @@ def _causal_conv1d_fwd_with_prefix_kernel(
                 # bf16 mul by the 0/1 mask == pre-kernel `sconv_cache[safe_idx]*cache_mask`.
                 p_val = p_val * m_val[:, None]
             # bf16 add (in_x / in_prefix mutually exclusive => one operand is 0), then
-            # cast to fp32 — bit-identical to the v3 Helion `(x_val + p_val).to(f32)`.
+            # cast to fp32 — the add must stay in bf16 to match the reference numerics.
             tap = (x_val + p_val).to(tl.float32)
 
         w_val = tl.load(weight_base + iw * stride_weight_w, mask=d_mask, other=0).to(
@@ -307,7 +307,7 @@ def fused_decode_sconv_metadata(
 ) -> tuple[torch.Tensor, torch.Tensor, SconvDecodeMetadata]:
     """Single-launch replacement for the decode metadata prep: the two arange calls,
     ones, `!= PAD`, `&`, `clamp` and `.long()` that
-    ``precompute_helion_decode_metadata`` (+ its callers) issued as ~7 tiny
+    ``precompute_decode_metadata`` (+ its callers) issued as ~7 tiny
     elementwise kernels. Returns
     ``(query_start_loc, has_initial_state, SconvDecodeMetadata)`` with tensors
     bit-identical to the unfused path. Pass ``out`` to write into preallocated
@@ -341,13 +341,13 @@ def fused_decode_sconv_metadata(
     )
 
 
-def precompute_helion_decode_metadata(
+def precompute_decode_metadata(
     B: int,
     W: int,
     cache_indices: torch.Tensor,
     has_initial_state: torch.Tensor,
 ) -> SconvDecodeMetadata:
-    """Precompute metadata for the helion decode path. Call once, reuse across layers."""
+    """Precompute metadata for the unfused decode path. Call once, reuse across layers."""
     device = cache_indices.device
     valid = cache_indices != PAD_SLOT_ID
     cache_mask = (has_initial_state & valid)[:, None, None]  # [B, 1, 1]
@@ -470,7 +470,7 @@ def fused_extend_sconv_metadata(
     zeros + cumsum(+scan-init) + slice-copy + compare chain the unfused
     ``query_start_loc`` / ``has_initial_state`` build issues, plus the != PAD, &,
     clamp, long, to, arange, searchsorted, clamp, int32 chain of
-    ``precompute_helion_extend_metadata`` (~10-14 tiny kernels, and before the
+    ``precompute_extend_metadata`` (~10-14 tiny kernels, and before the
     conv-state backend owned this prep, re-issued once per conv module of the
     owning layer).
     Returns ``(query_start_loc, has_initial_state, SconvExtendMetadata)`` with
@@ -526,7 +526,7 @@ def fused_extend_sconv_metadata(
     )
 
 
-def precompute_helion_extend_metadata(
+def precompute_extend_metadata(
     B: int,
     T: int,
     W: int,
@@ -534,7 +534,7 @@ def precompute_helion_extend_metadata(
     has_initial_state: torch.Tensor,
     query_start_loc: torch.Tensor,
 ) -> SconvExtendMetadata:
-    """Precompute metadata for the helion extend path. Call once, reuse across layers."""
+    """Precompute metadata for the unfused extend path. Call once, reuse across layers."""
     device = cache_indices.device
 
     valid = cache_indices != PAD_SLOT_ID
@@ -567,7 +567,7 @@ def causal_conv1d(
     """Inference sconv with prefix loaded directly from cache.
 
     Metadata args (cache_mask, safe_idx, cu, si) should be precomputed once
-    per forward pass via precompute_helion_{decode,extend}_metadata and reused
+    per forward pass via precompute_{decode,extend}_metadata and reused
     across layers.
     """
     if activation == "swish":
@@ -694,8 +694,7 @@ def _update_sconv_cache_kernel(
     The shift source old_cache[w + query_len] is selected with a static inner loop over
     src_w (no data-dependent subscript on the W dim). RAW-safe: this writes positions in
     increasing w, and the selected source w+query_len is always > w (query_len > 0), so a
-    position is only ever read before it is overwritten — matching the prior Helion kernel.
-    Triton replaces Helion to drop the AOT-autotune dependency (cf. causal_conv1d).
+    position is only ever read before it is overwritten.
     """
     pid_b = tl.program_id(0)
     pid_d = tl.program_id(1)

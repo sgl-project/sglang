@@ -1,0 +1,44 @@
+{
+  "torch.bfloat16": {
+    "1024": {
+      "BLOCK_SIZE_M": 1,
+      "BLOCK_SIZE_N": 1024,
+      "num_warps": 4
+    },
+    "2048": {
+      "BLOCK_SIZE_M": 1,
+      "BLOCK_SIZE_N": 1024,
+      "num_warps": 4
+    },
+    "384": {
+      "BLOCK_SIZE_M": 4,
+      "BLOCK_SIZE_N": 512,
+      "num_warps": 8
+    },
+    "4608": {
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 128,
+      "num_warps": 8
+    },
+    "512": {
+      "BLOCK_SIZE_M": 2,
+      "BLOCK_SIZE_N": 512,
+      "num_warps": 8
+    },
+    "6144": {
+      "BLOCK_SIZE_M": 2,
+      "BLOCK_SIZE_N": 1024,
+      "num_warps": 8
+    },
+    "768": {
+      "BLOCK_SIZE_M": 16,
+      "BLOCK_SIZE_N": 128,
+      "num_warps": 8
+    },
+    "8192": {
+      "BLOCK_SIZE_M": 2,
+      "BLOCK_SIZE_N": 1024,
+      "num_warps": 8
+    }
+  }
+}

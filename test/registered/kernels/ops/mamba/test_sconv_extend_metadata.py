@@ -1,7 +1,7 @@
 """fused_extend_sconv_metadata must be bit-identical to the unfused prep.
 
 The unfused reference is the exact op sequence the extend metadata prep
-+ precompute_helion_extend_metadata used to launch: zeros + cumsum + slice-copy
++ precompute_extend_metadata used to launch: zeros + cumsum + slice-copy
 (or arange + ones for verify) + the has_initial_state compare, then != PAD, &,
 clamp, long, to(int64), arange, searchsorted, clamp, to(int32).
 """
@@ -16,7 +16,7 @@ from sglang.srt.models.inkling_common.kernels.sconv import (
     HIS_ZEROS,
     PAD_SLOT_ID,
     fused_extend_sconv_metadata,
-    precompute_helion_extend_metadata,
+    precompute_extend_metadata,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -38,7 +38,7 @@ def _ref_extend(B, extend_seq_lens, his_mode, his_src, cache_indices, T):
         has_initial_state = his_src > 0
     else:  # HIS_SEQ_MINUS_EXT
         has_initial_state = (his_src[:B] - extend_seq_lens) > 0
-    meta = precompute_helion_extend_metadata(
+    meta = precompute_extend_metadata(
         B=B,
         T=T,
         W=4,
@@ -55,7 +55,7 @@ def _ref_verify(B, draft_token_num, cache_indices):
         0, (B + 1) * draft_token_num, draft_token_num, dtype=torch.int32, device=device
     )
     has_initial_state = torch.ones(B, dtype=torch.bool, device=device)
-    meta = precompute_helion_extend_metadata(
+    meta = precompute_extend_metadata(
         B=B,
         T=B * draft_token_num,
         W=4,

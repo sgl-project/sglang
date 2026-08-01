@@ -117,7 +117,6 @@ class InklingDenseMLP(LlamaMLP):
         else:
             self.global_scale = None
 
-        # The Helion kernel currently requires the interleaved layout.
         # Under --enable-lora gate/up is de-interleaved to [gate||up] at load, so run
         # contiguous swiglu (see lora_compatible_layout_enabled for the invariant).
         fused = fused and not lora_compatible_layout_enabled()
@@ -381,7 +380,6 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
         return out_td
 
     def _swiglu(self, y_st2f: torch.Tensor, gammas_st: torch.Tensor) -> torch.Tensor:
-        # Helion's kernel can produce NaNs for small shared-expert batches.
         from sglang.kernels.ops.moe.inkling_moe import (
             silu_and_mul_triton,
         )

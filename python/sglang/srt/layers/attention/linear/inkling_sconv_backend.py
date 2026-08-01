@@ -60,7 +60,7 @@ from sglang.srt.models.inkling_common.kernels.sconv import (
     SconvMetadataOut,
     fused_decode_sconv_metadata,
     fused_extend_sconv_metadata,
-    precompute_helion_extend_metadata,
+    precompute_extend_metadata,
 )
 from sglang.srt.runtime_context import get_exec, get_server_args, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
@@ -348,7 +348,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             query_start_loc, has_initial_state = self._unfused_extend_metadata(
                 forward_batch
             )
-            precomputed = precompute_helion_extend_metadata(
+            precomputed = precompute_extend_metadata(
                 B=B,
                 T=T,
                 W=self.conv_state_len + 1,

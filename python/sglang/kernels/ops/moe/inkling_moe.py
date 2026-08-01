@@ -1,163 +1,14 @@
-from functools import partial
-
-import helion
-import helion.language as hl
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.layers.moe.moe_runner.triton_utils.helion_utils import (
-    get_model_depths,
-    helion_aot_autotune,
+from sglang.kernels.ops.moe.inkling_silu_config import (
+    get_config as get_silu_and_mul_config,
 )
 
 DEFAULT_BLOCK_SIZE = 4096
 BLOCK_SIZE_M = 128
-
-
-def silu_and_mul_key(
-    gateup_output: torch.Tensor,
-    topk_weights: torch.Tensor | None,
-    out_dtype: object | None = None,
-):
-    # Keep this stable across inputs for Helion AOT autotune.
-    del out_dtype
-    return gateup_output.shape[1], (gateup_output.dtype,), (topk_weights is not None,)
-
-
-def silu_and_mul_inputs(sizes: list[int]):
-    # Used only for Helion autotune input generation.
-    inputs = []
-    numel = 2**30
-    with torch.device("cuda"):
-        for size in sizes:
-            x = torch.randn(numel // size, 2 * size, dtype=torch.bfloat16)
-            inputs.append((x, None, None))
-            inputs.append((x, torch.randn(numel // size, dtype=torch.bfloat16), None))
-    return inputs
-
-
-@helion_aot_autotune(
-    "silu_and_mul_interleaved",
-    kernel_key=silu_and_mul_key,
-    primary_inputs=partial(silu_and_mul_inputs, sizes=[512, 2048, 48 * 96, 6144, 8192]),
-    secondary_inputs=partial(
-        silu_and_mul_inputs,
-        sizes=[512]
-        + [i * 96 for i in get_model_depths()]
-        + list(range(1024, 8192 + 1, 1024)),
-    ),
-)
-@helion.kernel(static_shapes=False)
-def _silu_and_mul_helion_interleaved_kernel(
-    gateup_output,
-    topk_weights: torch.Tensor | None = None,
-    out_dtype: hl.constexpr | None = None,
-):
-    """
-    Interleaved version of silu_and_mul using Helion kernel.
-    Input format: [gate[0], up[0], gate[1], up[1], ...]
-    This matches the interleaved w13 weight format.
-    """
-    batch_size, hidden_size = gateup_output.shape
-    hidden_size = hl.specialize(hidden_size)
-    assert hidden_size % 2 == 0, f"{hidden_size=}"
-
-    half_hidden_size = hidden_size // 2
-    down_input = gateup_output.new_empty(
-        batch_size, half_hidden_size, dtype=out_dtype or gateup_output.dtype
-    )
-    for batch_tile, hidden_tile in hl.tile([batch_size, half_hidden_size]):
-        gate_output = gateup_output[batch_tile, 2 * hidden_tile.index].to(torch.float32)
-        up_output = gateup_output[batch_tile, 2 * hidden_tile.index + 1].to(
-            torch.float32
-        )
-        silu_mul_output = gate_output * torch.sigmoid(gate_output) * up_output
-        if topk_weights is not None:
-            weight_scale = topk_weights[batch_tile, None].to(torch.float32)
-            silu_mul_output = silu_mul_output * weight_scale
-        down_input[batch_tile, hidden_tile] = silu_mul_output
-    return down_input
-
-
-@helion_aot_autotune(
-    "silu_and_mul",
-    kernel_key=silu_and_mul_key,
-    primary_inputs=partial(silu_and_mul_inputs, sizes=[512, 2048, 48 * 96, 6144, 8192]),
-    secondary_inputs=partial(
-        silu_and_mul_inputs,
-        sizes=[512]
-        + [i * 96 for i in get_model_depths()]
-        + list(range(1024, 8192 + 1, 1024)),
-    ),
-)
-@helion.kernel(static_shapes=False)
-def _silu_and_mul_helion_non_interleaved_kernel(
-    gateup_output,
-    topk_weights: torch.Tensor | None = None,
-    out_dtype: hl.constexpr | None = None,
-):
-    """
-    Non-interleaved version of silu_and_mul using Helion kernel.
-    Input format: [gate[0], gate[1], ..., gate[N-1], up[0], up[1], ..., up[N-1]]
-    """
-    batch_size, hidden_size = gateup_output.shape
-    hidden_size = hl.specialize(hidden_size)
-    assert hidden_size % 2 == 0, f"{hidden_size=}"
-
-    half_hidden_size = hidden_size // 2
-    down_input = gateup_output.new_empty(
-        batch_size, half_hidden_size, dtype=out_dtype or gateup_output.dtype
-    )
-    for batch_tile, hidden_tile in hl.tile([batch_size, half_hidden_size]):
-        gate_output = gateup_output[batch_tile, hidden_tile.index].to(torch.float32)
-        up_output = gateup_output[batch_tile, hidden_tile.index + half_hidden_size].to(
-            torch.float32
-        )
-        silu_mul_output = gate_output * torch.sigmoid(gate_output) * up_output
-        if topk_weights is not None:
-            weight_scale = topk_weights[batch_tile, None].to(torch.float32)
-            silu_mul_output = silu_mul_output * weight_scale
-        down_input[batch_tile, hidden_tile] = silu_mul_output
-    return down_input
-
-
-def silu_and_mul_helion(
-    gateup_output: torch.Tensor,
-    topk_weights: torch.Tensor | None = None,
-    out_dtype: torch.dtype | None = None,
-    use_interleaved: bool = True,
-) -> torch.Tensor:
-    """
-    Unified silu_and_mul function using Helion kernel.
-    Supports both interleaved and non-interleaved input formats.
-
-    Args:
-        gateup_output: Input tensor of shape (batch_size, hidden_size)
-        topk_weights: Optional topk weights tensor
-        out_dtype: Optional output dtype
-        use_interleaved: If True, expects interleaved format [gate[0], up[0], gate[1], up[1], ...]
-                        If False, expects non-interleaved format [gate[0], ..., gate[N-1], up[0], ..., up[N-1]]
-
-    Returns:
-        Output tensor of shape (batch_size, hidden_size // 2)
-    """
-    if use_interleaved:
-        return _silu_and_mul_helion_interleaved_kernel(
-            gateup_output, topk_weights, out_dtype
-        )
-    else:
-        return _silu_and_mul_helion_non_interleaved_kernel(
-            gateup_output, topk_weights, out_dtype
-        )
-
-
-# ---------------------------------------------------------------------------
-# Triton silu_and_mul
-# Used by InklingBatchDenseMLP._swiglu because the helion kernel above produces
-# NaN for small shared-expert batches in EP+DP configs.
-# ---------------------------------------------------------------------------
 
 
 @triton.jit
@@ -165,40 +16,34 @@ def _silu_and_mul_triton_kernel(
     gateup_out_ptr,
     topk_weights_ptr,
     down_inp_ptr,
-    M_ptr,
+    M,
     N: tl.constexpr,
     TOPK_WEIGHTS: tl.constexpr,
-    GRID_SIZE: tl.constexpr,
-    NUM_STAGES: tl.constexpr,
+    INTERLEAVED: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     EVEN_N: tl.constexpr,
     INT64_INDEX: tl.constexpr,
     USE_PDL: tl.constexpr = False,
 ):
-    start_pid = tl.program_id(0)
+    # One tile per program; a persistent grid measured 4-6% slower.
+    pid = tl.program_id(0)
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
-    if isinstance(M_ptr, tl.tensor) and M_ptr.dtype.is_ptr():
-        M = tl.load(M_ptr)
-    else:
-        M = M_ptr
     if INT64_INDEX:
-        start_pid = start_pid.to(tl.int64)
+        pid = pid.to(tl.int64)
         M = M.to(tl.int64)
 
     NUM_BLOCKS_N: tl.constexpr = tl.cdiv(N, BLOCK_SIZE_N)
-    num_blocks_mn = tl.cdiv(M, BLOCK_SIZE_M) * NUM_BLOCKS_N
+    pid_m = pid // NUM_BLOCKS_N
+    pid_n = pid % NUM_BLOCKS_N
 
-    for pid in tl.range(start_pid, num_blocks_mn, GRID_SIZE, num_stages=NUM_STAGES):
-        pid_m = pid // NUM_BLOCKS_N
-        pid_n = pid % NUM_BLOCKS_N
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
 
-        offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        mask_m = offs_m < M
-        mask_n = offs_n < N
-
+    if INTERLEAVED:
         mask_offs_2n = pid_n * BLOCK_SIZE_N + tl.arange(0, 2 * BLOCK_SIZE_N) // 2
         tl.static_assert(BLOCK_SIZE_N % 8 == 0, f"{BLOCK_SIZE_N=}")
         mask_2n = mask_offs_2n < N
@@ -218,20 +63,25 @@ def _silu_and_mul_triton_kernel(
         gate_out, up_out = tl.split(
             tl.reshape(gateup_out, (BLOCK_SIZE_M, BLOCK_SIZE_N, 2))
         )
-        gate_out = gate_out.to(tl.float32)
-        up_out = up_out.to(tl.float32)
+    else:
+        # [gate || up]: the two halves are BLOCK_SIZE_N-aligned row slices.
+        offs_gate = offs_m[:, None] * N * 2 + offs_n[None, :]
+        gate_mask = mask_m[:, None] if EVEN_N else mask_m[:, None] & mask_n[None, :]
+        gate_out = tl.load(gateup_out_ptr + offs_gate, mask=gate_mask, other=0.0)
+        up_out = tl.load(gateup_out_ptr + offs_gate + N, mask=gate_mask, other=0.0)
 
-        gate_out = gate_out * tl.sigmoid(gate_out)
-        down_inp = gate_out * up_out
-        if TOPK_WEIGHTS:
-            weight_scale = tl.load(topk_weights_ptr + offs_m, mask=mask_m).to(
-                tl.float32
-            )
-            down_inp = down_inp * weight_scale[:, None]
+    gate_out = gate_out.to(tl.float32)
+    up_out = up_out.to(tl.float32)
 
-        mask_mn = mask_m[:, None] if EVEN_N else mask_m[:, None] & mask_n[None, :]
-        offs_mn = offs_m[:, None] * N + offs_n[None, :]
-        tl.store(down_inp_ptr + offs_mn, down_inp, mask=mask_mn)
+    gate_out = gate_out * tl.sigmoid(gate_out)
+    down_inp = gate_out * up_out
+    if TOPK_WEIGHTS:
+        weight_scale = tl.load(topk_weights_ptr + offs_m, mask=mask_m).to(tl.float32)
+        down_inp = down_inp * weight_scale[:, None]
+
+    mask_mn = mask_m[:, None] if EVEN_N else mask_m[:, None] & mask_n[None, :]
+    offs_mn = offs_m[:, None] * N + offs_n[None, :]
+    tl.store(down_inp_ptr + offs_mn, down_inp, mask=mask_mn)
 
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -241,10 +91,14 @@ def silu_and_mul_triton(
     gateup_output: torch.Tensor,
     topk_weights: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
+    use_interleaved: bool = True,
 ) -> torch.Tensor:
-    """SiLU-and-mul for interleaved gate/up layout using a Triton kernel.
+    """SiLU-and-mul over a fused gate/up tensor of shape (M, 2 * N) -> (M, N).
 
     Adapted from ``inkling_kernels.activation.silu_and_mul_fwd`` (without MXFP).
+
+    ``use_interleaved`` selects ``[gate[0], up[0], gate[1], up[1], ...]`` (matching
+    interleaved w13) over the contiguous ``[gate[0..N-1], up[0..N-1]]``.
     """
     assert (
         gateup_output.is_contiguous()
@@ -262,29 +116,25 @@ def silu_and_mul_triton(
     dtype = out_dtype or gateup_output.dtype
     down_input = torch.empty((M, N), device=gateup_output.device, dtype=dtype)
 
-    BLOCK_SIZE_M = 32
-    BLOCK_SIZE_N = min(128, triton.next_power_of_2(N))
-    NUM_STAGES = 2
-    max_grid_size = triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N)
-    # Use ~512 SMs worth of blocks, capped to actual work
-    num_sms = torch.cuda.get_device_properties(
-        gateup_output.device
-    ).multi_processor_count
-    grid_size = min(num_sms * 4, max_grid_size)
+    config = get_silu_and_mul_config(use_interleaved, gateup_output.dtype, N)
+    BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
+    BLOCK_SIZE_N = config["BLOCK_SIZE_N"]
+    num_warps = config["num_warps"]
+    grid_size = triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N)
 
     _silu_and_mul_triton_kernel[(grid_size,)](
         gateup_out_ptr=gateup_output,
         topk_weights_ptr=topk_weights,
         down_inp_ptr=down_input,
-        M_ptr=M,
+        M=M,
         N=N,
         TOPK_WEIGHTS=topk_weights is not None,
-        GRID_SIZE=grid_size,
-        NUM_STAGES=NUM_STAGES,
+        INTERLEAVED=use_interleaved,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         EVEN_N=N % BLOCK_SIZE_N == 0,
         INT64_INDEX=gateup_output.nbytes >= 2**31,
+        num_warps=num_warps,
         **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
     )
 
