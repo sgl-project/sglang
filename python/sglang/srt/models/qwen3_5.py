@@ -188,7 +188,7 @@ def _enable_qwen35_fused_ar_quant() -> bool:
     return bool(get_server_args().enable_aiter_allreduce_fusion)
 
 
-def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
+def _linear_accepts_quant_tuple(linear: nn.Module) -> bool:
     quant_method = getattr(linear, "quant_method", None)
     name = quant_method.__class__.__name__
     if name == "Fp8LinearMethod" and (
@@ -196,11 +196,16 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
         or getattr(quant_method, "use_mxfp8", False)
     ):
         return True
-    # Quark w8a8 FP8 with per-token (dynamic) activations consumes a pre-quantized
-    # (fp8, scale) tuple via apply_fp8_linear's aiter a8w8 bpreshuffle path (e.g.
-    # MXFP4-AttnFP8 qkv_proj). Per-tensor / static quark has no tuple path.
     if name == "QuarkLinearMethod":
-        return bool(getattr(getattr(linear, "scheme", None), "per_token", False))
+        scheme = getattr(linear, "scheme", None)
+        # Quark MXFP4 takes the pre-quantized (fp4, scale) pair directly.
+        if scheme.__class__.__name__ == "QuarkW4A4MXFP4":
+            return True
+        # Quark w8a8 FP8 with per-token (dynamic) activations consumes a
+        # pre-quantized (fp8, scale) tuple via apply_fp8_linear's aiter a8w8
+        # bpreshuffle path (e.g. MXFP4-AttnFP8 qkv_proj). Per-tensor / static
+        # quark has no tuple path.
+        return bool(getattr(scheme, "per_token", False))
     return False
 
 
@@ -209,10 +214,10 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
         return hidden_states
     if len(hidden_states) == 3:
         hs_bf16, hs_fp8, hs_scale = hidden_states
-        if _linear_accepts_fp8_tuple(linear):
+        if _linear_accepts_quant_tuple(linear):
             return (hs_fp8, hs_scale)
         return hs_bf16
-    if len(hidden_states) == 2 and _linear_accepts_fp8_tuple(linear):
+    if len(hidden_states) == 2 and _linear_accepts_quant_tuple(linear):
         return hidden_states
     raise TypeError(
         f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
@@ -226,8 +231,9 @@ def _detect_fused_ar_quant_format(linear) -> str:
     select the fused all-reduce epilogue that matches the downstream GEMM's
     expected input layout:
 
-    * ``"mxfp4"``         - weight is packed MXFP4 (uint8 on gfx950/aiter);
-                            enables the fused AR+RMSNorm+MXFP4 quant epilogue.
+    * ``"mxfp4"``         - weight is packed MXFP4 (uint8 on gfx950/aiter) and
+                            the consumer takes (fp4, scale); enables the fused
+                            AR+RMSNorm+MXFP4 quant epilogue.
     * ``"fp8_per_token"`` - weight is FP8 and activations are quantized
                             per-token (``SGLANG_USE_AITER_FP8_PER_TOKEN``), as
                             on a MXFP4-AttnFP8 model whose attention/GDN input
@@ -244,12 +250,12 @@ def _detect_fused_ar_quant_format(linear) -> str:
     weight = getattr(linear, "weight", None)
     if weight is None:
         return ""
+    # Only emit a tuple format when the consumer GEMM can ingest it; otherwise
+    # the consumer uses the plain fused AR+RMSNorm path.
     if weight.dtype == torch.uint8:
-        return "mxfp4"
+        return "mxfp4" if _linear_accepts_quant_tuple(linear) else ""
     if weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-        # Only emit a tuple format when the consumer GEMM can ingest it;
-        # otherwise the consumer uses the plain fused AR+RMSNorm path.
-        if not _linear_accepts_fp8_tuple(linear):
+        if not _linear_accepts_quant_tuple(linear):
             return ""
         # Block-quantized (1x128) consumers always use the per-group path,
         # regardless of the per-token env flag.
@@ -819,7 +825,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # it. Otherwise, stay on the plain AR+RMSNorm path.
         enable_fused_ar_quant = (
             _enable_qwen35_fused_ar_quant()
-            and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
+            and _linear_accepts_quant_tuple(self.linear_attn.in_proj_qkvz)
         )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -1049,7 +1055,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # Standard attention layers benefit from a fused quant epilogue only
         # when qkv_proj can consume the returned quantized tuple.
         enable_fused_ar_quant = (
-            _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
+            _enable_qwen35_fused_ar_quant()
+            and _linear_accepts_quant_tuple(self.qkv_proj)
         )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
