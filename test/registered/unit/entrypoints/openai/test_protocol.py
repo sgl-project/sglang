@@ -476,7 +476,7 @@ class TestChatCompletionRequest(unittest.TestCase):
         )
         self.assertNotIn("json_schema", sampling_params)
 
-    def test_non_strict_response_format_is_not_a_sampling_constraint(self):
+    def test_non_strict_response_format_constraint_gated_on_renderer(self):
         request = ChatCompletionRequest(
             model="test-model",
             messages=[{"role": "user", "content": "Return JSON"}],
@@ -491,6 +491,12 @@ class TestChatCompletionRequest(unittest.TestCase):
         )
         sampling_params = request.to_sampling_params(
             stop=[], model_generation_config={}
+        )
+        self.assertIn("json_schema", sampling_params)
+        sampling_params = request.to_sampling_params(
+            stop=[],
+            model_generation_config={},
+            renderer_handles_response_format=True,
         )
         self.assertNotIn("json_schema", sampling_params)
 
