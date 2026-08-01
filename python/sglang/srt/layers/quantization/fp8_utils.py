@@ -13,7 +13,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils.common import torch_release
 
 if TYPE_CHECKING:
@@ -34,7 +34,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
-from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     ceil_align,
     ceil_div,
@@ -1844,7 +1843,7 @@ def apply_fp8_linear(
         if (
             input_scale is not None
             and input_scale.numel() == 1
-            and get_server_args().cuda_graph_config.prefill.tc_compiler == "inductor"
+            and get_exec().graph.cuda_graph_config.prefill.tc_compiler == "inductor"
         ):
             qinput = (
                 (input_2d * input_scale.reciprocal())
