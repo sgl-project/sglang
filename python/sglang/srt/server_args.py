@@ -3578,7 +3578,6 @@ class ServerArgs:
 
         handle_speculative_decoding(self)
 
-
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
 
