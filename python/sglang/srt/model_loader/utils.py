@@ -196,6 +196,11 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     from sglang.srt.models.registry import ModelRegistry
 
     architectures = getattr(model_config.hf_config, "architectures", [])
+    # EmbeddingGemma is serialized as Gemma3TextModel, which is also the name
+    # of the HF backbone.  Route the bidirectional variant to SGLang's pooled
+    # embedding wrapper instead of falling back to the generic HF backend.
+    if getattr(model_config, "is_embedding_gemma", False):
+        architectures = ["EmbeddingGemmaModel"]
     # Special handling for quantized Mixtral.
     # FIXME(woosuk): This is a temporary hack.
     mixtral_supported = [
@@ -280,7 +285,13 @@ def should_async_load(weight: torch.Tensor) -> bool:
     For host (CPU) tensors, using a threadpool can overlap H2D copies
     and improve throughput. For device tensors, threading often adds overhead
     (e.g., GIL contention) without benefit, so we do it synchronously.
+
+    RunAI-streamed tensors are zero-copy views into a reused CPU buffer. They
+    must be consumed synchronously before the streamer fills its next batch.
     """
+    if getattr(weight, "_sglang_runai_streamer_tensor", False):
+        return False
+
     device = getattr(weight, "device", None)
     if device is None:
         return False

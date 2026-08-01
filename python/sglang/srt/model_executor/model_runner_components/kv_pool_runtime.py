@@ -71,7 +71,7 @@ def compute_post_capture_kv_resize(
     if eager_decode_gap or mambaish_config(model_runner.model_config) is not None:
         headroom_gb = max(
             headroom_gb,
-            model_runner.server_args.mamba_pre_capture_reserve_mb(
+            model_runner.server_args.pre_capture_activation_reserve_mb(
                 get_device_memory_capacity(model_runner.device)
             )
             / 1024,

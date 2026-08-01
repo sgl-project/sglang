@@ -78,6 +78,7 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_forward,
     get_parallel,
     get_server_args,
@@ -209,7 +210,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             self.router_dtype = torch.bfloat16
 
         # TODO global_server_args.ep_num_redundant_experts is used for eplb, not supported now
-        assert get_server_args().ep_num_redundant_experts == 0
+        assert get_exec().moe.ep_num_redundant_experts == 0
         # check group topk
         self.num_expert_group = getattr(config, "n_group", 0)
         self.topk_group = getattr(config, "topk_group", 0)
@@ -223,9 +224,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             self.num_expert_group = self.topk_group = None
             self.use_grouped_topk = False
 
-        self.num_experts = (
-            config.num_experts + get_server_args().ep_num_redundant_experts
-        )
+        self.num_experts = config.num_experts + get_exec().moe.ep_num_redundant_experts
 
         self.gate = BailingMoEGate(
             config=config,

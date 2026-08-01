@@ -18,7 +18,7 @@ from sglang.srt.models.inkling_common.util import (
     lora_compatible_layout_enabled,
 )
 from sglang.srt.models.llama import LlamaMLP
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +123,7 @@ class InklingDenseMLP(LlamaMLP):
         fused = fused and not lora_compatible_layout_enabled()
         self.layer_id = layer_id
         self.act_fn = InklingSwiglu(interleaved=fused)
-        self.scattered_sconv = get_server_args().enable_scattered_sconv
+        self.scattered_sconv = get_exec().comm.enable_scattered_sconv
 
     def forward(
         self,
@@ -382,7 +382,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
 
     def _swiglu(self, y_st2f: torch.Tensor, gammas_st: torch.Tensor) -> torch.Tensor:
         # Helion's kernel can produce NaNs for small shared-expert batches.
-        from sglang.srt.layers.moe.moe_runner.triton_utils.inkling_moe import (
+        from sglang.kernels.ops.moe.inkling_moe import (
             silu_and_mul_triton,
         )
 
