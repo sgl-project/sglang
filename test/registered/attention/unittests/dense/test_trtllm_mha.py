@@ -36,7 +36,7 @@ register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
 @unittest.skipIf(
     not torch.cuda.is_available()
     or not is_flashinfer_available()
-    or not (is_sm90_supported() or is_sm120_supported()),
+    or not (is_sm90_supported() or is_sm100_supported() or is_sm120_supported()),
     "CUDA + FlashInfer TRT-LLM MHA decode support are required",
 )
 class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
@@ -149,7 +149,10 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
         ),
     )
 
-    # Frozen-KV MTP draft CG runner (chain, topk=1).
+    # Frozen-KV MTP draft CG runner (chain, topk=1). The topk>1 batch-expansion
+    # path this backend also supports is not covered here: the draft runner
+    # fixture lays branch cache slots out linearly and so is page_size=1 only,
+    # while trtllm_mha requires page_size >= 16. It is covered e2e instead.
     FROZEN_KV_MTP_RUNNER_CASES = (
         DenseAttentionCase(
             name="runner_frozen_kv_mtp_decode_trtllm_mha_cuda_graph",
