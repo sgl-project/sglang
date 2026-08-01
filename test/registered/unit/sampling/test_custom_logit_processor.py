@@ -224,20 +224,33 @@ class TestThinkingBudgetLogitProcessor(CustomTestCase):
         self.assertEqual(result[1, self.NL].item(), 0.0)
         self.assertTrue(torch.isinf(result[1, 0]) and result[1, 0] < 0)
 
-    def test_multiple_thinking_start_counts_from_first(self):
-        """Test that budget counts from the first THINKING_START occurrence."""
+    def test_multiple_thinking_start_counts_from_most_recent(self):
+        """Test that budget counts from the most recent THINKING_START occurrence."""
         req = _make_req(
             origin_input_ids=[self.START, 100, 101],
             output_ids=[self.START, 200, 201],  # second START in output
         )
         # cur_ids = [START, 100, 101, START, 200, 201]
-        # First START at index 0, tokens_after_start = 5
-        # Budget=10 → 5 < 10 → no modification
-        params = [{"thinking_budget": 10, "__req__": req}]
+        # Most recent START at index 3, tokens_after_start = 2
+        # Budget=4 → 2 < 4 → no modification (index 0 would have given 5)
+        params = [{"thinking_budget": 4, "__req__": req}]
         logits = self._logits()
         original = logits.clone()
         result = self.processor(logits, params)
         self.assertTrue(torch.equal(result, original))
+
+    def test_end_token_in_prompt_does_not_disable_budget(self):
+        """Test enforcement when THINKING_END also appears in the prompt."""
+        req = _make_req(
+            origin_input_ids=[100, self.END, 101, self.END],  # END also ends a message
+            output_ids=[self.START] + [100] * 5,  # 5 tokens, budget=5 → exceeded
+        )
+        params = [{"thinking_budget": 5, "__req__": req}]
+        logits = self._logits()
+        result = self.processor(logits, params)
+        # newline should be the only non-neg-inf token
+        self.assertEqual(result[0, self.NL].item(), 0.0)
+        self.assertTrue(torch.isinf(result[0, 0]) and result[0, 0] < 0)
 
     def test_deepseek_r1_variant_forces_end(self):
         """Test DeepSeekR1 variant with its own token IDs."""
