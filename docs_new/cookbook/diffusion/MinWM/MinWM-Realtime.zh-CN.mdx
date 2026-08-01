@@ -195,6 +195,7 @@ parity-only CLI flag。Realtime endpoint 为
 ```python
 request = {
     "type": "init",
+    "generation_mode": "i2v",
     "model": "minwm",
     "prompt": prompt,
     "first_frame": open(first_frame_path, "rb").read(),
@@ -209,6 +210,31 @@ request = {
     "condition_inputs": {"action_labels": [10] * 16},
 }
 ```
+
+纯 T2V 不上传首帧，使用最终 pixel-frame 数固定完整 horizon。例如 24 FPS、约 5 秒
+使用 121 帧：
+
+```python
+request = {
+    "type": "init",
+    "generation_mode": "t2v",
+    "model": "minwm",
+    "prompt": prompt,
+    "size": "832x480",
+    "fps": 24,
+    "num_frames": 121,
+    "seed": 42,
+    "num_inference_steps": 4,
+    "guidance_scale": 0.0,
+    "realtime_output_format": "webp",
+}
+```
+
+MinWM T2V 要求 `num_frames = 1 + N * 4`；adapter 会据此推导第一块、常规块、
+尾块和 `max_chunks`。新客户端应显式传 `generation_mode`；旧客户端不传时仍按
+`first_frame` 是否存在推断，因此原有 I2V/parity 脚本不需要同步升级。Realtime
+Studio 仅在部署配置的 `generationModes` 包含 `t2v` 时显示模式切换；T2V 下会隐藏
+Reference，并确保 init 包不含 `first_frame`。
 
 这 16 个 label 都是 latent-frame action：每个 chunk 消耗四个 label。0721 checkpoint
 继承的训练 dataloader contract 是 `label_81`，所以 `w`（即幅度 1）仍是其 canonical、
@@ -300,6 +326,7 @@ cross-attention KV；在第一个生成 latent chunk 之前，它还会送入 re
 | D41 | 三路页面固定同一 case，并把首次完整请求作为 warmup 后再计量。 | 首次 whole-DiT compile/autotune 是分钟级冷启动，若把它混入 5.375 秒 clip FPS，会掩盖服务稳态能力。页面同时保存 baseline、bitwise、optimized 的 lossless arrays、MP4、TTFF、steady FPS 和误差，而 optimized 的组合收益不会被误写成纯 compile 收益。 |
 | D42 | artifact-ready 标记之后仍允许显式保留容器。 | Kubernetes `emptyDir` 会随 Pod 退出立即消失；第一次三路成功运行虽有完整日志和摘要，却无法事后恢复视频。`MINWM_ARTIFACT_HOLD_SECONDS` 将计算完成与人工/自动拷贝窗口分离，不改变模型运行。 |
 | D43 | 第一阶段 causal Ulysses 只支持 `sp_degree == ulysses_degree > 1` 且 `ring_degree == 1`。 | MinWM 现在会对 patch/action token 做 contiguous shard，把完成 RoPE 的 Q/K/V 合并成一次 input all-to-all，每个 rank 只保存 full-history causal KV 的 local head，attention 后执行 reverse collective，并在 scheduler/VAE 前 gather output projection token。Head 必须可整除；Ring、TP+SP、FSDP+SP、whole-DiT compile+SP 继续拒绝。 |
+| D44 | Realtime init 增加显式 `generation_mode=i2v|t2v`，但保留按首帧存在性推断的兼容路径。 | 旧 API 已能通过“缺少首帧”进入 T2V，却无法在前端表达，也无法尽早发现模式/输入矛盾。显式字段让 UI、API 和日志使用同一合同；兼容推断避免破坏已经用于 parity 的 MsgPack 重放脚本。 |
 
 <Warning>
   Causal Ulysses 已有本地单测与隔离运行覆盖，但本文尚未记录 SP2/SP4/SP8 的 GPU parity

@@ -17,6 +17,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
     minwm_t5_postprocess_text,
 )
 from sglang.multimodal_gen.configs.sample.minwm import MinWMSamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    RealtimeVideoGenerationsRequest,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.minwm_realtime_adapter import (
     MinWMRealtimeAdapter,
     MinWMRealtimeState,
@@ -71,6 +74,51 @@ from sglang.multimodal_gen.tools.convert_minwm_checkpoint import (
     TRANSFORMER_CONFIG,
     build_transformer_config,
 )
+
+
+@pytest.mark.parametrize(
+    ("requested_mode", "first_frame", "expected_mode"),
+    [
+        (None, None, "t2v"),
+        (None, b"image", "i2v"),
+        ("t2v", None, "t2v"),
+        ("i2v", b"image", "i2v"),
+    ],
+)
+def test_minwm_normalizes_realtime_generation_mode(
+    requested_mode, first_frame, expected_mode
+):
+    request = RealtimeVideoGenerationsRequest(
+        type="init",
+        prompt="test",
+        generation_mode=requested_mode,
+        first_frame=first_frame,
+    )
+
+    MinWMRealtimeAdapter._normalize_generation_mode(request)
+
+    assert request.generation_mode == expected_mode
+
+
+@pytest.mark.parametrize(
+    ("requested_mode", "first_frame", "message"),
+    [
+        ("i2v", None, "I2V requires first_frame"),
+        ("t2v", b"image", "T2V does not accept first_frame"),
+    ],
+)
+def test_minwm_rejects_generation_mode_input_mismatch(
+    requested_mode, first_frame, message
+):
+    request = RealtimeVideoGenerationsRequest(
+        type="init",
+        prompt="test",
+        generation_mode=requested_mode,
+        first_frame=first_frame,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        MinWMRealtimeAdapter._normalize_generation_mode(request)
 
 
 @pytest.mark.parametrize(

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>sglang-diffusion Realtime Studio</title>
-    <link rel="stylesheet" href="./styles.css?v=realtime-record-v49" />
+    <link rel="stylesheet" href="./styles.css?v=realtime-t2v-v50" />
   </head>
   <body>
     <main class="shell">
@@ -15,12 +15,20 @@
         </div>
         <label>Server<input id="serverUrl" value="ws://127.0.0.1:30000/v1/realtime_video/generate" /></label>
         <label>Model<input id="model" value="" placeholder="auto from /v1/models" /></label>
-        <div class="section-title">Reference</div>
-        <label class="reference-upload">
-          <input id="firstFrame" type="file" accept="image/*" />
-          <canvas id="referencePreview" width="320" height="180"></canvas>
-          <span id="referenceName">Preset reference</span>
+        <label id="generationModeField">Generation
+          <select id="generationMode">
+            <option value="i2v" selected>Image to video (I2V)</option>
+            <option value="t2v">Text to video (T2V)</option>
+          </select>
         </label>
+        <div id="referenceSection">
+          <div class="section-title">Reference</div>
+          <label class="reference-upload">
+            <input id="firstFrame" type="file" accept="image/*" />
+            <canvas id="referencePreview" width="320" height="180"></canvas>
+            <span id="referenceName">Preset reference</span>
+          </label>
+        </div>
         <div class="section-title">Generate the scene</div>
         <label>Prompt<textarea id="prompt" rows="4">A cinematic handheld shot of a quiet city street at dusk, soft reflections, natural motion.</textarea></label>
         <button id="enhanceBtn" class="wide">Enhance</button>
@@ -29,7 +37,10 @@
           <label>FPS<input id="fps" type="number" value="16" min="1" max="60" /></label>
         </div>
         <div class="split">
-          <label>Frames<input id="numFrames" type="number" value="9" min="5" step="4" /></label>
+          <label>Frames
+            <input id="numFrames" type="number" value="9" min="5" step="4" />
+            <span id="t2vFrameHint" class="field-hint" hidden></span>
+          </label>
           <label>Seed<input id="seed" type="number" value="42" /></label>
         </div>
         <div class="split">
@@ -79,7 +90,7 @@
           </select>
         </label>
         <label class="toggle-row"><input id="frameInterpolation" type="checkbox" />Smooth 2x frames</label>
-        <label class="toggle-row"><input id="continuous" type="checkbox" checked />Continuous session</label>
+        <label class="toggle-row"><input id="continuous" type="checkbox" checked /><span id="continuousLabelText">Continuous session</span></label>
         <div class="actions">
           <button id="connectBtn" class="primary">Generate</button>
           <button id="stopBtn">Close session</button>
@@ -171,6 +182,6 @@
     </main>
   <script src="./runtime-config.js"></script>
   <script src="./playback_controller.js?v=realtime-playback-v21"></script>
-  <script src="./app.js?v=realtime-record-v94"></script>
+  <script src="./app.js?v=realtime-t2v-v95"></script>
 </body>
 </html>

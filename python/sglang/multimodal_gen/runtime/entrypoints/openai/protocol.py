@@ -144,6 +144,9 @@ class VideoRemixRequest(BaseModel):
 
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     type: Literal["init"]
+    # Explicit realtime task selection. When omitted, model adapters may infer
+    # I2V from first_frame presence for backwards compatibility.
+    generation_mode: Optional[Literal["i2v", "t2v"]] = None
     # WebSocket does not support multipart/form-data image uploads
     first_frame: Optional[bytes | str] = None
     condition_inputs: Optional[Dict[str, Any]] = None

@@ -142,9 +142,7 @@ class MinWMRealtimeState(RealtimeCameraControlState):
     ) -> None:
         self.seed_queue.push_script(seeds, event_id=event_id)
 
-    def receive_prompt_schedule(
-        self, schedule: dict[int, tuple[str, str]]
-    ) -> None:
+    def receive_prompt_schedule(self, schedule: dict[int, tuple[str, str]]) -> None:
         self.prompt_schedule = dict(schedule)
 
     def sample_chunk_seed(self) -> int | None:
@@ -162,9 +160,7 @@ class MinWMRealtimeState(RealtimeCameraControlState):
         switch_kind = condition_switch.get("kind")
         if not isinstance(prompt, str) or switch_kind not in {"prompt", "scene_cut"}:
             raise ValueError("invalid MinWM condition switch payload")
-        self.prompt_event_id = self.prompt_queue.last_sampled_seq_id(
-            "condition_switch"
-        )
+        self.prompt_event_id = self.prompt_queue.last_sampled_seq_id("condition_switch")
         return prompt, switch_kind
 
     def sample_action_labels(self, chunk_size: int) -> list[int]:
@@ -271,6 +267,7 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
         request.num_inference_steps = MINWM_DEFAULT_DMD_STEPS
         request.guidance_scale = 0.0
         request.guidance_scale_2 = None
+        self._normalize_generation_mode(request)
         inputs = request.condition_inputs or {}
         chunk_seeds_value = inputs.get(
             "chunk_seeds", inputs.get(MINWM_CHUNK_SEEDS_INPUT)
@@ -314,7 +311,7 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
             request,
             cache_remote_urls=True,
         )
-        if request.first_frame is None and request.num_frames is not None:
+        if self._is_t2v_request(request) and request.num_frames is not None:
             total_latent_frames = self._t2v_total_latent_frames(
                 request, get_global_server_args()
             )
@@ -346,13 +343,32 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
             raise ValueError("MinWM prompt schedule target is outside max_chunks")
 
     @staticmethod
+    def _normalize_generation_mode(
+        request: RealtimeVideoGenerationsRequest,
+    ) -> None:
+        inferred_mode = "i2v" if request.first_frame is not None else "t2v"
+        requested_mode = request.generation_mode
+        if requested_mode == "i2v" and request.first_frame is None:
+            raise ValueError("MinWM I2V requires first_frame")
+        if requested_mode == "t2v" and request.first_frame is not None:
+            raise ValueError("MinWM T2V does not accept first_frame")
+        request.generation_mode = requested_mode or inferred_mode
+
+    @staticmethod
+    def _is_t2v_request(request: RealtimeVideoGenerationsRequest) -> bool:
+        generation_mode = getattr(request, "generation_mode", None)
+        if generation_mode is not None:
+            return generation_mode == "t2v"
+        return getattr(request, "first_frame", None) is None
+
+    @staticmethod
     def _t2v_total_latent_frames(
         request: RealtimeVideoGenerationsRequest,
         server_args: ServerArgs,
     ) -> int | None:
         num_frames_value = getattr(request, "num_frames", None)
         if (
-            getattr(request, "first_frame", None) is not None
+            not MinWMRealtimeAdapter._is_t2v_request(request)
             or num_frames_value is None
         ):
             return None
@@ -382,7 +398,7 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
         chunk: RealtimeChunkContext,
     ) -> int:
         request = session.request
-        if request is None or getattr(request, "first_frame", None) is not None:
+        if request is None or not self._is_t2v_request(request):
             return super().get_chunk_size(session, server_args, chunk)
         arch_config = server_args.pipeline_config.dit_config.arch_config
         first_block = int(arch_config.num_frame_first_block)
@@ -453,9 +469,7 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
             request.prompt = prompt
             prompt_updated = True
         condition_inputs = {}
-        t2v_first_block = (
-            getattr(request, "first_frame", None) is None and chunk.index == 0
-        )
+        t2v_first_block = self._is_t2v_request(request) and chunk.index == 0
         if state.action_mode == "weights":
             temporal_factor = int(
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_temporal
@@ -486,7 +500,7 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
         chunk_seed = state.sample_chunk_seed()
         if chunk_seed is not None:
             condition_inputs[MINWM_CHUNK_SEED_CONDITION] = chunk_seed
-            if getattr(request, "first_frame", None) is not None:
+            if not self._is_t2v_request(request):
                 prefix_frames = 1 + chunk.index * int(
                     server_args.pipeline_config.dit_config.arch_config.num_frames_per_block
                 )

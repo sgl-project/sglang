@@ -12,6 +12,18 @@ function configuredNumber(name, fallback) {
   return Number.isFinite(value) ? value : fallback;
 }
 
+function configuredGenerationModes() {
+  const requestedModes = Array.isArray(UI_CONFIG.generationModes)
+    ? UI_CONFIG.generationModes
+    : ["i2v"];
+  const modes = requestedModes
+    .map((mode) => String(mode).toLowerCase())
+    .filter((mode, index, values) => (
+      (mode === "i2v" || mode === "t2v") && values.indexOf(mode) === index
+    ));
+  return modes.length ? modes : ["i2v"];
+}
+
 const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";
 const DEFAULT_PREVIEW_OUTPUT_QUALITY = 55;
 const MAX_WEBP_PREVIEW_OUTPUT_QUALITY = 80;
@@ -26,6 +38,20 @@ const DEFAULT_UPSCALING_SCALE = 2;
 const DEFAULT_UPSCALING_MODEL =
   "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth";
 const DEFAULT_PREVIEW_SCALE = 100;
+const ENABLED_GENERATION_MODES = configuredGenerationModes();
+const DEFAULT_GENERATION_MODE = ENABLED_GENERATION_MODES.includes(
+  String(UI_CONFIG.defaultGenerationMode || "").toLowerCase(),
+)
+  ? String(UI_CONFIG.defaultGenerationMode).toLowerCase()
+  : ENABLED_GENERATION_MODES[0];
+const T2V_FRAME_STEP = Math.max(
+  1,
+  Math.trunc(configuredNumber("t2vFrameStep", 4)),
+);
+const DEFAULT_T2V_NUM_FRAMES = Math.max(
+  1,
+  Math.trunc(configuredNumber("t2vDefaultNumFrames", 121)),
+);
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const DECODE_QUEUE_SECONDS = 0.5;
 const STARTUP_DECODE_QUEUE_SECONDS = 0.75;
@@ -90,6 +116,75 @@ function applyRuntimeUiConfig() {
       meta.amount = String(UI_CONFIG.actionAmountLabel);
     });
   }
+  configureGenerationModeSelect();
+}
+
+function configureGenerationModeSelect() {
+  const select = $("generationMode");
+  Array.from(select.options).forEach((option) => {
+    const enabled = ENABLED_GENERATION_MODES.includes(option.value);
+    option.disabled = !enabled;
+    option.hidden = !enabled;
+  });
+  select.value = DEFAULT_GENERATION_MODE;
+  $("generationModeField").hidden = ENABLED_GENERATION_MODES.length < 2;
+  updateGenerationModeUi();
+}
+
+function selectedGenerationMode() {
+  return $("generationMode").value === "t2v" ? "t2v" : "i2v";
+}
+
+function updateT2VFrameHint() {
+  const frames = Number($("numFrames").value);
+  const fps = Number($("fps").value || DEFAULT_TARGET_FPS);
+  const duration = Number.isFinite(frames) && Number.isFinite(fps) && fps > 0
+    ? Math.max(0, frames) / fps
+    : 0;
+  $("t2vFrameHint").textContent = (
+    `MinWM requires 1 + N × ${T2V_FRAME_STEP}; `
+    + `${frames || 0} frames ≈ ${duration.toFixed(2)}s at ${fps || 0}fps.`
+  );
+}
+
+function updateGenerationModeUi() {
+  const mode = selectedGenerationMode();
+  const isT2V = mode === "t2v";
+  if (lastGenerationMode !== mode) {
+    if (isT2V) {
+      savedI2VNumFrames = $("numFrames").value;
+      savedI2VContinuous = $("continuous").checked;
+      $("numFrames").value = String(DEFAULT_T2V_NUM_FRAMES);
+    } else if (lastGenerationMode === "t2v") {
+      $("numFrames").value = savedI2VNumFrames;
+      $("continuous").checked = savedI2VContinuous;
+    }
+  }
+  $("referenceSection").hidden = isT2V;
+  $("t2vFrameHint").hidden = !isT2V;
+  $("numFrames").min = isT2V ? "1" : "5";
+  $("numFrames").step = isT2V ? String(T2V_FRAME_STEP) : "4";
+  $("continuous").disabled = isT2V;
+  if (isT2V) $("continuous").checked = false;
+  $("continuousLabelText").textContent = isT2V
+    ? "T2V length is controlled by Frames"
+    : "Continuous session";
+  lastGenerationMode = mode;
+  updateT2VFrameHint();
+}
+
+function readT2VNumFrames() {
+  const numFrames = Number($("numFrames").value);
+  if (
+    !Number.isInteger(numFrames)
+    || numFrames < 1
+    || (numFrames - 1) % T2V_FRAME_STEP !== 0
+  ) {
+    throw new Error(
+      `MinWM T2V Frames must equal 1 + N × ${T2V_FRAME_STEP}`,
+    );
+  }
+  return numFrames;
 }
 
 const REACTOR_PRESET_BASE_URL = "https://www.reactor.inc/lingbot-world-fast-v1";
@@ -237,6 +332,9 @@ let selectedPreset = null;
 let selectedReferenceBytes = null;
 let selectedReferenceUrl = "";
 let selectedReferenceLabel = "";
+let lastGenerationMode = null;
+let savedI2VNumFrames = "9";
+let savedI2VContinuous = true;
 let pendingHeader = null;
 let frames = 0;
 let bytes = 0;
@@ -1527,33 +1625,43 @@ async function connect() {
     }
     resetStreamStats();
     const epoch = ++streamEpoch;
-    if (!$("firstFrame").files[0] && !selectedReferenceBytes && !selectedReferenceUrl) {
-      await setPresetReference(presets[0]);
-    }
-    const firstFrame = await readFirstFrame();
-    if (!firstFrame) {
-      setStatus("Pick a reference", "error");
-      setPreviewState("idle");
-      addHistory("reference image required");
-      $("connectBtn").disabled = false;
-      return;
+    const generationMode = selectedGenerationMode();
+    let firstFrame;
+    let numFrames = Number($("numFrames").value);
+    if (generationMode === "i2v") {
+      if (!$("firstFrame").files[0] && !selectedReferenceBytes && !selectedReferenceUrl) {
+        await setPresetReference(presets[0]);
+      }
+      firstFrame = await readFirstFrame();
+      if (!firstFrame) {
+        setStatus("Pick a reference", "error");
+        setPreviewState("idle");
+        addHistory("reference image required for I2V");
+        $("connectBtn").disabled = false;
+        return;
+      }
+    } else {
+      numFrames = readT2VNumFrames();
     }
     const previewTransportParams = readPreviewTransportParams();
     const frameInterpolationParams = readFrameInterpolationParams();
     const superResolutionParams = readSuperResolutionParams();
     const init = compact({
       type: "init",
+      generation_mode: generationMode,
       model: $("model").value,
       prompt: $("prompt").value,
       size: $("size").value,
       fps: Number($("fps").value || DEFAULT_TARGET_FPS),
-      num_frames: Number($("numFrames").value),
+      num_frames: numFrames,
       seed: Number($("seed").value),
       num_inference_steps: Number($("steps").value),
       guidance_scale: Number($("guidance").value),
       realtime_causal_sink_size: readOptionalInteger("sinkSize"),
       realtime_causal_kv_cache_num_frames: readOptionalInteger("windowFrames"),
-      max_chunks: $("continuous").checked ? undefined : 1,
+      max_chunks: generationMode === "t2v" || $("continuous").checked
+        ? undefined
+        : 1,
       first_frame: firstFrame,
       ...previewTransportParams,
       ...frameInterpolationParams,
@@ -1572,9 +1680,10 @@ async function connect() {
       if (epoch !== streamEpoch) return;
       socket.send(pack(init));
       setStatus("Starting", "live");
-      addHistory(
-        `session started with ${selectedReferenceLabel || "uploaded reference"}`
-      );
+      const source = generationMode === "t2v"
+        ? `${numFrames} frames from text`
+        : selectedReferenceLabel || "uploaded reference";
+      addHistory(`${generationMode.toUpperCase()} session started · ${source}`);
     };
     socket.onclose = (event) => {
       if (epoch !== streamEpoch) return;
@@ -2074,6 +2183,11 @@ async function applyQueryParams() {
   else applyDefaultServerUrl();
   const model = params.get("model");
   if (model) $("model").value = model;
+  const generationMode = String(params.get("mode") || "").toLowerCase();
+  if (ENABLED_GENERATION_MODES.includes(generationMode)) {
+    $("generationMode").value = generationMode;
+    updateGenerationModeUi();
+  }
   $("transportFormat").value = params.get("transport") || DEFAULT_PREVIEW_OUTPUT_FORMAT;
   $("transportQuality").value = params.get("quality") || String(DEFAULT_PREVIEW_OUTPUT_QUALITY);
   const playbackParam = params.get("playback");
@@ -2232,8 +2346,13 @@ $("recordBtn").onclick = () => {
   }
 };
 $("firstFrame").onchange = () => drawReferencePreview($("firstFrame").files[0]);
+$("generationMode").addEventListener("change", updateGenerationModeUi);
+$("numFrames").addEventListener("input", updateT2VFrameHint);
 $("size").addEventListener("input", () => updateOutputSizeText());
-$("fps").addEventListener("input", syncPlaybackTargetFps);
+$("fps").addEventListener("input", () => {
+  syncPlaybackTargetFps();
+  updateT2VFrameHint();
+});
 $("playbackMode").addEventListener("change", () => syncPlaybackMode());
 $("superResolution").addEventListener("change", updateSuperResolutionControls);
 $("upscalingScale").addEventListener("change", () => updateOutputSizeText());

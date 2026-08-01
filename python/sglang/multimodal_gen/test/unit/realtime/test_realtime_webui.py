@@ -12,9 +12,7 @@ def test_realtime_webui_uses_same_origin_server_by_default():
         repo_root / "python/sglang/multimodal_gen/apps/realtime_webui/server.py"
     ).read_text()
 
-    assert (
-        "`${protocol}//${window.location.host}/v1/realtime_video/generate`" in app_js
-    )
+    assert "`${protocol}//${window.location.host}/v1/realtime_video/generate`" in app_js
     assert 'app.router.add_get("/v1/realtime_video/generate"' in proxy_server
     assert 'app.router.add_route("*", "/v1/{path:.*}"' in proxy_server
 
@@ -36,6 +34,29 @@ def test_realtime_webui_supports_deployment_runtime_config():
     assert '<script src="./runtime-config.js"></script>' in index_html
     assert 'configuredNumber("targetFps", 16)' in app_js
     assert "UI_CONFIG.targetFps == null ? preset.fps : DEFAULT_TARGET_FPS" in app_js
+
+
+def test_realtime_webui_supports_explicit_minwm_t2v_sessions():
+    repo_root = Path(__file__).resolve().parents[6]
+    app_js = (
+        repo_root / "python/sglang/multimodal_gen/apps/realtime_webui/app.js"
+    ).read_text()
+    index_html = (
+        repo_root / "python/sglang/multimodal_gen/apps/realtime_webui/index.html"
+    ).read_text()
+
+    assert 'id="generationMode"' in index_html
+    assert '<option value="t2v">Text to video (T2V)</option>' in index_html
+    assert 'id="referenceSection"' in index_html
+    assert 'id="t2vFrameHint"' in index_html
+    assert "styles.css?v=realtime-t2v-v50" in index_html
+    assert "app.js?v=realtime-t2v-v95" in index_html
+    assert "UI_CONFIG.generationModes" in app_js
+    assert "generation_mode: generationMode" in app_js
+    assert 'generationMode === "i2v"' in app_js
+    assert "numFrames = readT2VNumFrames()" in app_js
+    assert 'max_chunks: generationMode === "t2v"' in app_js
+    assert '$("referenceSection").hidden = isT2V' in app_js
 
 
 def test_realtime_webui_presets_do_not_emit_camera_scripts():

@@ -121,6 +121,7 @@ T2V 请求不传 `first_frame`，并显式传最终 pixel-frame 数：
 ```python
 {
     "type": "init",
+    "generation_mode": "t2v",
     "prompt": "...",
     "size": "832x480",
     "fps": 24,
@@ -134,6 +135,10 @@ T2V 请求不传 `first_frame`，并显式传最终 pixel-frame 数：
     }
 }
 ```
+
+`generation_mode` 是新客户端的显式合同。为兼容旧重放脚本，不传时 adapter 仍按
+`first_frame` 是否存在推断：有首帧是 I2V，无首帧是 T2V；显式模式与首帧矛盾时
+会直接拒绝。`max_chunks` 可以省略，adapter 会从 `num_frames` 精确推导。
 
 adapter 根据 VAE temporal factor=4 把 pixel frames 转成 latent frames，并验证：
 

@@ -143,6 +143,7 @@ async def run_case(args, case, contract, first_frame: Path | None):
         action_condition = {"action_labels": action_label_sequence(case, contract)}
     payload = {
         "type": "init",
+        "generation_mode": "t2v" if first_frame is None else "i2v",
         "model": args.model,
         "prompt": case["prompt"],
         "size": f"{contract['width']}x{contract['height']}",
