@@ -1038,19 +1038,13 @@ def _fwd_kernel_ep_scatter_1(
     tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
 
     cur_expert_start = tl.load(expert_start_loc + cur_expert)
-    cur_expert_padded_token_num = tl.load(
-        num_recv_tokens_per_expert + cur_expert
-    )
-    cur_expert_valid_token_num = tl.load(
-        num_valid_tokens_per_expert + cur_expert
-    )
+    cur_expert_padded_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
+    cur_expert_valid_token_num = tl.load(num_valid_tokens_per_expert + cur_expert)
 
     m_indices_start_ptr = m_indices + cur_expert_start
     off_expert = tl.arange(0, BLOCK_E)
 
-    for start_m in tl.range(
-        0, cur_expert_padded_token_num, BLOCK_E, num_stages=4
-    ):
+    for start_m in tl.range(0, cur_expert_padded_token_num, BLOCK_E, num_stages=4):
         offsets = start_m + off_expert
         tl.store(
             m_indices_start_ptr + offsets,
