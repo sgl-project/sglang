@@ -14,22 +14,28 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=10, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=10, suite="nightly-amd-1-gpu-mi35x", nightly=True)
 
-device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
-torch.set_default_device(device_type)
-
-# Just to get the logging out of the way
-with set_batch_invariant_mode(True):
-    pass
-
 
 class TestBatchInvariantOps(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        # Scoped to this class, not module scope: pytest imports every test
+        # module in one process during collection, so a module-level
+        # set_default_device leaks into unrelated tests, and a module-level
+        # set_batch_invariant_mode makes the import itself fail on a host
+        # without an accelerator.
+        if not torch.accelerator.is_available():
+            raise unittest.SkipTest("batch-invariant ops require an accelerator")
+        cls._prev_default_device = torch.get_default_device()
+        torch.set_default_device(torch.accelerator.current_accelerator().type)
+        # Just to get the logging out of the way
+        with set_batch_invariant_mode(True):
+            pass
         batch_invariant_ops._ENABLE_MM_COMPARISON_TEST = True
 
     @classmethod
     def tearDownClass(cls):
         batch_invariant_ops._ENABLE_MM_COMPARISON_TEST = False
+        torch.set_default_device(cls._prev_default_device)
 
     def _test_batch_invariance(self, M, K, N, dtype):
         """
