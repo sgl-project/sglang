@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 
@@ -71,9 +71,21 @@ def process_hidden_states_from_ret(
         return None
 
     hidden_states = ret_item["meta_info"].get("hidden_states", None)
-    if hidden_states is not None:
-        hidden_states = hidden_states[-1] if len(hidden_states) > 1 else []
-    return hidden_states
+    return process_hidden_states_for_response(
+        hidden_states, request.return_hidden_states
+    )
+
+
+def process_hidden_states_for_response(
+    hidden_states: Optional[List],
+    return_hidden_states: Union[bool, Literal["last"]],
+) -> Optional[List]:
+    """Format scheduler hidden states for OpenAI API responses."""
+    if not return_hidden_states or hidden_states is None:
+        return None
+    if return_hidden_states == "last":
+        return hidden_states
+    return hidden_states[-1] if len(hidden_states) > 1 else []
 
 
 def should_include_usage(
