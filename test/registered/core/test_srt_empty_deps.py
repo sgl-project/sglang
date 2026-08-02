@@ -11,6 +11,10 @@ from pathlib import Path
 
 import pytest
 
+from sglang.test.ci.ci_register import register_npu_ci
+
+register_npu_ci(est_time=10, suite="stage-a-unit-test-npu")
+
 # Packages known to transitively depend on torch or triton.
 # If a new package is added to runtime_base and it pulls torch,
 # add it here and move it to runtime_common instead.
