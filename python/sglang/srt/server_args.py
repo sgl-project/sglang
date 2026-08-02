@@ -3305,8 +3305,21 @@ class ServerArgs:
         NS("exec.features"),
     ] = False
     enable_return_hidden_states: A[
-        bool, "Enable returning hidden states with responses.", NS("exec.features")
+        bool,
+        "Enable returning full hidden states with responses. Equivalent to "
+        "`--return-hidden-states-mode full`.",
+        NS("exec.features"),
     ] = False
+    return_hidden_states_mode: A[
+        Optional[str],
+        Arg(
+            help="Set the maximum hidden-state return mode supported by the "
+            "server. `last` allows requests with return_hidden_states=False or "
+            "`last`; `full` also allows return_hidden_states=True.",
+            choices=["last", "full"],
+        ),
+        NS("exec.features"),
+    ] = None
     enable_return_routed_experts: A[
         bool,
         "Enable returning routed experts of each layer with responses.",
@@ -3408,6 +3421,7 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._handle_return_hidden_states_mode()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3583,6 +3597,17 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _handle_return_hidden_states_mode(self):
+        if self.return_hidden_states_mode not in (None, "last", "full"):
+            raise ValueError(
+                "return_hidden_states_mode must be one of: None, 'last', or 'full'."
+            )
+        if self.return_hidden_states_mode is None:
+            if self.enable_return_hidden_states:
+                self.return_hidden_states_mode = "full"
+        else:
+            self.enable_return_hidden_states = True
 
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
