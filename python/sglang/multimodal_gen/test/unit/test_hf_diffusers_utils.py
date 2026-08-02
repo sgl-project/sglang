@@ -1,9 +1,17 @@
 import json
 
+import modelscope
+import pytest
+from huggingface_hub.errors import LocalEntryNotFoundError
+from modelscope.hub.errors import NotExistError
+from requests.exceptions import HTTPError
+
+from sglang.multimodal_gen.runtime.utils import hf_diffusers_utils
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     _check_index_files_for_missing_shards,
     _verify_diffusers_model_complete,
 )
+from sglang.srt.environ import envs
 
 
 def _write_model_index(root):
@@ -70,3 +78,113 @@ def test_diffusers_cache_validation_checks_declared_component_shards(tmp_path):
     assert not is_valid
     assert "transformer/missing.safetensors" in missing_files
     assert "transformer" in checked_subdirs
+
+
+def test_modelscope_file_download_preserves_local_dir(monkeypatch, tmp_path):
+    calls = []
+
+    def model_file_download(**kwargs):
+        calls.append(kwargs)
+        return str(tmp_path / kwargs["file_path"])
+
+    monkeypatch.setattr(modelscope, "model_file_download", model_file_download)
+
+    with envs.SGLANG_USE_MODELSCOPE.override(True):
+        result = hf_diffusers_utils.hf_hub_download(
+            "MiniMax/MiniMax-H3",
+            "FL2VA/model_index.json",
+            local_dir=tmp_path,
+            revision="master",
+        )
+
+    assert result == str(tmp_path / "FL2VA/model_index.json")
+    assert calls == [
+        {
+            "model_id": "MiniMax/MiniMax-H3",
+            "file_path": "FL2VA/model_index.json",
+            "local_dir": str(tmp_path),
+            "revision": "master",
+        }
+    ]
+
+
+def test_modelscope_snapshot_download_selects_h3_partition(monkeypatch, tmp_path):
+    calls = []
+
+    def snapshot_download(**kwargs):
+        calls.append(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr(modelscope, "snapshot_download", snapshot_download)
+
+    with envs.SGLANG_USE_MODELSCOPE.override(True):
+        result = hf_diffusers_utils.snapshot_download(
+            "MiniMax/MiniMax-H3",
+            local_dir=tmp_path,
+            allow_patterns=["Ref2VA/**"],
+            force_download=True,
+        )
+
+    assert result == str(tmp_path)
+    assert calls == [
+        {
+            "model_id": "MiniMax/MiniMax-H3",
+            "local_dir": str(tmp_path),
+            "ignore_patterns": None,
+            "allow_patterns": ["Ref2VA/**"],
+            "local_files_only": False,
+            "max_workers": 8,
+        }
+    ]
+
+
+def test_modelscope_empty_selected_partition_is_a_cache_miss(monkeypatch, tmp_path):
+    monkeypatch.setattr(modelscope, "snapshot_download", lambda **_: str(tmp_path))
+
+    with (
+        envs.SGLANG_USE_MODELSCOPE.override(True),
+        pytest.raises(LocalEntryNotFoundError, match="Ref2VA"),
+    ):
+        hf_diffusers_utils.snapshot_download(
+            "MiniMax/MiniMax-H3",
+            allow_patterns=["Ref2VA/**"],
+            local_files_only=True,
+        )
+
+
+def test_modelscope_selected_partition_cache_hit_requires_a_file(monkeypatch, tmp_path):
+    model_index = tmp_path / "FL2VA" / "model_index.json"
+    model_index.parent.mkdir()
+    model_index.write_text("{}")
+    monkeypatch.setattr(modelscope, "snapshot_download", lambda **_: str(tmp_path))
+
+    with envs.SGLANG_USE_MODELSCOPE.override(True):
+        result = hf_diffusers_utils.snapshot_download(
+            "MiniMax/MiniMax-H3",
+            allow_patterns=["FL2VA/**"],
+            local_files_only=True,
+        )
+
+    assert result == str(tmp_path)
+
+
+def test_modelscope_missing_repository_is_not_retried(monkeypatch):
+    calls = 0
+
+    def snapshot_download(**_):
+        nonlocal calls
+        calls += 1
+        try:
+            raise NotExistError("repository not found")
+        except NotExistError as exc:
+            raise HTTPError("repository not found") from exc
+
+    monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", snapshot_download)
+
+    with (
+        envs.SGLANG_USE_MODELSCOPE.override(True),
+        pytest.raises(ValueError, match="Model or revision not found"),
+    ):
+        hf_diffusers_utils.maybe_download_model("MiniMax/MiniMax-H3")
+
+    assert calls == 2
