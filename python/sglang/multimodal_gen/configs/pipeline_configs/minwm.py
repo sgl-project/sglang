@@ -27,9 +27,20 @@ MINWM_PROMPT_SCHEDULE_INPUT = "minwm_prompt_schedule"
 MINWM_PROMPT_UPDATED_CONDITION = "minwm_prompt_updated"
 MINWM_TOTAL_CHUNKS_CONDITION = "minwm_total_chunks"
 MINWM_TOTAL_LATENT_FRAMES_CONDITION = "minwm_total_latent_frames"
+MINWM_VAE_LANES = ("parity", "parallel")
 
 
 def _minwm_native_component_names() -> tuple[str, ...]:
+    vae_lane = os.environ.get("MINWM_VAE_LANE")
+    if vae_lane is not None:
+        if vae_lane not in MINWM_VAE_LANES:
+            raise ValueError(
+                f"MINWM_VAE_LANE must be one of {MINWM_VAE_LANES}, got {vae_lane!r}"
+            )
+        # The explicit lane takes precedence over the legacy component list so
+        # benchmark manifests cannot accidentally mix parity and speed modes.
+        return ("text_encoder", "vae") if vae_lane == "parity" else ("text_encoder",)
+
     value = os.environ.get("MINWM_NATIVE_COMPONENTS", "text_encoder,vae")
     names = tuple(name.strip() for name in value.split(",") if name.strip())
     unknown = set(names) - {"text_encoder", "vae"}

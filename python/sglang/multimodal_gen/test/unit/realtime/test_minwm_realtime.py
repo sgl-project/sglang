@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
     MINWM_ACTION_LABELS_CONDITION,
     MINWM_ACTION_WEIGHTS_CONDITION,
@@ -58,6 +59,7 @@ from sglang.multimodal_gen.runtime.pipelines.minwm_causal_dmd_pipeline import (
     MinWMCausalDMDPipeline,
     MinWMCausalUniPCPipeline,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minwm.minwm_causal_denoising import (
     MinWMCausalDMDDenoisingStage,
     MinWMCausalUniPCDenoisingStage,
@@ -67,7 +69,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.vae import (
     CausalVaeDecodingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
 from sglang.multimodal_gen.tools.convert_minwm_checkpoint import (
     DEFAULT_SOURCE_URI,
@@ -1211,6 +1212,31 @@ def test_minwm_requires_baseline_native_text_and_vae_components():
     assert config.enable_autocast is False
 
 
+def test_minwm_explicit_parallel_vae_lane_uses_sglang_vae(monkeypatch):
+    monkeypatch.setenv("MINWM_VAE_LANE", "parallel")
+    monkeypatch.setenv("MINWM_NATIVE_COMPONENTS", "text_encoder,vae")
+
+    config = MinWMCausalDMDConfig()
+
+    assert config.native_component_names == ("text_encoder",)
+
+
+def test_minwm_explicit_parity_vae_lane_uses_native_vae(monkeypatch):
+    monkeypatch.setenv("MINWM_VAE_LANE", "parity")
+    monkeypatch.setenv("MINWM_NATIVE_COMPONENTS", "")
+
+    config = MinWMCausalDMDConfig()
+
+    assert config.native_component_names == ("text_encoder", "vae")
+
+
+def test_minwm_rejects_unknown_vae_lane(monkeypatch):
+    monkeypatch.setenv("MINWM_VAE_LANE", "unknown")
+
+    with pytest.raises(ValueError, match="MINWM_VAE_LANE"):
+        MinWMCausalDMDConfig()
+
+
 def test_minwm_converter_defaults_to_requested_0721_checkpoint():
     assert (
         "wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200"
@@ -1430,11 +1456,16 @@ def test_minwm_causal_cache_uses_local_ulysses_heads(monkeypatch):
     }
 
 
-def test_minwm_ulysses_qkv_pack_uses_reusable_head_first_buffers(monkeypatch):
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_minwm_ulysses_qkv_pack_uses_reusable_peer_first_buffers(
+    monkeypatch, batch_size
+):
     import sglang.multimodal_gen.runtime.layers.usp as usp_module
 
     monkeypatch.setattr(usp_module, "get_ulysses_parallel_world_size", lambda: 2)
-    query = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4, 1)
+    query = torch.arange(8 * batch_size, dtype=torch.float32).reshape(
+        batch_size, 2, 4, 1
+    )
     key = query + 10
     value = query + 20
     send_buffer = torch.empty(3 * query.numel())
@@ -1442,10 +1473,13 @@ def test_minwm_ulysses_qkv_pack_uses_reusable_head_first_buffers(monkeypatch):
 
     def fake_exchange(packed, output_buffer=None):
         assert packed.data_ptr() == send_buffer.data_ptr()
-        assert packed.shape == (4, 1, 2, 3)
+        assert packed.shape == (2, batch_size, 2, 2, 3)
         assert output_buffer is receive_buffer
-        output_buffer.copy_(packed.flatten())
-        return output_buffer.view_as(packed)
+        received = output_buffer.view_as(packed)
+        # Simulate rank 0 receiving its head shard from two identical peers.
+        received[0].copy_(packed[0])
+        received[1].copy_(packed[0])
+        return received
 
     monkeypatch.setattr(usp_module, "_usp_all_to_all_single", fake_exchange)
     output = usp_module._usp_input_all_to_all_qkv(
@@ -1457,11 +1491,98 @@ def test_minwm_ulysses_qkv_pack_uses_reusable_head_first_buffers(monkeypatch):
     )
 
     packed_qkv = torch.cat((query, key, value), dim=-1)
-    expected = torch.cat(
-        (packed_qkv[:, :, :2], packed_qkv[:, :, 2:]),
-        dim=1,
-    )
+    expected = torch.cat((packed_qkv[:, :, :2], packed_qkv[:, :, :2]), dim=1)
     assert torch.equal(output, expected)
+    if batch_size == 1:
+        assert output.data_ptr() == receive_buffer.data_ptr()
+
+
+def test_minwm_ulysses_qkv_peer_first_layout_round_trips_exactly(monkeypatch):
+    import sglang.multimodal_gen.runtime.layers.usp as usp_module
+
+    world_size = 2
+    batch_size = 2
+    local_seq = 3
+    global_heads = 4
+    head_dim = 2
+    local_heads = global_heads // world_size
+    monkeypatch.setattr(
+        usp_module, "get_ulysses_parallel_world_size", lambda: world_size
+    )
+
+    qkv_by_rank = []
+    input_wire_by_rank = []
+    for rank in range(world_size):
+        query = (
+            torch.arange(
+                batch_size * local_seq * global_heads * head_dim,
+                dtype=torch.float32,
+            ).reshape(batch_size, local_seq, global_heads, head_dim)
+            + rank * 1000
+        )
+        qkv = torch.cat((query, query + 100, query + 200), dim=-1)
+        qkv_by_rank.append(qkv)
+        input_wire_by_rank.append(
+            qkv.unflatten(2, (world_size, local_heads))
+            .permute(2, 0, 1, 3, 4)
+            .contiguous()
+        )
+
+    active_rank = 0
+
+    def fake_input_exchange(packed, output_buffer=None):
+        assert output_buffer is None
+        assert torch.equal(packed, input_wire_by_rank[active_rank])
+        return torch.stack(
+            [input_wire_by_rank[source][active_rank] for source in range(world_size)]
+        )
+
+    monkeypatch.setattr(usp_module, "_usp_all_to_all_single", fake_input_exchange)
+    gathered_by_rank = []
+    for active_rank in range(world_size):
+        qkv = qkv_by_rank[active_rank]
+        query, key, value = qkv.chunk(3, dim=-1)
+        gathered = usp_module._usp_input_all_to_all_qkv(query, key, value)
+        expected = torch.cat(
+            [
+                source[
+                    :,
+                    :,
+                    active_rank * local_heads : (active_rank + 1) * local_heads,
+                ]
+                for source in qkv_by_rank
+            ],
+            dim=1,
+        )
+        assert gathered.shape == (
+            batch_size,
+            local_seq * world_size,
+            local_heads,
+            3 * head_dim,
+        )
+        assert torch.equal(gathered, expected)
+        gathered_by_rank.append(gathered)
+
+    output_wire_by_rank = [
+        gathered.permute(1, 0, 2, 3).contiguous() for gathered in gathered_by_rank
+    ]
+
+    def fake_output_exchange(packed, output_buffer=None):
+        assert output_buffer is None
+        assert torch.equal(packed, output_wire_by_rank[active_rank])
+        chunks = [
+            output_wire_by_rank[source].flatten().chunk(world_size)[active_rank]
+            for source in range(world_size)
+        ]
+        return torch.cat(chunks).reshape_as(packed)
+
+    monkeypatch.setattr(usp_module, "_usp_all_to_all_single", fake_output_exchange)
+    for active_rank in range(world_size):
+        round_trip = usp_module._usp_output_all_to_all(
+            gathered_by_rank[active_rank], head_dim=2
+        )
+        assert round_trip.shape == qkv_by_rank[active_rank].shape
+        assert torch.equal(round_trip, qkv_by_rank[active_rank])
 
 
 @pytest.mark.parametrize("seq_splits", [(2, 2), (3, 2)])

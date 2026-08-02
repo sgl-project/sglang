@@ -13,6 +13,7 @@ PROFILE_ROOT="${MINWM_RESULTS_ROOT%/}/${MINWM_RUN_ID}/nsys-sp12"
 CASES="${MINWM_CASES_PATH:-${SCRIPT_DIR}/cases_720p_compile_smoke.json}"
 MINWM_CONFIG="${MINWM_CONFIG_PATH:-/workspace/minWM/Wan21/configs/eval/wan22_5b_varlen_dmd.yaml}"
 SP_DEGREES="${MINWM_SP_DEGREES:-1 2}"
+NSYS_VAE_LANE="${MINWM_NSYS_VAE_LANE:-parity}"
 NSYS_URL="${MINWM_NSYS_URL:-https://developer.nvidia.com/downloads/assets/tools/secure/nsight-systems/2026_4/NsightSystems-linux-cli-public-2026.4.1.191-3860507.deb}"
 NSYS_ROOT="${WORK_ROOT}/nsight-systems"
 NSYS_DEB="${WORK_ROOT}/nsight-systems-cli.deb"
@@ -21,6 +22,10 @@ NSYS_DEB="${WORK_ROOT}/nsight-systems-cli.deb"
 [[ -f "${CASES}" ]]
 [[ -f "${CHECKPOINT}" ]]
 [[ -d "${PRETRAINED}" ]]
+if ! [[ "${NSYS_VAE_LANE}" =~ ^(parity|parallel)$ ]]; then
+  echo "MINWM_NSYS_VAE_LANE must be parity or parallel" >&2
+  exit 2
+fi
 mkdir -p "${PROFILE_ROOT}" "${NSYS_ROOT}"
 
 export MINWM_PARITY_DETERMINISTIC=1
@@ -158,6 +163,7 @@ for degree in "${sp_degrees[@]}"; do
   MINWM_ATTENTION_IMPL=packed \
   MINWM_PACKED_ATTENTION_DETERMINISTIC=true \
   MINWM_NATIVE_COMPONENTS=text_encoder,vae \
+  MINWM_VAE_LANE="${NSYS_VAE_LANE}" \
   nsys launch \
     --session-new="${session}" \
     --trace=cuda,nvtx \
@@ -187,7 +193,7 @@ for degree in "${sp_degrees[@]}"; do
     --results "${PROFILE_ROOT}/${lane}-warmup" \
     --ws-url ws://127.0.0.1:30000/v1/realtime_video/generate \
     --output-prefix warmup \
-    --engine-name "sglang-minwm-${lane}-nsys-warmup" \
+    --engine-name "sglang-minwm-${lane}-nsys-warmup-${NSYS_VAE_LANE}-vae" \
     --warmup-runs 0 \
     | tee "${PROFILE_ROOT}/${lane}-warmup-client.log"
 
@@ -202,7 +208,7 @@ for degree in "${sp_degrees[@]}"; do
     --results "${PROFILE_ROOT}/${lane}-measured" \
     --ws-url ws://127.0.0.1:30000/v1/realtime_video/generate \
     --output-prefix measured \
-    --engine-name "sglang-minwm-${lane}-nsys" \
+    --engine-name "sglang-minwm-${lane}-nsys-${NSYS_VAE_LANE}-vae" \
     --warmup-runs 0 \
     | tee "${PROFILE_ROOT}/${lane}-measured-client.log"
   nsys stop --session="${session}"
@@ -223,4 +229,4 @@ for degree in "${sp_degrees[@]}"; do
     | tee "${PROFILE_ROOT}/${lane}-metrics.log"
 done
 
-echo "MINWM_SP_NSYS_COMPLETE degrees=${sp_degrees[*]} results=${PROFILE_ROOT}"
+echo "MINWM_SP_NSYS_COMPLETE degrees=${sp_degrees[*]} vae_lane=${NSYS_VAE_LANE} results=${PROFILE_ROOT}"

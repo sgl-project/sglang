@@ -80,14 +80,15 @@ def _usp_input_all_to_all_qkv(
         raise ValueError(
             f"h_global ({h_global}) must be divisible by world_size ({world_size})"
         )
-    packed_shape = (h_global, b, s_local, 3 * d)
-    qkv_head_first = (
-        query.permute(2, 0, 1, 3),
-        key.permute(2, 0, 1, 3),
-        value.permute(2, 0, 1, 3),
+    h_local = h_global // world_size
+    packed_shape = (world_size, b, s_local, h_local, 3 * d)
+    qkv_peer_first = (
+        query.unflatten(2, (world_size, h_local)).permute(2, 0, 1, 3, 4),
+        key.unflatten(2, (world_size, h_local)).permute(2, 0, 1, 3, 4),
+        value.unflatten(2, (world_size, h_local)).permute(2, 0, 1, 3, 4),
     )
     if input_buffer is None:
-        packed = torch.cat(qkv_head_first, dim=-1)
+        packed = torch.cat(qkv_peer_first, dim=-1)
     else:
         if (
             input_buffer.numel() != 3 * query.numel()
@@ -96,15 +97,14 @@ def _usp_input_all_to_all_qkv(
         ):
             raise ValueError("Ulysses input buffer must match packed Q/K/V")
         packed = input_buffer.view(packed_shape)
-        torch.cat(qkv_head_first, dim=-1, out=packed)
+        torch.cat(qkv_peer_first, dim=-1, out=packed)
 
-    h_local = h_global // world_size
     exchanged = _usp_all_to_all_single(packed, output_buffer=output_buffer)
-    return (
-        exchanged.reshape(world_size, h_local, b, s_local, 3 * d)
-        .permute(2, 0, 3, 1, 4)
-        .contiguous()
-        .reshape(b, s_local * world_size, h_local, 3 * d)
+    # Keep each destination's head shard sequence-major in the collective.
+    # For MinWM realtime's batch=1 this permutation is contiguous, so reshape
+    # aliases the receive buffer instead of launching a full QKV layout copy.
+    return exchanged.permute(1, 0, 2, 3, 4).reshape(
+        b, s_local * world_size, h_local, 3 * d
     )
 
 

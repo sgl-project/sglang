@@ -1,5 +1,5 @@
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -22,6 +22,7 @@ from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
     StableDiffusion3VAEConfig,
 )
 from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
+from sglang.multimodal_gen.configs.pipeline_configs.minwm import MinWMWan22VAEConfig
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.layers.parallel_conv import (
@@ -49,8 +50,11 @@ from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import (
     _enable_ltx_decoder_spatial_parallel,
 )
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
+    AutoencoderKLWan,
     WanDecoder3d,
     WanDistAttentionBlock,
+    feat_cache,
+    first_chunk,
 )
 from sglang.multimodal_gen.runtime.utils.distributed import RankGenerator
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
@@ -134,6 +138,25 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertTrue(
             should_use_spatial_shard_parallel_decode(
                 hunyuan_config, torch.empty(1, 16, 9, 96, 96), 2
+            )
+        )
+
+    def test_minwm_parallel_vae_auto_threshold_targets_720p_sp2(self):
+        config = MinWMWan22VAEConfig()
+
+        self.assertFalse(
+            should_use_spatial_shard_parallel_decode(
+                config, torch.empty(1, 1, 3, 30, 52), 2
+            )
+        )
+        self.assertTrue(
+            should_use_spatial_shard_parallel_decode(
+                config, torch.empty(1, 1, 3, 44, 78), 2
+            )
+        )
+        self.assertFalse(
+            should_use_spatial_shard_parallel_decode(
+                config, torch.empty(1, 1, 1, 8, 8), 2
             )
         )
 
@@ -378,6 +401,78 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertTrue(
             any(isinstance(m, WanDistAttentionBlock) for m in decoder.modules())
         )
+
+    def test_wan_parallel_decoder_splits_and_gathers_sp2_output(self):
+        decoder = WanDecoder3d.__new__(WanDecoder3d)
+        torch.nn.Module.__init__(decoder)
+        decoder.use_parallel_decode = True
+        decoder.world_size = 2
+        decoder.rank = 0
+        decoder.upsample_count = 1
+        decoder.conv_in = torch.nn.Identity()
+        decoder.mid_block = torch.nn.Identity()
+        decoder.up_blocks = torch.nn.ModuleList()
+        decoder.norm_out = torch.nn.Identity()
+        decoder.nonlinearity = torch.nn.Identity()
+        decoder.conv_out = torch.nn.Identity()
+
+        x = torch.arange(5).view(1, 1, 1, 5, 1).float()
+        local = x[..., :3, :]
+        gathered = x + 10
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.models.vaes.wanvae.split_for_parallel_decode",
+                return_value=(local, 10),
+            ) as split,
+            patch(
+                "sglang.multimodal_gen.runtime.models.vaes.wanvae.gather_and_trim_height",
+                return_value=gathered,
+            ) as gather,
+        ):
+            out = decoder(x)
+
+        split.assert_called_once_with(x, 1, 2, 0)
+        gather.assert_called_once()
+        self.assertEqual(gather.call_args.args[1], 10)
+        torch.testing.assert_close(out, gathered, rtol=0, atol=0)
+
+    def test_wan_causal_decode_keeps_cache_until_explicit_reset(self):
+        calls = []
+
+        class _Decoder(torch.nn.Module):
+            def forward(self, x):
+                calls.append((feat_cache.get(), first_chunk.get()))
+                return x
+
+        vae = AutoencoderKLWan.__new__(AutoencoderKLWan)
+        torch.nn.Module.__init__(vae)
+        vae.use_feature_cache = True
+        vae._causal_decode_initialized = False
+        vae.config = SimpleNamespace(patch_size=None)
+        vae.post_quant_conv = torch.nn.Identity()
+        vae.decoder = _Decoder()
+        clear_calls = []
+
+        def clear_cache(self):
+            clear_calls.append("clear")
+            self._feat_map = [None]
+            self._conv_idx = 0
+
+        vae.clear_cache = MethodType(clear_cache, vae)
+        vae._should_use_spatial_parallel_decode = MethodType(lambda self, z: False, vae)
+
+        first = vae.causal_decode(torch.zeros(1, 1, 2, 1, 1))
+        second = vae.causal_decode(torch.ones(1, 1, 1, 1, 1))
+
+        self.assertEqual(clear_calls, ["clear"])
+        self.assertEqual([is_first for _, is_first in calls], [True, False, False])
+        self.assertTrue(vae._causal_decode_initialized)
+        torch.testing.assert_close(first, torch.zeros_like(first), rtol=0, atol=0)
+        torch.testing.assert_close(second, torch.ones_like(second), rtol=0, atol=0)
+
+        vae.reset_causal_decode_state()
+        self.assertEqual(clear_calls, ["clear", "clear"])
+        self.assertFalse(vae._causal_decode_initialized)
 
     def test_diffusers_2d_decoder_uses_spatial_parallel_components(self):
         config = StableDiffusion3VAEConfig()

@@ -550,6 +550,8 @@ if [[ "${MINWM_BENCHMARK_MODE}" == "spmatrix720p" ]]; then
   SP_RESULTS="${MINWM_SP_RESULTS_DIR:-${RESULTS}/sp-matrix-720p}"
   SP_WARMUP_RUNS="${MINWM_SP_WARMUP_RUNS:-1}"
   SP_DEGREES="${MINWM_SP_DEGREES:-1 2 4 8}"
+  SP_VAE_LANE="${MINWM_SP_VAE_LANE:-parity}"
+  SP_VAE_PARALLEL_DECODE="${MINWM_SP_VAE_PARALLEL_DECODE:-true}"
   ARTIFACT_HOLD_SECONDS="${MINWM_ARTIFACT_HOLD_SECONDS:-0}"
   if ! [[ "${SP_WARMUP_RUNS}" =~ ^[0-9]+$ ]]; then
     echo "MINWM_SP_WARMUP_RUNS must be a non-negative integer" >&2
@@ -557,6 +559,14 @@ if [[ "${MINWM_BENCHMARK_MODE}" == "spmatrix720p" ]]; then
   fi
   if ! [[ "${ARTIFACT_HOLD_SECONDS}" =~ ^[0-9]+$ ]]; then
     echo "MINWM_ARTIFACT_HOLD_SECONDS must be a non-negative integer" >&2
+    exit 2
+  fi
+  if ! [[ "${SP_VAE_LANE}" =~ ^(parity|parallel)$ ]]; then
+    echo "MINWM_SP_VAE_LANE must be parity or parallel" >&2
+    exit 2
+  fi
+  if ! [[ "${SP_VAE_PARALLEL_DECODE}" =~ ^(true|false)$ ]]; then
+    echo "MINWM_SP_VAE_PARALLEL_DECODE must be true or false" >&2
     exit 2
   fi
   mkdir -p "${SP_RESULTS}"
@@ -624,10 +634,12 @@ PY
     MINWM_ATTENTION_IMPL=packed \
     MINWM_PACKED_ATTENTION_DETERMINISTIC=true \
     MINWM_NATIVE_COMPONENTS=text_encoder,vae \
+    MINWM_VAE_LANE="${SP_VAE_LANE}" \
     CUDA_LAUNCH_BLOCKING="${MINWM_CUDA_LAUNCH_BLOCKING:-0}" \
     sglang serve \
       --model-path "${MODEL_DIR}" \
       --pipeline-class-name MinWMCausalDMDPipeline \
+      --vae-config.use-parallel-decode "${SP_VAE_PARALLEL_DECODE}" \
       --attention-backend fa \
       --performance-mode speed \
       --num-gpus "${degree}" \
@@ -660,7 +672,7 @@ PY
       --results "${SP_RESULTS}" \
       --ws-url ws://127.0.0.1:30000/v1/realtime_video/generate \
       --output-prefix "${prefix}" \
-      --engine-name "sglang-minwm-${prefix}-ulysses" \
+      --engine-name "sglang-minwm-${prefix}-ulysses-${SP_VAE_LANE}-vae-parallel-${SP_VAE_PARALLEL_DECODE}" \
       --warmup-runs "${SP_WARMUP_RUNS}" \
       | tee "${SP_RESULTS}/${prefix}-client.log"
     local lane_status=${PIPESTATUS[0]}
@@ -691,7 +703,7 @@ PY
     fi
   done
   if [[ "${sp_degrees[*]}" != "1 2 4 8" ]]; then
-    echo "MINWM_SP_PARTIAL_COMPLETE degrees=${sp_degrees[*]} results=${SP_RESULTS}"
+    echo "MINWM_SP_PARTIAL_COMPLETE degrees=${sp_degrees[*]} vae_lane=${SP_VAE_LANE} vae_parallel_decode=${SP_VAE_PARALLEL_DECODE} results=${SP_RESULTS}"
     sync_sp_results
     exit 0
   fi
@@ -704,7 +716,7 @@ PY
   cp "${SP_RESULTS}/sp_matrix_report.md" "${RESULTS}/"
   touch "${RESULTS}/sp-matrix-artifacts-ready"
   sync_sp_results
-  echo "MINWM_B200_SP_MATRIX_COMPLETE results=${RESULTS}"
+  echo "MINWM_B200_SP_MATRIX_COMPLETE vae_lane=${SP_VAE_LANE} vae_parallel_decode=${SP_VAE_PARALLEL_DECODE} results=${RESULTS}"
   if (( ARTIFACT_HOLD_SECONDS > 0 )); then
     echo "MINWM_ARTIFACT_HOLD seconds=${ARTIFACT_HOLD_SECONDS}"
     sleep "${ARTIFACT_HOLD_SECONDS}"
