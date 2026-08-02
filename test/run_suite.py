@@ -160,6 +160,9 @@ NIGHTLY_SUITES = {
         "nightly-amd-vlm",
         # MI35x 8-GPU suite (different model configs)
         "nightly-amd-8-gpu-mi35x",
+        # MI455X (gfx1250) bring-up: gpt-oss-120b MXFP4 on a single GPU.
+        "nightly-amd-1-gpu-mi45x",
+        "nightly-perf-1-gpu-mi45x-gpt-oss",
     ],
     HWBackend.MUSA: [
         "nightly-musa-1-gpu",

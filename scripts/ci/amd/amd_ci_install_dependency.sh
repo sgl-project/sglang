@@ -196,10 +196,22 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
   MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
   MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/')
 
-  if [[ "${GPU_ARCH}" == "mi35x" ]]; then
-    MORI_GPU_ARCHS="gfx950"
-  else
-    MORI_GPU_ARCHS="gfx942"
+  case "${GPU_ARCH}" in
+    mi35x)        MORI_GPU_ARCHS="gfx950" ;;
+    mi45x|mi455x) MORI_GPU_ARCHS="gfx1250" ;;
+    *)            MORI_GPU_ARCHS="gfx942" ;;
+  esac
+
+  # gfx1250 needs a newer MORI than the gfx942/gfx950 pin, and the Dockerfile
+  # carries that as MORI_COMMIT_DEFAULT on the gfx1250 stage.
+  if [[ "${MORI_GPU_ARCHS}" == "gfx1250" ]]; then
+    MORI_STAGE_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_1250_ROCM7_15 AS gfx1250-rocm7_15' docker/rocm.Dockerfile \
+                        | grep 'MORI_COMMIT_DEFAULT=' \
+                        | head -n1 \
+                        | sed 's/.*MORI_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
+    if [[ -n "${MORI_STAGE_COMMIT}" ]]; then
+      MORI_COMMIT="${MORI_STAGE_COMMIT}"
+    fi
   fi
 
   echo "[MORI] Reinstalling MORI ${MORI_COMMIT} (MORI_GPU_ARCHS=${MORI_GPU_ARCHS})"
@@ -241,7 +253,13 @@ echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 #############################################
 # 1. Extract AITER_COMMIT from correct Dockerfile block
 #############################################
-if [[ "${GPU_ARCH}" == "mi35x" ]]; then
+if [[ "${GPU_ARCH}" == "mi45x" || "${GPU_ARCH}" == "mi455x" ]]; then
+    echo "[CI-AITER-CHECK] Using gfx1250 block from Dockerfile..."
+    REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_1250_ROCM7_15 AS gfx1250-rocm7_15' docker/rocm.Dockerfile \
+                        | grep 'AITER_COMMIT_DEFAULT=' \
+                        | head -n1 \
+                        | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
+elif [[ "${GPU_ARCH}" == "mi35x" ]]; then
     echo "[CI-AITER-CHECK] Using gfx950 block from Dockerfile..."
     REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_950 AS gfx950' docker/rocm.Dockerfile \
                         | grep 'AITER_COMMIT_DEFAULT=' \
@@ -322,18 +340,27 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
         pip install -r requirements.txt
     "
 
-    if [[ "${GPU_ARCH}" == "mi35x" ]]; then
-        GPU_ARCH_LIST="gfx950"
-    else
-        GPU_ARCH_LIST="gfx942"
-    fi
+    case "${GPU_ARCH}" in
+        mi35x)        GPU_ARCH_LIST="gfx950" ;;
+        mi45x|mi455x) GPU_ARCH_LIST="gfx1250" ;;
+        *)            GPU_ARCH_LIST="gfx942" ;;
+    esac
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
-    # build AITER
-    docker exec ci_sglang bash -c "
-        cd /sgl-workspace/aiter && \
-        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
-    "
+    # build AITER. gfx1250 has no CK kernels yet and its clang lives under
+    # $ROCM_HOME rather than on PATH (ROCm is pip-installed on that image).
+    if [[ "${GPU_ARCH_LIST}" == "gfx1250" ]]; then
+        docker exec ci_sglang bash -c '
+            cd /sgl-workspace/aiter && \
+            PATH=$PATH:$ROCM_HOME/llvm/bin ENABLE_CK=0 AITER_USE_SYSTEM_TRITON=1 \
+            GPU_ARCHS='"${GPU_ARCH_LIST}"' python3 setup.py develop
+        '
+    else
+        docker exec ci_sglang bash -c "
+            cd /sgl-workspace/aiter && \
+            AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        "
+    fi
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
 fi

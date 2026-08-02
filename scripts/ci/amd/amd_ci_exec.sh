@@ -24,10 +24,14 @@ declare -A ENV_MAP=(
   [SGLANG_USE_AITER]=1
 )
 
-# Conditionally add GPU_ARCHS only for mi35x
-if [[ "${GPU_FAMILY}" == "mi35x" ]]; then
-  ENV_MAP[GPU_ARCHS]="gfx950"
-fi
+# Pin GPU_ARCHS for the architectures whose JIT paths need it. mi30x is left
+# unset to preserve its existing autodetect behaviour.
+case "${GPU_FAMILY}" in
+  mi35x)       ENV_MAP[GPU_ARCHS]="gfx950" ;;
+  mi45x|mi455x) ENV_MAP[GPU_ARCHS]="gfx1250"
+                # gfx1250 has no CK kernels yet; AITER must build the non-CK path.
+                ENV_MAP[ENABLE_CK]="0" ;;
+esac
 
 # Parse -w/--workdir and -e ENV=VAL
 while [[ $# -gt 0 ]]; do

@@ -21,13 +21,19 @@ fi
 
 # Default base tags (can be overridden by command line arguments)
 ROCM_VERSION="rocm700"
+# MI455X (gfx1250) only ships on the ROCm 7.15 line, so it does not follow
+# ROCM_VERSION; it is pinned below unless --rocm-version is passed explicitly.
+MI45X_ROCM_VERSION="rocm7.15"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
+DEFAULT_MI45X_BASE_TAG="${SGLANG_VERSION}-${MI45X_ROCM_VERSION}-mi45x"
 LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
+MI45X_BASE_TAG="${DEFAULT_MI45X_BASE_TAG}"
+ROCM_VERSION_EXPLICIT=""
 CUSTOM_IMAGE=""
 BUILD_FROM_DOCKERFILE=""
 GPU_ARCH_BUILD=""
@@ -36,13 +42,16 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --mi30x-base-tag) MI30X_BASE_TAG="$2"; shift 2;;
     --mi35x-base-tag) MI35X_BASE_TAG="$2"; shift 2;;
+    --mi45x-base-tag) MI45X_BASE_TAG="$2"; shift 2;;
     --custom-image) CUSTOM_IMAGE="$2"; shift 2;;
     --build-from-dockerfile) BUILD_FROM_DOCKERFILE="1"; shift;;
     --gpu-arch) GPU_ARCH_BUILD="$2"; shift 2;;
     --rocm-version)
       ROCM_VERSION="$2"
+      ROCM_VERSION_EXPLICIT="1"
       MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
       MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
+      MI45X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi45x"
       echo "Using ROCm version override: ${ROCM_VERSION}"
       shift 2;;
     -h|--help)
@@ -78,8 +87,19 @@ else
   echo "Warning: could not parse GPU architecture from '${HOSTNAME_VALUE}', defaulting to ${GPU_ARCH}"
 fi
 
-# Normalise / collapse architectures we don't yet build specifically for
+# Normalise / collapse architectures we don't yet build specifically for.
+# Unrecognised architectures are a hard error: silently falling back to the
+# mi30x (gfx942) image made a job on new hardware look green while running
+# kernels built for the wrong arch.
 case "${GPU_ARCH}" in
+  mi45x|mi455x)
+    echo "Runner uses ${GPU_ARCH}; will fetch mi45x image."
+    GPU_ARCH="mi45x"
+    if [[ -z "${ROCM_VERSION_EXPLICIT}" ]]; then
+      ROCM_VERSION="${MI45X_ROCM_VERSION}"
+      echo "Pinning ROCm version to ${ROCM_VERSION} for mi45x."
+    fi
+    ;;
   mi35x)
     echo "Runner uses ${GPU_ARCH}; will fetch mi35x image."
     ;;
@@ -88,8 +108,9 @@ case "${GPU_ARCH}" in
     GPU_ARCH="mi30x"
     ;;
   *)
-    echo "Runner architecture '${GPU_ARCH}' unrecognised; defaulting to mi30x image." >&2
-    GPU_ARCH="mi30x"
+    echo "Error: unrecognised runner architecture '${GPU_ARCH}' (hostname '${HOSTNAME_VALUE}')." >&2
+    echo "Add a case arm here plus a matching image tag before running CI on this hardware." >&2
+    exit 1
     ;;
 esac
 
@@ -144,6 +165,7 @@ find_latest_image() {
   case "${gpu_arch}" in
       mi30x) base_tag="${MI30X_BASE_TAG}" ;;
       mi35x) base_tag="${MI35X_BASE_TAG}" ;;
+      mi45x) base_tag="${MI45X_BASE_TAG}" ;;
       *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
   esac
 
@@ -210,6 +232,13 @@ find_latest_image() {
   fi
 
   echo "Error: no ${gpu_arch} image found in the last 7 days for base ${base_tag}" >&2
+  # The hard-coded fallbacks below only exist for mi30x/mi35x, and their `else`
+  # branches resolve to an mi30x image. Never let that answer an mi45x request —
+  # a wrong-arch image is worse than a failed job.
+  if [[ "${gpu_arch}" == "mi45x" ]]; then
+    echo "Error: no hard-coded fallback for ${gpu_arch}; is release-docker-amd-rocm7_15-nightly.yml publishing?" >&2
+    return 1
+  fi
   echo "Using hard-coded fallback for ${ROCM_VERSION}…" >&2
   case "${ROCM_VERSION}" in
     rocm720)
