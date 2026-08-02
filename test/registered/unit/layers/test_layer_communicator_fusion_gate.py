@@ -1,3 +1,4 @@
+import contextlib
 import types
 import unittest
 from unittest.mock import patch
@@ -6,10 +7,15 @@ import torch
 
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
-from sglang.srt.layers.moe import post_experts_all_reduce
+from sglang.srt.layers.moe import (
+    can_merge_post_experts_all_reduce,
+    deferred_post_experts_all_reduce,
+    post_experts_all_reduce,
+)
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -24,7 +30,32 @@ def _fake_communicator():
     )
 
 
-class TestPostExpertsAllReduceMerge(unittest.TestCase):
+@contextlib.contextmanager
+def _recorded_all_reduces(called, *, moe_ep_size, moe_tp_size, moe_dp_size):
+    """Log which group each all-reduce helper reduces over, under a fixed topo."""
+
+    def record(name):
+        return lambda x: called.append(name) or x
+
+    with patch(
+        "sglang.srt.distributed.communication_op.tensor_model_parallel_all_reduce",
+        side_effect=record("tp"),
+    ), patch(
+        "sglang.srt.distributed.communication_op.moe_expert_parallel_all_reduce",
+        side_effect=record("ep"),
+    ), patch(
+        "sglang.srt.distributed.communication_op.moe_tensor_model_parallel_all_reduce",
+        side_effect=record("moe_tp"),
+    ), get_parallel().override(
+        moe_ep_size=moe_ep_size,
+        moe_tp_size=moe_tp_size,
+        moe_dp_size=moe_dp_size,
+        tp_size=moe_ep_size * moe_tp_size * moe_dp_size,
+    ):
+        yield
+
+
+class TestPostExpertsAllReduceMerge(CustomTestCase):
     """The two post-experts reductions collapse into one _TP reduction.
 
     _MOE_EP and _MOE_TP are orthogonal subgroups of _TP, so with
@@ -36,26 +67,13 @@ class TestPostExpertsAllReduceMerge(unittest.TestCase):
     def _calls(self, *, moe_ep_size, moe_tp_size, moe_dp_size=1, skip=False):
         """Which all-reduce helpers post_experts_all_reduce() invokes."""
         called = []
-
-        def record(name):
-            return lambda x: called.append(name) or x
-
         with patch.object(
             moe_utils, "should_skip_post_experts_all_reduce", return_value=skip
-        ), patch(
-            "sglang.srt.distributed.communication_op.tensor_model_parallel_all_reduce",
-            side_effect=record("tp"),
-        ), patch(
-            "sglang.srt.distributed.communication_op.moe_expert_parallel_all_reduce",
-            side_effect=record("ep"),
-        ), patch(
-            "sglang.srt.distributed.communication_op.moe_tensor_model_parallel_all_reduce",
-            side_effect=record("moe_tp"),
-        ), get_parallel().override(
+        ), _recorded_all_reduces(
+            called,
             moe_ep_size=moe_ep_size,
             moe_tp_size=moe_tp_size,
             moe_dp_size=moe_dp_size,
-            tp_size=moe_ep_size * moe_tp_size * moe_dp_size,
         ):
             post_experts_all_reduce(torch.zeros(2, 2))
         return called
@@ -64,6 +82,9 @@ class TestPostExpertsAllReduceMerge(unittest.TestCase):
         self.assertEqual(self._calls(moe_ep_size=2, moe_tp_size=2), ["tp"])
 
     def test_moe_dp_keeps_the_two_step_form(self):
+        # Server args reject moe_ep_size > 1 together with moe_tp_size > 1 and
+        # moe_dp_size > 1 (they force ep_size * moe_dp_size == tp_size), so this
+        # pins the guard rather than a topology that can be launched today.
         self.assertEqual(
             self._calls(moe_ep_size=2, moe_tp_size=2, moe_dp_size=2), ["ep", "moe_tp"]
         )
@@ -76,7 +97,58 @@ class TestPostExpertsAllReduceMerge(unittest.TestCase):
         self.assertEqual(self._calls(moe_ep_size=2, moe_tp_size=2, skip=True), [])
 
 
-class TestFuseMlpAllReduceGate(unittest.TestCase):
+class TestDeferredPostExpertsAllReduce(CustomTestCase):
+    """The inline fallback must reduce over the same peers the fused kernel would.
+
+    _MOE_TP holds a single rank under pure EP, so reducing over it there is a
+    no-op that drops the deferred reduction instead of performing it.
+    """
+
+    def _calls(self, *, moe_ep_size, moe_tp_size, moe_dp_size=1):
+        called = []
+        with _recorded_all_reduces(
+            called,
+            moe_ep_size=moe_ep_size,
+            moe_tp_size=moe_tp_size,
+            moe_dp_size=moe_dp_size,
+        ):
+            deferred_post_experts_all_reduce(torch.zeros(2, 2))
+        return called
+
+    def test_hybrid_reduces_over_tp(self):
+        self.assertEqual(self._calls(moe_ep_size=2, moe_tp_size=2), ["tp"])
+
+    def test_pure_ep_reduces_over_ep(self):
+        self.assertEqual(self._calls(moe_ep_size=4, moe_tp_size=1), ["ep"])
+
+    def test_pure_tp_reduces_over_moe_tp(self):
+        self.assertEqual(self._calls(moe_ep_size=1, moe_tp_size=4), ["moe_tp"])
+
+    def test_moe_dp_reduces_over_moe_tp(self):
+        self.assertEqual(
+            self._calls(moe_ep_size=1, moe_tp_size=2, moe_dp_size=2), ["moe_tp"]
+        )
+
+
+class TestCanMergePostExpertsAllReduce(CustomTestCase):
+    def _can_merge(self, *, moe_ep_size, moe_tp_size, moe_dp_size=1):
+        with get_parallel().override(
+            moe_ep_size=moe_ep_size,
+            moe_tp_size=moe_tp_size,
+            moe_dp_size=moe_dp_size,
+            tp_size=moe_ep_size * moe_tp_size * moe_dp_size,
+        ):
+            return can_merge_post_experts_all_reduce()
+
+    def test_hybrid_ep_tp_merges(self):
+        self.assertTrue(self._can_merge(moe_ep_size=2, moe_tp_size=2))
+
+    def test_single_dimension_does_not_merge(self):
+        self.assertFalse(self._can_merge(moe_ep_size=1, moe_tp_size=4))
+        self.assertFalse(self._can_merge(moe_ep_size=4, moe_tp_size=1))
+
+
+class TestFuseMlpAllReduceGate(CustomTestCase):
     """Fusion is allowed only when one group covers the whole reduction.
 
     The fused residual+LN reduces over a single group. Hybrid EP+TP produces two
@@ -102,7 +174,7 @@ class TestFuseMlpAllReduceGate(unittest.TestCase):
                 moe_ep_size=moe_ep_size,
                 moe_tp_size=moe_tp_size,
                 moe_dp_size=moe_dp_size,
-                tp_size=4,
+                tp_size=moe_ep_size * moe_tp_size * moe_dp_size,
             ),
         ):
             return LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -113,6 +185,9 @@ class TestFuseMlpAllReduceGate(unittest.TestCase):
         self.assertTrue(self._should_fuse(moe_ep_size=2, moe_tp_size=2))
 
     def test_hybrid_ep_tp_does_not_fuse_when_moe_dp_blocks_the_merge(self):
+        # Same caveat as test_moe_dp_keeps_the_two_step_form: unreachable today,
+        # kept so a future relaxation cannot silently re-enable fusion over a
+        # reduction that no single group covers.
         self.assertFalse(self._should_fuse(moe_ep_size=2, moe_tp_size=2, moe_dp_size=2))
 
     def test_pure_tp_still_fuses(self):

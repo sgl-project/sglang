@@ -24,7 +24,6 @@ from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
     get_tp_group,
-    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -56,6 +55,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
+    deferred_post_experts_all_reduce,
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -613,15 +613,8 @@ class LayerCommunicator:
                         )
                 else:
                     # Fusion was published but this shape can't use the kernel,
-                    # so run the deferred reduction inline. Under hybrid EP+TP
-                    # it was merged into a single _TP reduction upstream, so a
-                    # MoE-TP-only all-reduce would cover half the peers.
-                    if can_merge_post_experts_all_reduce():
-                        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                    else:
-                        hidden_states = moe_tensor_model_parallel_all_reduce(
-                            hidden_states
-                        )
+                    # so run the deferred reduction inline.
+                    hidden_states = deferred_post_experts_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
