@@ -8,6 +8,9 @@ import logging
 import os
 import pathlib
 import re
+import shutil
+import socket
+import uuid
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Tuple, TypeAlias, Union
 
@@ -16,6 +19,7 @@ import torch
 from sglang.kernels.jit.utils.arch import get_default_target_flags, get_jit_cuda_arch
 from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime
 from sglang.kernels.jit.utils.deps import REGISTERED_DEPENDENCIES
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
@@ -102,6 +106,11 @@ DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_LDFLAGS = []
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, str, bool, torch.dtype]
 
+# Used when this process cannot get a host name from the operating system.
+# The random part keeps the value unique to this process, and it is computed
+# once so that every build in this process still shares one staging directory.
+_UNKNOWN_HOST_TAG = f"unknown-host_{uuid.uuid4().hex}"
+
 
 class CPPArgList(list[str]):
     def __str__(self) -> str:
@@ -169,6 +178,139 @@ def _jit_build_dir_name(module_name: str) -> str:
     return f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}"
 
 
+def _host_tag() -> str:
+    """Filesystem safe per host tag that keeps staging build dirs host private.
+
+    Some containerized, sandboxed or otherwise restricted environments refuse
+    the host name lookup, so a failure here falls back to a value that is
+    unique to this process instead of one fixed name. A single fixed fallback
+    name would put every host that cannot report a name back into one shared
+    staging directory, which is the cross host build race this staging step
+    exists to prevent. The price of the unique fallback is one extra compile
+    per process on such a host, on a cold cache only, which is far cheaper
+    than a failed startup.
+
+    The lookup itself is not cached, so a later call still sees a host name
+    that the operating system starts reporting. The fallback lives in a module
+    constant, so every call in one process gets the same fallback value.
+    """
+    try:
+        hostname = socket.gethostname()
+    except Exception:
+        logger.debug(
+            "Could not read the host name for the JIT staging directory. "
+            "Falling back to a name that is unique to this process.",
+            exc_info=True,
+        )
+        hostname = ""
+    return re.sub(r"[^0-9A-Za-z._-]", "_", hostname or _UNKNOWN_HOST_TAG)
+
+
+def _publish_first_wins(staged_so: pathlib.Path, target_so: pathlib.Path) -> None:
+    """Publish ``staged_so`` to ``target_so`` unless a published file already exists.
+
+    A hard link keeps the existing target untouched whenever one is already
+    present: replacing a library that another host may have loaded unlinks it
+    underneath that host, which on NFS reopens the stale file handle failure
+    this module exists to avoid. The staging directory sits inside the target's
+    directory, so both publish methods stay on one filesystem and are atomic.
+    """
+    try:
+        os.link(staged_so, target_so)
+    except FileExistsError:
+        # Another publisher won the race with an identical library. Keep it.
+        return
+    except OSError:
+        # This filesystem does not support hard links. Fall back to an atomic
+        # rename, which can still swap the target for a concurrent publisher
+        # but never exposes a partially written file.
+        os.replace(staged_so, target_so)
+        return
+    # The publish succeeded. Remove the staging name for the published file so
+    # a later rebuild in the staging directory can never write through it into
+    # the shared copy.
+    try:
+        staged_so.unlink()
+    except OSError:
+        pass
+
+
+def _cleanup_staging_directory(staging_dir: pathlib.Path) -> None:
+    """Best effort removal of build files left behind in a staging directory.
+
+    Runs after a successful publish so per host build trees do not pile up in
+    the shared cache. Deletion happens under the same file lock tvm_ffi uses
+    for builds in this directory, so it never races a build that is running on
+    this host. The lock file itself is kept: deleting it while another process
+    still holds it open would let two later builders lock different files and
+    build at the same time. Any failure here is ignored, because cleanup must
+    never break startup.
+    """
+    try:
+        from tvm_ffi.utils import FileLock
+
+        with FileLock(str(staging_dir / "lock")):
+            for entry in staging_dir.iterdir():
+                if entry.name == "lock":
+                    continue
+                if entry.is_dir():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+    except Exception:
+        logger.debug(
+            "Failed to clean up JIT staging directory %s.", staging_dir, exc_info=True
+        )
+
+
+def _publish_and_load(
+    built_so: str, target_so: pathlib.Path, *, overwrite: bool = False
+) -> Module:
+    """Publish a staged ``.so`` into the shared cache dir and load it.
+
+    By default the first publisher wins and an already published target is
+    kept as is, so republishing ranks never replace a library other hosts
+    already loaded. ``overwrite=True`` is for rebuilding after a published
+    library failed to load, where replacing the bad target is the point.
+    """
+    from tvm_ffi import load_module
+
+    staged_so = pathlib.Path(built_so)
+    try:
+        if overwrite:
+            os.replace(staged_so, target_so)
+        else:
+            _publish_first_wins(staged_so, target_so)
+    except OSError as exc:
+        if staged_so.is_file():
+            # The publish failed but the staged file is intact, for example
+            # because the shared directory is read only. Load the staged copy.
+            logger.warning(
+                "Failed to publish staged JIT module %s to %s; "
+                "loading it from the staging directory instead.",
+                built_so,
+                target_so,
+                exc_info=True,
+            )
+            return load_module(str(staged_so))
+        if target_so.is_file():
+            # Another process on this host already moved the staged file to
+            # the target. The target is complete, so load it.
+            logger.debug(
+                "Staged JIT module %s was already published to %s by another "
+                "process; loading the published copy.",
+                built_so,
+                target_so,
+            )
+            return load_module(str(target_so))
+        raise RuntimeError(
+            f"Failed to publish JIT module {built_so} to {target_so}, and "
+            "neither the staged file nor the published file exists."
+        ) from exc
+    _cleanup_staging_directory(staged_so.parent)
+    return load_module(str(target_so))
+
+
 def load_jit(
     *args: str,
     cpp_files: List[str] | None = None,
@@ -226,7 +368,7 @@ def load_jit(
     :rtype: Module
     """
 
-    from tvm_ffi.cpp import load, load_inline
+    from tvm_ffi.cpp import build, build_inline, load, load_inline
 
     cpp_files = cpp_files or []
     cuda_files = cuda_files or []
@@ -263,12 +405,16 @@ def load_jit(
     # A built .so under a deterministic dir is content-addressed: load it
     # directly to skip ninja, whose mtime check rebuilds every CI run (pip
     # install bumps dep header mtimes).
+    use_default_cache = build_directory is None
     if build_directory is None:
         cache_dir = os.environ.get("TVM_FFI_CACHE_DIR", "~/.cache/tvm-ffi")
         build_directory = str(
             pathlib.Path(cache_dir).expanduser() / _jit_build_dir_name(module_name)
         )
     prebuilt = pathlib.Path(build_directory) / f"{module_name}.so"
+    # When a cached library exists but cannot be loaded, the rebuild below must
+    # overwrite it. In every other case the first publisher wins.
+    overwrite_bad_target = False
     if prebuilt.is_file():
         from tvm_ffi import load_module
 
@@ -277,10 +423,27 @@ def load_jit(
             logger.debug("Reused cached JIT module %s", module_name)
             return module
         except Exception:
+            overwrite_bad_target = True
             logger.warning(
                 "Cached JIT module %s failed to load; rebuilding.", module_name
             )
 
+    # Cold cache. tvm-ffi builds in place inside `build_directory`, guarded by
+    # an fcntl.flock that is node-local on common HPC NFS mounts, so two hosts
+    # sharing the default cache dir (e.g. an NFS $HOME) can rewrite each
+    # other's link inputs mid-link and abort startup with ESTALE (see #31347).
+    # Build in a host-private staging dir instead, then atomically publish the
+    # finished .so to the shared path: warm starts above still share a single
+    # cached .so cluster-wide, and ranks on one host still deduplicate their
+    # compile through tvm-ffi's (locally correct) flock in the staging dir.
+    staging_directory: str | None = None
+    if use_default_cache and not envs.SGLANG_DISABLE_JIT_KERNEL_STAGED_BUILD.get():
+        staging_directory = str(pathlib.Path(build_directory) / f"stage__{_host_tag()}")
+
+    # The header only path passes sources as strings, the file based path
+    # passes file names, and everything else about the two calls is the same.
+    # Pick the pair of functions and the source arguments here, then make one
+    # call below so the flag arguments are written once.
     if header_only:
         cpp_wrappers = cpp_wrappers or []
         cuda_wrappers = cuda_wrappers or []
@@ -290,30 +453,31 @@ def load_jit(
         # include cuda files
         cuda_sources = [f'#include "{path}"' for path in cuda_files]
         cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
-        with _jit_compile_context():
-            return load_inline(
-                module_name,
-                cpp_sources=cpp_sources,
-                cuda_sources=cuda_sources,
-                extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-                extra_cuda_cflags=get_default_target_flags() + extra_cuda_cflags,
-                extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
-                extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-                build_directory=build_directory,
-            )
+
+        build_in_place, build_in_staging = load_inline, build_inline
+        source_kwargs = {"cpp_sources": cpp_sources, "cuda_sources": cuda_sources}
     else:
         assert cpp_wrappers is None and cuda_wrappers is None
-        with _jit_compile_context():
-            return load(
-                module_name,
-                cpp_files=cpp_files,
-                cuda_files=cuda_files,
-                extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-                extra_cuda_cflags=get_default_target_flags() + extra_cuda_cflags,
-                extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
-                extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-                build_directory=build_directory,
+
+        build_in_place, build_in_staging = load, build
+        source_kwargs = {"cpp_files": cpp_files, "cuda_files": cuda_files}
+
+    with _jit_compile_context():
+        build_kwargs = dict(
+            **source_kwargs,
+            extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+            extra_cuda_cflags=get_default_target_flags() + extra_cuda_cflags,
+            extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+            extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+        )
+        if staging_directory is None:
+            return build_in_place(
+                module_name, **build_kwargs, build_directory=build_directory
             )
+        built_so = build_in_staging(
+            module_name, **build_kwargs, build_directory=staging_directory
+        )
+        return _publish_and_load(built_so, prebuilt, overwrite=overwrite_bad_target)
 
 
 @contextmanager
