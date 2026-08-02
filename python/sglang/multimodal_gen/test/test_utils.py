@@ -2003,6 +2003,30 @@ def _save_generated_artifact_images(
     return generated_files
 
 
+def save_missing_consistency_gt_artifact(
+    artifact_dir: str | Path | None,
+    case_id: str,
+    num_gpus: int,
+    output_frames: list[np.ndarray],
+    is_video: bool,
+    output_format: str | None = None,
+) -> Path | None:
+    if not artifact_dir:
+        return None
+
+    out_dir = Path(artifact_dir) / "missing_consistency_gt"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filenames = _consistency_gt_filenames(
+        case_id,
+        num_gpus,
+        is_video=is_video,
+        output_format=output_format,
+    )
+    for frame, filename in zip(output_frames, filenames):
+        Image.fromarray(_ensure_rgb_uint8_image(frame)).save(out_dir / filename)
+    return out_dir
+
+
 def _write_consistency_failure_index(
     out_dir: Path,
     records: list[dict[str, Any]],
