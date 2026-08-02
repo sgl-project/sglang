@@ -13,7 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
@@ -62,7 +62,7 @@ class ProfileManager:
         )
         self.ps = ps
         self.cpu_group = cpu_group
-        self.first_rank_in_node = ps.gpu_id == get_server_args().base_gpu_id
+        self.first_rank_in_node = ps.gpu_id == get_device().base_gpu_id
         self.profiler_kwargs = None
         self.profiler = None
 
@@ -359,14 +359,17 @@ class _ProfilerTorch(_ProfilerConcreteBase):
 
 class _ProfilerMemory(_ProfilerConcreteBase):
     def start(self):
-        torch.cuda.memory._record_memory_history(max_entries=100000)
+        torch.cuda.memory._record_memory_history(
+            max_entries=envs.SGLANG_MEM_PROFILE_MAX_ENTRIES.get()
+        )
 
     def stop(self):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
         memory_profile_path = os.path.join(
             self.output_dir,
-            str(time.time())
+            (self.output_prefix + "-" if self.output_prefix else "")
+            + str(time.time())
             + f"-TP-{self.ps.tp_rank}-memory"
             + self.output_suffix
             + ".pickle",

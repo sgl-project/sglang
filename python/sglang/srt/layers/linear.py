@@ -39,7 +39,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -1438,6 +1438,8 @@ class RowParallelLinear(LinearBase):
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
+        # Flag set by CpDecodeAttnTpContext to enable all_reduce during decode.
+        self.use_decode_attn_tp: bool = False
 
         self.quant_method.create_weights(
             layer=self,
@@ -1585,8 +1587,7 @@ class RowParallelLinear(LinearBase):
         # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
         # the decoder — callers should not thread those flags into modules.
         if (
-            self.reduce_results
-            and self.tp_size > 1
+            ((self.reduce_results and self.tp_size > 1) or self.use_decode_attn_tp)
             and not skip_all_reduce
             and not should_skip_mlp_all_reduce()
         ):
@@ -1596,7 +1597,7 @@ class RowParallelLinear(LinearBase):
                 quantize_communications = (
                     (
                         not forward_batch.forward_mode.is_decode_or_idle()
-                        and get_server_args().enable_quant_communications
+                        and get_exec().comm.enable_quant_communications
                     )
                     if forward_batch is not None
                     else False
