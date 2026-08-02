@@ -188,6 +188,15 @@ class _FakeFullComponent(TreeComponent):
     def _evict_device_end(self) -> None:
         pass
 
+    def _dec_session_coverage(self, session_id, leaf) -> None:
+        pass
+
+    def _advance_session_coverage(self, session_id, leaf, old_ancestor) -> None:
+        pass
+
+    def _recede_session_coverage(self, session_id, leaf, fallback) -> None:
+        pass
+
 
 class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
     def test_component_registry_override_is_instance_local(self):
