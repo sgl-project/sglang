@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib
 import logging
 import os
 
@@ -15,7 +16,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER_GFX95
+from sglang.multimodal_gen.runtime.platforms.aiter import (
+    USE_AITER_GFX95,
+    USE_AITER_GFX942,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -205,3 +209,38 @@ class AITerImpl(AttentionImpl):
             return_lse=True,
         )
         return output
+
+    @torch.compiler.disable
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        del cu_seqlens_host
+        if USE_AITER_GFX942:
+            # The grouped-varlen ASM kernel hangs on H3's ~64K packed
+            # sequences on gfx942; AITER's Triton path handles this shape.
+            attention_func = importlib.import_module(
+                "aiter.ops.triton.attention.mha"
+            ).flash_attn_varlen_func
+        else:
+            attention_func = aiter.flash_attn_varlen_func
+
+        cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()
+        output = attention_func(
+            q=query.contiguous(),
+            k=key.contiguous(),
+            v=value.contiguous(),
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+        )
+        return output[0] if isinstance(output, tuple) else output

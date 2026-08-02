@@ -79,6 +79,8 @@ def synchronized(func):
 
 
 class HostKVCache(abc.ABC):
+    dcp_size = 1
+    dcp_rank = 0
 
     def __init__(
         self,
@@ -94,11 +96,7 @@ class HostKVCache(abc.ABC):
         dcp_rank: int = 0,
     ):
         self.device_pool = device_pool
-        # Under DCP the controller/radix layer works in the widened logical
-        # index space (page_size here is page_size * dcp_size), while this
-        # rank's buffer only materializes its owned 1/dcp_size token shard.
-        # self.page_size / self.size / self.page_num are kernel-facing
-        # (physical); the alloc/free/mem_state surface below is logical.
+        # page_size arrives widened (x dcp_size); size/page_size/page_num are physical.
         self.dcp_size = dcp_size
         self.dcp_rank = dcp_rank
         assert page_size % dcp_size == 0, (
@@ -106,7 +104,6 @@ class HostKVCache(abc.ABC):
             f"dcp_size ({dcp_size}); expected the widened page from the DCP "
             "paged allocator."
         )
-        self.logical_page_size = page_size
         self.page_size = page_size // dcp_size
         self.layout = layout
         self.pin_memory = pin_memory
@@ -122,12 +119,9 @@ class HostKVCache(abc.ABC):
             )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
-        # Align up the host memory pool size to the (physical) page size
+        # Align up the host memory pool size to the page size
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
-        # Logical capacity exposed to the radix/controller layer: one slot per
-        # logical token, dcp_size of which collapse onto one physical row.
-        self.logical_size = self.size * self.dcp_size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
@@ -282,9 +276,6 @@ class HostKVCache(abc.ABC):
     @synchronized
     def clear(self):
         # Initialize memory states and tracking structures.
-        # All slot accounting is in the logical space (== physical when
-        # dcp_size == 1): the radix tree stores one host slot per logical
-        # token; the physical buffer row is derived at transfer time.
         self.mem_state = torch.zeros(
             (self.logical_size,), dtype=torch.uint8, device=self.device
         )
@@ -312,15 +303,20 @@ class HostKVCache(abc.ABC):
         self.release_slots = []
         self.num_release_slots = 0
 
-    def dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        """Translate logical slot indices to this rank's physical buffer rows.
+    @property
+    def logical_size(self) -> int:
+        """Slots the radix/controller layer sees: dcp_size of them share a row."""
+        return self.size * self.dcp_size
 
-        Identity when dcp_size == 1. Under DCP, keeps the owned interleaved
-        subset (index % dcp_size == dcp_rank) and collapses it onto physical
-        rows (// dcp_size) — the same owner rule the device-side KV write and
-        page-table kernels use. For runs made of whole widened pages every
-        rank keeps exactly 1/dcp_size of the slots, covering its full
-        physical pages.
+    @property
+    def logical_page_size(self) -> int:
+        """Page size in that same logical space (the widened DCP page)."""
+        return self.page_size * self.dcp_size
+
+    def dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Transfer kernels index per-rank rows; callers hold widened logical slots.
+
+        Keep this rank's slots (% dcp_size == dcp_rank), then collapse (// dcp_size).
         """
         if self.dcp_size == 1:
             return indices

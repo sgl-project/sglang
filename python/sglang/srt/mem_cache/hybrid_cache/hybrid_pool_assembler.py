@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.mem_cache.unified_cache_components import ComponentType
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -76,8 +76,8 @@ def build_kv_host_pool(
     parallel = get_parallel()
     if parallel.dcp_enabled:
         assert use_mla, (
-            "HiCache + DCP is only wired for the MLA host pool (Kimi hybrid "
-            "models); the MHA host pool has no DCP index translation."
+            "HiCache + DCP is only wired for the MLA host pool; the MHA host "
+            "pool has no DCP index translation."
         )
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank

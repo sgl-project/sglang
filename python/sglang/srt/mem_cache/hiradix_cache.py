@@ -109,8 +109,8 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=allocator_type,
-                dcp_size=(_parallel.attn_dcp_size if _parallel.dcp_enabled else 1),
-                dcp_rank=(_parallel.attn_dcp_rank if _parallel.dcp_enabled else 0),
+                dcp_size=_parallel.attn_dcp_size,
+                dcp_rank=_parallel.attn_dcp_rank,
             )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, DSA, and MSA models")

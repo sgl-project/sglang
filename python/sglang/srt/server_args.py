@@ -4498,10 +4498,10 @@ class ServerArgs:
                 "two-batch overlap",
                 lambda: self.enable_two_batch_overlap,
             ),
-            # Only DeepEP's a2a is validated under BCG.
             (
-                "non-DeepEP a2a backend",
-                lambda: resolved_view(self).moe_a2a_backend not in ("none", "deepep"),
+                "unvalidated a2a backend",
+                lambda: resolved_view(self).moe_a2a_backend
+                not in ("none", "deepep", "megamoe", "flashinfer"),
             ),
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
@@ -7185,9 +7185,7 @@ class ServerArgs:
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
 
-        # Step 3: DCP compatibility. The L2 (device<->host) path translates
-        # the widened logical indices to per-rank physical rows at the host
-        # pool boundary; only the validated MLA-hybrid (Kimi) path is wired.
+        # Step 3: DCP compatibility for the L2 (device<->host) path.
         self._resolve_hicache_dcp_compatibility()
 
     def _resolve_hicache_dcp_compatibility(self):
@@ -7217,14 +7215,11 @@ class ServerArgs:
                 "--enable-hisparse with --dcp-size > 1 is not supported: the "
                 "HiSparse host pool is constructed without DCP translation."
             )
-        model_arches = self.get_model_config().hf_config.architectures
-        supported = {"KimiLinearForCausalLM", "KimiK3ForConditionalGeneration"}
-        if not supported.intersection(model_arches):
-            raise ValueError(
-                "HiCache with --dcp-size > 1 is only validated for the Kimi "
-                "hybrid models (KimiLinearForCausalLM / "
-                f"KimiK3ForConditionalGeneration), got {model_arches}. The "
-                "MHA host pool has no DCP index translation."
+        if not self.use_mla_backend():
+            raise NotImplementedError(
+                "HiCache with --dcp-size > 1 is only supported for MLA models: "
+                "the index translation lives in MLATokenToKVPoolHost, and the "
+                "MHA host pool has none."
             )
         logger.info(
             "HiCache + DCP enabled (L1/L2 only): host pool uses widened "
