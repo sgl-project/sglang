@@ -170,6 +170,11 @@ where
                 state.buffered.push_str(content);
 
                 if !state.parsing_tool {
+                    let partial_marker_len = if choice.finish_reason.is_some() {
+                        0
+                    } else {
+                        partial_marker_suffix_len(&state.buffered, &start_markers)
+                    };
                     if let Some(position) = start_markers
                         .iter()
                         .filter_map(|marker| state.buffered.find(marker))
@@ -186,17 +191,13 @@ where
                             });
                         }
                         state.parsing_tool = true;
-                    } else if start_markers.is_empty()
-                        && detect_tool_call_start(&state.buffered, Some(&parser)).unwrap_or(false)
+                    } else if partial_marker_len == 0
+                        && detect_tool_call_start(&state.buffered, Some(&parser))
+                            .unwrap_or(false)
                     {
                         state.parsing_tool = true;
                     } else {
-                        let held = if choice.finish_reason.is_some() {
-                            0
-                        } else {
-                            partial_marker_suffix_len(&state.buffered, &start_markers)
-                        };
-                        let safe_len = state.buffered.len().saturating_sub(held);
+                        let safe_len = state.buffered.len().saturating_sub(partial_marker_len);
                         if safe_len != 0 {
                             let text = state.buffered[..safe_len].to_owned();
                             state.buffered.drain(..safe_len);
@@ -912,6 +913,31 @@ mod tests {
             Some("get_weather".into())
         );
         // The terminal reason is rewritten: calls were emitted.
+        assert_eq!(terminal.finish_reason, Some(OpenAIFinishReason::ToolCalls));
+    }
+
+    #[tokio::test]
+    async fn streaming_parser_detects_bare_json_without_a_start_marker() {
+        let items = parse(
+            vec![
+                stream_item(r#"{"name":"get_weather","parameters":{"#, None),
+                stream_item(r#""city":"Paris"}}"#, Some(OpenAIFinishReason::Stop)),
+            ],
+            "llama3_json",
+            false,
+        )
+        .await;
+        assert_eq!(items.len(), 1);
+        let terminal = choice(&items[0]);
+        assert!(terminal.delta.content.is_none());
+        assert_eq!(
+            terminal.delta.tool_calls.as_ref().unwrap()[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .name,
+            Some("get_weather".into())
+        );
         assert_eq!(terminal.finish_reason, Some(OpenAIFinishReason::ToolCalls));
     }
 
