@@ -64,6 +64,17 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 _arange_cache = {}
 
 
+def _indexer_logits_chunk_pages(block_size: int, max_pages: int) -> int:
+    """Sequence-axis chunk width in KV pages for the torch paged MQA logits path."""
+    chunk_positions = envs.SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK.get()
+    chunk_pages = max_pages
+    if chunk_positions and chunk_positions > 0:
+        # Round down to whole pages so a chunk never straddles a page boundary,
+        # but never below a single page.
+        chunk_pages = min(max_pages, max(1, int(chunk_positions) // block_size))
+    return max(1, chunk_pages)
+
+
 def fp8_paged_mqa_logits_torch(
     q_fp8: torch.Tensor,
     kvcache_fp8: torch.Tensor,
@@ -95,37 +106,72 @@ def fp8_paged_mqa_logits_torch(
     kvcache_flat = kvcache_fp8.view(-1, total_dim)
 
     pages_clamped = page_table.clamp(min=0)
-    kvcache_gathered = kvcache_flat[pages_clamped]
-
-    kv_values_raw = kvcache_gathered[..., :SCALE_OFFSET].contiguous()
-    kv_values_fp8 = kv_values_raw.view(dtype=FP8_DTYPE)
-    kv_values = kv_values_fp8.to(torch.bfloat16)
-    kv_values = kv_values.reshape(batch_size, max_num_pages * block_size, head_dim)
-
-    kv_scales_raw = kvcache_gathered[..., SCALE_OFFSET:].contiguous()
-    kv_scales = kv_scales_raw.view(dtype=torch.float32)
-    kv_scales = kv_scales.reshape(batch_size, max_num_pages * block_size)
 
     q_float = q_fp8[:, 0].to(torch.bfloat16)
-    scores = torch.bmm(kv_values, q_float.transpose(1, 2))
-    scores = F.relu(scores)
-    scores = scores * weight.unsqueeze(1)
-    scores = scores.sum(dim=2)
-    scores = scores * kv_scales
+    q_t = q_float.transpose(1, 2)
+    weight_row = weight.unsqueeze(1)
 
     padded_seq_len = max_num_pages * block_size
+    device = q_float.device
     cache = _arange_cache
-    arange_key = f"arange_{padded_seq_len}_{scores.device}"
+    arange_key = f"arange_{padded_seq_len}_{device}"
     if arange_key not in cache:
-        cache[arange_key] = torch.arange(padded_seq_len, device=scores.device)
+        cache[arange_key] = torch.arange(padded_seq_len, device=device)
     positions = cache[arange_key].unsqueeze(0)
-    valid_mask = positions < seq_lens.unsqueeze(1)
-    scores = scores.masked_fill(~valid_mask, 0.0)
+    seq_lens_col = seq_lens.unsqueeze(1)
 
-    if padded_seq_len < max_seq_len:
-        scores = F.pad(scores, (0, max_seq_len - padded_seq_len), value=0.0)
-    else:
-        scores = scores[:, :max_seq_len]
+    # Same shape as the SM120 variant below: `bmm` materializes
+    # [batch, positions, num_heads] and the head axis is summed away two ops
+    # later, so a whole-sequence pass peaks at num_heads times the returned
+    # [batch, max_seq_len] -- and the gather feeding it pulls the whole context
+    # KV in first. Walk the sequence in page-aligned chunks instead, gather only
+    # that chunk's pages and write its scores straight into the output. No
+    # reduction crosses a chunk boundary (relu is elementwise, the bmm reduces
+    # over head_dim, the head sum stays within one row), so the result is
+    # unchanged. Positions past the sequence length keep the 0.0 the unchunked
+    # `masked_fill` wrote, positions past the gathered span the 0.0 of its
+    # `F.pad`. bmm(bf16, bf16) -> bf16, scaled by `weight` and then by the
+    # float32 KV scales; mirror that promotion so the output dtype matches a
+    # single pass.
+    logits_dtype = torch.promote_types(
+        torch.promote_types(q_float.dtype, weight.dtype), torch.float32
+    )
+    scores = torch.zeros((batch_size, max_seq_len), dtype=logits_dtype, device=device)
+
+    chunk_pages = _indexer_logits_chunk_pages(block_size, max_num_pages)
+    for page_start in range(0, max_num_pages, chunk_pages):
+        seq_start = page_start * block_size
+        if seq_start >= max_seq_len:
+            # The page table can be wider than max_seq_len; the unchunked pass
+            # computed those positions and then truncated them away.
+            break
+        page_stop = min(max_num_pages, page_start + chunk_pages)
+        chunk_seq = (page_stop - page_start) * block_size
+
+        kvcache_gathered = kvcache_flat[pages_clamped[:, page_start:page_stop]]
+
+        kv_values_raw = kvcache_gathered[..., :SCALE_OFFSET].contiguous()
+        kv_values_fp8 = kv_values_raw.view(dtype=FP8_DTYPE)
+        kv_values = kv_values_fp8.to(torch.bfloat16)
+        kv_values = kv_values.reshape(batch_size, chunk_seq, head_dim)
+
+        kv_scales_raw = kvcache_gathered[..., SCALE_OFFSET:].contiguous()
+        kv_scales = kv_scales_raw.view(dtype=torch.float32)
+        kv_scales = kv_scales.reshape(batch_size, chunk_seq)
+
+        chunk_scores = torch.bmm(kv_values, q_t)
+        chunk_scores = F.relu(chunk_scores)
+        chunk_scores = chunk_scores * weight_row
+        chunk_scores = chunk_scores.sum(dim=2)
+        chunk_scores = chunk_scores * kv_scales
+
+        valid_mask = positions[:, seq_start : seq_start + chunk_seq] < seq_lens_col
+        chunk_scores = chunk_scores.masked_fill(~valid_mask, 0.0)
+
+        # Only the last chunk can run past max_seq_len, since the padded span is
+        # a whole number of pages; every earlier chunk copies in full.
+        out_width = min(seq_start + chunk_seq, max_seq_len) - seq_start
+        scores[:, seq_start : seq_start + out_width] = chunk_scores[:, :out_width]
 
     return scores
 
@@ -168,17 +214,6 @@ def _aiter_fp8_paged_mqa_logits(
         Preshuffle=aiter_can_use_preshuffle_paged_mqa(),
     )
     return logits
-
-
-def _indexer_logits_chunk_pages(block_size: int, max_pages: int) -> int:
-    """Sequence-axis chunk width in KV pages for the torch paged MQA logits path."""
-    chunk_positions = envs.SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK.get()
-    chunk_pages = max_pages
-    if chunk_positions and chunk_positions > 0:
-        # Round down to whole pages so a chunk never straddles a page boundary,
-        # but never below a single page.
-        chunk_pages = min(max_pages, max(1, int(chunk_positions) // block_size))
-    return max(1, chunk_pages)
 
 
 def fp8_paged_mqa_logits_torch_sm120(
