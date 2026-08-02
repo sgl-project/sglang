@@ -50,9 +50,10 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
+from torch.distributed import barrier
+
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
-from torch.distributed import barrier
 
 try:
     from sglang.kernels.ops.mamba.triton_ops import (

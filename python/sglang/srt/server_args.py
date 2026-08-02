@@ -8438,7 +8438,9 @@ class ServerArgs:
         if not hasattr(self, "_mamba_cache_chunk_size"):
 
             try:
-                from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+                from sglang.kernels.ops.attention.fla.chunk_delta_h import (
+                    CHUNK_SIZE as FLA_CHUNK_SIZE,
+                )
             except ImportError:
                 # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE
                 FLA_CHUNK_SIZE = 64

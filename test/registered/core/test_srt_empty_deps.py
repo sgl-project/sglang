@@ -6,7 +6,6 @@ This prevents accidental introduction of packages that transitively pull
 torch/triton into the srt_empty install target.
 """
 
-import sys
 from pathlib import Path
 
 import pytest
@@ -53,7 +52,15 @@ def _parse_runtime_base() -> set:
     pkg_names = set()
     for dep in runtime_base:
         # "package[extra]>=1.0,<2.0" -> "package"
-        name = dep.split("[")[0].split(">")[0].split("<")[0].split("=")[0].split("!")[0].split(";")[0].strip()
+        name = (
+            dep.split("[")[0]
+            .split(">")[0]
+            .split("<")[0]
+            .split("=")[0]
+            .split("!")[0]
+            .split(";")[0]
+            .strip()
+        )
         pkg_names.add(name.lower())
 
     return pkg_names
@@ -76,3 +83,9 @@ def test_runtime_base_not_empty():
         f"runtime_base only has {len(pkg_names)} packages, expected >= 20. "
         f"Did the toml structure change?"
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
