@@ -3023,26 +3023,35 @@ class DeepseekV4ForCausalLM(nn.Module):
                             ) and not self.pp_group.is_last_rank:
                                 continue
                             elif COMPRESSOR_PART in name:
-                                is_kv = name.endswith(".wkv.weight")
-                                is_wgate = name.endswith(".wgate.weight")
-                                assert is_kv != is_wgate
-                                key = name.rsplit(".", 2)[0]
+                                classified = _classify_fused_shard(
+                                    name, _COMPRESSOR_SHARD_IDS
+                                )
+                                if classified is None:
+                                    raise ValueError(
+                                        f"Unexpected compressor tensor '{name}': "
+                                        f"expected one of "
+                                        f"{sorted(_COMPRESSOR_SHARD_IDS)} as the "
+                                        f"module name segment."
+                                    )
+                                shard_id, key, leaf = classified
+                                if leaf not in _COMPRESSOR_FUSABLE_LEAVES:
+                                    _reject_unfusable_leaf(
+                                        name,
+                                        leaf,
+                                        _COMPRESSOR_FUSABLE_LEAVES,
+                                        "The compressor wkv+wgate fusion supports "
+                                        "dense checkpoints only.",
+                                    )
                                 assert key.endswith(".compressor")
-                                if key not in cache_compressor_weight:
-                                    cache_compressor_weight[key] = (
-                                        is_kv,
-                                        _clone_if_runai_streamed_tensor(loaded_weight),
-                                    )
-                                else:
-                                    assert key in cache_compressor_weight
-                                    cached_is_kv, cached_weight = (
-                                        cache_compressor_weight[key]
-                                    )
-                                    assert cached_is_kv != is_kv
-                                    kv = loaded_weight if is_kv else cached_weight
-                                    wgate = loaded_weight if is_wgate else cached_weight
-                                    fused_weight = torch.cat([kv, wgate], dim=0)
-                                    param_name = key + ".wkv_gate.weight"
+                                param_name = f"{key}.wkv_gate.{leaf}"
+                                fused_weight = _pop_fused_weight(
+                                    cache_compressor_weight,
+                                    param_name,
+                                    shard_id,
+                                    loaded_weight,
+                                    _COMPRESSOR_SHARD_ORDER,
+                                )
+                                if fused_weight is not None:
                                     param = params_dict[param_name]
                                     weight_loader = auto_weight_loader(param)
                                     maybe_executor_submit(
@@ -3053,29 +3062,30 @@ class DeepseekV4ForCausalLM(nn.Module):
                                         func_args=(param, fused_weight),
                                     )
                                     loaded_params.add(param_name)
-                                    cache_compressor_weight.pop(key)
                             elif fuse_wqa_wkv and (
-                                name.endswith(".wq_a.weight")
-                                or name.endswith(".wq_a.weight_scale_inv")
-                                or name.endswith(".wkv.weight")
-                                or name.endswith(".wkv.weight_scale_inv")
+                                classified := _classify_fused_shard(
+                                    name, _WQKV_A_SHARD_IDS
+                                )
                             ):
-                                is_q = ".wq_a." in name
-                                param_name = name.replace(
-                                    ".wq_a." if is_q else ".wkv.", ".wqkv_a."
-                                )
-                                bucket = cache_wqkv_a_weight.setdefault(param_name, {})
-                                shard_key = "q" if is_q else "kv"
-                                assert (
-                                    shard_key not in bucket
-                                ), f"duplicate shard {shard_key} for {param_name}"
-                                bucket[shard_key] = _clone_if_runai_streamed_tensor(
-                                    loaded_weight
-                                )
-                                if len(bucket) == 2:
-                                    fused_weight = torch.cat(
-                                        [bucket["q"], bucket["kv"]], dim=0
+                                shard_id, parent, leaf = classified
+                                if leaf not in _WQKV_A_FUSABLE_LEAVES:
+                                    _reject_unfusable_leaf(
+                                        name,
+                                        leaf,
+                                        _WQKV_A_FUSABLE_LEAVES,
+                                        "Set SGLANG_OPT_FUSE_WQA_WKV=0 to load this "
+                                        "checkpoint with separate wq_a and wkv "
+                                        "projections.",
                                     )
+                                param_name = f"{parent}.wqkv_a.{leaf}"
+                                fused_weight = _pop_fused_weight(
+                                    cache_wqkv_a_weight,
+                                    param_name,
+                                    shard_id,
+                                    loaded_weight,
+                                    _WQKV_A_SHARD_ORDER,
+                                )
+                                if fused_weight is not None:
                                     param = params_dict[param_name]
                                     weight_loader = auto_weight_loader(param)
                                     maybe_executor_submit(
@@ -3086,7 +3096,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                                         func_args=(param, fused_weight),
                                     )
                                     loaded_params.add(param_name)
-                                    cache_wqkv_a_weight.pop(param_name)
                             else:
                                 if (
                                     "k_scale" in name or "v_scale" in name
@@ -3178,6 +3187,76 @@ class DeepseekV4ForCausalLM(nn.Module):
 
 
 EntryClass = [DeepseekV4ForCausalLM]
+
+
+# Shard id per module name segment for the projection pairs that are fused at
+# load time. Keyed by the segment (`...<segment>.<leaf>`), never by the leaf, so
+# that an unknown checkpoint layout is reported instead of falling through to
+# the generic loader path and being dropped as "not found in params_dict".
+_WQKV_A_SHARD_IDS = {"wq_a": "q", "wkv": "kv"}
+_WQKV_A_SHARD_ORDER = ("q", "kv")
+_COMPRESSOR_SHARD_IDS = {"wkv": "kv", "wgate": "wgate"}
+_COMPRESSOR_SHARD_ORDER = ("kv", "wgate")
+
+# Checkpoint leaves the fusions below can join. Both fusions concatenate on
+# dim 0, which is the output axis only for the dense `[output, input]` layout
+# and its block scale. Packed layouts (`.qweight`/`.qzeros`/`.scales`) are laid
+# out `[input, output]` with per-format packing and group-quantization
+# geometry, so their join axis differs and is not handled here.
+_WQKV_A_FUSABLE_LEAVES = frozenset({"weight", "weight_scale_inv"})
+_COMPRESSOR_FUSABLE_LEAVES = frozenset({"weight"})
+
+
+def _classify_fused_shard(
+    name: str, shard_ids: dict[str, str]
+) -> Optional[Tuple[str, str, str]]:
+    """Classify a checkpoint tensor by its module name segment.
+
+    Returns ``(shard_id, parent_prefix, leaf)`` for ``<parent>.<segment>.<leaf>``
+    when ``segment`` is one of ``shard_ids``, otherwise ``None``.
+    """
+    module_name, sep, leaf = name.rpartition(".")
+    if not sep:
+        return None
+    parent, sep, segment = module_name.rpartition(".")
+    if not sep:
+        return None
+    shard_id = shard_ids.get(segment)
+    if shard_id is None:
+        return None
+    return shard_id, parent, leaf
+
+
+def _reject_unfusable_leaf(
+    name: str, leaf: str, fusable_leaves: frozenset, hint: str
+) -> None:
+    raise ValueError(
+        f"Cannot fuse checkpoint tensor '{name}': the '{leaf}' leaf indicates a "
+        f"weight layout this fusion does not handle (supported leaves: "
+        f"{sorted(fusable_leaves)}). The fusion concatenates on dim 0, which is "
+        f"the output axis of the dense layout only. {hint}"
+    )
+
+
+def _pop_fused_weight(
+    cache: dict,
+    param_name: str,
+    shard_id: str,
+    loaded_weight: torch.Tensor,
+    shard_order: Tuple[str, ...],
+) -> Optional[torch.Tensor]:
+    """Buffer one shard of a fused parameter.
+
+    Returns the concatenated weight once every shard in ``shard_order`` has been
+    seen, otherwise ``None``.
+    """
+    bucket = cache.setdefault(param_name, {})
+    assert shard_id not in bucket, f"duplicate shard {shard_id} for {param_name}"
+    bucket[shard_id] = _clone_if_runai_streamed_tensor(loaded_weight)
+    if len(bucket) < len(shard_order):
+        return None
+    del cache[param_name]
+    return torch.cat([bucket[shard] for shard in shard_order], dim=0)
 
 
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
