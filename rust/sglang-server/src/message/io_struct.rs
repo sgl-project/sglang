@@ -29,9 +29,10 @@ wire_struct! {
         stream: bool,
         /// Not exposed by this server yet; the scheduler needs the slot filled.
         return_sampling_mask: bool,
+        return_flat_raw_top_logprobs: bool,
         return_hidden_states: bool,
         /// Filler block (not exposed by this server yet): default/nil slots so
-        /// the PD fields below land on their Python wire indices (24–30).
+        /// the PD fields below land on their Python wire indices (25–31).
         return_routed_experts: bool,
         routed_experts_start_len: i64,
         return_indexer_topk: bool,
@@ -94,6 +95,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             token_ids_logprob: req.token_ids_logprob.as_ref(),
             stream: req.stream,
             return_sampling_mask: req.return_sampling_mask,
+            return_flat_raw_top_logprobs: false,
             return_hidden_states: req.return_hidden_states,
             return_routed_experts: false,
             routed_experts_start_len: 0,
@@ -176,9 +178,9 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 31 (through
+        // msgspec requires >= 14 (through `stream`); we emit 32 (through
         // `disagg_prefill_dp_rank`). Trailing defaulted fields are omitted.
-        assert_eq!(arr.len(), 31, "header ends at disagg_prefill_dp_rank");
+        assert_eq!(arr.len(), 32, "header ends at disagg_prefill_dp_rank");
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
@@ -198,13 +200,18 @@ mod tests {
         );
         assert_eq!(
             arr[15].as_bool(),
+            Some(false),
+            "return_flat_raw_top_logprobs at idx 15"
+        );
+        assert_eq!(
+            arr[16].as_bool(),
             Some(true),
-            "return_hidden_states at idx 15"
+            "return_hidden_states at idx 16"
         );
     }
 
-    /// The PD block must land on Python's wire indices 24–30, with the filler
-    /// block (16–23) holding its defaults — a shift here silently routes KV
+    /// The PD block must land on Python's wire indices 25–31, with the filler
+    /// block (17–24) holding its defaults — a shift here silently routes KV
     /// transfers to the wrong host/room.
     #[test]
     fn header_bootstrap_block_is_positionally_aligned() {
@@ -223,18 +230,18 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        assert_eq!(arr[16].as_bool(), Some(false), "return_routed_experts");
-        assert_eq!(arr[17].as_u64(), Some(0), "routed_experts_start_len");
-        assert_eq!(arr[18].as_bool(), Some(false), "return_indexer_topk");
-        for (i, slot) in arr.iter().enumerate().take(24).skip(19) {
+        assert_eq!(arr[17].as_bool(), Some(false), "return_routed_experts");
+        assert_eq!(arr[18].as_u64(), Some(0), "routed_experts_start_len");
+        assert_eq!(arr[19].as_bool(), Some(false), "return_indexer_topk");
+        for (i, slot) in arr.iter().enumerate().take(25).skip(20) {
             assert!(slot.is_nil(), "idx {i} must be a nil default");
         }
-        assert_eq!(arr[24].as_str(), Some("10.0.0.1"), "bootstrap_host at 24");
-        assert_eq!(arr[25].as_u64(), Some(8998), "bootstrap_port at 25");
-        assert_eq!(arr[26].as_i64(), Some(i64::MAX), "bootstrap_room at 26");
-        assert_eq!(arr[27].as_str(), Some("pk"), "bootstrap_pair_key at 27");
-        assert_eq!(arr[28].as_i64(), Some(2), "decode_tp_size at 28");
-        assert_eq!(arr[29].as_i64(), Some(3), "routed_dp_rank at 29");
-        assert_eq!(arr[30].as_i64(), Some(4), "disagg_prefill_dp_rank at 30");
+        assert_eq!(arr[25].as_str(), Some("10.0.0.1"), "bootstrap_host at 25");
+        assert_eq!(arr[26].as_u64(), Some(8998), "bootstrap_port at 26");
+        assert_eq!(arr[27].as_i64(), Some(i64::MAX), "bootstrap_room at 27");
+        assert_eq!(arr[28].as_str(), Some("pk"), "bootstrap_pair_key at 28");
+        assert_eq!(arr[29].as_i64(), Some(2), "decode_tp_size at 29");
+        assert_eq!(arr[30].as_i64(), Some(3), "routed_dp_rank at 30");
+        assert_eq!(arr[31].as_i64(), Some(4), "disagg_prefill_dp_rank at 31");
     }
 }
