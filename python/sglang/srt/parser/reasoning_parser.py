@@ -1424,6 +1424,20 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
         self._saw_text_start = False
         self._saw_text_end = False
         self._in_action_mode = False
+        self._resolved_think_start_echo = False
+
+    def _consume_echoed_think_start(self, buf: str) -> Optional[str]:
+        """Drop a ``<|START_THINKING|>`` echoed at the very start of the stream,
+        mirroring detect_and_parse. Returns None while ``buf`` is only a partial
+        token and more text is needed to decide."""
+        token = self.think_start_token + self.think_start_self_label
+        if buf.startswith(token):
+            self._resolved_think_start_echo = True
+            return buf[len(token) :]
+        if token.startswith(buf):
+            return None
+        self._resolved_think_start_echo = True
+        return buf
 
     @classmethod
     def _strip_text_markers(cls, raw: str) -> str:
@@ -1505,6 +1519,14 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
         ``force_reasoning`` semantics."""
         self._buffer += new_text
         buf = self._buffer
+
+        # Some checkpoints echo the START_THINKING token even though the chat
+        # template put it in the prefix; drop it as detect_and_parse does.
+        if not self._resolved_think_start_echo:
+            stripped = self._consume_echoed_think_start(buf)
+            if stripped is None:
+                return StreamingParseResult()
+            buf = self._buffer = stripped
 
         if not self._reasoning_done:
             # Look for any marker that ends reasoning: an explicit
@@ -1609,6 +1631,10 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
             )
         elif self._saw_text_start and not self._saw_text_end:
             ret = StreamingParseResult(normal_text=buffer)
+        elif not self._saw_text_start:
+            # Reasoning closed in the final increment, which returns early after
+            # emitting the trace, so the whole text/action block is still buffered.
+            ret = StreamingParseResult(normal_text=self._strip_text_markers(buffer))
         else:
             return StreamingParseResult()
         return self._maybe_apply_force_nonempty_content(ret)
