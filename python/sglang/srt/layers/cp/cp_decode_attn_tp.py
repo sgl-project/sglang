@@ -15,7 +15,7 @@ import torch
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ class CpDecodeAttnTpContext:
     """Slices replicated attention weights across CP ranks during decode."""
 
     def __init__(self):
-        enable_attn_tp = get_server_args().enable_cp_decode_attn_tp
+        enable_attn_tp = get_parallel().enable_cp_decode_attn_tp
 
         if enable_attn_tp and get_parallel().attn_cp_size > 1:
             self.decode_tp_rank = get_parallel().attn_cp_rank

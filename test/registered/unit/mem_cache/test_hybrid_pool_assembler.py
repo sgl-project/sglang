@@ -26,6 +26,14 @@ class TestSplitHicacheSize(CustomTestCase):
         self.assertEqual(shares, (75.0, 25.0))  # proportional to device KV bytes
         self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
 
+    def test_splits_total_budget_by_device_bytes_three_pools(self):
+        # scalar and (k, v) tuple return shapes both supported
+        shares = _split_hicache_size(
+            100, (_Pool(55 * 10**9), _Pool((15 * 10**9, 10 * 10**9)), _Pool(20 * 10**9))
+        )
+        self.assertEqual(shares, (55.0, 25.0, 20.0))  # proportional to device KV bytes
+        self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
+from sglang.srt.runtime_context import get_exec, get_flags, get_forward, get_parallel
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
@@ -239,8 +239,8 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
 
     # 0. Parse server argument.
     server_args = get_server_args()
-    if server_args and server_args.deepep_dispatcher_output_dtype != "auto":
-        return DispatcherOutputDtype(server_args.deepep_dispatcher_output_dtype)
+    if server_args and get_exec().moe.deepep_dispatcher_output_dtype != "auto":
+        return DispatcherOutputDtype(get_exec().moe.deepep_dispatcher_output_dtype)
 
     # 1. Parse deprecated environment variables.
     if envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
@@ -506,7 +506,7 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     """
     if should_skip_mlp_all_reduce():
         return True
-    if get_server_args().dwdp_size > 1:
+    if get_parallel().dwdp_size > 1:
         return True
     if should_use_dp_reduce_scatterv():
         return True

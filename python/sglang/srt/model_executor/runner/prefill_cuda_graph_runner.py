@@ -50,6 +50,7 @@ import tqdm
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
+from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
@@ -102,7 +103,7 @@ from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -236,6 +237,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     buffer population, attention metadata init, and output slicing.
     """
 
+    # DSA forces use_mha=False in BCG capture/replay, so the sparse path
+    # serves any prefix and the MHA-prefix ban does not apply. Class
+    # default keeps __new__-built test instances on the ban.
+    dsa_sparse_prefill_forced: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         # --- model flags ----------------------------------------------
@@ -271,16 +277,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.prefill_backend_name == Backend.BREAKABLE
             and model_runner.spec_algorithm.is_eagle()
         )
-        needs_full_hidden_states = (
-            model_runner.server_args.enable_return_hidden_states
-            or model_runner.spec_algorithm.is_dflash_family()
-        )
         if is_breakable_eagle and model_runner.is_draft_worker:
             self.capture_hidden_mode = CaptureHiddenMode.LAST
-        elif is_breakable_eagle or needs_full_hidden_states:
+        elif is_breakable_eagle or model_runner.spec_algorithm.is_dflash_family():
             self.capture_hidden_mode = CaptureHiddenMode.FULL
         else:
-            self.capture_hidden_mode = CaptureHiddenMode.NULL
+            self.capture_hidden_mode = self.return_hidden_states_mode
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
@@ -316,6 +318,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             source=self.buffers,
         )
 
+        self.dsa_sparse_prefill_forced = is_deepseek_dsa(
+            self.model_runner.model_config.hf_config
+        )
+
         self.attention_layers = self.model_runner.attention_layers
         self.mha_companion_layers = self.model_runner.mha_companion_layers
         self.has_mha_companion_layers = any(
@@ -325,7 +331,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
 
-        self.dp_size = model_runner.server_args.dp_size
+        self.dp_size = get_parallel().dp_size
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
 
@@ -393,8 +399,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # This flag controls whether the model dispatches through the distinct
         # chunked-prefix topology; backend capability is validated separately.
         self._capture_chunked_prefix = (
-            self._is_full_backend
-            and not model_runner.server_args.disable_chunked_prefix_cache
+            self._is_full_backend and not get_schedule().disable_chunked_prefix_cache
         )
         self._prefix_chunk_len = 0
         self._prefix_chunk_capacity = 0
@@ -986,14 +991,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch=static_forward_batch,
         )
 
-    def _has_unsupported_mha_prefix(self, forward_batch: ForwardBatch) -> bool:
-        return (
-            self.prefill_backend_name == Backend.BREAKABLE
-            and self.has_mha_companion_layers
-            and forward_batch.extend_prefix_lens_cpu is not None
-            and any(forward_batch.extend_prefix_lens_cpu)
-        )
-
     @staticmethod
     def _restore_mha_capture_state(forward_batch: ForwardBatch) -> None:
         """Restore Python state omitted from breakable graph segments."""
@@ -1001,59 +998,113 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.mha_return_lse = False
         forward_batch.set_attn_attend_prefix_cache(False)
 
-    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
+    def can_replay_locally(
+        self,
+        *,
+        batch_size: int,
+        num_tokens: Optional[int],
+        input_embeds,
+        replace_embeds,
+        prefix_lens,
+        is_target_verify: bool,
+        capture_hidden_mode,
+        return_logprob: bool,
+        lora_ineligible: bool = False,
+        chunked_prefix_uncapturable: bool = False,
+    ) -> bool:
+        """Rank-local replay eligibility: the single source of truth for
+        ``can_run_graph`` (ForwardBatch, forward time) and the dp mlp-sync
+        vote (ScheduleBatch, schedule time) — all dp ranks must reach the
+        same replay-vs-eager decision or their collectives mismatch. Pass
+        ``capture_hidden_mode=None`` when unknown at the call site (it is
+        rank-uniform; forward-time-only checking cannot split the group).
+        """
+        if self._is_full_backend and batch_size > self._capture_req_slots:
             return False
-        # LoRA batches may only replay the graph when prepare_lora_batch put
-        # their metadata in the static buffers (same predicate); keyed off
-        # enable_lora, not lora_ids, which is non-None even without LoRA.
-        if self.enable_lora and not (
-            self._capture_lora
-            and self.model_runner.lora_manager.can_use_prefill_cuda_graph(forward_batch)
+        # LoRA replays need prepare_lora_batch's static metadata. lora_manager
+        # keeps LoRA prefill eager on every rank under dp attention, so the
+        # schedule-time vote derives this from enable_lora alone.
+        if lora_ineligible:
+            return False
+        if input_embeds is not None:
+            return False
+        if replace_embeds is not None:
+            return False
+        # A prefix forces the MHA companion path, whose captured state is
+        # frozen prefix-free; DSA models are exempt (capture/replay force
+        # the sparse path, which takes any prefix via device metadata).
+        if (
+            self.prefill_backend_name == Backend.BREAKABLE
+            and self.has_mha_companion_layers
+            and not self.dsa_sparse_prefill_forced
+            and prefix_lens is not None
+            and any(prefix_lens)
         ):
             return False
-        if forward_batch.input_embeds is not None:
-            return False
-        if forward_batch.replace_embeds is not None:
-            return False
-        if self._has_unsupported_mha_prefix(forward_batch):
+        # FullCG's chunked-prefix topology covers a bounded prefix. The flag
+        # gating it is FULL-backend-only, so this is inert for the breakable
+        # vote path.
+        if chunked_prefix_uncapturable:
             return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
-        if forward_batch.forward_mode.is_target_verify():
+        if is_target_verify:
             return False
-        if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
+        if (
+            capture_hidden_mode is not None
+            and self.capture_hidden_mode < capture_hidden_mode
+        ):
             return False
-        # BCG-with-captured-metadata under DP attention: every rank must
-        # have local tokens, and the batch must declare itself replayable.
-        # These gates are no-ops for non-DP / non-opt-in paths because
-        # global_num_tokens_cpu stays None.
-        if self._has_inactive_dp_rank(forward_batch):
+        if return_logprob and not self._uses_eager_prefill_tail():
             return False
+        if num_tokens is None:
+            return True
+        if num_tokens > self.max_num_tokens:
+            return False
+        # No exact-shape check: load_batch bucket-pads; only reject
+        # disproportionate padding waste.
+        padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
+            return False
+        return True
+
+    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        # DP check: group verdict from the schedule-time all-gather
+        # (min-reduced votes; also requires every rank to hold tokens).
         if (
             forward_batch.global_num_tokens_cpu is not None
             and not forward_batch.can_run_dp_breakable_cuda_graph
         ):
             return False
-        num_tokens = len(forward_batch.input_ids)
-        if forward_batch.return_logprob and not self._uses_eager_prefill_tail():
+
+        # Every dp rank must hold tokens this forward (reads the synced
+        # table post dp-padding; idle ranks vote permissively upstream).
+        if self._has_inactive_dp_rank(forward_batch):
             return False
-        if num_tokens > self.max_num_tokens:
-            return False
-        padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
-        if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
-            return False
-        # Other backends and non-MLA FullCG keep using their normal graph with
-        # replay-refreshed metadata; only this extra topology has a prefix cap.
-        if (
-            self._capture_chunked_prefix
-            and self._has_prefix_hit(forward_batch)
-            and self._select_prefix_capture_chunks(forward_batch) is None
+
+        # Non-DP local check (sole decision for tp-only).
+        if not self.can_replay_locally(
+            batch_size=forward_batch.batch_size,
+            num_tokens=len(forward_batch.input_ids),
+            input_embeds=forward_batch.input_embeds,
+            replace_embeds=forward_batch.replace_embeds,
+            prefix_lens=forward_batch.extend_prefix_lens_cpu,
+            is_target_verify=forward_batch.forward_mode.is_target_verify(),
+            capture_hidden_mode=forward_batch.capture_hidden_mode,
+            return_logprob=forward_batch.return_logprob,
+            lora_ineligible=self.enable_lora
+            and not (
+                self._capture_lora
+                and self.model_runner.lora_manager.can_use_prefill_cuda_graph(
+                    forward_batch
+                )
+            ),
+            chunked_prefix_uncapturable=(
+                self._capture_chunked_prefix
+                and self._has_prefix_hit(forward_batch)
+                and self._select_prefix_capture_chunks(forward_batch) is None
+            ),
         ):
             return False
-        # load_batch bucket-pads to the nearest captured shape. The factor
-        # above rejects replays whose padded model work is disproportionate
-        # to the useful token count.
-        #
         # Multi-req replay is supported by body-capture backends via the
         # layer_model.forward monkey-patch in replay(): the captured graph runs
         # the transformer stack, then the outer model.forward runs
@@ -1596,9 +1647,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             "PPProxyTensors is not supported in PrefillCudaGraphRunner yet."
         )
 
+    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
+        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
+            raise RuntimeError(
+                "The runtime hidden-state mode exceeds the fixed CUDA graph "
+                f"capture mode ({self.capture_hidden_mode.name})."
+            )
+
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        self._validate_capture_hidden_mode(forward_batch)
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
