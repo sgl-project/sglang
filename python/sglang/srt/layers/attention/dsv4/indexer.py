@@ -817,6 +817,18 @@ class C4IndexerBackendMixin:
             ):
                 # Ampere needs the same CUDA-graph-safe variant (no .item())
                 fn = fp8_paged_mqa_logits_torch_sm120
+                if q_indexer.shape[0] >= 128:
+                    # Prefill-sized calls take the fused Triton kernel: same
+                    # operator, but the [B, S, num_heads] intermediate is never
+                    # materialised. Decode stays on the torch variant — those
+                    # calls run under CUDA graph capture, where Triton
+                    # autotuning cannot, and their batches are too small for
+                    # the fusion to matter.
+                    from sglang.kernels.ops.attention.dsv4.fused_paged_indexer import (
+                        fused_paged_mqa_logits,
+                    )
+
+                    fn = fused_paged_mqa_logits
             else:
                 fn = fp8_paged_mqa_logits_torch
         elif is_xpu():
