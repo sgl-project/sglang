@@ -6,6 +6,7 @@ import torch
 
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
@@ -44,6 +45,21 @@ def forward_native_hf_reference(
     return out, residual_out
 
 
+def forward_scaled_reference(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    input_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scaled = (x.float() * input_scale).to(x.dtype)
+    residual_out = (residual.float() + scaled.float()).to(x.dtype)
+    residual_fp32 = residual_out.float()
+    variance = residual_fp32.pow(2).mean(-1, keepdim=True)
+    out = (residual_fp32 * torch.rsqrt(variance + eps) * weight.float()).to(x.dtype)
+    return out, residual_out
+
+
 BS_LIST = [2**n for n in range(0, 14)]
 BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]
 BS_LIST = get_ci_test_range(BS_LIST, [1, 9, 256, 4109])
@@ -54,6 +70,7 @@ HIDDEN_SIZE_LIST = get_ci_test_range(
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 EPS = torch.finfo(torch.bfloat16).eps
+SCALED_EPS = 1e-5
 
 
 @pytest.mark.parametrize(
@@ -90,6 +107,81 @@ def test_fused_add_rmsnorm(
 
     torch.testing.assert_close(input_sglang, out_ref, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(residual_sglang, residual_ref, atol=1e-2, rtol=1e-2)
+
+
+class TestFusedScaledAddRMSNorm(CustomTestCase):
+    def test_rejects_overlapping_buffers(self) -> None:
+        from sglang.jit_kernel.norm import fused_scaled_add_rmsnorm
+
+        input = torch.randn(1, 512, device=DEVICE, dtype=DTYPE)
+        residual = input.view_as(input)
+        weight = torch.randn(512, device=DEVICE, dtype=DTYPE)
+
+        with self.assertRaisesRegex(ValueError, "non-overlapping"):
+            fused_scaled_add_rmsnorm(
+                input, residual, weight, SCALED_EPS, input_scale=0.22
+            )
+
+    def test_correctness(self) -> None:
+        from sglang.jit_kernel.norm import fused_scaled_add_rmsnorm
+
+        input_scale = 0.22
+        for dtype, batch_size, hidden_size in itertools.product(
+            (torch.float16, torch.bfloat16),
+            (1, 9, 256),
+            (512, 1536, 8192),
+        ):
+            with self.subTest(
+                dtype=dtype, batch_size=batch_size, hidden_size=hidden_size
+            ):
+                torch.manual_seed(0)
+                input = torch.randn(batch_size, hidden_size, device=DEVICE, dtype=dtype)
+                residual = torch.randn_like(input)
+                weight = torch.randn(hidden_size, device=DEVICE, dtype=dtype)
+                expected_input, expected_residual = forward_scaled_reference(
+                    input, residual, weight, SCALED_EPS, input_scale
+                )
+
+                fused_scaled_add_rmsnorm(
+                    input, residual, weight, SCALED_EPS, input_scale
+                )
+
+                torch.testing.assert_close(input, expected_input, atol=1e-2, rtol=1e-2)
+                torch.testing.assert_close(residual, expected_residual, atol=0, rtol=0)
+
+    def test_torch_compile_fullgraph(self) -> None:
+        from sglang.jit_kernel.norm import fused_scaled_add_rmsnorm
+
+        captured_graphs = []
+
+        def backend(graph_module, _example_inputs):
+            captured_graphs.append(graph_module)
+            return graph_module.forward
+
+        def fn(input, residual, weight):
+            fused_scaled_add_rmsnorm(input, residual, weight, SCALED_EPS, 0.22)
+            return input, residual
+
+        torch.manual_seed(0)
+        input = torch.randn(1, 1536, device=DEVICE, dtype=DTYPE)
+        residual = torch.randn_like(input)
+        weight = torch.randn(1536, device=DEVICE, dtype=DTYPE)
+        expected_input, expected_residual = forward_scaled_reference(
+            input, residual, weight, SCALED_EPS, 0.22
+        )
+
+        compiled = torch.compile(fn, backend=backend, fullgraph=True)
+        actual_input, actual_residual = compiled(input, residual, weight)
+
+        torch.testing.assert_close(actual_input, expected_input, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(actual_residual, expected_residual, atol=0, rtol=0)
+        self.assertEqual(len(captured_graphs), 1)
+        self.assertTrue(
+            any(
+                node.target == torch.ops.sglang.fused_scaled_add_rmsnorm
+                for node in captured_graphs[0].graph.nodes
+            )
+        )
 
 
 if __name__ == "__main__":
