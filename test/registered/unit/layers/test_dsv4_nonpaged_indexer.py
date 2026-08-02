@@ -6,7 +6,11 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsv4.indexer import FP8_DTYPE, C4IndexerBackendMixin
+from sglang.srt.layers.attention.dsv4.indexer import (
+    FP8_DTYPE,
+    C4IndexerBackendMixin,
+    topk_transform_512_flashinfer,
+)
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
@@ -67,6 +71,76 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
             )
 
         self.assertIsNone(metadata.deep_gemm_metadata)
+
+    def test_non_sgl_backend_skips_topk_v2_plan(self):
+        with (
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
+            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
+            envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+            patch("sglang.kernels.ops.attention.dsv4.plan_topk_v2") as plan_topk_v2,
+        ):
+            metadata = PagedIndexerMetadata(
+                page_size=256,
+                page_table=torch.zeros((1, 1), dtype=torch.int32),
+                c4_seq_lens=torch.tensor([65], dtype=torch.int32),
+                enable_topk_v2=False,
+            )
+
+        plan_topk_v2.assert_not_called()
+        self.assertEqual(metadata.topk_metadata.numel(), 0)
+
+
+class TestDSV4FlashInferTopK(CustomTestCase):
+    def test_compact_page_transform_uses_fused_flashinfer_api(self):
+        score_storage = torch.empty((2, 80), dtype=torch.float32)
+        scores = score_storage[:, 1:65]
+        self.assertFalse(scores.is_contiguous())
+
+        seq_lens = torch.tensor([63, 64], dtype=torch.int32)
+        page_tables = torch.tensor([[7], [11]], dtype=torch.int32)
+        out_page_indices = torch.empty((2, 8), dtype=torch.int32)
+
+        for with_raw_output in (False, True):
+            with self.subTest(with_raw_output=with_raw_output):
+                out_raw_indices = (
+                    torch.empty_like(out_page_indices) if with_raw_output else None
+                )
+                top_k_page_table_transform = MagicMock()
+                flashinfer = SimpleNamespace(
+                    top_k_page_table_transform=top_k_page_table_transform
+                )
+
+                with (
+                    patch.dict(sys.modules, {"flashinfer": flashinfer}),
+                    envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.override(True),
+                    envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("small"),
+                ):
+                    topk_transform_512_flashinfer(
+                        scores,
+                        seq_lens,
+                        page_tables,
+                        out_page_indices,
+                        page_size=64,
+                        out_raw_indices=out_raw_indices,
+                    )
+
+                top_k_page_table_transform.assert_called_once()
+                call = top_k_page_table_transform.call_args
+                self.assertIs(call.args[0], scores)
+                self.assertIs(call.args[1], page_tables)
+                self.assertIs(call.args[2], seq_lens)
+                self.assertEqual(call.args[3], out_page_indices.shape[1])
+                self.assertEqual(
+                    call.kwargs,
+                    {
+                        "deterministic": True,
+                        "tie_break": 1,
+                        "dsa_graph_safe": True,
+                        "page_size": 64,
+                        "out": out_page_indices,
+                        "out_raw_indices": out_raw_indices,
+                    },
+                )
 
 
 class TestDSV4NonPagedIndexer(CustomTestCase):
