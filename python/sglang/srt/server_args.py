@@ -4494,10 +4494,10 @@ class ServerArgs:
                 "two-batch overlap",
                 lambda: self.enable_two_batch_overlap,
             ),
-            # Only DeepEP's a2a is validated under BCG.
             (
-                "non-DeepEP a2a backend",
-                lambda: resolved_view(self).moe_a2a_backend not in ("none", "deepep"),
+                "unvalidated a2a backend",
+                lambda: resolved_view(self).moe_a2a_backend
+                not in ("none", "deepep", "megamoe", "flashinfer"),
             ),
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
