@@ -6696,11 +6696,19 @@ class ServerArgs:
                     self.moe_runner_backend,
                     self.deepep_v2_dispatcher_output_dtype,
                 )
-            if self.moe_runner_backend not in ["deep_gemm", "triton"]:
+            # Validate the FINAL resolved runner, not the raw field. A model
+            # declaration (e.g. mxfp8 + auto -> flashinfer_trtllm) is
+            # materialized after this handler, so self.moe_runner_backend set
+            # above is not necessarily what the runtime will use. resolved_view
+            # reflects those pending declarations: validate and drive the graph
+            # decision off it, so an unsupported resolved runner fails fast here
+            # instead of being silently restored at materialize time.
+            resolved_runner = resolved_view(self).moe_runner_backend
+            if resolved_runner not in ["deep_gemm", "triton"]:
                 raise ValueError(
                     "DeepEP v2 MoE currently supports only "
                     "--moe-runner-backend deep_gemm or triton. "
-                    f"Got {self.moe_runner_backend!r}. Add a runner adapter before "
+                    f"Got {resolved_runner!r}. Add a runner adapter before "
                     "enabling DeepEP v2 with other MoE runners."
                 )
             if self.enable_two_batch_overlap or self.enable_single_batch_overlap:
@@ -6756,11 +6764,9 @@ class ServerArgs:
             # decode graph is disabled there (the prefill graph is always disabled).
             deepep_v2_fp8 = self.deepep_v2_dispatcher_output_dtype == "fp8" or (
                 self.deepep_v2_dispatcher_output_dtype == "auto"
-                and self.moe_runner_backend == "deep_gemm"
+                and resolved_runner == "deep_gemm"
             )
-            deepep_v2_graph_ok = (
-                self.moe_runner_backend == "deep_gemm" and deepep_v2_fp8
-            )
+            deepep_v2_graph_ok = resolved_runner == "deep_gemm" and deepep_v2_fp8
             if not deepep_v2_graph_ok:
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
