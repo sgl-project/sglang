@@ -69,11 +69,100 @@ class SWAComponent(TreeComponent):
             params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         ), f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(params.token_to_kv_pool_allocator)}"
         super().__init__(cache, params)
+        self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         self.sliding_window_size = params.sliding_window_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
 
     component_type = ComponentType.SWA
+
+    def reset_session_state(self) -> None:
+        super().reset_session_state()
+        self._session_leaf_covered_len = {}
+
+    def _walk_session_coverage(
+        self,
+        leaf: UnifiedTreeNode,
+        span: int,
+        delta: int,
+    ) -> int:
+        node = leaf
+        covered = 0
+        while node is not self.tree_core.root_node and covered < span:
+            cd = node.component_data[self.component_type]
+            if delta < 0:
+                assert cd.session_ref > 0
+            prev_ref = cd.session_ref
+            cd.session_ref += delta
+            if (prev_ref == 0) != (cd.session_ref == 0):
+                self._refresh_session_partition(node)
+            covered += len(node.key)
+            node = node.parent
+        return covered
+
+    def _inc_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
+        covered_by_leaf = self._session_leaf_covered_len.setdefault(session_id, {})
+        assert leaf not in covered_by_leaf
+        target_span = self.sliding_window_size + self.tree_core.page_size
+        covered = self._walk_session_coverage(leaf, target_span, 1)
+        assert covered > 0
+        covered_by_leaf[leaf] = covered
+
+    def _dec_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
+        covered_by_leaf = self._session_leaf_covered_len.get(session_id)
+        assert covered_by_leaf is not None and leaf in covered_by_leaf
+        covered_len = covered_by_leaf.pop(leaf)
+        if not covered_by_leaf:
+            self._session_leaf_covered_len.pop(session_id, None)
+        actual = self._walk_session_coverage(leaf, covered_len, -1)
+        assert actual == covered_len
+
+    def _advance_session_coverage(
+        self,
+        session_id: str,
+        leaf: UnifiedTreeNode,
+        old_ancestor: Optional[UnifiedTreeNode],
+    ) -> None:
+        self._inc_session_coverage(session_id, leaf)
+        if old_ancestor is not None:
+            self._dec_session_coverage(session_id, old_ancestor)
+
+    def _recede_session_coverage(
+        self,
+        session_id: str,
+        leaf: UnifiedTreeNode,
+        fallback: Optional[UnifiedTreeNode],
+    ) -> None:
+        self._dec_session_coverage(session_id, leaf)
+        if fallback is not None:
+            self._inc_session_coverage(session_id, fallback)
+
+    def validate_session_state(
+        self,
+        reachable_nodes: set[UnifiedTreeNode],
+        report_error: Callable[[str], None],
+    ) -> None:
+        super().validate_session_state(reachable_nodes, report_error)
+        ct = self.component_type
+
+        for session_id, covered_by_leaf in self._session_leaf_covered_len.items():
+            for leaf, covered_len in covered_by_leaf.items():
+                if leaf not in self._session_leaves.get(session_id, ()):
+                    report_error(
+                        f"{ct} session {session_id!r} coverage leaf {leaf.id} is not indexed"
+                    )
+                if covered_len <= 0:
+                    report_error(
+                        f"{ct} session {session_id!r} leaf {leaf.id} covered_len={covered_len}"
+                    )
+
+        for session_id, leaves in self._session_leaves.items():
+            covered_by_leaf = self._session_leaf_covered_len.get(session_id, {})
+            for leaf in leaves:
+                if leaf not in covered_by_leaf:
+                    report_error(
+                        f"{ct} session {session_id!r} leaf {leaf.id} has no coverage record"
+                    )
 
     def _translate_full_to_swa(self, full_indices: torch.Tensor) -> torch.Tensor:
         return self.cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -335,6 +424,10 @@ class SWAComponent(TreeComponent):
         new_parent.component_data[self.component_type].lock_ref = child.component_data[
             self.component_type
         ].lock_ref
+        new_parent.component_data[self.component_type].session_ref = (
+            child.component_data[self.component_type].session_ref
+        )
+        assert new_parent.component_data[self.component_type].session_ids is None
 
         child_swa_value = child.component_data[self.component_type].value
         if child_swa_value is not None:
@@ -421,9 +514,14 @@ class SWAComponent(TreeComponent):
     def _evict_device_start(self, request_cnt: int) -> None:
         """Begin the device-eviction walk from this component's LRU cursor."""
         self._evict_device_request_cnt = request_cnt
-        self._evict_device_cursor = self.tree_core.lru_lists[
-            self.component_type
-        ].get_lru_no_lock()
+        if self.tree_core.enable_session_radix_cache:
+            lru = self.tree_core.lru_lists[self.component_type]
+            lru.cursor_begin()
+            self._evict_device_cursor = lru.cursor_next()
+        else:
+            self._evict_device_cursor = self.tree_core.lru_lists[
+                self.component_type
+            ].get_lru_no_lock()
 
     def _evict_device_next_node(
         self,
@@ -432,14 +530,18 @@ class SWAComponent(TreeComponent):
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> Optional[NodeId]:
         """Return the next device-leaf node for the driver to evict, or None.
-        Internal nodes are tombstoned inline (no IO); the cursor is re-validated
-        (reset to LRU head) if the previous node's eviction removed it."""
+        Internal nodes are tombstoned inline (no IO). If the previous node's
+        eviction removed the cursor, the walk resumes from the partition
+        sentinel with session refs on, else it restarts at the LRU tail."""
         ct = self.component_type
         lru = self.tree_core.lru_lists[ct]
+        enabled = self.tree_core.enable_session_radix_cache
         if self._evict_device_cursor is not None and not lru.in_list(
             self._evict_device_cursor
         ):
-            self._evict_device_cursor = lru.get_lru_no_lock()
+            self._evict_device_cursor = (
+                lru.cursor_next() if enabled else lru.get_lru_no_lock()
+            )
         while (
             tracker[ct] < self._evict_device_request_cnt
             and self._evict_device_cursor is not None
@@ -447,10 +549,15 @@ class SWAComponent(TreeComponent):
         ):
             x = self._evict_device_cursor
             assert x.component_data[ct].value is not None
-            if x in self.tree_core.evictable_device_leaves:
-                self._evict_device_cursor = lru.get_prev_no_lock(x)
+            if x in self.tree_core.evictable_device_leaves and (
+                not enabled or self._can_evict_leaf_atomically(x)
+            ):
+                self._evict_device_cursor = (
+                    lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
+                )
                 return x.id
-            x_next = lru.get_prev_no_lock(x)
+            if not enabled:
+                x_next = lru.get_prev_no_lock(x)
             self.tree_core._evict_component_and_detach_lru(
                 x,
                 self,
@@ -462,11 +569,13 @@ class SWAComponent(TreeComponent):
             self.tree_core._cascade_evict(
                 x, self, tracker, device_frees=device_frees, host_frees=host_frees
             )
-            self._evict_device_cursor = x_next
+            self._evict_device_cursor = lru.cursor_next() if enabled else x_next
         return None
 
     def _evict_device_end(self) -> None:
         """Clear the device-eviction walk cursor state."""
+        if self.tree_core.enable_session_radix_cache:
+            self.tree_core.lru_lists[self.component_type].cursor_end()
         self._evict_device_cursor = None
 
     def acquire_component_lock(
@@ -938,11 +1047,19 @@ class SWAComponent(TreeComponent):
         Host leaves: atomic eviction via _evict_host_leaf."""
         ct = self.component_type
         host_lru = self.tree_core.host_lru_lists[ct]
-        x = host_lru.get_lru_no_host_lock()
+        enabled = self.tree_core.enable_session_radix_cache
+        if enabled:
+            host_lru.cursor_begin()
+            x = host_lru.cursor_next(host_lock=True)
+        else:
+            x = host_lru.get_lru_no_host_lock()
         while tracker[ct] < num_tokens and x is not None and host_lru.in_list(x):
-            x_next = host_lru.get_prev_no_host_lock(x)
+            if not enabled:
+                x_next = host_lru.get_prev_no_host_lock(x)
             cd = x.component_data[ct]
-            if x in self.tree_core.evictable_host_leaves:
+            if x in self.tree_core.evictable_host_leaves and (
+                not enabled or self._can_evict_leaf_atomically(x)
+            ):
                 self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
             else:
                 assert cd.host_value is not None
@@ -962,7 +1079,12 @@ class SWAComponent(TreeComponent):
                     host_frees=host_frees,
                     target=EvictLayer.HOST,
                 )
-            x = x_next
+            if enabled:
+                x = host_lru.cursor_next(host_lock=True)
+            else:
+                x = x_next
+        if enabled:
+            host_lru.cursor_end()
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
         if self._swa_kv_pool_host is None:
