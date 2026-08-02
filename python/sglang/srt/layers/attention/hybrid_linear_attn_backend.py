@@ -962,6 +962,12 @@ class HybridLinearAttnBackend(AttentionBackend):
             full_attn_backend.needs_cpu_seq_lens
             or linear_attn_backend.needs_cpu_seq_lens
         )
+        # Both sub-backends build metadata for every forward, including the
+        # extend-autotune dummy.
+        self.extend_dummy_seqs_capped_by_req_pool = (
+            full_attn_backend.extend_dummy_seqs_capped_by_req_pool
+            or linear_attn_backend.extend_dummy_seqs_capped_by_req_pool
+        )
 
     @property
     def data_type(self):
