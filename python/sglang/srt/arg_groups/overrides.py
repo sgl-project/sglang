@@ -1841,6 +1841,7 @@ def _mla_backend_page_constraints(view: Any) -> dict:
         view.attention_backend == "trtllm_mha"
         or view.decode_attention_backend == "trtllm_mha"
         or view.prefill_attention_backend == "trtllm_mha"
+        or view.speculative_draft_attention_backend == "trtllm_mha"
     ):
         # 128 runs on trtllm-gen's dynamic tokens-per-page kernels (flashinfer
         # >= 0.6.12), which require GQA and equal QK/V head dims — validated at
