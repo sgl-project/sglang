@@ -436,9 +436,8 @@ jobs:
         if: failure()
 
   multimodal-gen-test-4-h100:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+    # Temporarily disabled while the 4-gpu-h100 runner is unstable
+    if: ${{ false }}
     runs-on: 4-gpu-h100
     timeout-minutes: 90
     steps:
