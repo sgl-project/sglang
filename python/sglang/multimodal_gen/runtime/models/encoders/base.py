@@ -25,14 +25,8 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 def get_folding_tp_group(config: EncoderConfig):
-    """Group an encoder should tensor-parallel over.
-
-    ``config.parallel_folding_mode`` is set by ServerArgs.adjust_pipeline_config
-    when the encoder is folded over a larger group than its own TP (the idle DiT
-    replica during the encoding stage); when it is None the encoder uses the
-    default TP group. Shared by every text/image encoder so the choice lives in
-    one place.
-    """
+    """group an encoder tensor-parallels over; the default TP group unless a
+    fold mode is set"""
     mode = config.parallel_folding_mode
     if mode == "sp":
         return get_sp_group()
@@ -46,11 +40,14 @@ def get_folding_tp_group(config: EncoderConfig):
     return get_tp_group()
 
 
-# Folding pays off only for wide encoders: measured ~-22% encode latency for
-# T5-XXL (hidden 4096) and larger for Mistral-24B (hidden 5120), but a net loss
-# for narrower ones (Qwen3 hidden 2560, CLIP 512) whose per-layer all_reduce
-# dominates the sharded compute. Decided on the real (post-load) hidden size.
+# measured on 2/4xH100: folding wins only for wide encoders (T5-XXL 4096: -20%
+# at batch 1, R-insensitive); narrower ones lose to the per-layer all_reduce
+# (Qwen3 2560: +35%, CLIP 768: +50%)
 FOLD_MIN_HIDDEN_SIZE = 4096
+# below this width the encoder stays latency-bound across batch sizes, so
+# data-parallel encoding saves no compute and the all_gather is a pure loss
+# (CLIP 768: dp slower at every batch/R measured)
+DP_MIN_HIDDEN_SIZE = 1024
 
 
 def _encoder_dims(config: EncoderConfig):
@@ -71,15 +68,12 @@ def _encoder_dims(config: EncoderConfig):
     )
 
 
-def encoder_folding_worthwhile(config: EncoderConfig, group_size: int) -> bool:
-    """Fold only encoders wide enough to benefit whose heads and MLP divide the
-    fold group. Size-based (not per-architecture), so the same encoder family at
-    different parameter counts is handled correctly."""
-    hidden, heads, inter = _encoder_dims(config)
+def _encoder_dims_divide(config: EncoderConfig, group_size: int) -> bool:
+    """Whether the encoder's heads and MLP evenly divide the fold group -- a hard
+    requirement to shard (fold) it at all, regardless of whether it is worth it."""
+    _, heads, inter = _encoder_dims(config)
     return (
         group_size > 1
-        and hidden is not None
-        and hidden >= FOLD_MIN_HIDDEN_SIZE
         and heads is not None
         and heads % group_size == 0
         and inter is not None
@@ -87,21 +81,80 @@ def encoder_folding_worthwhile(config: EncoderConfig, group_size: int) -> bool:
     )
 
 
-def finalize_encoder_folding(config: EncoderConfig) -> None:
-    """Loader hook: call after the encoder's real dims are populated
-    (update_model_arch) and before construction. adjust_pipeline_config proposes
-    a fold group from the parallelism alone; here we keep it only if the encoder
-    is actually worth folding at its real size, otherwise fall back to
-    replicated by clearing the mode.
+def encoder_folding_worthwhile(config: EncoderConfig, group_size: int) -> bool:
+    """size-based, so the same family at different parameter counts differs"""
+    hidden, _, _ = _encoder_dims(config)
+    return (
+        _encoder_dims_divide(config, group_size)
+        and hidden is not None
+        and hidden >= FOLD_MIN_HIDDEN_SIZE
+    )
+
+
+def group_has_measured_topology(group) -> bool:
+    """Whether the measured fold/dp verdicts transfer to this group's topology.
+
+    Both thresholds above were measured on single-node H100s over NVLink. Their
+    costs are pure interconnect: folding adds an all_reduce per layer, dp one
+    all_gather per encode. Without peer-to-peer between the ranks (multi-node, or
+    a host-routed topology) the traffic costs several times more and a rule that
+    barely paid on NVLink can invert, so `auto` treats those topologies as
+    unmeasured and stays replicated. An explicit --encoder-parallel still wins.
     """
+    local_devices = torch.cuda.device_count()
+    if group.world_size <= 1 or group.world_size > local_devices:
+        return False
+    return all(
+        torch.cuda.can_device_access_peer(0, peer)
+        for peer in range(1, group.world_size)
+    )
+
+
+def encoder_dp_capable(config: EncoderConfig) -> bool:
+    """wide enough that splitting a batched encode beats its one all_gather"""
+    hidden, _, _ = _encoder_dims(config)
+    return hidden is not None and hidden >= DP_MIN_HIDDEN_SIZE
+
+
+def encoder_dp_worthwhile(
+    config: EncoderConfig, batch_size: int, measured_topology: bool
+) -> bool:
+    return measured_topology and batch_size > 1 and encoder_dp_capable(config)
+
+
+def finalize_encoder_folding(
+    config: EncoderConfig, policy: str = "auto", prefer_dp: bool = False
+) -> None:
+    """resolve fold-vs-replicate once real dims are known (post update_model_arch,
+    pre construction); folding shards the weights, so it rules out dp for the
+    lifetime of the loaded model. `prefer_dp` means the runtime can engage dp."""
     if config.parallel_folding_mode is None:
         return
-    group_size = getattr(get_folding_tp_group(config), "world_size", 1)
-    if not encoder_folding_worthwhile(config, group_size):
+    group = get_folding_tp_group(config)
+    if policy == "fold":
+        # explicit: shard whenever the dims allow, topology is the caller's call
+        keep = _encoder_dims_divide(config, group.world_size)
+    elif policy == "auto":
+        # a batched encode prefers dp (one all_gather) over folding (an
+        # all_reduce per layer), so leave a dp-capable encoder unsharded
+        keep = (
+            not (prefer_dp and encoder_dp_capable(config))
+            and encoder_folding_worthwhile(config, group.world_size)
+            and group_has_measured_topology(group)
+        )
+    else:  # dp / replicate
+        keep = False
+    if not keep:
         config.parallel_folding_mode = None
 
 
 class TextEncoder(nn.Module, ABC, LayerwiseOffloadableModuleMixin):
+    # Opt in per encoder to data-parallel batched encoding: the gather rebuilds a
+    # BaseEncoderOutput, and subclasses are free to return their own output type
+    # instead (Qwen2_5_VLForConditionalGeneration returns
+    # Qwen2_5_VLCausalLMOutputWithPast). Off by default so a new encoder is
+    # replicated rather than silently broken; flip it once dp is verified there.
+    supports_dp_encode = False
     layerwise_offload_dit_group_enabled = False
     layer_names = [
         "layers",
