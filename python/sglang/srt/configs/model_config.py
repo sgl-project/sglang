@@ -129,6 +129,14 @@ def is_deepseek_v4(config) -> bool:
     )
 
 
+def is_nemotron_h(config) -> bool:
+    return _hf_arch(config) in (
+        "NemotronHForCausalLM",
+        "NemotronHPuzzleForCausalLM",
+        "NemotronHForCausalLMMTP",
+    )
+
+
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config) or is_deepseek_v4(config)
     return config.index_head_dim
@@ -494,7 +502,7 @@ class ModelConfig:
         # Cache attributes
         self.hf_eos_token_id = self._get_hf_eos_token_id()
         # Set by scheduler when reasoning_parser is enabled
-        self.think_end_id: Optional[int] = None
+        self.think_end_ids: Optional[List[int]] = None
 
         # multimodal
         self.image_token_id = getattr(
@@ -1436,22 +1444,33 @@ class ModelConfig:
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()
 
+            # ModelOpt FP4 checkpoints quantize only the target model; an
+            # embedded MTP draft may stay unquantized, so an explicit
+            # nvfp4_online opt-in for the draft wins over checkpoint detection.
+            # The online loader rejects already-packed weights at load time.
+            preserve_online_draft_quantization = (
+                self.is_draft_model
+                and self.quantization == "nvfp4_online"
+                and quant_method == "modelopt_fp4"
+            )
+
             # Detect which checkpoint is it
-            for _, method in QUANTIZATION_METHODS.items():
-                quantization_override = method.override_quantization_method(
-                    quant_cfg, self.quantization
-                )
-                if quantization_override:
-                    quant_method = quantization_override
-                    self.quantization = quantization_override
-                    break
+            if not preserve_online_draft_quantization:
+                for _, method in QUANTIZATION_METHODS.items():
+                    quantization_override = method.override_quantization_method(
+                        quant_cfg, self.quantization
+                    )
+                    if quantization_override:
+                        quant_method = quantization_override
+                        self.quantization = quantization_override
+                        break
 
             # Verify quantization configurations.
             if self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
                 # Check if the CLI-specified quantization is compatible with HF config's quant_method
-                is_compatible = (
+                is_compatible = preserve_online_draft_quantization or (
                     self.quantization in compatible_quantization_methods
                     and quant_method
                     in compatible_quantization_methods[self.quantization]

@@ -277,6 +277,22 @@ def create_dual_chunk_flash_attn_backend(runner):
     return DualChunkFlashAttentionBackend(runner)
 
 
+def attn_backend_wrapper_for_draft_extend(
+    runner: "ModelRunner", full_attn_backend: "AttentionBackend"
+):
+    """Apply the model's attention wrapper to a DRAFT-EXTEND backend, if it needs one.
+
+    ``DraftBackendFactory`` skips :func:`attn_backend_wrapper`, which is right for
+    the mamba hybrids whose MTP draft is all softmax attention. Inkling's draft has
+    its own short convs, so it must expose ``conv_state_metadata`` too.
+    """
+    from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
+
+    if isinstance(runner.model_config.hf_config, (InklingModelConfig, InklingMMConfig)):
+        return attn_backend_wrapper(runner, full_attn_backend)
+    return full_attn_backend
+
+
 def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBackend"):
     """
     Wrapper for special models like hybrid GDN, so we don't
@@ -305,7 +321,16 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         if isinstance(
             runner.model_config.hf_config, (InklingModelConfig, InklingMMConfig)
         ):
-            return full_attn_backend
+            from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
+                InklingShortConvAttnBackend,
+                InklingShortConvHybridAttnBackend,
+            )
+
+            return InklingShortConvHybridAttnBackend(
+                full_attn_backend,
+                InklingShortConvAttnBackend(runner),
+                cfg.full_attention_layer_ids,
+            )
 
         from sglang.kernels.ops.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend

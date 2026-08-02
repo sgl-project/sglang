@@ -13,7 +13,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils.common import torch_release
 
 if TYPE_CHECKING:
@@ -34,7 +34,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
-from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     ceil_align,
     ceil_div,
@@ -111,6 +110,17 @@ def set_force_ck_w8a8(enabled: bool = True) -> None:
 def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
     """Materialize the physical scale layout consumed by gfx95 bpreshuffle GEMM."""
     return scale.t().contiguous().t() if scale.dim() == 2 else scale
+
+
+def view_aiter_fused_rms_transposed_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Expose AITER fused-RMS ``transpose_scale=True`` storage logically.
+
+    The fused-RMS op returns transposed physical bytes through a row-major-looking
+    view. Restore logical ``[M, G]`` indexing without copying those bytes.
+    """
+    if scale.dim() != 2:
+        return scale
+    return torch.as_strided(scale, scale.shape, (1, scale.shape[0]))
 
 
 def materialize_bpreshuffle_fp8_scale_tuple(
@@ -752,7 +762,27 @@ def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
     # fp8_blockscale_gemm_sm90 requires: N % 64 == 0, K % 128 == 0
     shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
 
-    if not (shape_supported and dtype_supported):
+    # Keep this backend to 1 <= M < 32, mirroring vLLM's
+    # FlashInferFp8DeepGEMMDynamicBlockScaledKernel. fp8_blockscale_gemm_sm90 is
+    # one entry point over two kernels and only the M < 32 swapAB half is worth
+    # taking:
+    #   M >= 32 picks the non-swapAB kernel, which is slower than DeepGEMM (worst
+    #     just above the threshold) and, on some checkpoints, less accurate.
+    #   M == 0 hard-fails inside the kernel ("Check failed: (input_ptr !=
+    #     nullptr)"). Empty batches are a normal steady-state input, not an edge
+    #     case: DP attention hands an idle rank a zero-token forward so the
+    #     collectives stay in sync (ScheduleBatch.prepare_for_idle).
+    # Same shape of guard as the gfx95 CK M bound below.
+    m_supported = 1 <= input.view(-1, input.shape[-1]).shape[0] < 32
+
+    if not m_supported and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        # DeepGEMM covers both ends and falls back to triton on its own for
+        # shapes it cannot serve.
+        return deepgemm_w8a8_block_fp8_linear_with_fallback(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
+
+    if not (shape_supported and dtype_supported and m_supported):
         if weight_scale.dtype == torch.int32:
             weight_scale = _unpack_ue8m0_scale_for_triton(
                 weight_scale, weight.shape, block_size
@@ -1844,7 +1874,7 @@ def apply_fp8_linear(
         if (
             input_scale is not None
             and input_scale.numel() == 1
-            and get_server_args().cuda_graph_config.prefill.tc_compiler == "inductor"
+            and get_exec().graph.cuda_graph_config.prefill.tc_compiler == "inductor"
         ):
             qinput = (
                 (input_2d * input_scale.reciprocal())
