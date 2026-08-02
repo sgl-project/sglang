@@ -34,14 +34,19 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
-    unified_mla_hooks,
 )
+from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_buffer, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_buffer,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
 
 if is_flashinfer_available():
@@ -238,11 +243,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.forward_prefill_metadata: Optional[TRTLLMMLAPrefillMetadata] = None
         self.forward_decode_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
-        self.disable_chunked_prefix_cache = (
-            get_server_args().disable_chunked_prefix_cache
-        )
+        self.disable_chunked_prefix_cache = get_schedule().disable_chunked_prefix_cache
 
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker

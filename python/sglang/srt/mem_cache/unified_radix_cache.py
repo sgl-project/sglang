@@ -54,6 +54,9 @@ from sglang.srt.mem_cache.unified_cache.components import (
     SWAComponent,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
+    UnifiedSessionRefTracker,
+)
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     NodeId,
@@ -135,6 +138,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
+        self.enable_session_radix_cache = params.enable_session_radix_cache
         component_registry = COMPONENT_REGISTRY
         if params.component_registry_override:
             component_registry = {
@@ -169,6 +173,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
+
+        # Session ref tracking (--enable-session-radix-cache).
+        self.session_refs = UnifiedSessionRefTracker(
+            components=self._components_tuple,
+            tree_core=self.tree_core,
+            enable_session_radix_cache=self.enable_session_radix_cache,
+        )
 
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
 
@@ -276,6 +287,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         self.tree_core.reset()
+        self.session_refs.reset()
 
         # Reset Controller.
         self.session.slots.clear()
@@ -668,11 +680,22 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
 
+        if is_insert and result is not None and result.last_device_node is not None:
+            req.last_node = result.last_device_node
+
         # cleanup
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
+
+        if self.enable_session_radix_cache and result is not None:
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            if req.finished_reason is not None and not isinstance(
+                req.finished_reason, FINISH_ABORT
+            ):
+                self.session_refs.register_session_ref(req)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
@@ -1998,6 +2021,17 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_mamba(self) -> bool:
         return self.is_mamba_enabled
 
+    # ---- Session radix cache API (delegates to composed UnifiedSessionRefTracker) ----
+
+    def open_radix_session(self, session_id: str) -> Optional[int]:
+        return self.session_refs.open_radix_session(session_id)
+
+    def ensure_session_generation(self, session_id: str) -> int:
+        return self.session_refs.ensure_session_generation(session_id)
+
+    def release_radix_session(self, session_id: str) -> int:
+        return self.session_refs.release_radix_session(session_id)
+
     # ---- Streaming session API (delegates to composed StreamingSession) ----
 
     def supports_streaming_session(self) -> bool:
@@ -2055,6 +2089,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.all_mamba_values_flatten()
 
     def available_and_evictable_str(self) -> str:
+        # TODO(zhangmj): need more detailed log info for session reference.
         if self.supports_swa():
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         else:
