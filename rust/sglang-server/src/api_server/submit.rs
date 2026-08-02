@@ -1,6 +1,6 @@
 //! Request submission into the ingress pipeline, shared by every endpoint
-//! module: mint the client-visible rid (uuid hex, Python-parity), build the
-//! `Request`, and hand it to the TM with an egress receiver for the response.
+//! module: bind the request's final rid, build the `Request`, and hand it to the
+//! TM with an egress receiver for the response.
 
 use std::convert::Infallible;
 
@@ -16,15 +16,32 @@ use tokio::sync::mpsc;
 
 use super::AppState;
 use super::frame::error_value;
+use super::guard::AbortGuard;
 use crate::fsm::RequestState;
 use crate::ids::Rid;
-use crate::message::{EgressItem, EgressSink, Request, RequestKind};
+use crate::message::{EgressItem, EgressSink, GenerateRequest, Request, RequestKind};
 use crate::tokenizer_manager::TmEvent;
 
-/// Submit one request; returns the rid, its hashed routing key, and the egress
-/// receiver. Every request arrives with its final rid — a generate request from
-/// `into_requests` (or the `HEALTH_CHECK_<uuid>` the health probe sets), a
-/// control request from its constructor — so this only echoes it back.
+pub(super) type GenerationReceiver = (Rid, mpsc::Receiver<EgressItem>);
+
+/// Successfully submitted generation requests and their abort-on-drop guard.
+/// Keeping these together prevents a caller from losing cancellation coverage
+/// between submission and handing the receivers to the unary or streaming path.
+pub(super) struct SubmittedGenerations {
+    receivers: Vec<GenerationReceiver>,
+    guard: AbortGuard,
+}
+
+impl SubmittedGenerations {
+    pub(super) fn into_parts(self) -> (Vec<GenerationReceiver>, AbortGuard) {
+        (self.receivers, self.guard)
+    }
+}
+
+/// Submit one request; returns its rid and egress receiver. Every request arrives
+/// with its final rid: a generate request from `into_requests` (or the
+/// `HEALTH_CHECK_<uuid>` the health probe sets), and a control request from its
+/// constructor. This only echoes that rid back.
 pub(super) async fn submit(
     state: &AppState,
     kind: RequestKind,
@@ -68,6 +85,27 @@ pub(super) async fn submit(
     }
 }
 
+/// Submit a generation batch before consuming any result. Requests are armed as
+/// they enter the scheduler, so a later submission failure aborts the requests
+/// that were already accepted.
+pub(super) async fn submit_all(
+    state: &AppState,
+    requests: Vec<GenerateRequest>,
+    stream: bool,
+) -> Result<SubmittedGenerations, Response> {
+    let mut receivers = Vec::with_capacity(requests.len());
+    let mut guard = AbortGuard::new_empty(state.senders.clone());
+
+    for request in requests {
+        let (rid, receiver) =
+            submit(state, RequestKind::Generate(Box::new(request)), stream).await?;
+        guard.arm(rid.clone());
+        receivers.push((rid, receiver));
+    }
+
+    Ok(SubmittedGenerations { receivers, guard })
+}
+
 /// Shape an error that occurs *before* (or instead of) a successful submit into a
 /// client response. Two parity points with Python's `generate_request`. The body
 /// is the same `{"error": {...}}` object every other path emits — not bare text,
@@ -89,6 +127,60 @@ pub(super) fn pre_submit_error(code: StatusCode, message: &str, stream: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokenizer_manager::{AbortSource, Senders};
+    use std::sync::{Arc, atomic::AtomicU64};
+
+    #[tokio::test]
+    async fn submit_all_aborts_prior_requests_when_a_later_submit_fails() {
+        // A rendezvous channel requires one receive per successful submission,
+        // so dropping it after the first ingress deterministically rejects the
+        // second request before it can be armed.
+        let (tm, tm_rx) = flume::bounded(0);
+        let (abort, abort_rx) = flume::unbounded();
+        let state = AppState {
+            senders: Senders {
+                tm,
+                abort,
+                tok: flume::unbounded().0,
+                detok: vec![],
+            },
+            egress_buf: 8,
+            server_args: Arc::new(
+                crate::runtime::ServerArgs::from_json(r#"{"model_path": "/m"}"#).unwrap(),
+            ),
+            egress_activity: Arc::new(AtomicU64::new(0)),
+        };
+        let requests = ["first", "second"]
+            .map(|rid| GenerateRequest {
+                rid: rid.into(),
+                text: Some("hello".into()),
+                ..Default::default()
+            })
+            .into();
+
+        let submitting = tokio::spawn(async move { submit_all(&state, requests, false).await });
+
+        let TmEvent::Ingress(first) = tm_rx.recv_async().await.unwrap() else {
+            panic!("generation must enter through the TM inbox");
+        };
+        assert_eq!(first.rid.client_facing(), "first");
+        drop(first);
+        drop(tm_rx);
+
+        let response = match submitting.await.unwrap() {
+            Ok(_) => panic!("the second submission must fail"),
+            Err(response) => response,
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(matches!(
+            abort_rx.try_recv().unwrap(),
+            AbortSource::Guard(rid) if rid.client_facing() == "first"
+        ));
+        assert!(
+            abort_rx.try_recv().is_err(),
+            "only the successfully submitted request is armed"
+        );
+    }
 
     /// Unary pre-submit errors are a 4xx/5xx with a JSON `{"error":...}` body;
     /// streaming ones are 200 + an SSE error frame + `[DONE]`, because Python

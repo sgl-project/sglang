@@ -2573,6 +2573,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tower 0.5.3",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

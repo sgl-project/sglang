@@ -10,6 +10,7 @@ mod log;
 mod native_api;
 mod openai;
 mod submit;
+mod vertex;
 
 use std::sync::Arc;
 
@@ -52,6 +53,7 @@ pub async fn serve(
         .merge(common::routes())
         .merge(native_api::routes())
         .merge(openai::routes())
+        .merge(vertex::routes())
         // TODO(auth): no API-key boundary yet. Python gates every route (except
         // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,
         // a configured `api_key` does NOT protect these routes.
