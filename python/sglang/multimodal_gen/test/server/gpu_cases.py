@@ -592,6 +592,71 @@ else:
 
 ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
+MINIMAX_H3_FOUR_GPU_H100_CASES = [
+    DiffusionTestCase(
+        "minimax_h3_fl2va_first_frame_4gpu_h100",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3",
+            modality="video",
+            num_gpus=4,
+            tp_size=2,
+            ulysses_degree=2,
+            extras=[
+                "--model-variant",
+                "fl2va",
+                "--performance-mode",
+                "speed",
+                "--enable-torch-compile",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A static night view of a narrow London alley in soft rain, wet "
+                "pavement reflecting a yellow streetlamp, the blue K. West sign "
+                "glowing above a doorway, cardboard boxes near the wall, a pale "
+                "parked car in the distance, and a slender glam-rock figure "
+                "holding a guitar under the lamp; preserve the album-cover "
+                "composition, brick storefronts, muted teal and amber colors, "
+                "subtle rain shimmer only."
+            ),
+            output_size="1344x768",
+            seconds=5,
+            output_format="mp4",
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "fl2va",
+                "conditions": [
+                    {
+                        "type": "image",
+                        "uri": (
+                            "https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/"
+                            "5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/"
+                            "825646124206.jpg/600x600bb.jpg"
+                        ),
+                        "role": "keyframe",
+                        "frame_index": 0,
+                    }
+                ],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 5.0,
+                },
+                "num_inference_steps": 2,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 42,
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    )
+]
+
 TWO_GPU_CASES = [
     DiffusionTestCase(
         "flux2_modelopt_fp8_tp2_t2i",
@@ -967,6 +1032,9 @@ FILE_SUITES = {
     ],
     "1-gpu-b200": [
         "test_server_b200.py",
+    ],
+    "4-gpu-h100": [
+        "test_server_4_gpu_h100.py",
     ],
 }
 
