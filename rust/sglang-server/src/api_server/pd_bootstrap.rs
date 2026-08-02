@@ -9,11 +9,14 @@
 //! protocol is Python-owned — field names, status codes, and the `-1`
 //! sentinel below are parity pins, not this crate's design.
 //!
-//! Hosted on its own listener (`disaggregation_bootstrap_port`, NOT the api
-//! port) and its own single-thread tokio runtime: the scheduler starts it via
-//! [`crate::BootstrapServer`] during `init_disaggregation`, BEFORE the main
-//! rust runtime boots — the KV managers register synchronously right after,
-//! with only a few bounded retries.
+//! Served on the api listener itself: `api_server::serve` merges
+//! [`router_and_sweeper`]'s routes on every prefill server
+//! (`ServerArgs::enable_pd_bootstrap()`). In rust-server mode the resolved
+//! `disaggregation_bootstrap_port` is aliased to the api port, so KV managers
+//! register here without knowing about the merge. The scheduler starts the
+//! rust server BEFORE `init_disaggregation` — the KV managers register
+//! synchronously there, with only a few bounded retries, so the routes must
+//! already be accepting.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -22,7 +25,7 @@ use std::time::{Duration, Instant};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{post, put};
 use axum::{Json, Router};
 
 /// Python default: `SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)`.
@@ -310,6 +313,8 @@ async fn query_dp_ranks(State(state): State<Shared>, Json(body): Json<QueryDpRan
     Json(result).into_response()
 }
 
+/// No `/health` here: the merged api router already serves it (same 200 "OK"
+/// the standalone Python bootstrap server answered, so probes are unchanged).
 fn router(state: Shared) -> Router {
     Router::new()
         // Unmatched methods on a routed path get axum's built-in 405, matching
@@ -317,7 +322,6 @@ fn router(state: Shared) -> Router {
         .route("/route", put(route_put).get(route_get))
         .route("/register_dp_rank", post(register_dp_rank))
         .route("/query_dp_ranks", post(query_dp_ranks))
-        .route("/health", get(|| async { "OK" }))
         .with_state(state)
 }
 
@@ -334,85 +338,25 @@ async fn cleanup_expired_entries(state: Shared, interval: Duration) {
     }
 }
 
-/// Running bootstrap server. Dropping it (or `close`) stops the listener and
-/// joins the serving thread.
-pub struct Handle {
-    /// Dropped to signal shutdown (the serving task selects on its closure).
-    shutdown: Option<flume::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Handle {
-    pub fn close(&mut self) {
-        drop(self.shutdown.take());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
-/// Bind `host:port` (synchronously, so EADDRINUSE is a hard startup error the
-/// caller sees — same contract as the api listener in `runtime::start`) and
-/// serve the registry on a dedicated single-thread tokio runtime.
-pub fn start(host: &str, port: u16) -> Result<Handle, String> {
-    // Tuple `ToSocketAddrs`: accepts IPs (v4/v6, no manual bracketing) and
-    // resolvable hostnames, like Python's `web.TCPSite`.
-    let listener = std::net::TcpListener::bind((host, port))
-        .map_err(|e| format!("bootstrap bind {host}:{port} failed: {e}"))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("bootstrap listener set_nonblocking failed: {e}"))?;
-    let local_addr = listener
-        .local_addr()
-        .map_err(|e| format!("bootstrap listener local_addr failed: {e}"))?;
-
+/// The registry routes plus their expiry sweeper, ready to mount on the api
+/// router (`merge` the router, `tokio::spawn` the sweeper on the api runtime —
+/// the runtime drop on shutdown cancels it along with the handlers).
+pub(crate) fn router_and_sweeper() -> (Router, impl std::future::Future<Output = ()>) {
+    let state = Shared::default();
     let cleanup_interval = Duration::from_secs(crate::environ::env_u64(
         ENTRY_CLEANUP_INTERVAL_ENV,
         ENTRY_CLEANUP_INTERVAL_DEFAULT_SECS,
     ));
-    let (shutdown_tx, shutdown_rx) = flume::bounded::<()>(0);
-    let thread = std::thread::Builder::new()
-        .name("pd-bootstrap".into())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build pd-bootstrap runtime");
-            rt.block_on(async move {
-                let state = Shared::default();
-                tokio::spawn(cleanup_expired_entries(state.clone(), cleanup_interval));
-                let listener =
-                    tokio::net::TcpListener::from_std(listener).expect("adopt bootstrap listener");
-                tracing::info!(addr = %local_addr, "PD KV bootstrap server listening");
-                // Non-graceful, like the api server: on shutdown just stop —
-                // the runtime drop cancels in-flight handlers (all trivial).
-                tokio::select! {
-                    r = axum::serve(listener, router(state)) => {
-                        if let Err(e) = r {
-                            tracing::error!(error = %e, "bootstrap serve exited");
-                        }
-                    }
-                    _ = shutdown_rx.recv_async() => {}
-                }
-            });
-        })
-        .map_err(|e| format!("spawn pd-bootstrap thread failed: {e}"))?;
-
-    Ok(Handle {
-        shutdown: Some(shutdown_tx),
-        thread: Some(thread),
-    })
+    (
+        router(state.clone()),
+        cleanup_expired_entries(state, cleanup_interval),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{Runtime, RuntimeConfig, RustServerServerArgs, ServerArgs};
     use std::io::{Read, Write};
     use std::net::SocketAddr;
 
@@ -469,13 +413,37 @@ mod tests {
     const SENTINEL: &str =
         "/route?prefill_dp_rank=-1&prefill_cp_rank=-1&target_tp_rank=-1&target_pp_rank=-1";
 
+    /// Minimal prefill boot blob (same shape as the `runtime` tests): no
+    /// tokenizer load, the two mandatory `model_config` fields, and the
+    /// prefill role that mounts the registry.
+    const TEST_SERVER_ARGS: &str = r#"{
+        "skip_tokenizer_init": true,
+        "disaggregation_mode": "prefill",
+        "model_config": {"context_len": 2048, "vocab_size": 1000}
+    }"#;
+
     /// Pick a free port (probe-bind pattern, as in the `runtime` tests) and
-    /// start a bootstrap server on it.
-    fn start_on_free_port() -> (Handle, SocketAddr) {
+    /// boot the full runtime there with the bootstrap registry mounted — the
+    /// registry serves on the api listener, so these tests also pin the merge
+    /// wiring (including the `enable_pd_bootstrap()` derivation from the
+    /// blob), not just the handlers.
+    fn start_on_free_port() -> (Runtime, SocketAddr) {
+        start_runtime(TEST_SERVER_ARGS)
+    }
+
+    fn start_runtime(server_args_json: &str) -> (Runtime, SocketAddr) {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
-        (start("127.0.0.1", addr.port()).unwrap(), addr)
+        let cfg = RuntimeConfig {
+            rust_server_args: RustServerServerArgs {
+                http_addr: addr,
+                api_worker_num: 1,
+                ..Default::default()
+            },
+            server_args: Arc::new(ServerArgs::from_json(server_args_json).unwrap()),
+        };
+        (crate::runtime::start(cfg).expect("start runtime"), addr)
     }
 
     /// The full wire contract the Python decode side / PD router depends on:
@@ -487,7 +455,7 @@ mod tests {
     /// disaggregation/common/conn.py — this pins the copy.
     #[test]
     fn route_contract_matches_python_client() {
-        let (_handle, addr) = start_on_free_port();
+        let (_rt, addr) = start_on_free_port();
 
         // Not registered yet → 503 (the decode side retries on exactly this).
         let (status, _) = request(addr, "GET", SENTINEL, None);
@@ -557,7 +525,7 @@ mod tests {
     /// 503 / wrong-rank routes.
     #[test]
     fn system_dp_drives_readiness_and_rank_keys() {
-        let (_handle, addr) = start_on_free_port();
+        let (_rt, addr) = start_on_free_port();
 
         let rank0 = put_route(serde_json::json!({
             "system_dp_size": 2, "system_dp_rank": 0, "rank_ip": "10.0.0.1",
@@ -594,14 +562,11 @@ mod tests {
 
     /// The PD router's room→dp-rank side channel: register/query round-trip
     /// with Python's `{str(room): dp_rank}` response shape, unknown rooms
-    /// silently omitted (not an error), plus the `/health` liveness probe the
-    /// launch fixtures poll.
+    /// silently omitted (not an error). (`/health` liveness now belongs to the
+    /// api router the registry is merged into.)
     #[test]
-    fn dp_rank_round_trip_and_health() {
-        let (_handle, addr) = start_on_free_port();
-
-        let (status, text) = request(addr, "GET", "/health", None);
-        assert_eq!((status, text.as_str()), (200, "OK"));
+    fn dp_rank_round_trip() {
+        let (_rt, addr) = start_on_free_port();
 
         let (status, text) = request(
             addr,
@@ -620,5 +585,28 @@ mod tests {
         assert_eq!(status, 200);
         let result: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(result, serde_json::json!({"42": 3}));
+    }
+
+    /// The registry mounts only on prefill (`enable_pd_bootstrap()`): a
+    /// non-prefill server must 404 the bootstrap routes rather than host an
+    /// empty replica — that replica would answer 503 "not registered" forever,
+    /// hiding a misdirected decode/router behind its retry loop.
+    #[test]
+    fn routes_absent_off_prefill() {
+        let non_prefill = r#"{
+            "skip_tokenizer_init": true,
+            "model_config": {"context_len": 2048, "vocab_size": 1000}
+        }"#;
+        let (_rt, addr) = start_runtime(non_prefill);
+
+        let (status, _) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 404);
+        let (status, _) = request(
+            addr,
+            "PUT",
+            "/route",
+            Some(&put_route(serde_json::json!({}))),
+        );
+        assert_eq!(status, 404);
     }
 }

@@ -9,6 +9,7 @@ mod guard;
 mod log;
 mod native_api;
 mod openai;
+mod pd_bootstrap;
 mod submit;
 
 use std::sync::Arc;
@@ -48,7 +49,7 @@ pub async fn serve(
         egress_activity,
     };
     // Each endpoint module registers its own routes and merges here.
-    let app = Router::new()
+    let mut app = Router::new()
         .merge(common::routes())
         .merge(native_api::routes())
         .merge(openai::routes())
@@ -59,6 +60,14 @@ pub async fn serve(
         // No body limit, matching the Python server.
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state);
+    if server_args.enable_pd_bootstrap() {
+        // Merged after `with_state` (the registry carries its own state) and
+        // before `log::apply`, so bootstrap traffic shows in the access log.
+        let (bootstrap_routes, sweeper) = pd_bootstrap::router_and_sweeper();
+        tokio::spawn(sweeper); // cancelled with the runtime on shutdown
+        app = app.merge(bootstrap_routes);
+        tracing::info!("PD KV bootstrap registry mounted on the api listener");
+    }
     let app = log::apply(app, &server_args);
 
     // The listener was already bound synchronously in `runtime::start` (so a port

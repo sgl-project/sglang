@@ -97,8 +97,8 @@ pub struct ServerArgs {
     #[serde(default)]
     pub incremental_streaming_output: bool,
     /// PD-disaggregation role: `"null"` (unified), `"prefill"`, or `"decode"`.
-    /// (The prefill KV bootstrap registry itself — `crate::bootstrap` — is
-    /// started separately, before this blob exists; see `lib::BootstrapServer`.)
+    /// (On prefill, the KV bootstrap registry is mounted on the api router —
+    /// see [`Self::enable_pd_bootstrap`].)
     #[serde(default = "default_disaggregation_mode")]
     pub disaggregation_mode: String,
     /// The resolved Python `ModelConfig`, attached to the blob at dump time.
@@ -201,6 +201,16 @@ impl ServerArgs {
     /// True on a prefill or decode node — requests need bootstrap routing.
     pub fn is_disaggregation(&self) -> bool {
         self.disaggregation_mode != "null"
+    }
+
+    /// Serve the PD KV bootstrap registry on the api listener: every prefill
+    /// rust server hosts it, unconditionally — no extra topology gating. KV
+    /// managers and decode nodes reach the registry at the resolved
+    /// `disaggregation_bootstrap_port`, which rust-server mode aliases to the
+    /// api port, so whichever prefill server that port names is the one that
+    /// receives the registrations.
+    pub fn enable_pd_bootstrap(&self) -> bool {
+        self.disaggregation_mode == "prefill"
     }
 
     /// Bind address `host:port`. `host` is expected to be an IP — the result is

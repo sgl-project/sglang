@@ -11,7 +11,6 @@
 //! All are non-blocking, so the GIL is never held across a wait.
 
 mod api_server;
-mod bootstrap;
 mod detokenizer;
 mod environ;
 mod error;
@@ -62,7 +61,6 @@ impl Server {
         egress_ring_cap = 8192,
         channel_cap = 8192,
         cores = None,
-
         server_args_json = "{}",
     ))]
     // pyo3 `#[new]` constructor: the wide arg list is the Python-facing boot
@@ -224,40 +222,6 @@ impl Server {
     }
 }
 
-/// PD prefill KV bootstrap registry (see `crate::bootstrap`) on its own
-/// listener + thread — no GIL. Deliberately separate from [`Server`]:
-/// the scheduler starts it during `init_disaggregation`, BEFORE the main
-/// runtime boots, because the KV managers PUT-register synchronously right
-/// after with only a few bounded retries.
-#[pyclass]
-struct BootstrapServer {
-    handle: Option<crate::bootstrap::Handle>,
-}
-
-#[pymethods]
-impl BootstrapServer {
-    /// Bind `host:port` (a failed bind is a boot error, mirroring the api
-    /// listener) and start serving.
-    #[new]
-    fn start(host: &str, port: u16) -> PyResult<Self> {
-        let handle = crate::bootstrap::start(host, port).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "bootstrap server start failed: {e}"
-            ))
-        })?;
-        Ok(Self {
-            handle: Some(handle),
-        })
-    }
-
-    /// Stop the listener and join the serving thread (also runs on drop).
-    fn close(&mut self) {
-        if let Some(mut handle) = self.handle.take() {
-            handle.close();
-        }
-    }
-}
-
 /// Keeps the non-blocking log writer's background thread alive for the process
 /// lifetime (dropping the guard would stop log delivery).
 static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
@@ -281,6 +245,5 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .try_init();
     m.add_class::<Server>()?;
     m.add_class::<IngressBatch>()?;
-    m.add_class::<BootstrapServer>()?;
     Ok(())
 }

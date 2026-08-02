@@ -4,8 +4,8 @@ Same 2-GPU layout as test_disaggregation_basic (prefill GPU 0, decode GPU 1,
 mini_lb in front), but prefill and decode run with ``SGLANG_RUST_SERVER=1`` —
 covering the Rust `/generate` bootstrap-field intake (scalar form via the gsm8k
 eval's single-prompt requests, per-item list form via the batch test), the
-positional scheduler-wire PD block, the rust-hosted KV bootstrap server,
-the PD warmup fan-out, and the fake-bootstrap health probe.
+positional scheduler-wire PD block, the KV bootstrap registry served on the
+rust api listener, the PD warmup fan-out, and the fake-bootstrap health probe.
 
 The Rust server has no OpenAI endpoints, so everything (including the gsm8k
 eval) goes through ``/generate``.
@@ -41,6 +41,12 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        # Rust-server prefill serves the KV bootstrap registry on its api
+        # listener (a separate --disaggregation-bootstrap-port is a launch
+        # error there), so point both sides' bootstrap port at it: decode's
+        # flag is its fallback for requests without a bootstrap_port field,
+        # which is what mini_lb sends when --prefill carries no port.
+        cls.bootstrap_port = cls.prefill_port
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         # launch_all already exercises the PD-specific plumbing: the rust PD
         # warmup fan-out and the fake-bootstrap /health probe on both sides.
