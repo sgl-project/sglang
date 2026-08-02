@@ -95,16 +95,18 @@ class TestQwenNativeMmHost(CustomTestCase):
         self.assertLess(diff.max(), 0.06)
         self.assertLess(diff.mean(), 1e-3)
 
-        row = 0
-        for python_item, grid, expected_hash in zip(
-            python_output.mm_items, grids, hashes
-        ):
-            rows = int(np.prod(grid))
-            native_bytes = np.ascontiguousarray(
-                rust["features"][row : row + rows]
-            ).tobytes()
-            self.assertEqual(expected_hash, CORE.common.content_hash(native_bytes))
-            row += rows
+        # The native item hash is blake3 of the raw encoded source bytes
+        # (`sglang-mm` driver convention), not of the feature tensor.
+        def raw_bytes(source):
+            if isinstance(source, bytes):
+                return source
+            if source.startswith("data:"):
+                return base64.b64decode(source.split(",", 1)[1])
+            return Path(source.removeprefix("file://")).read_bytes()
+
+        for source, expected_hash in zip(sources, hashes):
+            self.assertEqual(expected_hash, CORE.common.content_hash(raw_bytes(source)))
+        for python_item in python_output.mm_items:
             expected_python_hash = hash_feature(python_item.feature)
             python_item.set_pad_value()
             self.assertEqual(python_item.hash, expected_python_hash)
