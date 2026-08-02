@@ -2,8 +2,7 @@
 
 ## Status
 
-- Workflow phase: implementation, with spec/tickets backfilled after the first
-  three PoC slices.
+- Workflow phase: BF16 PoC validation complete; upstream PR handoff next.
 - Branch/worktree: `sg-moonep` in `/home/user/sg-moonep`.
 - Local MoonEP reference: `/home/user/MoonEP` at commit `0f385f0`.
 - Fork issue map: `wirybeaver/sglang#7`.
@@ -15,9 +14,15 @@ Completed implementation slices:
 1. `1396477f8 Recognize MoonEP MoE A2A backend`
 2. `9865fc123 Add MoonEP dispatcher data contract`
 3. `d47680245 Add MoonEP buffer facade`
+4. `eed214860 Document MoonEP token capacity policy`
+5. `ae30e8e9d Add MoonEP BF16 weight layout`
+6. `8b84353f3 Add MoonEP BF16 expert runner`
+7. `0dc3f745a Wire MoonEP BF16 runtime path`
+8. `c11c7040a Add MoonEP BF16 validation script`
 
-Runtime dispatch is still intentionally guarded until MoonEP expert weight
-layout and expert GEMM support exist.
+Runtime dispatch/prefetch/compute/combine is now executable for the BF16
+correctness PoC. It remains experimental and guarded by documented limitations
+rather than being production-ready for full Kimi-K3 serving.
 
 ## Problem
 
@@ -186,7 +191,7 @@ later cloned or summarized upstream to `sgl-project/sglang` before upstream PRs.
 | 6 | Done | Add MoonEP contiguous symmetric weight layout (`wirybeaver/sglang#13`). |
 | 7 | Done | Add BF16 MoonEP expert runner consuming `cu_seqlens` (`wirybeaver/sglang#14`). |
 | 8 | Done | Wire runtime dispatcher dispatch/prefetch/compute/combine (`wirybeaver/sglang#15`). |
-| 9 | Next | Add Kimi-K3 recipe, validation, and upstream handoff notes (`wirybeaver/sglang#16`). |
+| 9 | Done | Add BF16 PoC validation and upstream handoff notes (`wirybeaver/sglang#16`). |
 
 Issue links are tracked in `.scratch/moonep/tickets.md`.
 
@@ -201,15 +206,42 @@ Local/unit validation:
   module.
 - `python3 -m compileall` and `git diff --check` pass.
 
-Runtime validation once executable:
+Runtime validation completed:
 
-- Multi-GPU/NVLink test against local MoonEP examples for BF16 dispatch,
-  prefetch, expert compute, and combine.
-- Compare correctness against the existing DeepEP/standard MoE path for a small
-  Kimi-style MoE model.
-- Validate Kimi-K3 launch recipe and document required env vars.
+- Added `scripts/moonep/validate_moonep_bf16_poc.py`, a torchrun correctness
+  harness for `MoonEPDispatcher.dispatch -> prefetch_weight ->` BF16 segment
+  runner `-> combine`. The script compares every rank's token-major output
+  against a local PyTorch reference using the same global BF16 expert weights
+  and top-k routes.
+- Vast.ai 4x H100 SXM (`NV6` topology) was not sufficient for MoonEP: CUDA
+  reported `CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED=0`, and MoonEP failed
+  during multicast granularity setup with `operation not supported`. This
+  confirms that pairwise NVLink alone is not enough for this MoonEP path.
+- Vast.ai 8x H100 SXM (`NV18` topology) passed the BF16 PoC validation. All
+  eight ranks reported `global_ok=true`, `max_abs_err=0.0`, `relative_err=0.0`
+  for `tokens=128`, `hidden_size=1024`, `intermediate_size=128`, `top_k=2`,
+  `num_experts=16`, and `num_prefetch_slots=2`.
+- Validation artifacts are local under
+  `.scratch/moonep/remote-validation-20260802T050429Z/`, including the 4x H100
+  failure, 8x H100 success, environment records, command logs, and SHA-256
+  manifests.
 
-Known local environment blockers at time of backfill:
+Docker/NCU validation notes:
+
+- `docker-ncu-benchmark` preflight was run against the Vast.ai H100 hosts. The
+  H100 offers with the required NVSwitch/multicast capability are container
+  instances, not VM/Docker hosts: Docker, `nvidia-ctk`, and
+  `nvidia-container-cli` were absent, so `docker run --gpus all` could not be
+  tested there.
+- Host Nsight Compute was present, but `RmProfilingAdminOnly=1`; a direct NCU
+  hardware-counter smoke test failed with `ERR_NVGPUCTRPERM`. No performance
+  claims are made from NCU profiling.
+- Available Vast.ai VM/Docker offers with multiple RTX 5090/4090 GPUs had
+  `bw_nvlink=0` and are useful only for build/Docker smoke, not for MoonEP
+  all-to-all correctness. The BF16 MoonEP validation should use an 8x H100/H200
+  or B200-class NVSwitch/multicast host.
+
+Known local environment blockers at time of validation:
 
 - `orjson` is missing, so Python unit tests fail during SGLang import.
 - `pytest` is not installed.
