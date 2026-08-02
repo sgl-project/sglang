@@ -14,9 +14,6 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     USPAttention,
     build_varlen_mask_meta_from_lengths,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-    FlashAttentionBackend,
-)
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     apply_qk_norm_with_optional_rope,
 )
@@ -41,13 +38,6 @@ logger = init_logger(__name__)
 ADALN_EMBED_DIM = 1024
 TIMESTEP_FREQ_DIM = 256
 NUM_ADALN_MODULATION_PARAMS = 4
-
-
-def _fa_padded_head_dim(head_dim: int) -> int:
-    return next(
-        (b for b in FlashAttentionBackend.get_supported_head_sizes() if b >= head_dim),
-        head_dim,
-    )
 
 
 class BooguRMSNorm(nn.Module):
@@ -255,7 +245,7 @@ class BooguAttention(nn.Module):
             ]
         )
 
-        self._padded_head_dim = _fa_padded_head_dim(self.head_dim)
+        self._padded_head_dim = 128  # Boogu head_dim=120 → next FA-supported bucket
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
             head_size=self._padded_head_dim,
@@ -421,7 +411,7 @@ class BooguJointAttention(nn.Module):
             ]
         )
 
-        self._padded_head_dim = _fa_padded_head_dim(self.head_dim)
+        self._padded_head_dim = 128  # Boogu head_dim=120 → next FA-supported bucket
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
             head_size=self._padded_head_dim,
