@@ -14,6 +14,9 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     USPAttention,
     build_varlen_mask_meta_from_lengths,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+    FlashAttentionBackend,
+)
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     apply_qk_norm_with_optional_rope,
 )
@@ -39,22 +42,12 @@ ADALN_EMBED_DIM = 1024
 TIMESTEP_FREQ_DIM = 256
 NUM_ADALN_MODULATION_PARAMS = 4
 
-# Head sizes FA's tuned kernels are compiled for -- must stay in sync with
-# FlashAttentionBackend.get_supported_head_sizes(). Boogu's head_dim=120 is
-# outside this set, so we zero-pad Q/K/V in the head_dim direction up to the
-# next-larger bucket (128) before dispatching to attention: Q_pad K_pad^T =
-# Q K^T + 0, so with softmax_scale pinned at 1/sqrt(head_dim) the logits are
-# unchanged and the padded output tail is 0 (sliced off). Same pattern as
-# sana_wm's _sana_wm_sdpa (head_dim=112), minus that model's baked-in
-# 1/sqrt(pad) training convention -- Boogu was trained with 1/sqrt(120).
-_FA_HEAD_DIM_BUCKETS = (32, 64, 96, 128, 160, 192, 224, 256)
 
-
-def _pad_to_fa_bucket(head_dim: int) -> int:
-    for bucket in _FA_HEAD_DIM_BUCKETS:
-        if head_dim <= bucket:
-            return bucket
-    return head_dim  # > 256: FA won't help either, leave caller on SDPA
+def _fa_padded_head_dim(head_dim: int) -> int:
+    return next(
+        (b for b in FlashAttentionBackend.get_supported_head_sizes() if b >= head_dim),
+        head_dim,
+    )
 
 
 class BooguRMSNorm(nn.Module):
@@ -262,10 +255,7 @@ class BooguAttention(nn.Module):
             ]
         )
 
-        # Route through FA by lying to the backend selector about head_size --
-        # softmax_scale must stay pinned to the model's native head_dim, since
-        # USPAttention's None-default would derive 1/sqrt(padded) which is wrong.
-        self._padded_head_dim = _pad_to_fa_bucket(self.head_dim)
+        self._padded_head_dim = _fa_padded_head_dim(self.head_dim)
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
             head_size=self._padded_head_dim,
@@ -431,8 +421,7 @@ class BooguJointAttention(nn.Module):
             ]
         )
 
-        # See _pad_to_fa_bucket / BooguAttention.__init__ for the rationale.
-        self._padded_head_dim = _pad_to_fa_bucket(self.head_dim)
+        self._padded_head_dim = _fa_padded_head_dim(self.head_dim)
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
             head_size=self._padded_head_dim,
