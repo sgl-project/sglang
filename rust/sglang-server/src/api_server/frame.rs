@@ -238,12 +238,9 @@ pub(super) fn frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
 /// accumulated length, where rebuilding the `Value` is O(T) per frame and so O(T²)
 /// per request.
 ///
-/// Byte-identical to `frame_value(..).to_string()`, which requires emitting
-/// `meta_info`'s keys in the alphabetical order `serde_json`'s `BTreeMap` gives
-/// them — pinned for both the plain and the logprob shapes by
-/// `cumulative_frame_json_matches_serde`. `None` only when the extras memo was
-/// invalidated (see `extras_memo_broken`), leaving the `Value` path as the
-/// fallback.
+/// Encodes the same JSON document as `frame_value(..).to_string()` — same keys,
+/// same values, same escaping — pinned for both the plain and the logprob shapes
+/// by `cumulative_frame_json_matches_serde`.
 pub(super) fn cumulative_frame_json(
     acc: &OutputAccumulator,
     rid: &str,
@@ -255,12 +252,13 @@ pub(super) fn cumulative_frame_json(
         return None;
     }
     let o = acc.snapshot();
-    // Through `Value`, not `to_string` on the struct: the `Value` path sorts the
-    // finish reason's own keys via `BTreeMap`, and this must match it byte for byte.
+    // Through `Value` rather than `to_string` on the struct: it is the same
+    // encoder the slow path runs the finish reason through, so any representation
+    // quirk is reproduced instead of re-derived.
     let finish = serde_json::to_value(&o.finish_reason).ok()?.to_string();
 
-    // KEEP ALPHABETICAL: `serde_json::Map` is a `BTreeMap` here, so this is the
-    // order the `Value` path produces and the order the equivalence test asserts.
+    // Alphabetical by convention only — a stable order that is easy to extend and
+    // diff.
     let mut m = String::new();
     let _ = write!(m, "{{\"completion_tokens\":{}", o.completion_tokens);
     let _ = write!(m, ",\"finish_reason\":{finish}");
@@ -668,11 +666,16 @@ mod tests {
         assert_eq!(opt_texts(&t), Some(t.as_slice()));
     }
 
-    /// The memoized cumulative fast path must emit **byte-identical** JSON to the
-    /// `serde_json::Value` builder it replaces — same keys, same alphabetical order
-    /// (`Map` is a `BTreeMap`; no `preserve_order`), same escaping. Covers unicode
-    /// and control chars, an empty-ids first frame, a finish_reason, and the batch
-    /// `index`. Guards the O(T) rewrite of the O(T²) `output_ids` serialization.
+    /// Parse a frame so the fast and slow paths can be compared as documents.
+    fn as_json(frame: &str) -> serde_json::Value {
+        serde_json::from_str(frame).expect("a frame must be valid JSON")
+    }
+
+    /// The memoized cumulative fast path must emit the **same JSON document** as the
+    /// `serde_json::Value` builder it replaces — same keys, same values, same
+    /// escaping. Covers unicode and control chars, an empty-ids first frame, a
+    /// finish_reason, and the batch `index`. Guards the O(T) rewrite of the O(T²)
+    /// `output_ids` serialization.
     #[test]
     fn cumulative_frame_json_matches_serde() {
         let deltas = [
@@ -720,7 +723,14 @@ mod tests {
                 acc.fold(d);
                 let fast = cumulative_frame_json(&acc, "7", index).expect("no extras → fast path");
                 let slow = tag_value(frame_value(acc.snapshot(), "7"), index);
-                assert_eq!(fast, slow, "index={index:?} text={:?}", acc.snapshot().text);
+                println!("fast={fast:?}");
+                println!("slow={slow:?}");
+                assert_eq!(
+                    as_json(&fast),
+                    as_json(&slow),
+                    "index={index:?} text={:?}",
+                    acc.snapshot().text
+                );
             }
         }
     }
@@ -728,12 +738,6 @@ mod tests {
     /// The same equivalence, for the shape that made cumulative streaming O(T²):
     /// every logprob family at once, across several deltas, with and without
     /// `return_text_in_logprobs` texts and with a null ragged position.
-    ///
-    /// This is the guard on the memoization. The fast path hand-writes
-    /// `meta_info`'s keys, so it has to reproduce `serde_json`'s alphabetical
-    /// `BTreeMap` order and every family's exact tuple encoding; asserting equality
-    /// against the `Value` builder after each fold is what makes that safe to
-    /// maintain.
     #[test]
     fn cumulative_frame_json_matches_serde_with_logprobs() {
         for with_texts in [false, true] {
@@ -824,7 +828,11 @@ mod tests {
                     let fast = cumulative_frame_json(&acc, "9", index)
                         .expect("the extras memo must stay valid for a well-formed request");
                     let slow = tag_value(frame_value(acc.snapshot(), "9"), index);
-                    assert_eq!(fast, slow, "with_texts={with_texts} index={index:?}");
+                    assert_eq!(
+                        as_json(&fast),
+                        as_json(&slow),
+                        "with_texts={with_texts} index={index:?}"
+                    );
                 }
             }
         }

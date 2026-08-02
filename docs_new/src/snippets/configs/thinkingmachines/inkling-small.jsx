@@ -9,6 +9,7 @@ export const config = {
   // Platform list inherited from the Inkling recipes (same architecture family).
   supportedHardware: [
     "h200", "b200", "b300", "gb200", "gb300",
+    "dgx-spark",
     "mi350x", "mi355x",
   ],
 
@@ -71,13 +72,15 @@ export const config = {
   // NVIDIA: two multi-arch CUDA builds (dev-inkling-dspark for CUDA 13,
   // dev-cu12-inkling-dspark for CUDA 12) — pick by your CUDA version, not by GPU.
   // Panel defaults to cu13. AMD: dev-rocm720-mi35x-inkling-dspark (sglang-rocm repo).
-  // All tiers ship from the same images, DSpark included.
+  // DGX Spark uses a dedicated arm64 CUDA 13 image with NCCL 2.30.7.
+  // All tiers ship from the same images, DSpark included (except DGX Spark).
   dockerImages: {
     h200:  "lmsysorg/sglang:dev-inkling-dspark",
     b200:  "lmsysorg/sglang:dev-inkling-dspark",
     b300:  "lmsysorg/sglang:dev-inkling-dspark",
     gb200: "lmsysorg/sglang:dev-inkling-dspark",
     gb300: "lmsysorg/sglang:dev-inkling-dspark",
+    "dgx-spark": "lmsysorg/sglang:dev-inkling-small-dgx-spark",
     mi350x: "lmsysorg/sglang-rocm:dev-rocm720-mi35x-inkling-dspark",
     mi355x: "lmsysorg/sglang-rocm:dev-rocm720-mi35x-inkling-dspark",
   },
@@ -89,12 +92,16 @@ export const config = {
   playgroundFeatures: {
 
     // ----- Card: "Attention Parallelism" -----
-    // TP only. Inkling-Small needs TP=8 to hold the 1M-token SWA + Mamba/sconv pools
-    // (TP=4 can't fit — see §2). TP=16 is cross-node (multi-node path).
+    // TP only. Datacenter NVFP4 recipes need TP=8 (or TP=4 on GB200/GB300) to hold
+    // the 1M-token SWA + Mamba/sconv pools. DGX Spark uses TP=2 across 2 nodes
+    // (1 GPU each). TP=16 is the cross-node datacenter path.
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [
-          null, 4, 8,
+          null,
+          { value: 2, disable: { hw: ["h200", "b200", "b300", "gb200", "gb300", "mi350x", "mi355x"] },
+            disableReason: "TP=2 is the DGX Spark multi-node recipe (1 GPU × 2 nodes)." },
+          4, 8,
           { value: 16, disable: { nodes: ["single"] },
             disableReason: "TP=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
         ]},
@@ -103,7 +110,7 @@ export const config = {
 
     // ----- Card: "MoE Parallelism" -----
     // Blackwell (SM100) runs the FlashInfer TRT-LLM routed FP4 experts; Hopper (SM90)
-    // has no FP4 runner and falls back to Marlin W4A16.
+    // and DGX Spark (SM121) fall back to Marlin W4A16.
     moe: {
       backend: {
         options: [
@@ -112,16 +119,16 @@ export const config = {
           { id: "flashinfer_trtllm_routed", label: "FlashInfer TRT-LLM (routed FP4)",
             flags: ["--moe-runner-backend flashinfer_trtllm_routed"],
             requiresHw: ["b200", "b300", "gb200", "gb300"],
-            hide: { hw: ["mi350x", "mi355x"] } },
+            hide: { hw: ["mi350x", "mi355x", "dgx-spark"] } },
           { id: "marlin", label: "Marlin (W4A16)",
             flags: ["--moe-runner-backend marlin"],
             hide: { hw: ["mi350x", "mi355x"] } },
           { id: "aiter", label: "AITER",
             flags: ["--moe-runner-backend aiter"],
-            hide: { hw: ["h200", "b200", "b300", "gb200", "gb300"] } },
+            hide: { hw: ["h200", "b200", "b300", "gb200", "gb300", "dgx-spark"] } },
           { id: "triton", label: "Triton",
             flags: ["--moe-runner-backend triton"],
-            hide: { hw: ["h200", "b200", "b300", "gb200", "gb300"] } },
+            hide: { hw: ["h200", "b200", "b300", "gb200", "gb300", "dgx-spark"] } },
         ],
       },
     },
@@ -146,12 +153,12 @@ export const config = {
       ],
     },
 
-    // ----- Card: "PD Disaggregation" -----  NVIDIA only; Mooncake MNNVL env gated to GB200/GB300.
+    // ----- Card: "PD Disaggregation" -----  NVIDIA datacenter only; Mooncake MNNVL env gated to GB200/GB300.
     pdDisagg: {
       modes: [
         { id: "off",     label: "Off" },
-        { id: "prefill", label: "Prefill role", hide: { hw: ["mi350x", "mi355x"] } },
-        { id: "decode",  label: "Decode role",  hide: { hw: ["mi350x", "mi355x"] } },
+        { id: "prefill", label: "Prefill role", hide: { hw: ["mi350x", "mi355x", "dgx-spark"] } },
+        { id: "decode",  label: "Decode role",  hide: { hw: ["mi350x", "mi355x", "dgx-spark"] } },
       ],
       transferBackends: [
         { id: "mooncake", label: "Mooncake",
@@ -330,6 +337,38 @@ export const config = {
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
         "--enable-multimodal",
+        "--reasoning-parser inkling",
+        "--tool-call-parser inkling",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // NVIDIA DGX Spark (GB10 / SM121) + NVFP4 — 2× Spark over ConnectX-7.
+    // 1 GPU per node → TP=2 across 2 nodes. Marlin W4A16 + Triton attention;
+    // prefill CUDA graphs disabled on this platform.
+    // ====================================================================
+    {
+      match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "multi-2" },
+      verified: true,
+      env: [
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--quantization modelopt_fp4",
+        "--attention-backend triton",
+        "--page-size 128",
+        "--fp4-gemm-backend marlin",
+        "--moe-runner-backend marlin",
+        "--mamba-radix-cache-strategy extra_buffer",
+        "--mem-fraction-static 0.85",
+        "--swa-full-tokens-ratio 0.1",
+        "--mamba-full-memory-ratio 0.1",
+        "--enable-multimodal",
+        "--disable-prefill-cuda-graph",
         "--reasoning-parser inkling",
         "--tool-call-parser inkling",
         "--host {{HOST_IP}}",
