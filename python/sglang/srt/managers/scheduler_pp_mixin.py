@@ -35,6 +35,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.model_runner_components.misc_utils import (
+    should_use_pp_send_allgather,
+)
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
@@ -557,9 +560,16 @@ class SchedulerPPMixin:
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
-        # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
-        self.require_attn_tp_allgather = (
-            not self.server_args.enable_dsa_prefill_context_parallel
+        # Typed PP messages share one receive path, so proxy and output messages
+        # must use the same transport layout. Preserve TP lanes when a model can
+        # emit token-sharded proxy tensors.
+        self.require_attn_tp_allgather = should_use_pp_send_allgather(
+            enable_dsa_prefill_context_parallel=(
+                self.server_args.enable_dsa_prefill_context_parallel
+            ),
+            preserve_tp_lanes=(
+                self.tp_worker.model_runner.requires_pp_proxy_tp_lane_preservation()
+            ),
         )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size

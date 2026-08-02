@@ -40,6 +40,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.model_runner_components.misc_utils import (
+    compute_pp_proxy_num_tokens,
+)
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
@@ -464,8 +467,12 @@ class BaseRunner(ABC):
             extend_start_loc = None
 
         if mr.server_args.pp_size > 1:
-            # PP0 already cp-split hidden_states before send.
-            pp_hidden_tokens = num_tokens
+            # Later PP stages may receive token-sharded proxy tensors.
+            pp_hidden_tokens = compute_pp_proxy_num_tokens(
+                num_tokens=num_tokens,
+                pp_rank=mr.ps.pp_rank,
+                token_scatter_factor=mr.get_pp_proxy_token_scatter_factor(),
+            )
             if (
                 capture_forward_mode == ForwardMode.EXTEND
                 and mr.ps.pp_rank != 0

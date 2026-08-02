@@ -13,6 +13,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def compute_pp_proxy_num_tokens(
+    *, num_tokens: int, pp_rank: int, token_scatter_factor: int
+) -> int:
+    if token_scatter_factor < 1:
+        raise ValueError(
+            f"token_scatter_factor must be positive, got {token_scatter_factor}"
+        )
+    if pp_rank == 0:
+        return num_tokens
+    if num_tokens % token_scatter_factor != 0:
+        raise ValueError(
+            f"PP proxy token count {num_tokens} is not divisible by "
+            f"scatter factor {token_scatter_factor}"
+        )
+    return num_tokens // token_scatter_factor
+
+
+def should_use_pp_send_allgather(
+    *, enable_dsa_prefill_context_parallel: bool, preserve_tp_lanes: bool
+) -> bool:
+    return not enable_dsa_prefill_context_parallel and not preserve_tp_lanes
+
+
 def maybe_disable_chunked_prefix_cache(
     *, server_args: ServerArgs, use_mla_backend: bool, is_draft_worker: bool
 ) -> None:

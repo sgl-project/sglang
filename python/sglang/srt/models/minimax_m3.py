@@ -1349,6 +1349,13 @@ class MiniMaxM3Model(nn.Module):
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
+    def get_pp_proxy_token_scatter_factor(self) -> int:
+        if self.pp_group.is_first_rank or get_moe_a2a_backend().is_none():
+            return 1
+
+        input_mode = self.layers[self.start_layer].layer_scatter_modes.layer_input_mode
+        return get_parallel().attn_tp_size if input_mode == ScatterMode.SCATTERED else 1
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1429,6 +1436,9 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
+        self.requires_pp_proxy_tp_lane_preservation = (
+            not get_moe_a2a_backend().is_none()
+        )
 
         self.num_fused_shared_experts = 0
         self.determine_num_fused_shared_experts()
@@ -1454,6 +1464,9 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
+
+    def get_pp_proxy_token_scatter_factor(self) -> int:
+        return self.model.get_pp_proxy_token_scatter_factor()
 
     def determine_num_fused_shared_experts(self):
         if get_server_args().disable_shared_experts_fusion:

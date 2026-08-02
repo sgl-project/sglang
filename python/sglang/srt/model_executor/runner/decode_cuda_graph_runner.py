@@ -64,6 +64,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.model_runner_components.misc_utils import (
+    compute_pp_proxy_num_tokens,
+)
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -729,8 +732,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         pp_proxy_tensors = None
         # pipeline parallelism
         if self.pp_size > 1:
+            pp_hidden_tokens = compute_pp_proxy_num_tokens(
+                num_tokens=num_tokens,
+                pp_rank=self.model_runner.ps.pp_rank,
+                token_scatter_factor=(
+                    self.model_runner.get_pp_proxy_token_scatter_factor()
+                ),
+            )
             pp_proxy_tensors = PPProxyTensors(
-                {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+                {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
         if self.require_mlp_tp_gather:

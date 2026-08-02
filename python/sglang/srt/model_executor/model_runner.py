@@ -714,6 +714,15 @@ class ModelRunner:
             start_layer=self.layer_info.start_layer,
         )
 
+    def get_pp_proxy_token_scatter_factor(self) -> int:
+        get_scatter_factor = getattr(
+            self.model, "get_pp_proxy_token_scatter_factor", None
+        )
+        return get_scatter_factor() if get_scatter_factor is not None else 1
+
+    def requires_pp_proxy_tp_lane_preservation(self) -> bool:
+        return getattr(self.model, "requires_pp_proxy_tp_lane_preservation", False)
+
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:

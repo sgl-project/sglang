@@ -64,6 +64,9 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
+        self.requires_pp_proxy_tp_lane_preservation = (
+            not get_moe_a2a_backend().is_none()
+        )
 
         self.use_data_parallel = get_server_args().mm_enable_dp_encoder
 
@@ -187,6 +190,9 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    def get_pp_proxy_token_scatter_factor(self) -> int:
+        return self.model.get_pp_proxy_token_scatter_factor()
 
     def forward(
         self,
